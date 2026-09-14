@@ -13,6 +13,117 @@ from enum import Enum
 
 from .actions import PostComment, Relabel, Target
 from .labels import Label
+from .eligibility import (
+    AllowedEligibility, Eligibility, HeldEligibility, InvalidEligibility,
+    LifecycleOperation, IssueCompletionGuard,
+)
+
+
+_EXPLICIT_HOLDS = frozenset({
+    Label.NEEDS_HUMAN_REVIEW, Label.NEEDS_BUDGET_REVIEW,
+    Label.AI_PARKED, Label.NEEDS_DESIGN,
+})
+
+
+def completion_guard(issue, operation: LifecycleOperation) -> IssueCompletionGuard:
+    return IssueCompletionGuard(
+        operation, issue.title, issue.body, issue.author, issue.state_reason,
+        issue.labels, tuple((c.author, c.body, c.created_at) for c in issue.comments),
+    )
+
+
+def completion_matches(
+    guard: IssueCompletionGuard, issue, *, removed: tuple[Label, ...] = (),
+    added: tuple[Label, ...] = (), comment: str = "",
+) -> bool:
+    """Accept only the original facts plus this command's declared partial effects."""
+    if issue.state != "open" or (
+        issue.title, issue.body, issue.author, issue.state_reason
+    ) != (guard.title, guard.body, guard.author, guard.state_reason):
+        return False
+    if issue.labels - guard.labels - set(added) or guard.labels - issue.labels - set(removed):
+        return False
+    current = [(c.author, c.body, c.created_at) for c in issue.comments]
+    for original in guard.comments:
+        if original not in current:
+            return False
+        current.remove(original)
+    return not current or (bool(comment) and len(current) == 1 and current[0][1] == comment)
+
+
+def completion_eligibility(issue, operation: LifecycleOperation, action) -> Eligibility:
+    if isinstance(action, Relabel) and action.add in {
+        Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW, Label.NEEDS_HUMAN_REVIEW,
+    } and not set(action.removed_labels) & (_EXPLICIT_HOLDS | {Label.AI_BLOCKED}):
+        return AllowedEligibility(operation)
+    return issue_eligibility(issue, operation)
+
+
+def issue_eligibility(issue, operation: LifecycleOperation) -> Eligibility:
+    """Interpret reachable partial transitions without erasing explicit holds."""
+    if operation not in {
+        LifecycleOperation.RESOLVE, LifecycleOperation.RESUME, LifecycleOperation.REPAIR,
+        LifecycleOperation.TRIAGE, LifecycleOperation.GROOM, LifecycleOperation.CLOSE,
+        LifecycleOperation.CLOSE_MERGED,
+        LifecycleOperation.COMPLETE_RESOLVE, LifecycleOperation.COMPLETE_TRIAGE,
+    }:
+        return InvalidEligibility(operation, "operation does not apply to an issue")
+    if issue.state not in {"open", "closed"}:
+        return InvalidEligibility(operation, "issue state is unavailable or malformed")
+    if issue.state != "open" or (
+        Label.AI_DONE in issue.labels and operation is not LifecycleOperation.CLOSE_MERGED
+    ):
+        return HeldEligibility(operation, ("issue is terminal",))
+    if operation in {LifecycleOperation.CLOSE, LifecycleOperation.CLOSE_MERGED} and getattr(
+        issue, "state_reason", ""
+    ).strip().casefold() == "reopened":
+        return HeldEligibility(operation, ("issue was reopened",))
+    holds = issue.labels & _EXPLICIT_HOLDS
+    if holds:
+        return HeldEligibility(operation, tuple(sorted(label.value for label in holds)))
+    if Label.AI_BLOCKED in issue.labels and operation is not LifecycleOperation.RESUME:
+        return HeldEligibility(operation, (Label.AI_BLOCKED.value,))
+    if operation is LifecycleOperation.CLOSE_MERGED:
+        allowed = Label.AI_DONE in issue.labels
+    elif operation is LifecycleOperation.RESOLVE:
+        allowed = Label.AI_READY in issue.labels and not issue.labels & {
+            Label.AI_WORKING, Label.AI_PR_OPEN, Label.AI_SUGGESTION,
+        }
+    elif operation is LifecycleOperation.RESUME:
+        allowed = Label.AI_BLOCKED in issue.labels and Label.AI_PR_OPEN not in issue.labels
+    elif operation in {
+        LifecycleOperation.TRIAGE, LifecycleOperation.COMPLETE_TRIAGE,
+        LifecycleOperation.CLOSE,
+    }:
+        allowed = not issue.labels & {
+            Label.AI_READY, Label.AI_WORKING, Label.AI_PR_OPEN, Label.AI_SUGGESTION,
+        }
+    else:
+        allowed = True
+    return (AllowedEligibility(operation) if allowed else
+            HeldEligibility(operation, ("workflow position does not permit this operation",)))
+
+
+def pr_eligibility(pr, operation: LifecycleOperation) -> Eligibility:
+    if operation not in {
+        LifecycleOperation.PR_RESUME, LifecycleOperation.REVIEW, LifecycleOperation.REPAIR,
+        LifecycleOperation.MERGE, LifecycleOperation.UPDATE_BRANCH, LifecycleOperation.REMEDIATE_CI,
+    }:
+        return InvalidEligibility(operation, "operation does not apply to a PR")
+    if pr.state not in {"OPEN", "CLOSED", "MERGED"}:
+        return InvalidEligibility(operation, "PR state is unavailable or malformed")
+    if pr.state != "OPEN" or Label.AI_DONE in pr.labels:
+        return HeldEligibility(operation, ("PR is terminal",))
+    holds = pr.labels & _EXPLICIT_HOLDS
+    if operation is LifecycleOperation.REVIEW:
+        holds = holds | (pr.labels & {Label.NO_AI_REVIEW, Label.AI_WORKING})
+    if Label.AI_BLOCKED in pr.labels and operation is not LifecycleOperation.PR_RESUME:
+        holds = holds | {Label.AI_BLOCKED}
+    if holds:
+        return HeldEligibility(operation, tuple(sorted(label.value for label in holds)))
+    if operation is LifecycleOperation.PR_RESUME and Label.AI_BLOCKED not in pr.labels:
+        return HeldEligibility(operation, ("PR is not awaiting a reply",))
+    return AllowedEligibility(operation)
 
 
 class IssuePhase(str, Enum):
@@ -85,7 +196,7 @@ class IssueLifecycle:
 
     @property
     def is_ready(self) -> bool:
-        return self.is_open and Label.AI_READY in self.labels
+        return isinstance(issue_eligibility(self, LifecycleOperation.RESOLVE), AllowedEligibility)
 
     @property
     def is_blocked(self) -> bool:
@@ -122,7 +233,9 @@ class PrLifecycle:
 
     @property
     def is_reviewable(self) -> bool:
-        return self.is_open and Label.AI_PR_OPEN in self.labels
+        return Label.AI_PR_OPEN in self.labels and isinstance(
+            pr_eligibility(self, LifecycleOperation.REVIEW), AllowedEligibility
+        )
 
     @property
     def is_blocked(self) -> bool:

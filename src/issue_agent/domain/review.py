@@ -20,7 +20,10 @@ from .actions import Action, AgentKind, Relabel, RunAgent, Target
 from .exemptions import AuthenticatedGrantPairs
 from .identity import IdentityMode, login_eq
 from .labels import Label
-from .lifecycle import pr_escalation, retry_breaker
+from .lifecycle import (
+    AllowedEligibility, LifecycleOperation, pr_eligibility, pr_escalation,
+    retry_breaker,
+)
 from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
 
 # Ceiling on UNPRODUCTIVE review rounds per PR (see ReviewConfig). Deliberately
@@ -161,6 +164,7 @@ class ReviewState:
     # (`app.roles._review_state` reads their union) so the domain sees one
     # number per PR.
     unproductive_rounds: dict[int, int] = field(default_factory=dict)
+    control_errors: Mapping[int, str] = field(default_factory=dict)
 
 
 def needs_initial_review(pr: PRView, state: ReviewState) -> bool:
@@ -569,7 +573,9 @@ def decide_review(
         return []
     actions: list[Action] = []
     for pr in world.prs_with(cfg.trigger_label):
-        if pr.state != "OPEN":
+        if pr.number in state.control_errors or not isinstance(
+            pr_eligibility(pr, LifecycleOperation.REVIEW), AllowedEligibility
+        ):
             continue
         if needs_initial_review(pr, state):
             kind = AgentKind.REVIEW
@@ -587,6 +593,10 @@ def decide_review(
             continue
         actions.append(RunAgent(kind, pr.number))
     for pr in world.prs:
+        if pr.number in state.control_errors or not isinstance(
+            pr_eligibility(pr, LifecycleOperation.REVIEW), AllowedEligibility
+        ):
+            continue
         # Before adoption, deliberately: an abandoned-at-ceiling PR matches
         # `should_adopt` too (no trigger label, no needs-human-review), and
         # adopting it re-labels and re-dispatches a review that can only skip

@@ -365,7 +365,9 @@ def test_a_well_evidenced_close_closes_the_issue_with_its_reason_and_reopen_rule
     assert "PR #170" in closed[0].comment
     assert "Reopen this issue if:" in closed[0].comment
     assert "still fails on a build newer than PR #170" in closed[0].comment
-    assert Relabel(Target.ISSUE, 143, Label.AI_TRIAGE, Label.AI_CLOSED) in acts
+    assert closed[0].remove_labels == (Label.AI_TRIAGE,)
+    assert closed[0].add_labels == (Label.AI_CLOSED,)
+    assert not any(isinstance(a, Relabel) for a in acts)
     # The explanation rides ON the close command — not a second, separately
     # retried comment effect.
     assert not any(isinstance(a, PostComment) for a in acts)

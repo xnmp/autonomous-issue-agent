@@ -7,6 +7,7 @@ from enum import Enum
 
 from .actions import Action, CloseIssue, Relabel, Target
 from .labels import Label
+from .lifecycle import LifecycleOperation, completion_guard
 from .world import IssueView
 
 
@@ -138,8 +139,10 @@ def duplicate_close_actions(
         "just reopen it — a reopened issue is never auto-closed a second time._"
     )
     return (
-        Relabel(Target.ISSUE, current.number, triage_label, Label.AI_CLOSED),
-        CloseIssue(current.number, "completed", body),
+        CloseIssue(current.number, "completed", body,
+                   expected_revision=current.updated_at,
+                   completion_guard=completion_guard(current, LifecycleOperation.CLOSE),
+                   remove_labels=(triage_label,), add_labels=(Label.AI_CLOSED,)),
     )
 
 

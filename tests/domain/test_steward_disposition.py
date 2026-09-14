@@ -41,9 +41,9 @@ def test_validated_duplicate_disposition_closes_with_harness_owned_reason():
     assert close.reason == "completed"
     assert "validated that #42 exists and is closed" in close.comment
     assert "The same crash is tracked" in close.comment
-    assert Relabel(
-        Target.ISSUE, 196, Label.AI_TRIAGE, Label.AI_CLOSED
-    ) in actions
+    assert close.remove_labels == (Label.AI_TRIAGE,)
+    assert close.add_labels == (Label.AI_CLOSED,)
+    assert not any(isinstance(action, Relabel) for action in actions)
     assert not any(isinstance(action, PostComment) for action in actions)
 
 

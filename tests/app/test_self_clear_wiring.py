@@ -1,5 +1,6 @@
 from dataclasses import replace
 from types import SimpleNamespace
+import pytest
 
 from issue_agent.adapters.control_store import AccountingDisposition
 from issue_agent.adapters.effects import action_from_command, command_for_action
@@ -187,8 +188,10 @@ def test_malformed_store_markers_fail_closed(tmp_path):
     store._write(store.issue_path(7, "machine-block"), "{not-json")
     store._write(store.issue_path(7, "budget-block"), '{"reservation_micros":-1}')
 
-    assert store.get_machine_block(7) is None
-    assert store.get_budget_block(7) is None
+    with pytest.raises(ValueError, match="control unavailable"):
+        store.get_machine_block(7)
+    with pytest.raises(ValueError, match="control unavailable"):
+        store.get_budget_block(7)
 
 
 def test_ceiling_event_is_persisted_once(tmp_path):

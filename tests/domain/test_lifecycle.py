@@ -39,7 +39,7 @@ def test_issue_lifecycle_phase_precedence_prefers_furthest_state():
     )
 
     assert lifecycle.phase is IssuePhase.DONE
-    assert lifecycle.is_ready is True
+    assert lifecycle.is_ready is False
     assert lifecycle.is_working is True
     assert lifecycle.is_pr_open is True
 

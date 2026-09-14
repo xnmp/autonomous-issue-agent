@@ -1,6 +1,7 @@
 """Steward and Jira workflow wiring tests."""
 
 import asyncio
+from dataclasses import replace
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event
 
@@ -49,7 +50,7 @@ def test_steward_triage_promotes_ready_issue_and_records_post_action_updated_at(
 
         def get_issue(self, number):
             self.reads += 1
-            return issue if self.reads == 1 else updated
+            return issue if self.reads == 1 else replace(self.issues[number], updated_at="after")
 
     gw = UpdatingGateway()
     store = FakeStore()
@@ -921,10 +922,12 @@ def test_a_close_verdict_comments_closes_and_journals_without_a_paid_resolve_leg
         _close_cfg(journal), gw, store, FakeRunner(_close_verdict()), executor
     ).triage(143))
 
-    assert ("relabel", "issue", 143, "ai-triage", "ai-closed") in gw.calls
+    assert Label.AI_CLOSED in gw.issues[143].labels
+    assert Label.AI_TRIAGE not in gw.issues[143].labels
     close = next(c for c in gw.calls if c[0] == "close")
     assert close[1] == 143 and close[2] == "completed"
-    assert "PR #170" in close[3] and "Reopen this issue if:" in close[3]
+    assert any(c[0] == "comment" and "PR #170" in c[3] and "Reopen this issue if:" in c[3]
+               for c in gw.calls)
     assert not any(c[0] == "relabel" and c[4] == "ai-ready" for c in gw.calls)
     assert not any(c[0] == "relabel" and c[4] == "ai-done" for c in gw.calls)
     assert store.triage_at[143] == "t1"
@@ -1115,3 +1118,28 @@ def test_the_prompt_tells_the_classifier_close_exists_and_keeps_the_bar_high():
     assert "close_reason" in prompt and "reopen_if" in prompt
     assert "CONCRETE, CHECKABLE evidence" in prompt
     assert "close" in runner.tasks[0].schema["properties"]["verdict"]["enum"]
+
+
+@pytest.mark.parametrize("state_reason,may_close", [("", True), ("REOPENED", False)])
+def test_withdrawn_test_report_uses_observed_lifecycle_not_stale_bot_comment(state_reason, may_close):
+    issue = IssueView(
+        143, title="dummy issue", body="pls close", author="alice",
+        state="open", state_reason=state_reason,
+        comments=(Comment("steward-bot", "Closed by the triage steward; later reopened."),),
+    )
+    gateway = FakeGateway(issues={143: issue})
+    runner = FakeRunner(_close_verdict(
+        close_reason="The author explicitly withdrew this test report: pls close.",
+        close_state_reason="not_planned",
+        reopen_if="The author has a concrete bug or feature to report.",
+    ))
+    asyncio.run(StewardWorkflow(
+        _close_cfg(), gateway, FakeStore(), runner, Executor(gateway)
+    ).triage(143))
+
+    prompt = runner.tasks[0].prompt
+    assert "Observed GitHub state: open" in prompt
+    assert f"Observed GitHub state reason: {state_reason.lower() or 'not reported'}" in prompt
+    assert "explicitly withdrawn" in prompt
+    assert "attempted actions" in prompt
+    assert bool([call for call in gateway.calls if call[0] == "close"]) is may_close

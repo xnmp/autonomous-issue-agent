@@ -23,7 +23,7 @@ from issue_agent.domain.actions import (
     Target,
 )
 from issue_agent.domain.labels import Label
-from issue_agent.domain.world import PRView
+from issue_agent.domain.world import IssueView, PRView
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
 
@@ -106,8 +106,10 @@ def test_ci_pending_escalation_withholds_marker_when_relabel_is_not_verified():
 
 def test_close_issue():
     ex, gw, _, _ = _exec()
+    gw.issues[5] = IssueView(5)
     ex.execute(CloseIssue(5, "completed", "done"))
-    assert gw.calls == [("close", 5, "completed", "done")]
+    assert gw.calls == [("comment", "issue", 5, "done"), ("close", 5, "completed", "")]
+    assert gw.issues[5].state == "closed"
 
 
 def test_enable_auto_merge():
@@ -365,19 +367,19 @@ def test_noop_does_nothing():
 
 
 def test_every_action_is_logged_except_noop():
-    gw = FakeGateway()
+    gw = FakeGateway(issues={7: IssueView(7), 8: IssueView(8)})
     logged: list[str] = []
     ex = Executor(gw, remove_worktree=lambda i: None, run_agent=lambda a: None,
                   log=logged.append)
     ex.execute(Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING))
-    ex.execute(CloseIssue(7))
+    ex.execute(CloseIssue(8))
     ex.execute(RunAgent(AgentKind.RESOLVE, 7))
     ex.execute(NoOp("idle"))
     # Three real actions logged, NoOp silent — the audit trail nobody has to guess.
     assert len(logged) == 3
     assert "relabel issue #7" in logged[0]
     assert "-ai-ready" in logged[0] and "+ai-working" in logged[0]
-    assert "close issue #7" in logged[1]
+    assert "close issue #8" in logged[1]
     assert "dispatch RESOLVE #7" in logged[2]
 
 

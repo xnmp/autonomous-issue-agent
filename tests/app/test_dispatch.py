@@ -1021,7 +1021,7 @@ def test_address_review_mid_dispatch_failure_still_applies_the_rest_of_the_tail(
     retry by design: waiting on a human is not a failed attempt.)"""
     store = Store(state_dir=str(tmp_path))
     pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
-               reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="T1"),))
+               reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="2026-01-01T00:00:01Z"),))
     gw = FakeGateway(prs={100: pr}, fail_on={"comment"})
     runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="ar-live"))
     d = _ci_dispatcher(gw, store, runner)
@@ -1040,7 +1040,7 @@ def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
     run — the review-retry breaker is the ONLY thing bounding this leg now."""
     store = Store(state_dir=str(tmp_path))
     pr = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
-               reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="T1"),))
+               reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at="2026-01-01T00:00:01Z"),))
     gw = FakeGateway(prs={100: pr})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="ar-live"))
     d = _ci_dispatcher(gw, store, runner)
@@ -1048,7 +1048,7 @@ def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, 100)))
 
     assert store.get_session(5) == "ar-live"
-    assert store.get_review_retry(5) == ("T1", 1)
+    assert store.get_review_retry(5) == ("2026-01-01T00:00:01Z", 1)
     assert not any(c[0] == "relabel" for c in gw.calls)  # no gh write at all, not a failed one
     assert store.get_infra_deaths(5) == 0
 

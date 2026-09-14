@@ -354,7 +354,8 @@ def test_operator_interrupt_cancels_async_dispatch_and_joins_pool():
     assert daemon.available_dispatch_slots == 0
 
 
-def test_shutdown_deadline_forces_process_teardown_and_exits_transient():
+@pytest.mark.parametrize("exhausted", [False, True], ids=["teardown-window", "budget-exhausted"])
+def test_shutdown_deadline_forces_process_teardown_and_exits_transient(exhausted):
     from issue_agent.domain.actions import AgentKind, RunAgent
     from issue_agent.domain.supervision import ExitCode
 
@@ -373,23 +374,30 @@ def test_shutdown_deadline_forces_process_teardown_and_exits_transient():
         Executor(FakeGateway(), run_agent=run_agent),
         poll_seconds=1,
         dispatch_capacity=1,
-        shutdown_timeout_seconds=0.01,
+        shutdown_timeout_seconds=1,
         force_kill_dispatches=lambda: forced.append(True),
     )
 
-    with pytest.raises(SystemExit) as stopped:
-        daemon.run_forever(
-            sleep=lambda _seconds: None,
-            now=lambda: 0,
-            max_ticks=1,
-        )
+    def before_shutdown(_seconds):
+        assert started.wait(timeout=1)
+        if exhausted:
+            # A deadline can already be exhausted by earlier shutdown work;
+            # optional teardown has no remaining allocation in that case.
+            daemon._shutdown_deadline = 0
 
-    assert started.is_set()
-    assert stopped.value.code is ExitCode.TRANSIENT
-    assert forced == [True]
-    assert daemon.requires_hard_exit is True
-    release.set()
-    daemon.wait_for_dispatches()
+    try:
+        with pytest.raises(SystemExit) as stopped:
+            daemon.run_forever(
+                sleep=before_shutdown,
+                now=lambda: 0,
+                max_ticks=1,
+            )
+        assert stopped.value.code is ExitCode.TRANSIENT
+        assert forced == ([] if exhausted else [True])
+        assert daemon.requires_hard_exit is True
+    finally:
+        release.set()
+        daemon.wait_for_dispatches()
 
 
 def test_shutdown_reaps_killed_worker_before_final_spend_reconciliation():

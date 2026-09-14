@@ -15,7 +15,8 @@ actions (auto-merge, cleanup) remain independent of pool occupancy.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
 from enum import Enum
 
 from .actions import (
@@ -59,6 +60,10 @@ from .exemptions import (
 from .identity import login_eq
 from .labels import Label, priority_rank
 from .lifecycle import (
+    AllowedEligibility,
+    LifecycleOperation,
+    issue_eligibility,
+    pr_eligibility,
     issue_escalation,
     issue_lifecycle,
     pr_escalation,
@@ -223,6 +228,8 @@ class FixState:
     budget_worlds: dict[int, BudgetWorld] = field(default_factory=dict)
     self_clear_counts: dict[int, int] = field(default_factory=dict)
     self_clear_ceiling_reported: frozenset[int] = frozenset()
+    # A bad per-target record must not mint a default allowance or hide peers.
+    control_errors: Mapping[int, str] = field(default_factory=dict)
 
 
 # ── holds (why a ready issue was NOT picked) ─────────────────────────────────
@@ -925,6 +932,7 @@ def reap_actions(
         )
         for issue in world.issues_with(Label.AI_WORKING)
         if issue.number not in active_issues
+        and isinstance(issue_eligibility(issue, LifecycleOperation.COMPLETE_RESOLVE), AllowedEligibility)
     ]
 
 
@@ -1000,6 +1008,7 @@ def cleanup_actions(
                     CloseIssue(
                         issue_number,
                         comment=f"Resolved by #{pr.number} (merged).",
+                        operation=LifecycleOperation.CLOSE_MERGED,
                     )
                 )
     else:  # CLOSED unmerged → re-queue the issue
@@ -1537,10 +1546,15 @@ def ci_remediations(
     `test_the_journal_agrees_with_the_escalation_it_explains` exists to forbid).
     """
 
-    return (
+    eligible_prs = {
+        p.number for p in world.prs
+        if isinstance(pr_eligibility(p, LifecycleOperation.REMEDIATE_CI), AllowedEligibility)
+        and breaker_key(p) not in state.control_errors
+    }
+    return tuple(remedy for remedy in (
         *ci_stall_remedies(world, cfg, state),
         *ci_cancel_green_illusions(world, cfg, state),
-    )
+    ) if remedy.pr in eligible_prs)
 
 
 # ── flake-aware CI repair (#38) ──────────────────────────────────────────────
@@ -1673,6 +1687,13 @@ def decide_fix(
     lease, including PR legs mapped back to their linked issue.
     """
     actions: list[Action] = []
+    if state.control_errors:
+        world = replace(
+            world,
+            issues=tuple(i for i in world.issues if i.number not in state.control_errors),
+            prs=tuple(p for p in world.prs if breaker_key(p) not in state.control_errors
+                      and -p.number not in state.control_errors),
+        )
 
     retiring = self_clear_actions(
         world,
@@ -1796,6 +1817,10 @@ def decide_fix(
     # expensive resolve. Under continuous ready-issue load, the old resolve-first
     # order starved ADDRESS_REVIEW/FIX_CI/REBASE for 88 minutes (#56).
     for pr in open_prs:
+        operation = (LifecycleOperation.PR_RESUME if Label.AI_BLOCKED in pr.labels
+                     else LifecycleOperation.REPAIR)
+        if not isinstance(pr_eligibility(pr, operation), AllowedEligibility):
+            continue
         # An open GitHub "blocked by" dependency holds the WHOLE repair arm,
         # not just fresh resolves. Unparking keifu #130/#157 (2026-08-03) would
         # have re-dispatched FIX_CI straight into the Windows CI wedge their
@@ -1812,6 +1837,10 @@ def decide_fix(
         # a blocker-READ failure alone no longer drops the issue (the adapter
         # marks it blocked instead, failing closed).
         held = _observed_issue(world, _issue_for_pr(pr))
+        if held is not None and held.state != "closed" and not isinstance(
+            issue_eligibility(held, LifecycleOperation.REPAIR), AllowedEligibility
+        ):
+            continue
         if dependency_blocked(held):
             # A settled-green episode still closes its breaker while held:
             # the reset is bookkeeping, not a dispatch, and skipping it
@@ -2001,6 +2030,11 @@ def decide_fix(
     if remaining:
         needing = issues_needing_any_resume(world, state, cfg)
         for n, _at in needing:
+            if not isinstance(
+                issue_eligibility(issues_by_number[n], LifecycleOperation.RESUME),
+                AllowedEligibility,
+            ):
+                continue
             if n in retiring_issues:
                 continue
             if not remaining:
@@ -2099,7 +2133,7 @@ def decide_fix(
     # because reading this poll's escalations would re-import pool dependence —
     # escalation itself only happens when a dispatch slot is available.)
     for pr in open_prs:
-        if pr_lifecycle(pr).is_blocked:
+        if not isinstance(pr_eligibility(pr, LifecycleOperation.MERGE), AllowedEligibility):
             continue  # a human owns the next move — don't arm anything
         if should_automerge(pr, state, cfg):
             actions.append(

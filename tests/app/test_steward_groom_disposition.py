@@ -64,8 +64,10 @@ def test_groom_duplicate_claim_is_validated_closed_and_journalled(tmp_path):
 
     close = next(call for call in gateway.calls if call[0] == "close")
     assert close[1:3] == (196, "completed")
-    assert "validated that #42 exists and is closed" in close[3]
-    assert ("relabel", "issue", 196, "ai-triage", "ai-closed") in gateway.calls
+    assert any(call[0] == "comment" and "validated that #42 exists and is closed" in call[3]
+               for call in gateway.calls)
+    assert Label.AI_CLOSED in gateway.issues[196].labels
+    assert Label.AI_TRIAGE not in gateway.issues[196].labels
     event = next(
         event for event in read_events(journal.path)
         if event.get("event") == "groomed" and event.get("kind") == "duplicate_of"
@@ -191,7 +193,7 @@ def test_groom_journals_acceptance_before_a_failing_action_batch(tmp_path):
         if event.get("event") == "groomed" and event.get("kind") == "duplicate_of"
     )
     assert event["outcome"] == "accepted"
-    assert any(call[0] == "close" for call in gateway.calls)
+    assert not any(call[0] == "close" for call in gateway.calls)
 
 
 def test_groom_journal_failure_does_not_block_close(tmp_path):

@@ -26,6 +26,7 @@ from issue_agent.domain.actions import (
     UpdateBranch,
 )
 from issue_agent.domain.labels import Label
+from issue_agent.domain.world import IssueView, Comment
 from issue_agent.domain.triage import TriageConfig, TriageVerdict, close_actions
 
 
@@ -77,8 +78,13 @@ class Gateway:
         return SimpleNamespace(head_ref_oid=self.head)
 
     def get_issue(self, issue):
-        del issue
-        return SimpleNamespace(updated_at=self.issue_revision)
+        closed, reason = self.issue_closure(issue)
+        return IssueView(
+            issue, updated_at=self.issue_revision, state="closed" if closed else "open",
+            state_reason=reason,
+            labels=frozenset(Label(label) for kind, number, label in self.labels if kind == "issue" and number == issue),
+            comments=tuple(Comment("bot", body) for kind, number, body in sorted(self.comments) if kind == "issue" and number == issue),
+        )
 
     def rerun_failed_checks(self, head, run_ids, expected_attempts=None):
         assert expected_attempts in (None, {run_id: self.run_attempt for run_id in run_ids})
@@ -276,7 +282,7 @@ def test_close_issue_applies_comment_then_exact_close_state(tmp_path) -> None:
     assert store.pending_commands() == ()
 
 
-def test_partial_close_recovery_restores_missing_comment_without_reclosing(
+def test_legacy_closed_target_with_missing_explanation_requires_reconciliation(
     tmp_path,
 ) -> None:
     executor, gateway, store = _executor(tmp_path)
@@ -287,19 +293,29 @@ def test_partial_close_recovery_restores_missing_comment_without_reclosing(
     gateway.issue_revision = "issue-rev-after-close"
     gateway.issue_closures[4] = (True, "completed")
 
-    assert executor.execute(action)
+    with pytest.raises(UnknownEffectOutcome, match="incomplete disposition"):
+        executor.execute(action)
+    assert gateway.calls == []
+    assert not gateway.has_comment("issue", 4, "done")
+    assert store.pending_commands()
 
-    assert gateway.calls == [("comment", "issue", 4, "done")]
-    assert gateway.has_comment("issue", 4, "done")
-    assert store.pending_commands() == ()
-    with store._connect() as db:
-        state, attempts = db.execute(
-            "SELECT state, attempts FROM lifecycle_commands"
-        ).fetchone()
-        status = db.execute(
-            "SELECT status FROM effect_receipts"
-        ).fetchone()[0]
-    assert (state, attempts, status) == ("succeeded", 2, "succeeded")
+
+def test_legacy_partial_close_never_binds_a_humans_newer_hold(tmp_path):
+    executor, gateway, store = _executor(tmp_path)
+    action = CloseIssue(4, "completed", "done")
+    command = executor._command(action)
+    store.enqueue_command(command)
+    store.begin_command(command.command_id)
+    gateway.comments.add(("issue", 4, "done"))
+    gateway.labels.add(("issue", 4, Label.NEEDS_HUMAN_REVIEW.value))
+    gateway.issue_revision = "new-human-hold"
+
+    with pytest.raises(UnknownEffectOutcome, match="legacy close"):
+        executor.execute(action)
+
+    assert gateway.calls == []
+    assert gateway.issue_closure(4) == (False, "")
+    assert store.pending_commands()
 
 
 def test_partial_close_recovery_finishes_close_after_comment_ack_is_lost(
@@ -954,8 +970,9 @@ def test_steward_close_actions_are_durable_commands_with_receipts(tmp_path) -> N
         assert executor.execute(action)
 
     assert gateway.calls == [
-        ("relabel", "issue", 143, "ai-triage", "ai-closed"),
-        ("comment", "issue", 143, actions[1].comment),
+        ("comment", "issue", 143, actions[0].comment),
+        ("relabel", "issue", 143, None, "ai-closed"),
+        ("relabel", "issue", 143, "ai-triage", None),
         ("close", 143, "completed", ""),
     ]
     assert gateway.issue_closure(143) == (True, "completed")
@@ -970,8 +987,8 @@ def test_steward_close_actions_are_durable_commands_with_receipts(tmp_path) -> N
         statuses = tuple(
             row[0] for row in db.execute("SELECT status FROM effect_receipts")
         )
-    assert kinds == ("relabel", "close_issue")
-    assert statuses == ("succeeded", "succeeded")
+    assert kinds == ("close_issue",)
+    assert statuses == ("succeeded",)
 
 
 def test_a_replayed_steward_close_neither_re_comments_nor_re_closes(tmp_path) -> None:
@@ -989,8 +1006,9 @@ def test_a_replayed_steward_close_neither_re_comments_nor_re_closes(tmp_path) ->
             executor.execute(action)
 
     assert gateway.calls == [
-        ("relabel", "issue", 143, "ai-triage", "ai-closed"),
-        ("comment", "issue", 143, actions[1].comment),
+        ("comment", "issue", 143, actions[0].comment),
+        ("relabel", "issue", 143, None, "ai-closed"),
+        ("relabel", "issue", 143, "ai-triage", None),
         ("close", 143, "not_planned", ""),
     ]
 

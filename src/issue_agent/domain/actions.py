@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Union
 
+from .eligibility import IssueCompletionGuard, LifecycleOperation
 from .labels import Label
 
 
@@ -76,6 +77,7 @@ class Relabel:
     # would share one observed revision, so the first mutation would stale the
     # second command and could strand a half-completed label transition.
     removes: tuple[Label, ...] = ()
+    completion_guard: IssueCompletionGuard | None = None
 
     @property
     def removed_labels(self) -> tuple[Label, ...]:
@@ -96,6 +98,11 @@ class CloseIssue:
     number: int
     reason: str = "completed"
     comment: str = ""
+    expected_revision: str | None = None
+    completion_guard: IssueCompletionGuard | None = None
+    remove_labels: tuple[Label, ...] = ()
+    add_labels: tuple[Label, ...] = ()
+    operation: LifecycleOperation = LifecycleOperation.CLOSE
 
 
 @dataclass(frozen=True)

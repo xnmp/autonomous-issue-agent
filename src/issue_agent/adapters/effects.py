@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from dataclasses import fields, is_dataclass
+from dataclasses import fields, is_dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Mapping, Protocol, runtime_checkable
 
@@ -24,6 +24,11 @@ from ..domain.actions import (
     UpdateBranch,
 )
 from ..domain.labels import Label
+from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
+from ..domain.lifecycle import (
+    AllowedEligibility, completion_guard, completion_matches, issue_eligibility,
+    completion_eligibility,
+)
 from ..domain.repository import canonical_repository
 from ..domain.contracts import (
     CommandId,
@@ -171,7 +176,17 @@ class ImmediateGitHubEffectExecutor:
     def handles(self, action: Action) -> bool:
         return GitHubEffectExecutor.handles(self, action)
 
+    def _validate_completion(self, action, *, partial=False):
+        return GitHubEffectExecutor._validate_completion(self, action, partial=partial)
+
+    def _close_state_matches(self, action):
+        return GitHubEffectExecutor._close_state_matches(self, action)
+
     def execute(self, action: Action):
+        if isinstance(action, CloseIssue) and action.completion_guard is None:
+            current = self.gateway.get_issue(action.number)
+            if current.state == "open":
+                action = replace(action, completion_guard=completion_guard(current, action.operation))
         if isinstance(action, Relabel):
             removals = action.removed_labels
             self.gateway.relabel(
@@ -342,6 +357,19 @@ class GitHubEffectExecutor:
 
     def execute(self, action: Action):
         pending = self._pending_for_action(action)
+        if pending is None and isinstance(action, CloseIssue) and self._reconcile(action) is True:
+            return True
+        if isinstance(action, CloseIssue) or (
+            isinstance(action, Relabel) and action.target is Target.ISSUE
+            and action.remove is Label.AI_WORKING and not action.harness_signal
+        ):
+            if action.completion_guard is None and pending is None:
+                current = self.gateway.get_issue(action.number)
+                operation = (action.operation if isinstance(action, CloseIssue)
+                             else LifecycleOperation.COMPLETE_RESOLVE)
+                if not isinstance(issue_eligibility(current, operation), AllowedEligibility):
+                    raise StaleExpectedRevision(f"issue:{action.number}: completion is no longer eligible")
+                action = replace(action, completion_guard=completion_guard(current, operation))
         if pending is None:
             command = self._command(action)
             pending = self.effects.enqueue(command)
@@ -378,8 +406,10 @@ class GitHubEffectExecutor:
             )
         repairing_partial_close = (
             pending.state != "pending"
-            and isinstance(action, CloseIssue)
-            and self._close_effect_partially_applied(action)
+            and (
+                isinstance(action, CloseIssue) and self._close_effect_partially_applied(action)
+                or isinstance(action, Relabel) and self._relabel_partially_applied(action)
+            )
         )
         if pending.state in {
             "executing",
@@ -706,6 +736,7 @@ class GitHubEffectExecutor:
         command: LifecycleCommand | None = None,
     ):
         if isinstance(action, Relabel):
+            self._validate_completion(action, partial=True)
             removals = action.removed_labels
             self.gateway.relabel(
                 _TARGET[action.target],
@@ -714,6 +745,7 @@ class GitHubEffectExecutor:
                 action.add.value if action.add else None,
             )
             for label in removals[1:]:
+                self._validate_completion(action, partial=True)
                 self.gateway.relabel(
                     _TARGET[action.target], action.number, label.value, None
                 )
@@ -722,21 +754,25 @@ class GitHubEffectExecutor:
             self.gateway.comment(_TARGET[action.target], action.number, action.body)
             return True
         elif isinstance(action, CloseIssue):
-            if (
-                not isinstance(self.gateway, IssueClosureVerifier)
-                or (
-                    action.comment
-                    and not isinstance(self.gateway, CommentVerifier)
-                )
-            ):
-                self.gateway.close_issue(
-                    action.number, action.reason, action.comment
-                )
-                return True
-            if action.comment and not self.gateway.has_comment(
-                "issue", action.number, action.comment
-            ):
+            if self._close_state_matches(action):
+                if self.reconcile(action) is True:
+                    return True
+                raise UnknownEffectOutcome("closed target has an incomplete disposition; reconcile remaining effects")
+            self._validate_completion(action, partial=True)
+            has_comment = (
+                self.gateway.has_comment("issue", action.number, action.comment)
+                if isinstance(self.gateway, CommentVerifier)
+                else any(c.body == action.comment for c in self.gateway.get_issue(action.number).comments)
+            )
+            if action.comment and not has_comment:
                 self.gateway.comment("issue", action.number, action.comment)
+            self._validate_completion(action, partial=True)
+            for label in action.add_labels:
+                self.gateway.relabel("issue", action.number, None, label.value)
+                self._validate_completion(action, partial=True)
+            for label in action.remove_labels:
+                self.gateway.relabel("issue", action.number, label.value, None)
+                self._validate_completion(action, partial=True)
             if not self._close_state_matches(action):
                 self.gateway.close_issue(action.number, action.reason, "")
             return True
@@ -836,6 +872,12 @@ class GitHubEffectExecutor:
                 return None
             if not self._close_state_matches(action):
                 return False
+            if action.remove_labels or action.add_labels:
+                current = self.gateway.get_issue(action.number)
+                if any(label in current.labels for label in action.remove_labels) or any(
+                    label not in current.labels for label in action.add_labels
+                ):
+                    return False
             if not action.comment:
                 return True
             if not isinstance(self.gateway, CommentVerifier):
@@ -944,6 +986,16 @@ class GitHubEffectExecutor:
             )
         )
 
+    def _relabel_partially_applied(self, action: Relabel) -> bool:
+        if action.completion_guard is None:
+            return False
+        current = self.gateway.get_issue(action.number)
+        guard = action.completion_guard
+        return current.labels != guard.labels and completion_matches(
+            guard, current, removed=action.removed_labels,
+            added=(action.add,) if action.add else (),
+        )
+
     def reconcile(self, action: Action) -> bool | None:
         return self._reconcile(action)
 
@@ -1036,13 +1088,22 @@ class GitHubEffectExecutor:
             if command.kind is not kind or command.target != target:
                 continue
             try:
-                if action_from_command(command) == action:
+                candidate = action_from_command(command)
+                if isinstance(action, (CloseIssue, Relabel)) and action.completion_guard is None and isinstance(candidate, type(action)):
+                    candidate = replace(candidate, completion_guard=None)
+                if candidate == action:
                     return pending
             except (KeyError, TypeError, ValueError):
                 continue
         return None
 
     def _revision_matches(self, command: LifecycleCommand) -> bool:
+        if command.kind in {CommandKind.RELABEL, CommandKind.CLOSE_ISSUE}:
+            action = action_from_command(command)
+            try:
+                self._validate_completion(action, partial=isinstance(action, CloseIssue))
+            except StaleExpectedRevision:
+                return False
         if command.expected_revision is None:
             return True
         number = int(command.target.split(":", 1)[1])
@@ -1059,6 +1120,33 @@ class GitHubEffectExecutor:
                 f"{command.command_id}: current revision is unavailable"
             )
         return current == command.expected_revision
+
+    def _validate_completion(self, action: Action, *, partial: bool = False) -> None:
+        if not isinstance(action, (Relabel, CloseIssue)):
+            return
+        if action.completion_guard is None:
+            if isinstance(action, CloseIssue) and self.reconcile(action) is not True:
+                raise UnknownEffectOutcome("legacy close lacks completion facts; reconcile before any further write")
+            return
+        guard = action.completion_guard
+        current = self.gateway.get_issue(action.number)
+        if isinstance(action, CloseIssue) and self._close_state_matches(action):
+            if self.reconcile(action) is True:
+                return
+            raise StaleExpectedRevision(f"issue:{action.number}: closed target has incomplete disposition")
+        removed = added = ()
+        comment = ""
+        if partial:
+            if isinstance(action, CloseIssue):
+                removed, added, comment = action.remove_labels, action.add_labels, action.comment
+            else:
+                removed = action.removed_labels
+                added = (action.add,) if action.add else ()
+        if not completion_matches(guard, current, removed=removed, added=added, comment=comment):
+            raise StaleExpectedRevision(f"issue:{action.number}: completion facts changed")
+        permission = completion_eligibility(current, guard.operation, action)
+        if not isinstance(permission, AllowedEligibility):
+            raise StaleExpectedRevision(f"issue:{action.number}: completion held: {permission}")
 
 def command_for_action(
     action: Action,
@@ -1124,6 +1212,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
             ),
             bool(payload.get("harness_signal", False)),
             tuple(Label(str(label)) for label in payload.get("removes", ())),
+            _completion_guard_from_payload(payload.get("completion_guard")),
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(
@@ -1133,10 +1222,21 @@ def action_from_command(command: LifecycleCommand) -> Action:
             bool(payload.get("harness_signal", False)),
         )
     if command.kind is CommandKind.CLOSE_ISSUE:
+        operation = LifecycleOperation(payload.get("operation", LifecycleOperation.CLOSE.value))
+        guard = _completion_guard_from_payload(payload.get("completion_guard"))
+        if operation not in {LifecycleOperation.CLOSE, LifecycleOperation.CLOSE_MERGED} or (
+            operation is LifecycleOperation.CLOSE_MERGED and payload.get("reason", "completed") != "completed"
+        ) or (guard is not None and guard.operation is not operation):
+            raise ValueError("inconsistent close completion operation")
         return CloseIssue(
             int(payload["number"]),
             str(payload.get("reason", "completed")),
             str(payload.get("comment", "")),
+            expected_revision=payload.get("expected_revision", command.expected_revision),
+            completion_guard=guard,
+            remove_labels=tuple(Label(label) for label in payload.get("remove_labels", ())),
+            add_labels=tuple(Label(label) for label in payload.get("add_labels", ())),
+            operation=operation,
         )
     if command.kind is CommandKind.ENABLE_AUTO_MERGE:
         return EnableAutoMerge(
@@ -1203,7 +1303,7 @@ def _command_identity(action: Action) -> tuple[CommandKind, str]:
 
 
 def _expected_revision(action: Action) -> str | None:
-    if isinstance(action, Relabel):
+    if isinstance(action, (Relabel, CloseIssue)):
         return action.expected_revision
     return (
         action.head
@@ -1240,7 +1340,32 @@ def _run_attempt_baseline(
     return baseline
 
 
+def _completion_guard_from_payload(raw: object) -> IssueCompletionGuard | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or any(
+        not isinstance(raw.get(key), str)
+        for key in ("operation", "title", "body", "author", "state_reason")
+    ):
+        raise ValueError("malformed completion guard")
+    labels, comments = raw.get("labels"), raw.get("comments")
+    if not isinstance(labels, (tuple, list)) or not all(isinstance(label, str) for label in labels):
+        raise ValueError("malformed completion guard labels")
+    if not isinstance(comments, (tuple, list)) or not all(
+        isinstance(comment, (tuple, list)) and len(comment) == 3
+        and all(isinstance(value, str) for value in comment) for comment in comments
+    ):
+        raise ValueError("malformed completion guard comments")
+    return IssueCompletionGuard(
+        LifecycleOperation(raw["operation"]), raw["title"], raw["body"], raw["author"],
+        raw["state_reason"], frozenset(Label(label) for label in labels),
+        tuple(tuple(comment) for comment in comments),
+    )
+
+
 def _jsonable(value: object) -> Any:
+    if isinstance(value, frozenset):
+        return sorted(_jsonable(item) for item in value)
     if isinstance(value, Enum):
         return value.value
     if is_dataclass(value):

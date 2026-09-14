@@ -19,6 +19,10 @@ from ...domain.events import (
     TriageDispositionRecorded,
 )
 from ...domain.labels import Label
+from ...domain.lifecycle import (
+    AllowedEligibility, LifecycleOperation, completion_guard, completion_matches,
+    issue_eligibility,
+)
 from ...domain.leg import Leg, LegTarget
 from ...domain.outcome import AgentResult, MAX_BUDGET_STATUS, budget_exhausted
 from ...domain.steward_stall import (
@@ -43,6 +47,7 @@ from ...domain.trust import as_untrusted
 from ..planners import tasks as task_builders
 from ..planners.tasks import GroomTaskConfig, TriageTaskConfig
 from .base import run_leg
+from .completion import execute_issue_completion
 
 
 @dataclass(frozen=True)
@@ -510,6 +515,11 @@ class StewardWorkflow:
             try:
                 action_issue = self.gateway.get_issue(issue)
                 action_reference = self.gateway.get_issue(claim.issue)
+                if (action_issue.title, action_issue.body, action_issue.author, action_issue.comments) != (
+                    iss.title, iss.body, iss.author, iss.comments
+                ):
+                    self.cfg.log(f"groom #{issue}: duplicate closure deferred; source facts changed")
+                    return
             except GhUnavailable:
                 self._stall(
                     issue,
@@ -584,6 +594,9 @@ class StewardWorkflow:
             as_untrusted(thread),
             self.cfg.triage,
             recent_merges=as_untrusted(_merge_lines(merged)),
+            issue_state=iss.state,
+            state_reason=iss.state_reason,
+            issue_author=iss.author,
         )
         result = await run_leg(
             self.runner,
@@ -600,6 +613,13 @@ class StewardWorkflow:
         if result.is_error or not isinstance(result.structured, dict):
             self._charge_stall(issue, "triage", result, iss)
             return
+        fresh = self.gateway.get_issue(issue)
+        if not completion_matches(completion_guard(iss, LifecycleOperation.COMPLETE_TRIAGE), fresh) or not isinstance(
+            issue_eligibility(fresh, LifecycleOperation.COMPLETE_TRIAGE), AllowedEligibility
+        ):
+            self.cfg.log(f"triage #{issue}: completion deferred; decision facts changed or issue held")
+            return
+        iss = fresh
         s = result.structured
         verdict = TriageVerdict(
             # `or ""` throughout, not `get(k, "")`: under strict structured
@@ -669,8 +689,8 @@ class StewardWorkflow:
         if rec:
             disp += f"; possible recurrence of #{verdict.recurrence_of}"
         self.cfg.log(f"triage #{issue}: {disp}")
-        if not self.executor.execute_all(
-            [
+        if not execute_issue_completion(
+            self.gateway, self.executor, iss, [
                 *triage_dom.actions_for_verdict(
                     issue,
                     iss.author,
@@ -680,7 +700,8 @@ class StewardWorkflow:
                     labels=iss.labels,
                 ),
                 *rec,
-            ]
+            ], LifecycleOperation.CLOSE if closing else LifecycleOperation.COMPLETE_TRIAGE,
+            self.cfg.log,
         ):
             # Mirrors the groom path. Whether this costs another paid leg
             # depends on whether the writes are DURABLY OWED or were never

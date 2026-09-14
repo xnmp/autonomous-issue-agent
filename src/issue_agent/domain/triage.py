@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 from .actions import Action, AddDependency, CloseIssue, PostComment, Relabel, Target
 from .gate import Adr, check_adr_references
 from .labels import LIFECYCLE_LABELS, Label
+from .lifecycle import AllowedEligibility, LifecycleOperation, issue_eligibility
 from .world import IssueView, PRView, WorldState
 
 
@@ -139,7 +140,8 @@ def grooming_candidates(
     content = seen_content or {}
     return [
         issue.number for issue in world.open_issues()
-        if issue.updated_at != seen_at.get(issue.number, "")
+        if isinstance(issue_eligibility(issue, LifecycleOperation.GROOM), AllowedEligibility)
+        and issue.updated_at != seen_at.get(issue.number, "")
         and (not content.get(issue.number) or content[issue.number] != grooming_content(issue))
     ][:max(0, limit)]
 
@@ -239,6 +241,8 @@ def triage_candidates(
         return []
     out: list[int] = []
     for issue in world.open_issues():
+        if not isinstance(issue_eligibility(issue, LifecycleOperation.TRIAGE), AllowedEligibility):
+            continue
         if not is_untriaged(issue):
             continue
         if issue.updated_at == state.seen_at.get(issue.number, ""):
@@ -284,19 +288,10 @@ def close_actions(
     verdict: TriageVerdict,
     cfg: TriageConfig,
 ) -> list[Action]:
-    """Execute a `close` verdict: mark, then say why, then close.
-
-    The relabel is FIRST so the terminal marker exists before the issue's state
-    changes; a partially-applied close then still shows an operator which issue
-    the steward was disposing of. The comment rides ON the `CloseIssue` command
-    rather than being its own `PostComment`, so the explanation and the close are
-    one durable lifecycle command with one receipt — the executor's closure
-    verifier already reconciles the comment and the state together, which a
-    separate comment action would split into two independently-retried effects.
-    """
+    """One durable disposition owns its labels, explanation and issue closure."""
     return [
-        Relabel(Target.ISSUE, issue_number, cfg.triage_label, Label.AI_CLOSED),
-        CloseIssue(issue_number, verdict.close_state, _close_body(author, verdict)),
+        CloseIssue(issue_number, verdict.close_state, _close_body(author, verdict),
+                   remove_labels=(cfg.triage_label,), add_labels=(Label.AI_CLOSED,)),
     ]
 
 

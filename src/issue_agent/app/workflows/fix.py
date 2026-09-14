@@ -51,6 +51,7 @@ from ...domain.effort import (
     escalate,
 )
 from ...domain.labels import Label
+from ...domain.lifecycle import AllowedEligibility, LifecycleOperation, issue_eligibility
 from ...domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
@@ -63,6 +64,7 @@ from ...domain.world import (
 )
 from ..mcp import mcp_servers_for_checks
 from .base import run_leg
+from .completion import execute_issue_completion
 
 
 def _discard_route_decision(
@@ -623,11 +625,33 @@ class FixWorkflow:
         self.store.save_session(issue, result.session_id)
         self._decay_infra_deaths(issue, result)
         pr = self.gateway.pr_for_issue(issue)
-        self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
         self._journal_budget_path(issue, "resolve", result.exit_reason, pr)
         if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
             self._bump_resolve_retry(issue, result)
-        self.executor.execute_all(self._resolve_actions(issue, result, pr))
+        self._complete_resolve(issue, result, pr, observed=iss)
+
+    def _complete_resolve(self, issue: int, result, pr: int | None, *, observed=None) -> bool:
+        current = self.gateway.get_issue(issue)
+        actions = self._resolve_actions(issue, result, pr)
+        if current.state != "open":
+            return self.executor.execute_all(actions)
+        if not isinstance(issue_eligibility(current, LifecycleOperation.COMPLETE_RESOLVE), AllowedEligibility):
+            self.cfg.log(f"resolve #{issue}: completion deferred; issue is held")
+            return False
+        if observed is not None and pr is None and result.status == "blocked" and not (
+            outcome.budget_exhausted(result.exit_reason) or outcome.infra_class_failure(result)
+        ) and (
+            current.title, current.body, current.author
+        ) != (observed.title, observed.body, observed.author):
+            self.cfg.log(f"resolve #{issue}: requirements changed during work; requeueing for the new facts")
+            self._bump_resolve_retry(issue, result)
+            actions = [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
+        else:
+            self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
+        return execute_issue_completion(
+            self.gateway, self.executor, current, actions,
+            LifecycleOperation.COMPLETE_RESOLVE, self.cfg.log,
+        )
 
     def _resolve_actions(self, issue: int, result, pr: int | None):
         """Retire an already-implemented issue closed without opening a PR."""
@@ -637,6 +661,11 @@ class FixWorkflow:
             closed_without_pr = (
                 refreshed is not None and refreshed.state != "open"
             )
+        if not closed_without_pr and not isinstance(
+            issue_eligibility(self.gateway.get_issue(issue), LifecycleOperation.COMPLETE_RESOLVE),
+            AllowedEligibility,
+        ):
+            return []
         return outcome.resolve_actions(
             issue,
             result,
@@ -733,11 +762,10 @@ class FixWorkflow:
             pr = self.gateway.pr_for_issue(issue)
             fu = outcome.implement_followup(impl, pr is not None)
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
-                self._record_block_state(issue, Target.ISSUE, issue, impl, pr=pr)
                 self._journal_budget_path(issue, "implement", impl.exit_reason, pr)
                 if fu is outcome.ImplementFollowup.RETRY:
                     self._bump_resolve_retry(issue, impl, "implement")
-                self.executor.execute_all(self._resolve_actions(issue, impl, pr))
+                self._complete_resolve(issue, impl, pr, observed=iss)
                 return
 
             objection = impl.needs or impl.summary or "see logs"

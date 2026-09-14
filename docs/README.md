@@ -44,6 +44,12 @@ job someone still has to do; the same file in `history/` is a record.
   and what triggers the work. **Read §1 before pointing this at a real repo.**
 - [2026-07-30-architectural-review-and-plan.md](open/2026-07-30-architectural-review-and-plan.md)
   — completed implementation record; retained here until the changes land.
+- [2026-09-14-architecture-overhaul-critique.md](open/2026-09-14-architecture-overhaul-critique.md)
+  — assessment of the 2026-09-14 external review's staged overhaul; adopts the
+  direction, lists required plan changes with code locations.
+- [2026-09-14-architecture-implementation.md](open/2026-09-14-architecture-implementation.md)
+  — six-phase implementation, protected deployment pause, acceptance status,
+  archived review and observational baseline.
 - [issues/](open/issues/) — unresolved incident write-ups awaiting
   re-validation against the current tree.
 

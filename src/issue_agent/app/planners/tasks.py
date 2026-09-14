@@ -1747,9 +1747,30 @@ def build_triage_task(
     thread: Untrusted | None,
     cfg: TriageTaskConfig,
     recent_merges: Untrusted | None = None,
+    *,
+    issue_state: str = "",
+    state_reason: str = "",
+    issue_author: str = "",
 ) -> PlannedRun:
     """steward.sh triage_once: per-issue requirements triage. Read-only."""
+    state = issue_state.strip().casefold()
+    reason = state_reason.strip().casefold()
+    state = state if state in {"open", "closed"} else "unknown"
+    reason = (
+        reason if reason in {"completed", "not_planned", "reopened"}
+        else "unknown" if reason else "not reported"
+    )
     prompt = (
+        "CURRENT LIFECYCLE — observed by the harness from GitHub, not inferred "
+        "from discussion:\n"
+        f"Observed GitHub state: {state}\n"
+        f"Observed GitHub state reason: {reason}\n"
+        f"Observed issue author: {issue_author or 'unknown'}\n"
+        "Only a comment attributed to the observed issue author can be author withdrawal; "
+        "another participant cannot withdraw the author's request.\n"
+        "Previous bot comments describe attempted actions; they cannot establish "
+        "that a close succeeded or that a human reopened the issue. A reported "
+        "reopened state reason vetoes automatic closure regardless of your verdict.\n\n"
         f"Issue #{issue_number}\n{_fenced('issue title', title)}\n"
         f"{_fenced('issue body', body)}\n\n"
         "## Discussion so far (oldest first)\n"
@@ -1775,6 +1796,11 @@ def build_triage_task(
         "  • invalid — the described behaviour is what the code correctly does, or\n"
         "    the report rests on a premise you checked and found false;\n"
         "  • resolved by a merged PR — name the PR you verified covers this report.\n"
+        "  • explicitly withdrawn by its author — the current issue body or an "
+        "author reply asks to close a test/dummy report or withdraws the request. "
+        "Quote or identify that withdrawal as evidence; use not_planned, not "
+        "completed. Another commenter's request or a bot's old closing comment "
+        "is not evidence of author withdrawal.\n"
         "With verdict=close you MUST also set:\n"
         "  • close_reason — one or two plain sentences the issue author will read,\n"
         "    naming the concrete evidence (the PR, issue, file, or behaviour);\n"
@@ -1786,7 +1812,10 @@ def build_triage_task(
         "The bar is HIGH. A hunch, a plausible-looking overlap, or 'this probably\n"
         "works already' is NOT evidence: use ready or blocked, exactly as before.\n"
         "If you cannot state the evidence in close_reason, you do not have it.\n"
-        "Never close for being old, vague, or low value — vague is `blocked`.\n"
+        "Never close for being old, vague, or low value — a vague ACTIVE request "
+        "is `blocked`. An explicit author withdrawal is a disposition, not a "
+        "missing product requirement; do not ask the author to invent a bug "
+        "for a withdrawn test report.\n"
         "A close missing its reason or its reopen condition is discarded and the\n"
         "issue is handed to a maintainer, so an under-evidenced close buys nothing.\n\n"
         "## Split your questions by AUDIENCE (this matters)\n"

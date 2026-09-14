@@ -33,6 +33,15 @@ from .self_clear import BudgetBlock, MachineBlock
 T = TypeVar("T")
 
 
+class WorkflowControlError(ValueError):
+    """A present control record is unreadable or invalid, not an unused allowance."""
+
+    def __init__(self, path: str, reason: str):
+        self.path = path
+        self.reason = reason
+        super().__init__(f"Workflow control unavailable at {path}: {reason}")
+
+
 @runtime_checkable
 class GitHubReads(Protocol):
     """Authoritative GitHub observations; transport failure raises."""
@@ -84,8 +93,10 @@ class WorkflowState(Protocol):
     """Durable workflow state.
 
     Missing scalar values use their documented empty/zero value. Read,
-    corruption, and write failures propagate and fail the current workflow;
-    callers never treat them as an absent marker.
+    corruption, and write failures for eligibility/continuation controls
+    propagate and fail the affected workflow; callers never treat them as an
+    absent marker. CI history, predicted paths, last-error summaries, operator
+    guidance and Jira mirrors are advisory and may return empty fallbacks.
     """
 
     def get_branch(self, issue: int) -> str: ...

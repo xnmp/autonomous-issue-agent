@@ -692,7 +692,7 @@ def test_rebase_retries_round_trip_trips_the_breaker(tmp_path):
 
 
 # ── review-retry (PR-keyed via closing_issue; (at, count) tuple) ──────────────
-def _review_pr(issue, submitted_at="T1"):
+def _review_pr(issue, submitted_at="2026-01-01T00:00:01Z"):
     return PRView(
         300, head_ref_name="fix/7-z", closing_issue=issue,
         reviews=(Review(state=REVIEW_CHANGES_REQUESTED, author="human1", submitted_at=submitted_at),),
@@ -716,12 +716,12 @@ def test_review_retry_round_trip_trips_the_breaker(tmp_path):
         return WorldState(prs=(_review_pr(issue),))
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, pr)))
-    assert store.get_review_retry(issue) == ("T1", 1)
+    assert store.get_review_retry(issue) == ("2026-01-01T00:00:01Z", 1)
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert _has_run(actions, AgentKind.ADDRESS_REVIEW)
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, pr)))
-    assert store.get_review_retry(issue) == ("T1", 2)
+    assert store.get_review_retry(issue) == ("2026-01-01T00:00:01Z", 2)
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert not _has_run(actions, AgentKind.ADDRESS_REVIEW)
     assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
@@ -1164,6 +1164,13 @@ def _steward_decide(
 
 def _triaged(number=30):
     return WorldState(issues=(IssueView(number, title="t", body="b", updated_at="T1"),))
+
+
+def test_corrupt_steward_counter_holds_only_its_issue(tmp_path, monkeypatch):
+    decide, store = _steward_decide(tmp_path, monkeypatch)
+    (tmp_path / "issue-30.steward-stalls-triage").write_text("oops")
+    world = WorldState(issues=(_triaged(30).issues[0], _triaged(31).issues[0]))
+    assert decide(world) == [RunAgent(AgentKind.TRIAGE, 31)]
 
 
 def test_the_steward_stops_dispatching_for_an_issue_whose_sessions_keep_dying(

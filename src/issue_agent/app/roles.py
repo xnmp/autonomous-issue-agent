@@ -141,6 +141,7 @@ from ..domain.events import (
     TelemetryWarning,
 )
 from ..domain.ports import (
+    WorkflowControlError,
     CiPendingState,
     CommandRecovery,
     EventSink,
@@ -1801,6 +1802,14 @@ def _collect_test_exemptions(
     return facts
 
 
+def _control_value(errors, key, reader, default, *, error_key=None):
+    try:
+        return reader(key)
+    except WorkflowControlError as exc:
+        errors[key if error_key is None else error_key] = str(exc)
+        return default
+
+
 def _fix_state(
     store: Store,
     world,
@@ -1809,22 +1818,27 @@ def _fix_state(
     test_exemptions: dict[int, "ExemptionFacts"] | None = None,
 ) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
-    sessions = frozenset(i.number for i in world.issues if store.has_session(i.number))
-    resumed = {i.number: store.get_resumed_at(i.number) for i in world.issues}
-    pr_resumed = {p.number: store.get_pr_resumed_at(p.number) for p in world.prs}
-    automerge = frozenset(p.number for p in world.prs if store.automerge_enabled(p.number))
+    errors: dict[int, str] = {}
+
+    def read(key, reader, default, *, error_key=None):
+        return _control_value(errors, key, reader, default, error_key=error_key)
+
+    sessions = frozenset(i.number for i in world.issues if read(i.number, store.has_session, False))
+    resumed = {i.number: read(i.number, store.get_resumed_at, "") for i in world.issues}
+    pr_resumed = {p.number: read(p.number, store.get_pr_resumed_at, "", error_key=breaker_key(p)) for p in world.prs}
+    automerge = frozenset(p.number for p in world.prs if read(p.number, store.automerge_enabled, False, error_key=breaker_key(p)))
     # Retry counters are keyed by breaker_key(pr): the linked issue number, or the
     # NEGATED PR number when a PR has no resolvable issue (Jira-keyed branch, no
     # closing-ref). Must match the workflow's increment key exactly, else the
     # breaker reads 0 forever and the retry loop never escalates (was PR #112).
     keys = {breaker_key(p) for p in world.prs}
-    ci_retries = {k: store.get_ci_retries(k) for k in keys}
+    ci_retries = {k: read(k, store.get_ci_retries, 0) for k in keys}
     # Full (review_at, count) tuple: the domain compares the stored timestamp
     # against the CURRENT review's submitted_at so a superseding review reads
     # as count 0 (see FixState.review_retries).
-    review_retries = {k: store.get_review_retry(k) for k in keys}
-    rebase_retries = {k: store.get_rebase_retries(k) for k in keys}
-    resolve_retries = {i.number: store.get_resolve_retries(i.number) for i in world.issues}
+    review_retries = {k: read(k, store.get_review_retry, ("", 0)) for k in keys}
+    rebase_retries = {k: read(k, store.get_rebase_retries, 0) for k in keys}
+    resolve_retries = {i.number: read(i.number, store.get_resolve_retries, 0) for i in world.issues}
     last_resolve_error = {
         i.number: err
         for i in world.issues
@@ -1852,31 +1866,31 @@ def _fix_state(
     def _infra_for_pr(p) -> int:
         k = breaker_key(p)
         alt = -p.number
-        total = store.get_infra_deaths(k) + deaths.get(k, 0)
+        total = read(k, store.get_infra_deaths, 0) + deaths.get(k, 0)
         if alt != k:
-            total += store.get_infra_deaths(alt) + deaths.get(alt, 0)
+            total += read(alt, store.get_infra_deaths, 0, error_key=k) + deaths.get(alt, 0)
         return total
 
     infra_deaths = {breaker_key(p): _infra_for_pr(p) for p in world.prs}
     for i in world.issues:
         infra_deaths.setdefault(
-            i.number, store.get_infra_deaths(i.number) + deaths.get(i.number, 0)
+            i.number, read(i.number, store.get_infra_deaths, 0) + deaths.get(i.number, 0)
         )
     # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
-    ci_rerun_head = {p.number: store.get_ci_rerun_head(p.number) for p in world.prs}
+    ci_rerun_head = {p.number: read(p.number, store.get_ci_rerun_head, "", error_key=breaker_key(p)) for p in world.prs}
     # keifu PR #177: the head whose wedged runs were already sent a cancel, so
     # the deadline waits for GitHub instead of re-cancelling every poll.
-    ci_cancel_head = {p.number: store.get_ci_cancel_head(p.number) for p in world.prs}
+    ci_cancel_head = {p.number: read(p.number, store.get_ci_cancel_head, "", error_key=breaker_key(p)) for p in world.prs}
     update_branch_head = {
-        p.number: store.get_update_branch_head(p.number) for p in world.prs
+        p.number: read(p.number, store.get_update_branch_head, "", error_key=breaker_key(p)) for p in world.prs
     }
     ci_pending_escalated = frozenset(
         (p.number, head)
         for p in world.prs
         if isinstance(store, CiPendingState)
-        and (head := store.get_ci_pending_escalated_head(p.number))
+        and (head := read(p.number, store.get_ci_pending_escalated_head, "", error_key=breaker_key(p)))
     )
     issue_keys = {
         *[i.number for i in world.issues],
@@ -1885,20 +1899,21 @@ def _fix_state(
     machine_blocks = {
         issue: block
         for issue in issue_keys
-        if (block := store.get_machine_block(issue)) is not None
+        if (block := read(issue, store.get_machine_block, None)) is not None
     }
     budget_blocks = {
         issue: block
         for issue in issue_keys
-        if (block := store.get_budget_block(issue)) is not None
+        if (block := read(issue, store.get_budget_block, None)) is not None
     }
     self_clear_counts = {
-        issue: store.get_self_clear_count(issue) for issue in issue_keys
+        issue: read(issue, store.get_self_clear_count, 0) for issue in issue_keys
     }
     self_clear_ceiling_reported = frozenset(
-        issue for issue in issue_keys if store.self_clear_ceiling_reported(issue)
+        issue for issue in issue_keys if read(issue, store.self_clear_ceiling_reported, False)
     )
     return FixState(
+        control_errors=errors,
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
         automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
@@ -2702,6 +2717,8 @@ def build_fix_daemon(
                 gateway, world, fix_cfg, fix_cfg.review_bot, _log("fix")
             ),
         )
+        for target, reason in state.control_errors.items():
+            _log("fix")(f"workflow {target} held: {reason}")
         budget_blocks, budget_worlds = _budget_self_clear_worlds(
             control, cfg, world, state.budget_blocks
         )
@@ -2839,18 +2856,20 @@ def _review_state(
     closing-link change cannot erase a paid round. The current issue key is
     included only to migrate counters written before that policy. For an
     issueless PR both keys coincide and the set deduplicates them."""
-    sessions = frozenset(p.number for p in world.prs if store.get_pr_session(p.number))
-    last = {p.number: store.get_last_sha(p.number) for p in world.prs}
+    errors: dict[int, str] = {}
+    sessions = frozenset(p.number for p in world.prs if _control_value(errors, p.number, store.get_pr_session, ""))
+    last = {p.number: _control_value(errors, p.number, store.get_last_sha, "") for p in world.prs}
     deaths = process_deaths or {}
     unproductive = {
         p.number: sum(
-            store.get_infra_deaths(k) + deaths.get(k, 0)
+            _control_value(errors, k, store.get_infra_deaths, 0, error_key=p.number) + deaths.get(k, 0)
             for k in {breaker_key(p), -p.number}
         )
         for p in world.prs
     }
     return ReviewState(
-        sessions=sessions, last_sha=last, unproductive_rounds=unproductive
+        sessions=sessions, last_sha=last, unproductive_rounds=unproductive,
+        control_errors=errors,
     )
 
 
@@ -3126,15 +3145,12 @@ def build_review_daemon(
     )
 
     def decide(world):
-        actions = decide_review(
-            world,
-            rcfg,
-            _review_state(
-                store,
-                world,
-                control.abandoned_dispatch_counts(owner_id),
-            ),
+        state = _review_state(
+            store, world, control.abandoned_dispatch_counts(owner_id)
         )
+        for target, reason in state.control_errors.items():
+            _log("review")(f"PR #{target} held: {reason}")
+        actions = decide_review(world, rcfg, state)
         plan = hold_review_dispatch(
             actions,
             _fix_holds(control, cfg.repo, world, datetime.now(timezone.utc)),
@@ -3447,11 +3463,22 @@ def build_steward_daemon(
         # tick has still recorded what came back. The steward is probe-gated, so
         # this only runs on a genuinely fresh world.
         report_recurrences(world)
-        state = TriageState(seen_at={i.number: store.get_triage_at(i.number) for i in world.issues})
+        errors: dict[int, str] = {}
+        seen = {i.number: _control_value(errors, i.number, store.get_triage_at, "") for i in world.issues}
+        groom_seen = {i.number: _control_value(errors, i.number, store.get_groom_at, "") for i in world.issues}
+        groom_content = {i.number: _control_value(errors, i.number, store.get_groom_content, "") for i in world.issues}
+        infra = {i.number: _control_value(errors, i.number, store.get_infra_deaths, 0) for i in world.issues}
+        for i in world.issues:
+            for leg in ("triage", "groom"):
+                _control_value(errors, i.number, lambda n: store.get_steward_stalls(n, leg), 0)
+        for target, reason in errors.items():
+            steward_log(f"issue #{target} held: {reason}")
+        world = replace(world, issues=tuple(i for i in world.issues if i.number not in errors))
+        state = TriageState(seen_at=seen)
         deaths = control.abandoned_dispatch_counts(owner_id)
 
         def exhausted(n: int) -> bool:
-            spent = store.get_infra_deaths(n) + deaths.get(n, 0)
+            spent = infra.get(n, 0) + deaths.get(n, 0)
             return retry_breaker(spent, max_deaths).tripped
 
         actions = [
@@ -3466,9 +3493,9 @@ def build_steward_daemon(
             RunAgent(AgentKind.GROOM, n)
             for n in grooming_candidates(
                 world,
-                {i.number: store.get_groom_at(i.number) for i in world.issues},
+                groom_seen,
                 groom_enabled,
-                {i.number: store.get_groom_content(i.number) for i in world.issues},
+                groom_content,
             )
             if not exhausted(n)
         )

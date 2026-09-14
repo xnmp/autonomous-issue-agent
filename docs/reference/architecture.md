@@ -451,6 +451,9 @@ module requires placing it in the appropriate tier and explaining it here.
 was red, so attempt N can see the pattern across attempts 1..N-1 instead of
 re-diagnosing one tick's failure blind),
 `domain/contracts.py`, `domain/dashboard.py`, `domain/effect_retry.py`,
+`domain/eligibility.py`
+(action-specific allowed/held/invalid results and immutable completion facts;
+shared by lifecycle policy and durable action payloads without an import cycle),
 `domain/effort.py`, `domain/environment.py`
 (the harness-attested capability manifest: what the boot probe saw, and the
 narrow conditions under which it may state a verdict rather than facts),
@@ -505,6 +508,8 @@ adapters live under `adapters/dashweb/`.
 `app/world_probe.py`, and `app/world_reporter.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid
 workflow sequencing and the single `run_leg` path are in `app/workflows/`;
+its shared completion helper revalidates current facts between confirmed
+effects, while the durable executor retains those facts across command retries;
 the web composition/read-model boundary is in `app/dashweb/`.
 
 ## Where the detail lives

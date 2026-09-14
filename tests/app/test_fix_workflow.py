@@ -102,6 +102,25 @@ def test_resolve_blocked_comments_and_blocks_issue():
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
 
 
+def test_resolve_plan_comment_preserves_valid_clarification_without_retry():
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
+    store = FakeStore()
+
+    class PlanPostingRunner(FakeRunner):
+        async def run(self, task):
+            result = await super().run(task)
+            gw.comment("issue", 5, "Acceptance criteria audit and Test Plan: preserve existing API behavior.")
+            return result
+
+    runner = PlanPostingRunner(AgentResult(is_error=False, status="blocked", needs="which API?"))
+    asyncio.run(_workflow(gw, store, runner).resolve(5))
+
+    assert any(c[0] == "comment" and "which API?" in c[3] for c in gw.calls)
+    assert Label.AI_BLOCKED in gw.issues[5].labels
+    assert Label.AI_READY not in gw.issues[5].labels
+    assert store.get_resolve_retries(5) == 0
+
+
 def test_resolve_closed_without_a_pr_retires_the_issue_worktree_and_state():
     gw = FakeGateway(
         issues={5: IssueView(5, title="t", body="b", state="closed")},
@@ -947,7 +966,7 @@ class LegacyGateway(FakeGateway):
 
 def _review_pr():
     return PRView(100, head_ref_name="fix/5-x", closing_issue=5,
-                  reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+                  reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
 
 
 _PUSHED = AgentResult(is_error=False, status="pushed", session_id="s")
@@ -1077,7 +1096,7 @@ def test_address_review_error_does_not_touch_the_infra_ceiling(tmp_path):
     asyncio.run(_workflow(gw, store, runner).address_review(100))
 
     assert store.get_infra_deaths(5) == 0
-    assert store.get_review_retry(5) == ("t9", 1)
+    assert store.get_review_retry(5) == ("2026-01-01T00:00:09Z", 1)
 
 
 def _resume_issue():

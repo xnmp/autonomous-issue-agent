@@ -4,6 +4,7 @@ import inspect
 import os
 import re
 import tempfile
+import pytest
 
 from issue_agent.adapters import store as store_module
 from issue_agent.adapters.store import HarnessMarkers, Store
@@ -41,10 +42,10 @@ def test_empty_session_not_written():
 
 def test_resumed_at_and_resumes_counter():
     s, _ = _store()
-    s.set_resumed_at(5, "t2")
-    assert s.get_resumed_at(5) == "t2"
-    s.set_pr_resumed_at(100, "t3")
-    assert s.get_pr_resumed_at(100) == "t3"
+    s.set_resumed_at(5, "2026-01-01T00:00:02Z")
+    assert s.get_resumed_at(5) == "2026-01-01T00:00:02Z"
+    s.set_pr_resumed_at(100, "2026-01-01T00:00:03Z")
+    assert s.get_pr_resumed_at(100) == "2026-01-01T00:00:03Z"
     assert s.bump_resumes(5) == 1
     assert s.bump_resumes(5) == 2
 
@@ -144,7 +145,7 @@ def test_a_requeued_issue_does_not_inherit_the_dead_prs_attempt_history():
     assert s.get_ci_history(9) == ()
 
 
-def test_malformed_numeric_state_fails_soft_to_defaults():
+def test_malformed_numeric_state_blocks_reads_and_increments():
     s, root = _store()
     for path in (
         s.issue_path(5, "resumes"),
@@ -156,13 +157,13 @@ def test_malformed_numeric_state_fails_soft_to_defaults():
         with open(path, "w") as f:
             f.write("not-an-int")
 
-    assert s.get_ci_retries(5) == 0
-    assert s.get_rebase_retries(5) == 0
-    assert s.get_review_retry(5) == ("", 0)
-    assert s.get_round(100) == 1
-    assert s.bump_resumes(5) == 1
+    for read in (lambda: s.get_ci_retries(5), lambda: s.get_rebase_retries(5),
+                 lambda: s.get_review_retry(5), lambda: s.get_round(100),
+                 lambda: s.bump_resumes(5)):
+        with pytest.raises(ValueError, match="control unavailable"):
+            read()
     with open(os.path.join(root, "issue-5.resumes")) as f:
-        assert f.read() == "1"
+        assert f.read() == "not-an-int"
 
 
 # review M3/T2: the old `test_write_is_atomic_and_leaves_no_tmp_file` above

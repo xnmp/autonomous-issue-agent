@@ -22,6 +22,7 @@ import subprocess
 from dataclasses import dataclass
 
 from ..domain.agent_task import RuntimeName
+from ..domain.ci import parse_timestamp
 from ..domain.ci_history import (
     CiAttempt,
     append_attempt,
@@ -30,6 +31,7 @@ from ..domain.ci_history import (
 )
 from ..domain.world import normalize_predicted_paths
 from ..domain.actions import Target
+from ..domain.ports import WorkflowControlError
 from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
@@ -127,14 +129,41 @@ class Store:
     # ids and counters, but operator guidance is free text an operator typed,
     # and a daemon started under a C/POSIX locale would otherwise fail to write
     # (or mis-read) the same file a UTF-8 shell wrote. `errors="replace"` on the
-    # read side keeps a byte-damaged file readable — a mangled note is still
-    # better than a state file that raises on every tick.
+    # advisory reads preserve byte-damaged notes. Control records use strict
+    # decoding so a damaged marker cannot grant a fresh attempt.
     def _read(self, path: str) -> str:
+        advisory = path.rsplit(".", 1)[-1] in {
+            "ci-history", "operator-guidance", "jira", "jira-phase",
+            "predicted-paths", "last-error", "stall-sig",
+        }
+        if not advisory:
+            raw = self._read_control(path)
+            if raw == "" and path.rsplit(".", 1)[-1] in {
+                "session", "last-sha", "patch-id", "resumed-at", "at", "content",
+                "ci-rerun-head", "ci-cancel-head", "update-branch-head",
+                "ci-pending-escalated-head", "self-clear-ceiling",
+            }:
+                raise WorkflowControlError(path, "empty control record; repair or explicitly remove it")
+            return raw or ""
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 return f.read().strip()
         except (FileNotFoundError, OSError):
             return ""
+
+    def _read_control(self, path: str) -> str | None:
+        try:
+            with open(path, encoding="utf-8") as stream:
+                # Control files hold scalar markers or small typed records;
+                # advisory prose has a separate read contract.
+                raw = stream.read(65537)
+                if len(raw) > 65536:
+                    raise WorkflowControlError(path, "control record exceeds 65536-character limit")
+                return raw.strip()
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError) as exc:
+            raise WorkflowControlError(path, f"unreadable control record: {exc}") from exc
 
     def _write(self, path: str, value: str) -> None:
         # review M3: pid-suffix the tmp name — two daemons sharing a STATE_DIR
@@ -156,24 +185,39 @@ class Store:
     def _remove(self, path: str) -> None:
         try:
             os.remove(path)
-        except (FileNotFoundError, OSError):
+        except FileNotFoundError:
             pass
+        except OSError as exc:
+            raise WorkflowControlError(path, f"control record removal failed: {exc}") from exc
 
     def _read_int(self, path: str, default: int = 0) -> int:
-        # review M3: an empty/zero-length file reads back as `default` here —
-        # the one counter this bites is resolve-retries, whose entire purpose
-        # is stopping an infinite loop. Before the fsync above, a power loss
-        # mid-write could leave exactly this (a torn, zero-length file) and
-        # silently reset a tripped breaker to a full budget; fsync narrows the
-        # crash window to "before os.replace", where the OLD value still reads
-        # back intact instead.
-        raw = self._read(path)
-        if not raw:
+        raw = self._read_control(path)
+        if raw is None:
             return default
-        try:
-            return int(raw)
-        except ValueError:
-            return default
+        return self._counter(raw, path)
+
+    @staticmethod
+    def _counter(raw: str, path: str) -> int:
+        if not raw.isascii() or not raw.isdecimal() or len(raw) > 19:
+            raise WorkflowControlError(path, "malformed nonnegative counter; repair the record")
+        value = int(raw)
+        if value > 2**63 - 1:
+            raise WorkflowControlError(path, "counter exceeds the supported integer range")
+        return value
+
+    def _read_timestamp(self, path: str) -> str:
+        raw = self._read_control(path)
+        if raw is None:
+            return ""
+        if parse_timestamp(raw) is None:
+            raise WorkflowControlError(path, "malformed consumed-reply timestamp")
+        return raw
+
+    @staticmethod
+    def _integer(value: object, path: str, *, signed: bool = False) -> int:
+        if type(value) is not int or not (-(2**63) if signed else 0) <= value < 2**63:
+            raise WorkflowControlError(path, "malformed integer in structured control record")
+        return value
 
     def get_branch(self, issue: int) -> str:
         return self._read(self.issue_path(issue, "branch"))
@@ -255,13 +299,13 @@ class Store:
 
     # ── resume reply mark + counter ──
     def get_resumed_at(self, issue: int) -> str:
-        return self._read(self.issue_path(issue, "resumed-at"))
+        return self._read_timestamp(self.issue_path(issue, "resumed-at"))
 
     def set_resumed_at(self, issue: int, at: str) -> None:
         self._write(self.issue_path(issue, "resumed-at"), at)
 
     def get_pr_resumed_at(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "resumed-at"))
+        return self._read_timestamp(self.pr_path(pr, "resumed-at"))
 
     def set_pr_resumed_at(self, pr: int, at: str) -> None:
         self._write(self.pr_path(pr, "resumed-at"), at)
@@ -351,21 +395,22 @@ class Store:
             self._write(self.issue_path(issue, "last-error"), line)
 
     def get_machine_block(self, issue: int) -> MachineBlock | None:
-        raw = self._read(self.issue_path(issue, "machine-block"))
-        if not raw:
+        path = self.issue_path(issue, "machine-block")
+        raw = self._read_control(path)
+        if raw is None:
             return None
         try:
             value = json.loads(raw)
             return MachineBlock(
                 issue=issue,
                 target=Target[str(value["target"])],
-                number=int(value["number"]),
-                pr=int(value["pr"]),
+                number=self._integer(value["number"], path),
+                pr=self._integer(value["pr"], path),
                 blocker=MachineBlocker(str(value["blocker"])),
                 blocked_head=str(value["blocked_head"]),
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WorkflowControlError(path, "malformed machine block") from exc
 
     def set_machine_block(self, block: MachineBlock) -> None:
         self._write(
@@ -387,8 +432,9 @@ class Store:
         self._remove(self.issue_path(issue, "machine-block"))
 
     def get_budget_block(self, issue: int) -> BudgetBlock | None:
-        raw = self._read(self.issue_path(issue, "budget-block"))
-        if not raw:
+        path = self.issue_path(issue, "budget-block")
+        raw = self._read_control(path)
+        if raw is None:
             return None
         try:
             value = json.loads(raw)
@@ -396,15 +442,15 @@ class Store:
             return BudgetBlock(
                 issue=issue,
                 target=Target[str(value["target"])],
-                number=int(value["number"]),
-                reservation_micros=int(value["reservation_micros"]),
+                number=self._integer(value["number"], path),
+                reservation_micros=self._integer(value["reservation_micros"], path),
                 scope=str(value["scope"]),
-                cap_micros=int(value["cap_micros"]),
-                old_headroom_micros=None if old is None else int(old),
+                cap_micros=self._integer(value["cap_micros"], path),
+                old_headroom_micros=None if old is None else self._integer(old, path, signed=True),
                 currency=str(value.get("currency", "USD")),
             )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
-            return None
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+            raise WorkflowControlError(path, "malformed budget block") from exc
 
     def set_budget_block(self, block: BudgetBlock) -> None:
         self._write(
@@ -498,14 +544,14 @@ class Store:
 
     def get_review_retry(self, issue: int) -> tuple[str, int]:
         """(review_at, count). Bash stored "<at> <n>" in issue-N.review-retries."""
-        raw = self._read(self.issue_path(issue, "review-retries"))
-        if not raw:
+        path = self.issue_path(issue, "review-retries")
+        raw = self._read_control(path)
+        if raw is None:
             return "", 0
         at, _, n = raw.rpartition(" ")
-        try:
-            return at, int(n or "0")
-        except ValueError:
-            return "", 0
+        if at and parse_timestamp(at) is None:
+            raise WorkflowControlError(path, "malformed review episode timestamp")
+        return at, self._counter(n, path)
 
     def set_review_retry(
         self, issue: int, at: str, retries: int
@@ -674,7 +720,7 @@ class Store:
 
     # ── automerge marker ──
     def automerge_enabled(self, pr: int) -> bool:
-        return os.path.exists(self.pr_path(pr, "automerge"))
+        return self._read_control(self.pr_path(pr, "automerge")) is not None
 
     def mark_automerge(self, pr: int) -> None:
         self._write(self.pr_path(pr, "automerge"), "")

@@ -1,0 +1,237 @@
+{
+  "schema_version": 1,
+  "purpose": "Pre-overhaul observational baseline, not a completed or comparable unattended cohort.",
+  "captured_at": "2026-09-14T03:03:28Z",
+  "repository": "xnmp/tauri-explorer",
+  "harness_baseline": "4c365a8",
+  "window": {
+    "started_at": "2026-09-13T23:00:00Z",
+    "ended_at": "2026-09-14T03:03:28Z",
+    "selection": "Runs started within this window for owner_id xnmp/tauri-explorer:%; open/inherited work is retained. Queries were captured shortly before ended_at; no live paid admission remained."
+  },
+  "profile": {
+    "os": "Linux",
+    "kernel": "7.1.5-arch1-2",
+    "architecture": "x86_64",
+    "base_branch": "dev",
+    "runtime": "codex",
+    "default_implementer": "gpt-5.6-sol",
+    "exceptional_implementers_by_runtime": {
+      "codex": "gpt-6-astra",
+      "claude": "fable"
+    },
+    "evidence_stack": "webkitgtk",
+    "test_command": "set -e; bunx vitest run && (cd src-tauri && cargo test --quiet)",
+    "posture": "trusted inbound only",
+    "unsupported_local_qualification": [
+      "interactive macOS startup half-bounce (#696)",
+      "Windows-only behavior"
+    ],
+    "activation": "paused: fix/review/steward/dashboard stopped and autostart disabled"
+  },
+  "exposure": {
+    "settled_paid_legs": 69,
+    "admitted_workflows": null,
+    "admitted_workflows_reason": "Paid legs are not distinct admitted workflows. No stable workflow-generation denominator was reconstructed for this mixed inherited/new cohort.",
+    "active_runs": 0,
+    "registered_leases": 0,
+    "open_issues": 15,
+    "open_pull_requests": 7,
+    "outstanding_commands": [
+      {
+        "kind": "publish_branch",
+        "state": "retryable_failure",
+        "count": 1
+      }
+    ],
+    "parked_and_blocked": "Included in open inventory, not silently excluded."
+  },
+  "spend": {
+    "currency": "USD",
+    "basis": "configured_rate_card",
+    "amount_micros": 76406584,
+    "by_leg": [
+      {
+        "leg": "ADDRESS_REVIEW",
+        "count": 6,
+        "amount_micros": 20054149
+      },
+      {
+        "leg": "FIX_CI",
+        "count": 4,
+        "amount_micros": 7381772
+      },
+      {
+        "leg": "GROOM",
+        "count": 6,
+        "amount_micros": 1181720
+      },
+      {
+        "leg": "REBASE",
+        "count": 1,
+        "amount_micros": 2784823
+      },
+      {
+        "leg": "RESOLVE",
+        "count": 8,
+        "amount_micros": 34774396
+      },
+      {
+        "leg": "REVIEW",
+        "count": 4,
+        "amount_micros": 2152837
+      },
+      {
+        "leg": "RE_REVIEW",
+        "count": 10,
+        "amount_micros": 4683509
+      },
+      {
+        "leg": "ROUTE",
+        "count": 15,
+        "amount_micros": 251551
+      },
+      {
+        "leg": "TRIAGE",
+        "count": 15,
+        "amount_micros": 3141827
+      }
+    ],
+    "cost_per_merge": null,
+    "cost_per_merge_reason": "Window spend includes ongoing/unmerged work and inherited PRs; do not present it as comparable cohort cost."
+  },
+  "outcomes": {
+    "merged_pull_requests": [
+      {
+        "number": 724,
+        "merged_at": "2026-09-14T01:59:33Z"
+      },
+      {
+        "number": 726,
+        "merged_at": "2026-09-14T02:25:43Z"
+      }
+    ],
+    "first_pass_approval_rate": null,
+    "recurrence_rate": null,
+    "operator_minutes": null,
+    "operator_interruptions": null,
+    "unknown_reason": "Not measured completely; missing observations are not zero."
+  },
+  "incidents": [
+    {
+      "family_id": "launcher-exit-propagation",
+      "kind": "escaped",
+      "classification": "systemic",
+      "severity": "high",
+      "affected_workflow": "deployment startup",
+      "evidence": "Foreground canary returned zero after watchers failed at boot; docs/field-verification.md.",
+      "harness_issue": 194,
+      "fixed_by": "eaa1cc5",
+      "live_fix_verification": "pending"
+    },
+    {
+      "family_id": "branch-publication-identity",
+      "kind": "escaped",
+      "classification": "systemic",
+      "severity": "high",
+      "affected_workflow": "issue:703",
+      "evidence": "Retained test/703 branch did not match publication authority; eventual PR #724 merged.",
+      "harness_issue": 195,
+      "fixed_by": "d26e935",
+      "live_fix_verification": "partial: merge observed; field-ledger event audit still pending"
+    },
+    {
+      "family_id": "routine-decision-ownership",
+      "kind": "escaped",
+      "classification": "mixed",
+      "severity": "medium",
+      "affected_workflow": "triage backlog",
+      "evidence": "Routine implementation decisions escalated to owner; shared prompt ownership updated.",
+      "harness_issue": 196,
+      "fixed_by": "d26e935",
+      "live_fix_verification": "pending"
+    },
+    {
+      "family_id": "repair-context-revision",
+      "kind": "escaped",
+      "classification": "systemic",
+      "severity": "high",
+      "affected_workflow": "issue:678/pr:679",
+      "evidence": "Repair repeated already-consumed rerun request without current scope/log context; shared context and pinned CI log path introduced.",
+      "harness_issue": 197,
+      "fixed_by": "4c365a8",
+      "live_fix_verification": "pending"
+    },
+    {
+      "family_id": "triage-observation-authority",
+      "kind": "escaped",
+      "classification": "mixed",
+      "severity": "medium",
+      "affected_workflow": "issue:594",
+      "evidence": "Old failed-close comment confused actual open lifecycle and explicit author withdrawal.",
+      "harness_issue": 198,
+      "fixed_by": null,
+      "live_fix_verification": "pending"
+    },
+    {
+      "family_id": "issue-attachment-observation",
+      "kind": "escaped",
+      "classification": "mixed",
+      "severity": "medium",
+      "affected_workflow": "issue:723",
+      "evidence": "Browser cache miss prompted transcription request; bounded direct download succeeded and image was inspected.",
+      "harness_issue": null,
+      "fixed_by": null,
+      "live_fix_verification": "not implemented"
+    },
+    {
+      "family_id": "held-target-dispatch",
+      "kind": "audit",
+      "classification": "systemic",
+      "severity": "high",
+      "affected_workflow": "controlled issue/PR reproductions",
+      "evidence": "Architecture report repro_lifecycle.py; regression matrix reproduced on current tree.",
+      "harness_issue": null,
+      "fixed_by": null,
+      "live_fix_verification": "not a claimed live incident"
+    },
+    {
+      "family_id": "corrupt-control-default-allowance",
+      "kind": "audit",
+      "classification": "systemic",
+      "severity": "high",
+      "affected_workflow": "controlled resolve reproduction",
+      "evidence": "Architecture report repro_corrupt_counter.py; operational frequency unknown.",
+      "harness_issue": null,
+      "fixed_by": null,
+      "live_fix_verification": "not a claimed live incident"
+    },
+    {
+      "family_id": "stale-completion-disposition",
+      "kind": "audit",
+      "classification": "systemic",
+      "severity": "high",
+      "affected_workflow": "controlled resolve/triage reproductions",
+      "evidence": "Architecture report repro_stale_completion.py and repro_stale_triage_close.py.",
+      "harness_issue": null,
+      "fixed_by": null,
+      "live_fix_verification": "not a claimed live incident"
+    }
+  ],
+  "intervention_categories": {
+    "mechanical_and_diagnosis": "Launcher/service recovery, branch/worktree investigation, repair-context reconstruction, and image transcription occurred; complete action count and operator duration were not captured.",
+    "product_policy_decisions": [
+      "Keep #696 blocked pending interactive Mac",
+      "Add #523 branch-status badges",
+      "Allow #514 Gravatar only as explicit opt-in",
+      "Clarify #722 as image pasted from another app"
+    ],
+    "administrative_pause": "User explicitly paused supervised work for architecture changes; not an unattended failure."
+  },
+  "source_contract": {
+    "accounting": "Read-only SQLite runs JOIN charges with target owner and window predicates; leases and outstanding lifecycle commands queried separately.",
+    "remote": "Read-only GitHub open issue/PR inventory and merged PR timestamps.",
+    "incidents": "Conversation observations, harness issues #194–#198, field-verification ledger and architecture controlled reproductions. Catalog is a lower bound, not exhaustive.",
+    "redaction": "No credentials, session IDs, private commit bodies, or raw prompts included."
+  }
+}
