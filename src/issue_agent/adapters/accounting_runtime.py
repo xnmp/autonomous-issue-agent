@@ -84,6 +84,7 @@ class AccountingRuntime(AgentRuntime):
     approved_base_branch: str = "dev"
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
+    max_contract_rounds: int | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, WorkflowBinding | None]
     ] = field(
@@ -277,6 +278,7 @@ class AccountingRuntime(AgentRuntime):
                 "role": self.role,
                 "kind": kind or "unknown",
                 "leg_id": _leg_id or str(run_id),
+                "runtime": self.runtime_name,
                 "number": number,
                 "issue": issue,
                 "breaker_key": retry_key,
@@ -313,6 +315,7 @@ class AccountingRuntime(AgentRuntime):
             kind or "paid",
             self.owner_id or f"{self.repository}:{self.role}",
             workflow=workflow,
+            adjudication_ceiling=self.max_contract_rounds if workflow is not None and kind == "ADJUDICATE" else None,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:

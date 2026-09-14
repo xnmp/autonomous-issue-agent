@@ -37,8 +37,10 @@ replay followed by the separately authorized live window in phase 5.
 GitHub owns remote lifecycle, reviews, replies, linkage and revisions. SQLite
 owns the selected workflow's generation, exhausted-episode cause, durable
 operator intent, required remediation and completion decision. Worktrees own
-content. File-backed runtime sessions and branch continuity retain ADR 0009's
-ownership until a later accepted migration. JSONL remains telemetry.
+content. The selected no-PR resolve flow's reusable session and authored split
+checkpoint move with its episode as specified below. Other runtime sessions,
+consumed replies and branch continuity retain ADR 0009's ownership until a later
+accepted migration. JSONL remains telemetry.
 
 The stable workflow key is `(canonical_repository, typed_target)`, with positive
 issue and PR identities represented separately. Resolve is issue-owned;
@@ -75,6 +77,39 @@ current policy: only a resolve-family result that ran and requeues without a
 PR consumes this ceiling; admission refusal, infra death and budget exhaustion
 retain their existing classification. An old-generation result still settles
 spend and keeps its receipt but cannot charge or relabel the new episode.
+
+Resolve continuation belongs to that same episode: `FreshResolve` has no reusable
+authored split checkpoint; `AuthoredResolve` retains the exact successful author
+attempt. Either may contain the latest verified runtime-tagged session. The
+session carries its source attempt and selected model; an unreported actual model
+is not invented. A new allowance grant starts with a fresh continuation even if
+old phase/session files remain on disk as evidence. `ContinueGrantedRearm` keeps
+the same episode and continuation. This prevents new guidance from being bypassed
+by an unrelated old `authored` marker. Worktree content is retained under existing
+identity checks, never deleted as an unrecorded re-arm side effect.
+
+Paid admission allocates a workflow revision and records its ordered admission
+receipt in the existing SQLite transaction. Neither UUID order nor timestamps
+establish invocation order. Result recording uses that receipt and the existing
+run/provider evidence: each genuine failed result still consumes its strike once,
+but an older delivery cannot overwrite a newer continuation or resurrect a cleared
+session. Router, infrastructure and admission/budget failures do not replace a
+resolve checkpoint. A newer legitimate sessionless result clears the prior handle,
+and a blocked resume discards even its returned handle, preserving current
+fresh-recovery behavior. A successful author establishes the authored checkpoint;
+other stages may update its session but cannot fabricate that checkpoint.
+Author-checkpoint provenance and session ordering advance independently: a late
+successful author still establishes its checkpoint without restoring an older
+handle, and a newer author proof supersedes an older one regardless of delivery
+order. Successful progression requires normal executed settlement evidence even
+when no session handle was returned. A released, never-launched reservation can
+be audited as an infrastructure/admission failure but cannot establish a checkpoint.
+
+The adjacent split adjudication allowance is checked in the same paid-admission
+transaction by counting existing admitted `ADJUDICATE` runs for the workflow,
+epoch and episode. An admitted run is the charge, including a crashed run.
+Continuation across generations does not renew it; a genuinely new episode does.
+This does not introduce a second counter or a pending-stage execution engine.
 
 Accepting a valid request records guidance, advances generation, creates the
 new bounded episode and retains a rearming gate, all in one transaction.

@@ -37,9 +37,10 @@ from ..domain.contracts import (
     ReservationId,
     RunId,
     TokenUsage,
+    WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import WorkflowBinding
-from ..domain.workflow import ActiveReconciliation
+from ..domain.workflow_identity import WorkflowBinding, WorkflowRevision, validate_workflow_integer
+from ..domain.workflow import ActiveReconciliation, ResolveAdmission, ResolveStage, WorkflowSnapshot, adjudication_allowed
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -65,7 +66,7 @@ from .deployment_authority import (
     deployment_role,
 )
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, require_workflow_binding
+from .workflow_rows import WorkflowAuthorityError, load_workflow_row, require_workflow_binding, workflow_scope
 
 SCHEMA_VERSION = 19
 SCHEMA_BASELINE_VERSION = 9
@@ -73,7 +74,7 @@ LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
 )
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
-_RESOLVE_PAID_KINDS = frozenset({"RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ROUTE"})
+_RESOLVE_PAID_KINDS = frozenset(stage.value for stage in ResolveStage)
 AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
 
@@ -228,6 +229,7 @@ class ReservationRequest:
     kind: str = "paid"
     owner_id: str = "reservation"
     workflow: WorkflowBinding | None = None
+    adjudication_ceiling: int | None = None
 
     def __post_init__(self) -> None:
         workload_repository = canonical_repository(
@@ -241,6 +243,10 @@ class ReservationRequest:
             or self.workflow.fence.key.repository != workload_repository
         ):
             raise ValueError("reservation workflow binding must match its workload repository")
+        if self.adjudication_ceiling is not None:
+            validate_workflow_integer(self.adjudication_ceiling, "adjudication ceiling")
+            if self.workflow is None or self.kind != ResolveStage.ADJUDICATE.value:
+                raise ValueError("adjudication ceiling requires a bound adjudication admission")
         if self.scope.currency != self.quote.maximum_charge.currency:
             raise ValueError("reservation scope and quote currency differ")
         if self.cap.currency != self.scope.currency:
@@ -3123,7 +3129,7 @@ class SQLiteControlStore:
                         request.cap,
                         "idempotent reservation" if identical else "conflicting reservation",
                     )
-                self._validate_workflow_reservation(db, request)
+                workflow_snapshot = self._validate_workflow_reservation(db, request)
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
                     settled, reserved = self._balance(db, limit.scope)
@@ -3144,6 +3150,8 @@ class SQLiteControlStore:
                             limit.scope.dimension,
                         )
                 now = _stamp(self._now())
+                if workflow_snapshot is not None:
+                    self._record_workflow_admission(db, request, workflow_snapshot, now)
                 db.execute(
                     "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, "
                     "config_version, workflow_binding_json) VALUES (?, ?, ?, ?, 'reserved', ?, ?)",
@@ -3307,7 +3315,7 @@ class SQLiteControlStore:
             )
 
     @staticmethod
-    def _validate_workflow_reservation(db: sqlite3.Connection, request: ReservationRequest) -> None:
+    def _validate_workflow_reservation(db: sqlite3.Connection, request: ReservationRequest) -> WorkflowSnapshot | None:
         binding = request.workflow
         activation = db.execute(
             "SELECT 1 FROM workflow_authority_epochs WHERE repository=? AND family='resolve'",
@@ -3327,12 +3335,53 @@ class SQLiteControlStore:
         if role != "fix":
             raise WorkflowAuthorityError("resolve admission requires the repository's fix owner")
         try:
-            require_workflow_binding(db, binding)
+            snapshot = require_workflow_binding(db, binding)
             dispatch = json.loads(request.dispatch_id)
             if not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository or type(dispatch.get("issue")) is not int or dispatch["issue"] != binding.fence.key.target.number:
                 raise WorkflowAuthorityError("paid dispatch identity disagrees with its workflow")
+            stage = ResolveStage(request.kind)
+            if dispatch.get("kind") != stage.value or not isinstance(dispatch.get("leg_id"), str) or not dispatch["leg_id"]:
+                raise WorkflowAuthorityError("resolve admission requires its captured stage and leg identity")
+            if stage is ResolveStage.ADJUDICATE:
+                if request.adjudication_ceiling is None:
+                    raise WorkflowAuthorityError("adjudication admission requires a configured contract-round ceiling")
+                admitted = 0
+                for row in db.execute(
+                    "SELECT r.workflow_binding_json FROM runs r JOIN budget_reservations b USING(run_id) "
+                    "WHERE b.workload_repository=? AND r.kind='ADJUDICATE' AND r.workflow_binding_json IS NOT NULL",
+                    (request.workload_repository,),
+                ):
+                    previous = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
+                    if (previous.fence.key, previous.authority, previous.episode_id) == (binding.fence.key, binding.authority, binding.episode_id):
+                        admitted += 1
+                if not adjudication_allowed(admitted, request.adjudication_ceiling):
+                    raise WorkflowAuthorityError("resolve episode's admitted adjudication allowance is exhausted")
+            return snapshot
         except (ValueError, TypeError) as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
+
+    @staticmethod
+    def _record_workflow_admission(
+        db: sqlite3.Connection, request: ReservationRequest, snapshot: WorkflowSnapshot, now: str,
+    ) -> None:
+        """Admission order is a durable revision, independent of clocks and delivery."""
+        try:
+            metadata = json.loads(request.dispatch_id)
+            revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
+            admission = ResolveAdmission(
+                WorkflowAttemptIdentity(snapshot.binding, request.run_id, metadata["leg_id"]),
+                revision, ResolveStage(request.kind), request.adjudication_ceiling,
+            )
+            db.execute(
+                "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",
+                (revision.version, *workflow_scope(revision.fence.key)),
+            )
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission',?,?,?,?)",
+                (request.workload_repository, str(request.run_id), now, encode_workflow(admission)),
+            )
+        except (ValueError, TypeError, KeyError) as exc:
+            raise WorkflowAuthorityError(f"invalid workflow admission: {exc}") from exc
 
     @staticmethod
     def _reservation_request_matches(
@@ -3351,6 +3400,22 @@ class SQLiteControlStore:
         ).fetchone()
         if run is None:
             return False
+        if request.workflow is not None:
+            receipt = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
+                (request.workload_repository, str(request.run_id)),
+            ).fetchone()
+            if receipt is None:
+                return False
+            try:
+                admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
+                metadata = json.loads(request.dispatch_id)
+                expected_attempt = WorkflowAttemptIdentity(request.workflow, request.run_id, metadata["leg_id"])
+                current = load_workflow_row(db, request.workflow.fence.key)
+            except (ValueError, TypeError, KeyError) as exc:
+                raise WorkflowAuthorityError("invalid admitted workflow receipt") from exc
+            if current is None or admission.attempt != expected_attempt or admission.stage.value != request.kind or admission.adjudication_ceiling != request.adjudication_ceiling or admission.revision.version > current.revision.version:
+                return False
         actual_reservation = tuple(
             prior[name]
             for name in (

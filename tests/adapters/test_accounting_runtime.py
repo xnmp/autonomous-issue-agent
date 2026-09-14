@@ -208,7 +208,7 @@ def test_activated_resolve_rejects_missing_or_stale_authority_before_provider(tm
     assert store.active_reservation_runs() == ()
 
 
-@pytest.mark.parametrize("kind", ["ROUTE", "AUTHOR", "IMPLEMENT"])
+@pytest.mark.parametrize("kind", ["ROUTE", "AUTHOR", "IMPLEMENT", "ADJUDICATE"])
 def test_workflow_binding_survives_nested_leg_context_and_exception(tmp_path, kind) -> None:
     wrapper, _store = _wrapper(tmp_path, Runtime(AgentResult(False)))
     journaled = JournalingRuntime(

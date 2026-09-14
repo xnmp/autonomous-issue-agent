@@ -162,6 +162,7 @@ def _publication_run(control, cwd, *, workflow=None, kind="RESOLVE", issue=42,
     request = ReservationRequest(
         ReservationId(f"reservation:{name}"), RunId(name),
         json.dumps({"repository": "o/r", "role": "fix", "kind": kind,
+                    "leg_id": f"leg:{name}",
                     "number": issue, "issue": issue, "cwd": str(cwd),
                     "publication_branch": f"fix/{issue}-issue"}),
         BudgetScope("o/r", "daily", "USD", "2026-09-14", now,

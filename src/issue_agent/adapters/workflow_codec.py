@@ -26,6 +26,7 @@ _VALUES = (
     identity.WorkflowFence, identity.FamilyAuthority, identity.WorkflowRevision,
     identity.WorkflowBinding, WorkflowAttemptIdentity,
     Comment, IssueView, w.ObservedIssue, w.NoLinkedPr, w.LinkedPrPresent, w.ResolveRearmPreflight,
+    w.ResolveSession, w.FreshResolve, w.AuthoredResolve, w.ResolveAdmission,
     w.ResolveEpisode, w.ResolveCeiling, w.RemoteOutcomeUncertain, w.RetryAuthorizationRequired,
     w.EvidenceUnavailable, w.RearmNeedsDecision, w.NoAuthorizedRemediation,
     w.RemediationAttempted, w.OpenGate, w.RearmingGate,
@@ -41,7 +42,7 @@ _VALUES = (
 )
 _ENUMS = (
     Label, identity.WorkflowFamily, w.StopReason, w.RemediationOperation,
-    w.RemediationOutcome, w.ResolveResultKind,
+    w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
 )
 _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
 

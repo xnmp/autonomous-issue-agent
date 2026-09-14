@@ -59,17 +59,112 @@ def _command_ids(value: tuple[CommandId, ...], name: str) -> None:
 
 
 @dataclass(frozen=True)
+class ResolveSession:
+    source: WorkflowAttemptIdentity
+    session_id: str
+    runtime: str
+    model: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, WorkflowAttemptIdentity):
+            raise ValueError("resolve session requires its admitted source attempt")
+        for name in ("session_id", "runtime", "model"):
+            _text(getattr(self, name), name)
+
+
+@dataclass(frozen=True)
+class FreshResolve:
+    session: ResolveSession | None = None
+    last_applied_admission_version: int = 0
+
+    def __post_init__(self) -> None:
+        _count(self.last_applied_admission_version, "continuation admission version")
+        if self.session is not None and (
+            not isinstance(self.session, ResolveSession) or not self.last_applied_admission_version
+        ):
+            raise ValueError("resolve session requires an applied admission")
+
+
+@dataclass(frozen=True)
+class AuthoredResolve:
+    author_admission: ResolveAdmission
+    last_applied_admission_version: int
+    session: ResolveSession | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.author_admission, ResolveAdmission) or self.author_admission.stage is not ResolveStage.AUTHOR:
+            raise ValueError("authored resolve requires its admitted author provenance")
+        _count(self.last_applied_admission_version, "continuation admission version", minimum=1)
+        if self.author_admission.revision.version > self.last_applied_admission_version:
+            raise ValueError("authored checkpoint cannot exceed the applied admission watermark")
+        if self.session is not None and not isinstance(self.session, ResolveSession):
+            raise ValueError("authored resolve session must be validated")
+
+    @property
+    def author_attempt(self) -> WorkflowAttemptIdentity:
+        return self.author_admission.attempt
+
+
+ResolveContinuation = FreshResolve | AuthoredResolve
+
+
+class ResolveStage(str, Enum):
+    ROUTE = "ROUTE"
+    RESOLVE = "RESOLVE"
+    AUTHOR = "AUTHOR"
+    IMPLEMENT = "IMPLEMENT"
+    ADJUDICATE = "ADJUDICATE"
+    RESUME = "RESUME"
+
+
+@dataclass(frozen=True)
+class ResolveAdmission:
+    attempt: WorkflowAttemptIdentity
+    revision: WorkflowRevision
+    stage: ResolveStage
+    adjudication_ceiling: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attempt, WorkflowAttemptIdentity) or not isinstance(self.revision, WorkflowRevision):
+            raise ValueError("resolve admission requires captured attempt and revision")
+        if self.revision.fence != self.attempt.binding.fence or not self.revision.version:
+            raise ValueError("resolve admission requires its newly allocated workflow revision")
+        if not isinstance(self.stage, ResolveStage):
+            raise ValueError("resolve admission requires a supported stage")
+        if self.stage is ResolveStage.ADJUDICATE:
+            if self.adjudication_ceiling is None:
+                raise ValueError("adjudication admission requires its configured ceiling")
+            _count(self.adjudication_ceiling, "adjudication ceiling")
+        elif self.adjudication_ceiling is not None:
+            raise ValueError("only adjudication admits against a contract-round ceiling")
+
+
+def adjudication_allowed(admitted: int, ceiling: int) -> bool:
+    _count(admitted, "admitted adjudications")
+    _count(ceiling, "adjudication ceiling")
+    return admitted < ceiling
+
+
+@dataclass(frozen=True)
 class ResolveEpisode:
     episode_id: str
     failures: int = 0
     last_failure: str = ""
     guidance: str = ""
+    continuation: ResolveContinuation = FreshResolve()
 
     def __post_init__(self) -> None:
         _text(self.episode_id, "episode")
         _count(self.failures, "failures")
         _text(self.last_failure, "last failure", limit=MAX_DETAIL_CHARS, empty=True)
         _text(self.guidance, "guidance", limit=GUIDANCE_MAX_CHARS, empty=True)
+        if not isinstance(self.continuation, (FreshResolve, AuthoredResolve)):
+            raise ValueError("resolve episode requires a validated continuation")
+        sources = (
+            (self.continuation.author_attempt,) if isinstance(self.continuation, AuthoredResolve) else ()
+        ) + ((self.continuation.session.source,) if self.continuation.session is not None else ())
+        if any(source.binding.episode_id != self.episode_id for source in sources):
+            raise ValueError("resolve continuation cannot inherit another episode")
 
 
 @dataclass(frozen=True)
@@ -447,6 +542,19 @@ class WorkflowSnapshot:
             raise ValueError("this snapshot supports only resolve")
         if not isinstance(self.revision.fence.key.target, IssueRef):
             raise ValueError("resolve workflow requires an issue")
+        continuation = self.episode.continuation
+        if continuation.last_applied_admission_version > self.revision.version:
+            raise ValueError("continuation cannot originate in a future admission")
+        sources = (
+            (continuation.author_attempt,) if isinstance(continuation, AuthoredResolve) else ()
+        ) + ((continuation.session.source,) if continuation.session is not None else ())
+        if any(
+            source.binding.fence.key != self.revision.fence.key
+            or source.binding.authority != self.authority
+            or source.binding.fence.generation > self.revision.fence.generation
+            for source in sources
+        ):
+            raise ValueError("continuation provenance disagrees with its workflow authority")
         _items(self.gates, "gates", (OpenGate, RearmingGate), MAX_WORKFLOW_GATES)
         opened = tuple(g.gate if isinstance(g, RearmingGate) else g for g in self.gates)
         if len({g.gate_id for g in opened}) != len(opened):
@@ -792,11 +900,20 @@ class ResolveAttemptResult:
     attempt: WorkflowAttemptIdentity
     kind: ResolveResultKind
     summary: str = ""
+    stage: ResolveStage = ResolveStage.RESOLVE
+    session: ResolveSession | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, WorkflowAttemptIdentity) or not isinstance(self.kind, ResolveResultKind):
             raise ValueError("result requires captured binding and typed classification")
         _text(self.summary, "result summary", limit=MAX_DETAIL_CHARS, empty=True)
+        if not isinstance(self.stage, ResolveStage):
+            raise ValueError("resolve result requires a supported stage")
+        if self.session is not None and (
+            not isinstance(self.session, ResolveSession) or self.session.source != self.attempt
+            or self.stage is ResolveStage.ROUTE
+        ):
+            raise ValueError("resolve session must belong to this non-router attempt")
 
 
 class WorkflowMutation(str, Enum):

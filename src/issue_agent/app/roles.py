@@ -435,6 +435,7 @@ def _with_accounting(
         approved_base_branch=cfg.base_branch,
         require_dispatch_claim=True,
         reservation_reconciler=reconciler,
+        max_contract_rounds=cfg.max_contract_rounds,
     )
 
 

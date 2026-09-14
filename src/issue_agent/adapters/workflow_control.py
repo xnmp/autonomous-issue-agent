@@ -13,12 +13,12 @@ from contextlib import closing
 from dataclasses import replace
 from datetime import datetime
 
-from ..domain.contracts import EffectStatus
+from ..domain.contracts import EffectStatus, PricingBasis
 from ..domain.workflow import (
     ActiveReconciliation, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, HeldProjection, LinkedPrPresent, ObservedIssue, ObservedTransition, OpenGate,
     PendingRearm, RearmingGate, RearmIntent, ReconciliationOnly, RemoteOutcomeUncertain,
-    RequestRearm, ResolveAttemptResult, ResolveRearmPreflight, RetiredSettledCommand, RetiredUncertainCommand,
+    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmPreflight, ResolveResultKind, RetiredSettledCommand, RetiredUncertainCommand,
     StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
     WorkflowConflict, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
     WorkflowUnchanged, WorkflowRejected,
@@ -190,7 +190,7 @@ class SQLiteWorkflowControl:
             prior = load_workflow_row(db, key)
             if prior is None:
                 raise WorkflowAuthorityError("workflow must be explicitly imported before recording results")
-            self._validate_attempt_run(db, result)
+            admission = self._validate_attempt_run(db, result)
             receipt = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-result' AND scope=? AND key=?",
                 (self.writer.repository, str(result.attempt.run_id)),
@@ -199,11 +199,11 @@ class SQLiteWorkflowControl:
                 if receipt["payload_json"] != encoded:
                     return WorkflowConflict(prior.revision, "paid run already has a different recorded classification")
                 return WorkflowCommitted(prior, idempotent=True)
-            proposal = record_resolve_attempt(prior, result, ceiling=self._resolve_ceiling)
+            proposal = record_resolve_attempt(prior, result, ceiling=self._resolve_ceiling, admission=admission)
             if isinstance(proposal, WorkflowRejected):
                 return WorkflowConflict(prior.revision, proposal.reason)
             if isinstance(proposal, WorkflowChanged):
-                validate_resolve_transition(prior, proposal, ceiling=self._resolve_ceiling, now=self._control._now())
+                validate_resolve_transition(prior, proposal, ceiling=self._resolve_ceiling, now=self._control._now(), admission=admission)
                 self._persist(db, prior, proposal, encoded)
                 after = proposal.snapshot
             else:
@@ -250,13 +250,14 @@ class SQLiteWorkflowControl:
             if prior.revision != expected:
                 return WorkflowConflict(prior.revision, "workflow revision changed before commit")
             observations = self._validate_evidence(db, prior, transition)
+            admission = self._validate_attempt_run(db, transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else None
             accepted_preflight = None
             if isinstance(prior.intent, PendingRearm):
                 row = db.execute("SELECT actor_json FROM workflow_rearms WHERE request_id=?", (prior.intent.request_id,)).fetchone()
                 if row is None:
                     raise WorkflowAuthorityError("pending intent lacks its accepted audit")
                 accepted_preflight = decode_workflow(row["actor_json"], AuthorizedOperatorCommand).preflight
-            validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight)
+            validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight, admission=admission)
             self._persist(db, prior, transition, encoded)
             db.execute(
                 "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) VALUES (?, ?, ?, ?, ?)",
@@ -274,8 +275,6 @@ class SQLiteWorkflowControl:
     ) -> tuple[ResolveRearmPreflight | ObservedIssue | LinkedPrPresent, ...]:
         audit = proposal.audit
         scope = workflow_scope(prior.revision.fence.key)
-        if isinstance(audit, ResolveAttemptResult):
-            self._validate_attempt_run(db, audit)
         if isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, (RequestRearm, ContinueGrantedRearm)):
             for row in db.execute(
                 "SELECT runs.workflow_binding_json, runs.dispatch_id FROM runs LEFT JOIN leases USING(run_id) "
@@ -339,7 +338,7 @@ class SQLiteWorkflowControl:
                 raise WorkflowAuthorityError("re-arm command does not belong to the accepting fix owner")
         return tuple(observations)
 
-    def _validate_attempt_run(self, db: sqlite3.Connection, result: ResolveAttemptResult) -> None:
+    def _validate_attempt_run(self, db: sqlite3.Connection, result: ResolveAttemptResult) -> ResolveAdmission:
         row = db.execute("SELECT * FROM runs WHERE run_id=?", (str(result.attempt.run_id),)).fetchone()
         if row is None or row["owner_id"] != self.writer.owner_id or row["workflow_binding_json"] is None:
             raise WorkflowAuthorityError("resolve result has no owning admitted run")
@@ -350,8 +349,52 @@ class SQLiteWorkflowControl:
             raise WorkflowAuthorityError("resolve run has malformed attempt metadata") from exc
         if binding != result.attempt.binding or not isinstance(metadata, dict) or metadata.get("leg_id") != result.attempt.leg_id:
             raise WorkflowAuthorityError("resolve attempt disagrees with its admitted run")
+        if row["kind"] != result.stage.value or metadata.get("kind") != result.stage.value:
+            raise WorkflowAuthorityError("resolve result stage disagrees with its admitted run")
         if row["state"] not in ("completed", "cancelled", "abandoned"):
             raise WorkflowAuthorityError("resolve result requires a terminal admitted run")
+        receipt = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
+            (self.writer.repository, str(result.attempt.run_id)),
+        ).fetchone()
+        if receipt is None:
+            raise WorkflowAuthorityError("resolve result lacks its durable admission receipt")
+        admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
+        if admission.attempt != result.attempt or admission.stage is not result.stage:
+            raise WorkflowAuthorityError("resolve result disagrees with its durable admission receipt")
+        if result.kind not in (ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL) or result.session is not None:
+            reservation = db.execute(
+                "SELECT workload_repository, model, state, provider_receipt_id, basis "
+                "FROM budget_reservations JOIN charges USING(run_id) WHERE run_id=?", (str(result.attempt.run_id),),
+            ).fetchone()
+            runtime = metadata.get("runtime")
+            receipt_id = row["provider_receipt_id"]
+            normal_receipt = (
+                isinstance(runtime, str) and bool(runtime)
+                and isinstance(receipt_id, str)
+                and receipt_id.startswith(f"{runtime}:")
+                and receipt_id.endswith(f":{result.attempt.run_id}")
+                and len(receipt_id) > len(runtime) + len(result.attempt.run_id) + 2
+            )
+            if (
+                row["state"] != "completed" or reservation is None or reservation["state"] != "settled"
+                or reservation["workload_repository"] != self.writer.repository
+                or not normal_receipt or reservation["provider_receipt_id"] != receipt_id
+                or reservation["basis"] not in {basis.value for basis in PricingBasis if basis is not PricingBasis.RECONCILED}
+            ):
+                raise WorkflowAuthorityError("resolve progress lacks normal executed settlement provenance")
+        else:
+            reservation = None
+        if result.session is not None:
+            session = result.session
+            if (
+                session.session_id == "no-session"
+                or row["provider_receipt_id"] != f"{session.runtime}:{session.session_id}:{result.attempt.run_id}"
+                or metadata.get("runtime") != session.runtime
+                or reservation is None or reservation["model"] != session.model
+            ):
+                raise WorkflowAuthorityError("resolve session lacks exact provider and selected-model provenance")
+        return admission
 
     def _owns_command(self, db: sqlite3.Connection, owner: str) -> bool:
         """Terminal receipts retain their executor through audited adoption."""

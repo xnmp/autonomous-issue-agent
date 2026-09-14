@@ -123,6 +123,23 @@ plus hooks, parity, import contracts and both Pyrefly passes. Final log:
 `/tmp/phase3-discovery-reconciliation-full-final.log`. The earlier run's sole
 failure was test-only union narrowing in Pyrefly; the complete rerun is green.
 
+The next resolve-continuation increment adds episode-owned fresh/authored
+checkpoints and runtime-tagged sessions, durable admission ordering in the existing
+reservation transaction, and an adjudication allowance derived from admitted runs.
+Independent reviews reproduced and corrected four boundary/interleaving gaps:
+incomplete admission replay identity, global-only spend-scope confusion, a delayed
+author checkpoint suppressed by a newer session, and progress claimed by a
+never-launched reservation. The corrected policy orders author provenance and
+session updates independently, and requires normal settled execution evidence for
+progress even when no session handle was returned. Real SQLite tests cover all
+24 delivery permutations of two authors, implementation and blocked resume.
+Daemon/scheduler/operator integration and legacy-path deletion remain required;
+these authority primitives alone do not accept the resolve vertical slice.
+The corrected increment passed fresh adversarial re-review (327 focused tests,
+including both original reproductions) and the full `make test`: 1,345 domain,
+1,411 adapter and 2,361 application tests, hooks/parity/import contracts and both
+Pyrefly passes. Final log: `/tmp/phase3-continuation-full-final.log`.
+
 Phase 1 replaces contradictory raw trigger checks with shared action-specific
 eligibility, replaces swallowed control corruption with per-target errors,
 and replaces separate triage/groom relabel-then-close choreography with guarded

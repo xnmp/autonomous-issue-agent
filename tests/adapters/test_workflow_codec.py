@@ -8,10 +8,11 @@ from issue_agent.adapters.workflow_codec import (
     MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow,
 )
 from issue_agent.domain.workflow import (
+    AuthoredResolve, ResolveAdmission, ResolveSession, ResolveStage,
     NoAuthorizedRemediation, OpenGate, RemoteOutcomeUncertain, ResolveEpisode, RetryAuthorizationRequired,
     WorkflowSnapshot,
 )
-from issue_agent.domain.contracts import CommandId
+from issue_agent.domain.contracts import CommandId, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
 )
@@ -91,3 +92,29 @@ def test_nested_constructor_rejects_future_gate_generation():
     raw["value"]["fields"]["gates"][0]["fields"]["opened_generation"] = 100
     with pytest.raises(WorkflowEncodingError):
         decode_workflow(json.dumps(raw), WorkflowSnapshot)
+
+
+@pytest.mark.parametrize("with_session", [False, True])
+def test_authored_checkpoint_and_independent_session_order_survive_roundtrip(with_session):
+    state = snapshot()
+    author = WorkflowAttemptIdentity(state.binding, RunId("author"), "author-leg")
+    source = ResolveAdmission(author, replace(state.revision, version=5), ResolveStage.AUTHOR)
+    implement = WorkflowAttemptIdentity(state.binding, RunId("implement"), "implement-leg")
+    session = ResolveSession(implement, "session:id", "codex", "<runtime-default>") if with_session else None
+    checkpoint = AuthoredResolve(source, 8, session)
+    state = replace(state, episode=replace(state.episode, continuation=checkpoint))
+    recovered = decode_workflow(encode_workflow(state), WorkflowSnapshot)
+    assert recovered == state
+    assert recovered.episode.continuation.author_admission == source
+    assert recovered.episode.continuation.last_applied_admission_version == 8
+    assert recovered.episode.continuation.session == session
+
+
+def test_other_admitted_stage_cannot_be_deserialized_as_authored_checkpoint():
+    state = snapshot()
+    source = ResolveAdmission(WorkflowAttemptIdentity(state.binding, RunId("run"), "leg"),
+                              replace(state.revision, version=5), ResolveStage.AUTHOR)
+    raw = json.loads(encode_workflow(AuthoredResolve(source, 5)))
+    raw["value"]["fields"]["author_admission"]["fields"]["stage"]["value"] = "IMPLEMENT"
+    with pytest.raises(WorkflowEncodingError):
+        decode_workflow(json.dumps(raw), AuthoredResolve)

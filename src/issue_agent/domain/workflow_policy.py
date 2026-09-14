@@ -13,13 +13,13 @@ from .labels import Label
 from .lifecycle import issue_eligibility
 from .outcome import AgentResult, ResolveFollowup, budget_exhausted, infra_class_failure
 from .workflow import (
-    AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
+    AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, EnsureLifecycleProjection, IssueObservation,
     LinkedPrObservation, LinkedPrPresent, NoAuthorizedRemediation, NoLinkedPr, ObservedIssue,
     ObservedTransition, OpenGate, OperatorActor, PendingRearm, RearmingGate,
     RearmNeedsDecision, RemoteOutcomeUncertain, RenewResolveAllowance,
-    RequestRearm, ResolveAttemptResult, ResolveCeiling, ResolveEpisode,
-    ResolveRearmPreflight, ResolveResultKind, SetGuidance, ClearGuidance, StopReason, SupersededRearm,
+    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveCeiling, ResolveEpisode,
+    ResolveRearmPreflight, ResolveResultKind, ResolveStage, SetGuidance, ClearGuidance, StopReason, SupersededRearm,
     UnresolvedGate, WorkflowChanged, WorkflowMutation, WorkflowRejected,
     WorkflowRejection, WorkflowSnapshot, WorkflowTransition, WorkflowUnchanged,
 )
@@ -188,12 +188,17 @@ def record_resolve_attempt(
     result: ResolveAttemptResult,
     *,
     ceiling: int,
+    admission: ResolveAdmission,
     prior_result: ResolveAttemptResult | None = None,
 ) -> WorkflowTransition:
     """Deduplication evidence is read from SQLite by the committing adapter."""
     if type(ceiling) is not int or not 0 <= ceiling <= 2**63 - 1:
         raise ValueError("resolve ceiling must be a nonnegative bounded integer")
     attempt = result.attempt
+    if not isinstance(admission, ResolveAdmission) or admission.attempt != attempt or admission.stage is not result.stage:
+        return _reject(WorkflowRejection.INVALID_SCOPE, "result disagrees with its captured admission")
+    if admission.revision.version > snapshot.revision.version or admission.revision.fence.generation > snapshot.revision.fence.generation:
+        return _reject(WorkflowRejection.INVALID_SCOPE, "result admission is newer than the workflow")
     if attempt.binding.fence.key != snapshot.revision.fence.key:
         return _reject(WorkflowRejection.INVALID_SCOPE, "attempt belongs to a different workflow")
     if prior_result is not None:
@@ -202,14 +207,31 @@ def record_resolve_attempt(
         return WorkflowUnchanged(snapshot)
     if attempt.binding != snapshot.binding:
         return WorkflowUnchanged(snapshot)
-    if result.kind is not ResolveResultKind.COUNTED_REQUEUE:
+    # Router selection is audited but does not own a resolve continuation or a
+    # resolve strike. Infrastructure/admission failures cannot replace a usable
+    # checkpoint with an unproven provider handle.
+    if result.stage is ResolveStage.ROUTE or result.kind in (ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL):
         return WorkflowUnchanged(snapshot)
-    if snapshot.episode.failures == 2**63 - 1:
-        return _reject(WorkflowRejection.INVALID_SCOPE, "resolve failure counter is exhausted")
-    episode = replace(
-        snapshot.episode, failures=snapshot.episode.failures + 1,
-        last_failure=result.summary or snapshot.episode.last_failure,
-    )
+    continuation = snapshot.episode.continuation
+    if admission.revision.version > continuation.last_applied_admission_version:
+        session = result.session
+        if result.stage is ResolveStage.RESUME and result.kind is ResolveResultKind.BLOCKED:
+            session = None
+        continuation = replace(continuation, session=session, last_applied_admission_version=admission.revision.version)
+    # Checkpoint and handle advance independently: a delayed successful author
+    # still proves the contract exists, but cannot restore an older handle.
+    if result.stage is ResolveStage.AUTHOR and result.kind is ResolveResultKind.STAGE_PROGRESSED and (
+        not isinstance(continuation, AuthoredResolve)
+        or admission.revision.version > continuation.author_admission.revision.version
+    ):
+        continuation = AuthoredResolve(admission, continuation.last_applied_admission_version, continuation.session)
+    episode = replace(snapshot.episode, continuation=continuation)
+    if result.kind is ResolveResultKind.COUNTED_REQUEUE:
+        if episode.failures == 2**63 - 1:
+            return _reject(WorkflowRejection.INVALID_SCOPE, "resolve failure counter is exhausted")
+        episode = replace(episode, failures=episode.failures + 1, last_failure=result.summary or episode.last_failure)
+    if episode == snapshot.episode:
+        return WorkflowUnchanged(snapshot)
     gates = _ceiling_gates(snapshot, episode, ceiling)
     after = replace(snapshot, revision=_next(snapshot), episode=episode, gates=gates)
     return WorkflowChanged(snapshot.revision, WorkflowMutation.RECORD_RESULT, after, result)
@@ -452,6 +474,7 @@ def validate_resolve_transition(
     now: datetime,
     observations: tuple[ResolveRearmPreflight | ObservedIssue | LinkedPrPresent, ...] = (),
     accepted_preflight: ResolveRearmPreflight | None = None,
+    admission: ResolveAdmission | None = None,
 ) -> None:
     """Recompute authoritative deltas; a well-formed snapshot is not permission.
 
@@ -467,7 +490,9 @@ def validate_resolve_transition(
     audit = proposal.audit
     expected: WorkflowTransition
     if proposal.mutation is WorkflowMutation.RECORD_RESULT and isinstance(audit, ResolveAttemptResult):
-        expected = record_resolve_attempt(prior, audit, ceiling=ceiling)
+        if admission is None:
+            raise ValueError("result transition requires its captured admission")
+        expected = record_resolve_attempt(prior, audit, ceiling=ceiling, admission=admission)
     elif proposal.mutation is WorkflowMutation.OPEN_GATE and isinstance(audit, ObservedTransition):
         expected = reconcile_resolve_ceiling(prior, ceiling=ceiling, evidence_ids=audit.evidence_ids)
     elif proposal.mutation is WorkflowMutation.REQUEST_REARM and isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, RequestRearm):
