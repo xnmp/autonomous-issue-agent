@@ -198,6 +198,12 @@ the pure `domain/reservation_recovery.py` state machine. That model owns action
 ordering and terminal reporting; SQLite remains responsible for atomically
 proving that a requested release is still eligible. New runtimes or evidence
 sources therefore extend one decision table rather than adding recovery loops.
+V20 indexes the workflow episode on existing admitted runs. Adjudication allowance
+reads are bounded and episode-scoped; generation changes do not renew them. A
+strict never-launched release carries a distinct terminal proof, while ambiguous
+execution continues counting. Migration validates immutable run/admission/budget
+provenance atomically before deriving the index; it does not activate a workflow
+family. This migration has been exercised only against isolated test databases.
 Every migration is digest-validated and individually transactional; restart
 and concurrent-role tests interrupt both sides of every migration commit
 boundary and serialize fresh/v8/v9 boot. Machine-readable

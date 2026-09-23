@@ -112,7 +112,8 @@ def run(control, state, *, name="run:1", status="completed", leg="leg:1", stage=
     result = ResolveAttemptResult(WorkflowAttemptIdentity(state.binding, RunId(name), leg), ResolveResultKind.COUNTED_REQUEUE, "failed experiment", stage)
     control.start_run(RunId(name), json.dumps({"repository": "o/r", "issue": state.revision.fence.key.target.number, "number": state.revision.fence.key.target.number, "leg_id": leg, "kind": stage.value, "runtime": runtime, "input_fingerprint": "a" * 64}), stage.value, WRITER.owner_id, "config", state=status)
     with control.transaction() as db:
-        db.execute("UPDATE runs SET workflow_binding_json=? WHERE run_id=?", (encode_workflow(state.binding), name))
+        from issue_agent.adapters.control_store import workflow_episode_key
+        db.execute("UPDATE runs SET workflow_binding_json=?,workflow_episode_key=? WHERE run_id=?", (encode_workflow(state.binding), workflow_episode_key(state.binding), name))
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission', ?, ?, ?, ?)",
                    (WRITER.repository, name, NOW.isoformat(), encode_workflow(admission(state, result))))
         if session_id is not None:
@@ -167,8 +168,9 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
             current = load_workflow_row(db, state.revision.fence.key)
             assert current is not None
             revision = replace(current.revision, version=current.revision.version + 1)
-            db.execute("UPDATE runs SET kind=?,workflow_binding_json=? WHERE run_id=?",
-                       (stage.value, encode_workflow(state.binding), name))
+            from issue_agent.adapters.control_store import workflow_episode_key
+            db.execute("UPDATE runs SET kind=?,workflow_binding_json=?,workflow_episode_key=? WHERE run_id=?",
+                       (stage.value, encode_workflow(state.binding), workflow_episode_key(state.binding), name))
             db.execute("UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",
                        (revision.version, *workflow_scope(state.revision.fence.key)))
             legacy = ResolveAdmission(attempt, revision, stage, request.adjudication_ceiling, "a" * 64)

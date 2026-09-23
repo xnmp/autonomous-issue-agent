@@ -1,14 +1,15 @@
 # Architecture implementation phases
 
 **Phase 3 resumed on 2026-09-23 at the user's request.** See the
-[current split-recovery handover](2026-09-23-phase-3-split-recovery-handover.md),
+[current re-arm preparation handover](2026-09-23-phase-3-rearm-handover.md),
+[split-recovery checkpoint](2026-09-23-phase-3-split-recovery-handover.md),
 [ordinary-return checkpoint](2026-09-23-phase-3-paid-return-handover.md) and the
 [earlier integration inventory](2026-09-14-phase-3-integration-handover.md).
 The ordinary-return checkpoint is committed as `99bc61d`. The documented crash boundary
 now has atomic paid-return receipts and composed restart coverage. The bounded
 increment passed full-suite verification and independent review; phase 3 overall
 remains incomplete.
-The subsequent split-recovery checkpoint also passed the final full suite and
+The subsequent split-recovery checkpoint `73c63bb` also passed the final full suite and
 independent review, including replacement-author isolation. Its handover above
 records the remaining re-arm/activation and bounded-adjudication-query work.
 Implementation and its phase agent are authorized to resume;
@@ -223,11 +224,12 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
 6. Only then accept phase 3 and start phase 4. Live activation and soak remain
    separately blocked by the deployment pause, not simulated as completed.
 
-Before full phase-3 acceptance, replace the repository-wide historical
-adjudication-binding scan with an indexed, bounded per-episode admission query.
-Independent review records both hot-path growth and unrelated corrupt-record
-coupling; strict proven-never-launched exclusions must remain intact. This is
-tracked acceptance work, not permission to reset or duplicate the allowance.
+The indexed-allowance checkpoint replaces the repository-wide historical scan
+with a bounded per-episode admission query, preserving strict never-launched
+exclusions without another counter. Independent review and full `make test`
+passed; final log: `/tmp/phase3-episode-index-full-verified.log`. Schema v20 was
+exercised only on isolated databases. The current handover records the next
+workspace-handoff/re-arm increment; no live family activation has occurred.
 
 Receipt recovery trusts atomically written terminal dispositions and schedule
 indexes. It isolates corrupt selected unfinished payloads, not arbitrary at-rest

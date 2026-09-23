@@ -110,6 +110,10 @@ transaction by counting existing admitted `ADJUDICATE` runs for the workflow,
 epoch and episode. An admitted run is the charge, including a crashed run.
 Continuation across generations does not renew it; a genuinely new episode does.
 This does not introduce a second counter or a pending-stage execution engine.
+The v20 indexed projection keeps the episode key on the existing admitted run,
+excluding generation. Counts saturate above the largest supported ceiling.
+Only a transactionally proven never-launched release is excluded; unknown,
+crashed or generally released executions continue consuming allowance.
 
 Accepting a valid request records guidance, advances generation, creates the
 new bounded episode and retains a rearming gate, all in one transaction.
@@ -320,7 +324,8 @@ cannot mint an allowance renewal or authorize review dismissal.
 ## Migration and rollback
 
 Schema changes are additive and versioned by the parent in the next available
-control-store migration (currently v19 is next; recheck at implementation).
+control-store migrations (v19 installs workflow foundations; v20 indexes admitted
+episode work and backfills only validated immutable historical bindings).
 Family activation is scoped to canonical repository plus family and records
 epoch, source digest, verified deployment inventory and imported targets.
 Schema installation is not family activation. Live authority must not be

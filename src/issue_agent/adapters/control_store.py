@@ -49,7 +49,7 @@ from ..domain.workflow import (
 from ..domain.workflow_reconciliation import ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
 from ..domain.outcome import AuthorFollowup, author_followup
-from ..domain.resolve_split import AdjudicationInput, ContractResetCompleted, ReauthorInput, ReauthorResetIntent, SplitContext, SplitImplement, SplitInput, split_context, validate_contract_rounds
+from ..domain.resolve_split import MAX_SPLIT_TRAIL, AdjudicationInput, ContractResetCompleted, ReauthorInput, ReauthorResetIntent, SplitContext, SplitImplement, SplitInput, split_context, validate_contract_rounds
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -77,21 +77,44 @@ from .deployment_authority import (
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, load_workflow_row, require_workflow_binding, workflow_scope
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
+
+
+def workflow_episode_key(binding: WorkflowBinding) -> str:
+    """An indexed projection of immutable admission scope, not an allowance."""
+    return json.dumps((*workflow_scope(binding.fence.key), binding.authority.family.value,
+                       binding.authority.epoch, binding.episode_id), ensure_ascii=False, separators=(",", ":"))
 
 
 def admitted_adjudications(db: sqlite3.Connection, binding: WorkflowBinding) -> int:
-    """Unknown execution consumes allowance; proven never-launched work does not."""
+    """Saturate above every supported ceiling without scanning other episodes."""
     admitted = 0
     for row in db.execute(
-        "SELECT r.run_id,r.workflow_binding_json FROM runs r JOIN budget_reservations b USING(run_id) "
-        "WHERE b.workload_repository=? AND r.kind='ADJUDICATE' AND r.workflow_binding_json IS NOT NULL",
-        (binding.fence.key.repository,),
+        "SELECT r.run_id,r.kind,r.dispatch_id,r.workflow_binding_json FROM runs r "
+        "WHERE r.workflow_episode_key=? AND r.kind='ADJUDICATE' "
+        "AND NOT(r.state='cancelled' AND r.outcome IS 'unlaunched_released' AND r.provider_receipt_id IS NULL) "
+        "LIMIT ?", (workflow_episode_key(binding), MAX_SPLIT_TRAIL + 1),
     ):
-        previous = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
-        if (previous.fence.key, previous.authority, previous.episode_id) == (binding.fence.key, binding.authority, binding.episode_id):
-            admitted += int(not proven_unlaunched_run(db, RunId(row["run_id"])))
+        previous = _indexed_run_binding(db, row)
+        if workflow_episode_key(previous) != workflow_episode_key(binding):
+            raise WorkflowAuthorityError("adjudication index disagrees with immutable run scope")
+        admitted += 1
     return admitted
+
+
+def _indexed_run_binding(db: sqlite3.Connection, row: sqlite3.Row) -> WorkflowBinding:
+    binding = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
+    reservation = db.execute("SELECT workload_repository FROM budget_reservations WHERE run_id=?", (row["run_id"],)).fetchone()
+    receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?", (binding.fence.key.repository, row["run_id"])).fetchone()
+    if reservation is None or reservation["workload_repository"] != binding.fence.key.repository or receipt is None:
+        raise WorkflowAuthorityError("indexed workflow run lacks its reservation and immutable admission")
+    admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
+    metadata = json.loads(row["dispatch_id"])
+    if (admission.attempt.binding != binding or str(admission.attempt.run_id) != row["run_id"]
+        or admission.stage.value != row["kind"] or not isinstance(metadata, dict)
+        or metadata.get("leg_id") != admission.attempt.leg_id):
+        raise WorkflowAuthorityError("indexed workflow run disagrees with its immutable admission")
+    return binding
 
 
 def _split_admission_input(metadata: dict) -> SplitInput | None:
@@ -132,7 +155,7 @@ def latest_work_admission(db: sqlite3.Connection, binding: WorkflowBinding) -> R
 def proven_unlaunched_run(db: sqlite3.Connection, run_id: RunId) -> bool:
     row = db.execute(
         "SELECT 1 FROM runs r JOIN budget_reservations b USING(run_id) JOIN reservation_recovery rr USING(run_id) "
-        "WHERE r.run_id=? AND r.state='cancelled' AND r.outcome='released' AND b.state='released' "
+        "WHERE r.run_id=? AND r.state='cancelled' AND r.outcome='unlaunched_released' AND b.state='released' "
         "AND rr.policy='spawn_pending' AND r.provider_receipt_id IS NULL "
         "AND NOT EXISTS(SELECT 1 FROM charges c WHERE c.run_id=r.run_id) "
         "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id)", (str(run_id),),
@@ -623,10 +646,12 @@ class MigrationReport:
 class SchemaMigration:
     version: int
     source: str
+    transform_spec: str = ""
 
     @property
     def digest(self) -> str:
-        return hashlib.sha256(self.source.encode()).hexdigest()
+        material = self.source if not self.transform_spec else self.source + "\0" + self.transform_spec
+        return hashlib.sha256(material.encode()).hexdigest()
 
 
 _DDL = """
@@ -1086,6 +1111,55 @@ ALTER TABLE lifecycle_commands ADD COLUMN workflow_reconciliation_json TEXT;
 ALTER TABLE lifecycle_commands ADD COLUMN attempt_owner TEXT;
 """
 
+_MIGRATION_V20 = """
+-- The transaction also runs _backfill_workflow_episode_index_v20, validating
+-- legacy binding values before recording their immutable episode projection.
+ALTER TABLE runs ADD COLUMN workflow_episode_key TEXT;
+UPDATE runs SET outcome='unlaunched_released'
+WHERE state='cancelled' AND outcome='released' AND provider_receipt_id IS NULL
+    AND EXISTS(SELECT 1 FROM budget_reservations b
+               WHERE b.run_id=runs.run_id AND b.state='released')
+    AND EXISTS(SELECT 1 FROM reservation_recovery rr
+               WHERE rr.run_id=runs.run_id AND rr.policy='spawn_pending')
+    AND NOT EXISTS(SELECT 1 FROM charges c WHERE c.run_id=runs.run_id)
+    AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=runs.run_id);
+CREATE INDEX runs_adjudication_episode ON runs(workflow_episode_key)
+WHERE kind='ADJUDICATE'
+    AND NOT(state='cancelled' AND outcome IS 'unlaunched_released' AND provider_receipt_id IS NULL);
+CREATE TRIGGER runs_require_workflow_episode_insert BEFORE INSERT ON runs
+WHEN (NEW.workflow_binding_json IS NULL) != (NEW.workflow_episode_key IS NULL)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow admission requires its episode projection');
+END;
+CREATE TRIGGER runs_require_workflow_episode_update BEFORE UPDATE ON runs
+WHEN (NEW.workflow_binding_json IS NULL) != (NEW.workflow_episode_key IS NULL)
+    OR (OLD.workflow_episode_key IS NOT NULL AND NEW.workflow_episode_key IS NOT OLD.workflow_episode_key)
+BEGIN
+    SELECT RAISE(ABORT, 'workflow episode projection is immutable');
+END;
+"""
+
+_V20_TRANSFORM_SPEC = """workflow-episode-index-v1:
+Decode every non-null immutable run binding with the tagged workflow codec.
+Require a matching reservation repository and immutable admission run, binding,
+stage and leg identity. Persist compact UTF-8 JSON array of repository, typed
+target discriminator (issue/pr), target number, family, epoch and episode;
+generation is excluded.
+Iterate with bounded memory inside the same migration transaction. Any invalid
+bound history aborts the entire migration. Never use the current workflow row.
+"""
+
+
+def _backfill_workflow_episode_index_v20(db: sqlite3.Connection) -> None:
+    # This versioned transform belongs to v20's immutable migration contract.
+    # Ambiguous historical authority blocks migration, never buys fresh rounds.
+    for row in db.execute("SELECT run_id,kind,dispatch_id,workflow_binding_json FROM runs WHERE workflow_binding_json IS NOT NULL"):
+        try:
+            binding = _indexed_run_binding(db, row)
+        except ValueError as exc:
+            raise IncompatibleSchema(f"cannot project historical workflow run {row['run_id']!r}: {exc}") from exc
+        db.execute("UPDATE runs SET workflow_episode_key=? WHERE run_id=?", (workflow_episode_key(binding), row["run_id"]))
+
 
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
@@ -1109,6 +1183,7 @@ _SCHEMA_MIGRATIONS = (
     # than to `attempts`, which would import the very over-count being fixed.
     SchemaMigration(18, _MIGRATION_V18),
     SchemaMigration(19, _MIGRATION_V19),
+    SchemaMigration(20, _MIGRATION_V20, _V20_TRANSFORM_SPEC),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -1479,6 +1554,8 @@ class SQLiteControlStore:
                     return
                 for statement in _sql_statements(migration.source):
                     db.execute(statement)
+                if migration.version == 20:
+                    _backfill_workflow_episode_index_v20(db)
                 db.execute(
                     "INSERT INTO schema_migrations("
                     "version, applied_at, source_digest) VALUES (?, ?, ?)",
@@ -1537,6 +1614,24 @@ class SQLiteControlStore:
             )
 
         violations = (
+            (
+                "workflow binding lacks its episode projection",
+                "SELECT run_id FROM runs WHERE (workflow_binding_json IS NULL) != (workflow_episode_key IS NULL) LIMIT 1",
+            ),
+            (
+                "never-launched release contradicts execution or accounting evidence",
+                """
+                SELECT r.run_id FROM runs r
+                LEFT JOIN budget_reservations b USING(run_id)
+                LEFT JOIN reservation_recovery rr USING(run_id)
+                WHERE r.outcome='unlaunched_released' AND (
+                    r.state != 'cancelled' OR r.provider_receipt_id IS NOT NULL
+                    OR b.state IS NOT 'released' OR rr.policy IS NOT 'spawn_pending'
+                    OR EXISTS(SELECT 1 FROM charges c WHERE c.run_id=r.run_id)
+                    OR EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id)
+                ) LIMIT 1
+                """,
+            ),
             (
                 "active reservation recovery classification is absent",
                 """
@@ -1948,6 +2043,8 @@ class SQLiteControlStore:
     ) -> bool:
         if state not in {"completed", "cancelled", "abandoned"}:
             raise ValueError("run completion requires a terminal state")
+        if outcome == "unlaunched_released":
+            raise ValueError("never-launched evidence can only be minted by reservation release")
         with self.transaction() as db:
             row = db.execute(
                 "SELECT state, outcome, provider_receipt_id FROM runs WHERE run_id=?",
@@ -1982,6 +2079,9 @@ class SQLiteControlStore:
 
     def register_lease(self, lease: Lease) -> None:
         with self.transaction() as db:
+            run = db.execute("SELECT state FROM runs WHERE run_id=?", (str(lease.run_id),)).fetchone()
+            if run is None or run["state"] in {"completed", "cancelled", "abandoned"}:
+                raise ControlStoreError("process lease requires a nonterminal run")
             db.execute(
                 "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, "
                 "process_start_ticks, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3368,7 +3468,7 @@ class SQLiteControlStore:
                     self._record_workflow_admission(db, request, workflow_snapshot, now)
                 db.execute(
                     "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, "
-                    "config_version, workflow_binding_json) VALUES (?, ?, ?, ?, 'reserved', ?, ?)",
+                    "config_version, workflow_binding_json, workflow_episode_key) VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?)",
                     (
                         str(request.run_id),
                         request.dispatch_id,
@@ -3376,6 +3476,7 @@ class SQLiteControlStore:
                         request.owner_id,
                         request.config_version,
                         encode_workflow(request.workflow) if request.workflow is not None else None,
+                        workflow_episode_key(request.workflow) if request.workflow is not None else None,
                     ),
                 )
                 db.execute(
@@ -3616,13 +3717,15 @@ class SQLiteControlStore:
         """Match the complete authority, not a convenient subset of its IDs."""
 
         run = db.execute(
-            "SELECT dispatch_id, kind, owner_id, state, config_version, workflow_binding_json "
+            "SELECT dispatch_id, kind, owner_id, state, config_version, workflow_binding_json, workflow_episode_key "
             "FROM runs WHERE run_id=?",
             (str(request.run_id),),
         ).fetchone()
         if run is None:
             return False
         if request.workflow is not None:
+            if run["workflow_episode_key"] != workflow_episode_key(request.workflow):
+                return False
             receipt = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
                 (request.workload_repository, str(request.run_id)),
@@ -4158,6 +4261,12 @@ class SQLiteControlStore:
                 detail=f"reservation is already {reservation['state']}",
             )
         now = _stamp(self._now())
+        never_launched = db.execute(
+            "SELECT 1 FROM runs r JOIN reservation_recovery rr USING(run_id) "
+            "WHERE r.run_id=? AND r.state IN ('reserved','starting') AND rr.policy='spawn_pending' "
+            "AND r.provider_receipt_id IS NULL AND NOT EXISTS(SELECT 1 FROM charges c WHERE c.run_id=r.run_id) "
+            "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id)", (str(run_id),),
+        ).fetchone() is not None
         db.execute(
             "UPDATE budget_reservations SET state='released', release_reason=?, "
             "updated_at=? WHERE run_id=?",
@@ -4166,9 +4275,9 @@ class SQLiteControlStore:
         db.execute(
             "UPDATE runs SET "
             "state=CASE WHEN state='abandoned' THEN 'abandoned' ELSE 'cancelled' END, "
-            "outcome=CASE WHEN state='abandoned' THEN outcome ELSE 'released' END, "
+            "outcome=CASE WHEN state='abandoned' THEN outcome ELSE ? END, "
             "completed_at=? WHERE run_id=?",
-            (now, str(run_id)),
+            ("unlaunched_released" if never_launched else "released", now, str(run_id)),
         )
         db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
         self._transition(

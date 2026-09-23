@@ -1,5 +1,9 @@
 # Phase 3 split recovery — verified checkpoint handover
 
+The subsequent [re-arm preparation checkpoint](2026-09-23-phase-3-rearm-handover.md)
+closes the historical adjudication-query debt recorded below and holds the current
+next-step inventory. This file retains the split checkpoint's evidence.
+
 The full six-phase goal remains **active and incomplete**. The overall plan is
 [architecture implementation phases](2026-09-14-architecture-implementation.md).
 Phases 1–2 are accepted; phase 3 is still the current phase. Do not start phase 4
