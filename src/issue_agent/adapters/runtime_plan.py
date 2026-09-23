@@ -18,6 +18,7 @@ from ..domain.agent_task import RunIntent, RuntimeName
 from ..domain.effort import Effort
 from ..domain.outcome import AgentResult
 from ..domain.workflow_identity import WorkflowBinding
+from ..domain.resolve_return import ResolveInputs
 
 
 @dataclass(frozen=True)
@@ -56,6 +57,10 @@ class RuntimePlan:
     mcp_servers: tuple[McpServer, ...]
     subagents: tuple[SubagentDef, ...]
     env: dict[str, str]
+    # Scratch history is execution context, never authoritative task input.
+    context_prefix: str
+    context_suffix: str
+    resolve_inputs: ResolveInputs | None
 
     def __init__(
         self,
@@ -76,6 +81,9 @@ class RuntimePlan:
         *,
         intent: RunIntent | None = None,
         runtime: RuntimeName | None = None,
+        context_prefix: str = "",
+        context_suffix: str = "",
+        resolve_inputs: ResolveInputs | None = None,
     ) -> None:
         selected_intent = intent
         if selected_intent is None:
@@ -101,10 +109,17 @@ class RuntimePlan:
         object.__setattr__(self, "mcp_servers", mcp_servers)
         object.__setattr__(self, "subagents", subagents)
         object.__setattr__(self, "env", dict(env or {}))
+        if not isinstance(context_prefix, str) or not isinstance(context_suffix, str):
+            raise ValueError("runtime context must be text")
+        object.__setattr__(self, "context_prefix", context_prefix)
+        object.__setattr__(self, "context_suffix", context_suffix)
+        if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
+            raise ValueError("resolve completion inputs must be validated")
+        object.__setattr__(self, "resolve_inputs", resolve_inputs)
 
     @property
     def prompt(self) -> str:
-        return self.intent.prompt
+        return self.context_prefix + self.intent.prompt + self.context_suffix
 
     @property
     def schema(self) -> dict | None:

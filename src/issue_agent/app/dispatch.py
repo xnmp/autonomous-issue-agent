@@ -25,6 +25,7 @@ from ..adapters.runtime_plan import (
     AgentRuntime,
     ContextualRuntime,
 )
+from ..adapters.workflow_rows import WorkflowAuthorityError
 from ..domain.agent_task import (
     RuntimeName,
 )
@@ -40,6 +41,7 @@ from ..domain.ports import (
     WorkflowGitHubReads,
     WorkflowState,
 )
+from ..domain.workflow_ports import WorkflowControl
 from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
@@ -230,6 +232,7 @@ class AgentDispatcher:
         reserve_fix_paths: Callable[[int, frozenset[str]], bool] | None = None,
         dedupe: ControlStore | None = None,
         dispatch_claim_target: Callable[[RunAgent], int | None] | None = None,
+        workflow_control: WorkflowControl | None = None,
     ):
         self.cfg = cfg
         self.gw = gateway
@@ -254,6 +257,7 @@ class AgentDispatcher:
             executor,
             prepare_cwd,
             reserve_fix_paths,
+            workflow_control,
         )
         self.review_workflow = ReviewWorkflow(
             replace(cfg.review_workflow_config(), journal=journal),
@@ -405,6 +409,8 @@ class AgentDispatcher:
         }.get(action.kind)
         if handler is None:
             return
+        if action.kind in {AgentKind.RESOLVE, AgentKind.RESUME}:
+            handler = partial(handler, binding=action.workflow)
         issue, resolved, claim_target = self._spend_target(action)
         if action.kind in {
             AgentKind.PR_RESUME,
@@ -483,6 +489,15 @@ class AgentDispatcher:
             # that ignores Ctrl-C, and a swallowed CancelledError is a task that
             # refuses to die.
             raise
+        except WorkflowAuthorityError as exc:
+            # Authority holds are not provider deaths and cannot spend the
+            # independent infrastructure allowance while migration is pending.
+            self.cfg.log(f"{action.kind.name} #{action.number} held: {exc}")
+            if self.journal is not None:
+                self.journal.emit(TelemetryEvent(
+                    TelemetryWarning("workflow_authority_held", str(exc)),
+                    Correlation(issue=issue),
+                ))
         except BaseException as exc:
             # Review C3. A session that dies BEFORE `runner.run` returns RAISES
             # (agent_runner.py, deliberately), so the whole workflow tail —

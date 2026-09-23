@@ -58,6 +58,7 @@ def test_ci_resume_preserves_selected_answer_beyond_discussion_comment_limit(tmp
                 checks=(Check("native", bucket="fail"),),
                 comments=(Comment("owner", answer, "2026-09-14T00:00:00Z"),))
     store = Store(str(tmp_path))
+    store.save_session(5, "blocked-pr-session")
     runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
     gateway = Gateway(issues={5: IssueView(5, "renderer")}, prs={100: pr})
     asyncio.run(_ci_dispatcher(gateway, store, runner).dispatch(RunAgent(AgentKind.PR_RESUME, 100)))

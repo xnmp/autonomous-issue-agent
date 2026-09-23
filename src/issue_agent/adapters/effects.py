@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import sqlite3
 import sys
 from dataclasses import fields, is_dataclass, replace
 from enum import Enum
@@ -31,6 +32,7 @@ from ..domain.lifecycle import (
 )
 from ..domain.repository import canonical_repository
 from ..domain.workflow_identity import WorkflowBinding
+from ..domain.workflow import ReconciliationOnly, RetiredUncertainCommand
 from ..domain.contracts import (
     CommandId,
     CommandKind,
@@ -190,34 +192,24 @@ class ImmediateGitHubEffectExecutor:
             if current.state == "open":
                 action = replace(action, completion_guard=completion_guard(current, action.operation))
         if isinstance(action, Relabel):
-            removals = action.removed_labels
-            self.gateway.relabel(
-                _TARGET[action.target],
-                action.number,
-                removals[0].value if removals else None,
-                action.add.value if action.add else None,
-            )
-            for label in removals[1:]:
-                self.gateway.relabel(
-                    _TARGET[action.target], action.number, label.value, None
-                )
-            if not isinstance(self.gateway, LabelVerifier):
-                return True
+            if _is_compound_relabel(action):
+                current = self.gateway.get_issue(action.number)
+                if (
+                    current.updated_at != action.expected_revision
+                    and not GitHubEffectExecutor._relabel_partially_applied(
+                        self, action
+                    )
+                ):
+                    raise StaleExpectedRevision(
+                        f"issue:{action.number}: expected revision no longer "
+                        "matches the remote target"
+                    )
+            GitHubEffectExecutor._apply(self, action)
+            verified = GitHubEffectExecutor._reconcile(self, action)
             return (
-                (
-                    action.add is None
-                    or self.gateway.has_label(
-                        _TARGET[action.target], action.number, action.add.value
-                    )
-                )
-                and (
-                    all(
-                        not self.gateway.has_label(
-                            _TARGET[action.target], action.number, label.value
-                        )
-                        for label in action.removed_labels
-                    )
-                )
+                True
+                if verified is None and not _is_compound_relabel(action)
+                else verified
             )
         if isinstance(action, PostComment):
             if (
@@ -622,19 +614,27 @@ class GitHubEffectExecutor:
         """Resume durable commands after restart without blindly repeating ambiguity."""
 
         completed = 0
-        for pending in self.store.pending_commands(
+        for pending in self.store.runnable_commands(
             repository=self.repository,
             executor_identity=self.identity,
+            diagnose=self.log,
         ):
             command = pending.command
             if command.kind not in _OWNED_COMMAND_KINDS:
                 self._note_unowned_kind(command.kind)
                 continue
             try:
-                if command.kind is CommandKind.SUBMIT_REVIEW:
+                reconciliation = self.store.command_reconciliation(command.command_id)
+                if isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
+                    applied = self._reconcile_read_only(command, reconciliation)
+                elif command.kind is CommandKind.SUBMIT_REVIEW:
                     applied = self._run_review_command(pending)
                 else:
                     applied = self.execute(action_from_command(command))
+            except sqlite3.Error:
+                # Storage failure invalidates this recovery pass, unlike one
+                # malformed or unavailable remote target.
+                raise
             except Exception as exc:  # noqa: BLE001 — see below
                 # One command must not stop the drain: an unreconstructable
                 # payload or a single wedged target would otherwise strand
@@ -652,6 +652,39 @@ class GitHubEffectExecutor:
             if applied:
                 completed += 1
         return completed
+
+    def _reconcile_read_only(
+        self, command: LifecycleCommand,
+        state: ReconciliationOnly | RetiredUncertainCommand,
+    ) -> bool:
+        def observe() -> bool:
+            error = ""
+            try:
+                if command.kind is CommandKind.SUBMIT_REVIEW:
+                    payload = command.payload
+                    present = self.gateway.has_review(int(payload["pr"]), str(payload["event"]), str(payload["body"]), str(payload["head"])) if isinstance(self.gateway, ReviewVerifier) else None
+                else:
+                    action = action_from_command(command)
+                    if isinstance(action, Relabel) and _is_compound_relabel(action):
+                        # Current postcondition evidence does not authorize a
+                        # mutation. A changed guard cannot hide retired debt.
+                        issue = self.gateway.get_issue(action.number)
+                        present = (
+                            all(label in issue.labels for label in action.added_labels)
+                            and all(label not in issue.labels for label in action.removed_labels)
+                            and (not action.comment or any(item.body == action.comment for item in issue.comments))
+                        )
+                    else:
+                        present = self._reconcile(action, command)
+            except sqlite3.Error:
+                raise
+            except Exception as exc:  # noqa: BLE001 — bounded durable failed-read evidence
+                present, error = None, f"{type(exc).__name__}: {exc}"
+            return self.store.record_reconciliation_read(
+                command.command_id, state, executor_identity=self.identity,
+                observed=present, error=error,
+            )
+        return self.effects.authorized(observe)
 
     def _note_unowned_kind(self, kind: CommandKind) -> None:
         """Report a queued kind belonging to another executor once per process.
@@ -738,6 +771,29 @@ class GitHubEffectExecutor:
         command: LifecycleCommand | None = None,
     ):
         if isinstance(action, Relabel):
+            if _is_compound_relabel(action):
+                self._validate_completion(action, partial=True)
+                current = self.gateway.get_issue(action.number)
+                if action.comment and not any(
+                    item.body == action.comment for item in current.comments
+                ):
+                    self.gateway.comment("issue", action.number, action.comment)
+                    self._validate_completion(action, partial=True)
+                for label in action.added_labels:
+                    current = self.gateway.get_issue(action.number)
+                    if label not in current.labels:
+                        self.gateway.relabel(
+                            "issue", action.number, None, label.value
+                        )
+                        self._validate_completion(action, partial=True)
+                for label in action.removed_labels:
+                    current = self.gateway.get_issue(action.number)
+                    if label in current.labels:
+                        self.gateway.relabel(
+                            "issue", action.number, label.value, None
+                        )
+                        self._validate_completion(action, partial=True)
+                return True
             self._validate_completion(action, partial=True)
             removals = action.removed_labels
             self.gateway.relabel(
@@ -848,6 +904,23 @@ class GitHubEffectExecutor:
         self, action: Action, command: LifecycleCommand | None = None
     ) -> bool | None:
         if isinstance(action, Relabel):
+            if _is_compound_relabel(action):
+                self._validate_completion(action, partial=True)
+                current = self.gateway.get_issue(action.number)
+                return (
+                    all(label in current.labels for label in action.added_labels)
+                    and all(
+                        label not in current.labels
+                        for label in action.removed_labels
+                    )
+                    and (
+                        not action.comment
+                        or any(
+                            item.body == action.comment
+                            for item in current.comments
+                        )
+                    )
+                )
             if not isinstance(self.gateway, LabelVerifier):
                 return None
             added = (
@@ -993,9 +1066,18 @@ class GitHubEffectExecutor:
             return False
         current = self.gateway.get_issue(action.number)
         guard = action.completion_guard
-        return current.labels != guard.labels and completion_matches(
-            guard, current, removed=action.removed_labels,
-            added=(action.add,) if action.add else (),
+        current_comments = tuple(
+            (item.author, item.body, item.created_at)
+            for item in current.comments
+        )
+        return (
+            current.labels != guard.labels or current_comments != guard.comments
+        ) and completion_matches(
+            guard,
+            current,
+            removed=action.removed_labels,
+            added=action.added_labels,
+            comment=action.comment,
         )
 
     def reconcile(self, action: Action) -> bool | None:
@@ -1143,7 +1225,8 @@ class GitHubEffectExecutor:
                 removed, added, comment = action.remove_labels, action.add_labels, action.comment
             else:
                 removed = action.removed_labels
-                added = (action.add,) if action.add else ()
+                added = action.added_labels
+                comment = action.comment
         if not completion_matches(guard, current, removed=removed, added=added, comment=comment):
             raise StaleExpectedRevision(f"issue:{action.number}: completion facts changed")
         permission = completion_eligibility(current, guard.operation, action)
@@ -1168,6 +1251,14 @@ def command_for_action(
     kind, target = _command_identity(action)
     action_payload = _jsonable(action)
     action_payload.pop("workflow", None)
+    if isinstance(action, Relabel):
+        # These optional fields extend the existing relabel command. Omitting
+        # empty defaults preserves the digest of commands minted before the
+        # compound projection capability existed.
+        if not action.adds:
+            action_payload.pop("adds", None)
+        if not action.comment:
+            action_payload.pop("comment", None)
     payload = {**action_payload, **dict(payload_extra or {})}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     revision = (
@@ -1207,6 +1298,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
                 str(payload["head"]),
                 str(payload["body"]),
             )
+        adds, comment = _relabel_projection_from_payload(payload)
         return Relabel(
             Target(payload["target"]),
             int(payload["number"]),
@@ -1225,6 +1317,8 @@ def action_from_command(command: LifecycleCommand) -> Action:
             tuple(Label(str(label)) for label in payload.get("removes", ())),
             _completion_guard_from_payload(payload.get("completion_guard")),
             workflow=command.workflow,
+            adds=adds,
+            comment=comment,
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(
@@ -1333,6 +1427,28 @@ def _expected_revision(action: Action) -> str | None:
         )
         else None
     )
+
+
+def _is_compound_relabel(action: Relabel) -> bool:
+    return bool(action.adds or action.comment)
+
+
+def _relabel_projection_from_payload(
+    payload: Mapping[str, object],
+) -> tuple[tuple[Label, ...], str]:
+    raw_adds = payload.get("adds", ())
+    if not isinstance(raw_adds, (tuple, list)) or not all(
+        isinstance(label, str) for label in raw_adds
+    ):
+        raise ValueError("malformed relabel projection labels")
+    raw_comment = payload.get("comment", "")
+    if (
+        not isinstance(raw_comment, str)
+        or len(raw_comment) > 65536
+        or "\x00" in raw_comment
+    ):
+        raise ValueError("malformed relabel projection comment")
+    return tuple(Label(label) for label in raw_adds), raw_comment
 
 
 def _run_attempt_baseline(

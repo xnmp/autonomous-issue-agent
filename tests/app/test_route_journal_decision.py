@@ -7,7 +7,8 @@ from issue_agent.adapters.journal import JournalingRuntime, read_events
 from issue_agent.adapters.store import Store
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import FixTaskConfig
-from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
+from issue_agent.app.workflows.fix import FixWorkflowConfig
+from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.effort import Effort
 from issue_agent.domain.outcome import AgentResult
@@ -27,7 +28,7 @@ def test_route_event_records_the_decision_not_the_probe_model(tmp_path):
     gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={})
     store = FakeStore()
     worktrees = FakeWorktrees()
-    workflow = FixWorkflow(
+    workflow = AccountedFixtureWorkflow(
         FixWorkflowConfig(
             base_branch="dev",
             fix=FixTaskConfig("o/r", agent_md="AM", effort=Effort.HIGH),
@@ -40,6 +41,7 @@ def test_route_event_records_the_decision_not_the_probe_model(tmp_path):
             remove_worktree=worktrees.remove,
             clear_issue_state=getattr(store, "cleanup_pr", None),
         ),
+        workflow_control=attach_workflow_authority(gateway, store),
     )
 
     asyncio.run(workflow.resolve(5))

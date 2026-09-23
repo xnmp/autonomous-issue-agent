@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import hashlib
+import json
 
 from .effort import Effort
 
@@ -12,6 +14,17 @@ class RuntimeName(str, Enum):
     CLAUDE = "claude"
     CODEX = "codex"
     GLM = "glm"
+
+
+def run_input_fingerprint(intent: RunIntent) -> str:
+    """Identify supplied requirements/instructions, not provider selection or cost."""
+    if not isinstance(intent, RunIntent):
+        raise ValueError("input fingerprint requires a validated run intent")
+    value = json.dumps(
+        (intent.prompt, intent.system_instruction, intent.schema),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+    )
+    return hashlib.sha256(value.encode()).hexdigest()
 
 
 @dataclass(frozen=True)

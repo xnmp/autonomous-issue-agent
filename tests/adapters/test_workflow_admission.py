@@ -9,6 +9,7 @@ import pytest
 from issue_agent.adapters.control_store import AccountingDisposition, ReservationRequest, SQLiteControlStore
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+from issue_agent.domain.agent_task import RunIntent, run_input_fingerprint
 from issue_agent.domain.contracts import BudgetScope, Money, PriceQuote, ReservationId, RunId
 from issue_agent.domain.workflow import ResolveAdmission, ResolveEpisode, ResolveStage
 from issue_agent.domain.workflow_identity import WorkflowWriter
@@ -26,12 +27,14 @@ def control(tmp_path):
     return store
 
 
-def request(name, *, binding=None, stage="RESOLVE", ceiling=None, cap=100):
+def request(name, *, binding=None, stage="RESOLVE", ceiling=None, cap=100, intent=None):
     binding = binding or resolve_snapshot().binding
+    intent = intent or RunIntent(f"Resolve issue {binding.fence.key.target.number}")
     return ReservationRequest(
         ReservationId("reservation:" + name), RunId(name),
         json.dumps({"repository": "o/r", "role": "fix", "kind": stage,
                     "leg_id": "leg:" + name, "runtime": "codex",
+                    "input_fingerprint": run_input_fingerprint(intent),
                     "issue": binding.fence.key.target.number}),
         BudgetScope("o/r", "daily", "USD", "2026-09-14", NOW,
                     NOW + timedelta(days=1), ZoneInfo("UTC")),
@@ -73,6 +76,33 @@ def test_concurrent_admissions_allocate_unique_order(control):
     assert all(result.admitted for result in results)
     assert {admission(control, f"run-{n}").revision.version for n in range(4)} == {1, 2, 3, 4}
     assert snapshot(control).revision.version == 4
+
+
+def test_author_admission_retains_supplied_inputs_and_replay_cannot_change_them(control):
+    intent = RunIntent("Author issue 7 contract", system_instruction="Preserve public behavior",
+                       schema={"type": "object", "required": ["tests"]})
+    accepted = request("author", stage="AUTHOR", intent=intent)
+    assert control.reserve(accepted).admitted
+    restarted = SQLiteControlStore(control.path, now=lambda: NOW)
+    assert admission(restarted, "author").input_fingerprint == run_input_fingerprint(intent)
+    assert restarted.reserve(accepted).admitted
+    changed = request("author", stage="AUTHOR", intent=replace(intent, prompt="Changed requirements"))
+    assert restarted.reserve(changed).disposition is AccountingDisposition.CONFLICT
+    assert snapshot(restarted).revision.version == 1
+
+
+@pytest.mark.parametrize("fingerprint", [None, "", True, 123, "a" * 63, "a" * 65, "G" * 64, "a" * 63 + "\n"])
+def test_author_without_valid_input_provenance_cannot_buy_admission(control, fingerprint):
+    original = request("author", stage="AUTHOR")
+    metadata = json.loads(original.dispatch_id)
+    if fingerprint is None:
+        metadata.pop("input_fingerprint")
+    else:
+        metadata["input_fingerprint"] = fingerprint
+    assert not control.reserve(replace(original, dispatch_id=json.dumps(metadata))).admitted
+    assert admission(control, "author") is None
+    assert snapshot(control).revision.version == 0
+    assert control.active_reservation_runs() == ()
 
 
 def test_budget_denial_does_not_allocate_workflow_order(control):

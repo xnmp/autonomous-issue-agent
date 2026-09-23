@@ -9,16 +9,22 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from ..domain.contracts import EffectStatus, PricingBasis
+from ..domain.contracts import EffectStatus, PricingBasis, WorkflowAttemptIdentity
+from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
+from ..domain.contracts import CommandId
+from ..domain.outcome import budget_exhausted, infra_class_failure
+from ..domain.resolve_return import (
+    FinalizedResolveReturn, PendingResolveReturn, ResolveCleanupCompleted, ReturnedResolve, RetiredResolveReturn, UnavailableResolveReturn,
+)
 from ..domain.workflow import (
-    ActiveReconciliation, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
-    ContinueGrantedRearm, HeldProjection, LinkedPrPresent, ObservedIssue, ObservedTransition, OpenGate,
-    PendingRearm, RearmingGate, RearmIntent, ReconciliationOnly, RemoteOutcomeUncertain,
-    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmPreflight, ResolveResultKind, RetiredSettledCommand, RetiredUncertainCommand,
+    AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
+    ContinueGrantedRearm, HeldProjection, LinkedPrPresent, NoLinkedPr, ObservedIssue, ObservedTransition, OpenGate,
+    PendingRearm, RearmingGate, RearmIntent, RemoteOutcomeUncertain,
+    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmPreflight, ResolveResultKind,
     StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
     WorkflowConflict, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
     WorkflowUnchanged, WorkflowRejected,
@@ -27,9 +33,14 @@ from ..domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
     WorkflowWriter, validate_workflow_identifier, validate_workflow_integer,
 )
-from ..domain.workflow_policy import initial_resolve_workflow, record_resolve_attempt, validate_resolve_transition
-from .control_store import SQLiteControlStore
-from .deployment_authority import deployment_role
+from ..domain.workflow_policy import (
+    apply_return_cleanup, decide_return, defer_return_observation, initial_resolve_workflow,
+    record_resolve_attempt, resolve_return_actions, return_gate_id,
+    update_return_observation, validate_resolve_transition,
+)
+from .control_store import AccountingDisposition, SettlementRequest, SettlementResult, SQLiteControlStore, _command_from_row
+from .effects import command_for_action
+from .deployment_authority import DeploymentAuthority, deployment_role
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, load_workflow_row, workflow_scope
 
@@ -178,6 +189,286 @@ class SQLiteWorkflowControl:
             raise WorkflowAuthorityError("held projection requires available workflow authority")
         return HeldProjection(state)
 
+    @staticmethod
+    def _return_proof(returned: ReturnedResolve) -> ResolveAttemptResult:
+        result = returned.result()
+        kind = (ResolveResultKind.BUDGET_REFUSAL if budget_exhausted(result.exit_reason) else
+                ResolveResultKind.INFRA_FAILURE if infra_class_failure(result) else ResolveResultKind.STAGE_PROGRESSED)
+        # This value only selects the settlement validation contract. It is
+        # never recorded as a provisional paid classification.
+        return ResolveAttemptResult(returned.attempt, kind, stage=returned.stage, session=returned.session)
+
+    def _return_prior(self, db: sqlite3.Connection, returned: ReturnedResolve) -> tuple[WorkflowSnapshot, ResolveAdmission]:
+        self._scope(returned.attempt.binding.fence.key)
+        self._control._assert_owner_active(db, self.writer.owner_id)
+        prior = load_workflow_row(db, returned.attempt.binding.fence.key)
+        if prior is None:
+            raise WorkflowAuthorityError("paid return requires existing workflow authority")
+        admission = self._validate_attempt_run(db, self._return_proof(returned))
+        if admission.revision.version > prior.revision.version or returned.returned_at > self._control._now():
+            raise WorkflowAuthorityError("paid return or admission is newer than current authority")
+        return prior, admission
+
+    def _return_row(self, db: sqlite3.Connection, namespace: str, returned: ReturnedResolve):
+        return db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                          (namespace, self.writer.repository, str(returned.attempt.run_id))).fetchone()
+
+    def _return_disposition(self, db: sqlite3.Connection, returned: ReturnedResolve) -> FinalizedResolveReturn | RetiredResolveReturn | None:
+        row = self._return_row(db, "workflow-return-disposition", returned)
+        if row is None:
+            return None
+        disposition = decode_workflow(row["payload_json"], FinalizedResolveReturn | RetiredResolveReturn)
+        attempt = disposition.result.attempt if isinstance(disposition, FinalizedResolveReturn) else disposition.attempt
+        if attempt != returned.attempt:
+            raise WorkflowAuthorityError("paid return disposition belongs to another attempt")
+        if isinstance(disposition, FinalizedResolveReturn):
+            result = self._return_row(db, "workflow-result", returned)
+            if result is None or result["payload_json"] != encode_workflow(disposition.result) or disposition.result.stage is not returned.stage:
+                raise WorkflowAuthorityError("paid return disposition disagrees with final classification")
+            for command_id in disposition.commands:
+                command = db.execute("SELECT repository,workflow_binding_json FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+                if command is None or command["repository"] != self.writer.repository or decode_workflow(command["workflow_binding_json"], WorkflowBinding) != returned.attempt.binding:
+                    raise WorkflowAuthorityError("paid return disposition lacks its bound completion command")
+                provenance = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-command' AND scope=? AND key=?",
+                                        (self.writer.repository, str(command_id))).fetchone()
+                if provenance is None or decode_workflow(provenance["payload_json"], WorkflowAttemptIdentity) != returned.attempt:
+                    raise WorkflowAuthorityError("paid return command lacks its admitted occurrence provenance")
+            if not returned.is_error and returned.status in ("pushed", "done") and disposition.issue.issue.state == "closed" and isinstance(disposition.linkage, NoLinkedPr):
+                cleanup_row = self._return_row(db, "workflow-return-cleanup", returned)
+                if cleanup_row is None:
+                    raise WorkflowAuthorityError("terminal returned result lacks its cleanup acknowledgement")
+                cleanup = decode_workflow(cleanup_row["payload_json"], ResolveCleanupCompleted)
+                if cleanup != ResolveCleanupCompleted(returned.attempt, disposition.issue, disposition.linkage) or disposition.result.session is not None:
+                    raise WorkflowAuthorityError("terminal returned result disagrees with its cleanup acknowledgement")
+        return disposition
+
+    def _insert_return_record(self, db: sqlite3.Connection, namespace: str, returned: ReturnedResolve, payload: str, *, at: datetime | None = None) -> None:
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                   (namespace, self.writer.repository, str(returned.attempt.run_id),
+                    (at or self._control._now()).isoformat(), payload))
+
+    def _retire_return(self, db: sqlite3.Connection, prior: WorkflowSnapshot, returned: ReturnedResolve) -> WorkflowSnapshot:
+        after = update_return_observation(prior, returned, None)
+        self._persist_snapshot(db, after)
+        self._insert_return_record(db, "workflow-return-disposition", returned,
+                                   encode_workflow(RetiredResolveReturn(returned.attempt, prior.binding)))
+        self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "retired",
+                                  {"generation": prior.revision.fence.generation})
+        return after
+
+    def capture_return(self, returned: ReturnedResolve) -> WorkflowCommitted | WorkflowConflict:
+        with self._control.transaction() as db:
+            return self._capture_return(db, returned)
+
+    def _capture_return(self, db: sqlite3.Connection, returned: ReturnedResolve) -> WorkflowCommitted | WorkflowConflict:
+        if not isinstance(returned, ReturnedResolve):
+            raise ValueError("capture requires a typed paid return")
+        encoded = encode_workflow(returned)
+        prior, _ = self._return_prior(db, returned)
+        existing = self._return_row(db, "workflow-return", returned)
+        if existing is not None:
+            if existing["payload_json"] != encoded:
+                return WorkflowConflict(prior.revision, "paid return identity already contains different evidence")
+            self._return_disposition(db, returned)
+            return WorkflowCommitted(prior, idempotent=True)
+        if self._return_row(db, "workflow-result", returned) is not None:
+            return WorkflowConflict(prior.revision, "paid run was already classified without this return receipt")
+        self._insert_return_record(db, "workflow-return", returned, encoded)
+        if prior.binding != returned.attempt.binding:
+            return WorkflowCommitted(self._retire_return(db, prior, returned))
+        pending = PendingResolveReturn(returned, self._control._now())
+        self._insert_return_record(db, "workflow-return-observation", returned, encode_workflow(pending), at=pending.next_read_at)
+        after = update_return_observation(prior, returned, pending)
+        self._persist_snapshot(db, after)
+        self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "captured",
+                                  {"generation": after.revision.fence.generation})
+        return WorkflowCommitted(after)
+
+    def settle_return(self, request: SettlementRequest, returned: ReturnedResolve) -> SettlementResult:
+        """Money and recoverable paid output share the existing settlement commit."""
+        if not isinstance(request, SettlementRequest) or not isinstance(returned, ReturnedResolve) or request.run_id != returned.attempt.run_id:
+            raise ValueError("atomic settlement requires this paid return's run")
+        self._scope(returned.attempt.binding.fence.key)
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            settled = self._control._settle(db, request)
+            if settled.disposition is AccountingDisposition.AVAILABLE:
+                captured = self._capture_return(db, returned)
+                if isinstance(captured, WorkflowConflict):
+                    raise WorkflowAuthorityError(captured.reason)
+            return settled
+
+    def returned_result(self, attempt: WorkflowAttemptIdentity) -> ReturnedResolve | None:
+        if not isinstance(attempt, WorkflowAttemptIdentity):
+            raise ValueError("returned result lookup requires a captured attempt")
+        self._scope(attempt.binding.fence.key)
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?",
+                             (self.writer.repository, str(attempt.run_id))).fetchone()
+            if row is None:
+                return None
+            returned = decode_workflow(row["payload_json"], ReturnedResolve)
+            if returned.attempt != attempt:
+                raise WorkflowAuthorityError("returned result lookup disagrees with the admitted attempt")
+            self._return_prior(db, returned)
+            self._return_disposition(db, returned)
+            return returned
+
+    def pending_returns(self, *, limit: int = 32) -> tuple[PendingResolveReturn | UnavailableResolveReturn, ...]:
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("return reconciliation limit must be between 1 and 128")
+        pending: list[PendingResolveReturn | UnavailableResolveReturn] = []
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            now = self._control._now()
+            # Operational recovery trusts atomic terminal records and scheduling
+            # indexes; this is not an audit of arbitrary at-rest DB tampering.
+            # Direct return lookup/capture/finalize still validate dispositions.
+            rows = db.execute(
+                "SELECT raw.key AS run_id, raw.payload_json AS returned_json, observation.payload_json AS observation_json "
+                "FROM dedupe_keys raw LEFT JOIN dedupe_keys observation ON observation.namespace='workflow-return-observation' "
+                "AND observation.scope=raw.scope AND observation.key=raw.key LEFT JOIN runs ON runs.run_id=raw.key "
+                "LEFT JOIN dedupe_keys done ON done.namespace='workflow-return-disposition' AND done.scope=raw.scope AND done.key=raw.key "
+                "WHERE raw.namespace='workflow-return' AND raw.scope=? AND (runs.owner_id=? OR runs.run_id IS NULL) "
+                "AND done.key IS NULL "
+                "AND COALESCE(julianday(raw.claimed_at), 0)<=julianday(?) "
+                "AND COALESCE(julianday(observation.claimed_at), 0)<=julianday(?) "
+                "ORDER BY julianday(raw.claimed_at), raw.key LIMIT ?",
+                (self.writer.repository, self.writer.owner_id, now.isoformat(), now.isoformat(), limit),
+            ).fetchall()
+            for row in rows:
+                db.execute("SAVEPOINT returned_observation")
+                try:
+                    returned = decode_workflow(row["returned_json"], ReturnedResolve)
+                    if str(returned.attempt.run_id) != row["run_id"]:
+                        raise WorkflowAuthorityError("paid return index disagrees with its admitted run")
+                    item = decode_workflow(row["observation_json"], PendingResolveReturn)
+                    if item.returned != returned:
+                        raise WorkflowAuthorityError("pending observation disagrees with immutable paid return")
+                    prior, _ = self._return_prior(db, returned)
+                    if prior.binding != returned.attempt.binding:
+                        self._retire_return(db, prior, returned)
+                    elif item.next_read_at <= now:
+                        pending.append(item)
+                except (ValueError, TypeError, KeyError) as exc:
+                    db.execute("ROLLBACK TO returned_observation")
+                    next_read = now + timedelta(hours=1)
+                    reason = (str(exc) or type(exc).__name__).replace("\x00", "\\0")[:16384]
+                    record_key = row["run_id"]
+                    try:
+                        validate_workflow_identifier(record_key, "paid return index")
+                    except ValueError:
+                        record_key = "invalid-index:" + hashlib.sha256(repr(record_key).encode("utf-8", "backslashreplace")).hexdigest()
+                        reason = "Invalid paid return index; " + reason[:16000]
+                    self._schedule_return_audit(db, row["run_id"], next_read)
+                    self._control._transition(db, "workflow_return", record_key, "authority_unavailable",
+                                              {"reason": reason, "next_read_at": next_read.isoformat()})
+                    pending.append(UnavailableResolveReturn(record_key, reason, next_read))
+                finally:
+                    db.execute("RELEASE returned_observation")
+        return tuple(pending)
+
+    def _schedule_return_audit(self, db: sqlite3.Connection, run_id: str, at: datetime) -> None:
+        # The raw payload and its returned_at remain immutable. This existing
+        # index doubles as a fair scan cursor: corrupt prefixes cannot
+        # monopolize a bounded recovery batch, including after process restart.
+        db.execute("UPDATE dedupe_keys SET claimed_at=? WHERE namespace='workflow-return' AND scope=? AND key=?",
+                   (at.isoformat(), self.writer.repository, run_id))
+
+    def defer_return(self, returned: ReturnedResolve, error: str) -> None:
+        with self._control.transaction() as db:
+            prior, _ = self._return_prior(db, returned)
+            self._require_return(db, returned)
+            if self._return_disposition(db, returned) is not None:
+                return
+            if prior.binding != returned.attempt.binding:
+                self._retire_return(db, prior, returned)
+                return
+            row = self._return_row(db, "workflow-return-observation", returned)
+            if row is None:
+                raise WorkflowAuthorityError("paid return lacks observation scheduling evidence")
+            previous = decode_workflow(row["payload_json"], PendingResolveReturn)
+            if previous.returned != returned:
+                raise WorkflowAuthorityError("paid return observation payload changed")
+            pending = defer_return_observation(previous, error, now=self._control._now())
+            db.execute("UPDATE dedupe_keys SET claimed_at=?,payload_json=? WHERE namespace='workflow-return-observation' AND scope=? AND key=?",
+                       (pending.next_read_at.isoformat(), encode_workflow(pending), self.writer.repository, str(returned.attempt.run_id)))
+            self._persist_snapshot(db, update_return_observation(prior, returned, pending))
+            self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "observation_deferred",
+                                      {"failed_reads": pending.failed_reads, "next_read_at": pending.next_read_at.isoformat()})
+
+    def _require_return(self, db: sqlite3.Connection, returned: ReturnedResolve) -> None:
+        row = self._return_row(db, "workflow-return", returned)
+        if row is None or row["payload_json"] != encode_workflow(returned):
+            raise WorkflowAuthorityError("completion requires its exact immutable paid return")
+
+    @contextmanager
+    def return_effect_authority(self, returned: ReturnedResolve):
+        with DeploymentAuthority(self._control, self.writer.repository, self.writer.role, self.writer.owner_id).effect():
+            with self._control.transaction() as db:
+                prior, _ = self._return_prior(db, returned)
+                self._require_return(db, returned)
+                if self._return_disposition(db, returned) is not None or prior.binding != returned.attempt.binding:
+                    raise WorkflowAuthorityError("returned local effects require current unfinished authority")
+                if not prior.gates or any(_opened(g).gate_id != return_gate_id(returned) for g in prior.gates):
+                    raise WorkflowAuthorityError("returned local effects are held by another cause")
+            # Acceptance/owner retirement requires the exclusive deployment
+            # barrier; the shared barrier spans I/O but no SQL transaction does.
+            yield
+
+    def finalize_return(self, returned: ReturnedResolve, issue: ObservedIssue, linkage: NoLinkedPr | LinkedPrPresent,
+                        *, cleanup: ResolveCleanupCompleted | None = None) -> WorkflowCommitted | WorkflowConflict:
+        with self._control.transaction() as db:
+            prior, admission = self._return_prior(db, returned)
+            self._require_return(db, returned)
+            if self._return_disposition(db, returned) is not None:
+                return WorkflowCommitted(prior, idempotent=True)
+            if prior.binding != returned.attempt.binding:
+                return WorkflowCommitted(self._retire_return(db, prior, returned))
+            classified, actions = decide_return(returned, issue, linkage, now=self._control._now())
+            remaining = replace(prior, gates=tuple(g for g in prior.gates if _opened(g).gate_id != return_gate_id(returned)))
+            if any(not isinstance(action, Relabel) for action in actions):
+                if remaining.gates:
+                    return WorkflowConflict(prior.revision, "another workflow gate still holds local cleanup")
+                expected_cleanup = (RemoveWorktree(issue.issue.number), ClearIssueState(pr=None, issue=issue.issue.number, merged=True))
+                if actions != expected_cleanup or not isinstance(cleanup, ResolveCleanupCompleted) or cleanup.attempt != returned.attempt or cleanup.issue != issue or cleanup.linkage != linkage:
+                    return WorkflowConflict(prior.revision, "closed-issue local cleanup requires durable completion evidence")
+                actions = ()
+            elif cleanup is not None:
+                return WorkflowConflict(prior.revision, "unexpected cleanup acknowledgement for remote completion")
+            if self._return_row(db, "workflow-result", returned) is not None:
+                return WorkflowConflict(prior.revision, "paid return already has an independently recorded classification")
+            self._validate_attempt_run(db, classified)
+            proposal = record_resolve_attempt(prior, classified, ceiling=self._resolve_ceiling, admission=admission)
+            if isinstance(proposal, WorkflowRejected):
+                return WorkflowConflict(prior.revision, proposal.reason)
+            after = proposal.snapshot
+            # Capture did not advance the continuation watermark, so the final
+            # blocked RESUME can still clear this exact run's returned session.
+            after = replace(after, gates=tuple(g for g in after.gates if _opened(g).gate_id != return_gate_id(returned)),
+                            revision=replace(prior.revision, version=prior.revision.version + 1))
+            if cleanup is not None:
+                after = apply_return_cleanup(after, cleanup)
+            self._persist_snapshot(db, after)
+            commands = []
+            for index, action in enumerate(resolve_return_actions(after, actions, prior=prior)):
+                command = command_for_action(action, repository=self.writer.repository, executor_identity=self.writer.owner_id)
+                occurrence = hashlib.sha256(f"{returned.attempt.run_id}\0{index}\0{command.command_id}".encode()).hexdigest()
+                command = replace(command, command_id=CommandId(occurrence), idempotency_key=f"resolve-return:{occurrence}")
+                self._control._enqueue_command(db, command)
+                db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-return-command',?,?,?,?)",
+                           (self.writer.repository, str(command.command_id), self._control._now().isoformat(), encode_workflow(returned.attempt)))
+                commands.append(command.command_id)
+            self._insert_return_record(db, "workflow-result", returned, encode_workflow(classified))
+            self._insert_return_record(db, "workflow-return-disposition", returned,
+                                       encode_workflow(FinalizedResolveReturn(classified, issue, linkage, tuple(commands))))
+            if cleanup is not None:
+                self._insert_return_record(db, "workflow-return-cleanup", returned, encode_workflow(cleanup))
+            self._control._transition(db, "workflow_return", str(returned.attempt.run_id), "finalized",
+                                      {"classification": classified.kind.value, "commands": commands})
+            return WorkflowCommitted(after)
+
     def record_attempt(self, result: ResolveAttemptResult) -> WorkflowCommitted | WorkflowConflict:
         """Every paid classification has one immutable audit, even without a strike."""
         if not isinstance(result, ResolveAttemptResult):
@@ -191,6 +482,9 @@ class SQLiteWorkflowControl:
             if prior is None:
                 raise WorkflowAuthorityError("workflow must be explicitly imported before recording results")
             admission = self._validate_attempt_run(db, result)
+            if db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?",
+                          (self.writer.repository, str(result.attempt.run_id))).fetchone() is not None:
+                return WorkflowConflict(prior.revision, "captured paid return must use observation finalization")
             receipt = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-result' AND scope=? AND key=?",
                 (self.writer.repository, str(result.attempt.run_id)),
@@ -239,6 +533,11 @@ class SQLiteWorkflowControl:
                 raise WorkflowAuthorityError("workflow must be explicitly imported before mutation")
             if authorities != (prior.authority,):
                 raise WorkflowAuthorityError("workflow family activation epoch changed")
+            if isinstance(transition.audit, ResolveAttemptResult) and db.execute(
+                "SELECT 1 FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?",
+                (self.writer.repository, str(transition.audit.attempt.run_id)),
+            ).fetchone() is not None:
+                return WorkflowConflict(prior.revision, "captured paid return must use observation finalization")
             receipt = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
                 (namespace, self.writer.repository, dedupe),
@@ -362,6 +661,8 @@ class SQLiteWorkflowControl:
         admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
         if admission.attempt != result.attempt or admission.stage is not result.stage:
             raise WorkflowAuthorityError("resolve result disagrees with its durable admission receipt")
+        if admission.input_fingerprint != metadata.get("input_fingerprint"):
+            raise WorkflowAuthorityError("resolve admission disagrees with its actual task input fingerprint")
         if result.kind not in (ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL) or result.session is not None:
             reservation = db.execute(
                 "SELECT workload_repository, model, state, provider_receipt_id, basis "
@@ -413,11 +714,7 @@ class SQLiteWorkflowControl:
             owner = row["successor_owner_id"]
         return False
 
-    def _persist(
-        self, db: sqlite3.Connection, prior: WorkflowSnapshot,
-        proposal: WorkflowChanged, encoded: str,
-    ) -> None:
-        after = proposal.snapshot
+    def _persist_snapshot(self, db: sqlite3.Connection, after: WorkflowSnapshot) -> None:
         scope = workflow_scope(after.revision.fence.key)
         db.execute(
             "UPDATE workflows SET generation=?, version=?, episode_json=? "
@@ -442,6 +739,13 @@ class SQLiteWorkflowControl:
                 (opened.gate_id, *scope, opened.opened_generation, cause_key,
                  "rearming" if isinstance(gate, RearmingGate) else "open", encode_workflow(gate)),
             )
+    def _persist(
+        self, db: sqlite3.Connection, prior: WorkflowSnapshot,
+        proposal: WorkflowChanged, encoded: str,
+    ) -> None:
+        after = proposal.snapshot
+        self._persist_snapshot(db, after)
+        scope = workflow_scope(after.revision.fence.key)
         intent = after.intent
         if intent is not None and intent != prior.intent:
             if isinstance(intent, PendingRearm):
@@ -487,46 +791,8 @@ class SQLiteWorkflowControl:
             raise WorkflowAuthorityError("retired obligation has no durable command")
         if not self._owns_command(db, row["executor_identity"]) or decode_workflow(row["workflow_binding_json"], WorkflowBinding) != snapshot.binding:
             raise WorkflowAuthorityError("retired obligation belongs to a different workflow owner")
-        receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (command_id,)).fetchone()
-        if receipt is not None and (not row["attempt_owner"] or receipt["executor_identity"] != row["attempt_owner"]):
-            raise WorkflowAuthorityError("retired obligation receipt does not match its executing owner")
-        scope = workflow_scope(snapshot.revision.fence.key)
-        if row["state"] in ("executing", "unknown_outcome"):
-            gate = next((g for g in snapshot.gates if isinstance(cause := _opened(g).cause, RemoteOutcomeUncertain) and str(cause.command_id) == command_id), None)
-            if gate is None:
-                raise WorkflowAuthorityError("retiring an uncertain command requires its visible uncertainty gate")
-            cause = _opened(gate).cause
-            assert isinstance(cause, RemoteOutcomeUncertain)
-            raw = row["workflow_reconciliation_json"]
-            if raw is None:
-                since = datetime.fromisoformat(row["updated_at"])
-                if cause.unresolved_since != since:
-                    raise WorkflowAuthorityError("command uncertainty must retain its recorded start")
-                history = ActiveReconciliation(since, max(since, self._control._now()), cause.failed_reads)
-            else:
-                previous = decode_workflow(raw, ActiveReconciliation | ReconciliationOnly)
-                history = previous.history if isinstance(previous, ReconciliationOnly) else previous
-                if cause.unresolved_since != history.unresolved_since or cause.failed_reads != history.failed_reads:
-                    raise WorkflowAuthorityError("retirement cannot reset command uncertainty history")
-            disposition = RetiredUncertainCommand(ReconciliationOnly(history, _opened(gate).gate_id), retirement_id)
-        else:
-            if row["state"] == "pending" and row["attempts"] == 0 and receipt is None:
-                evidence = json.dumps({"command_id": command_id, "state": "pending", "attempts": 0, "observation": "never_began_locally"}, sort_keys=True)
-            elif receipt is not None and row["state"] in ("succeeded", "retryable_failure", "permanent_failure") and receipt["status"] == row["state"]:
-                # A verified refusal settles current uncertainty, not a claim
-                # that earlier partial effects or paid work never happened.
-                evidence = json.dumps(dict(receipt), sort_keys=True)
-            else:
-                raise WorkflowAuthorityError("command retirement lacks a settled outcome or uncertainty gate")
-            outcome_id = "retired-outcome:" + hashlib.sha256(evidence.encode()).hexdigest()
-            db.execute(
-                "INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, 'observation', ?)",
-                (outcome_id, *scope, command_id, evidence),
-            )
-            disposition = RetiredSettledCommand(retirement_id, outcome_id)
-        db.execute(
-            "UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
-            (encode_workflow(disposition), command_id),
+        self._control._retire_workflow_command(
+            db, row, _command_from_row(row), snapshot, retirement_id,
         )
 
 

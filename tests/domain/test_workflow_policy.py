@@ -29,9 +29,126 @@ from issue_agent.domain.workflow_policy import (
     initial_resolve_workflow, validate_resolve_transition,
 )
 from issue_agent.domain.world import IssueView
+from issue_agent.domain.actions import Relabel, RemoveWorktree
+from issue_agent.domain.resolve_return import PendingResolveReturn, ResolveInputs, ReturnedResolve
+from issue_agent.domain.workflow_policy import decide_return, defer_return_observation
 
 NOW = datetime(2026, 9, 14, 9, tzinfo=timezone.utc)
 ACTOR = OperatorActor("operator:alice", "dashboard")
+
+
+def returned_result(*, stage=ResolveStage.RESOLVE, **changes):
+    state = snapshot()
+    attempt = WorkflowAttemptIdentity(state.binding, RunId("returned:1"), "leg:1")
+    values = dict(attempt=attempt, stage=stage, inputs=ResolveInputs("title", "body", "alice"),
+                  is_error=False, status="blocked", summary="summary", needs="which API?",
+                  envelope_subtype="", exit_reason=None,
+                  session=ResolveSession(attempt, "session", "codex", "model"), returned_at=NOW)
+    values.update(changes)
+    return ReturnedResolve(**values)
+
+
+def completion_observation(returned, **changes):
+    values = dict(number=returned.attempt.binding.fence.key.target.number, title="title", body="body", author="alice",
+                  labels=frozenset({Label.AI_WORKING}), updated_at="revision:1")
+    values.update(changes)
+    return ObservedIssue(returned.attempt.binding.fence.key, IssueView(**values), NOW)
+
+
+@pytest.mark.parametrize("stage,status,error,expected", [
+    (ResolveStage.RESOLVE, "blocked", False, ResolveResultKind.BLOCKED),
+    (ResolveStage.RESOLVE, "pushed", False, ResolveResultKind.COUNTED_REQUEUE),
+    (ResolveStage.RESOLVE, "", True, ResolveResultKind.COUNTED_REQUEUE),
+    (ResolveStage.RESUME, "blocked", False, ResolveResultKind.BLOCKED),
+    (ResolveStage.RESUME, "pushed", False, ResolveResultKind.STAGE_PROGRESSED),
+    (ResolveStage.RESUME, "", True, ResolveResultKind.BLOCKED),
+])
+def test_return_classification_preserves_ordinary_stage_semantics(stage, status, error, expected):
+    returned = returned_result(stage=stage, status=status, is_error=error)
+    classified, actions = decide_return(returned, completion_observation(returned),
+                                       NoLinkedPr(returned.attempt.binding.fence.key, NOW), now=NOW)
+    assert classified.kind is expected
+    assert len(actions) == 1 and isinstance(actions[0], Relabel)
+    assert actions[0].expected_revision == "revision:1"
+    assert actions[0].workflow == returned.attempt.binding
+    if status == "blocked" and not error:
+        assert "which API?" in actions[0].comment
+        assert actions[0].add is Label.AI_BLOCKED
+
+
+@pytest.mark.parametrize("stage", [ResolveStage.RESOLVE, ResolveStage.RESUME])
+@pytest.mark.parametrize("reason,kind", [(ExitReason.BUDGET_EXHAUSTED, ResolveResultKind.BUDGET_REFUSAL),
+                                        (ExitReason.TRANSPORT_DEATH, ResolveResultKind.INFRA_FAILURE)])
+def test_return_verified_pr_wins_projection_but_never_charges_excluded_failures(stage, reason, kind):
+    returned = returned_result(stage=stage, is_error=True, exit_reason=reason)
+    classified, actions = decide_return(returned, completion_observation(returned),
+        LinkedPrPresent(returned.attempt.binding.fence.key, 99, "head", NOW), now=NOW)
+    assert classified.kind is kind and classified.session is None
+    assert [action.add for action in actions] == [Label.AI_PR_OPEN, Label.AI_PR_OPEN]
+    assert actions[1].expected_revision == "head"
+
+
+def test_return_budget_projection_is_one_guarded_comment_and_multilabel_operation():
+    returned = returned_result(is_error=True, exit_reason=ExitReason.BUDGET_EXHAUSTED)
+    classified, actions = decide_return(returned, completion_observation(returned),
+                                       NoLinkedPr(returned.attempt.binding.fence.key, NOW), now=NOW)
+    assert classified.kind is ResolveResultKind.BUDGET_REFUSAL
+    assert len(actions) == 1 and isinstance(actions[0], Relabel)
+    assert set(actions[0].added_labels) == {Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}
+    assert "Budget review needed" in actions[0].comment
+
+
+def test_return_changed_requirements_requeues_without_repeating_obsolete_question():
+    returned = returned_result()
+    classified, actions = decide_return(returned, completion_observation(returned, body="new requirement"),
+                                       NoLinkedPr(returned.attempt.binding.fence.key, NOW), now=NOW)
+    assert classified.kind is ResolveResultKind.COUNTED_REQUEUE
+    assert len(actions) == 1 and actions[0].add is Label.AI_READY and not actions[0].comment
+
+
+def test_successful_closed_return_proposes_local_cleanup_without_a_failure_strike():
+    returned = returned_result(status="done")
+    classified, actions = decide_return(returned, completion_observation(returned, state="closed"),
+                                       NoLinkedPr(returned.attempt.binding.fence.key, NOW), now=NOW)
+    assert classified.kind is ResolveResultKind.STAGE_PROGRESSED
+    assert classified.session is None
+    assert isinstance(actions[0], RemoveWorktree)
+
+
+@pytest.mark.parametrize("label", [Label.AI_PARKED, Label.NEEDS_HUMAN_REVIEW, Label.NEEDS_BUDGET_REVIEW])
+def test_return_completion_does_not_erase_fresh_external_holds(label):
+    returned = returned_result(status="pushed")
+    classified, actions = decide_return(returned, completion_observation(returned, labels=frozenset({Label.AI_WORKING, label})),
+                                       NoLinkedPr(returned.attempt.binding.fence.key, NOW), now=NOW)
+    assert actions == () and classified.kind is ResolveResultKind.COUNTED_REQUEUE
+
+
+@pytest.mark.parametrize("missing", ["issue", "linkage"])
+def test_unavailable_completion_observation_is_not_absence(missing):
+    returned = returned_result(status="pushed")
+    key = returned.attempt.binding.fence.key
+    with pytest.raises(ValueError, match="complete observations"):
+        if missing == "issue":
+            decide_return(returned, IssueUnavailable(key, NOW, "unavailable"), NoLinkedPr(key, NOW), now=NOW)
+        else:
+            decide_return(returned, completion_observation(returned), LinkedPrUnavailable(key, NOW, "unavailable"), now=NOW)
+
+
+@pytest.mark.parametrize("delta", [-1, 301])
+def test_return_rejects_future_or_stale_observations(delta):
+    returned = returned_result()
+    with pytest.raises(ValueError, match="fresh"):
+        decide_return(returned, completion_observation(returned), NoLinkedPr(returned.attempt.binding.fence.key, NOW),
+                      now=NOW + timedelta(seconds=delta))
+
+
+def test_pending_return_backoff_is_bounded_and_never_authorizes_execution():
+    pending = PendingResolveReturn(returned_result(), NOW)
+    for _ in range(30):
+        now = pending.next_read_at
+        pending = defer_return_observation(pending, "GitHub unavailable", now=now)
+        assert 5 <= (pending.next_read_at - now).total_seconds() <= 3600
+    assert pending.failed_reads == 30 and pending.returned == returned_result()
 
 
 def snapshot(*, number=7, failures=0, guidance=""):
@@ -46,7 +163,7 @@ def snapshot(*, number=7, failures=0, guidance=""):
 def admission(state, attempt_result):
     """Captured post-admission fixture; production reads the immutable SQL receipt."""
     return ResolveAdmission(attempt_result.attempt, WorkflowRevision(attempt_result.attempt.binding.fence, state.revision.version), attempt_result.stage,
-                            3 if attempt_result.stage is ResolveStage.ADJUDICATE else None)
+                            3 if attempt_result.stage is ResolveStage.ADJUDICATE else None, input_fingerprint="a" * 64)
 
 
 def observed(state, *, labels=frozenset({Label.NEEDS_HUMAN_REVIEW}), remote_state="open"):
@@ -524,7 +641,7 @@ def test_late_author_checkpoint_converges_independently_of_newer_implementation_
     author = staged_result(state, ResolveStage.AUTHOR, name="author")
     implement = staged_result(state, ResolveStage.IMPLEMENT, name="implement", session_id="implementation-session")
     results = (author, implement)
-    proofs = tuple(ResolveAdmission(item.attempt, replace(state.revision, version=index + 1), item.stage) for index, item in enumerate(results))
+    proofs = tuple(ResolveAdmission(item.attempt, replace(state.revision, version=index + 1), item.stage, input_fingerprint="a" * 64) for index, item in enumerate(results))
     for index in order:
         state = record_resolve_attempt(state, results[index], ceiling=3, admission=proofs[index]).snapshot
     assert state.episode.continuation == AuthoredResolve(proofs[0], 2, implement.session)
@@ -539,7 +656,7 @@ def test_multiple_authors_and_blocked_resume_converge_for_every_delivery_order(o
         staged_result(state, ResolveStage.IMPLEMENT, name="implement"),
         staged_result(state, ResolveStage.RESUME, kind=ResolveResultKind.BLOCKED, name="resume"),
     )
-    proofs = tuple(ResolveAdmission(item.attempt, replace(state.revision, version=index + 1), item.stage) for index, item in enumerate(results))
+    proofs = tuple(ResolveAdmission(item.attempt, replace(state.revision, version=index + 1), item.stage, input_fingerprint="a" * 64) for index, item in enumerate(results))
     for index in order:
         state = record_resolve_attempt(state, results[index], ceiling=3, admission=proofs[index]).snapshot
     assert state.episode.continuation == AuthoredResolve(proofs[1], 4, None)

@@ -5,7 +5,10 @@ workflow outcomes without pinning the entire ordered action list, so the fix
 workflow can be extracted/refactored while preserving behavior.
 """
 
+from dataclasses import replace
+
 from tests.domain.builders import Check, Comment, Review, issue, pr, world
+from tests.fakes.workflow_authority import resolve_snapshot
 
 from issue_agent.domain.actions import (
     AgentKind,
@@ -18,13 +21,28 @@ from issue_agent.domain.actions import (
 )
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
+from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
+from issue_agent.domain.workflow import FreshResolve, ResolveSession
 
 
 CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
 
 
 def _runs(actions, kind: AgentKind, number: int) -> bool:
-    return RunAgent(kind, number) in actions
+    binding = resolve_snapshot(number).binding if kind in (AgentKind.RESOLVE, AgentKind.RESUME) else None
+    return RunAgent(kind, number, workflow=binding) in actions
+
+
+def _state(*numbers, session=False, **kwargs):
+    snapshots = {number: resolve_snapshot(number) for number in numbers}
+    if session:
+        for number, snapshot in snapshots.items():
+            source = WorkflowAttemptIdentity(snapshot.binding, RunId(f"prior-{number}"), f"leg-{number}")
+            snapshots[number] = replace(snapshot, revision=replace(snapshot.revision, version=1),
+                                        episode=replace(snapshot.episode, continuation=FreshResolve(
+                                            ResolveSession(source, f"session-{number}", "claude", "model"), 1,
+                                        )))
+    return FixState(resolve_workflows=snapshots, **kwargs)
 
 
 def _relabels(actions, target: Target, number: int, remove, add) -> bool:
@@ -34,19 +52,21 @@ def _relabels(actions, target: Target, number: int, remove, add) -> bool:
         and action.number == number
         and action.remove is remove
         and action.add is add
+        and action.workflow == (resolve_snapshot(number).binding if target is Target.ISSUE else None)
         for action in actions
     )
 
 
 def _closes_issue(actions, number: int) -> bool:
-    return any(isinstance(action, CloseIssue) and action.number == number for action in actions)
+    return any(isinstance(action, CloseIssue) and action.number == number
+               and action.workflow == resolve_snapshot(number).binding for action in actions)
 
 
 def test_ready_issue_dispatch_is_single_fixer_and_marks_working():
     actions = decide_fix(
         world(issues=[issue(2, "ai-ready", "P2"), issue(1, "ai-ready", "P1")]),
         CFG,
-        FixState(),
+        _state(1, 2),
         fixer_busy=False,
     )
 
@@ -66,7 +86,7 @@ def test_ready_issue_is_held_when_known_paths_overlap_open_pr():
             ],
         ),
         CFG,
-        FixState(),
+        _state(3),
         fixer_busy=False,
     )
 
@@ -84,14 +104,14 @@ def test_blocked_issue_with_new_human_reply_resumes_once():
     first = decide_fix(
         world(issues=[blocked]),
         CFG,
-        FixState(sessions=frozenset({7})),
+        _state(7, session=True),
         fixer_busy=False,
     )
     second = decide_fix(
         world(issues=[blocked]),
         CFG,
-        FixState(
-            sessions=frozenset({7}),
+        _state(
+            7, session=True,
             resumed_at={7: "2026-01-01T00:00:00Z"},
         ),
         fixer_busy=False,
@@ -161,7 +181,7 @@ def test_merged_pr_cleanup_updates_issue_pr_and_worktree():
             prs=[pr(101, "ai-pr-open", state="MERGED", closing_issue=9)],
         ),
         CFG,
-        FixState(),
+        _state(9),
         fixer_busy=False,
     )
 
@@ -194,7 +214,7 @@ def test_fixer_busy_still_allows_lock_free_cleanup_and_automerge():
             ],
         ),
         CFG,
-        FixState(),
+        _state(5, 9),
         fixer_busy=True,
     )
 

@@ -1,8 +1,8 @@
-"""Fix workflow continuation under ADR 0009.
+"""Fix workflow continuation under ADR 0009 and ADR 0015.
 
 This module owns the impure fix-side agent dispatch sequence: gather GitHub and
-store state, build an agent task, run it, persist session/counter markers, then
-apply the pure follow-up actions. It is extracted from AgentDispatcher so the
+store state, build an agent task, run it, commit the captured resolve outcome,
+then apply pure follow-up actions. It is extracted from AgentDispatcher so the
 central dispatcher can become a thin role router.
 """
 
@@ -12,6 +12,7 @@ import contextlib
 import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 
 from ...domain import fix as fix_domain
 from ...domain.events import (
@@ -26,8 +27,15 @@ from ...domain.leg import Leg, LegTarget
 from ...domain import outcome
 from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
-from ...domain.actions import AgentKind, Relabel, Target
-from ...adapters.runtime_plan import AgentRuntime, RunTelemetryRuntime
+from ...domain.actions import AgentKind, ClearIssueState, CloseIssue, PostComment, Relabel, RemoveWorktree, Target
+from ...domain.agent_task import RuntimeName, run_input_fingerprint
+from ...domain.workflow import AuthoredResolve, HeldProjection, ResolveResultKind, ResolveSession, ResolveStage, WorkflowConflict, WorkflowSnapshot
+from ...domain.workflow import ObservedIssue, NoLinkedPr, LinkedPrPresent
+from ...domain.resolve_return import ResolveCleanupCompleted, ResolveInputs, ReturnedResolve, UnavailableResolveReturn
+from ...domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowKey
+from ...domain.workflow_policy import classify_resolve_attempt, decide_return
+from ...adapters.workflow_rows import WorkflowAuthorityError
+from ...adapters.runtime_plan import AgentRuntime, ContextualRuntime, RunTelemetryRuntime
 from ...adapters.github import format_pr_discussion
 from ...domain.ports import (
     ActionExecutor,
@@ -39,6 +47,7 @@ from ...domain.ports import (
     WorkflowGitHubReads,
     WorkflowState,
 )
+from ...domain.workflow_ports import WorkflowControl
 from ...domain.ci import latest_other_review
 from ...domain.ci_history import make_attempt
 from ...domain.effort import (
@@ -55,7 +64,7 @@ from ...domain.lifecycle import AllowedEligibility, LifecycleOperation, issue_el
 from ...domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
-from ...domain.trust import as_untrusted
+from ...domain.trust import as_untrusted, untrusted_block
 from ...domain.world import (
     REVIEW_CHANGES_REQUESTED,
     PRView,
@@ -120,6 +129,161 @@ class FixWorkflow:
     # Atomic application-level reservation update for router-expanded paths.
     # None keeps standalone workflow tests and serial callers unchanged.
     reserve_paths: Callable[[int, frozenset[str]], bool] | None = None
+    workflow_control: WorkflowControl | None = None
+
+    def _resolve_state(self, issue: int, binding: WorkflowBinding | None, *, allow_held: bool = False) -> WorkflowSnapshot:
+        control = self.workflow_control
+        if control is None or not isinstance(binding, WorkflowBinding):
+            raise WorkflowAuthorityError("resolve requires captured durable workflow authority")
+        if binding.fence.key != WorkflowKey(control.writer.repository, IssueRef(issue)):
+            raise WorkflowAuthorityError("resolve binding belongs to another target")
+        state = control.load_workflow(binding.fence.key)
+        if not isinstance(state, WorkflowSnapshot) or state.binding != binding:
+            raise WorkflowAuthorityError("resolve authority is unavailable or stale")
+        if not allow_held and HeldProjection(state).held:
+            raise WorkflowAuthorityError("resolve workflow is held")
+        return state
+
+    @staticmethod
+    def _guided(task, state: WorkflowSnapshot):
+        if not state.episode.guidance:
+            return task
+        return dataclasses.replace(task, intent=dataclasses.replace(
+            task.intent, prompt=task.intent.prompt + "\n\n" + untrusted_block("operator_guidance", as_untrusted(state.episode.guidance)),
+        ))
+
+    def _record_resolve_result(self, issue: int, result, stage: ResolveStage, task, binding: WorkflowBinding,
+                               followup: outcome.ResolveFollowup, *, progressed: bool = False) -> bool:
+        control = self.workflow_control
+        assert control is not None
+        classified = classify_resolve_attempt(result, followup)
+        if classified is None:
+            if outcome.infra_class_failure(result) or outcome.budget_exhausted(result.exit_reason):
+                self._resolve_state(issue, binding, allow_held=True)
+                return True
+            raise WorkflowAuthorityError("resolve result lacks its accounting-owned attempt")
+        if classified.attempt.binding != binding:
+            raise WorkflowAuthorityError("resolve result disagrees with its captured dispatch binding")
+        kind = classified.kind
+        if outcome.budget_exhausted(result.exit_reason):
+            kind = ResolveResultKind.BUDGET_REFUSAL
+        elif outcome.infra_class_failure(result):
+            kind = ResolveResultKind.INFRA_FAILURE
+        elif progressed:
+            kind = ResolveResultKind.STAGE_PROGRESSED
+        session = None
+        if result.session_id and stage is not ResolveStage.ROUTE and kind not in (ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL):
+            runtime = task.runtime.value if task.runtime is not None else self._resolve_runtime_name()
+            session = ResolveSession(classified.attempt, result.session_id, runtime, task.model or "<runtime-default>")
+        recorded = control.record_attempt(dataclasses.replace(classified, kind=kind, stage=stage, session=session))
+        if isinstance(recorded, WorkflowConflict):
+            raise WorkflowAuthorityError(recorded.reason)
+        return recorded.snapshot.binding == binding
+
+    def _execute_resolve_actions(self, issue: int, actions, binding: WorkflowBinding, *, current=None) -> bool:
+        state = self._resolve_state(issue, binding, allow_held=True)
+        if HeldProjection(state).held:
+            self.cfg.log(f"resolve #{issue}: completion deferred; durable workflow is held")
+            return False
+        bound = [dataclasses.replace(action, workflow=binding) if isinstance(action, (Relabel, PostComment, CloseIssue)) else action for action in actions]
+        if current is None or current.state != "open":
+            return self.executor.execute_all(bound)
+        return execute_issue_completion(self.gateway, self.executor, current, bound, LifecycleOperation.COMPLETE_RESOLVE, self.cfg.log)
+
+    def _returned_result(self, result, binding: WorkflowBinding) -> ReturnedResolve | None:
+        if result.workflow_attempt is None:
+            if outcome.infra_class_failure(result) or outcome.budget_exhausted(result.exit_reason):
+                return None
+            raise WorkflowAuthorityError("paid resolve return lacks accounting provenance")
+        if result.workflow_attempt.binding != binding:
+            raise WorkflowAuthorityError("paid return disagrees with dispatch binding")
+        control = self.workflow_control
+        assert control is not None
+        returned = control.returned_result(result.workflow_attempt)
+        if returned is None:
+            raise WorkflowAuthorityError("paid return lacks atomic settlement evidence; recovery is required")
+        return returned
+
+    def _observe_return(self, returned: ReturnedResolve):
+        key = returned.attempt.binding.fence.key
+        assert isinstance(key.target, IssueRef)
+        current = self.gateway.get_issue(key.target.number)
+        observed = ObservedIssue(key, current, datetime.now(timezone.utc))
+        pr = self.gateway.pr_for_issue(key.target.number)
+        linkage = (
+            NoLinkedPr(key, datetime.now(timezone.utc)) if pr is None else
+            LinkedPrPresent(key, pr, self.gateway.get_pr(pr).head_ref_oid, datetime.now(timezone.utc))
+        )
+        return observed, linkage
+
+    def _finish_return(self, returned: ReturnedResolve) -> bool:
+        control = self.workflow_control
+        assert control is not None
+        key = returned.attempt.binding.fence.key
+        assert isinstance(key.target, IssueRef)
+        try:
+            observed, linkage = self._observe_return(returned)
+            _, actions = decide_return(returned, observed, linkage, now=datetime.now(timezone.utc))
+            if any(isinstance(action, (RemoveWorktree, ClearIssueState)) for action in actions):
+                # Re-arm/owner retirement cannot race deletion of this episode's
+                # worktree. A crash leaves the receipt held for idempotent replay.
+                with control.return_effect_authority(returned):
+                    observed, linkage = self._observe_return(returned)
+                    _, actions = decide_return(returned, observed, linkage, now=datetime.now(timezone.utc))
+                    cleanup = None
+                    if actions and all(isinstance(action, (RemoveWorktree, ClearIssueState)) for action in actions):
+                        if not self.executor.execute_all(actions):
+                            raise WorkflowAuthorityError("returned issue cleanup remains incomplete")
+                        assert isinstance(linkage, NoLinkedPr)
+                        cleanup = ResolveCleanupCompleted(returned.attempt, observed, linkage)
+                    committed = control.finalize_return(returned, observed, linkage, cleanup=cleanup)
+            else:
+                committed = control.finalize_return(returned, observed, linkage)
+            if isinstance(committed, WorkflowConflict):
+                raise WorkflowAuthorityError(committed.reason)
+            if not committed.idempotent and committed.snapshot.binding == returned.attempt.binding:
+                pr = linkage.pr if isinstance(linkage, LinkedPrPresent) else None
+                self._record_block_state(key.target.number, Target.ISSUE, key.target.number, returned.result(), pr=pr)
+                self._journal_budget_path(key.target.number, returned.stage.value.casefold(), returned.exit_reason, pr)
+            return True
+        except Exception as exc:
+            # The paid run did return. Observation uncertainty is a workflow
+            # hold, not a provider death or permission to buy a replacement.
+            control.defer_return(returned, str(exc)[:16384] or type(exc).__name__)
+            self.cfg.log(f"resolve #{key.target.number}: returned result held for reconciliation: {exc}")
+            return False
+
+    def reconcile_returns(self) -> int:
+        control = self.workflow_control
+        if control is None:
+            return 0
+        completed = 0
+        for pending in control.pending_returns(limit=32):
+            if isinstance(pending, UnavailableResolveReturn):
+                self.cfg.log(f"resolve result {pending.record_key}: authority unavailable; next audit {pending.next_read_at.isoformat()}: {pending.reason}")
+                continue
+            try:
+                completed += int(self._finish_return(pending.returned))
+            except Exception as exc:
+                # Corrupt/unwritable authority must not prevent a healthy peer
+                # from recovering; its existing gate continues to bar admission.
+                self.cfg.log(f"resolve result {pending.returned.attempt.run_id}: recovery unavailable: {exc}")
+        return completed
+
+    def _resolve_resume_cfg(self, issue: int, state: WorkflowSnapshot, iss):
+        cfg = self.cfg.fix
+        if cfg is None:
+            raise WorkflowAuthorityError("resolve configuration is unavailable")
+        session = state.episode.continuation.session
+        if session is not None:
+            if session.runtime != self._resolve_runtime_name():
+                raise WorkflowAuthorityError("resolve session belongs to a different runtime")
+            cfg = dataclasses.replace(cfg, model=None if session.model == "<runtime-default>" else session.model)
+        return self._escalated(cfg, issue, "resume", iss=iss)
+
+    def _resolve_runtime_name(self) -> str:
+        runtime = self.cfg.fixer_runtime
+        return runtime.value if isinstance(runtime, RuntimeName) else runtime
 
     def _clear_block_markers(self, issue: int) -> None:
         for name in ("clear_machine_block", "clear_budget_block"):
@@ -333,13 +497,21 @@ class FixWorkflow:
         answer — it reads 1 forever no matter how many times the reviewer comes
         back.
         """
+        resolve_retries = 0
+        if self.workflow_control is not None:
+            try:
+                state = self.workflow_control.load_workflow(WorkflowKey(self.workflow_control.writer.repository, IssueRef(issue)))
+                if isinstance(state, WorkflowSnapshot):
+                    resolve_retries = state.episode.failures
+                else:
+                    self.cfg.log(f"issue #{issue}: no available resolve escalation evidence")
+            except Exception as exc:  # noqa: BLE001 — advisory only; selected admission validates authority separately
+                self.cfg.log(f"issue #{issue}: resolve escalation evidence unavailable ({exc})")
         return EscalationSignals(
             recurrence=bool(
                 self._try(lambda: iss is not None and iss.has(Label.RECURRENCE), False)
             ),
-            resolve_retries=int(
-                self._try(lambda: self.store.get_resolve_retries(issue), 0) or 0
-            ),
+            resolve_retries=resolve_retries,
             ci_retries=int(
                 self._try(lambda: self.store.get_ci_retries(issue), 0) or 0
             ),
@@ -512,7 +684,7 @@ class FixWorkflow:
         if not cfg.model:
             inherited = self.store.get_model(issue)
             if inherited:
-                cfg = dataclasses.replace(cfg, model=inherited)
+                cfg = dataclasses.replace(cfg, model=None if inherited == "<runtime-default>" else inherited)
         # Behind the kill switch: with escalation off nothing reads the labels,
         # so paying a `gh issue view` per repair leg would be pure waste.
         if iss is None and self.cfg.escalate_on_evidence:
@@ -541,7 +713,7 @@ class FixWorkflow:
         return paths_overlap_open_prs(paths, world.prs)
 
     async def _routed_fix_cfg(
-        self, issue: int, iss, cwd: str
+        self, issue: int, iss, cwd: str, binding: WorkflowBinding,
     ) -> tuple[FixTaskConfig, bool]:
         """Difficulty-routed, evidence-escalated FixTaskConfig for a RESOLVE
         dispatch (P4.1/#8, ladder #16).
@@ -565,25 +737,25 @@ class FixWorkflow:
             return cfg, False
         if cfg.model:
             return self._escalated(cfg, issue, "resolve", iss=iss), False
+        state = self._resolve_state(issue, binding)
+        task = self._guided(task_builders.build_router_task(
+            as_untrusted(iss.title), as_untrusted(iss.body), runtime=self.cfg.fixer_runtime,
+            max_budget_usd=cfg.router_budget_usd, cwd=cwd,
+        ), state)
         with self._route_receipt() as record_decision:
             try:
                 result = await self._run_logged(
-                    "route", issue,
-                    task_builders.build_router_task(
-                        as_untrusted(iss.title),
-                        as_untrusted(iss.body),
-                        runtime=self.cfg.fixer_runtime,
-                        max_budget_usd=cfg.router_budget_usd,
-                        cwd=cwd,
-                    ),
+                    "route", issue, task,
                     kind=AgentKind.ROUTE.name,
                 )
-                tier = result.field("tier")
-                predicted_paths = normalize_predicted_paths(result.field("predicted_paths"))
-                self.store.save_predicted_paths(issue, predicted_paths)
             except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
                 self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
                 return self._escalated(cfg, issue, "resolve", iss=iss), False
+            if not self._record_resolve_result(issue, result, ResolveStage.ROUTE, task, binding, outcome.ResolveFollowup.BLOCKED):
+                raise WorkflowAuthorityError("workflow changed while routing")
+            tier = result.field("tier")
+            predicted_paths = normalize_predicted_paths(result.field("predicted_paths"))
+            self.store.save_predicted_paths(issue, predicted_paths)
             routed = self._escalated(
                 cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss
             )
@@ -600,58 +772,62 @@ class FixWorkflow:
                 or self._prediction_overlaps_open_pr(issue, predicted_paths)
             )
 
-    async def resolve(self, issue: int) -> None:
+    async def resolve(self, issue: int, *, binding: WorkflowBinding | None = None) -> None:
+        state = self._resolve_state(issue, binding)
+        assert binding is not None
         if self.cfg.author_tests_split:
-            await self.resolve_split(issue)
+            await self.resolve_split(issue, binding=binding)
             return
         iss = self.gateway.get_issue(issue)
         branch = self._resume_branch(issue, iss.title)
         cwd = self._ensure_cwd(issue, branch)
-        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd)
+        fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd, binding)
         if deferred_for_overlap:
-            self.executor.execute_all([
+            self._execute_resolve_actions(issue, [
                 Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)
-            ])
+            ], binding)
             return
-        self.store.save_model(issue, fix_cfg.model)
-        task = task_builders.build_resolve_task(
+        self._resolve_state(issue, binding)
+        task = self._guided(task_builders.build_resolve_task(
             issue,
             as_untrusted(iss.title),
             as_untrusted(iss.body),
             cwd,
             fix_cfg,
-        )
+        ), state)
+        task = dataclasses.replace(task, resolve_inputs=ResolveInputs(iss.title, iss.body, iss.author))
         result = await self._run_logged("resolve", issue, task)
-        self.store.save_session(issue, result.session_id)
+        returned = self._returned_result(result, binding)
         self._decay_infra_deaths(issue, result)
+        if returned is not None:
+            if outcome.infra_class_failure(result):
+                self._charge_infra_death(issue, "resolve", result)
+            if self._finish_return(returned):
+                self.executor.replay_pending()
+            return
         pr = self.gateway.pr_for_issue(issue)
         self._journal_budget_path(issue, "resolve", result.exit_reason, pr)
-        if outcome.resolve_followup(result, pr is not None) is outcome.ResolveFollowup.RETRY:
-            self._bump_resolve_retry(issue, result)
-        self._complete_resolve(issue, result, pr, observed=iss)
+        self._complete_resolve(issue, result, pr, observed=iss, task=task, stage=ResolveStage.RESOLVE, binding=binding)
 
-    def _complete_resolve(self, issue: int, result, pr: int | None, *, observed=None) -> bool:
+    def _complete_resolve(self, issue: int, result, pr: int | None, *, observed=None, task, stage: ResolveStage, binding: WorkflowBinding) -> bool:
         current = self.gateway.get_issue(issue)
-        actions = self._resolve_actions(issue, result, pr)
-        if current.state != "open":
-            return self.executor.execute_all(actions)
-        if not isinstance(issue_eligibility(current, LifecycleOperation.COMPLETE_RESOLVE), AllowedEligibility):
-            self.cfg.log(f"resolve #{issue}: completion deferred; issue is held")
-            return False
-        if observed is not None and pr is None and result.status == "blocked" and not (
+        changed = observed is not None and pr is None and result.status == "blocked" and not (
             outcome.budget_exhausted(result.exit_reason) or outcome.infra_class_failure(result)
         ) and (
             current.title, current.body, current.author
-        ) != (observed.title, observed.body, observed.author):
+        ) != (observed.title, observed.body, observed.author)
+        followup = outcome.ResolveFollowup.RETRY if changed else outcome.resolve_followup(result, pr is not None)
+        if not self._record_resolve_result(issue, result, stage, task, binding, followup):
+            return False
+        if outcome.infra_class_failure(result):
+            self._charge_infra_death(issue, stage.value.casefold(), result)
+        actions = self._resolve_actions(issue, result, pr)
+        if changed:
             self.cfg.log(f"resolve #{issue}: requirements changed during work; requeueing for the new facts")
-            self._bump_resolve_retry(issue, result)
             actions = [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
         else:
             self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
-        return execute_issue_completion(
-            self.gateway, self.executor, current, actions,
-            LifecycleOperation.COMPLETE_RESOLVE, self.cfg.log,
-        )
+        return self._execute_resolve_actions(issue, actions, binding, current=current)
 
     def _resolve_actions(self, issue: int, result, pr: int | None):
         """Retire an already-implemented issue closed without opening a PR."""
@@ -673,171 +849,116 @@ class FixWorkflow:
             issue_closed_without_pr=closed_without_pr,
         )
 
-    async def resolve_split(self, issue: int, human_reply: str = "") -> None:
+    def _author_task(self, issue: int, iss, cwd: str, fix_cfg, human_reply: str, state: WorkflowSnapshot):
+        return self._guided(task_builders.build_author_task(
+            issue, as_untrusted(iss.title), as_untrusted(iss.body), cwd, fix_cfg,
+            human_reply=as_untrusted(human_reply),
+        ), state)
+
+    async def resolve_split(self, issue: int, human_reply: str = "", *, binding: WorkflowBinding | None = None) -> None:
+        state = self._resolve_state(issue, binding)
+        assert binding is not None
         iss = self.gateway.get_issue(issue)
         branch = self._resume_branch(issue, iss.title)
         cwd = self._ensure_cwd(issue, branch)
-
         if human_reply:
-            # A reply-driven RESUME has already consumed this clarification.
-            # Re-running fresh-resolve routing could overlap-defer to ai-ready
-            # without delivering it to either split role.
-            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
+            fix_cfg = self._resolve_resume_cfg(issue, state, iss)
             deferred_for_overlap = False
         else:
-            fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd)
+            fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd, binding)
         if deferred_for_overlap:
-            self.executor.execute_all([
-                Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)
-            ])
+            self._execute_resolve_actions(issue, [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)], binding)
             return
-        self.store.save_model(issue, fix_cfg.model)
-        if self.store.get_phase(issue) != "authored":
-            author = await self._run_logged(
-                "author",
-                issue,
-                task_builders.build_author_task(
-                    issue,
-                    as_untrusted(iss.title),
-                    as_untrusted(iss.body),
-                    cwd,
-                    fix_cfg,
-                    human_reply=as_untrusted(human_reply),
-                ),
-                kind="AUTHOR",
-            )
-            self.store.save_session(issue, author.session_id)
-            self._decay_infra_deaths(issue, author)
+        state = self._resolve_state(issue, binding)
+        author_task = self._author_task(issue, iss, cwd, fix_cfg, human_reply, state)
+        checkpoint = state.episode.continuation
+        if not isinstance(checkpoint, AuthoredResolve) or checkpoint.author_admission.input_fingerprint != run_input_fingerprint(author_task.intent):
+            author = await self._run_logged("author", issue, author_task, kind="AUTHOR")
             fu_author = outcome.author_followup(author)
+            pr = self.gateway.pr_for_issue(issue) if fu_author is not outcome.AuthorFollowup.AUTHORED else None
+            current = self.gateway.get_issue(issue)
+            changed = fu_author is outcome.AuthorFollowup.BLOCKED and (
+                current.title, current.body, current.author
+            ) != (iss.title, iss.body, iss.author)
+            followup = (
+                outcome.ResolveFollowup.PR_OPENED if pr is not None else
+                outcome.ResolveFollowup.RETRY if changed or fu_author is outcome.AuthorFollowup.RETRY else
+                outcome.ResolveFollowup.BLOCKED
+            )
+            if not self._record_resolve_result(issue, author, ResolveStage.AUTHOR, author_task, binding, followup,
+                                               progressed=fu_author is outcome.AuthorFollowup.AUTHORED):
+                return
+            self._decay_infra_deaths(issue, author)
+            if outcome.infra_class_failure(author):
+                self._charge_infra_death(issue, "author", author)
             if fu_author is not outcome.AuthorFollowup.AUTHORED:
-                pr = self.gateway.pr_for_issue(issue)
                 self._record_block_state(issue, Target.ISSUE, issue, author, pr=pr)
                 self._journal_budget_path(issue, "author", author.exit_reason, pr)
-                if fu_author is outcome.AuthorFollowup.RETRY:
-                    self._bump_resolve_retry(issue, author, "author")
-                self.executor.execute_all(
-                    self._resolve_actions(issue, author, pr)
-                    if pr is not None else outcome.author_actions(issue, author)
+                actions = (
+                    [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)] if changed else
+                    self._resolve_actions(issue, author, pr) if pr is not None else outcome.author_actions(issue, author)
                 )
+                self._execute_resolve_actions(issue, actions, binding, current=current)
                 return
-            self.store.set_phase(issue, "authored")
-
-        await self._implement_loop(
-            issue,
-            iss,
-            cwd,
-            fix_cfg,
-            human_reply=human_reply,
-        )
+        await self._implement_loop(issue, iss, cwd, fix_cfg, human_reply=human_reply, binding=binding)
 
     async def _implement_loop(
-        self,
-        issue: int,
-        iss,
-        cwd: str,
-        fix_cfg=None,
-        human_reply: str = "",
+        self, issue: int, iss, cwd: str, fix_cfg=None, human_reply: str = "", *, binding: WorkflowBinding,
     ) -> None:
         fix_cfg = fix_cfg if fix_cfg is not None else self.cfg.fix
         uphold_note = ""
         trail: list[str] = []
         rounds = 0
         while True:
-            impl = await self._run_logged(
-                "implement",
-                issue,
-                task_builders.build_implement_task(
-                    issue,
-                    as_untrusted(iss.title),
-                    as_untrusted(iss.body),
-                    cwd,
-                    fix_cfg,
-                    uphold_note=as_untrusted(uphold_note),
-                    human_reply=as_untrusted(human_reply),
-                ),
-                kind="IMPLEMENT",
-            )
-            self.store.save_session(issue, impl.session_id)
+            state = self._resolve_state(issue, binding)
+            fresh = self.gateway.get_issue(issue)
+            current_inputs = self._author_task(issue, fresh, cwd, fix_cfg, human_reply, state)
+            checkpoint = state.episode.continuation
+            if not isinstance(checkpoint, AuthoredResolve) or checkpoint.author_admission.input_fingerprint != run_input_fingerprint(current_inputs.intent):
+                self.cfg.log(f"resolve #{issue}: author inputs changed; a fresh author is required")
+                self._execute_resolve_actions(issue, [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)], binding, current=fresh)
+                return
+            iss = fresh
+            task = self._guided(task_builders.build_implement_task(
+                issue, as_untrusted(iss.title), as_untrusted(iss.body), cwd, fix_cfg,
+                uphold_note=as_untrusted(uphold_note), human_reply=as_untrusted(human_reply),
+            ), state)
+            impl = await self._run_logged("implement", issue, task, kind="IMPLEMENT")
             self._decay_infra_deaths(issue, impl)
             pr = self.gateway.pr_for_issue(issue)
             fu = outcome.implement_followup(impl, pr is not None)
             if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
                 self._journal_budget_path(issue, "implement", impl.exit_reason, pr)
-                if fu is outcome.ImplementFollowup.RETRY:
-                    self._bump_resolve_retry(issue, impl, "implement")
-                self._complete_resolve(issue, impl, pr, observed=iss)
+                self._complete_resolve(issue, impl, pr, observed=iss, task=task, stage=ResolveStage.IMPLEMENT, binding=binding)
                 return
-
+            if not self._record_resolve_result(issue, impl, ResolveStage.IMPLEMENT, task, binding,
+                                               outcome.ResolveFollowup.BLOCKED, progressed=True):
+                return
             objection = impl.needs or impl.summary or "see logs"
             if rounds >= self.cfg.max_contract_rounds:
-                self.executor.execute_all(
-                    outcome.contract_escalation_actions(issue, objection, "\n".join(trail))
-                )
+                self._execute_resolve_actions(issue, outcome.contract_escalation_actions(issue, objection, "\n".join(trail)), binding)
                 return
             rounds += 1
+            self._resolve_state(issue, binding)
             self.worktrees.reset(issue)
-            adj = await self._run_logged(
-                "adjudicate",
-                issue,
-                # The SAME config the implementer ran on (routed + escalated),
-                # not the unrouted base: the adjudicator's job is to overrule
-                # the implementer's objection, and an arbiter that reasons
-                # weaker than the leg it is arbitrating decides the wrong way
-                # exactly when the issue is hard enough to have escalated.
-                task_builders.build_adjudicate_task(
-                    issue,
-                    as_untrusted(iss.title),
-                    as_untrusted(iss.body),
-                    as_untrusted(objection),
-                    cwd,
-                    fix_cfg,
-                    human_reply=as_untrusted(human_reply),
-                ),
-                kind="ADJUDICATE",
-            )
-            self.store.save_session(issue, adj.session_id)
+            adj_task = self._guided(task_builders.build_adjudicate_task(
+                issue, as_untrusted(iss.title), as_untrusted(iss.body), as_untrusted(objection),
+                cwd, fix_cfg, human_reply=as_untrusted(human_reply),
+            ), state)
+            adj = await self._run_logged("adjudicate", issue, adj_task, kind="ADJUDICATE")
+            if not self._record_resolve_result(issue, adj, ResolveStage.ADJUDICATE, adj_task, binding,
+                                               outcome.ResolveFollowup.BLOCKED, progressed=not adj.is_error):
+                return
+            if outcome.infra_class_failure(adj):
+                self._charge_infra_death(issue, "adjudicate", adj)
+                return
+            if outcome.budget_exhausted(adj.exit_reason):
+                self._journal_budget_path(issue, "adjudicate", adj.exit_reason, None)
+                self._execute_resolve_actions(issue, outcome.budget_actions(issue), binding)
+                return
             verdict = outcome.adjudication(adj)
-            trail.append(
-                f"round {rounds}: {adj.field('verdict') or 'upheld'} — "
-                f"{adj.field('rationale') or adj.summary}"
-            )
-            uphold_note = (
-                "" if verdict is outcome.Adjudication.REVISED
-                else (adj.field("rationale") or adj.summary or "the contract is correct")
-            )
-
-    def _bump_resolve_retry(self, issue: int, result, leg: str = "resolve") -> None:
-        """A resolve-family leg that ends in a REQUEUE (error, or a claimed
-        'done' with no PR on GitHub) counts toward the resolve breaker. The T3
-        convergence probe proved this leg loops UNBOUNDED without one — a full
-        paid session per poll on the most expensive leg (#39's shape).
-
-        Only a leg that actually RAN and failed to open a PR counts. An
-        infra-class failure — killed session, transport death, admission
-        refusal, or a runtime that could not start the leg at all — measures
-        the harness, so it takes the separate infra ceiling instead. Blocked /
-        PR-opened outcomes don't requeue, so they never reach here.
-
-        keifu #130 (2026-08-02): a broken codex binary killed three resolve
-        legs at $0 with no session. They landed on THIS counter, and the first
-        healthy dispatch hours later escalated `resolve failed 3× without
-        opening a PR`. The phantom count also reached the router as difficulty
-        evidence. The classification, not the ceiling, was the bug.
-        """
-        if outcome.budget_exhausted(result.exit_reason):
-            return
-        if outcome.infra_class_failure(result):
-            # …but it IS counted against the separate, higher infra ceiling
-            # (review C3/D2c): failing to run is its own paid loop, and nothing
-            # else bounds it. This is the RETURNED-result twin of
-            # AgentDispatcher.dispatch's bump-on-raise; a leg either raises or
-            # returns, so a single death is counted exactly once.
-            self._charge_infra_death(issue, leg, result)
-            return
-        self.store.set_resolve_retries(issue, self.store.get_resolve_retries(issue) + 1)
-        # #188: keep the WHY beside the counter, so the breaker's escalation
-        # comment can quote the last terminal error instead of only "failed N×".
-        self.store.set_last_resolve_error(issue, getattr(result, "summary", "") or "")
+            trail.append(f"round {rounds}: {adj.field('verdict') or 'upheld'} — {adj.field('rationale') or adj.summary}")
+            uphold_note = "" if verdict is outcome.Adjudication.REVISED else (adj.field("rationale") or adj.summary or "the contract is correct")
 
     def _charge_infra_death(self, issue: int, leg: str, result) -> None:
         """Bill an infra-class failure to the infra ceiling, and journal it.
@@ -915,105 +1036,109 @@ class FixWorkflow:
         except Exception as exc:  # noqa: BLE001 — telemetry never fails a dispatch
             self.cfg.log(f"agent #{issue}: budget path not journalled ({exc})")
 
-    async def resume(self, issue: int) -> None:
+    async def resume(self, issue: int, *, binding: WorkflowBinding | None = None) -> None:
         iss = self.gateway.get_issue(issue)
+        pr_existing = self.gateway.pr_for_issue(issue)
+        state = None
+        effect_binding = binding
+        if pr_existing is None:
+            state = self._resolve_state(issue, binding)
+            assert binding is not None
+        else:
+            if binding is not None:
+                self._resolve_state(issue, binding, allow_held=True)
+            elif self.workflow_control is not None:
+                captured = self.workflow_control.load_workflow(WorkflowKey(self.workflow_control.writer.repository, IssueRef(issue)))
+                if not isinstance(captured, WorkflowSnapshot):
+                    raise WorkflowAuthorityError("PR reply requires available linked-issue command authority")
+                effect_binding = captured.binding
+            if isinstance(self.runner, ContextualRuntime):
+                self.runner.set_context("fix", "PR_RESUME", pr_existing, issue, workflow=None)
         reply_comment = fix_domain.last_human_reply(iss, self.cfg.fix_bot)
         if reply_comment is None or not reply_comment.body.strip():
-            # Dispatched on a reply that vanished on re-fetch or has an empty
-            # body: nothing to resume on. The decide side already flipped
-            # ai-blocked → ai-working; leaving that stands strands the issue
-            # into the reaper (→ ai-ready → a full RESOLVE loop — T3 probe
-            # finding). Consume the reply (if any) and put the issue back to
-            # awaiting-human.
             if reply_comment is not None:
                 self.store.set_resumed_at(issue, reply_comment.created_at)
-            self.executor.execute_all([
-                Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED)
-            ])
+            actions = [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED, workflow=effect_binding)]
+            if state is not None:
+                self._execute_resolve_actions(issue, actions, state.binding)
+            else:
+                self.executor.execute_all(actions)
             return
         reply = reply_comment.body
-        # V1/#13 write side: record WHICH reply this dispatch consumes, BEFORE
-        # running — the decide loop's dedup (issues_needing_resume) compares
-        # this mark against the thread, and without it one unanswered reply
-        # re-fired a paid RESUME session every poll tick. Written pre-run so
-        # even a crashed/blocked leg cannot loop on the same reply; a crashed
-        # leg is requeued by the reaper (ai-working → ai-ready), not by
-        # re-resuming.
         self.store.set_resumed_at(issue, reply_comment.created_at)
-        pr_existing = self.gateway.pr_for_issue(issue)
-        if self.cfg.author_tests_split and pr_existing is None:
-            await self.resolve_split(issue, human_reply=reply)
+        if self.cfg.author_tests_split and state is not None:
+            await self.resolve_split(issue, human_reply=reply, binding=binding)
             return
         branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else self._resume_branch(issue, iss.title)
         cwd = self._ensure_cwd(issue, branch)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
-        session_id = self.store.get_session(issue)
-        fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
+        if state is not None:
+            session = state.episode.continuation.session
+            session_id = session.session_id if session is not None else ""
+            fix_cfg = self._resolve_resume_cfg(issue, state, iss)
+        else:
+            session_id = self.store.get_session(issue)
+            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
         task = (
-            task_builders.build_resume_task(
-                as_untrusted(reply), cwd, session_id, fix_cfg, fork=fork
-            )
-            if session_id
-            else task_builders.build_fresh_reply_task(
-                issue,
-                as_untrusted(iss.title),
-                as_untrusted(iss.body),
-                as_untrusted(reply),
-                cwd,
-                fix_cfg,
+            task_builders.build_resume_task(as_untrusted(reply), cwd, session_id, fix_cfg, fork=fork)
+            if session_id else task_builders.build_fresh_reply_task(
+                issue, as_untrusted(iss.title), as_untrusted(iss.body), as_untrusted(reply), cwd, fix_cfg,
             )
         )
-        result = await self._run_logged("resume", issue, task, kind="RESUME")
-        # A resumed session that re-blocks is a poor target for the NEXT
-        # resume: its history is dominated by its own block turns, and each
-        # further resume amplifies the pattern (tauri #604, 2026-08-09 — the
-        # fourth consecutive resume blocked in 7s asking for "additional
-        # execution time" on a leg with its full wall budget unspent).
-        # Dropping the handle makes the next reply rebuild from the thread
-        # and the persistent worktree (fresh-recovery, the #71 path) instead
-        # of re-entering the blocked groove. A blocked FRESH leg stores its
-        # new session as before — first blocks keep their context; only a
-        # block that survived a resume forfeits it.
-        if result.status == "blocked":
-            self.store.save_session(issue, "")
-        else:
-            self.store.save_session(issue, result.session_id)
+        if state is not None:
+            self._resolve_state(issue, binding)
+            task = self._guided(task, state)
+            task = dataclasses.replace(task, resolve_inputs=ResolveInputs(iss.title, iss.body, iss.author))
+        result = await self._run_logged("resume", issue, task, kind="RESUME" if state is not None else "PR_RESUME")
+        if state is not None:
+            assert binding is not None
+            returned = self._returned_result(result, binding)
+            if returned is not None:
+                if outcome.infra_class_failure(result):
+                    self._charge_infra_death(issue, "resume", result)
+                else:
+                    self._decay_infra_deaths(issue, result)
+                if self._finish_return(returned):
+                    self.executor.replay_pending()
+                return
         pr = self.gateway.pr_for_issue(issue)
+        if state is not None:
+            assert binding is not None
+            # A reply-driven failure remains blocked; it does not buy a resolve
+            # strike unless fresh requirements explicitly require a requeue.
+            current = self.gateway.get_issue(issue)
+            changed = result.status == "blocked" and not (
+                outcome.infra_class_failure(result) or outcome.budget_exhausted(result.exit_reason)
+            ) and (current.title, current.body, current.author) != (iss.title, iss.body, iss.author)
+            followup = outcome.ResolveFollowup.PR_OPENED if pr is not None else (
+                outcome.ResolveFollowup.RETRY if changed else outcome.ResolveFollowup.BLOCKED
+            )
+            if not self._record_resolve_result(
+                issue, result, ResolveStage.RESUME, task, binding, followup,
+                progressed=pr is None and not result.is_error and result.status != "blocked",
+            ):
+                return
+        else:
+            self.store.save_session(issue, "" if result.status == "blocked" else result.session_id)
+            changed = False
+            current = None
         self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
         if outcome.infra_class_failure(result):
-            # review C3/D2c, RETURNED-result half. Reads `infra_class_failure`
-            # so a runtime that could not start the leg counts here, not as a
-            # quality signal (keifu #130).
-            #
-            # R1-F10: this used to claim resume_actions "does NOTHING… so the
-            # reply must not be consumed by a session that never ran… the
-            # issue stays ai-working, the reaper requeues it, and the next
-            # poll pays for the SAME resume again." Both halves were wrong.
-            # The reply is ALREADY consumed regardless of this session's fate:
-            # set_resumed_at (above) is written BEFORE the run, precisely so
-            # the dedup mark holds even if the session that follows dies —
-            # not only after a successful resume. And the orphaned ai-working
-            # issue is not requeued back into "awaiting the same reply":
-            # domain.fix.reap_actions repairs it to ai-pr-open when it already
-            # has an open PR (the common case here — most resumes happen on an
-            # issue that already opened one; as of HEAD f0b4040, review
-            # P0R-5), or to ai-ready when it does not. Either way the NEXT
-            # poll pays for a fresh RESOLVE or PR-leg dispatch, never "the
-            # same resume again" — issues_needing_resume won't re-fire on a
-            # reply whose timestamp already matches the (pre-run) resumed-at
-            # mark. What this counter actually bounds is that repeat-dispatch
-            # loop — the session dying before producing ANY result, over and
-            # over, with no retry counter of its own to catch it. A leg either
-            # raises (AgentDispatcher.dispatch bumps) or returns (here), never
-            # both, so a death is counted exactly once.
             self._charge_infra_death(issue, "resume", result)
         else:
-            # No alt_key: RESUME is issue-keyed at the dispatcher
-            # (`_issue_number` returns action.number without a lookup), so its
-            # count can never land in the `-pr` half — and `pr` here is an
-            # Optional from `pr_for_issue`, which `-pr` would not survive.
             self._decay_infra_deaths(issue, result)
-        self.executor.execute_all(outcome.resume_actions(issue, result, pr))
+        actions = ([Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)] if changed
+                   else outcome.resume_actions(issue, result, pr))
+        if state is not None:
+            self._execute_resolve_actions(issue, actions, state.binding, current=current)
+        else:
+            # PR work owns no resolve allowance, but its issue effects retain
+            # the issue generation captured before the paid repair began.
+            self.executor.execute_all([
+                dataclasses.replace(action, workflow=effect_binding)
+                if isinstance(action, (Relabel, PostComment)) and action.target is Target.ISSUE
+                else action for action in actions
+            ])
 
     def _dispatch_pr(self, pr: int, issue_hint: int | None):
         """Bind fresh PR state to the issue captured by its claim (ADR 0008)."""
@@ -1073,20 +1198,33 @@ class FixWorkflow:
             if reply_comment is not None:
                 self.store.set_pr_resumed_at(pr, reply_comment.created_at)
             return
-        # Persist before the paid run: an unchanged PR reply must not fire again
-        # after a crash or another blocked result.
-        self.store.set_pr_resumed_at(pr, reply_comment.created_at)
         iss = self.gateway.get_issue(issue)
+        session_id = self.store.get_session(issue)
+        leg = "fix-ci" if any(check.bucket == "fail" and not check.advisory for check in p.checks) else "resume"
+        if session_id:
+            fix_cfg = self._repair_fix_cfg(issue, leg, iss=iss)
+        else:
+            handed_off = self._resolve_handoff_session(issue)
+            if handed_off is None or self.cfg.fix is None:
+                self.cfg.log(f"PR #{pr}: reply deferred; no compatible session is available")
+                return
+            session_id = handed_off.session_id
+            fix_cfg = self._escalated(dataclasses.replace(
+                self.cfg.fix, model=None if handed_off.model == "<runtime-default>" else handed_off.model,
+            ), issue, leg, iss=iss)
+        # Persist only after a usable transcript is selected, but before paid
+        # work: neither missing handoff nor an incompatible runtime consumes it.
+        self.store.set_pr_resumed_at(pr, reply_comment.created_at)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         if any(check.bucket == "fail" and not check.advisory for check in p.checks):
-            task = self._ci_task(p, issue, cwd, fork=fork)
+            task = self._ci_task(p, issue, cwd, fork=fork, session_id=session_id, fix_cfg=fix_cfg)
         else:
             task = task_builders.build_resume_task(
                 as_untrusted(reply_comment.body),
                 cwd,
-                self.store.get_session(issue),
-                self._repair_fix_cfg(issue, "resume", iss=iss), fork=fork,
+                session_id,
+                fix_cfg, fork=fork,
             )
         result = await self._run_pr_logged(
             "pr-resume", issue, task, p, kind="PR_RESUME", reply=reply_comment.body
@@ -1095,11 +1233,28 @@ class FixWorkflow:
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
         self.store.save_session(issue, result.session_id)
+        if result.session_id:
+            self.store.save_model(issue, task.model or "<runtime-default>")
         if outcome.infra_class_failure(result):
             self._charge_infra_death(issue, "pr-resume", result)
         else:
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         self.executor.execute_all(outcome.pr_resume_actions(pr, result))
+
+    def _resolve_handoff_session(self, issue: int) -> ResolveSession | None:
+        """Consume a prior resolve transcript without reviving its file writer."""
+        if self.workflow_control is None:
+            return None
+        try:
+            state = self.workflow_control.load_workflow(WorkflowKey(self.workflow_control.writer.repository, IssueRef(issue)))
+        except Exception as exc:  # noqa: BLE001 — unavailable handoff cannot authorize paid resume
+            self.cfg.log(f"issue #{issue}: resolve session handoff unavailable ({exc})")
+            return None
+        if isinstance(state, WorkflowSnapshot):
+            session = state.episode.continuation.session
+            if session is not None and session.runtime == self._resolve_runtime_name():
+                return session
+        return None
 
     async def address_review(
         self, pr: int, *, issue_hint: int | None = None
@@ -1172,7 +1327,8 @@ class FixWorkflow:
         )
         return await self._run_logged(label, issue, current, kind=kind)
 
-    def _ci_task(self, p: PRView, issue: int, cwd: str, *, fork: bool = False):
+    def _ci_task(self, p: PRView, issue: int, cwd: str, *, fork: bool = False,
+                 session_id: str | None = None, fix_cfg: FixTaskConfig | None = None):
         pr = p.number
         failed = "\n".join(c.name for c in p.checks if c.bucket == "fail")
         failed_log = self._failed_run_log(p)
@@ -1189,13 +1345,13 @@ class FixWorkflow:
             as_untrusted(failed),
             as_untrusted(failed_log),
             cwd,
-            self.store.get_session(issue),
+            self.store.get_session(issue) if session_id is None else session_id,
             # No `review_rounds` here (nor on `rebase`), though `p.reviews` is in
             # hand: review dissatisfaction is evidence about the RESOLUTION, and
             # a red pipeline or a conflicted branch is a different failure mode.
             # Spending the ladder on it would charge the wrong leg for the
             # reviewer's objections. Recurrence and resolve retries still apply.
-            self._repair_fix_cfg(issue, "fix-ci"),
+            self._repair_fix_cfg(issue, "fix-ci") if fix_cfg is None else fix_cfg,
             mcp_servers=mcp_servers,
             ci_history=prior_attempts,
             fork=fork,

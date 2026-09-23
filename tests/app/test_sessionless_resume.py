@@ -1,9 +1,12 @@
 """Regression coverage for reply-driven recovery without a runtime session."""
 
 import asyncio
+from dataclasses import replace
+
+import pytest
 
 from tests.domain.builders import Comment, issue, pr, world
-from test_convergence import Scenario, simulate
+from test_convergence import Scenario, simulate, controlled_publication_context
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, SeqRunner
 from test_fix_workflow import _workflow
 
@@ -13,6 +16,9 @@ from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.world import Comment as WorldComment
 from issue_agent.domain.world import IssueView
+from issue_agent.domain.workflow import AuthoredResolve, FreshResolve
+from tests.fakes.accounted_workflow import seed_resolve, resolve_state, attach_workflow_authority
+from tests.fakes.workflow_authority import resolve_snapshot
 
 
 def test_sessionless_blocked_reply_dispatches_once_as_resume(tmp_path):
@@ -62,7 +68,10 @@ def test_sessionless_reply_keeps_world_order_when_saved_session_also_waits():
             ),
         ]
     )
-    state = FixState(sessions=frozenset({8}))
+    store = FakeStore()
+    seed_resolve(store, 8, session_id="saved")
+    attach_workflow_authority(FakeGateway(issues={8: blocked.issues[1]}), store)
+    state = FixState(resolve_workflows={7: resolve_snapshot(7), 8: resolve_state(store, 8)})
 
     actions = decide_fix(
         blocked,
@@ -120,7 +129,7 @@ def test_reply_with_session_continues_the_saved_runtime_handle():
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
-    store.save_session(5, "prior-session")
+    seed_resolve(store, 5, session_id="prior-session")
     runner = FakeRunner(
         AgentResult(
             is_error=False,
@@ -153,7 +162,7 @@ def test_split_author_reply_stays_in_author_phase():
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
-    store.save_session(5, "blocked-author-session")
+    seed_resolve(store, 5, session_id="blocked-author-session")
     runner = FakeRunner(
         AgentResult(is_error=False, status="blocked", session_id="new-author-session")
     )
@@ -173,10 +182,11 @@ def test_split_author_reply_stays_in_author_phase():
     assert "TEST/INTERFACE AUTHOR" in task.prompt
     assert "Use PostgreSQL." in task.prompt
     assert "Do NOT write the implementation" in task.prompt
-    assert store.get_phase(5) == ""
+    assert isinstance(resolve_state(store).episode.continuation, FreshResolve)
 
 
-def test_split_implementer_reply_stays_in_implementer_phase():
+@pytest.mark.parametrize("changed_reply", [False, True])
+def test_split_implementer_reply_reuses_only_its_current_author_inputs(changed_reply):
     iss = IssueView(
         5,
         title="Choose storage",
@@ -188,8 +198,22 @@ def test_split_implementer_reply_stays_in_implementer_phase():
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
-    store.set_phase(5, "authored")
-    store.save_session(5, "blocked-implementer-session")
+    initial = SeqRunner([
+        AgentResult(is_error=False, status="tests_authored", session_id="author-session"),
+        AgentResult(is_error=False, status="blocked", session_id="blocked-implementer-session"),
+    ])
+    asyncio.run(_workflow(gateway, store, initial, fix_bot="fix-bot", author_tests_split=True).resume(5))
+    checkpoint = resolve_state(store).episode.continuation
+    assert isinstance(checkpoint, AuthoredResolve)
+    blocked = gateway.issues[5]
+    assert blocked.comments[-1].body.startswith("**Agent needs input:**")
+    gateway.issues[5] = replace(blocked, comments=blocked.comments + (
+        WorldComment(
+            "alice",
+            "Use SQLite instead." if changed_reply else "Use PostgreSQL.",
+            "t3",
+        ),
+    ))
     runner = FakeRunner(
         AgentResult(
             is_error=False,
@@ -210,10 +234,15 @@ def test_split_implementer_reply_stays_in_implementer_phase():
 
     task = runner.tasks[0]
     assert task.resume is None
-    assert "You are the IMPLEMENTER" in task.prompt
-    assert "Use PostgreSQL." in task.prompt
-    assert "HARD RULE: do NOT modify" in task.prompt
-    assert store.get_phase(5) == "authored"
+    if changed_reply:
+        assert "TEST/INTERFACE AUTHOR" in task.prompt
+        assert "Use SQLite instead." in task.prompt
+        assert "Do NOT write the implementation" in task.prompt
+    else:
+        assert "You are the IMPLEMENTER" in task.prompt
+        assert "Use PostgreSQL." in task.prompt
+        assert "HARD RULE: do NOT modify" in task.prompt
+    assert resolve_state(store).episode.continuation.author_admission == checkpoint.author_admission
 
 
 def test_split_reply_recovery_does_not_rerun_overlap_routing():
@@ -276,9 +305,9 @@ def test_split_reply_reaches_contract_adjudicator():
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
-    store.set_phase(5, "authored")
     runner = SeqRunner(
         [
+            AgentResult(is_error=False, status="tests_authored", session_id="author-session"),
             AgentResult(
                 is_error=False,
                 status="contract_change",
@@ -308,6 +337,7 @@ def test_split_reply_reaches_contract_adjudicator():
         ).resume(5)
     )
 
-    assert "adjudicating a contract dispute" in runner.tasks[1].prompt
-    assert "Use PostgreSQL." in runner.tasks[1].prompt
+    assert isinstance(resolve_state(store).episode.continuation, AuthoredResolve)
+    assert "adjudicating a contract dispute" in runner.tasks[2].prompt
     assert "Use PostgreSQL." in runner.tasks[2].prompt
+    assert "Use PostgreSQL." in runner.tasks[3].prompt

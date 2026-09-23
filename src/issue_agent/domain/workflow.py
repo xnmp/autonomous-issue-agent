@@ -94,6 +94,8 @@ class AuthoredResolve:
     def __post_init__(self) -> None:
         if not isinstance(self.author_admission, ResolveAdmission) or self.author_admission.stage is not ResolveStage.AUTHOR:
             raise ValueError("authored resolve requires its admitted author provenance")
+        if self.author_admission.input_fingerprint is None:
+            raise ValueError("authored checkpoint requires its admitted input fingerprint")
         _count(self.last_applied_admission_version, "continuation admission version", minimum=1)
         if self.author_admission.revision.version > self.last_applied_admission_version:
             raise ValueError("authored checkpoint cannot exceed the applied admission watermark")
@@ -123,6 +125,7 @@ class ResolveAdmission:
     revision: WorkflowRevision
     stage: ResolveStage
     adjudication_ceiling: int | None = None
+    input_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, WorkflowAttemptIdentity) or not isinstance(self.revision, WorkflowRevision):
@@ -137,6 +140,11 @@ class ResolveAdmission:
             _count(self.adjudication_ceiling, "adjudication ceiling")
         elif self.adjudication_ceiling is not None:
             raise ValueError("only adjudication admits against a contract-round ceiling")
+        if self.input_fingerprint is not None and (
+            not isinstance(self.input_fingerprint, str) or len(self.input_fingerprint) != 64
+            or any(character not in "0123456789abcdef" for character in self.input_fingerprint)
+        ):
+            raise ValueError("admission input fingerprint must be a SHA-256 digest")
 
 
 def adjudication_allowed(admitted: int, ceiling: int) -> bool:

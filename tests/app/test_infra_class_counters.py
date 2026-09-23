@@ -14,17 +14,22 @@ quality counter; a leg that ran and produced no PR still does.
 
 import asyncio
 
+import pytest
+
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import FixTaskConfig
-from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
-from issue_agent.domain.actions import AgentKind, PostComment, RunAgent
+from issue_agent.app.workflows.fix import FixWorkflowConfig
+from issue_agent.domain.actions import AgentKind, PostComment, Relabel, RunAgent
 from issue_agent.domain.events import InfraPathEntered
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.world import IssueView
+from issue_agent.domain.workflow import OpenGate, ResolveCeiling
 
 from tests.domain.builders import issue as build_issue, world
+from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, resolve_state, seed_resolve
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees
 
@@ -54,9 +59,11 @@ def workflow(gateway, store, runner, **overrides):
     )
     config.update(overrides)
     worktrees = FakeWorktrees()
-    return FixWorkflow(
+    authority = attach_workflow_authority(gateway, store, resolve_ceiling=CFG.max_resolve_retries)
+    return AccountedFixtureWorkflow(
         FixWorkflowConfig(**config), gateway, store, worktrees, runner,
         Executor(gateway, remove_worktree=worktrees.remove),
+        workflow_control=authority,
     )
 
 
@@ -93,9 +100,9 @@ def run_resolves(store, result, times, gateway=None, **overrides):
 
 
 def decide_from(store):
-    """Run the real decide function over the counters the workflow persisted."""
+    """Use the SQL-owned episode and separate infrastructure counter."""
     state = FixState(
-        resolve_retries={ISSUE: store.get_resolve_retries(ISSUE)},
+        resolve_workflows={ISSUE: resolve_state(store, ISSUE)},
         infra_deaths={ISSUE: store.get_infra_deaths(ISSUE)},
     )
     return decide_fix(
@@ -120,7 +127,7 @@ def test_three_stillborn_legs_leave_the_resolve_breaker_untouched():
 
     run_resolves(store, stillborn(), 3)
 
-    assert store.get_resolve_retries(ISSUE) == 0
+    assert resolve_state(store, ISSUE).episode.failures == 0
 
 
 def test_next_healthy_dispatch_after_three_stillborn_legs_is_not_escalated():
@@ -131,7 +138,7 @@ def test_next_healthy_dispatch_after_three_stillborn_legs_is_not_escalated():
 
     actions = decide_from(store)
 
-    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE)]
+    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE, workflow=resolve_state(store, ISSUE).binding)]
     assert "resolve failed" not in comments(actions)
 
 
@@ -198,7 +205,7 @@ def test_a_counter_we_cannot_persist_does_not_replace_the_death_it_reports():
     )
 
     assert any("infra death not persisted" in m for m in logged)
-    assert store.get_resolve_retries(ISSUE) == 0
+    assert resolve_state(store, ISSUE).episode.failures == 0
     assert ("relabel", "issue", ISSUE, "ai-working", "ai-ready") in gateway.calls
 
 
@@ -209,11 +216,16 @@ def test_three_legs_that_ran_without_opening_a_pr_still_trip_the_breaker():
     store = FakeStore()
     run_resolves(store, ran_and_failed(), 3)
 
-    assert store.get_resolve_retries(ISSUE) == 3
+    assert resolve_state(store, ISSUE).episode.failures == 3
 
     actions = decide_from(store)
     assert resolve_dispatches(actions) == []
-    assert "resolve failed 3× without opening a PR" in comments(actions)
+    state = resolve_state(store, ISSUE)
+    assert len(state.gates) == 1
+    gate = state.gates[0]
+    assert isinstance(gate, OpenGate)
+    assert gate.cause == ResolveCeiling(state.episode.episode_id, 3, 3, "could not make the tests pass")
+    assert "resolve failed 3×" in comments(actions)
 
 
 def test_mixed_history_counts_only_the_legs_that_ran():
@@ -223,10 +235,10 @@ def test_mixed_history_counts_only_the_legs_that_ran():
     run_resolves(store, ran_and_failed(), 2)
     run_resolves(store, stillborn(), 3)
 
-    assert store.get_resolve_retries(ISSUE) == 2
+    assert resolve_state(store, ISSUE).episode.failures == 2
 
     actions = decide_from(store)
-    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE)]
+    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE, workflow=resolve_state(store, ISSUE).binding)]
     assert "resolve failed" not in comments(actions)
 
 
@@ -238,7 +250,9 @@ def test_a_leg_that_ran_decays_the_infra_deaths_that_preceded_it():
     run_resolves(store, ran_and_failed(), 1)
 
     assert store.get_infra_deaths(ISSUE) == 0
-    assert store.get_resolve_retries(ISSUE) == 1
+    assert resolve_state(store, ISSUE).episode.failures == 1
+    session = resolve_state(store, ISSUE).episode.continuation.session
+    assert session is not None and session.session_id == "sess-abc"
 
 
 # ── the rest of the taxonomy keeps its existing meaning ──────────────────────
@@ -251,13 +265,13 @@ def test_wall_timeout_is_a_quality_strike_not_an_infra_failure():
         is_error=True, session_id="sess-1", exit_reason=ExitReason.WALL_TIMEOUT,
     ), 3)
 
-    assert store.get_resolve_retries(ISSUE) == 3
+    assert resolve_state(store, ISSUE).episode.failures == 3
     assert store.get_infra_deaths(ISSUE) == 0
 
 
-def test_budget_exhausted_admission_denial_touches_neither_counter():
-    """It never started, so it is not a strike — and it has its own operator
-    surface (needs-budget-review), so it is not an infra death either."""
+def test_budget_exhausted_outcome_touches_neither_counter():
+    """Budget outcomes have their own operator surface, not a quality strike
+    or an infrastructure death, even when returned by an admitted runtime."""
     store = FakeStore()
 
     run_resolves(store, AgentResult(
@@ -266,7 +280,7 @@ def test_budget_exhausted_admission_denial_touches_neither_counter():
         exit_reason=ExitReason.BUDGET_EXHAUSTED,
     ), 3)
 
-    assert store.get_resolve_retries(ISSUE) == 0
+    assert resolve_state(store, ISSUE).episode.failures == 0
     assert store.get_infra_deaths(ISSUE) == 0
 
 
@@ -282,7 +296,7 @@ def test_admission_refusal_subtypes_are_infra_not_strikes():
         exit_reason=ExitReason.AGENT_ERROR,
     ), 3)
 
-    assert store.get_resolve_retries(ISSUE) == 0
+    assert resolve_state(store, ISSUE).episode.failures == 0
     assert store.get_infra_deaths(ISSUE) == 3
 
 
@@ -322,17 +336,18 @@ def test_router_still_sees_evidence_from_legs_that_ran():
 
 
 # ── malformed / absent counter state ─────────────────────────────────────────
-def test_absent_counters_read_as_no_history():
+def test_initialized_episode_starts_with_no_failure_history():
     store = FakeStore()
+    seed_resolve(store, ISSUE)
+    attach_workflow_authority(FakeGateway(issues={ISSUE: IssueView(ISSUE)}), store)
 
     actions = decide_from(store)
 
-    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE)]
+    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE, workflow=resolve_state(store, ISSUE).binding)]
 
 
-def test_a_store_that_cannot_answer_degrades_to_no_evidence_not_a_dead_leg():
-    """The counters are an optimisation of WHICH configuration to dispatch,
-    never a precondition for dispatching."""
+def test_unreadable_legacy_counters_do_not_erase_sql_failure_evidence():
+    """Unavailable legacy CI evidence is optional; resolve authority is not."""
 
     class BrokenStore(FakeStore):
         def get_resolve_retries(self, issue):
@@ -341,27 +356,46 @@ def test_a_store_that_cannot_answer_degrades_to_no_evidence_not_a_dead_leg():
         def get_ci_retries(self, issue):
             raise OSError("state dir is gone")
 
+    store = BrokenStore()
+    seed_resolve(store, ISSUE, failures=2)
     signals = workflow(
         FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}),
-        BrokenStore(),
+        store,
         FakeRunner(stillborn()),
     )._signals(ISSUE)
 
-    assert signals.resolve_retries == 0
+    assert signals.resolve_retries == 2
     assert signals.ci_retries == 0
+
+
+def test_corrupt_sql_episode_blocks_paid_resolve_instead_of_resetting_evidence():
+    gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")})
+    store = FakeStore()
+    runner = FakeRunner(ran_and_failed())
+    current = workflow(gateway, store, runner)
+    binding = resolve_state(store, ISSUE).binding
+    with store._workflow_db.transaction() as db:
+        db.execute("UPDATE workflows SET episode_json='corrupt' WHERE repository='o/r' AND target_number=?", (ISSUE,))
+
+    with pytest.raises(WorkflowAuthorityError):
+        asyncio.run(current.resolve(ISSUE, binding=binding))
+    assert runner.tasks == []
 
 
 def test_a_ready_issue_at_neither_ceiling_is_never_escalated_by_either_reason():
     """Boundary: one below both caps."""
-    state = FixState(resolve_retries={ISSUE: 2}, infra_deaths={ISSUE: 4})
+    store = FakeStore()
+    seed_resolve(store, ISSUE, failures=2)
+    attach_workflow_authority(FakeGateway(issues={ISSUE: IssueView(ISSUE)}), store)
+    state = FixState(resolve_workflows={ISSUE: resolve_state(store, ISSUE)}, infra_deaths={ISSUE: 4})
 
     actions = decide_fix(
         world(issues=[build_issue(ISSUE, "ai-ready")]), CFG, state, fixer_busy=False
     )
 
-    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE)]
+    assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE, workflow=resolve_state(store, ISSUE).binding)]
     assert not any(
-        a.to_label is Label.NEEDS_HUMAN_REVIEW
+        a.add is Label.NEEDS_HUMAN_REVIEW
         for a in actions
-        if hasattr(a, "to_label")
+        if isinstance(a, Relabel)
     )

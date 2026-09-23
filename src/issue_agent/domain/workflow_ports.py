@@ -1,11 +1,13 @@
 """Bound repository/owner ports for resolve workflow control; ADR 0015."""
 
 from typing import Protocol
+from contextlib import AbstractContextManager
 
-from .contracts import CommandId
+from .contracts import CommandId, WorkflowAttemptIdentity
+from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
 from .workflow import (
     CommandAbsenceEvidence, CommandRetryApplicability, HeldProjection, RearmIntent, RetryAlreadyConsumed,
-    RetryBegan, ObservedIssue, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead,
+    RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead,
 )
 from .workflow_identity import (
     FamilyAuthority, WorkflowKey, WorkflowRevision, WorkflowWriter,
@@ -35,6 +37,22 @@ class WorkflowControl(Protocol):
 
     def record_attempt(
         self, result: ResolveAttemptResult
+    ) -> WorkflowCommitted | WorkflowConflict: ...
+
+    def capture_return(self, returned: ReturnedResolve) -> WorkflowCommitted | WorkflowConflict: ...
+
+    def returned_result(self, attempt: WorkflowAttemptIdentity) -> ReturnedResolve | None: ...
+
+    def pending_returns(self, *, limit: int = 32) -> tuple[PendingResolveReturn | UnavailableResolveReturn, ...]: ...
+
+    def defer_return(self, returned: ReturnedResolve, error: str) -> None: ...
+
+    def return_effect_authority(self, returned: ReturnedResolve) -> AbstractContextManager[None]: ...
+
+    def finalize_return(
+        self, returned: ReturnedResolve, issue: ObservedIssue,
+        linkage: NoLinkedPr | LinkedPrPresent,
+        *, cleanup: ResolveCleanupCompleted | None = None,
     ) -> WorkflowCommitted | WorkflowConflict: ...
 
     def lookup_rearm(

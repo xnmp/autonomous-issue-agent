@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from ...adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
 from ...domain.agent_task import RunIntent, RuntimeName
 from ...domain.effort import Effort
+from ...domain.resolve_return import ResolveInputs
 
 
 @dataclass(frozen=True, init=False)
@@ -23,6 +24,7 @@ class PlannedRun:
     mcp_servers: tuple[McpServer, ...]
     subagents: tuple[SubagentDef, ...]
     env: dict[str, str]
+    resolve_inputs: ResolveInputs | None
 
     def __init__(
         self,
@@ -43,6 +45,7 @@ class PlannedRun:
         *,
         intent: RunIntent | None = None,
         runtime: RuntimeName | None = None,
+        resolve_inputs: ResolveInputs | None = None,
     ) -> None:
         selected_intent = intent or (
             prompt
@@ -66,6 +69,9 @@ class PlannedRun:
         object.__setattr__(self, "mcp_servers", mcp_servers)
         object.__setattr__(self, "subagents", subagents)
         object.__setattr__(self, "env", dict(env or {}))
+        if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
+            raise ValueError("resolve completion inputs must be validated")
+        object.__setattr__(self, "resolve_inputs", resolve_inputs)
 
     @property
     def prompt(self) -> str:
@@ -113,4 +119,5 @@ def compose_runtime_plan(plan: PlannedRun) -> RuntimePlan:
         mcp_servers=plan.mcp_servers,
         subagents=plan.subagents,
         env=plan.env,
+        resolve_inputs=plan.resolve_inputs,
     )

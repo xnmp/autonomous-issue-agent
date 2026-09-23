@@ -101,16 +101,13 @@ def with_previous_handover(task: RuntimePlan, scope: HandoverScope) -> PreparedT
     return PreparedTask(
         replace(
             task,
-            intent=replace(
-                task.intent,
-                prompt=(
-                    f"{HANDOVER_PROMPT_HEADER}\n\n"
-                    "<untrusted_handover_json>\n"
-                    f"{encoded_context}\n"
-                    "</untrusted_handover_json>\n\n"
-                    "## Current authoritative task (follow this)\n\n"
-                    f"{task.prompt}"
-                ),
+            context_prefix=(
+                f"{HANDOVER_PROMPT_HEADER}\n\n"
+                "<untrusted_handover_json>\n"
+                f"{encoded_context}\n"
+                "</untrusted_handover_json>\n\n"
+                "## Current authoritative task (follow this)\n\n"
+                f"{task.context_prefix}"
             ),
         ),
         hashlib.sha256(raw).hexdigest(),

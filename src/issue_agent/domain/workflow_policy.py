@@ -4,17 +4,19 @@ from __future__ import annotations
 
 import hashlib
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from .actions import Relabel, Target
+from . import outcome
+from .actions import Action, PostComment, Relabel, Target
 from .contracts import CommandId, CommandKind, WorkflowAttemptIdentity
 from .eligibility import AllowedEligibility, LifecycleOperation
 from .labels import Label
-from .lifecycle import issue_eligibility
+from .lifecycle import completion_guard, issue_eligibility
 from .outcome import AgentResult, ResolveFollowup, budget_exhausted, infra_class_failure
+from .resolve_return import PendingResolveReturn, ResolveCleanupCompleted, ReturnedResolve
 from .workflow import (
     AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
-    ContinueGrantedRearm, EnsureLifecycleProjection, IssueObservation,
+    ContinueGrantedRearm, EnsureLifecycleProjection, EvidenceUnavailable, FreshResolve, IssueObservation,
     LinkedPrObservation, LinkedPrPresent, NoAuthorizedRemediation, NoLinkedPr, ObservedIssue,
     ObservedTransition, OpenGate, OperatorActor, PendingRearm, RearmingGate,
     RearmNeedsDecision, RemoteOutcomeUncertain, RenewResolveAllowance,
@@ -26,6 +28,147 @@ from .workflow import (
 from .workflow_identity import (
     FamilyAuthority, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier,
 )
+
+
+def return_gate_id(returned: ReturnedResolve) -> str:
+    identity = returned.attempt
+    material = f"{identity.binding.fence.key.repository}\0{identity.run_id}\0{identity.leg_id}"
+    return "resolve-return:" + hashlib.sha256(material.encode()).hexdigest()
+
+
+def return_observation_gate(pending: PendingResolveReturn) -> OpenGate:
+    returned = pending.returned
+    return OpenGate(
+        return_gate_id(returned), returned.attempt.binding.fence.generation,
+        EvidenceUnavailable(str(returned.attempt.run_id), returned.returned_at,
+                            pending.failed_reads, pending.last_error or "paid return awaits complete issue and linkage observations"),
+        NoAuthorizedRemediation("read-only completion observation is required; do not repeat the paid leg"),
+    )
+
+
+def update_return_observation(
+    snapshot: WorkflowSnapshot, returned: ReturnedResolve, pending: PendingResolveReturn | None,
+) -> WorkflowSnapshot:
+    if snapshot.revision.fence.key != returned.attempt.binding.fence.key:
+        raise ValueError("returned observation belongs to another workflow")
+    if pending is not None and (pending.returned != returned or snapshot.binding != returned.attempt.binding):
+        raise ValueError("cannot open a return gate for a stale or different attempt")
+    gates = tuple(g for g in snapshot.gates if _open(g).gate_id != return_gate_id(returned))
+    if pending is not None:
+        gates += (return_observation_gate(pending),)
+    if gates == snapshot.gates:
+        return snapshot
+    return replace(snapshot, revision=_next(snapshot), gates=gates)
+
+
+def resolve_return_actions(snapshot: WorkflowSnapshot, actions: tuple[Action, ...], *, prior: WorkflowSnapshot) -> tuple[Action, ...]:
+    """Keep projection debt under existing holds; a new ceiling owns escalation."""
+    existing = {_open(g).gate_id for g in prior.gates}
+    newly_exhausted = any(_open(g).gate_id not in existing and isinstance(_open(g).cause, ResolveCeiling)
+                          for g in snapshot.gates)
+    return tuple(action for action in actions if not (
+        newly_exhausted and isinstance(action, Relabel) and action.add is Label.AI_READY
+    ))
+
+
+def apply_return_cleanup(snapshot: WorkflowSnapshot, cleanup: ResolveCleanupCompleted) -> WorkflowSnapshot:
+    """Removed worktree content cannot retain an authored checkpoint or handle."""
+    if not isinstance(cleanup, ResolveCleanupCompleted) or cleanup.attempt.binding != snapshot.binding:
+        raise ValueError("terminal cleanup must belong to the current episode")
+    fresh = FreshResolve(last_applied_admission_version=snapshot.episode.continuation.last_applied_admission_version)
+    return replace(snapshot, episode=replace(snapshot.episode, continuation=fresh))
+
+
+def defer_return_observation(pending: PendingResolveReturn, error: str, *, now: datetime) -> PendingResolveReturn:
+    # Observation continues at a bounded cadence even after prolonged failure;
+    # neither elapsed time nor a failed read authorizes a new execution.
+    if not isinstance(error, str) or not error.strip() or len(error) > 16384 or "\x00" in error:
+        raise ValueError("return observation failure requires bounded error text")
+    if now.tzinfo is None or now < pending.returned.returned_at:
+        raise ValueError("return observation clock precedes the paid return")
+    failures = pending.failed_reads + 1
+    delay = min(3600, 5 * 2 ** min(failures - 1, 10))
+    return replace(pending, failed_reads=failures, last_error=error,
+                   next_read_at=max(pending.next_read_at, now + timedelta(seconds=delay)))
+
+
+def decide_return(
+    returned: ReturnedResolve, issue: ObservedIssue, linkage: NoLinkedPr | LinkedPrPresent,
+    *, now: datetime,
+) -> tuple[ResolveAttemptResult, tuple[Action, ...]]:
+    """The immediate and recovered ordinary resolve tail share one decision."""
+    if not isinstance(returned, ReturnedResolve) or not isinstance(issue, ObservedIssue) or not isinstance(linkage, (NoLinkedPr, LinkedPrPresent)):
+        raise ValueError("completion requires a typed return and complete observations")
+    key = returned.attempt.binding.fence.key
+    if issue.key != key or linkage.issue != key:
+        raise ValueError("return observations belong to another workflow")
+    if not isinstance(now, datetime) or now.tzinfo is None or any(
+        not 0 <= (now - at).total_seconds() <= 300 or at < returned.returned_at
+        for at in (issue.observed_at, linkage.observed_at)
+    ):
+        raise ValueError("return observations must be fresh and postdate the paid return")
+    result = returned.result()
+    number = key.target.number
+    pr = linkage.pr if isinstance(linkage, LinkedPrPresent) else None
+    changed = pr is None and result.status == "blocked" and not (
+        infra_class_failure(result) or budget_exhausted(result.exit_reason)
+    ) and (issue.issue.title, issue.issue.body, issue.issue.author) != (
+        returned.inputs.title, returned.inputs.body, returned.inputs.author,
+    )
+    closed_success = pr is None and issue.issue.state == "closed" and not result.is_error and result.status in ("pushed", "done")
+    followup = (ResolveFollowup.PR_OPENED if pr is not None else ResolveFollowup.RETRY if changed
+                else ResolveFollowup.BLOCKED if returned.stage is ResolveStage.RESUME
+                else outcome.resolve_followup(result, False))
+    classified = classify_resolve_attempt(result, followup)
+    assert classified is not None
+    kind = classified.kind
+    if budget_exhausted(result.exit_reason):
+        kind = ResolveResultKind.BUDGET_REFUSAL
+    elif infra_class_failure(result):
+        kind = ResolveResultKind.INFRA_FAILURE
+    elif closed_success or (returned.stage is ResolveStage.RESUME and pr is None and not result.is_error and result.status != "blocked"):
+        kind = ResolveResultKind.STAGE_PROGRESSED
+    elif issue.issue.state == "closed" and pr is None:
+        kind = ResolveResultKind.BLOCKED
+    classified = replace(classified, kind=kind, stage=returned.stage,
+                         session=None if kind in (ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL) else returned.session)
+    if closed_success:
+        return replace(classified, session=None), tuple(outcome.resolve_actions(number, result, None, issue_closed_without_pr=True))
+    if not isinstance(issue_eligibility(issue.issue, LifecycleOperation.COMPLETE_RESOLVE), AllowedEligibility):
+        return classified, ()
+    if changed:
+        actions: list[Action] = [Relabel(Target.ISSUE, number, Label.AI_WORKING, Label.AI_READY)]
+    elif returned.stage is ResolveStage.RESUME and pr is None and not budget_exhausted(result.exit_reason):
+        actions = outcome.resume_actions(number, result, None)
+    else:
+        actions = outcome.resolve_actions(number, result, pr)
+    removes: list[Label] = []
+    adds: list[Label] = []
+    comments: list[str] = []
+    others: list[Action] = []
+    for action in actions:
+        if isinstance(action, Relabel) and action.target is Target.ISSUE:
+            removes.extend(action.removed_labels)
+            adds.extend(action.added_labels)
+        elif isinstance(action, PostComment) and action.target is Target.ISSUE:
+            comments.append(action.body)
+        elif isinstance(action, Relabel) and action.target is Target.PR:
+            assert isinstance(linkage, LinkedPrPresent)
+            others.append(replace(action, expected_revision=linkage.head_sha, workflow=returned.attempt.binding))
+        else:
+            raise ValueError("ordinary resolve completion emitted an unsupported effect")
+    removes = list(dict.fromkeys(removes))
+    adds = list(dict.fromkeys(adds))
+    compact: tuple[Action, ...] = ()
+    if removes or adds or comments:
+        compact = (Relabel(
+            Target.ISSUE, number, removes[0] if removes else None, adds[0] if adds else None,
+            expected_revision=issue.issue.updated_at, removes=tuple(removes[1:]), adds=tuple(adds[1:]),
+            comment="\n\n".join(comments)[:65536],
+            completion_guard=completion_guard(issue.issue, LifecycleOperation.COMPLETE_RESOLVE),
+            workflow=returned.attempt.binding,
+        ),)
+    return classified, compact + tuple(others)
 
 
 def initial_resolve_workflow(

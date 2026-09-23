@@ -44,6 +44,7 @@ from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.world import CIState, Comment
 from issue_agent.domain.ci import ci_state, parse_timestamp
+from tests.fakes.workflow_authority import resolve_snapshot
 
 
 # ── parsers ────────────────────────────────────────────────────────────────
@@ -2443,9 +2444,11 @@ _CFG = FixConfig(fix_bot="fix-bot")
 
 
 def _decide(runner):
+    observed = GitHubGateway("o/r", runner=runner).build_world()
     return decide_fix(
-        GitHubGateway("o/r", runner=runner).build_world(),
-        _CFG, FixState(), fixer_busy=False,
+        observed,
+        _CFG, FixState(resolve_workflows={i.number: resolve_snapshot(i.number) for i in observed.issues}),
+        fixer_busy=False,
     )
 
 
@@ -2460,8 +2463,8 @@ def test_merge_cleanup_runs_on_the_poll_after_github_auto_closed_the_issue():
     world = GitHubGateway("o/r", runner=runner).build_world()
     assert 8 in {i.number for i in world.issues}, "closed ai-pr-open issue must be observable"
 
-    actions = decide_fix(world, _CFG, FixState(), fixer_busy=False)
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    actions = decide_fix(world, _CFG, FixState(resolve_workflows={8: resolve_snapshot(8)}), fixer_busy=False)
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
     assert RemoveWorktree(8) in actions
     assert ClearIssueState(pr=50, issue=8, merged=True) in actions
     # GitHub already closed it — re-closing would re-comment "Resolved by #50".
@@ -2479,7 +2482,7 @@ def test_backlog_issue_whose_pr_lost_its_label_still_gets_cleaned_up():
         # still in the stale search index, but its real label set is empty
         prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
     ))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
     assert RemoveWorktree(8) in actions
     assert ClearIssueState(pr=None, issue=8, merged=True) in actions
     assert not any(isinstance(a, CloseIssue) for a in actions)
@@ -2490,7 +2493,7 @@ def test_backlog_issue_is_cleaned_up_even_when_the_pr_has_left_the_world():
     actions = _decide(_gh_repo(
         issues={8: {"state": "CLOSED", "labels": ["ai-pr-open"]}}, prs={},
     ))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
     assert RemoveWorktree(8) in actions
 
 
@@ -2506,7 +2509,7 @@ def test_stranded_issue_repairs_itself_on_the_next_tick():
         prs={50: {"state": "MERGED", "labels": [], "issue": 8}},
     )
     actions = _decide(tick_n_plus_1)
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
 
     # …and it is ONE-SHOT: the repair's own relabel removes ai-pr-open, which
     # drops the issue out of both queries that feed the arm.
@@ -2536,7 +2539,7 @@ def test_a_human_reopen_is_relabelled_ai_done_and_never_re_closed():
     reopened = {"state": "OPEN", "labels": ["ai-pr-open"], "stateReason": "REOPENED"}
     # (a) via the issue-driven arm — the PR is gone
     actions = _decide(_gh_repo(issues={8: reopened}, prs={}))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
     assert not any(isinstance(a, CloseIssue) for a in actions)
     # (b) via the PR-driven arm — the merged PR is still labelled, so without the
     # stateReason guard `close_issue_on_merge` would close the reopen outright.
@@ -2544,7 +2547,7 @@ def test_a_human_reopen_is_relabelled_ai_done_and_never_re_closed():
         issues={8: reopened},
         prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
     ))
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) in actions
     assert not any(isinstance(a, CloseIssue) for a in actions)
 
 
@@ -2577,11 +2580,11 @@ def test_widened_world_heals_the_backlog_without_stomping_a_fresh_dispatch():
         prs={50: {"state": "MERGED", "labels": ["ai-pr-open"], "issue": 8}},
     ))
     # the backlog issue is healed — this is what the widening buys
-    assert Relabel(Target.ISSUE, 9, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 9, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(9).binding) in actions
     assert RemoveWorktree(9) in actions
     # …and the freshly-dispatched issue is untouched
     assert RemoveWorktree(8) not in actions
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) not in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=resolve_snapshot(8).binding) not in actions
     assert not any(isinstance(a, ClearIssueState) and a.issue == 8 for a in actions)
     # …while the PR-side arm, which is never stale, still fires.
     assert Relabel(Target.PR, 50, Label.AI_PR_OPEN, None) in actions

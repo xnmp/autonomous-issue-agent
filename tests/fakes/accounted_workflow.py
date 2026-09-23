@@ -1,0 +1,114 @@
+"""Isolated accounting-backed resolve workflow fixtures, never live authority."""
+
+import contextlib
+import dataclasses
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+from issue_agent.adapters import accounting_runtime
+from issue_agent.adapters.accounting_runtime import AccountingRuntime
+from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.journal import JournalingRuntime
+from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+from issue_agent.adapters.effects import GitHubEffectExecutor
+from issue_agent.app.workflows.fix import FixWorkflow
+from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
+from issue_agent.domain.pricing import BudgetPolicy, ModelRates, RateTable, UnknownModelPolicy
+from issue_agent.domain.workflow import FreshResolve, ResolveSession
+from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
+from issue_agent.domain.world import PRView
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.legacy_journal import Journal
+
+
+def seed_resolve(store, issue, *, failures=0, session_id=None, runtime="claude", model="m", guidance=""):
+    state = resolve_snapshot(issue)
+    if session_id:
+        source = WorkflowAttemptIdentity(state.binding, RunId("imported-session"), "imported-leg")
+        state = dataclasses.replace(state, revision=dataclasses.replace(state.revision, version=1), episode=dataclasses.replace(
+            state.episode, continuation=FreshResolve(ResolveSession(source, session_id, runtime, model), 1),
+        ))
+    object.__setattr__(store, "_workflow_seed", dataclasses.replace(state, episode=dataclasses.replace(state.episode, failures=failures, guidance=guidance)))
+
+
+def resolve_state(store, issue=5):
+    return store._workflow_authority.load_workflow(WorkflowKey("o/r", IssueRef(issue)))
+
+
+class AccountedFixtureWorkflow(FixWorkflow):
+    """Direct workflow calls receive the same captured context as dispatch."""
+
+    @contextlib.contextmanager
+    def _accounted(self, issue, kind, binding):
+        original = self.runner
+        original_effects = self.executor._effect_executor
+        self.executor._effect_executor = GitHubEffectExecutor(
+            self.gateway, self.store._workflow_db, repository="o/r",
+            identity="o/r:fix:fixture", log=self.cfg.log,
+        )
+        inner = original.inner if isinstance(original, JournalingRuntime) else original
+        maximum = self.cfg.fix.max_budget_usd
+        limits = {("fix", stage): Money.from_major("USD", maximum) for stage in (
+            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE",
+        )}
+        limits[("fix", "ROUTE")] = Money.from_major("USD", self.cfg.fix.router_budget_usd)
+        accounted = AccountingRuntime(
+            inner, self.store._workflow_db, "o/r", "fix", None, None, None, "fixture", self._resolve_runtime_name(),
+            BudgetPolicy(limits), RateTable("fixture", "1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
+                                            ModelRates(1, 1, 1, 1)),
+            owner_id="o/r:fix:fixture", max_contract_rounds=self.cfg.max_contract_rounds,
+        )
+        journalled = original if isinstance(original, JournalingRuntime) else JournalingRuntime(
+            accounted, Journal(str(Path(self.store._workflow_dir.name) / "events.jsonl")), repo="o/r", role="fix",
+        )
+        if isinstance(original, JournalingRuntime):
+            original.inner = accounted
+        self.runner = journalled
+        journalled.set_context("fix", kind, issue, issue, workflow=binding)
+        publication = accounting_runtime._FixPublicationContext(
+            f"/wt/issue-{issue}", f"fix/{issue}-fixture", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
+        )
+        try:
+            with patch.object(accounting_runtime, "_fix_publication_context", return_value=publication):
+                yield
+        finally:
+            self.runner = original
+            self.executor._effect_executor = original_effects
+            if isinstance(original, JournalingRuntime):
+                original.inner = inner
+
+    async def resolve(self, issue, *, binding=None):
+        binding = binding or resolve_state(self.store, issue).binding
+        with self._accounted(issue, "RESOLVE", binding):
+            await super().resolve(issue, binding=binding)
+
+    async def resume(self, issue, *, binding=None):
+        binding = binding or resolve_state(self.store, issue).binding
+        with self._accounted(issue, "RESUME", binding):
+            await super().resume(issue, binding=binding)
+
+
+
+def attach_workflow_authority(gw, store, *, resolve_ceiling=20):
+    # Every gateway instance models a fresh authoritative observation. Some
+    # tests deliberately reuse one control store across several instances, so
+    # normalization cannot be coupled to first-time database initialization.
+    for number, issue in tuple(gw.issues.items()):
+        if not issue.updated_at:
+            gw.issues[number] = dataclasses.replace(
+                issue, updated_at=f"fixture-revision-{number}"
+            )
+    if not hasattr(store, "_workflow_db"):
+        for number in getattr(gw, "_pr_for_issue", {}).values():
+            gw.prs.setdefault(number, PRView(number, head_ref_oid="head-sha"))
+        object.__setattr__(store, "_workflow_dir", tempfile.TemporaryDirectory(prefix="workflow-test-"))
+        object.__setattr__(store, "_workflow_db", SQLiteControlStore(str(Path(store._workflow_dir.name) / "control.sqlite")))
+        store._workflow_db.initialize()
+        seeded = getattr(store, "_workflow_seed", None)
+        numbers = set(gw.issues) | {p.closing_issue for p in gw.prs.values() if p.closing_issue}
+        numbers.add(5)
+        for number in numbers:
+            install_workflow(store._workflow_db, seeded if seeded is not None and seeded.revision.fence.key.target.number == number else resolve_snapshot(number))
+        object.__setattr__(store, "_workflow_authority", SQLiteWorkflowControl(store._workflow_db, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"), resolve_ceiling=resolve_ceiling))
+    return store._workflow_authority

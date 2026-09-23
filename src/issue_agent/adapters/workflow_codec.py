@@ -16,12 +16,15 @@ from ..domain import workflow_identity as identity
 from ..domain.contracts import WorkflowAttemptIdentity
 from ..domain.labels import Label
 from ..domain.world import Comment, IssueView
+from ..domain.outcome import ExitReason
+from ..domain.resolve_return import ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted
 
 MAX_WORKFLOW_PAYLOAD_BYTES = 262144
 MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted,
     identity.IssueRef, identity.PullRequestRef, identity.WorkflowKey,
     identity.WorkflowFence, identity.FamilyAuthority, identity.WorkflowRevision,
     identity.WorkflowBinding, WorkflowAttemptIdentity,
@@ -41,6 +44,7 @@ _VALUES = (
     w.AuthorizedOperatorCommand, w.ObservedTransition,
 )
 _ENUMS = (
+    ExitReason,
     Label, identity.WorkflowFamily, w.StopReason, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
 )

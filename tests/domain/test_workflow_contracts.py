@@ -3,6 +3,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+from issue_agent.domain.agent_task import RunIntent, run_input_fingerprint
 from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow import (
     AuthorizedOperatorCommand, CancelRearm, KeepGuidance, OperatorActor,
@@ -89,7 +90,8 @@ def continuation_state():
     state = snapshot()
     source = WorkflowAttemptIdentity(state.binding, RunId("author"), "author-leg")
     session = ResolveSession(source, "session:with:separator", "codex", "<runtime-default>")
-    admission = ResolveAdmission(source, replace(state.revision, version=1), ResolveStage.AUTHOR)
+    admission = ResolveAdmission(source, replace(state.revision, version=1), ResolveStage.AUTHOR,
+                                 input_fingerprint=run_input_fingerprint(RunIntent("Author issue 7 contract")))
     return replace(state, revision=replace(state.revision, version=1),
                    episode=replace(state.episode, continuation=AuthoredResolve(admission, 1, session)))
 
@@ -114,7 +116,8 @@ def test_continuation_cannot_inherit_foreign_or_future_authority(change):
         elif change == "generation":
             source = state.episode.continuation.author_attempt
             future = replace(source, binding=replace(source.binding, fence=replace(source.binding.fence, generation=1)))
-            admission = ResolveAdmission(future, WorkflowRevision(future.binding.fence, 1), ResolveStage.AUTHOR)
+            admission = replace(state.episode.continuation.author_admission, attempt=future,
+                                revision=WorkflowRevision(future.binding.fence, 1))
             replace(state, episode=replace(state.episode, continuation=AuthoredResolve(admission, 1)))
         else:
             replace(state, revision=replace(state.revision, version=0))

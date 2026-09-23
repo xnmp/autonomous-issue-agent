@@ -123,11 +123,11 @@ def append_repository_guidance(
         )
     if not guidance:
         return task
-    prompt = (
-        f"{task.prompt}{_HEADING}"
+    context = (
+        f"{task.context_suffix}{_HEADING}"
         f"{untrusted_block('repository_guidance', as_untrusted(guidance))}"
     )
-    return replace(task, intent=replace(task.intent, prompt=prompt))
+    return replace(task, context_suffix=context)
 
 
 class RepositoryGuidanceRuntime(AgentRuntime):

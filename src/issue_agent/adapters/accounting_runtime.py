@@ -32,11 +32,18 @@ from ..domain.outcome import (
     AgentResult,
     ExitReason,
     MAX_BUDGET_STATUS,
+    budget_exhausted,
+    infra_class_failure,
 )
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.refs import is_governed_branch
-from ..domain.workflow_identity import WorkflowBinding
+from ..domain.workflow_identity import WorkflowBinding, WorkflowWriter
+from ..domain.workflow import ResolveSession, ResolveStage
+from ..domain.resolve_return import ReturnedResolve
+from .workflow_control import SQLiteWorkflowControl
+from .workflow_codec import WorkflowEncodingError, encode_workflow
+from ..domain.agent_task import run_input_fingerprint
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -47,6 +54,34 @@ from .control_store import (
 )
 
 _UNLIMITED_ACCOUNTING_MICROS = 9_000_000_000_000_000_000
+
+
+def _return_text(value: object) -> str:
+    if not isinstance(value, str):
+        return "" if value is None else f"[invalid provider text: {type(value).__name__}]"
+    normalized = value.replace("\x00", "\\0")
+    return normalized if len(normalized) <= 4000 else normalized[:3980] + "\n[truncated]"
+
+
+def _normalize_resolve_result(result: AgentResult) -> AgentResult:
+    malformed = type(result.is_error) is not bool or any(
+        value is not None and not isinstance(value, str)
+        for value in (result.status, result.summary, result.needs, result.envelope_subtype, result.session_id)
+    ) or (result.exit_reason is not None and not isinstance(result.exit_reason, ExitReason))
+    session = result.session_id if isinstance(result.session_id, str) else ""
+    if session and (len(session) > 512 or not session.strip() or any(ord(char) < 32 for char in session)):
+        session = ""
+        malformed = True
+    return replace(
+        result, is_error=malformed or result.is_error is not False,
+        status=_return_text(result.status)[:512],
+        summary=_return_text(result.summary), needs=_return_text(result.needs),
+        envelope_subtype=_return_text(result.envelope_subtype)[:512],
+        session_id=session,
+        exit_reason=result.exit_reason if isinstance(result.exit_reason, ExitReason) else None,
+    )
+
+
 _FIX_PUBLICATION_KINDS = frozenset(
     {
         "RESOLVE",
@@ -219,6 +254,17 @@ class AccountingRuntime(AgentRuntime):
     async def run(self, task: RuntimePlan) -> AgentResult:
         now = datetime.now(timezone.utc)
         issue, kind, number, claim_target, workflow = self._context.get()
+        if task.resolve_inputs is not None:
+            if workflow is None or self.role != "fix" or kind not in ("RESOLVE", "RESUME"):
+                return _return_refused("returned-result context does not match the admitted workflow")
+            # Bound persisted input before paying. Provider prose is normalized
+            # separately below, leaving room for its receipt and provenance.
+            try:
+                encoded_inputs = encode_workflow(task.resolve_inputs)
+            except WorkflowEncodingError:
+                return _return_refused("resolve completion inputs exceed durable receipt capacity")
+            if len(encoded_inputs.encode()) > 100000:
+                return _return_refused("resolve completion inputs exceed durable receipt capacity")
         # ADR 0008: paid admission binds the decision-side target unchanged;
         # review convergence remains PR-owned even when spend is issue-scoped.
         target = (
@@ -279,6 +325,7 @@ class AccountingRuntime(AgentRuntime):
                 "kind": kind or "unknown",
                 "leg_id": _leg_id or str(run_id),
                 "runtime": self.runtime_name,
+                "input_fingerprint": run_input_fingerprint(task.intent),
                 "number": number,
                 "issue": issue,
                 "breaker_key": retry_key,
@@ -455,12 +502,25 @@ class AccountingRuntime(AgentRuntime):
         # Settlement/normalization failures retain the reservation. Releasing
         # here would turn an unavailable accounting authority into new budget
         # headroom even though the paid runtime already completed.
+        returned = None
+        if task.resolve_inputs is not None:
+            result = _normalize_resolve_result(result)
+            assert result.workflow_attempt is not None
+            session = None
+            if result.session_id and not (infra_class_failure(result) or budget_exhausted(result.exit_reason)):
+                session = ResolveSession(result.workflow_attempt, result.session_id, self.runtime_name, reserved_model)
+            returned = ReturnedResolve(
+                result.workflow_attempt, ResolveStage(kind), task.resolve_inputs,
+                result.is_error,
+                result.status, result.summary, result.needs, result.envelope_subtype,
+                result.exit_reason, session, datetime.now(timezone.utc),
+            )
         return self._settle_result(
-            run_id, task.model or result.model or reserved_model, result
+            run_id, task.model or result.model or reserved_model, result, returned=returned,
         )
 
     def _settle_result(
-        self, run_id: RunId, model: str | None, result: AgentResult
+        self, run_id: RunId, model: str | None, result: AgentResult, *, returned: ReturnedResolve | None = None,
     ) -> AgentResult:
         usage = _token_usage(result.usage, self.runtime_name)
         provider_amount = Money.from_major("USD", result.cost_usd)
@@ -575,8 +635,7 @@ class AccountingRuntime(AgentRuntime):
                 if provider_amount.micros <= 0
                 else PricingBasis.PROVIDER_REPORTED
             )
-        settlement = self.store.settle(
-            SettlementRequest(
+        request = SettlementRequest(
                 run_id,
                 amount,
                 basis,
@@ -599,8 +658,13 @@ class AccountingRuntime(AgentRuntime):
                 )
                 and self.rate_table is not None
                 else None,
-            )
         )
+        if returned is None:
+            settlement = self.store.settle(request)
+        else:
+            writer = WorkflowWriter(self.repository, self.role, self.owner_id or f"{self.repository}:{self.role}")
+            # Capturing evidence does not classify or consume the resolve ceiling.
+            settlement = SQLiteWorkflowControl(self.store, writer, resolve_ceiling=0).settle_return(request, returned)
         if settlement.disposition is not AccountingDisposition.AVAILABLE:
             raise RuntimeError(
                 f"accounting settlement failed closed: {settlement.detail}"
@@ -772,6 +836,18 @@ def _issue_scope(
         start,
         datetime.max.replace(tzinfo=timezone.utc),
         ZoneInfo("UTC"),
+    )
+
+
+def _return_refused(detail: str) -> AgentResult:
+    # Receipt authority is a harness precondition, not evidence of exhausted
+    # money or a failed issue implementation. Existing infra ceilings own it.
+    return AgentResult(
+        is_error=True,
+        status="return_authority_unavailable",
+        envelope_subtype="return_authority_unavailable",
+        summary=f"paid admission refused: {detail}",
+        exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
     )
 
 

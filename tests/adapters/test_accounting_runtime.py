@@ -17,6 +17,7 @@ from issue_agent.adapters.control_store import Lease, SQLiteControlStore
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
+from issue_agent.domain.agent_task import run_input_fingerprint
 from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority,
@@ -33,6 +34,7 @@ from issue_agent.domain.events import (
     decode_event_line,
 )
 from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.resolve_return import ResolveInputs
 from issue_agent.domain.pricing import (
     BudgetPolicy,
     ModelRates,
@@ -180,6 +182,59 @@ def test_captured_binding_is_persisted_and_mints_actual_attempt_identity(tmp_pat
     with store._connect() as db:
         raw = db.execute("SELECT workflow_binding_json FROM runs WHERE run_id='harness-run'").fetchone()[0]
     assert decode_workflow(raw, WorkflowBinding) == state.binding
+
+
+@pytest.mark.parametrize("body", ["x" * 65536, "😀" * 22000], ids=["ascii-capacity", "unicode-codec-limit"])
+def test_oversized_recovery_inputs_are_refused_before_paid_admission(tmp_path, body):
+    state = resolve_snapshot()
+    provider = Runtime(AgentResult(False, status="done", cost_usd=1))
+    wrapper, store = _wrapper(tmp_path, provider)
+    install_workflow(store, state)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
+    # Include enough ASCII metadata to exceed the selected input envelope too.
+    inputs = ResolveInputs("t" * 40000, body, "author")
+    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2, resolve_inputs=inputs)))
+    assert provider.calls == 0
+    assert result.is_error
+    assert "receipt capacity" in result.summary
+    assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
+    assert result.workflow_attempt is None
+    with store._connect() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+
+
+def test_author_runtime_persists_fingerprint_of_supplied_inputs_before_provider_runs(tmp_path) -> None:
+    from issue_agent.adapters.workflow_codec import decode_workflow
+    from issue_agent.domain.workflow import ResolveAdmission
+
+    state = resolve_snapshot()
+    task = RuntimePlan("Author the issue contract", schema={"type": "object"},
+                       append_system_prompt="Keep public behavior stable", max_budget_usd=2)
+    seen = []
+
+    class InspectingRuntime:
+        async def run(self, supplied):
+            with store._connect() as db:
+                row = db.execute(
+                    "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope='o/r' AND key='author-run'",
+                ).fetchone()
+            receipt = decode_workflow(row[0], ResolveAdmission)
+            seen.append(receipt)
+            assert receipt.input_fingerprint == run_input_fingerprint(supplied.intent)
+            return AgentResult(False, status="ok", cost_usd=1)
+
+    wrapper, store = _wrapper(tmp_path, InspectingRuntime())
+    wrapper = dataclasses.replace(wrapper, budget_policy=BudgetPolicy({("fix", "AUTHOR"): Money("USD", 2_000_000)}))
+    install_workflow(store, state)
+    wrapper.set_context("fix", "AUTHOR", 1, 1, workflow=state.binding)
+    wrapper.set_run_identity("author-run", "author-leg")
+    result = asyncio.run(wrapper.run(task))
+
+    assert result.status == "ok"
+    assert len(seen) == 1
+    assert seen[0].input_fingerprint == run_input_fingerprint(task.intent)
+    assert seen[0].attempt == result.workflow_attempt
 
 
 @pytest.mark.parametrize("invalid", ["missing", "generation", "episode", "epoch", "target"])

@@ -73,7 +73,7 @@ from issue_agent.app.roles import (
     _duplicate_pr_reporter,
     _fix_hold_reporter,
     _fix_holds,
-    _fix_state,
+    _fix_state as read_fix_state,
     _hold_reporter,
     _inject_predicted_paths,
     _prediction_outcome_reporter,
@@ -490,8 +490,20 @@ from test_dispatch import (
     _val,
 )
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
+from tests.fakes.accounted_dispatch import with_resolve_authority
+from tests.fakes.accounted_workflow import attach_workflow_authority, resolve_state
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 FIX_BOT = "fix-bot"
+
+
+def _fix_state(store, world, *args, **kwargs):
+    """Behavior fixtures supply isolated SQL authority explicitly."""
+    workflows = attach_workflow_authority(FakeGateway(
+        issues={i.number: i for i in world.issues},
+        prs={p.number: p for p in world.prs},
+    ), store, resolve_ceiling=3)
+    return read_fix_state(store, world, *args, workflow_control=workflows, **kwargs)
 
 
 def _control(tmp_path) -> SQLiteControlStore:
@@ -511,7 +523,7 @@ def _dispatcher(gw, store, runner, **overrides):
     kwargs.update(overrides)
     cfg = DispatchConfig(**kwargs)
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor)
+    return with_resolve_authority(AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor))
 
 
 def _cfg(**overrides):
@@ -592,17 +604,14 @@ def test_distinct_checkouts_share_durable_fix_dispatch_claims(
 
 
 # ── resolve-retries (issue-keyed) ──────────────────────────────────────────────
-def test_resolve_retries_round_trip_trips_the_breaker(tmp_path):
-    """review C4. Write: two erroring RESOLVE dispatches bump resolve-retries
-    via the REAL FixWorkflow.resolve → _bump_resolve_retry. Read: _fix_state
-    surfaces the count under the issue number; decide_fix, given the same cap,
-    withholds RunAgent(RESOLVE) and escalates instead once the cap is hit."""
+def test_resolve_episode_round_trip_trips_the_gate(tmp_path):
+    """Settled attempts update the same SQL episode the scheduler observes."""
     issue = 5
     gw = FakeGateway(issues={issue: IssueView(issue, title="t", body="b")})
     store = Store(state_dir=str(tmp_path))
     runner = FakeRunner(AgentResult(is_error=True))  # error, no PR opened, no infra death
     d = _dispatcher(gw, store, runner)
-    cfg = _cfg(max_resolve_retries=2)
+    cfg = _cfg(max_resolve_retries=3)
 
     def world():
         return WorldState(issues=(
@@ -610,16 +619,20 @@ def test_resolve_retries_round_trip_trips_the_breaker(tmp_path):
         ))
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert store.get_resolve_retries(issue) == 1  # sanity: the write side moved
+    assert resolve_state(store).episode.failures == 1
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert _has_run(actions, AgentKind.RESOLVE)          # anti-vacuity: below cap, still dispatches
     assert Relabel(Target.ISSUE, issue, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) not in actions
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
-    assert store.get_resolve_retries(issue) == 2
+    assert resolve_state(store).episode.failures == 2
+    assert _has_run(decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False), AgentKind.RESOLVE)
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, issue)))
+    assert resolve_state(store).episode.failures == 3
+    assert resolve_state(store).gates
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert not _has_run(actions, AgentKind.RESOLVE)      # at cap: withheld
-    assert Relabel(Target.ISSUE, issue, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
+    assert any(isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in actions)
 
 
 # ── ci-retries (PR-keyed via closing_issue) ────────────────────────────────────
@@ -1004,7 +1017,8 @@ def test_control_store_process_deaths_escalate_the_fix_role(tmp_path):
         fixer_busy=False,
     )
     assert not _has_run(actions, AgentKind.RESOLVE)
-    assert Relabel(Target.ISSUE, issue, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
+    assert Relabel(Target.ISSUE, issue, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW,
+                   workflow=resolve_state(store, issue).binding) in actions
 
 
 def test_healthy_runs_do_not_enter_control_store_process_deaths(tmp_path):
@@ -1470,11 +1484,15 @@ def test_reaper_ignores_a_leg_that_finishes_during_the_world_fetch(tmp_path):
                 return stale
             return stale
 
+    cfg = HarnessConfig(
+        repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
+        state_dir=str(state_dir),
+    )
+    control = SQLiteControlStore(_control_store_path(cfg, str(state_dir)))
+    control.initialize()
+    install_workflow(control, resolve_snapshot(8))
     daemon = build_fix_daemon(
-        HarnessConfig(
-            repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
-            state_dir=str(state_dir),
-        ),
+        cfg,
         RacingGateway(), Store(str(state_dir)), FakeWorktrees(),
         BlockingRunner(),
     )
@@ -2852,9 +2870,10 @@ def test_the_reporter_and_the_decision_read_the_same_world(tmp_path):
     journal = Journal(str(tmp_path / "journal.jsonl"))
     world = _duplicate_world()
     _duplicate_pr_reporter(journal, "o/r", _GUARD_CFG, lambda _m: None)(world)
-    actions = decide_fix(world, _GUARD_CFG, FixState(), fixer_busy=False)
+    snapshot = resolve_snapshot(554)
+    actions = decide_fix(world, _GUARD_CFG, FixState(resolve_workflows={554: snapshot}), fixer_busy=False)
     assert [a for a in actions if isinstance(a, RunAgent)] == []
-    assert Relabel(Target.ISSUE, 554, Label.AI_READY, Label.AI_BLOCKED) in actions
+    assert Relabel(Target.ISSUE, 554, Label.AI_READY, Label.AI_BLOCKED, workflow=snapshot.binding) in actions
     assert _duplicates_in(journal)[0]["pr"] == 558
 
 

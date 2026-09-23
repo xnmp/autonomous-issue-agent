@@ -107,7 +107,7 @@ def _missing_handler(name: str):
 def _is_advisory_relabel(action: Relabel) -> bool:
     return (
         any(label in ADVISORY_LABELS for label in action.removed_labels)
-        or action.add in ADVISORY_LABELS
+        or any(label in ADVISORY_LABELS for label in action.added_labels)
     )
 
 
@@ -124,6 +124,10 @@ def _action_spec(action: Action) -> tuple[str, str, int | None, dict]:
         }
         if action.removes:
             payload["removes"] = [label.value for label in action.removes]
+        if action.adds:
+            payload["adds"] = [label.value for label in action.adds]
+        if action.comment:
+            payload["comment"] = action.comment
         return "relabel", action.target.name.lower(), action.number, payload
     if isinstance(action, PostComment):
         return "comment", action.target.name.lower(), action.number, {
@@ -436,6 +440,12 @@ class Executor:
         # they emit is serialized with the observation loop, preserving the
         # single-writer pending queue and deterministic GitHub transitions.
         self._action_lock = threading.RLock()
+        self._reconcile_workflow: Callable[[], int] | None = None
+
+    def bind_workflow_reconciliation(self, reconcile: Callable[[], int]) -> None:
+        if self._reconcile_workflow is not None:
+            raise ValueError("workflow reconciliation is already bound")
+        self._reconcile_workflow = reconcile
 
     def bind_dispatch(self, run_agent: Callable[[RunAgent], None]) -> None:
         """Bind the paid-dispatch handler exactly once.
@@ -939,6 +949,8 @@ class Executor:
     def _replay_pending(self) -> bool:
         """Drain the SQLite lifecycle-command authority before new decisions."""
         try:
+            if self._reconcile_workflow is not None:
+                self._reconcile_workflow()
             self._effect_executor.drain_pending_commands()
             return True
         except Exception as exc:

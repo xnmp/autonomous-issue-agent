@@ -9,6 +9,7 @@ from issue_agent.adapters.control_store import (
 )
 from issue_agent.adapters.effects import (
     GitHubEffectExecutor,
+    ImmediateGitHubEffectExecutor,
     action_from_command,
     StaleExpectedRevision,
     command_for_action,
@@ -26,6 +27,8 @@ from issue_agent.domain.actions import (
     UpdateBranch,
 )
 from issue_agent.domain.labels import Label
+from issue_agent.domain.eligibility import LifecycleOperation
+from issue_agent.domain.lifecycle import completion_guard
 from issue_agent.domain.world import IssueView, Comment
 from issue_agent.domain.triage import TriageConfig, TriageVerdict, close_actions
 
@@ -182,6 +185,23 @@ def _executor(tmp_path):
     )
 
 
+def _compound_projection(gateway: Gateway) -> Relabel:
+    gateway.labels.add(("issue", 4, Label.AI_WORKING.value))
+    observed = gateway.get_issue(4)
+    return Relabel(
+        Target.ISSUE,
+        4,
+        Label.AI_WORKING,
+        Label.RECURRENCE,
+        expected_revision=observed.updated_at,
+        completion_guard=completion_guard(
+            observed, LifecycleOperation.REPAIR
+        ),
+        adds=(Label.MAYBE_RESOLVED,),
+        comment="The bounded workflow ceiling was reached.",
+    )
+
+
 def test_remote_effect_is_committed_before_execution_and_deduplicated(tmp_path) -> None:
     executor, gateway, store = _executor(tmp_path)
     action = Relabel(Target.ISSUE, 4, Label.AI_READY, Label.AI_WORKING)
@@ -193,6 +213,156 @@ def test_remote_effect_is_committed_before_execution_and_deduplicated(tmp_path) 
         ("relabel", "issue", 4, "ai-ready", "ai-working")
     ]
     assert store.pending_commands() == ()
+
+
+def test_compound_relabel_recovers_after_comment_lands_before_reply_is_lost(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = _compound_projection(gateway)
+    original = gateway.comment
+
+    def committed_then_lost(*args):
+        original(*args)
+        gateway.issue_revision = "issue-rev-after-comment"
+        raise RuntimeError("comment reply lost")
+
+    gateway.comment = committed_then_lost
+    with pytest.raises(RuntimeError, match="comment reply lost"):
+        executor.execute(action)
+    gateway.comment = original
+
+    assert executor.execute(action)
+    assert gateway.calls == [
+        ("comment", "issue", 4, action.comment),
+        ("relabel", "issue", 4, None, "recurrence"),
+        ("relabel", "issue", 4, None, "maybe-resolved"),
+        ("relabel", "issue", 4, "ai-working", None),
+    ]
+    assert store.pending_commands() == ()
+    with store._connect() as db:
+        assert db.execute(
+            "SELECT COUNT(*) FROM lifecycle_commands"
+        ).fetchone()[0] == 1
+
+
+def test_compound_relabel_recovers_only_missing_labels_after_partial_apply(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = _compound_projection(gateway)
+    original = gateway.relabel
+
+    def first_label_then_lost(kind, number, remove, add):
+        original(kind, number, remove, add)
+        if add == Label.RECURRENCE.value:
+            gateway.issue_revision = "issue-rev-after-first-label"
+            raise RuntimeError("first label reply lost")
+
+    gateway.relabel = first_label_then_lost
+    with pytest.raises(RuntimeError, match="first label reply lost"):
+        executor.execute(action)
+    gateway.relabel = original
+
+    assert executor.execute(action)
+    assert gateway.calls == [
+        ("comment", "issue", 4, action.comment),
+        ("relabel", "issue", 4, None, "recurrence"),
+        ("relabel", "issue", 4, None, "maybe-resolved"),
+        ("relabel", "issue", 4, "ai-working", None),
+    ]
+    assert store.pending_commands() == ()
+
+
+@pytest.mark.parametrize("changed_fact", ("title", "body", "author", "comments", "hold"))
+def test_compound_relabel_refuses_unrelated_human_change_after_partial_apply(
+    tmp_path,
+    changed_fact,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = _compound_projection(gateway)
+    original_comment = gateway.comment
+
+    def committed_then_lost(*args):
+        original_comment(*args)
+        gateway.issue_revision = "issue-rev-after-comment"
+        raise RuntimeError("comment reply lost")
+
+    gateway.comment = committed_then_lost
+    with pytest.raises(RuntimeError, match="comment reply lost"):
+        executor.execute(action)
+    gateway.comment = original_comment
+
+    original_get_issue = gateway.get_issue
+
+    def changed_issue(issue):
+        current = original_get_issue(issue)
+        if changed_fact == "title":
+            return replace(current, title="human retitled")
+        if changed_fact == "body":
+            return replace(current, body="human edited body")
+        if changed_fact == "author":
+            return replace(current, author="different-author")
+        if changed_fact == "comments":
+            return replace(
+                current,
+                comments=current.comments
+                + (Comment("human", "new direction", "later"),),
+            )
+        return replace(
+            current,
+            labels=current.labels | {Label.NEEDS_HUMAN_REVIEW},
+        )
+
+    gateway.get_issue = changed_issue
+    with pytest.raises(StaleExpectedRevision, match="completion facts changed"):
+        executor.execute(action)
+
+    assert gateway.calls == [("comment", "issue", 4, action.comment)]
+    assert store.pending_commands()[0].state == "unknown_outcome"
+
+
+def test_immediate_executor_applies_and_verifies_compound_relabel() -> None:
+    gateway = Gateway()
+    action = _compound_projection(gateway)
+
+    assert ImmediateGitHubEffectExecutor(gateway).execute(action) is True
+    assert gateway.calls == [
+        ("comment", "issue", 4, action.comment),
+        ("relabel", "issue", 4, None, "recurrence"),
+        ("relabel", "issue", 4, None, "maybe-resolved"),
+        ("relabel", "issue", 4, "ai-working", None),
+    ]
+
+
+def test_immediate_executor_rejects_stale_compound_relabel() -> None:
+    gateway = Gateway()
+    action = _compound_projection(gateway)
+    gateway.issue_revision = "human-edit"
+
+    with pytest.raises(StaleExpectedRevision, match="expected revision"):
+        ImmediateGitHubEffectExecutor(gateway).execute(action)
+
+    assert gateway.calls == []
+
+
+def test_compound_relabel_requires_every_postcondition_before_success(
+    tmp_path,
+) -> None:
+    executor, gateway, store = _executor(tmp_path)
+    action = _compound_projection(gateway)
+    original = gateway.relabel
+
+    def drop_second_add(kind, number, remove, add):
+        if add == Label.MAYBE_RESOLVED.value:
+            gateway.calls.append(("relabel", kind, number, remove, add))
+            return
+        original(kind, number, remove, add)
+
+    gateway.relabel = drop_second_add
+
+    assert executor.execute(action) is False
+    assert store.pending_commands()[0].state == "retryable_failure"
 
 
 def test_owner_retirement_before_apply_fences_github_mutation(tmp_path) -> None:
@@ -420,6 +590,63 @@ def test_command_identity_includes_expected_revision() -> None:
         executor_identity="o/r:fix",
     )
     assert first.command_id != second.command_id
+
+
+def test_legacy_relabel_identity_and_decoder_ignore_empty_projection_fields() -> None:
+    legacy = Relabel(
+        Target.ISSUE,
+        7,
+        Label.AI_READY,
+        Label.AI_WORKING,
+        "issue-rev-1",
+    )
+    command = command_for_action(
+        legacy,
+        repository="o/r",
+        executor_identity="o/r:fix",
+    )
+
+    assert "adds" not in command.payload
+    assert "comment" not in command.payload
+    decoded = action_from_command(command)
+    assert decoded == legacy
+    assert command_for_action(
+        decoded,
+        repository="o/r",
+        executor_identity="o/r:fix",
+    ).command_id == command.command_id
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "message"),
+    (
+        ("adds", "recurrence", "projection labels"),
+        ("adds", ["not-a-real-label"], "not-a-real-label"),
+        ("comment", 3, "projection comment"),
+        ("comment", "contains\x00nul", "projection comment"),
+    ),
+)
+def test_compound_relabel_decoder_rejects_malformed_projection(
+    field,
+    value,
+    message,
+) -> None:
+    command = command_for_action(
+        Relabel(
+            Target.ISSUE,
+            7,
+            Label.AI_READY,
+            Label.AI_WORKING,
+            "issue-rev-1",
+        ),
+        repository="o/r",
+        executor_identity="o/r:fix",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        action_from_command(
+            replace(command, payload={**command.payload, field: value})
+        )
 
 
 def test_command_identity_canonicalizes_repository_case_aliases() -> None:

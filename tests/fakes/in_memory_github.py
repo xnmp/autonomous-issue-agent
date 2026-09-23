@@ -5,7 +5,7 @@ from dataclasses import replace
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.domain.labels import Label
 from issue_agent.domain.refs import issue_from_branch
-from issue_agent.domain.world import IssueView, PRView, PullRequestDiff
+from issue_agent.domain.world import Comment, IssueView, PRView, PullRequestDiff
 
 
 class InMemoryGitHub:
@@ -208,6 +208,11 @@ class InMemoryGitHub:
         self._maybe_fail("comment")
         self.calls.append(("comment", kind, number, body))
         self.comments.setdefault((kind, number), []).append(body)
+        views = self.issues if kind == "issue" else self.prs
+        if number in views:
+            current = views[number]
+            comment = Comment("fix-bot", body, f"fixture-comment-{len(current.comments) + 1}")
+            views[number] = replace(current, comments=current.comments + (comment,))
 
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self._maybe_fail("close_issue")

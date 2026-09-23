@@ -1,5 +1,26 @@
 # Architecture implementation phases
 
+**Phase 3 resumed on 2026-09-23 at the user's request.** See the
+[current handover](2026-09-23-phase-3-paid-return-handover.md) and the
+[earlier integration inventory](2026-09-14-phase-3-integration-handover.md).
+The integration is uncommitted. The documented ordinary-resolve crash boundary
+now has atomic paid-return receipts and composed restart coverage. The bounded
+increment passed full-suite verification and independent review; phase 3 overall
+remains incomplete.
+Implementation and its phase agent are authorized to resume;
+live operation and live migrations remain paused. Phase 3 must be accepted before
+phase 4 starts. The six-phase goal remains incomplete.
+
+Current collaboration brief: domain policies remain pure; existing SQLite run,
+admission, gate, receipt and lifecycle-command authority is reused. Adapters own
+I/O, app owns composition; no second queue or execution engine. The parent owns
+core values, ports, codec/schema and shared signatures. Phase agents implement
+assigned policy/adapter/app slices only after those seams are agreed. Retain
+generation fencing, actual settlement provenance, atomic outbox insertion and
+bounded reconciliation. Use isolated databases, `uv`, Pyrefly and `apply_patch`;
+no live services, target writes, paid harness runs or commits by agents. Full
+`make test` and fresh independent adversarial review precede every parent commit.
+
 Authority: the revised six-stage plan in
 [the archived review](2026-09-14-architecture-review.md), copied from
 `/tmp/architecture-review-2026-09-14/report.md`, incorporating
@@ -139,6 +160,54 @@ The corrected increment passed fresh adversarial re-review (327 focused tests,
 including both original reproductions) and the full `make test`: 1,345 domain,
 1,411 adapter and 2,361 application tests, hooks/parity/import contracts and both
 Pyrefly passes. Final log: `/tmp/phase3-continuation-full-final.log`.
+
+The current **uncommitted** integration replaces selected resolve scheduling and
+workflow file reads/writes with the episode authority, carries decision bindings
+through claims, and checks AUTHOR applicability against a fingerprint of the
+authoritative task inputs. Scratch handover and repository-guidance enrichment
+are separate runtime context; they must not rewrite or duplicate those inputs.
+Application fixtures now exercise real accounting and SQLite authority. Fresh
+review found and prompted fixes for discovery-failure isolation, runtime-name
+normalization, the resolve-to-PR session handoff, and missing remote ceiling
+projection. This integration reached the verified ordinary-return checkpoint
+below; complete phase-3 acceptance still requires the remaining vertical slices.
+
+The ordinary RESOLVE/RESUME crash boundary now commits settlement, an immutable
+returned-outcome receipt and its observation gate in one existing SQLite
+transaction. Restart reconciliation observes fresh issue/PR facts, classifies
+once and queues guarded compound follow-up commands atomically. The session is
+retained in the receipt until classification, not provisionally published as a
+successful continuation. A real child-process exit immediately after settlement
+tests that recovery does not pay for another leg. Unavailable receipt records
+are isolated per run and use a bounded, restart-safe audit schedule; healthy
+targets continue. Receipt-capacity refusal is infrastructure unavailability,
+not budget exhaustion. This is not yet full resolve-slice acceptance.
+
+### Phase 3 remaining checkpoints
+
+1. **Checkpoint verified:** scheduler, continuation and ordinary paid-return
+   integration; held/stale command projection debt uses shared typed retirement
+   and read-only reconciliation. Independent review has no blocking findings;
+   full `make test` passed with 1,406 domain, 1,521 adapter and 2,408 app tests,
+   plus other targets. Log: `/tmp/phase3-return-full-accepted.log`. Uncommitted.
+2. Extend crash recovery to the AUTHOR/IMPLEMENT/ADJUDICATE split flow, including
+   durable contract-objection/adjudication context. Ordinary receipts deliberately
+   reject these stages rather than promise recovery without that context.
+3. Complete resolve operator activation/import, re-arm, cancellation and explicit
+   absence-authorized retry, with exclusive effect barriers and daemon recovery.
+4. Wire authoritative dashboard projection and aged-command uncertainty;
+   complete migration, rollback, old-writer fencing and legacy-path deletion.
+5. Accept the complete resolve vertical slice with independent review and full
+   composed failure coverage, then implement/accept the review-rejection slice.
+6. Only then accept phase 3 and start phase 4. Live activation and soak remain
+   separately blocked by the deployment pause, not simulated as completed.
+
+Receipt recovery trusts atomically written terminal dispositions and schedule
+indexes. It isolates corrupt selected unfinished payloads, not arbitrary at-rest
+database tampering. Direct return lookup/capture/finalization still validate
+terminal dispositions; a general historical audit/quarantine path is not part of
+this increment. Adjacent file-backed infra/block telemetry remains outside the
+atomic return classification and is not claimed exactly-once.
 
 Phase 1 replaces contradictory raw trigger checks with shared action-specific
 eligibility, replaces swallowed control corruption with per-target errors,

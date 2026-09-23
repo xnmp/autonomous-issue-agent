@@ -16,7 +16,7 @@ import stat
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
@@ -40,7 +40,14 @@ from ..domain.contracts import (
     WorkflowAttemptIdentity,
 )
 from ..domain.workflow_identity import WorkflowBinding, WorkflowRevision, validate_workflow_integer
-from ..domain.workflow import ActiveReconciliation, ResolveAdmission, ResolveStage, WorkflowSnapshot, adjudication_allowed
+from ..domain.workflow import (
+    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation,
+    NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
+    RemoteOutcomeUncertain, RetiredSettledCommand, RetiredUncertainCommand, RetryAuthorizationRequired,
+    ResolveAdmission, ResolveStage, WorkflowSnapshot, adjudication_allowed,
+)
+from ..domain.workflow_reconciliation import ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
+from ..domain.resolve_return import FinalizedResolveReturn
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -3342,6 +3349,9 @@ class SQLiteControlStore:
             stage = ResolveStage(request.kind)
             if dispatch.get("kind") != stage.value or not isinstance(dispatch.get("leg_id"), str) or not dispatch["leg_id"]:
                 raise WorkflowAuthorityError("resolve admission requires its captured stage and leg identity")
+            fingerprint = dispatch.get("input_fingerprint")
+            if stage is ResolveStage.AUTHOR and fingerprint is None:
+                raise WorkflowAuthorityError("author admission requires its supplied input fingerprint")
             if stage is ResolveStage.ADJUDICATE:
                 if request.adjudication_ceiling is None:
                     raise WorkflowAuthorityError("adjudication admission requires a configured contract-round ceiling")
@@ -3370,7 +3380,7 @@ class SQLiteControlStore:
             revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
             admission = ResolveAdmission(
                 WorkflowAttemptIdentity(snapshot.binding, request.run_id, metadata["leg_id"]),
-                revision, ResolveStage(request.kind), request.adjudication_ceiling,
+                revision, ResolveStage(request.kind), request.adjudication_ceiling, metadata.get("input_fingerprint"),
             )
             db.execute(
                 "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",
@@ -3414,7 +3424,7 @@ class SQLiteControlStore:
                 current = load_workflow_row(db, request.workflow.fence.key)
             except (ValueError, TypeError, KeyError) as exc:
                 raise WorkflowAuthorityError("invalid admitted workflow receipt") from exc
-            if current is None or admission.attempt != expected_attempt or admission.stage.value != request.kind or admission.adjudication_ceiling != request.adjudication_ceiling or admission.revision.version > current.revision.version:
+            if current is None or admission.attempt != expected_attempt or admission.stage.value != request.kind or admission.adjudication_ceiling != request.adjudication_ceiling or admission.input_fingerprint != metadata.get("input_fingerprint") or admission.revision.version > current.revision.version:
                 return False
         actual_reservation = tuple(
             prior[name]
@@ -3528,250 +3538,253 @@ class SQLiteControlStore:
 
     def settle(self, request: SettlementRequest) -> SettlementResult:
         with self.transaction() as db:
-            reservation = db.execute(
-                "SELECT b.state, b.maximum_micros, b.currency, r.dispatch_id "
-                "FROM budget_reservations b JOIN runs r ON r.run_id=b.run_id "
-                "WHERE b.run_id=?",
-                (str(request.run_id),),
-            ).fetchone()
-            if reservation is None:
-                return SettlementResult(
-                    AccountingDisposition.CONFLICT,
-                    request.amount,
-                    detail="run has no reservation",
-                )
-            if reservation["currency"] != request.amount.currency:
-                return SettlementResult(
-                    AccountingDisposition.CONFLICT,
-                    request.amount,
-                    detail="settlement currency differs from reservation",
-                )
-            existing = db.execute(
-                "SELECT * FROM charges WHERE run_id=? OR provider_receipt_id=?",
-                (str(request.run_id), request.provider_receipt_id),
-            ).fetchone()
-            encoded_usage = (
-                _json(
-                    {
-                        "input_tokens": request.usage.input_tokens,
-                        "output_tokens": request.usage.output_tokens,
-                        "cache_read_tokens": request.usage.cache_read_tokens,
-                        "cache_write_tokens": request.usage.cache_write_tokens,
-                        "source": request.usage.source.value,
-                    }
-                )
-                if request.usage is not None
-                else None
+            return self._settle(db, request)
+
+    def _settle(self, db: sqlite3.Connection, request: SettlementRequest) -> SettlementResult:
+        reservation = db.execute(
+            "SELECT b.state, b.maximum_micros, b.currency, r.dispatch_id "
+            "FROM budget_reservations b JOIN runs r ON r.run_id=b.run_id "
+            "WHERE b.run_id=?",
+            (str(request.run_id),),
+        ).fetchone()
+        if reservation is None:
+            return SettlementResult(
+                AccountingDisposition.CONFLICT,
+                request.amount,
+                detail="run has no reservation",
             )
-            if existing is not None:
-                identical = (
-                    existing["run_id"] == str(request.run_id)
-                    and existing["provider_receipt_id"] == request.provider_receipt_id
-                    and existing["amount_micros"] == request.amount.micros
-                    and existing["currency"] == request.amount.currency
-                    and existing["basis"] == request.basis.value
-                    and existing["usage_json"] == encoded_usage
-                    and existing["rate_card_id"] == request.rate_card_id
-                    and existing["rate_card_version"] == request.rate_card_version
+        if reservation["currency"] != request.amount.currency:
+            return SettlementResult(
+                AccountingDisposition.CONFLICT,
+                request.amount,
+                detail="settlement currency differs from reservation",
+            )
+        existing = db.execute(
+            "SELECT * FROM charges WHERE run_id=? OR provider_receipt_id=?",
+            (str(request.run_id), request.provider_receipt_id),
+        ).fetchone()
+        encoded_usage = (
+            _json(
+                {
+                    "input_tokens": request.usage.input_tokens,
+                    "output_tokens": request.usage.output_tokens,
+                    "cache_read_tokens": request.usage.cache_read_tokens,
+                    "cache_write_tokens": request.usage.cache_write_tokens,
+                    "source": request.usage.source.value,
+                }
+            )
+            if request.usage is not None
+            else None
+        )
+        if existing is not None:
+            identical = (
+                existing["run_id"] == str(request.run_id)
+                and existing["provider_receipt_id"] == request.provider_receipt_id
+                and existing["amount_micros"] == request.amount.micros
+                and existing["currency"] == request.amount.currency
+                and existing["basis"] == request.basis.value
+                and existing["usage_json"] == encoded_usage
+                and existing["rate_card_id"] == request.rate_card_id
+                and existing["rate_card_version"] == request.rate_card_version
+            )
+            recovered_confirmation = (
+                existing["run_id"] == str(request.run_id)
+                and existing["basis"] == PricingBasis.RECONCILED.value
+                and request.basis is not PricingBasis.RECONCILED
+                and existing["amount_micros"] == request.amount.micros
+                and existing["currency"] == request.amount.currency
+            )
+            if recovered_confirmation:
+                # A dead-child sweep may settle the same final Codex
+                # evidence while the live caller is normalizing its
+                # already-returned result. Equal monetary authority must
+                # converge without duplicating or rewriting the charge.
+                run = db.execute(
+                    "SELECT state, outcome FROM runs WHERE run_id=?",
+                    (str(request.run_id),),
+                ).fetchone()
+                corrected = (
+                    run is not None
+                    and run["state"] == "abandoned"
+                    and run["outcome"] == "dead_lease"
                 )
-                recovered_confirmation = (
-                    existing["run_id"] == str(request.run_id)
-                    and existing["basis"] == PricingBasis.RECONCILED.value
-                    and request.basis is not PricingBasis.RECONCILED
-                    and existing["amount_micros"] == request.amount.micros
-                    and existing["currency"] == request.amount.currency
+                already_corrected = (
+                    run is not None
+                    and run["state"] == "completed"
+                    and run["outcome"] == "settled"
                 )
-                if recovered_confirmation:
-                    # A dead-child sweep may settle the same final Codex
-                    # evidence while the live caller is normalizing its
-                    # already-returned result. Equal monetary authority must
-                    # converge without duplicating or rewriting the charge.
-                    run = db.execute(
-                        "SELECT state, outcome FROM runs WHERE run_id=?",
-                        (str(request.run_id),),
-                    ).fetchone()
-                    corrected = (
-                        run is not None
-                        and run["state"] == "abandoned"
-                        and run["outcome"] == "dead_lease"
-                    )
-                    already_corrected = (
-                        run is not None
-                        and run["state"] == "completed"
-                        and run["outcome"] == "settled"
-                    )
-                    if corrected:
-                        db.execute(
-                            "UPDATE runs SET state='completed', "
-                            "outcome='settled', completed_at=? "
-                            "WHERE run_id=?",
-                            (_stamp(self._now()), str(request.run_id)),
-                        )
-                        db.execute(
-                            "UPDATE reservation_recovery SET "
-                            "reason='normal completion confirmed recovered "
-                            "settlement', updated_at=? WHERE run_id=?",
-                            (_stamp(self._now()), str(request.run_id)),
-                        )
-                        self._transition(
-                            db,
-                            "run",
-                            str(request.run_id),
-                            "completed",
-                            {
-                                "outcome": "settled",
-                                "settlement": "recovery_confirmed",
-                            },
-                            correlation=_run_correlation(
-                                request.run_id,
-                                reservation["dispatch_id"],
-                            ),
-                        )
-                    if corrected or already_corrected:
-                        return SettlementResult(
-                            AccountingDisposition.AVAILABLE,
-                            request.amount,
-                            idempotent=True,
-                            detail=(
-                                "normal completion matched recovered settlement"
-                            ),
-                        )
-                return SettlementResult(
-                    (
-                        AccountingDisposition.AVAILABLE
-                        if identical
-                        else AccountingDisposition.CONFLICT
-                    ),
-                    request.amount,
-                    idempotent=identical,
-                    detail="" if identical else "conflicting settlement receipt",
-                )
-            if reservation["state"] != "active":
-                return SettlementResult(
-                    AccountingDisposition.CONFLICT,
-                    request.amount,
-                    detail=f"reservation is already {reservation['state']}",
-                )
-            correlation = _run_correlation(
-                request.run_id, reservation["dispatch_id"]
-            )
-            maximum = int(reservation["maximum_micros"])
-            variance = (
-                Money(request.amount.currency, request.amount.micros - maximum)
-                if request.amount.micros > maximum
-                else None
-            )
-            db.execute(
-                "INSERT INTO charges(run_id, provider_receipt_id, amount_micros, "
-                "currency, basis, usage_json, rate_card_id, rate_card_version, "
-                "settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                (
-                    str(request.run_id),
-                    request.provider_receipt_id,
-                    request.amount.micros,
-                    request.amount.currency,
-                    request.basis.value,
-                    encoded_usage,
-                    request.rate_card_id,
-                    request.rate_card_version,
-                    _stamp(self._now()),
-                ),
-            )
-            db.execute(
-                "UPDATE budget_reservations SET state='settled', updated_at=? "
-                "WHERE run_id=?",
-                (_stamp(self._now()), str(request.run_id)),
-            )
-            db.execute(
-                "UPDATE runs SET "
-                "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
-                "THEN state ELSE 'completed' END, "
-                "outcome=CASE WHEN state IN ('completed','cancelled','abandoned') "
-                "THEN outcome ELSE 'settled' END, "
-                "provider_receipt_id=?, completed_at=COALESCE(completed_at, ?) "
-                "WHERE run_id=?",
-                (
-                    request.provider_receipt_id,
-                    _stamp(self._now()),
-                    str(request.run_id),
-                ),
-            )
-            corrected_dead_lease = False
-            if request.basis is not PricingBasis.RECONCILED:
-                # The normal caller can win after lease reclamation but before
-                # the recovery reconciler. Its successful settlement proves
-                # the accounting owner survived the child, so dead_lease is a
-                # stale recovery observation rather than a terminal outcome.
-                corrected_dead_lease = bool(
+                if corrected:
                     db.execute(
-                        "UPDATE runs SET state='completed', outcome='settled', "
-                        "completed_at=? WHERE run_id=? AND state='abandoned' "
-                        "AND outcome='dead_lease'",
+                        "UPDATE runs SET state='completed', "
+                        "outcome='settled', completed_at=? "
+                        "WHERE run_id=?",
                         (_stamp(self._now()), str(request.run_id)),
-                    ).rowcount
-                )
-                if corrected_dead_lease:
+                    )
                     db.execute(
                         "UPDATE reservation_recovery SET "
-                        "reason='normal settlement won recovery race', "
-                        "updated_at=? WHERE run_id=?",
+                        "reason='normal completion confirmed recovered "
+                        "settlement', updated_at=? WHERE run_id=?",
                         (_stamp(self._now()), str(request.run_id)),
                     )
-            db.execute("DELETE FROM leases WHERE run_id=?", (str(request.run_id),))
+                    self._transition(
+                        db,
+                        "run",
+                        str(request.run_id),
+                        "completed",
+                        {
+                            "outcome": "settled",
+                            "settlement": "recovery_confirmed",
+                        },
+                        correlation=_run_correlation(
+                            request.run_id,
+                            reservation["dispatch_id"],
+                        ),
+                    )
+                if corrected or already_corrected:
+                    return SettlementResult(
+                        AccountingDisposition.AVAILABLE,
+                        request.amount,
+                        idempotent=True,
+                        detail=(
+                            "normal completion matched recovered settlement"
+                        ),
+                    )
+            return SettlementResult(
+                (
+                    AccountingDisposition.AVAILABLE
+                    if identical
+                    else AccountingDisposition.CONFLICT
+                ),
+                request.amount,
+                idempotent=identical,
+                detail="" if identical else "conflicting settlement receipt",
+            )
+        if reservation["state"] != "active":
+            return SettlementResult(
+                AccountingDisposition.CONFLICT,
+                request.amount,
+                detail=f"reservation is already {reservation['state']}",
+            )
+        correlation = _run_correlation(
+            request.run_id, reservation["dispatch_id"]
+        )
+        maximum = int(reservation["maximum_micros"])
+        variance = (
+            Money(request.amount.currency, request.amount.micros - maximum)
+            if request.amount.micros > maximum
+            else None
+        )
+        db.execute(
+            "INSERT INTO charges(run_id, provider_receipt_id, amount_micros, "
+            "currency, basis, usage_json, rate_card_id, rate_card_version, "
+            "settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(request.run_id),
+                request.provider_receipt_id,
+                request.amount.micros,
+                request.amount.currency,
+                request.basis.value,
+                encoded_usage,
+                request.rate_card_id,
+                request.rate_card_version,
+                _stamp(self._now()),
+            ),
+        )
+        db.execute(
+            "UPDATE budget_reservations SET state='settled', updated_at=? "
+            "WHERE run_id=?",
+            (_stamp(self._now()), str(request.run_id)),
+        )
+        db.execute(
+            "UPDATE runs SET "
+            "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
+            "THEN state ELSE 'completed' END, "
+            "outcome=CASE WHEN state IN ('completed','cancelled','abandoned') "
+            "THEN outcome ELSE 'settled' END, "
+            "provider_receipt_id=?, completed_at=COALESCE(completed_at, ?) "
+            "WHERE run_id=?",
+            (
+                request.provider_receipt_id,
+                _stamp(self._now()),
+                str(request.run_id),
+            ),
+        )
+        corrected_dead_lease = False
+        if request.basis is not PricingBasis.RECONCILED:
+            # The normal caller can win after lease reclamation but before
+            # the recovery reconciler. Its successful settlement proves
+            # the accounting owner survived the child, so dead_lease is a
+            # stale recovery observation rather than a terminal outcome.
+            corrected_dead_lease = bool(
+                db.execute(
+                    "UPDATE runs SET state='completed', outcome='settled', "
+                    "completed_at=? WHERE run_id=? AND state='abandoned' "
+                    "AND outcome='dead_lease'",
+                    (_stamp(self._now()), str(request.run_id)),
+                ).rowcount
+            )
+            if corrected_dead_lease:
+                db.execute(
+                    "UPDATE reservation_recovery SET "
+                    "reason='normal settlement won recovery race', "
+                    "updated_at=? WHERE run_id=?",
+                    (_stamp(self._now()), str(request.run_id)),
+                )
+        db.execute("DELETE FROM leases WHERE run_id=?", (str(request.run_id),))
+        self._event(
+            db,
+            SpendRecorded(
+                str(request.run_id),
+                request.amount.micros,
+                request.amount.currency,
+                request.basis.value,
+                request.rate_card_id,
+                request.rate_card_version,
+            ),
+            correlation=correlation,
+        )
+        if variance is not None:
             self._event(
                 db,
-                SpendRecorded(
+                BudgetVarianceDetected(
                     str(request.run_id),
+                    maximum,
                     request.amount.micros,
+                    variance.micros,
                     request.amount.currency,
-                    request.basis.value,
-                    request.rate_card_id,
-                    request.rate_card_version,
                 ),
                 correlation=correlation,
             )
-            if variance is not None:
-                self._event(
-                    db,
-                    BudgetVarianceDetected(
-                        str(request.run_id),
-                        maximum,
-                        request.amount.micros,
-                        variance.micros,
-                        request.amount.currency,
-                    ),
-                    correlation=correlation,
-                )
+        self._transition(
+            db,
+            "reservation",
+            str(request.run_id),
+            "settled",
+            {
+                "amount_micros": request.amount.micros,
+                "currency": request.amount.currency,
+                "basis": request.basis.value,
+                "provider_receipt_id": request.provider_receipt_id,
+            },
+            correlation=correlation,
+        )
+        if corrected_dead_lease:
             self._transition(
                 db,
-                "reservation",
+                "run",
                 str(request.run_id),
-                "settled",
+                "completed",
                 {
-                    "amount_micros": request.amount.micros,
-                    "currency": request.amount.currency,
-                    "basis": request.basis.value,
-                    "provider_receipt_id": request.provider_receipt_id,
+                    "outcome": "settled",
+                    "settlement": "normal_after_reclaim",
                 },
                 correlation=correlation,
             )
-            if corrected_dead_lease:
-                self._transition(
-                    db,
-                    "run",
-                    str(request.run_id),
-                    "completed",
-                    {
-                        "outcome": "settled",
-                        "settlement": "normal_after_reclaim",
-                    },
-                    correlation=correlation,
-                )
-            return SettlementResult(
-                AccountingDisposition.AVAILABLE,
-                request.amount,
-                variance=variance,
-            )
+        return SettlementResult(
+            AccountingDisposition.AVAILABLE,
+            request.amount,
+            variance=variance,
+        )
 
     def release(self, run_id: RunId, reason: str) -> ReleaseResult:
         if not reason:
@@ -4266,6 +4279,275 @@ class SQLiteControlStore:
             for row in rows
         )
 
+    def command_reconciliation(self, command_id: CommandId) -> CommandReconciliation | None:
+        with self._connect() as db:
+            row = db.execute("SELECT workflow_reconciliation_json FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+        if row is None:
+            raise KeyError(str(command_id))
+        return self._command_reconciliation(row)
+
+    @staticmethod
+    def _command_reconciliation(row: sqlite3.Row) -> CommandReconciliation | None:
+        raw = row["workflow_reconciliation_json"]
+        return None if raw is None else decode_workflow(
+            raw, ActiveReconciliation | ReconciliationOnly | RetiredUncertainCommand | RetiredSettledCommand,
+        )
+
+    @staticmethod
+    def _require_reconciliation_gate(
+        db: sqlite3.Connection, command: LifecycleCommand,
+        state: ReconciliationOnly | RetiredUncertainCommand,
+    ) -> OpenGate:
+        binding = command.workflow
+        if binding is None:
+            raise WorkflowAuthorityError("command uncertainty has no captured workflow")
+        current = load_workflow_row(db, binding.fence.key)
+        if current is None:
+            raise WorkflowAuthorityError("command uncertainty workflow is absent")
+        uncertainty = state.uncertainty if isinstance(state, RetiredUncertainCommand) else state
+        gate = next((opened for item in current.gates
+                     if (opened := item.gate if isinstance(item, RearmingGate) else item).gate_id == uncertainty.gate_id), None)
+        if gate is None or not isinstance(gate.cause, (RemoteOutcomeUncertain, RetryAuthorizationRequired)) or gate.cause.command_id != command.command_id:
+            raise WorkflowAuthorityError("command uncertainty has no matching visible gate")
+        if isinstance(gate.cause, RemoteOutcomeUncertain) and (
+            gate.cause.unresolved_since != uncertainty.history.unresolved_since
+            or gate.cause.failed_reads != uncertainty.history.failed_reads
+        ):
+            raise WorkflowAuthorityError("command uncertainty gate disagrees with its read history")
+        if isinstance(gate.cause, RetryAuthorizationRequired):
+            row = db.execute("SELECT * FROM workflow_evidence WHERE evidence_id=?", (gate.cause.absence_evidence_id,)).fetchone()
+            if row is None or row["kind"] != "absence" or row["command_id"] != str(command.command_id):
+                raise WorkflowAuthorityError("known-absence gate lacks command evidence")
+            evidence = decode_workflow(row["payload_json"], CommandAbsenceEvidence)
+            if evidence.binding != binding or evidence.command_id != command.command_id:
+                raise WorkflowAuthorityError("known-absence evidence belongs to another command")
+        return gate
+
+    @staticmethod
+    def _require_retirement_evidence(
+        db: sqlite3.Connection, command: LifecycleCommand,
+        state: RetiredSettledCommand | RetiredUncertainCommand,
+    ) -> None:
+        if command.workflow is None:
+            raise WorkflowAuthorityError("retired command has no captured workflow")
+        scope = workflow_scope(command.workflow.fence.key)
+        identifiers = (state.retirement_evidence_id, state.outcome_evidence_id) if isinstance(state, RetiredSettledCommand) else (state.retirement_evidence_id,)
+        for index, identifier in enumerate(identifiers):
+            row = db.execute("SELECT * FROM workflow_evidence WHERE evidence_id=?", (identifier,)).fetchone()
+            if row is None or (row["repository"], row["target_kind"], row["target_number"]) != scope or row["command_id"] not in ((None, str(command.command_id)) if index == 0 else (str(command.command_id),)):
+                raise WorkflowAuthorityError("retired command lacks scoped retirement/outcome evidence")
+            if not isinstance(json.loads(row["payload_json"]), dict):
+                raise WorkflowAuthorityError("retired command evidence is malformed")
+
+    def runnable_commands(
+        self, *, repository: str, executor_identity: str,
+        diagnose: Callable[[str], None],
+    ) -> tuple[PendingCommand, ...]:
+        """Visible inventory and execution eligibility are deliberately separate.
+
+        A hold is normal state, not a failed attempt. Corrupt authority still
+        reports a diagnostic without starving unrelated obligations.
+        """
+        selected: list[PendingCommand] = []
+        diagnostics: list[str] = []
+        with self.transaction() as db:
+            self._assert_owner_active(db, executor_identity)
+            rows = db.execute(
+                "SELECT * FROM lifecycle_commands WHERE repository=? AND executor_identity=? "
+                "AND state IN ('pending','executing','retryable_failure','unknown_outcome') ORDER BY created_at, command_id",
+                (repository, executor_identity),
+            ).fetchall()
+            for row in rows:
+                db.execute("SAVEPOINT runnable_command")
+                try:
+                    command = _command_from_row(row)
+                    reconciliation = self._command_reconciliation(row)
+                    if isinstance(reconciliation, (RetiredSettledCommand, RetiredUncertainCommand)):
+                        self._require_retirement_evidence(db, command, reconciliation)
+                    if isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
+                        self._require_reconciliation_gate(db, command, reconciliation)
+                    attempt = self._return_projection_attempt(db, command)
+                    if attempt is not None:
+                        current = load_workflow_row(db, attempt.binding.fence.key)
+                        if current is None:
+                            raise WorkflowAuthorityError("returned command workflow is absent")
+                        if current.binding != attempt.binding and not isinstance(reconciliation, (RetiredSettledCommand, RetiredUncertainCommand)):
+                            reconciliation = self._retire_return_projection(db, row, command, current)
+                        if current.binding == attempt.binding and current.gates and not isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
+                            continue
+                    if reconciliation is not None and not reconciliation_due(reconciliation, self._now()):
+                        continue
+                    selected.append(PendingCommand(command, row["state"], row["attempts"], int(row["refusals"])))
+                except (ValueError, TypeError, KeyError, ControlStoreError) as exc:
+                    db.execute("ROLLBACK TO runnable_command")
+                    diagnostics.append(f"lifecycle command {row['command_id']} cannot be selected: {type(exc).__name__}: {exc}")
+                finally:
+                    db.execute("RELEASE runnable_command")
+        for diagnostic in diagnostics:
+            diagnose(diagnostic)
+        return tuple(selected)
+
+    def _retire_return_projection(
+        self, db: sqlite3.Connection, row: sqlite3.Row,
+        command: LifecycleCommand, current: WorkflowSnapshot,
+    ) -> CommandReconciliation:
+        binding = command.workflow
+        assert binding is not None
+        scope = workflow_scope(binding.fence.key)
+        evidence = json.dumps({"command": str(command.command_id), "captured": encode_workflow(binding),
+                               "superseded_by": encode_workflow(current.binding)}, sort_keys=True)
+        retirement_id = "command-superseded:" + hashlib.sha256(evidence.encode()).hexdigest()
+        db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, 'observation', ?)",
+                   (retirement_id, *scope, str(command.command_id), evidence))
+        return self._retire_workflow_command(db, row, command, current, retirement_id, create_uncertainty=True)
+
+    def _retire_workflow_command(
+        self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand,
+        current: WorkflowSnapshot, retirement_id: str, *, create_uncertainty: bool = False,
+    ) -> CommandReconciliation:
+        """One receipt/history boundary for rearm retirement and supersession."""
+        binding = command.workflow
+        if binding is None or binding.fence.key != current.binding.fence.key:
+            raise WorkflowAuthorityError("retired command belongs to another workflow")
+        scope = workflow_scope(binding.fence.key)
+        receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command.command_id),)).fetchone()
+        if receipt is not None and (not row["attempt_owner"] or receipt["executor_identity"] != row["attempt_owner"]):
+            raise WorkflowAuthorityError("retired obligation receipt does not match its executing owner")
+        if row["state"] in ("executing", "unknown_outcome"):
+            prior = self._command_reconciliation(row)
+            history = prior.history if isinstance(prior, ReconciliationOnly) else prior
+            gate = next((opened for item in current.gates
+                         if isinstance((opened := item.gate if isinstance(item, RearmingGate) else item).cause, (RemoteOutcomeUncertain, RetryAuthorizationRequired))
+                         and opened.cause.command_id == command.command_id), None)
+            if gate is None and not create_uncertainty:
+                raise WorkflowAuthorityError("retiring an uncertain command requires its visible uncertainty gate")
+            if history is None:
+                since = datetime.fromisoformat(row["updated_at"])
+                if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) and gate.cause.unresolved_since != since:
+                    raise WorkflowAuthorityError("command uncertainty must retain its recorded start")
+                history = ActiveReconciliation(since, max(since, self._now()), gate.cause.failed_reads if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) else 0)
+            if not isinstance(history, ActiveReconciliation):
+                raise WorkflowAuthorityError("superseded command has incompatible uncertainty history")
+            if isinstance(prior, ReconciliationOnly) and (gate is None or prior.gate_id != gate.gate_id):
+                raise WorkflowAuthorityError("command reconciliation lacks its matching uncertainty gate")
+            if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) and (
+                gate.cause.unresolved_since != history.unresolved_since or gate.cause.failed_reads != history.failed_reads
+            ):
+                raise WorkflowAuthorityError("retirement cannot reset command uncertainty history")
+            gate_id = gate.gate_id if gate is not None else "command-uncertain:" + hashlib.sha256(str(command.command_id).encode()).hexdigest()
+            state = RetiredUncertainCommand(ReconciliationOnly(history, gate_id), retirement_id)
+            if gate is None:
+                self._reconciliation_gate(db, binding, gate_id, OpenGate(
+                    gate_id, binding.fence.generation,
+                    RemoteOutcomeUncertain(command.command_id, history.unresolved_since, history.failed_reads, "superseded command outcome remains unverified"),
+                    NoAuthorizedRemediation("read-only outcome reconciliation required"),
+                ))
+        else:
+            if row["state"] == "pending" and row["attempts"] == 0 and receipt is None:
+                outcome = json.dumps({"command": str(command.command_id), "observation": "never_began_locally"}, sort_keys=True)
+            elif receipt is not None and receipt["status"] == row["state"] and row["state"] in ("retryable_failure", "permanent_failure", "succeeded"):
+                outcome = json.dumps(dict(receipt), sort_keys=True)
+            else:
+                raise WorkflowAuthorityError("superseded command lacks settled or uncertain outcome evidence")
+            outcome_id = "command-outcome:" + hashlib.sha256(outcome.encode()).hexdigest()
+            db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, 'observation', ?)",
+                       (outcome_id, *scope, str(command.command_id), outcome))
+            state = RetiredSettledCommand(retirement_id, outcome_id)
+        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                   (encode_workflow(state), str(command.command_id)))
+        self._transition(db, "lifecycle_command", str(command.command_id), "superseded", {"evidence_id": retirement_id})
+        return state
+
+    def _reconciliation_gate(
+        self, db: sqlite3.Connection, binding: WorkflowBinding, gate_id: str, gate: OpenGate | None,
+    ) -> None:
+        scope = workflow_scope(binding.fence.key)
+        current = load_workflow_row(db, binding.fence.key)
+        if current is None:
+            raise WorkflowAuthorityError("command reconciliation workflow is absent")
+        existing = db.execute("SELECT * FROM workflow_gates WHERE gate_id=?", (gate_id,)).fetchone()
+        if existing is not None and (existing["repository"], existing["target_kind"], existing["target_number"]) != scope:
+            raise WorkflowAuthorityError("command uncertainty gate belongs to another workflow")
+        retained = tuple(item for item in current.gates if (item.gate if isinstance(item, RearmingGate) else item).gate_id != gate_id)
+        # Reconciliation is not exempt from the same bounded snapshot contract
+        # used by operator and result transitions.
+        replace(current, gates=retained + ((gate,) if gate is not None else ()))
+        if gate is None:
+            changed = db.execute("UPDATE workflow_gates SET state='closed' WHERE gate_id=? AND state<>'closed'", (gate_id,)).rowcount
+        else:
+            db.execute(
+                "INSERT INTO workflow_gates VALUES (?, ?, ?, ?, ?, ?, 'open', ?) "
+                "ON CONFLICT(gate_id) DO UPDATE SET opened_generation=excluded.opened_generation, cause_key=excluded.cause_key, state='open', payload_json=excluded.payload_json",
+                (gate_id, *scope, gate.opened_generation, hashlib.sha256(encode_workflow(gate.cause).encode()).hexdigest(), encode_workflow(gate)),
+            )
+            changed = 1
+        if changed:
+            db.execute("UPDATE workflows SET version=version+1 WHERE repository=? AND target_kind=? AND target_number=?", scope)
+
+    def record_reconciliation_read(
+        self, command_id: CommandId, expected: ReconciliationOnly | RetiredUncertainCommand,
+        *, executor_identity: str, observed: bool | None, error: str = "",
+    ) -> bool:
+        """Persist a harness read, never permission to repeat a remote mutation."""
+        if observed is not None and not isinstance(observed, bool):
+            raise ValueError("postcondition observation must be a boolean or unavailable")
+        with self.transaction() as db:
+            self._assert_owner_active(db, executor_identity)
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+            if row is None or row["executor_identity"] != executor_identity:
+                raise WorkflowAuthorityError("command reconciliation belongs to another executor")
+            command = _command_from_row(row)
+            binding = command.workflow
+            if binding is None:
+                raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
+            self._return_projection_attempt(db, command)
+            state = self._command_reconciliation(row)
+            if state != expected:
+                return False  # Another verified read already advanced this history.
+            self._require_reconciliation_gate(db, command, state)
+            if isinstance(state, RetiredUncertainCommand):
+                self._require_retirement_evidence(db, command, state)
+            uncertainty = state.uncertainty if isinstance(state, RetiredUncertainCommand) else state
+            assert isinstance(uncertainty, ReconciliationOnly)
+            now = self._now()
+            evidence_payload = json.dumps({"command": str(command_id), "observed_at": _stamp(now),
+                                           "postcondition_present": observed, "error": error[:4096],
+                                           "prior": encode_workflow(state)}, sort_keys=True)
+            evidence_id = "command-read:" + hashlib.sha256(evidence_payload.encode()).hexdigest()
+            scope = workflow_scope(binding.fence.key)
+            progress: ReconciliationProgress | None = None
+            if observed is False:
+                evidence = CommandAbsenceEvidence(evidence_id, command_id, binding, now, "current-postcondition:" + hashlib.sha256(evidence_payload.encode()).hexdigest())
+                progress = absent_reconciliation(binding, command_id, state, evidence, now=now)
+                kind, payload = "absence", encode_workflow(evidence)
+            elif observed is None:
+                progress = unavailable_reconciliation(binding, command_id, state, now=now, evidence_id=evidence_id, error=error[:4096] or "postcondition verification unavailable")
+                kind, payload = "observation", evidence_payload
+            else:
+                if row["state"] not in ("executing", "unknown_outcome"):
+                    raise WorkflowAuthorityError("verified success contradicts a settled command state")
+                receipt = EffectReceipt(command_id, executor_identity, now, now, EffectStatus.SUCCEEDED)
+                self._replace_effect_receipt(db, command)
+                db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (executor_identity, str(command_id)))
+                self._insert_effect(db, receipt, _receipt_digest(receipt))
+                kind, payload = "observation", evidence_payload
+                if isinstance(state, RetiredUncertainCommand):
+                    resolved: CommandReconciliation | None = RetiredSettledCommand(state.retirement_evidence_id, evidence_id)
+                else:
+                    resolved = None
+                db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                           (encode_workflow(resolved) if resolved is not None else None, str(command_id)))
+                self._reconciliation_gate(db, binding, uncertainty.gate_id, None)
+            db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (evidence_id, *scope, str(command_id), kind, payload))
+            if observed is not True:
+                assert progress is not None
+                db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                           (encode_workflow(progress.state), str(command_id)))
+                self._reconciliation_gate(db, binding, uncertainty.gate_id, progress.gate)
+            self._transition(db, "lifecycle_command", str(command_id), "reconciled_read_only", {"evidence_id": evidence_id})
+            return observed is True
+
     def latest_command(self, logical_key: str) -> PendingCommand | None:
         if not logical_key:
             raise ValueError("logical command key is required")
@@ -4294,6 +4576,7 @@ class SQLiteControlStore:
                 raise KeyError(str(command_id))
             command = _command_from_row(row)
             self._validate_workflow_command(db, command)
+            self._validate_return_projection(db, command)
             self._validate_workflow_reexecution(row)
             if row["state"] not in {"pending", "retryable_failure"}:
                 raise ControlStoreError(
@@ -4312,6 +4595,37 @@ class SQLiteControlStore:
                 str(command_id),
                 "executing",
             )
+
+    def _return_projection_attempt(self, db: sqlite3.Connection, command: LifecycleCommand) -> WorkflowAttemptIdentity | None:
+        if not command.idempotency_key.startswith("resolve-return:"):
+            return None
+        source = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-command' AND scope=? AND key=?",
+            (command.repository, str(command.command_id)),
+        ).fetchone()
+        if source is None:
+            raise ControlStoreError("resolve completion command lacks its paid-return provenance")
+        attempt = decode_workflow(source["payload_json"], WorkflowAttemptIdentity)
+        if command.workflow != attempt.binding:
+            raise ControlStoreError("resolve completion command disagrees with its paid return")
+        disposition = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-disposition' AND scope=? AND key=?",
+            (command.repository, str(attempt.run_id)),
+        ).fetchone()
+        if disposition is None:
+            raise ControlStoreError("resolve completion has not been finalized")
+        finalized = decode_workflow(disposition["payload_json"], FinalizedResolveReturn)
+        if finalized.result.attempt != attempt or command.command_id not in finalized.commands:
+            raise ControlStoreError("resolve completion is not an authorized returned-result obligation")
+        return attempt
+
+    def _validate_return_projection(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
+        attempt = self._return_projection_attempt(db, command)
+        if attempt is None:
+            return
+        # Classification and its outbox obligation may commit while another
+        # gate holds. Only execution needs an unheld current generation.
+        require_workflow_binding(db, attempt.binding)
 
     def retry_reconciled_command(self, command_id: CommandId) -> None:
         """A trusted read proved an ambiguous mutation did not land."""

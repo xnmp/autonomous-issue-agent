@@ -34,6 +34,9 @@ from issue_agent.domain.world import (
 )
 from issue_agent.domain.labels import Label
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
+from tests.fakes.accounted_dispatch import with_resolve_authority
+from tests.fakes.accounted_workflow import resolve_state
+from tests.fakes.accounted_workflow import attach_workflow_authority
 
 
 class FakeStore:
@@ -308,7 +311,7 @@ def _dispatcher(gw, store, runner):
         triage_cfg=TriageConfig("steward-bot", enabled=True),
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor)
+    return with_resolve_authority(AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor))
 
 
 def _delegated_dispatcher(gw, store, runner):
@@ -338,9 +341,31 @@ def test_resolve_routes_to_fix_workflow():
     runner = FakeRunner(AgentResult(is_error=False, status="pr_opened", session_id="s5"))
     d = _dispatcher(gw, store, runner)
     asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
-    assert store.sessions[5] == "s5"
+    assert resolve_state(store).episode.continuation.session.session_id == "s5"
     assert ("relabel", "issue", 5, "ai-working", "ai-pr-open") in gw.calls
     assert ("relabel", "pr", 100, None, "ai-pr-open") in gw.calls
+
+
+@pytest.mark.parametrize("authority", ["missing", "uncaptured", "stale"])
+def test_resolve_authority_hold_never_calls_provider_or_charges_infra(authority):
+    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")})
+    store = FakeStore()
+    runner = FakeRunner(AgentResult(is_error=False))
+    logged = []
+    control = None if authority == "missing" else attach_workflow_authority(gw, store)
+    action = RunAgent(AgentKind.RESOLVE, 5)
+    if authority == "stale":
+        binding = resolve_state(store).binding
+        action = replace(action, workflow=replace(binding, fence=replace(binding.fence, generation=0)))
+    dispatcher = AgentDispatcher(
+        DispatchConfig(fix=FixTaskConfig("o/r", agent_md="AM", model="m"), log=logged.append),
+        gw, store, FakeWorktrees(), runner, Executor(gw), workflow_control=control,
+    )
+    asyncio.run(dispatcher.dispatch(action))
+    assert not runner.tasks
+    assert store.get_infra_deaths(5) == 0
+    assert not any(call[0] == "relabel" for call in gw.calls)
+    assert any("held" in message for message in logged)
 
 
 def _split_dispatcher(gw, store, runner, wt=None, max_contract_rounds=2):
@@ -352,7 +377,7 @@ def _split_dispatcher(gw, store, runner, wt=None, max_contract_rounds=2):
     )
     wt = wt or FakeWorktrees()
     executor = Executor(gw, remove_worktree=wt.remove)
-    return AgentDispatcher(cfg, gw, store, wt, runner, executor)
+    return with_resolve_authority(AgentDispatcher(cfg, gw, store, wt, runner, executor))
 
 
 def test_split_resolve_routes_to_fix_workflow():
@@ -571,7 +596,7 @@ def test_resolve_logs_worktree_and_agent_lifecycle():
     logged: list[str] = []
     cfg = DispatchConfig(fix=FixTaskConfig("o/r", agent_md="AM"), log=logged.append)
     executor = Executor(gw, remove_worktree=lambda i: None)
-    d = AgentDispatcher(cfg, gw, FakeStore(), FakeWorktrees(), runner, executor)
+    d = with_resolve_authority(AgentDispatcher(cfg, gw, FakeStore(), FakeWorktrees(), runner, executor))
     asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
     joined = "\n".join(logged)
     assert "worktree #5: ready on 'fix/5-" in joined
@@ -907,8 +932,8 @@ def test_a_counter_write_failure_does_not_replace_the_original_death():
     logged: list[str] = []
     cfg = DispatchConfig(fix=FixTaskConfig("o/r", agent_md="AM"), log=logged.append)
     gw = _resolve_gateway()
-    d = AgentDispatcher(cfg, gw, BrokenStore(), FakeWorktrees(),
-                        RaisingRunner(), Executor(gw))
+    d = with_resolve_authority(AgentDispatcher(cfg, gw, BrokenStore(), FakeWorktrees(),
+                        RaisingRunner(), Executor(gw)))
 
     with pytest.raises(RuntimeError, match="stream closed"):
         asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
@@ -934,24 +959,29 @@ def test_a_counter_write_failure_does_not_replace_the_original_death():
 # T3's fail_on injection.
 
 def test_resolve_mid_dispatch_failure_persists_the_session_before_the_gh_read_fails(tmp_path):
-    """resolve: pr_for_issue (the ground-truth check) is called exactly once,
-    strictly AFTER save_session — so a GhUnavailable there can't unwind the
-    session write. Nothing else in the tail (the retry bump, the relabel) ever
-    runs, so resolve-retries stays untouched and no relabel is recorded — the
-    issue is left exactly ai-working, which the reaper safely requeues next
-    idle tick rather than a half-applied label move."""
+    """The paid handle survives uncertainty without granting another dispatch.
+
+    Raw evidence is durable before observation; continuation is deliberately
+    unchanged until classification, so blocked RESUME can still clear its handle.
+    """
     store = Store(state_dir=str(tmp_path))
     gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, fail_on={"pr_for_issue"})
     runner = FakeRunner(AgentResult(is_error=False, status="done", session_id="paid-session"))
     d = _dispatcher(gw, store, runner)
 
-    with pytest.raises(GhUnavailable):
-        asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
+    asyncio.run(d.dispatch(RunAgent(AgentKind.RESOLVE, 5)))
 
-    assert store.get_session(5) == "paid-session"      # money spent → persisted
-    assert store.get_resolve_retries(5) == 0            # follow-up never reached: no false bump
+    from datetime import datetime, timedelta, timezone
+    from unittest.mock import patch
+    with patch.object(store._workflow_db, "_now", return_value=datetime.now(timezone.utc) + timedelta(hours=1)):
+        pending = store._workflow_authority.pending_returns()
+    assert len(pending) == 1
+    assert pending[0].returned.session.session_id == "paid-session"
+    assert resolve_state(store).gates
+    assert resolve_state(store).episode.continuation.session is None
+    assert resolve_state(store).episode.failures == 0  # unknown PR outcome is not absence
     assert not any(c[0] == "relabel" for c in gw.calls)  # nothing half-applied
-    assert store.get_infra_deaths(5) == 1                # dispatcher's crash-isolation net, same key
+    assert store.get_infra_deaths(5) == 0  # observation failed, not the paid provider
 
 
 ## NOTE (B5→B4 coordination): `Executor.execute_all`'s exact failure-propagation

@@ -18,7 +18,7 @@ from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.infra_breaker import InfraBreaker
 from issue_agent.app.loop import Daemon
 from issue_agent.app.planners.tasks import FixTaskConfig
-from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
+from issue_agent.app.workflows.fix import FixWorkflowConfig
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.events import InfraBreakerCleared, InfraBreakerTripped
 from issue_agent.domain.infra_breaker import (
@@ -35,6 +35,8 @@ from issue_agent.domain.world import IssueView, WorldState
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees
 from tests.fakes.in_memory_github import InMemoryGitHub as LoopGateway
+from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, resolve_state
+from tests.fakes.workflow_authority import resolve_snapshot
 
 
 STORM = (34, 130, 132, 142)
@@ -113,10 +115,11 @@ def run_resolve(issue, result, infra_breaker, store=None):
     """One real resolve leg through the real FixWorkflow."""
     store = store if store is not None else FakeStore()
     gateway = FakeGateway(
-        issues={issue: IssueView(issue, title="t", body="b")}, pr_for_issue={}
+        issues={number: IssueView(number, title="t", body="b") for number in {*STORM, issue}}, pr_for_issue={}
     )
     worktrees = FakeWorktrees()
-    workflow = FixWorkflow(
+    runner = FakeRunner(result)
+    workflow = AccountedFixtureWorkflow(
         FixWorkflowConfig(
             base_branch="dev",
             fix=FixTaskConfig("o/r", agent_md="AM", model="m"),
@@ -131,16 +134,17 @@ def run_resolve(issue, result, infra_breaker, store=None):
         gateway,
         store,
         worktrees,
-        FakeRunner(result),
+        runner,
         Executor(gateway, remove_worktree=worktrees.remove),
+        workflow_control=attach_workflow_authority(gateway, store),
     )
     asyncio.run(workflow.resolve(issue))
+    assert len(runner.tasks) == 1
     return store
 
 
 def storm(infra_breaker, result=None, issues=STORM):
-    for issue in issues:
-        run_resolve(issue, result or stillborn(), infra_breaker)
+    return {issue: run_resolve(issue, result or stillborn(), infra_breaker) for issue in issues}
 
 
 # ── the incident ─────────────────────────────────────────────────────────────
@@ -155,11 +159,12 @@ def test_a_storm_across_issues_trips_the_breaker():
 
 
 def _fix_daemon(subject, dispatched, gateway):
-    claim = Relabel(Target.ISSUE, 34, Label.AI_READY, Label.AI_WORKING)
+    binding = resolve_snapshot(34).binding
+    claim = Relabel(Target.ISSUE, 34, Label.AI_READY, Label.AI_WORKING, workflow=binding)
     return Daemon(
         "fix",
         lambda: WorldState(),
-        lambda _world: [claim, RunAgent(AgentKind.RESOLVE, 34, claim)],
+        lambda _world: [claim, RunAgent(AgentKind.RESOLVE, 34, claim, workflow=binding)],
         Executor(gateway, run_agent=dispatched.append),
         tick_gate=subject.gate_reason,
     )
@@ -235,6 +240,7 @@ def test_one_issue_dying_repeatedly_never_trips_the_breaker():
     assert subject.gate_reason() is None
     # …and the per-issue ceiling did its own counting, unchanged.
     assert store.get_infra_deaths(130) == DEFAULT_BREAKER_DEATHS * 3
+    assert resolve_state(store, 130).episode.failures == 0
 
 
 def test_deaths_below_the_threshold_do_not_trip_it():
@@ -251,17 +257,21 @@ def test_wall_timeouts_never_count_toward_the_breaker():
     about the issue, not evidence the runtime is broken."""
     subject = breaker()
 
-    storm(subject, result=hung())
+    stores = storm(subject, result=hung())
 
     assert not subject.tripped
+    assert all(resolve_state(store, issue).episode.failures == 1 for issue, store in stores.items())
+    assert all(store.get_infra_deaths(issue) == 0 for issue, store in stores.items())
 
 
 def test_ordinary_agent_failures_never_count_toward_the_breaker():
     subject = breaker()
 
-    storm(subject, result=ran_and_failed())
+    stores = storm(subject, result=ran_and_failed())
 
     assert not subject.tripped
+    assert all(resolve_state(store, issue).episode.failures == 1 for issue, store in stores.items())
+    assert all(store.get_infra_deaths(issue) == 0 for issue, store in stores.items())
 
 
 # ── window ───────────────────────────────────────────────────────────────────

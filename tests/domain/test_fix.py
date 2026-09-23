@@ -2,6 +2,8 @@
 
 from dataclasses import replace
 
+import pytest
+
 from tests.domain.builders import Check, Comment, Review, closing_ref, issue, pr, world
 
 from issue_agent.domain.actions import (
@@ -46,7 +48,7 @@ from issue_agent.domain.fix import (
     ci_stall_remedies,
     cleanup_actions,
     label_repair_actions,
-    decide_fix,
+    decide_fix as raw_decide_fix,
     duplicate_pr_guards,
     issue_holds,
     issues_needing_any_resume,
@@ -59,8 +61,49 @@ from issue_agent.domain.fix import (
     should_update_branch,
 )
 from issue_agent.domain.labels import Label
+from issue_agent.domain.contracts import RunId, WorkflowAttemptIdentity
+from issue_agent.domain.workflow import (
+    FreshResolve, NoAuthorizedRemediation, OpenGate, ResolveCeiling,
+    ResolveEpisode, ResolveSession, WorkflowAbsent, WorkflowSnapshot, WorkflowUnavailable,
+)
+from issue_agent.domain.workflow_identity import (
+    FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
+)
 
 CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
+
+
+def _workflow(number, *, session=False, failures=0, held=False, error=""):
+    snapshot = WorkflowSnapshot(
+        WorkflowRevision(WorkflowFence(WorkflowKey("o/r", IssueRef(number)), 2), 1),
+        FamilyAuthority(WorkflowFamily.RESOLVE, 1), ResolveEpisode(f"episode-{number}", failures, error),
+    )
+    if session:
+        source = WorkflowAttemptIdentity(snapshot.binding, RunId(f"run-{number}"), f"leg-{number}")
+        snapshot = replace(snapshot, episode=replace(snapshot.episode, continuation=FreshResolve(
+            ResolveSession(source, f"session-{number}", "codex", "model"), 1,
+        )))
+    if held:
+        snapshot = replace(snapshot, gates=(OpenGate(
+            f"gate-{number}", 2, ResolveCeiling(snapshot.episode.episode_id, failures, 3, error),
+            NoAuthorizedRemediation("Operator decision required"),
+        ),))
+    return snapshot
+
+
+def _with_session(number=7, **kwargs):
+    return FixState(resolve_workflows={number: _workflow(number, session=True)}, **kwargs)
+
+
+def decide_fix(observed, cfg, state, **kwargs):
+    """Legacy behavior fixtures explicitly assume activated, available episodes.
+
+    Authority-negative tests call raw_decide_fix so absent input stays absent.
+    """
+    snapshots = {item.number: _workflow(item.number) for item in observed.issues}
+    return raw_decide_fix(observed, cfg, replace(
+        state, resolve_workflows={**snapshots, **state.resolve_workflows},
+    ), **kwargs)
 
 
 def _run_agents(actions):
@@ -414,16 +457,13 @@ def test_pr_stage_hold_ignores_an_issue_whose_blocker_is_closed():
 def test_resolve_dispatch_relabels_then_runs():
     w = world(issues=[issue(5, "ai-ready", updated_at="issue-rev-5")])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    claim = Relabel(
-        Target.ISSUE,
-        5,
+    claim = Relabel(Target.ISSUE, 5,
         Label.AI_READY,
         Label.AI_WORKING,
-        "issue-rev-5",
-    )
+        "issue-rev-5", workflow=_workflow(5).binding)
     assert claim in actions
     dispatch = next(action for action in actions if isinstance(action, RunAgent))
-    assert dispatch == RunAgent(AgentKind.RESOLVE, 5)
+    assert dispatch == RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding)
     assert dispatch.requires == claim
 
 
@@ -458,8 +498,8 @@ def test_available_slots_dispatch_only_path_disjoint_issues():
     )
 
     assert _run_agents(actions) == [
-        RunAgent(AgentKind.RESOLVE, 1),
-        RunAgent(AgentKind.RESOLVE, 2),
+        RunAgent(AgentKind.RESOLVE, 1, workflow=_workflow(1).binding),
+        RunAgent(AgentKind.RESOLVE, 2, workflow=_workflow(2).binding),
     ]
 
 
@@ -477,7 +517,7 @@ def test_unknown_path_resolves_are_staged_until_router_prediction_is_observed():
         dispatch_slots=2,
     )
 
-    assert _run_agents(actions) == [RunAgent(AgentKind.RESOLVE, 1)]
+    assert _run_agents(actions) == [RunAgent(AgentKind.RESOLVE, 1, workflow=_workflow(1).binding)]
 
 
 def test_active_unknown_path_resolve_excludes_other_work():
@@ -532,15 +572,15 @@ def test_resume_needs_session_and_new_reply():
     iss = issue(7, "ai-blocked", comments=(Comment("alice", "here you go", "t2"),))
     w = world(issues=[iss])
     # no session → not eligible
-    assert issues_needing_resume(w, FixState(), CFG) == []
+    assert issues_needing_resume(w, FixState(resolve_workflows={7: _workflow(7)}), CFG) == []
     # with a session → eligible
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
     assert issues_needing_resume(w, st, CFG) == [(7, "t2")]
 
 
 def test_resume_skips_already_resumed_reply():
     iss = issue(7, "ai-blocked", comments=(Comment("alice", "x", "t2"),))
-    st = FixState(sessions=frozenset({7}), resumed_at={7: "t2"})
+    st = _with_session(resumed_at={7: "t2"})
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
 
@@ -552,7 +592,7 @@ def test_resume_never_fires_on_a_closed_issue():
         7, "ai-blocked", state="closed",
         comments=(Comment("alice", "closing as duplicate of #192", "t2"),),
     )
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
     assert issues_needing_any_resume(world(issues=[iss]), st, CFG) == []
 
@@ -562,7 +602,7 @@ def test_resume_ignores_bot_and_fixer_comments():
         7, "ai-blocked",
         comments=(Comment("fix-bot", "asking", "t1"), Comment("ci[bot]", "noise", "t2")),
     )
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
 
@@ -579,7 +619,7 @@ def test_resume_accepts_operator_reply_when_operator_is_also_fix_bot():
             Comment("fix-bot", "Use A.", "t2"),
         ),
     )
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
 
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
 
@@ -595,7 +635,7 @@ def test_resume_accepts_reply_when_fix_bot_is_an_app_identity():
         ),
     )
     cfg = FixConfig(fix_bot="fix-bot[bot]")
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
 
     assert issues_needing_resume(world(issues=[iss]), st, cfg) == [(7, "t2")]
 
@@ -612,7 +652,7 @@ def test_unblock_prompt_does_not_count_as_its_own_reply():
             ),
         ),
     )
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
 
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
@@ -629,7 +669,7 @@ def test_second_round_unblock_prompt_supersedes_the_original_reply():
             Comment("fix-bot", second, "t3"),
         ),
     )
-    st = FixState(sessions=frozenset({7}), resumed_at={7: "t2"})
+    st = _with_session(resumed_at={7: "t2"})
 
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
@@ -644,7 +684,7 @@ def test_author_leg_prompt_accepts_fix_bot_operator_reply():
             Comment("fix-bot", "Use the documented behavior.", "t2"),
         ),
     )
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
 
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
 
@@ -659,7 +699,7 @@ def test_quoted_unblock_prompt_is_consumed_as_the_reply():
             Comment("alice", f"> {prompt}\n\nUse A.", "t2"),
         ),
     )
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
 
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
 
@@ -674,7 +714,7 @@ def test_unrelated_bot_noise_after_prompt_does_not_trigger_resume():
             Comment("ci[bot]", "build finished", "t2"),
         ),
     )
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
 
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
@@ -684,7 +724,7 @@ def test_resume_dispatch_relabels_blocked_to_working():
     # and the issue must flip ai-blocked → ai-working for the run's duration (so it
     # doesn't read as still-blocked while actively resuming).
     iss = issue(7, "ai-blocked", comments=(Comment("alice", "go ahead", "t2"),))
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
     actions = decide_fix(world(issues=[iss]), CFG, st, fixer_busy=False)
     relabels = [a for a in actions if isinstance(a, Relabel)]
     assert any(
@@ -1554,7 +1594,7 @@ def test_c1_suffixed_fix_bot_does_not_read_its_own_comment_as_a_human_reply():
     # comment must not count as a new human reply, or one unanswered question
     # re-fires a paid RESUME session every poll.
     iss = issue(7, "ai-blocked", comments=(Comment("fix-bot", "asking", "t1"),))
-    st = FixState(sessions=frozenset({7}))
+    st = _with_session()
     assert issues_needing_resume(world(issues=[iss]), st, SUFFIXED_CFG) == []
     # Anti-vacuity twin: a real human's reply on the same world still resumes.
     iss2 = issue(7, "ai-blocked", comments=(
@@ -1666,54 +1706,106 @@ def test_review_with_unknown_commit_dispatches():
     assert RunAgent(AgentKind.ADDRESS_REVIEW, 100) in _run_agents(actions)
 
 
-# ── resolve breaker (T3 finding: the most expensive leg had no ceiling) ──────
+# ── SQLite-owned resolve gates ──────────────────────────────────────────────
 def test_resolve_under_cap_dispatches():
-    st = FixState(resolve_retries={5: 2})
+    st = FixState(resolve_workflows={5: _workflow(5, failures=2)})
     actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
 
 
-def test_resolve_at_cap_escalates_issue_not_dispatches():
-    st = FixState(resolve_retries={5: 3})  # cap is 3 (default)
-    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
+@pytest.mark.parametrize("labels", [("ai-ready",), ("ai-ready", "needs-human-review")])
+def test_remote_relabel_cannot_rearm_an_exhausted_episode(labels):
+    st = FixState(resolve_workflows={5: _workflow(5, failures=3, held=True)})
+    actions = raw_decide_fix(world(issues=[issue(5, *labels)]), CFG, st, fixer_busy=False)
     assert _run_agents(actions) == []
-    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
-    assert any(isinstance(a, PostComment) and a.number == 5 for a in actions)
+    projections = [a for a in actions if isinstance(a, Relabel)]
+    assert bool(projections) == ("needs-human-review" not in labels)
+    assert all(a.add is Label.NEEDS_HUMAN_REVIEW and a.workflow == st.resolve_workflows[5].binding for a in projections)
 
 
-# ── operator re-arm is the dashboard's, not the label's (#98, ADR 0012) ──────
-# A restored ai-ready with the counter still at ceiling re-escalates: a mutable
-# GitHub label is not operator provenance, and reading it as a grant would let
-# any label-writer (agent children included) convert relabels into unbounded
-# paid budgets. The sanctioned re-arm path is the dashboard unblock, which
-# resets the counter BEFORE the label comes back — so decide_fix never sees
-# this state on that path. The escalation comment routes the operator there.
-def test_resolve_at_cap_relabelled_ai_ready_reescalates_and_names_the_remedy():
-    st = FixState(resolve_retries={5: 3})
-    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
-    assert _run_agents(actions) == []
-    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
-    comments = [a for a in actions if isinstance(a, PostComment) and a.number == 5]
-    assert comments and "Unblock" in comments[0].body
+@pytest.mark.parametrize("authority", ["missing", "absent", "unavailable", "gated"])
+@pytest.mark.parametrize("label", ["ai-ready", "ai-blocked"])
+def test_resolve_and_resume_require_available_ungated_authority(authority, label):
+    snapshot = _workflow(7, session=True, failures=3, held=authority == "gated")
+    reads = {
+        "missing": {},
+        "absent": {7: WorkflowAbsent(snapshot.revision.fence.key)},
+        "unavailable": {7: WorkflowUnavailable(snapshot.revision.fence.key, "corrupt workflow row")},
+        "gated": {7: snapshot},
+    }
+    observed = world(issues=[issue(7, label, comments=(Comment("alice", "continue", "t2"),))])
+    state = FixState(sessions=frozenset({7}), resolve_workflows=reads[authority])
+    assert _run_agents(raw_decide_fix(observed, CFG, state, fixer_busy=False)) == []
 
 
-def test_resolve_escalation_quotes_the_last_terminal_error():
-    """#188: 'failed 3×' with no why sent the operator grepping journals for a
-    config fix the harness had already diagnosed verbatim (tauri #650)."""
-    st = FixState(
-        resolve_retries={5: 3},
-        last_resolve_error={5: "codex binary 'codex' not found on PATH"},
-    )
-    actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
-    comments = [a for a in actions if isinstance(a, PostComment) and a.number == 5]
-    assert comments and "codex binary 'codex' not found on PATH" in comments[0].body
-    # No recorded error (legacy state) still escalates, without an empty quote.
-    bare = decide_fix(
-        world(issues=[issue(5, "ai-ready")]), CFG,
-        FixState(resolve_retries={5: 3}), fixer_busy=False,
-    )
-    bare_comments = [a for a in bare if isinstance(a, PostComment) and a.number == 5]
-    assert bare_comments and "Last attempt's error" not in bare_comments[0].body
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_held_p1_cannot_starve_healthy_p2(unavailable):
+    held = _workflow(1, failures=3, held=True)
+    healthy = _workflow(2)
+    state = FixState(resolve_workflows={
+        1: WorkflowUnavailable(held.revision.fence.key, "invalid row") if unavailable else held,
+        2: healthy,
+    })
+    observed = world(issues=[issue(1, "ai-ready", "P1"), issue(2, "ai-ready", "P2")])
+    actions = raw_decide_fix(observed, CFG, state, fixer_busy=False)
+    assert _run_agents(actions) == [RunAgent(AgentKind.RESOLVE, 2, workflow=healthy.binding)]
+
+
+def test_issue_resume_ignores_legacy_session_without_sql_continuation():
+    observed = world(issues=[_blocked_issue_with_reply()])
+    state = FixState(sessions=frozenset({7}), resolve_workflows={7: _workflow(7)})
+    assert issues_needing_resume(observed, state, CFG) == []
+    assert issues_needing_any_resume(observed, state, CFG) == [(7, "t1")]
+
+
+@pytest.mark.parametrize("kind,label", [(AgentKind.RESOLVE, "ai-ready"), (AgentKind.RESUME, "ai-blocked")])
+def test_issue_claim_and_dispatch_capture_exact_observed_generation(kind, label):
+    original = _workflow(7)
+    current = replace(original, revision=WorkflowRevision(replace(original.revision.fence, generation=9), 12))
+    observed = world(issues=[issue(7, label, updated_at="revision-7", comments=(Comment("alice", "continue", "t2"),))])
+    actions = raw_decide_fix(observed, CFG, FixState(resolve_workflows={7: current}), fixer_busy=False)
+    assert _run_agents(actions) == [RunAgent(kind, 7, workflow=current.binding)]
+    claim = next(action for action in actions if isinstance(action, Relabel))
+    assert claim.workflow == current.binding
+    assert claim.expected_revision == "revision-7"
+    assert _run_agents(actions)[0].requires == claim
+
+
+@pytest.mark.parametrize("kind", [AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE, AgentKind.PR_RESUME])
+def test_pr_repair_retains_pr_authority_without_issue_workflow_binding(kind):
+    variants = {
+        AgentKind.FIX_CI: pr(100, "ai-pr-open", checks=(Check("unit", bucket="fail"),)),
+        AgentKind.ADDRESS_REVIEW: pr(100, "ai-pr-open", reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),)),
+        AgentKind.REBASE: pr(100, "ai-pr-open", mergeable="CONFLICTING"),
+        AgentKind.PR_RESUME: pr(100, "ai-pr-open", "ai-blocked", closing_issue=7, comments=(Comment("alice", "continue", "t2"),)),
+    }
+    state = FixState(sessions=frozenset({7}))
+    actions = raw_decide_fix(world(prs=[variants[kind]]), CFG, state, fixer_busy=False)
+    assert _run_agents(actions) == [RunAgent(kind, 100)]
+    assert all(action.workflow is None for action in actions if isinstance(action, (RunAgent, Relabel, PostComment)))
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_missing_cleanup_authority_cannot_emit_unbound_issue_leaf_effects(unavailable):
+    current = _workflow(7)
+    reads = {7: WorkflowUnavailable(current.revision.fence.key, "invalid authority")} if unavailable else {}
+    observed = world(issues=[issue(7, "ai-pr-open")], prs=[pr(100, "ai-pr-open", state="MERGED", closing_issue=7)])
+    actions = raw_decide_fix(observed, CFG, FixState(resolve_workflows=reads), fixer_busy=False)
+    assert not any(isinstance(action, CloseIssue) or (
+        isinstance(action, (Relabel, PostComment)) and action.target is Target.ISSUE
+    ) for action in actions)
+
+
+def test_issue_cleanup_leaf_effects_capture_existing_workflow_binding():
+    current = _workflow(7)
+    observed = world(issues=[issue(7, "ai-pr-open")], prs=[pr(100, "ai-pr-open", state="MERGED", closing_issue=7)])
+    actions = raw_decide_fix(observed, CFG, FixState(resolve_workflows={7: current}), fixer_busy=False)
+    effects = [action for action in actions if isinstance(action, CloseIssue) or (
+        isinstance(action, (Relabel, PostComment)) and action.target is Target.ISSUE
+    )]
+    assert any(isinstance(action, CloseIssue) for action in effects)
+    assert any(isinstance(action, Relabel) for action in effects)
+    assert all(action.workflow == current.binding for action in effects)
 
 
 def test_fix_ci_at_cap_escalates_not_dispatches():
@@ -1791,7 +1883,7 @@ def test_ready_issue_at_infra_ceiling_escalates_instead_of_dispatching():
     st = FixState(infra_deaths={5: 2})
     actions = decide_fix(world(issues=[issue(5, "ai-ready")]), INFRA_CFG, st, fixer_busy=False)
     assert _run_agents(actions) == []
-    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW) in actions
+    assert Relabel(Target.ISSUE, 5, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW, workflow=_workflow(5).binding) in actions
     assert any(isinstance(a, PostComment) and "died 2×" in a.body for a in actions)
 
 
@@ -1800,7 +1892,7 @@ def test_ready_issue_below_infra_ceiling_still_dispatches():
     # a couple of transport deaths must not stop a healthy issue.
     st = FixState(infra_deaths={5: 1})
     actions = decide_fix(world(issues=[issue(5, "ai-ready")]), INFRA_CFG, st, fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
 
 
 def test_infra_deaths_are_counted_against_their_own_higher_cap():
@@ -1808,16 +1900,16 @@ def test_infra_deaths_are_counted_against_their_own_higher_cap():
     # past the RETRY cap and must still dispatch — the two counters are separate
     # ceilings, and "resolve failed 4× without opening a PR" would be a lie
     # about work that never ran.
-    st = FixState(infra_deaths={5: 4}, resolve_retries={5: 0})
+    st = FixState(infra_deaths={5: 4}, resolve_workflows={5: _workflow(5)})
     actions = decide_fix(world(issues=[issue(5, "ai-ready")]), CFG, st, fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
 
 
 def test_infra_ceiling_of_zero_never_escalates():
     st = FixState(infra_deaths={5: 99})
     cfg = FixConfig(fix_bot="fix-bot", max_infra_deaths=0)  # 0 = off, like every cap
     actions = decide_fix(world(issues=[issue(5, "ai-ready")]), cfg, st, fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 5) in _run_agents(actions)
+    assert RunAgent(AgentKind.RESOLVE, 5, workflow=_workflow(5).binding) in _run_agents(actions)
 
 
 def _blocked_issue_with_reply():
@@ -1829,18 +1921,18 @@ def test_resume_at_infra_ceiling_escalates_from_blocked():
     # returns nothing on an infra death), so the dedup mark cannot stop the loop
     # either — only this ceiling can. The issue is ai-blocked here, so that is
     # the label the escalation removes.
-    st = FixState(sessions=frozenset({7}), infra_deaths={7: 2})
+    st = _with_session(infra_deaths={7: 2})
     actions = decide_fix(world(issues=[_blocked_issue_with_reply()]), INFRA_CFG, st,
                          fixer_busy=False)
     assert _run_agents(actions) == []
-    assert Relabel(Target.ISSUE, 7, Label.AI_BLOCKED, Label.NEEDS_HUMAN_REVIEW) in actions
+    assert Relabel(Target.ISSUE, 7, Label.AI_BLOCKED, Label.NEEDS_HUMAN_REVIEW, workflow=_workflow(7).binding) in actions
 
 
 def test_resume_below_infra_ceiling_still_dispatches():
-    st = FixState(sessions=frozenset({7}), infra_deaths={7: 1})
+    st = _with_session(infra_deaths={7: 1})
     actions = decide_fix(world(issues=[_blocked_issue_with_reply()]), INFRA_CFG, st,
                          fixer_busy=False)
-    assert RunAgent(AgentKind.RESUME, 7) in _run_agents(actions)
+    assert RunAgent(AgentKind.RESUME, 7, workflow=_workflow(7).binding) in _run_agents(actions)
 
 
 def test_ci_leg_at_infra_ceiling_escalates_the_pr():
@@ -1901,14 +1993,10 @@ def test_contradictory_ready_plus_pr_open_repairs_to_pr_open_only():
         issues=[issue(482, "ai-ready", "ai-pr-open", updated_at=_REV)],
         prs=[pr(620, "ai-pr-open", head_ref_name="fix/482-backoff", closing_issue=482)],
     )
-    assert Relabel(
-        Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV
-    ) in label_repair_actions(w)
+    assert Relabel(Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV) in label_repair_actions(w)
     # ...and decide_fix emits it lock-free even with the fixer busy.
     actions = decide_fix(w, CFG, FixState(), fixer_busy=True, dispatch_slots=0)
-    assert Relabel(
-        Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV
-    ) in actions
+    assert Relabel(Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV, workflow=_workflow(482).binding) in actions
 
 
 def test_no_repair_without_an_open_pr_or_without_the_pair():
@@ -1952,10 +2040,8 @@ def test_a_repaired_issue_is_not_claimed_or_dispatched_in_the_same_tick():
         prs=[pr(620, "ai-pr-open", head_ref_name="fix/482-backoff")],
     )
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False, dispatch_slots=1)
-    assert Relabel(
-        Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV
-    ) in actions
-    assert RunAgent(AgentKind.RESOLVE, 482) not in _run_agents(actions)
+    assert Relabel(Target.ISSUE, 482, Label.AI_READY, None, expected_revision=_REV, workflow=_workflow(482).binding) in actions
+    assert RunAgent(AgentKind.RESOLVE, 482, workflow=_workflow(482).binding) not in _run_agents(actions)
     assert not any(
         isinstance(a, Relabel) and a.number == 482 and a.add is not None
         for a in actions
@@ -1978,12 +2064,12 @@ def test_a_repair_preempts_the_duplicate_pr_guard_for_the_same_issue():
         if isinstance(a, Relabel) and a.number == 500
     ]
     assert relabels == [
-        Relabel(Target.ISSUE, 500, Label.AI_READY, None, expected_revision=_REV)
+        Relabel(Target.ISSUE, 500, Label.AI_READY, None, expected_revision=_REV, workflow=_workflow(500).binding)
     ]
     assert not any(
         isinstance(a, PostComment) and a.number == 500 for a in actions
     )
-    assert RunAgent(AgentKind.RESOLVE, 500) not in _run_agents(actions)
+    assert RunAgent(AgentKind.RESOLVE, 500, workflow=_workflow(500).binding) not in _run_agents(actions)
 
 
 def test_reap_requeues_orphaned_issue_to_ready():
@@ -2108,7 +2194,7 @@ def test_reap_does_not_pay_for_a_second_resolve_when_the_relabel_keeps_failing()
     )
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
     assert Relabel(Target.ISSUE, 8, Label.AI_WORKING, Label.AI_PR_OPEN,
-                   expected_revision=_REV) in actions
+                   expected_revision=_REV, workflow=_workflow(8).binding) in actions
     assert not [a for a in actions if isinstance(a, RunAgent) and a.number == 8]
 
 
@@ -2191,14 +2277,12 @@ def test_cleanup_does_not_stomp_a_fresh_dispatch_in_the_same_poll():
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
 
     # the fresh dispatch happened
-    assert Relabel(
-        Target.ISSUE, 8, Label.AI_READY, Label.AI_WORKING, ""
-    ) in actions
-    assert RunAgent(AgentKind.RESOLVE, 8) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_READY, Label.AI_WORKING, "", workflow=_workflow(8).binding) in actions
+    assert RunAgent(AgentKind.RESOLVE, 8, workflow=_workflow(8).binding) in actions
 
     # …and cleanup's ISSUE-side arm must NOT fire on top of it
     assert RemoveWorktree(8) not in actions
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_READY) not in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_READY, workflow=_workflow(8).binding) not in actions
     assert not any(isinstance(a, ClearIssueState) and a.issue == 8 for a in actions)
 
     # the PR-side arm (dropping ai-pr-open from the genuinely-dead PR) still
@@ -2216,7 +2300,7 @@ def test_cleanup_issue_side_arm_still_fires_when_issue_genuinely_awaits_cleanup(
                   head_ref_name="fix/8-thing")
     w = world(issues=[issue(8, "ai-pr-open")], prs=[stale_pr])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_READY) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_READY, workflow=_workflow(8).binding) in actions
     assert RemoveWorktree(8) in actions
     assert ClearIssueState(pr=50, issue=8, merged=False) in actions
 
@@ -2230,7 +2314,7 @@ def test_cleanup_does_not_reclose_an_issue_github_already_closed():
                 head_ref_name="fix/8-thing")
     w = world(issues=[issue(8, "ai-pr-open", state="closed")], prs=[merged])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=_workflow(8).binding) in actions
     assert RemoveWorktree(8) in actions
     assert ClearIssueState(pr=50, issue=8, merged=True) in actions
     assert not any(isinstance(a, CloseIssue) for a in actions)
@@ -2276,9 +2360,7 @@ def test_cleanup_defers_active_issue_but_still_cleans_unrelated_terminal_pr():
         isinstance(action, ClearIssueState) and action.issue == 8
         for action in actions
     )
-    assert Relabel(
-        Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE
-    ) not in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=_workflow(8).binding) not in actions
     assert RemoveWorktree(9) in actions
     assert ClearIssueState(pr=51, issue=9, merged=True) in actions
 
@@ -2298,7 +2380,7 @@ def test_deferred_active_merge_cleanup_runs_after_worker_settles():
     assert RemoveWorktree(8) in actions
     assert ClearIssueState(pr=50, issue=8, merged=True) in actions
     assert Relabel(Target.PR, 50, Label.AI_PR_OPEN, None) in actions
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=_workflow(8).binding) in actions
 
 
 # ── issue-driven cleanup: the PR is gone from the world entirely (#28) ───────
@@ -2361,7 +2443,7 @@ def test_cleanup_never_recloses_a_human_reopen():
                 head_ref_name="fix/8-thing")
     w = world(issues=[issue(8, "ai-pr-open", state_reason="reopened")], prs=[merged])
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE) in actions
+    assert Relabel(Target.ISSUE, 8, Label.AI_PR_OPEN, Label.AI_DONE, workflow=_workflow(8).binding) in actions
     assert not any(isinstance(a, CloseIssue) for a in actions)
 
 
@@ -2936,11 +3018,12 @@ def test_third_party_open_pr_closing_the_issue_blocks_the_resolve():
     assert _run_agents(actions) == []
     # The advisory half: the operator is told WHICH PR, and the issue parks in
     # ai-blocked (not needs-human-review — nothing is broken).
-    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_BLOCKED) in actions
+    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_BLOCKED, workflow=_workflow(7).binding) in actions
     body = next(a.body for a in actions if isinstance(a, PostComment))
     assert "#558" in body and "xnmp" in body
+    assert all(a.workflow == _workflow(7).binding for a in actions if isinstance(a, PostComment))
     # ...and specifically NOT the ai-working relabel a dispatch would have made.
-    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING) not in actions
+    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING, workflow=_workflow(7).binding) not in actions
 
 
 def test_fix_bots_own_open_pr_is_the_normal_in_flight_state_not_a_duplicate():
@@ -2948,14 +3031,14 @@ def test_fix_bots_own_open_pr_is_the_normal_in_flight_state_not_a_duplicate():
     # block the harness from ever resolving anything.
     w = _guard_world(closing_ref(558, 7, author="fix-bot"))
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(actions)
+    assert RunAgent(AgentKind.RESOLVE, 7, workflow=_workflow(7).binding) in _run_agents(actions)
 
 
 def test_fix_bot_matched_through_login_eq_not_raw_equality():
     # A FIX_BOT/author pair differing only by the `[bot]` suffix is the SAME
     # identity (review C1) — reading it as a stranger would block every issue.
     w = _guard_world(closing_ref(558, 7, author="Fix-Bot[bot]"))
-    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(
+    assert RunAgent(AgentKind.RESOLVE, 7, workflow=_workflow(7).binding) in _run_agents(
         decide_fix(w, CFG, FixState(), fixer_busy=False)
     )
 
@@ -2967,7 +3050,7 @@ def test_unknown_author_on_a_closing_pr_is_treated_as_not_ours():
     w = _guard_world(closing_ref(558, 7, author=""))
     actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
     assert _run_agents(actions) == []
-    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_BLOCKED) in actions
+    assert Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_BLOCKED, workflow=_workflow(7).binding) in actions
 
 
 def test_no_closing_refs_collected_dispatches_as_before():
@@ -2975,12 +3058,12 @@ def test_no_closing_refs_collected_dispatches_as_before():
     # exists" — but a guard that refused work on missing data would strand every
     # issue on any world builder that does not fill it.
     actions = decide_fix(_guard_world(), CFG, FixState(), fixer_busy=False)
-    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(actions)
+    assert RunAgent(AgentKind.RESOLVE, 7, workflow=_workflow(7).binding) in _run_agents(actions)
 
 
 def test_a_pr_closing_a_different_issue_does_not_block_this_one():
     w = _guard_world(closing_ref(558, 999, author="xnmp"))
-    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(
+    assert RunAgent(AgentKind.RESOLVE, 7, workflow=_workflow(7).binding) in _run_agents(
         decide_fix(w, CFG, FixState(), fixer_busy=False)
     )
 
@@ -3025,7 +3108,7 @@ def test_guard_can_be_switched_off():
     cfg = FixConfig(fix_bot="fix-bot", duplicate_pr_guard=False)
     w = _guard_world(closing_ref(558, 7, author="xnmp"))
     assert duplicate_pr_guards(w, cfg) == ()
-    assert RunAgent(AgentKind.RESOLVE, 7) in _run_agents(
+    assert RunAgent(AgentKind.RESOLVE, 7, workflow=_workflow(7).binding) in _run_agents(
         decide_fix(w, cfg, FixState(), fixer_busy=False)
     )
 

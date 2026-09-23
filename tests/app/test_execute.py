@@ -1,9 +1,14 @@
 """Action executor — each Action triggers the right adapter call, no logic."""
 
+from dataclasses import replace
+
 import pytest
 
 from issue_agent.adapters.journal import _legacy_event_record
-from issue_agent.app.execute import Executor as DurableExecutor
+from issue_agent.app.execute import (
+    Executor as DurableExecutor,
+    _is_advisory_relabel,
+)
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.domain.actions import (
     ClearIssueState,
@@ -23,6 +28,9 @@ from issue_agent.domain.actions import (
     Target,
 )
 from issue_agent.domain.labels import Label
+from issue_agent.domain.eligibility import LifecycleOperation
+from issue_agent.domain.events import ActionApplied
+from issue_agent.domain.lifecycle import completion_guard
 from issue_agent.domain.world import IssueView, PRView
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 
@@ -196,6 +204,127 @@ class _Journal:
         if not isinstance(event, str):
             event, fields = _legacy_event_record(event)
         self.events.append((event, fields))
+
+
+class _TypedJournal:
+    def __init__(self):
+        self.events = []
+
+    def emit(self, event):
+        self.events.append(event)
+
+
+class _SuccessfulRelabelEffects:
+    def handles(self, action):
+        return isinstance(action, Relabel)
+
+    def execute(self, _action):
+        return True
+
+    def reconcile(self, _action):
+        return False
+
+
+def _compound_relabel(
+    *,
+    adds=(Label.RECURRENCE, Label.MAYBE_RESOLVED),
+    comment="Resolve ceiling reached.",
+):
+    observed = IssueView(
+        7,
+        labels=frozenset({Label.AI_WORKING}),
+        updated_at="issue-rev-1",
+    )
+    return Relabel(
+        Target.ISSUE,
+        7,
+        Label.AI_WORKING,
+        Label.AI_BLOCKED,
+        expected_revision=observed.updated_at,
+        completion_guard=completion_guard(
+            observed, LifecycleOperation.REPAIR
+        ),
+        adds=adds,
+        comment=comment,
+    )
+
+
+def _applied(journal):
+    return [
+        event.payload
+        for event in journal.events
+        if isinstance(event.payload, ActionApplied)
+    ]
+
+
+def test_compound_relabel_audit_includes_every_projected_effect() -> None:
+    journal = _TypedJournal()
+    action = _compound_relabel()
+    executor = DurableExecutor(
+        FakeGateway(),
+        journal=journal,
+        effect_executor=_SuccessfulRelabelEffects(),
+    )
+
+    executor.execute(action)
+
+    [audit] = _applied(journal)
+    assert dict(audit.attributes or {}) == {
+        "type": "relabel",
+        "target": "ISSUE",
+        "number": 7,
+        "remove": "ai-working",
+        "add": "ai-blocked",
+        "adds": ["recurrence", "maybe-resolved"],
+        "comment": "Resolve ceiling reached.",
+        "attempts": 1,
+        "replayed": False,
+    }
+
+
+def test_compound_relabel_effects_have_distinct_emitted_action_ids() -> None:
+    journal = _TypedJournal()
+    executor = DurableExecutor(
+        FakeGateway(),
+        journal=journal,
+        effect_executor=_SuccessfulRelabelEffects(),
+    )
+    baseline = _compound_relabel()
+
+    executor.execute(baseline)
+    executor.execute(replace(baseline, adds=(Label.RECURRENCE,)))
+    executor.execute(replace(baseline, comment="Different explanation."))
+
+    audits = _applied(journal)
+    assert len({audit.command_id for audit in audits}) == 3
+
+
+def test_legacy_relabel_audit_shape_omits_empty_compound_fields() -> None:
+    journal = _TypedJournal()
+    executor = DurableExecutor(
+        FakeGateway(),
+        journal=journal,
+        effect_executor=_SuccessfulRelabelEffects(),
+    )
+
+    executor.execute(
+        Relabel(Target.ISSUE, 7, Label.AI_READY, Label.AI_WORKING)
+    )
+
+    [audit] = _applied(journal)
+    assert dict(audit.attributes or {}) == {
+        "type": "relabel",
+        "target": "ISSUE",
+        "number": 7,
+        "remove": "ai-ready",
+        "add": "ai-working",
+        "attempts": 1,
+        "replayed": False,
+    }
+
+
+def test_relabel_is_advisory_when_only_an_additional_label_is_advisory() -> None:
+    assert _is_advisory_relabel(_compound_relabel())
 
 
 def test_rerun_marks_the_head_before_asking_github():

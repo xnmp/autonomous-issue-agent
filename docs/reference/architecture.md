@@ -475,7 +475,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
-`domain/workflow_reconciliation.py`
+`domain/workflow_reconciliation.py`, `domain/resolve_return.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration).
 

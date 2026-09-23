@@ -72,6 +72,7 @@ from .lifecycle import (
 )
 from .refs import is_governed_branch, issue_from_branch
 from .review import IdentityMode
+from .workflow import OpenGate, ResolveCeiling, WorkflowRead, WorkflowSnapshot
 from .world import (
     CIState,
     ClosingRef,
@@ -155,7 +156,7 @@ class FixConfig:
 
 @dataclass(frozen=True)
 class FixState:
-    """Persistent orchestration state (STATE_DIR files), passed in purely."""
+    """Observed control authority and unselected legacy families, passed in purely."""
 
     sessions: frozenset[int] = frozenset()        # issues with a saved session
     resumed_at: dict[int, str] = field(default_factory=dict)  # issue → last reply ts resumed on
@@ -183,14 +184,9 @@ class FixState:
     # review daemon meant an infinite full-session-cost loop.
     review_retries: dict[int, tuple[str, int]] = field(default_factory=dict)
     rebase_retries: dict[int, int] = field(default_factory=dict)
-    # Per-ISSUE resolve requeue counter (T3 finding): an always-failing resolve
-    # requeues ai-ready each round; without a breaker that is a full paid
-    # session per poll, forever — #39's shape on the most expensive leg.
-    resolve_retries: dict[int, int] = field(default_factory=dict)
-    # #188: the last terminal error of the failed leg, beside its counter, so
-    # the breaker escalation names the WHY. Absent = never recorded (legacy
-    # state or a pre-#188 daemon) — the comment then omits the quote.
-    last_resolve_error: dict[int, str] = field(default_factory=dict)
+    # Missing/unavailable authority never means a fresh allowance. Resolve's
+    # gates, failure count and continuation are one SQLite-owned episode.
+    resolve_workflows: Mapping[int, WorkflowRead] = field(default_factory=dict)
     # Pre-result session deaths (review C3), keyed the same way the retry
     # counters are: issue number for the issue legs, `breaker_key(pr)` for the
     # PR legs. Written by the dispatcher (on a raised handler) and by the fix
@@ -580,7 +576,10 @@ def _issues_needing_resume(
         if issue.state == "closed":
             continue
         lifecycle = issue_lifecycle(issue)
-        has_session = issue.number in state.sessions
+        workflow = state.resolve_workflows.get(issue.number)
+        if not isinstance(workflow, WorkflowSnapshot) or workflow.gates:
+            continue
+        has_session = workflow.episode.continuation.session is not None
         if not lifecycle.is_blocked or has_session != require_session:
             continue
         last_at = _last_human_reply_at(issue, cfg.fix_bot)
@@ -1695,8 +1694,12 @@ def decide_fix(
                       and -p.number not in state.control_errors),
         )
 
+    issue_world = replace(world, issues=tuple(
+        issue for issue in world.issues
+        if isinstance(state.resolve_workflows.get(issue.number), WorkflowSnapshot)
+    ))
     retiring = self_clear_actions(
-        world,
+        issue_world,
         state.machine_blocks,
         state.budget_blocks,
         state.budget_worlds,
@@ -1717,11 +1720,32 @@ def decide_fix(
     }
 
     active_issues = frozenset(active.issue for active in state.inflight)
+    gated_issues = frozenset(
+        issue.number for issue in issue_world.issues
+        if isinstance(workflow := state.resolve_workflows.get(issue.number), WorkflowSnapshot)
+        and workflow.gates
+    )
+    for issue in issue_world.issues:
+        if issue.number in active_issues or issue.state != "open" or issue.has(Label.NEEDS_HUMAN_REVIEW):
+            continue
+        workflow = state.resolve_workflows[issue.number]
+        assert isinstance(workflow, WorkflowSnapshot)
+        exhausted = next((gate.cause for gate in workflow.gates
+                          if isinstance(gate, OpenGate) and isinstance(gate.cause, ResolveCeiling)), None)
+        if exhausted is None or not issue.labels & {Label.AI_READY, Label.AI_WORKING}:
+            continue
+        reason = f"resolve failed {exhausted.failures}× without opening a PR. This episode is held; an explicit harness re-arm is required to grant another allowance."
+        if exhausted.last_failure:
+            reason += f"\n\nLast attempt's error: {exhausted.last_failure}"
+        actions.extend(issue_escalation(
+            issue.number, reason,
+            Label.AI_WORKING if issue.has(Label.AI_WORKING) else Label.AI_READY,
+        ).actions())
     # A legacy external lock exposes only a boolean, so it cannot identify the
     # issue to protect and retains global suppression. Pool state carries exact
     # identities and can safely reap every other orphan.
     if not fixer_busy or state.inflight:
-        actions.extend(reap_actions(world, active_issues))
+        actions.extend(reap_actions(issue_world, active_issues | gated_issues))
     # Lock-free like the guards below: a label repair consumes no fixer and
     # must not wait for one — the contradiction it clears is exactly what
     # keeps looking dispatch-worthy every tick (#185). The repaired issues are
@@ -1730,7 +1754,7 @@ def decide_fix(
     # without the guard the same tick emits the repair AND a RESOLVE claim for
     # the same issue — a race the claim's CAS usually, but not provably, loses
     # (#185 review F2).
-    repairs = label_repair_actions(world)
+    repairs = label_repair_actions(issue_world)
     actions.extend(repairs)
     repaired = frozenset(
         r.number for r in repairs if isinstance(r, Relabel)
@@ -1801,7 +1825,7 @@ def decide_fix(
     # resolving it in the same tick would be incoherent, and the whole point is
     # that the resolve never happens.
     guarded: set[int] = set(repaired)
-    for dup in duplicate_pr_guards(world, cfg):
+    for dup in duplicate_pr_guards(issue_world, cfg):
         # A repaired issue is already being resolved toward its true state;
         # letting the guard ALSO fire would stack a second Relabel on the same
         # label in one tick and park the issue at ai-blocked + ai-pr-open — a
@@ -2059,41 +2083,19 @@ def decide_fix(
                 actions.append(RunAgent(AgentKind.RESUME, n, claim_action))
                 claim(n, paths)
 
+    # Filter before selecting so held high-priority work cannot starve an
+    # unrelated available episode. Labels cannot grant or reset SQL authority.
+    ready_world = replace(world, issues=tuple(
+        issue for issue in world.issues
+        if issue.number not in guarded
+        and isinstance(workflow := state.resolve_workflows.get(issue.number), WorkflowSnapshot)
+        and not workflow.gates
+    ))
     # 3) New ai-ready issues, only after repair work and only while slots remain.
     while remaining:
-        n = pick_ready_issue(world, tuple(inflight))
-        if n is not None and n in guarded:
-            # The duplicate guard above relabels this issue out of the ready set;
-            # let the next poll pick the next candidate.
-            break
-        elif n is not None:
-            if breaker_tripped(
-                state.resolve_retries.get(n, 0), cfg.max_resolve_retries
-            ):
-                # The counter deliberately survives a bare GitHub relabel: a
-                # mutable label is not operator provenance (ADR 0012 — agent
-                # children can write labels), so a restored ai-ready alone
-                # re-escalates here rather than granting budget. The sanctioned
-                # re-arm is the dashboard Unblock — an authenticated harness
-                # mint that resets the counter BEFORE restoring the label —
-                # and the escalation comment points the operator at it (#98).
-                # #188: quote the last attempt's terminal error — "failed 3×"
-                # alone read as "failed without a reason" and sent the
-                # operator grepping journals for a fix the harness had
-                # already diagnosed verbatim.
-                last_error = state.last_resolve_error.get(n, "")
-                why = f"\n\nLast attempt's error: {last_error}" if last_error else ""
-                actions.extend(issue_escalation(
-                    n,
-                    f"resolve failed {cfg.max_resolve_retries}× without "
-                    "opening a PR — this issue needs a human look. To grant "
-                    f"another {cfg.max_resolve_retries} attempts, use the "
-                    "dashboard's Unblock on this issue (a bare ai-ready "
-                    f"relabel re-escalates without resetting the budget).{why}",
-                    Label.AI_READY,
-                ).actions())
-                break
-            elif infra_ceiling_hit(state, cfg, n):
+        n = pick_ready_issue(ready_world, tuple(inflight))
+        if n is not None:
+            if infra_ceiling_hit(state, cfg, n):
                 actions.extend(issue_escalation(
                     n, infra_escalation_reason(cfg.max_infra_deaths), Label.AI_READY,
                 ).actions())
@@ -2182,7 +2184,7 @@ def decide_fix(
             observed = _observed_issue(world, issue_n)
             actions.extend(cleanup_actions(
                 pr, issue_n, cfg,
-                issue_observed_pr_open=_issue_carries_ai_pr_open(world, issue_n),
+                issue_observed_pr_open=_issue_carries_ai_pr_open(issue_world, issue_n),
                 issue_observed_closed=observed is not None and observed.state != "open",
                 issue_observed_reopened=(
                     observed is not None and observed.state_reason == "reopened"
@@ -2193,6 +2195,34 @@ def decide_fix(
     # world can no longer see at all. Lock-free, and deliberately AFTER (4) so
     # `covered` reflects the same snapshot the PR-driven arm just consumed — the
     # two are disjoint by construction, never both acting on one issue.
-    actions.extend(orphaned_cleanup_actions(world, active_issues))
+    actions.extend(orphaned_cleanup_actions(issue_world, active_issues))
 
-    return actions
+    return _bind_issue_actions(actions, state)
+
+
+def _bind_issue_actions(actions: list[Action], state: FixState) -> list[Action]:
+    """Retain the decision snapshot through claims and all issue effects.
+
+    Missing authority drops the affected command, never late-binds it at the
+    executor. PR-only commands and paid PR repair remain in their own family.
+    """
+    bound: list[Action] = []
+    for action in actions:
+        if isinstance(action, RunAgent) and action.kind in {AgentKind.RESOLVE, AgentKind.RESUME}:
+            workflow = state.resolve_workflows.get(action.number)
+            if not isinstance(workflow, WorkflowSnapshot) or workflow.gates:
+                continue
+            claim = (
+                replace(action.requires, workflow=workflow.binding)
+                if action.requires is not None else None
+            )
+            bound.append(replace(action, requires=claim, workflow=workflow.binding))
+        elif isinstance(action, CloseIssue) or (
+            isinstance(action, (Relabel, PostComment)) and action.target is Target.ISSUE
+        ):
+            workflow = state.resolve_workflows.get(action.number)
+            if isinstance(workflow, WorkflowSnapshot):
+                bound.append(replace(action, workflow=workflow.binding))
+        else:
+            bound.append(action)
+    return bound

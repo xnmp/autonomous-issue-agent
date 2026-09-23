@@ -18,6 +18,7 @@ import asyncio
 import hashlib
 import json
 import os
+import sqlite3
 import threading
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -50,6 +51,7 @@ from ..adapters.store import Store
 from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..adapters.wake import WakeSignal, wake_path
 from ..adapters.worktree import ReviewCheckouts, Worktrees
+from ..adapters.workflow_control import SQLiteWorkflowControl
 _PR_COMMITS_FETCH_CEILING = 100  # gh pr view --json commits silent cap
 
 from ..domain.fix import (
@@ -68,6 +70,10 @@ from ..domain.fix import (
 )
 from ..domain.review import REVIEW_APPROVED
 from ..domain.labels import Label
+from ..domain.ci import parse_timestamp
+from ..domain.workflow import ObservedIssue, WorkflowAbsent, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable
+from ..domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
+from ..domain.workflow_ports import WorkflowControl
 from ..domain.lifecycle import pr_lifecycle, retry_breaker
 from ..domain import review as review_dom
 from ..domain.exemptions import (
@@ -527,10 +533,12 @@ def _rate_table(
 class EffectRecovery:
     actions: GitHubEffectExecutor
     publications: AgentPublicationBroker
+    reconcile_workflow: Callable[[], int] | None = None
 
     def drain_pending_commands(self) -> int:
+        recovered = self.reconcile_workflow() if self.reconcile_workflow is not None else 0
         return (
-            self.actions.drain_pending_commands()
+            recovered + self.actions.drain_pending_commands()
             + self.publications.drain_pending_commands()
         )
 
@@ -1817,6 +1825,8 @@ def _fix_state(
     inflight: tuple[InFlightFix, ...] = (),
     process_deaths: Mapping[int, int] | None = None,
     test_exemptions: dict[int, "ExemptionFacts"] | None = None,
+    *,
+    workflow_control: WorkflowControl | None = None,
 ) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
     errors: dict[int, str] = {}
@@ -1824,7 +1834,9 @@ def _fix_state(
     def read(key, reader, default, *, error_key=None):
         return _control_value(errors, key, reader, default, error_key=error_key)
 
-    sessions = frozenset(i.number for i in world.issues if read(i.number, store.has_session, False))
+    # Only the unselected PR family may consult legacy session files.
+    pr_issues = {breaker_key(p) for p in world.prs if breaker_key(p) > 0}
+    sessions = frozenset(n for n in pr_issues if read(n, store.has_session, False))
     resumed = {i.number: read(i.number, store.get_resumed_at, "") for i in world.issues}
     pr_resumed = {p.number: read(p.number, store.get_pr_resumed_at, "", error_key=breaker_key(p)) for p in world.prs}
     automerge = frozenset(p.number for p in world.prs if read(p.number, store.automerge_enabled, False, error_key=breaker_key(p)))
@@ -1839,12 +1851,38 @@ def _fix_state(
     # as count 0 (see FixState.review_retries).
     review_retries = {k: read(k, store.get_review_retry, ("", 0)) for k in keys}
     rebase_retries = {k: read(k, store.get_rebase_retries, 0) for k in keys}
-    resolve_retries = {i.number: read(i.number, store.get_resolve_retries, 0) for i in world.issues}
-    last_resolve_error = {
-        i.number: err
-        for i in world.issues
-        if (err := store.get_last_resolve_error(i.number))
-    }
+    resolve_workflows: dict[int, WorkflowRead] = {}
+    if workflow_control is not None:
+        observed_at = parse_timestamp(world.now)
+        for issue in world.issues:
+            key = WorkflowKey(workflow_control.writer.repository, IssueRef(issue.number))
+            try:
+                workflow = workflow_control.load_workflow(key)
+                if isinstance(workflow, WorkflowAbsent):
+                    if observed_at is None:
+                        workflow = WorkflowUnavailable(key, "workflow discovery requires a timestamped issue observation")
+                    else:
+                        workflow = workflow_control.ensure_observed_workflow(
+                            ObservedIssue(key, issue, observed_at)
+                        ).snapshot
+                resolve_workflows[issue.number] = workflow
+            except (ValueError, sqlite3.Error) as exc:
+                resolve_workflows[issue.number] = WorkflowUnavailable(key, str(exc))
+        # A PR may remain observable when its issue fetch failed. Existing SQL
+        # handoff evidence can be read, but absence cannot initialize an unseen
+        # issue or authorize an issue-side effect.
+        for number in pr_issues - resolve_workflows.keys():
+            key = WorkflowKey(workflow_control.writer.repository, IssueRef(number))
+            try:
+                resolve_workflows[number] = workflow_control.load_workflow(key)
+            except (ValueError, sqlite3.Error) as exc:
+                resolve_workflows[number] = WorkflowUnavailable(key, str(exc))
+    sessions = sessions | frozenset(
+        number for number in pr_issues
+        if isinstance(workflow := resolve_workflows.get(number), WorkflowSnapshot)
+        and workflow.episode.continuation.session is not None
+        and workflow.episode.continuation.session.runtime == store.runtime
+    )
     # Infra deaths (review C3) span BOTH key spaces: the issue legs (resolve /
     # resume) escalate on the issue number, the PR legs on breaker_key(pr) —
     # and the dispatcher writes under whichever one the dying leg used. Read the
@@ -1918,8 +1956,7 @@ def _fix_state(
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
         automerge_enabled=automerge,
         ci_retries=ci_retries, review_retries=review_retries,
-        rebase_retries=rebase_retries, resolve_retries=resolve_retries,
-        last_resolve_error=last_resolve_error,
+        rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
         update_branch_head=update_branch_head,
@@ -2614,13 +2651,20 @@ def build_fix_daemon(
         role="fix",
         owner_id=owner_id,
     )
+    workflow_control = SQLiteWorkflowControl(
+        control, WorkflowWriter(cfg.repo, "fix", owner_id),
+        resolve_ceiling=cfg.max_resolve_retries,
+    )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,
         prepare_cwd=prepare_cwd, journal=journal,
         reserve_fix_paths=reservations.expand,
         dedupe=control,
         dispatch_claim_target=reservations.issue_for,
+        workflow_control=workflow_control,
     )
+    executor.bind_workflow_reconciliation(dispatcher.fix_workflow.reconcile_returns)
+    effect_executor = replace(effect_executor, reconcile_workflow=dispatcher.fix_workflow.reconcile_returns)
     dispatch_runtime = CancellableAsyncDispatch(
         dispatcher.dispatch,
         finished=reservations.finish,
@@ -2717,9 +2761,13 @@ def build_fix_daemon(
             _collect_test_exemptions(
                 gateway, world, fix_cfg, fix_cfg.review_bot, _log("fix")
             ),
+            workflow_control=workflow_control,
         )
         for target, reason in state.control_errors.items():
             _log("fix")(f"workflow {target} held: {reason}")
+        for target, workflow in state.resolve_workflows.items():
+            if isinstance(workflow, WorkflowUnavailable):
+                _log("fix")(f"resolve workflow {target} held: {workflow.reason}")
         budget_blocks, budget_worlds = _budget_self_clear_worlds(
             control, cfg, world, state.budget_blocks
         )

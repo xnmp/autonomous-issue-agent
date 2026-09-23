@@ -89,13 +89,28 @@ class Relabel:
     removes: tuple[Label, ...] = ()
     completion_guard: IssueCompletionGuard | None = None
     workflow: WorkflowBinding | None = None
+    adds: tuple[Label, ...] = ()
+    comment: str = ""
 
     def __post_init__(self) -> None:
         _validate_action_workflow(self.workflow, self.target, self.number)
+        if not isinstance(self.adds, tuple) or any(not isinstance(label, Label) for label in self.adds):
+            raise ValueError("additional labels must be a tuple of labels")
+        if not isinstance(self.comment, str) or len(self.comment) > 65536 or "\x00" in self.comment:
+            raise ValueError("projection comment must be bounded text")
+        if self.adds or self.comment:
+            if self.target is not Target.ISSUE or self.harness_signal or self.completion_guard is None or not self.expected_revision:
+                raise ValueError("compound projection requires a guarded issue revision")
+            if set(self.added_labels) & set(self.removed_labels):
+                raise ValueError("projection cannot add and remove the same label")
 
     @property
     def removed_labels(self) -> tuple[Label, ...]:
         return ((self.remove,) if self.remove is not None else ()) + self.removes
+
+    @property
+    def added_labels(self) -> tuple[Label, ...]:
+        return ((self.add,) if self.add is not None else ()) + self.adds
 
 
 @dataclass(frozen=True)

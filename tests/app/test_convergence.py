@@ -11,8 +11,9 @@ re-fired a full session every tick, forever.
 
 This file tests that shape rather than one instance of it. Each scenario runs the
 REAL `app.loop.Daemon` tick loop — `decide_fix` → `Executor.execute` →
-`AgentDispatcher.dispatch` → the REAL `app/workflows/fix.py` → a REAL
-`Store(tmp_path)` — against a FROZEN GitHub world (a `_SimGateway` double whose
+`AgentDispatcher.dispatch` → the REAL `app/workflows/fix.py` → real SQLite
+workflow/admission authority and the remaining `Store(tmp_path)` state — against
+a FROZEN GitHub world (a `_SimGateway` double whose
 only behaviour beyond plain data is applying the daemon's OWN `relabel`/
 `close_issue` writes, exactly as GitHub itself would). The agent's own run is the
 pathological case where it accomplishes nothing (no push, no PR, no comment);
@@ -44,7 +45,15 @@ from dataclasses import dataclass, replace
 import pytest
 from tests.domain.builders import Check, Comment, Review, issue, pr, world
 
+from issue_agent.adapters import accounting_runtime
+from issue_agent.adapters.accounting_runtime import AccountingRuntime
+from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.effects import (
+    GitHubEffectExecutor,
+    ImmediateGitHubEffectExecutor,
+)
 from issue_agent.adapters.store import Store
+from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
 from issue_agent.app import roles
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
@@ -52,10 +61,15 @@ from issue_agent.app.loop import Daemon
 from issue_agent.app.planners.tasks import FixTaskConfig
 from issue_agent.domain import outcome
 from issue_agent.domain.actions import Action, AgentKind, Relabel, RunAgent, Target
+from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
+from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.refs import issue_from_branch
 from issue_agent.domain.world import IssueView, PRView, WorldState
+from issue_agent.domain.workflow import FreshResolve, ResolveSession
+from issue_agent.domain.workflow_identity import WorkflowWriter
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 CFG = FixConfig(fix_bot="fix-bot")
 
@@ -68,6 +82,16 @@ STABLE_TAIL = 3
 # GitHub (no push, no PR, no comment). is_error=True → Outcome.ERROR; session_id
 # is empty, matching a run that died before the SDK returned one.
 ERRORED_RUN = outcome.AgentResult(is_error=True)
+
+
+@pytest.fixture(autouse=True)
+def controlled_publication_context(monkeypatch):
+    monkeypatch.setattr(
+        accounting_runtime, "_fix_publication_context",
+        lambda _role, cwd: accounting_runtime._FixPublicationContext(
+            cwd, f"fix/{cwd.rsplit('-', 1)[-1]}-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
+        ),
+    )
 
 
 # ── adapter doubles ──────────────────────────────────────────────────────────
@@ -158,8 +182,24 @@ class _SimGateway:
     down."""
 
     def __init__(self, world_state: WorldState):
-        self.world = world_state
+        self._revision = 0
+        self.world = replace(
+            world_state,
+            issues=tuple(
+                issue
+                if issue.updated_at
+                else replace(
+                    issue,
+                    updated_at=self._next_issue_revision(issue.number),
+                )
+                for issue in world_state.issues
+            ),
+        )
         self.calls: list = []
+
+    def _next_issue_revision(self, number: int) -> str:
+        self._revision += 1
+        return f"fixture-revision-{number}-{self._revision}"
 
     def build_world(self) -> WorldState:
         return self.world
@@ -167,8 +207,15 @@ class _SimGateway:
     def get_issue(self, n: int) -> IssueView:
         return _find(self.world.issues, n)
 
-    def get_pr(self, n: int) -> PRView:
+    def get_pr(
+        self, n: int, *, mergeability: bool = True, checks: bool = True
+    ) -> PRView:
+        del mergeability, checks
         return _find(self.world.prs, n)
+
+    def has_label(self, kind: str, number: int, label: str) -> bool:
+        view = self.get_issue(number) if kind == "issue" else self.get_pr(number)
+        return Label(label) in view.labels
 
     def pr_for_issue(self, issue_number: int) -> int | None:
         for p in self.world.prs:
@@ -185,7 +232,12 @@ class _SimGateway:
         ad = Label(add) if add else None
         if kind == "issue":
             self.world = replace(self.world, issues=tuple(
-                replace(i, labels=_moved(i.labels, rm, ad)) if i.number == number else i
+                replace(
+                    i,
+                    labels=_moved(i.labels, rm, ad),
+                    updated_at=self._next_issue_revision(number),
+                )
+                if i.number == number else i
                 for i in self.world.issues
             ))
         else:
@@ -196,11 +248,41 @@ class _SimGateway:
 
     def comment(self, kind: str, number: int, body: str) -> None:
         self.calls.append(("comment", kind, number, body))
+        if kind == "issue":
+            self.world = replace(self.world, issues=tuple(
+                replace(
+                    i,
+                    comments=i.comments + (
+                        Comment(
+                            "fix-bot",
+                            body,
+                            self._next_issue_revision(number),
+                        ),
+                    ),
+                    updated_at=self._next_issue_revision(number),
+                )
+                if i.number == number else i
+                for i in self.world.issues
+            ))
+        else:
+            self.world = replace(self.world, prs=tuple(
+                replace(
+                    p,
+                    comments=p.comments + (Comment("fix-bot", body, "fixture-comment"),),
+                )
+                if p.number == number else p
+                for p in self.world.prs
+            ))
 
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self.calls.append(("close", number))
         self.world = replace(self.world, issues=tuple(
-            replace(i, state="closed") if i.number == number else i
+            replace(
+                i,
+                state="closed",
+                updated_at=self._next_issue_revision(number),
+            )
+            if i.number == number else i
             for i in self.world.issues
         ))
 
@@ -209,6 +291,31 @@ class _SimGateway:
 
     def update_branch(self, pr_number: int) -> None:
         self.calls.append(("update_branch", pr_number))
+
+
+class _SimEffects:
+    """Keep ordinary fixture writes immediate while draining atomic outbox work."""
+
+    def __init__(self, gateway: _SimGateway, control: SQLiteControlStore):
+        self.immediate = ImmediateGitHubEffectExecutor(gateway)
+        self.durable = GitHubEffectExecutor(
+            gateway,
+            control,
+            repository="o/r",
+            identity="o/r:fix",
+        )
+
+    def handles(self, action: Action) -> bool:
+        return self.immediate.handles(action)
+
+    def execute(self, action: Action):
+        return self.immediate.execute(action)
+
+    def reconcile(self, action: Action) -> bool | None:
+        return self.immediate.reconcile(action)
+
+    def drain_pending_commands(self) -> int:
+        return self.durable.drain_pending_commands()
 
 
 @dataclass(frozen=True)
@@ -231,10 +338,10 @@ class Scenario:
     # — the C3 shape, driven by `_RaisingRunner` rather than `_FakeRunner`.
     runner_raises: bool = False
     runner_result: outcome.AgentResult = ERRORED_RUN
-    # Pre-seed the REAL Store before the loop starts — the store-backed
-    # equivalent of what used to be a hand-built `FixState(sessions=...)` seed
-    # (e.g. "a resolve already ran and saved a session for this issue").
+    # PR-family sessions remain in Store; selected resolve sessions belong to
+    # the explicitly imported workflow episode instead.
     seed: Callable[[Store], None] | None = None
+    resolve_session: str = ""
 
 
 def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
@@ -243,9 +350,9 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
     and the agent is inert. Wires the SAME pieces `app.roles.build_fix_daemon`
     does:
 
-        decide_fix(world, cfg, roles._fix_state(store, world), fixer_busy=False)
+        decide_fix(world, cfg, roles._fix_state(store, world, workflow_control=...), fixer_busy=False)
             → Daemon.tick() → Executor.execute → AgentDispatcher.dispatch
-            → FixWorkflow.<leg>() → a REAL Store(tmp_path)
+            → FixWorkflow.<leg>() → real workflow authority and accounting
 
     so a decide/write drift — the review's D13 finding — fails THIS suite
     instead of only `tests/adapters/test_fix_workflow.py`.
@@ -253,26 +360,51 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
     store = Store(state_dir=str(tmp_path))
     if scenario.seed is not None:
         scenario.seed(store)
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    for item in scenario.world.issues:
+        snapshot = resolve_snapshot(item.number)
+        if scenario.resolve_session:
+            source = WorkflowAttemptIdentity(snapshot.binding, RunId(f"prior:{item.number}"), "prior-leg")
+            snapshot = replace(
+                snapshot, revision=replace(snapshot.revision, version=1),
+                episode=replace(snapshot.episode, continuation=FreshResolve(
+                    ResolveSession(source, scenario.resolve_session, "claude", "<runtime-default>"), 1,
+                )),
+            )
+        install_workflow(control, snapshot)
+    workflow = SQLiteWorkflowControl(
+        control, WorkflowWriter("o/r", "fix", "o/r:fix"),
+        resolve_ceiling=scenario.cfg.max_resolve_retries,
+    )
     gw = _SimGateway(scenario.world)
     worktrees = _FakeWorktrees()
-    runner = (
+    provider = (
         _RaisingRunner()
         if scenario.runner_raises
         else _FakeRunner(scenario.runner_result)
+    )
+    runner = AccountingRuntime(
+        provider, control, "o/r", "fix", None, None, None, "test", "claude",
+        BudgetPolicy({("fix", kind.name): Money("USD", 3_000_000) for kind in AgentKind}),
     )
     log: Callable[[str], None] = lambda _m: None  # noqa: E731
     executor = Executor(
         gw, remove_worktree=worktrees.remove, log=log,
         mark_automerge=store.mark_automerge, clear_issue_state=store.cleanup_pr,
+        effect_executor=_SimEffects(gw, control),
     )
     dcfg = DispatchConfig(
         fix=FixTaskConfig("o/r", agent_md="AM"), fix_bot=scenario.cfg.fix_bot, log=log,
     )
-    dispatcher = AgentDispatcher(dcfg, gw, store, worktrees, runner, executor)
+    dispatcher = AgentDispatcher(dcfg, gw, store, worktrees, runner, executor, workflow_control=workflow)
+    executor.bind_workflow_reconciliation(
+        dispatcher.fix_workflow.reconcile_returns
+    )
     executor._run_agent = lambda a: asyncio.run(dispatcher.dispatch(a))  # noqa: SLF001
 
     def decide(w: WorldState) -> list[Action]:
-        return decide_fix(w, scenario.cfg, roles._fix_state(store, w), fixer_busy=False)
+        return decide_fix(w, scenario.cfg, roles._fix_state(store, w, workflow_control=workflow), fixer_busy=False)
 
     daemon = Daemon("fix", gw.build_world, decide, executor, poll_seconds=1, log=log)
 
@@ -281,6 +413,9 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
         decided = daemon.tick()
         dispatches = tuple(a for a in decided if isinstance(a, RunAgent))
         trace.append(Tick(tuple(decided), dispatches))
+    assert sum(len(tick.dispatches) for tick in trace) == len(provider.tasks), (
+        "scheduled work must actually reach the provider; an authority refusal is not convergence"
+    )
     return trace
 
 
@@ -296,9 +431,7 @@ def _resume_dedup() -> Scenario:
                 Comment("alice", "here is the missing context", "2026-01-01T00:00:00Z"),
             )),
         ]),
-        # A resolve already ran and saved a session for issue 7 — the
-        # precondition `issues_needing_resume` requires.
-        seed=lambda store: store.save_session(7, "prior-session"),
+        resolve_session="prior-session",
         expect_dispatches=1,
         expect_kinds=frozenset({AgentKind.RESUME}),
         cap=0,  # not a retry loop: the dedup mark alone must hold it to one
@@ -423,7 +556,7 @@ def _resolve_retry_loop() -> Scenario:
     """The T3 headline finding, now FIXED: an ai-ready issue whose resolve run
     keeps erroring is requeued to ai-ready by `outcome.resolve_actions`
     (ResolveFollowup.RETRY), and the workflow counts each requeue
-    (`_bump_resolve_retry`). At `max_resolve_retries` the decide side escalates
+    (the durable episode result). At `max_resolve_retries` the decide side escalates
     the issue to needs-human-review instead of paying for another full session
     — the same breaker shape as review/CI/rebase, on the most expensive leg."""
     return Scenario(
@@ -542,10 +675,21 @@ def test_simulator_can_detect_an_unbounded_loop():
     written back. The property above is only meaningful because a `decide_fix`
     that ignored its own state entirely would fail it."""
     scenario = _resume_dedup()
-    frozen_state = FixState(sessions=frozenset({7}))
+    frozen_state = FixState(resolve_workflows={7: resolve_snapshot(7)})
     dispatches = 0
     for _ in range(TICKS):
         decided = decide_fix(scenario.world, scenario.cfg, frozen_state, fixer_busy=False)
         dispatches += sum(1 for a in decided if isinstance(a, RunAgent))
         # deliberately never updates frozen_state / scenario.world
     assert dispatches == TICKS
+
+
+def test_resolve_loop_is_unbounded_without_the_durable_episode_ceiling(tmp_path):
+    scenario = replace(_resolve_retry_loop(), cfg=replace(CFG, max_resolve_retries=0))
+
+    trace = simulate(scenario, tmp_path)
+
+    assert sum(len(tick.dispatches) for tick in trace) == TICKS
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    workflow = SQLiteWorkflowControl(control, WorkflowWriter("o/r", "fix", "o/r:fix"), resolve_ceiling=0)
+    assert workflow.load_workflow(resolve_snapshot(5).revision.fence.key).episode.failures == TICKS

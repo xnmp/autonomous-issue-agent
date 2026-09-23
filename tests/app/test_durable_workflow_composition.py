@@ -8,13 +8,14 @@ databases. These are controlled restart replays, not live deployment evidence.
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 import multiprocessing
 import os
 from pathlib import Path
 import sqlite3
 from threading import Barrier
 from zoneinfo import ZoneInfo
+from unittest.mock import patch
 
 import pytest
 
@@ -25,6 +26,8 @@ from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.event_log import EventLog, read_event_log
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.store import Store
+from issue_agent.adapters.workflow_codec import decode_workflow
+from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
 from issue_agent.app import roles
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from issue_agent.app.execute import Executor
@@ -40,8 +43,11 @@ from issue_agent.domain.lifecycle import LifecycleOperation, completion_guard
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.triage import TriageConfig
+from issue_agent.domain.workflow import ResolveAdmission
+from issue_agent.domain.workflow_identity import WorkflowBinding, WorkflowWriter
 from tests.domain.builders import issue, pr
 from tests.fakes.persistent_github import PersistentGitHub
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 
 class Crash(BaseException):
@@ -76,15 +82,31 @@ class Composition:
     daemon: Daemon
     remote: PersistentGitHub
     control: SQLiteControlStore
+    workflow: SQLiteWorkflowControl
     effects: GitHubEffectExecutor
     provider: Provider
+    dispatched: list[RunAgent]
     log: list[str]
 
 
-def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, accounted=False, role="fix") -> Composition:
+@pytest.fixture(autouse=True)
+def controlled_publication_context(monkeypatch):
+    monkeypatch.setattr(
+        accounting_runtime, "_fix_publication_context",
+        lambda _role, cwd: accounting_runtime._FixPublicationContext(
+            str(Path(cwd).resolve()), "fix/7-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
+        ),
+    )
+
+
+def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix") -> Composition:
     remote = PersistentGitHub(root / "github.db", fault=fault)
     control = SQLiteControlStore(str(root / "control.db"))
     control.initialize()
+    workflow = SQLiteWorkflowControl(
+        control, WorkflowWriter("o/r", "fix", "o/r:fix"),
+        resolve_ceiling=FixConfig(fix_bot="fix-bot").max_resolve_retries,
+    )
     events = EventLog(str(root / "events.jsonl"), Producer("test", "o/r", role, os.getpid(), "test-boot"))
     control.bind_event_outbox(events.prepare, events.append_committed)
     state = Store(state_dir=str(root / role))
@@ -94,19 +116,32 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, acc
     runtime = AccountingRuntime(
         provider, control, "o/r", "fix", Money("USD", 5_000_000), None, None,
         "test", "claude", BudgetPolicy({("fix", "RESOLVE"): Money("USD", 3_000_000)}),
-    ) if accounted else provider
+    )
     executor = Executor(remote, effect_executor=effects, retry_delays=(), log=messages.append, remove_worktree=lambda _: None, clear_issue_state=state.cleanup_pr)
     dispatcher = AgentDispatcher(
         DispatchConfig(fix=FixTaskConfig("o/r", agent_md="test", model="test-model"), fix_bot="fix-bot", log=messages.append),
-        remote, state, Worktrees(root), runtime, executor,
+        remote, state, Worktrees(root), runtime, executor, workflow_control=workflow,
     )
-    executor._run_agent = lambda action: asyncio.run(dispatcher.dispatch(action))
-    policy = decide or (lambda world: decide_fix(world, FixConfig(fix_bot="fix-bot"), roles._fix_state(state, world), fixer_busy=False))
-    return Composition(Daemon("fix", remote.build_world, policy, executor, log=messages.append), remote, control, effects, provider, messages)
+    executor.bind_workflow_reconciliation(dispatcher.fix_workflow.reconcile_returns)
+    dispatched = []
+
+    def dispatch(action):
+        dispatched.append(action)
+        return asyncio.run(dispatcher.dispatch(action))
+
+    executor._run_agent = dispatch
+    policy = decide or (lambda world: decide_fix(
+        world, FixConfig(fix_bot="fix-bot"),
+        roles._fix_state(state, world, workflow_control=workflow), fixer_busy=False,
+    ))
+    return Composition(Daemon("fix", remote.build_world, policy, executor, log=messages.append), remote, control, workflow, effects, provider, dispatched, messages)
 
 
 def seed(root: Path, *labels: str) -> None:
     PersistentGitHub(root / "github.db").seed(issue(7, *labels, updated_at="2026-09-14T00:00:00Z"))
+    control = SQLiteControlStore(str(root / "control.db"))
+    control.initialize()
+    install_workflow(control, resolve_snapshot(7))
 
 
 def fail_at(point: str):
@@ -116,8 +151,114 @@ def fail_at(point: str):
     return fault
 
 
+@pytest.mark.parametrize("failed_read", ["get_issue", "pr_for_issue"])
+def test_paid_return_recovers_each_failed_observation_without_rebuying(tmp_path, monkeypatch, failed_read):
+    seed(tmp_path, "ai-ready")
+    paid = False
+
+    def returned():
+        nonlocal paid
+        paid = True
+
+    provider = Provider(returned, AgentResult(False, status="blocked", needs="Which destination?", session_id="paid-session", cost_usd=.25))
+    first = compose(tmp_path, provider=provider)
+    original = getattr(first.remote, failed_read)
+
+    def unavailable(number):
+        if paid:
+            raise GhUnavailable("network", "post-run observation unavailable")
+        return original(number)
+
+    monkeypatch.setattr(first.remote, failed_read, unavailable)
+    first.daemon.tick()
+    assert len(provider.tasks) == 1
+    key = resolve_snapshot(7).binding.fence.key
+    held = first.workflow.load_workflow(key)
+    assert held.gates
+    assert held.episode.failures == 0
+    assert held.episode.continuation.session is None
+    assert not any(call[0] == "comment" for call in first.remote.calls)
+
+    restarted = compose(tmp_path)
+    monkeypatch.setattr(restarted.control, "_now", lambda: datetime.now(timezone.utc) + timedelta(minutes=2))
+    for _ in range(3):
+        restarted.daemon.tick()
+    assert restarted.provider.tasks == []
+    assert restarted.remote.get_issue(7).has(Label.AI_BLOCKED)
+    assert not restarted.remote.get_issue(7).has(Label.AI_WORKING)
+    assert len([call for call in restarted.remote.calls if call[0] == "comment"]) == 1
+    recovered = restarted.workflow.load_workflow(key)
+    assert recovered.episode.continuation.session.session_id == "paid-session"
+    assert recovered.episode.failures == 0
+    assert recovered.gates == ()
+    assert restarted.workflow.pending_returns() == ()
+    with sqlite3.connect(tmp_path / "control.db") as db:
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
+
+
+def test_corrupt_paid_return_holds_only_its_issue_while_restart_advances_a_healthy_peer(tmp_path, monkeypatch):
+    seed(tmp_path, "ai-ready")
+    paid = False
+
+    def returned():
+        nonlocal paid
+        paid = True
+
+    first = compose(tmp_path, provider=Provider(returned))
+    original = first.remote.get_issue
+
+    def unavailable(number):
+        if paid:
+            raise GhUnavailable("network", "post-run observation unavailable")
+        return original(number)
+
+    monkeypatch.setattr(first.remote, "get_issue", unavailable)
+    first.daemon.tick()
+    with first.control.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='workflow-return'")
+    first.remote.seed(issue(8, "ai-ready", updated_at="2026-09-14T00:00:00Z"))
+    install_workflow(first.control, resolve_snapshot(8))
+
+    restarted = compose(tmp_path)
+    monkeypatch.setattr(restarted.control, "_now", lambda: datetime.now(timezone.utc) + timedelta(minutes=2))
+    restarted.daemon.tick()
+
+    assert len(restarted.provider.tasks) == 1
+    assert [action.number for action in restarted.dispatched] == [8]
+    assert restarted.workflow.load_workflow(resolve_snapshot(7).binding.fence.key).gates
+    assert restarted.workflow.load_workflow(resolve_snapshot(8).binding.fence.key).episode.failures == 1
+    assert any("authority unavailable" in line for line in restarted.log)
+    with restarted.control._connect() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 2
+
+
+def test_process_loss_after_capture_retains_session_and_durable_followup(tmp_path):
+    seed(tmp_path, "ai-ready")
+    paid = False
+
+    def returned():
+        nonlocal paid
+        paid = True
+
+    def crash_after_return(point):
+        if paid and point == "read":
+            raise Crash("after capture, before observation")
+
+    first = compose(tmp_path, fault=crash_after_return, provider=Provider(
+        returned, AgentResult(False, status="blocked", needs="Which destination?", session_id="paid-session", cost_usd=.25),
+    ))
+    with pytest.raises(Crash):
+        first.daemon.tick()
+    restarted = compose(tmp_path)
+    assert restarted.workflow.pending_returns()[0].returned.session.session_id == "paid-session"
+    restarted.daemon.tick()
+    assert restarted.provider.tasks == []
+    assert restarted.remote.get_issue(7).has(Label.AI_BLOCKED)
+    assert restarted.workflow.pending_returns() == ()
+
+
 def _terminated_daemon(root: Path, boundary: str) -> None:
-    action = PostComment(Target.ISSUE, 7, "Survives process loss.")
+    action = PostComment(Target.ISSUE, 7, "Survives process loss.", workflow=resolve_snapshot(7).binding)
     client = compose(root, decide=lambda _: [action])
     if boundary == "after_begin":
         begin = client.control.begin_command
@@ -130,6 +271,68 @@ def _terminated_daemon(root: Path, boundary: str) -> None:
     else:
         client.control.record_effect = lambda _: os._exit(71)
     client.daemon.tick()
+
+
+def _terminated_after_paid_settlement(root: Path) -> None:
+    client = compose(root, provider=Provider(result=AgentResult(
+        False, status="blocked", needs="Which destination?", session_id="paid-session", cost_usd=.25,
+    )))
+    settle = AccountingRuntime._settle_result
+
+    def after_settlement(self, *args, **kwargs):
+        settle(self, *args, **kwargs)
+        os._exit(72)
+
+    context = accounting_runtime._FixPublicationContext(
+        str(root.resolve()), "fix/7-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
+    )
+    with patch.object(AccountingRuntime, "_settle_result", after_settlement), patch.object(
+        accounting_runtime, "_fix_publication_context", return_value=context,
+    ):
+        client.daemon.tick()
+
+
+def test_process_exit_after_settlement_cannot_leave_a_charge_without_return_evidence(tmp_path):
+    seed(tmp_path, "ai-ready")
+    process = multiprocessing.get_context("spawn").Process(target=_terminated_after_paid_settlement, args=(tmp_path,))
+    process.start()
+    try:
+        process.join(timeout=10)
+        assert process.exitcode == 72
+    finally:
+        if process.is_alive():
+            process.terminate()
+            process.join(timeout=5)
+    restarted = compose(tmp_path)
+    receipt = restarted.workflow.pending_returns()[0].returned
+    assert receipt.session.session_id == "paid-session"
+    with sqlite3.connect(tmp_path / "control.db") as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+    restarted.daemon.tick()
+    assert restarted.provider.tasks == []
+    assert restarted.remote.get_issue(7).has(Label.AI_BLOCKED)
+    assert restarted.workflow.pending_returns() == ()
+
+
+@pytest.mark.parametrize("value", ["😀" * 22000, None, {"unexpected": "object"}, "contains\x00nul"], ids=["large-unicode", "null", "object", "nul"])
+def test_paid_result_prose_is_bounded_before_atomic_receipt(tmp_path, value):
+    seed(tmp_path, "ai-ready")
+    client = compose(tmp_path, provider=Provider(result=AgentResult(
+        False, status="blocked", needs=value, summary=value, session_id="paid-session", cost_usd=.25,
+    )))
+    client.daemon.tick()
+    with sqlite3.connect(tmp_path / "control.db") as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+        payload = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return'").fetchone()[0]
+    from issue_agent.domain.resolve_return import ReturnedResolve
+    receipt = decode_workflow(payload, ReturnedResolve)
+    assert receipt.session.session_id == "paid-session"
+    assert len(receipt.needs) <= 4000
+    assert "\x00" not in receipt.needs
+    if isinstance(value, dict):
+        assert receipt.is_error
+    elif isinstance(value, str) and len(value) > 4000:
+        assert "[truncated]" in receipt.needs
 
 
 @pytest.mark.parametrize("boundary", ["after_begin", "before_receipt"])
@@ -160,7 +363,7 @@ def test_process_death_restarts_from_committed_command_without_duplicate(tmp_pat
 @pytest.mark.parametrize("point", ["comment_applied", "receipt_commit"])
 def test_remote_success_before_receipt_reconciles_once_after_restart(tmp_path, monkeypatch, point):
     seed(tmp_path, "needs-human-review")
-    action = PostComment(Target.ISSUE, 7, "Waiting for operator approval.")
+    action = PostComment(Target.ISSUE, 7, "Waiting for operator approval.", workflow=resolve_snapshot(7).binding)
     first = compose(tmp_path, fault=fail_at(point), decide=lambda _: [action])
     if point == "receipt_commit":
         monkeypatch.setattr(first.control, "record_effect", lambda _: (_ for _ in ()).throw(Crash(point)))
@@ -183,7 +386,7 @@ def test_remote_success_before_receipt_reconciles_once_after_restart(tmp_path, m
 @pytest.mark.parametrize("boundary", ["INSERT", "UPDATE"])
 def test_local_commit_failure_cannot_apply_remote_mutation(tmp_path, boundary):
     seed(tmp_path, "needs-human-review")
-    action = PostComment(Target.ISSUE, 7, "Durable intent first.")
+    action = PostComment(Target.ISSUE, 7, "Durable intent first.", workflow=resolve_snapshot(7).binding)
     first = compose(tmp_path, decide=lambda _: [action])
     with sqlite3.connect(first.control.path) as db:
         db.execute(f"CREATE TRIGGER injected_failure AFTER {boundary} ON lifecycle_commands BEGIN SELECT RAISE(ABORT, 'injected transaction failure'); END")
@@ -206,7 +409,7 @@ def test_local_commit_failure_cannot_apply_remote_mutation(tmp_path, boundary):
 
 def test_unknown_remote_result_remains_visible_and_does_not_repeat_write(tmp_path):
     seed(tmp_path, "needs-human-review")
-    action = PostComment(Target.ISSUE, 7, "Operator evidence.")
+    action = PostComment(Target.ISSUE, 7, "Operator evidence.", workflow=resolve_snapshot(7).binding)
     first = compose(tmp_path, fault=fail_at("comment_applied"), decide=lambda _: [action])
     with pytest.raises(Crash):
         first.daemon.tick()
@@ -234,7 +437,7 @@ def test_unknown_remote_result_remains_visible_and_does_not_repeat_write(tmp_pat
 
 def test_partial_relabel_preserves_hold_and_never_pays_after_restart(tmp_path):
     seed(tmp_path, "ai-ready")
-    hold = Relabel(Target.ISSUE, 7, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW)
+    hold = Relabel(Target.ISSUE, 7, Label.AI_READY, Label.NEEDS_HUMAN_REVIEW, workflow=resolve_snapshot(7).binding)
     first = compose(tmp_path, fault=fail_at("label_added"), decide=lambda _: [hold])
     with pytest.raises(Crash):
         first.daemon.tick()
@@ -265,7 +468,7 @@ def test_hold_added_during_resolve_completion_survives_restart(tmp_path):
 def test_concurrent_rearm_deliveries_do_not_erase_a_newer_hold(tmp_path):
     seed(tmp_path, "needs-human-review")
     revision = PersistentGitHub(tmp_path / "github.db").get_issue(7).updated_at
-    rearm = Relabel(Target.ISSUE, 7, Label.NEEDS_HUMAN_REVIEW, Label.AI_READY, expected_revision=revision)
+    rearm = Relabel(Target.ISSUE, 7, Label.NEEDS_HUMAN_REVIEW, Label.AI_READY, expected_revision=revision, workflow=resolve_snapshot(7).binding)
     barrier = Barrier(2)
 
     def deliver():
@@ -289,11 +492,10 @@ def test_concurrent_rearm_deliveries_do_not_erase_a_newer_hold(tmp_path):
     assert restarted.provider.tasks == []
 
 
-def test_paid_attempt_settlement_is_conserved_when_completion_receipt_is_lost(tmp_path, monkeypatch):
+def test_paid_attempt_settlement_is_conserved_when_completion_receipt_is_lost(tmp_path):
     seed(tmp_path, "ai-ready")
     # The external worktree capability is controlled; the accounting wrapper,
     # reserve/settle transaction and workflow are the production composition.
-    monkeypatch.setattr(accounting_runtime, "_fix_publication_context", lambda role, cwd: accounting_runtime._FixPublicationContext(str(tmp_path), "fix/7-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin"))
     provider = Provider(result=AgentResult(is_error=False, status="blocked", needs="Which API version?", cost_usd=0.25, session_id="provider-receipt"))
     completed_labels = 0
 
@@ -304,20 +506,34 @@ def test_paid_attempt_settlement_is_conserved_when_completion_receipt_is_lost(tm
             if completed_labels == 2:
                 raise Crash("completion applied before receipt")
 
-    first = compose(tmp_path, provider=provider, accounted=True, fault=crash_after_completion)
+    first = compose(tmp_path, provider=provider, fault=crash_after_completion)
     with pytest.raises(Crash):
         first.daemon.tick()
     assert len(provider.tasks) == 1
     run_id = provider.tasks[0].env["ISSUE_AGENT_RUN_ID"]
     assert run_id
+    with first.control._connect() as db:
+        admission = decode_workflow(db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' "
+            "AND scope='o/r' AND key=?", (run_id,),
+        ).fetchone()[0], ResolveAdmission)
+        run_binding = decode_workflow(db.execute(
+            "SELECT workflow_binding_json FROM runs WHERE run_id=?", (run_id,),
+        ).fetchone()[0], WorkflowBinding)
+    assert len(first.dispatched) == 1
+    assert first.dispatched[0].kind is AgentKind.RESOLVE
+    assert admission.attempt.binding == run_binding == first.dispatched[0].workflow
+    assert run_binding == resolve_snapshot(7).binding
     scope = daily_budget_scope("o/r", "repository", "USD", datetime.now(timezone.utc), ZoneInfo("UTC"))
     before = first.control.snapshot(scope)
     assert before.settled == Money("USD", 250_000)
     assert before.reserved == Money.zero("USD")
     assert first.control.active_reservation_runs() == ()
 
-    command_id = first.control.pending_commands()[0].command.command_id
-    restarted = compose(tmp_path, accounted=True)
+    pending = first.control.pending_commands()[0].command
+    assert pending.workflow == run_binding
+    command_id = pending.command_id
+    restarted = compose(tmp_path)
     for _ in range(4):
         restarted.daemon.tick()
     assert restarted.provider.tasks == []
@@ -326,7 +542,9 @@ def test_paid_attempt_settlement_is_conserved_when_completion_receipt_is_lost(tm
     assert restarted.control.effect_receipt(command_id).status is EffectStatus.SUCCEEDED
     assert restarted.remote.get_issue(7).labels == frozenset({Label.AI_BLOCKED})
     assert len([call for call in restarted.remote.calls if call[0] == "comment"]) == 1
-    assert len([call for call in restarted.remote.calls if call[0] == "relabel"]) == 2
+    transitions = [call for call in restarted.remote.calls if call[0] == "relabel"]
+    assert len([call for call in transitions if call[3] == "ai-blocked"]) == 1
+    assert len([call for call in transitions if call[2] == "ai-working"]) == 1
     with sqlite3.connect(restarted.control.path) as db:
         assert db.execute(
             "SELECT runs.run_id, runs.state, charges.run_id, "
@@ -355,6 +573,7 @@ def test_guarded_partial_relabel_recovery_preserves_completion_authority(tmp_pat
         Target.ISSUE, 7, Label.AI_WORKING, Label.AI_READY,
         expected_revision=observed.updated_at,
         completion_guard=completion_guard(observed, LifecycleOperation.COMPLETE_RESOLVE),
+        workflow=resolve_snapshot(7).binding,
     )
     first = compose(tmp_path, fault=fail_at("label_added"), decide=lambda _: [action])
     with pytest.raises(Crash):
@@ -454,9 +673,8 @@ def test_triage_promotion_finishes_advisory_recurrence_after_own_transition(tmp_
     assert restarted.remote.get_issue(7) == after
 
 
-def test_changed_issue_body_cannot_apply_obsolete_blocked_answer_or_reset_allowance(tmp_path, monkeypatch):
+def test_changed_issue_body_cannot_apply_obsolete_blocked_answer_or_reset_allowance(tmp_path):
     seed(tmp_path, "ai-ready")
-    monkeypatch.setattr(accounting_runtime, "_fix_publication_context", lambda role, cwd: accounting_runtime._FixPublicationContext(str(tmp_path), "fix/7-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin"))
     human = PersistentGitHub(tmp_path / "github.db")
     human.edit_issue_body(7, "Which API version should be used?")
     changes = 0
@@ -470,25 +688,28 @@ def test_changed_issue_body_cannot_apply_obsolete_blocked_answer_or_reset_allowa
         answer_during_run,
         AgentResult(is_error=False, status="blocked", needs="Which API version?", cost_usd=0.25, session_id="obsolete-verdict"),
     )
-    client = compose(tmp_path, provider=provider, accounted=True)
+    client = compose(tmp_path, provider=provider)
     client.daemon.tick()
     current = human.get_issue(7)
     assert len(provider.tasks) == 1
     assert not current.has(Label.AI_BLOCKED)
     assert not any("Which API version?" in comment.body for comment in current.comments)
     assert current.has(Label.AI_READY) or current.has(Label.AI_WORKING)
-    allowance_used = Store(state_dir=str(tmp_path / "fix")).get_resolve_retries(7)
-    assert allowance_used >= 1
-    restarted = compose(tmp_path, accounted=True, decide=lambda _: [])
+    key = resolve_snapshot(7).revision.fence.key
+    allowance_used = client.workflow.load_workflow(key).episode.failures
+    assert allowance_used == 1
+    restarted = compose(tmp_path, decide=lambda _: [])
     restarted.daemon.tick()
-    assert Store(state_dir=str(tmp_path / "fix")).get_resolve_retries(7) == allowance_used
+    assert restarted.workflow.load_workflow(key).episode.failures == allowance_used
     scope = daily_budget_scope("o/r", "repository", "USD", datetime.now(timezone.utc), ZoneInfo("UTC"))
     assert restarted.control.snapshot(scope).settled == Money("USD", 250_000)
     assert restarted.control.snapshot(scope).reserved == Money.zero("USD")
-    resumed = compose(tmp_path, provider=provider, accounted=True)
+    resumed = compose(tmp_path, provider=provider)
     for _ in range(6):
         resumed.daemon.tick()
     assert len(provider.tasks) == FixConfig(fix_bot="fix-bot").max_resolve_retries
+    assert resumed.workflow.load_workflow(key).episode.failures == len(provider.tasks)
+    assert resumed.workflow.held_projection(key).held
     assert human.get_issue(7).has(Label.NEEDS_HUMAN_REVIEW)
     assert not human.get_issue(7).has(Label.AI_BLOCKED)
     assert resumed.control.snapshot(scope).settled == Money("USD", 250_000 * len(provider.tasks))

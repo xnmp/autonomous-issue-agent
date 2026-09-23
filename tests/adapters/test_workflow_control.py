@@ -41,6 +41,8 @@ from issue_agent.domain.workflow_policy import (
     resolve_rearm_projection, supersede_resolve_rearm,
 )
 from issue_agent.domain.world import IssueView
+from issue_agent.domain.resolve_return import PendingResolveReturn, ResolveCleanupCompleted, ResolveInputs, ReturnedResolve, UnavailableResolveReturn
+from issue_agent.domain.workflow_policy import return_gate_id
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot as initial_snapshot
 
 NOW = datetime(2026, 9, 14, 12, tzinfo=timezone.utc)
@@ -108,7 +110,7 @@ def evidence(control, state, name="observation:1", payload=None):
 def run(control, state, *, name="run:1", status="completed", leg="leg:1", stage=ResolveStage.RESOLVE, session_id=None, runtime="codex", model="<runtime-default>"):
     """An isolated completed admission, including its immutable ordering receipt."""
     result = ResolveAttemptResult(WorkflowAttemptIdentity(state.binding, RunId(name), leg), ResolveResultKind.COUNTED_REQUEUE, "failed experiment", stage)
-    control.start_run(RunId(name), json.dumps({"repository": "o/r", "issue": state.revision.fence.key.target.number, "number": state.revision.fence.key.target.number, "leg_id": leg, "kind": stage.value, "runtime": runtime}), stage.value, WRITER.owner_id, "config", state=status)
+    control.start_run(RunId(name), json.dumps({"repository": "o/r", "issue": state.revision.fence.key.target.number, "number": state.revision.fence.key.target.number, "leg_id": leg, "kind": stage.value, "runtime": runtime, "input_fingerprint": "a" * 64}), stage.value, WRITER.owner_id, "config", state=status)
     with control.transaction() as db:
         db.execute("UPDATE runs SET workflow_binding_json=? WHERE run_id=?", (encode_workflow(state.binding), name))
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission', ?, ?, ?, ?)",
@@ -131,7 +133,7 @@ def run(control, state, *, name="run:1", status="completed", leg="leg:1", stage=
 def admission(state, attempt_result):
     """Captured post-admission fixture; production reads the immutable SQL receipt."""
     return ResolveAdmission(attempt_result.attempt, WorkflowRevision(attempt_result.attempt.binding.fence, state.revision.version), attempt_result.stage,
-                            3 if attempt_result.stage is ResolveStage.ADJUDICATE else None)
+                            3 if attempt_result.stage is ResolveStage.ADJUDICATE else None, input_fingerprint="a" * 64)
 
 
 def command_row(control, command_id):
@@ -139,7 +141,7 @@ def command_row(control, command_id):
         return db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
 
 
-def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runtime-default>", session_id=None, launch=True):
+def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runtime-default>", session_id=None, launch=True, settle=True):
     """Use real admission and settlement for continuation integration cases."""
     attempt = WorkflowAttemptIdentity(state.binding, RunId(name), f"leg:{name}")
     session_id = f"session:{name}" if session_id is None else session_id
@@ -147,7 +149,7 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
     request = ReservationRequest(
         ReservationId(f"reservation:{name}"), attempt.run_id,
         json.dumps({"repository": "o/r", "role": "fix", "kind": stage.value, "leg_id": attempt.leg_id,
-                    "runtime": "codex", "issue": state.revision.fence.key.target.number}),
+                    "runtime": "codex", "input_fingerprint": "a" * 64, "issue": state.revision.fence.key.target.number}),
         BudgetScope(money_scope, "daily", "USD", "2026-09-14", NOW, NOW + timedelta(days=1), ZoneInfo("UTC")),
         PriceQuote(model, "card", "1", NOW, Money("USD", 1)), Money("USD", 100), "config", "o/r",
         kind=stage.value, owner_id=WRITER.owner_id, workflow=state.binding,
@@ -158,11 +160,389 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
         released = control.release_unlaunched(attempt.run_id, "spawn never started")
         assert released.disposition is AccountingDisposition.AVAILABLE
         return ResolveAttemptResult(attempt, ResolveResultKind.STAGE_PROGRESSED, stage=stage)
-    settled = control.settle(SettlementRequest(attempt.run_id, Money("USD", 1), PricingBasis.PROVIDER_REPORTED,
-                                               f"codex:{session_id or 'no-session'}:{name}", None, None, None))
-    assert settled.disposition is AccountingDisposition.AVAILABLE
+    if settle:
+        settled = control.settle(SettlementRequest(attempt.run_id, Money("USD", 1), PricingBasis.PROVIDER_REPORTED,
+                                                   f"codex:{session_id or 'no-session'}:{name}", None, None, None))
+        assert settled.disposition is AccountingDisposition.AVAILABLE
     return ResolveAttemptResult(attempt, ResolveResultKind.STAGE_PROGRESSED, stage=stage,
                                 session=None if stage is ResolveStage.ROUTE else session)
+
+
+def paid_return(control, before, *, name="paid-return", stage=ResolveStage.RESOLVE, status="pushed"):
+    paid = paid_result(control, before, name, stage)
+    return ReturnedResolve(paid.attempt, stage, ResolveInputs("title", "body", "alice"), False,
+                           status, "paid summary", "which API?", "", None, paid.session, NOW)
+
+
+def unsettled_return(control, before):
+    paid = paid_result(control, before, "atomic-return", ResolveStage.RESOLVE, settle=False)
+    returned = ReturnedResolve(paid.attempt, paid.stage, ResolveInputs("title", "body", "alice"), False,
+                               "pushed", "paid summary", "", "", None, paid.session, NOW)
+    assert paid.session is not None
+    request = SettlementRequest(paid.attempt.run_id, Money("USD", 1), PricingBasis.PROVIDER_REPORTED,
+                                f"codex:{paid.session.session_id}:{paid.attempt.run_id}", None, None, None)
+    return returned, request
+
+
+def test_settlement_and_paid_return_gate_commit_and_replay_as_one_authority(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned, request = unsettled_return(control, before)
+    workflow = adapter(control)
+    assert workflow.returned_result(returned.attempt) is None
+    settled = workflow.settle_return(request, returned)
+    assert settled.disposition is AccountingDisposition.AVAILABLE and not settled.idempotent
+    restarted = adapter(SQLiteControlStore(control.path, now=lambda: NOW))
+    assert restarted.returned_result(returned.attempt) == returned
+    assert restarted.pending_returns()[0].returned == returned
+    assert restarted.settle_return(request, returned).idempotent
+    state = restarted.load_workflow(before.revision.fence.key)
+    assert state.episode.continuation.session is None and len(state.gates) == 1
+    with control.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
+        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "settled"
+
+
+@pytest.mark.parametrize("table,condition", [("dedupe_keys", "NEW.namespace='workflow-return'"), ("workflow_gates", "1")])
+def test_capture_failure_rolls_back_charge_reservation_receipt_and_gate(control, table, condition):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned, request = unsettled_return(control, before)
+    with control.transaction() as db:
+        db.execute(f"CREATE TRIGGER reject_capture BEFORE INSERT ON {table} WHEN {condition} BEGIN SELECT RAISE(ABORT,'capture failed'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="capture failed"):
+        adapter(control).settle_return(request, returned)
+    with control.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
+        assert db.execute("SELECT state FROM runs").fetchone()[0] != "completed"
+        assert db.execute("SELECT COUNT(*) FROM workflow_gates").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='workflow-return'").fetchone()[0] == 0
+        db.execute("DROP TRIGGER reject_capture")
+    assert adapter(control).settle_return(request, returned).disposition is AccountingDisposition.AVAILABLE
+
+
+def test_atomic_return_rejects_conflicting_content_and_foreign_lookup_leg(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned, request = unsettled_return(control, before)
+    workflow = adapter(control)
+    workflow.settle_return(request, returned)
+    with pytest.raises(WorkflowAuthorityError, match="different evidence"):
+        workflow.settle_return(request, replace(returned, summary="contradictory"))
+    assert workflow.returned_result(returned.attempt) == returned
+    with pytest.raises(WorkflowAuthorityError, match="disagrees"):
+        workflow.returned_result(replace(returned.attempt, leg_id="other-leg"))
+
+
+def test_settlement_conflict_cannot_capture_a_paid_return(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned, request = unsettled_return(control, before)
+    result = adapter(control).settle_return(replace(request, amount=Money("AUD", 1)), returned)
+    assert result.disposition is AccountingDisposition.CONFLICT
+    assert adapter(control).returned_result(returned.attempt) is None
+    assert not adapter(control).load_workflow(before.revision.fence.key).gates
+
+
+@pytest.mark.parametrize("basis", [PricingBasis.RECONCILED, PricingBasis.PROVIDER_REPORTED])
+def test_reconciled_charge_cannot_mint_normal_returned_continuation(control, basis):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned, request = unsettled_return(control, before)
+    control.settle(replace(request, basis=PricingBasis.RECONCILED))
+    with pytest.raises(WorkflowAuthorityError, match="settlement"):
+        adapter(control).settle_return(replace(request, basis=basis), returned)
+    assert adapter(control).returned_result(returned.attempt) is None
+    assert not adapter(control).load_workflow(before.revision.fence.key).gates
+
+
+def return_observations(returned, **changes):
+    fields = dict(number=returned.attempt.binding.fence.key.target.number, title="title", body="body", author="alice",
+                  labels=frozenset({Label.AI_WORKING}), updated_at="revision:1")
+    fields.update(changes)
+    return (ObservedIssue(returned.attempt.binding.fence.key, IssueView(**fields), NOW),
+            NoLinkedPr(returned.attempt.binding.fence.key, NOW))
+
+
+def test_paid_return_capture_survives_restart_without_publishing_pending_session(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    captured = adapter(control).capture_return(returned)
+    assert captured.snapshot.episode.continuation.session is None
+    assert captured.snapshot.episode.failures == 0
+    assert any(g.gate_id == return_gate_id(returned) for g in captured.snapshot.gates)
+    restarted = adapter(SQLiteControlStore(control.path, now=lambda: NOW))
+    assert restarted.pending_returns()[0].returned == returned
+    assert restarted.capture_return(returned).idempotent
+    assert isinstance(restarted.capture_return(replace(returned, needs="different")), WorkflowConflict)
+    finalized = restarted.finalize_return(returned, *return_observations(returned))
+    assert finalized.snapshot.episode.failures == 1
+    assert finalized.snapshot.episode.continuation.session == returned.session
+    assert finalized.snapshot.gates == ()
+    assert restarted.pending_returns() == ()
+    assert restarted.finalize_return(returned, *return_observations(returned)).idempotent
+    assert len(control.pending_commands(repository="o/r", executor_identity=WRITER.owner_id)) == 1
+
+
+def test_finalized_blocked_resume_clears_handle_after_raw_capture(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before, stage=ResolveStage.RESUME, status="blocked")
+    adapter(control).capture_return(returned)
+    finalized = adapter(control).finalize_return(returned, *return_observations(returned))
+    assert finalized.snapshot.episode.continuation.session is None
+    assert finalized.snapshot.episode.continuation.last_applied_admission_version == 1
+    assert finalized.snapshot.episode.failures == 0
+    commands = control.pending_commands(repository="o/r", executor_identity=WRITER.owner_id)
+    assert len(commands) == 1
+    assert commands[0].command.payload["comment"].startswith("**Agent still needs input:**")
+
+
+def test_return_outbox_failure_rolls_back_classification_gate_and_continuation(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    captured = adapter(control).capture_return(returned)
+    with control.transaction() as db:
+        db.execute("CREATE TRIGGER fail_return_command BEFORE INSERT ON lifecycle_commands BEGIN SELECT RAISE(ABORT,'outbox failed'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="outbox failed"):
+        adapter(control).finalize_return(returned, *return_observations(returned))
+    assert adapter(control).load_workflow(before.revision.fence.key) == captured.snapshot
+    assert adapter(control).pending_returns()[0].returned == returned
+    with control.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='workflow-result'").fetchone()[0] == 0
+        db.execute("DROP TRIGGER fail_return_command")
+    assert adapter(control).finalize_return(returned, *return_observations(returned)).snapshot.episode.failures == 1
+
+
+def test_stale_return_is_retired_by_bounded_scan_without_remote_observation(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    adapter(control).capture_return(returned)
+    with control.transaction() as db:
+        db.execute("UPDATE workflows SET generation=generation+1,version=version+1")
+    assert adapter(control).pending_returns() == ()
+    after = adapter(control).load_workflow(before.revision.fence.key)
+    assert after.episode.failures == 0 and after.episode.continuation.session is None
+    assert after.gates == ()
+    assert control.pending_commands(repository="o/r", executor_identity=WRITER.owner_id) == ()
+
+
+def test_return_backoff_survives_restart_and_retains_original_unresolved_time(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    adapter(control).capture_return(returned)
+    adapter(control).defer_return(returned, "linkage lookup unavailable")
+    assert adapter(control).pending_returns() == ()
+    later = adapter(SQLiteControlStore(control.path, now=lambda: NOW + timedelta(seconds=5)))
+    pending = later.pending_returns()[0]
+    assert pending.failed_reads == 1 and pending.returned == returned
+    cause = later.load_workflow(before.revision.fence.key).gates[0].cause
+    assert cause.unresolved_since == NOW and cause.failed_reads == 1
+
+
+@pytest.mark.parametrize("other_gate", [False, True])
+def test_return_finalization_retains_unrelated_or_new_ceiling_hold_without_ready_command(control, other_gate):
+    before = initial_snapshot()
+    if not other_gate:
+        before = replace(before, episode=replace(before.episode, failures=2))
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    adapter(control).capture_return(returned)
+    if other_gate:
+        gate = OpenGate("other-hold", before.revision.fence.generation,
+                        EvidenceUnavailable("independent fact", NOW, 1, "unavailable"), NoAuthorizedRemediation("observe"))
+        with control.transaction() as db:
+            db.execute("INSERT INTO workflow_gates VALUES (?,?,?,?,?,?,?,?)",
+                       (gate.gate_id, *workflow_scope(before.revision.fence.key), gate.opened_generation, "other", "open", encode_workflow(gate)))
+    finalized = adapter(control).finalize_return(returned, *return_observations(returned))
+    if other_gate:
+        assert isinstance(finalized, WorkflowCommitted)
+        assert adapter(control).pending_returns() == ()
+        assert len(finalized.snapshot.gates) == 1 and finalized.snapshot.episode.failures == 1
+        commands = control.pending_commands(repository="o/r", executor_identity=WRITER.owner_id)
+        assert len(commands) == 1
+        command = commands[0].command
+        with pytest.raises(WorkflowAuthorityError, match="unresolved gates"):
+            control.begin_command(command.command_id)
+        assert command_row(control, command.command_id)["attempts"] == 0
+        assert adapter(control).finalize_return(returned, *return_observations(returned)).idempotent
+        assert adapter(control).load_workflow(before.revision.fence.key).episode.failures == 1
+        with control.transaction() as db:
+            db.execute("UPDATE workflow_gates SET state='closed' WHERE gate_id='other-hold'")
+            db.execute("UPDATE workflows SET version=version+1")
+        control.begin_command(command.command_id)
+        assert command_row(control, command.command_id)["state"] == "executing"
+        assert command_row(control, command.command_id)["attempts"] == 1
+        return
+    assert len(finalized.snapshot.gates) == 1
+    assert finalized.snapshot.gates[0].gate_id != return_gate_id(returned)
+    assert not control.pending_commands(repository="o/r", executor_identity=WRITER.owner_id)
+
+
+def test_closed_return_keeps_local_cleanup_explicitly_pending(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before, status="done")
+    captured = adapter(control).capture_return(returned)
+    refused = adapter(control).finalize_return(returned, *return_observations(returned, state="closed"))
+    assert isinstance(refused, WorkflowConflict) and "local cleanup" in refused.reason
+    assert adapter(control).load_workflow(before.revision.fence.key) == captured.snapshot
+    assert adapter(control).pending_returns()[0].returned == returned
+
+
+def test_closed_return_finishes_only_after_matching_idempotent_cleanup_acknowledgement(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    authored = paid_result(control, before, "earned-author", ResolveStage.AUTHOR)
+    before = adapter(control).record_attempt(authored).snapshot
+    assert isinstance(before.episode.continuation, AuthoredResolve)
+    returned = paid_return(control, before, status="done")
+    workflow = adapter(control)
+    workflow.capture_return(returned)
+    issue, linkage = return_observations(returned, state="closed")
+    with workflow.return_effect_authority(returned):
+        # A second transaction is possible during local I/O; the shared effect
+        # barrier, not a held SQLite write transaction, fences re-arm acceptance.
+        with control.transaction() as db:
+            assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+        wrong = ResolveCleanupCompleted(returned.attempt, replace(issue, issue=replace(issue.issue, title="changed")), linkage)
+        assert isinstance(workflow.finalize_return(returned, issue, linkage, cleanup=wrong), WorkflowConflict)
+        acknowledged = ResolveCleanupCompleted(returned.attempt, issue, linkage)
+        finalized = workflow.finalize_return(returned, issue, linkage, cleanup=acknowledged)
+    assert finalized.snapshot.episode.failures == 0 and finalized.snapshot.gates == ()
+    assert isinstance(finalized.snapshot.episode.continuation, FreshResolve)
+    assert finalized.snapshot.episode.continuation.session is None
+    assert finalized.snapshot.episode.continuation.last_applied_admission_version > before.episode.continuation.last_applied_admission_version
+    reopened = workflow.ensure_observed_workflow(replace(issue, issue=replace(issue.issue, state="open", state_reason="reopened")))
+    assert reopened.snapshot.episode.continuation == finalized.snapshot.episode.continuation
+    assert workflow.pending_returns() == ()
+    assert not control.pending_commands(repository="o/r", executor_identity=WRITER.owner_id)
+
+
+def test_stale_generation_cannot_enter_return_local_effect_authority(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before, status="done")
+    workflow = adapter(control)
+    workflow.capture_return(returned)
+    with control.transaction() as db:
+        db.execute("UPDATE workflows SET generation=generation+1,version=version+1")
+    with pytest.raises(WorkflowAuthorityError, match="current unfinished"):
+        with workflow.return_effect_authority(returned):
+            pytest.fail("stale return must not execute cleanup")
+
+
+@pytest.mark.parametrize("replay", ["capture", "finalize"])
+def test_corrupt_return_disposition_does_not_silently_hide_pending_recovery(control, replay):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    workflow = adapter(control)
+    workflow.capture_return(returned)
+    workflow.finalize_return(returned, *return_observations(returned))
+    with control.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='workflow-return-disposition'")
+    with pytest.raises(ValueError):
+        if replay == "capture":
+            workflow.capture_return(returned)
+        else:
+            workflow.finalize_return(returned, *return_observations(returned))
+
+
+@pytest.mark.parametrize("damaged", ["workflow-return", "workflow-return-observation", "missing-observation", "workflow-admission"])
+def test_unavailable_return_is_isolated_and_cannot_starve_a_bounded_scan(control, damaged):
+    workflow = adapter(control)
+    returns = []
+    for number in (1, 2):
+        before = initial_snapshot(number)
+        install_workflow(control, before)
+        returned = paid_return(control, before, name=f"return:{number}")
+        workflow.capture_return(returned)
+        returns.append(returned)
+    broken, healthy = returns
+    with control.transaction() as db:
+        if damaged == "missing-observation":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-return-observation' AND key=?", (str(broken.attempt.run_id),))
+        else:
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace=? AND key=?", (damaged, str(broken.attempt.run_id)))
+    unavailable = workflow.pending_returns(limit=1)
+    assert len(unavailable) == 1
+    assert isinstance(unavailable[0], UnavailableResolveReturn)
+    assert unavailable[0].record_key == broken.attempt.run_id
+    assert unavailable[0].next_read_at == NOW + timedelta(hours=1)
+    restarted = adapter(SQLiteControlStore(control.path, now=lambda: NOW))
+    available = restarted.pending_returns(limit=1)
+    assert len(available) == 1 and isinstance(available[0], PendingResolveReturn)
+    assert available[0].returned == healthy
+    restarted.finalize_return(healthy, *return_observations(healthy))
+    assert restarted.pending_returns() == ()
+    held = restarted.load_workflow(broken.attempt.binding.fence.key)
+    assert isinstance(held, WorkflowSnapshot) and held.gates
+    assert held.episode.failures == 0 and held.episode.continuation.session is None
+    later = adapter(SQLiteControlStore(control.path, now=lambda: NOW + timedelta(hours=1)))
+    assert isinstance(later.pending_returns()[0], UnavailableResolveReturn)
+    with control._connect() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 2
+        if damaged != "missing-observation":
+            assert db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace=? AND key=?", (damaged, str(broken.attempt.run_id))).fetchone()[0] == "{}"
+
+
+@pytest.mark.parametrize("index", ["", "x" * 513, "broken\x00key", "\t"])
+def test_malformed_orphan_return_index_cannot_break_isolated_diagnostics(control, index):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    workflow = adapter(control)
+    workflow.capture_return(returned)
+    with control.transaction() as db:
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-return', 'o/r', ?, ?, '{}')", (index, (NOW - timedelta(minutes=1)).isoformat()))
+    unavailable = workflow.pending_returns(limit=1)
+    assert len(unavailable) == 1 and isinstance(unavailable[0], UnavailableResolveReturn)
+    assert unavailable[0].record_key.startswith("invalid-index:")
+    assert "Invalid paid return index" in unavailable[0].reason
+    restarted = adapter(SQLiteControlStore(control.path, now=lambda: NOW))
+    pending = restarted.pending_returns(limit=1)
+    assert len(pending) == 1 and isinstance(pending[0], PendingResolveReturn)
+    assert pending[0].returned == returned
+
+
+def test_unsettled_return_cannot_publish_session_or_clear_paid_admission_hold(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    with control.transaction() as db:
+        db.execute("UPDATE budget_reservations SET state='active'")
+    with pytest.raises(WorkflowAuthorityError, match="settlement"):
+        adapter(control).capture_return(returned)
+    assert adapter(control).pending_returns() == ()
+    assert adapter(control).load_workflow(before.revision.fence.key).episode.continuation.session is None
+
+
+def test_captured_return_cannot_bypass_observation_by_direct_final_result_write(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned = paid_return(control, before)
+    captured = adapter(control).capture_return(returned)
+    result = ResolveAttemptResult(returned.attempt, ResolveResultKind.COUNTED_REQUEUE, stage=returned.stage, session=returned.session)
+    assert isinstance(adapter(control).record_attempt(result), WorkflowConflict)
+    assert adapter(control).load_workflow(before.revision.fence.key) == captured.snapshot
+    assert adapter(control).pending_returns()[0].returned == returned
+
+
+def test_unlaunched_reservation_cannot_mint_returned_progress(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    unlaunched = paid_result(control, before, "never-started", ResolveStage.RESOLVE, launch=False)
+    returned = ReturnedResolve(unlaunched.attempt, ResolveStage.RESOLVE, ResolveInputs("title", "body", "alice"),
+                               False, "pushed", "", "", "", None, None, NOW)
+    with pytest.raises(WorkflowAuthorityError, match="settlement"):
+        adapter(control).capture_return(returned)
+    assert adapter(control).pending_returns() == ()
 
 
 @pytest.mark.parametrize("money_scope", ["o/r", "*"])
@@ -269,7 +649,7 @@ def test_result_proposal_uses_durable_admission_not_a_forged_newer_order(control
     result = paid_result(control, before, "old", ResolveStage.AUTHOR)
     latest_result = paid_result(control, adapter(control).load_workflow(before.revision.fence.key), "new", ResolveStage.RESOLVE)
     latest = adapter(control).record_attempt(latest_result).snapshot
-    forged_proof = ResolveAdmission(result.attempt, latest.revision, result.stage)
+    forged_proof = ResolveAdmission(result.attempt, latest.revision, result.stage, input_fingerprint="a" * 64)
     forged = record_resolve_attempt(latest, result, ceiling=3, admission=forged_proof)
     assert isinstance(forged, WorkflowChanged)
     with pytest.raises(ValueError, match="authorized state transition|pure transition"):
