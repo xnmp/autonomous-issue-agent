@@ -20,6 +20,7 @@ from ..domain.outcome import ExitReason
 from ..domain.outcome import Adjudication
 from ..domain.effort import Effort
 from ..domain import resolve_split as split
+from ..domain import resolve_workspace as workspace
 from ..domain.resolve_return import ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted
 
 MAX_WORKFLOW_PAYLOAD_BYTES = 262144
@@ -27,6 +28,9 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
+    workspace.PriorResolveAdmission, workspace.EpisodeWorkspaceHandoff,
+    workspace.PrepareResolveWorkspace, workspace.EpisodeWorkspacePrepared,
     split.ContractRevision, split.ContractBaseline, split.UnavailableContractRevision,
     split.SplitSelection, split.SplitReply, split.AdjudicationStep, split.SplitContext,
     split.SplitImplement, split.NeedsAdjudication, split.ContractResetIntent,

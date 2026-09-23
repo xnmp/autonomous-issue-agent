@@ -88,6 +88,30 @@ the same episode and continuation. This prevents new guidance from being bypasse
 by an unrelated old `authored` marker. Worktree content is retained under existing
 identity checks, never deleted as an unrecorded re-arm side effect.
 
+A genuinely new resolve allowance also requires an explicit workspace handoff.
+The harness observes the configured upstream branch, pins the exact fetched
+commit and records the prior admitted work (or verified absence), old binding,
+new binding and issue branch. This is not a successful AUTHOR baseline.
+Preparation archives the old committed, tracked, untracked and ignored content
+through the existing preserving reset before installing that pinned base.
+Failure to fetch or verify the configured upstream cannot fall back to local
+HEAD, a stale remote-tracking ref or a convenient local branch. Once the grant
+is accepted, upstream movement cannot replace its selected commit.
+
+The handoff belongs to the original granting request and destination episode.
+Cancellation retains it, and continuation reuses the same obligation, pin,
+archive and acknowledgement under the current execution fence; it never grants
+another allowance or repeats acknowledged preparation. Keep the latest-work
+admission pointer: only an exact acknowledged handoff naming that predecessor
+may bridge an older episode. These typed values are obligations and evidence,
+not permission to perform Git I/O. Acceptance and preparation must separately
+prove owner/generation authority, fresh issue/no-PR facts and quiescence under
+the existing exclusive deployment barriers. Terminal run state alone does not
+prove settled accounting, finalized returns or resolved publication effects.
+Keep the selected gate held until workspace preparation and remote projection
+are both verified. Wire these checks before activating operator re-arm; the
+standalone workspace primitives do not establish vertical-slice acceptance.
+
 Paid admission allocates a workflow revision and records its ordered admission
 receipt in the existing SQLite transaction. Neither UUID order nor timestamps
 establish invocation order. Result recording uses that receipt and the existing

@@ -19,7 +19,6 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
 
 from ..domain.contracts import (
     CommandId,
@@ -36,6 +35,7 @@ from ..domain.events import Producer
 from ..domain import gate
 from ..domain.refs import is_governed_branch, issue_from_branch
 from ..domain.repository import canonical_repository
+from ..domain.git_remote import require_repository_remote as _require_repository_remote
 from ..domain.workflow_identity import WorkflowBinding
 from .workflow_codec import encode_workflow
 
@@ -1335,41 +1335,6 @@ def _captured_push(
         remote,
         f"{captured_head}:{remote_ref}",
     )
-
-
-def _require_repository_remote(
-    remote_url: str,
-    repository: str,
-    approved_host: str,
-) -> None:
-    """Reject a same-command push whose remote is outside configured authority."""
-
-    host, resolved_repository = _remote_identity(remote_url)
-    if (
-        host.lower() != approved_host.lower()
-        or resolved_repository.lower() != repository.lower()
-    ):
-        raise ValueError(
-            "origin push URL does not match the configured repository"
-        )
-
-
-def _remote_identity(remote_url: str) -> tuple[str, str]:
-    raw = remote_url.strip()
-    if "://" in raw:
-        parsed = urlparse(raw)
-        host = parsed.hostname or ""
-        path = parsed.path
-    elif "@" in raw and ":" in raw:
-        authority, path = raw.split(":", 1)
-        host = authority.rsplit("@", 1)[-1]
-    else:
-        raise ValueError("origin push URL is not a remote repository URL")
-    parts = tuple(part for part in path.strip("/").split("/") if part)
-    if len(parts) != 2 or not host:
-        raise ValueError("origin push URL has no owner/repository identity")
-    owner, name = parts
-    return host, f"{owner}/{name.removesuffix('.git')}"
 
 
 def _normalized_pr_create(

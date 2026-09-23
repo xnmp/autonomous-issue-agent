@@ -3,11 +3,12 @@
 Goal remains **active and incomplete**: complete the remaining phases of the
 [six-phase plan](2026-09-14-architecture-implementation.md). Phases 1–2 are
 accepted; phase 3 is current. No phase-4 implementation or live activation is
-authorized by this checkpoint. Base is `73c63bb` on `dev`; that commit accepted
-the bounded [split-recovery increment](2026-09-23-phase-3-split-recovery-handover.md),
-not the complete resolve or phase-3 vertical slice.
+authorized by this checkpoint. Base is `4685ef0` on `dev`; that commit accepted
+the bounded episode-index increment below. The preceding `73c63bb` accepted
+[split recovery](2026-09-23-phase-3-split-recovery-handover.md), not the complete
+resolve or phase-3 vertical slice.
 
-## Current episode-index increment
+## Accepted episode-index increment (`4685ef0`)
 
 The split reviewer identified a repository-wide historical adjudication-binding
 scan. It grew with all retained runs and decoded unrelated corrupt payloads on
@@ -62,6 +63,53 @@ all import contracts and both Pyrefly checks. Independent review accepted the
 final stable-wire correction as well. This closes the indexed-allowance debt,
 not phase 3 overall.
 
+## Current workspace-preparation increment
+
+This verified checkpoint implements the typed workspace obligation and local Git
+preparation boundary, not production operator re-arm or its durable
+acknowledgement authority. There are no production callers yet. Keep this
+distinction when continuing: a valid handoff value is not permission to reset.
+
+- `domain/resolve_workspace.py` holds the observed upstream base, explicit
+  prior-admission/absence variants, exact handoff, preparation operation and
+  acknowledgement. No successful AUTHOR baseline is fabricated.
+- The handoff identity includes the original grant, source/destination
+  authority and episode, prior admission/version, issue branch and exact base.
+  Observation time is not replay identity. A later execution generation in the
+  same destination episode retains the original handoff, pin and archive.
+- The closed workflow codec registers these variants without permissive
+  missing-field defaults. Shared repository and Git-object validation replace
+  ad-hoc validation objects. Publication and base observation share one remote
+  identity policy in `domain/git_remote.py`.
+- Worktree preparation reuses the existing preserving reset and its recovery
+  archive; it does not add a second reset journal or pending-work queue.
+  Configured upstream observation and exact-pin verification remain distinct
+  from later checkout mutation. No stale local base may substitute for a
+  successful upstream fetch.
+- Review identified additional required boundaries: credential-bearing
+  fetch URLs must be refused before process invocation, and missing admitted
+  predecessor work must not be replaced with a new empty branch. Fresh branch
+  creation is reserved for explicit verified admission absence. The checkout
+  must be the exact canonical `issue-N` child, not merely a descendant or a
+  symlink alias of another managed checkout. Explicit external worktree roots
+  and `WORKTREE_ROOT=.` remain supported; the target itself cannot be either
+  the managed root or the repository root.
+
+The metric is avoiding paid work against a contaminated or incorrectly selected
+new-episode checkout. Preservation of all displaced work and one allowance per
+grant remain guardrails. Full `make test` passed against the final frozen code:
+1,568 domain, 1,658 adapter and 2,421 application tests, plus hooks, parity,
+configuration, all import contracts and both Pyrefly checks. Independent adversarial review has
+accepted the final correction; its 150 focused workspace/domain/codec/remote
+checks pass. The 19 real-Git workspace cases include preservation, pin movement,
+invalid/unavailable upstream, missing/corrupt pins, credential refusal, exact
+child containment and restart after pin/reset interruption. Existing worktree
+coverage also passes (101 combined cases). Final full log:
+`/tmp/phase3-workspace-preparation-full-final.log`.
+No database schema, live authority, target repository or service was changed.
+The checkpoint commit subject is
+`feat: prepare resolve episode workspaces from pinned upstream`.
+
 ## Agreed next re-arm handoff design
 
 The Astra phase owner inspected existing policy, persistence, dashboard and
@@ -76,7 +124,7 @@ archived using the existing preserving reset mechanism, not silently deleted.
 Do not fabricate `ContractBaseline`: no successful AUTHOR exists in the new
 episode. Do not use current HEAD or a fallback local base as upstream proof.
 
-Proposed shared values, to be finalized and owned by the parent before fan-out:
+Shared values now implemented by the parent; workflow integration remains:
 
 - `ObservedResolveBase`: repository, configured upstream ref, exact commit and
   observation time.
@@ -115,8 +163,8 @@ absence retry. Delete only the selected family's replaced live choreography.
 
 Parent owns core values, ports, schema/codec, shared signatures and integration.
 `phase_3_gates` (Astra) owns agreed pure policy and workflow persistence slices;
-its handoff proposal is complete, with no handoff production edits yet.
-`compound_projection` added release-order tests only and is frozen.
+it added the workspace domain/codec behavior tests for this increment.
+`compound_projection` owns workspace adapter and real-Git test implementation.
 `review_return_recovery` independently reviews this increment read-only.
 Use the existing authority, receipts, outbox, barriers and daemon—not another
 queue, retry counter or orchestration engine. Domain stays pure, adapters own

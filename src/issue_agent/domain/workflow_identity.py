@@ -29,7 +29,7 @@ def validate_workflow_text(value: str, name: str, *, limit: int = 512, empty: bo
         raise ValueError(f"{name} must be a bounded string")
 
 
-def _repository(value: str) -> str:
+def canonical_workflow_repository(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("workflow repository must be a string")
     repository = canonical_repository(value)
@@ -63,7 +63,7 @@ class WorkflowKey:
     target: WorkflowTarget
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "repository", _repository(self.repository))
+        object.__setattr__(self, "repository", canonical_workflow_repository(self.repository))
         if not isinstance(self.target, (IssueRef, PullRequestRef)):
             raise ValueError("workflow target must be an issue or pull request identity")
 
@@ -126,7 +126,7 @@ class WorkflowWriter:
     owner_id: str
 
     def __post_init__(self) -> None:
-        object.__setattr__(self, "repository", _repository(self.repository))
+        object.__setattr__(self, "repository", canonical_workflow_repository(self.repository))
         if self.role not in ("fix", "review", "steward"):
             raise ValueError("workflow writer requires a deployment role")
         validate_workflow_identifier(self.owner_id, "workflow writer owner")

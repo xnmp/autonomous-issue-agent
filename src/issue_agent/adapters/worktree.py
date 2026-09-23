@@ -26,6 +26,7 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime
 
 from ..domain.contracts import (
     DEFAULT_TEST_FAILURE_EXIT_CODES,
@@ -40,8 +41,16 @@ from ..domain.exemptions import (
     parse_exemption_declarations,
 )
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
+from ..domain.git_remote import require_repository_remote, require_safe_fetch_url
 from ..domain.refs import issue_from_branch
 from ..domain.resolve_split import ContractResetResult, ContractRevision
+from ..domain.resolve_workspace import (
+    EpisodeWorkspaceHandoff,
+    EpisodeWorkspacePrepared,
+    NoPriorResolveAdmission,
+    ObservedResolveBase,
+)
+from ..domain.workflow_identity import canonical_workflow_repository
 from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
 
@@ -188,6 +197,13 @@ def _contract_git(
     if not isinstance(result, GitResult):
         raise WorktreeUnavailable(failure)
     return result
+
+
+def _resolved_git_path(cwd: str, value: str) -> str:
+    path = value.strip()
+    if not path:
+        return ""
+    return os.path.realpath(path if os.path.isabs(path) else os.path.join(cwd, path))
 
 
 def _validate_contract_checkout(
@@ -522,6 +538,385 @@ class Worktrees:
     def path(self, issue: int) -> str:
         return os.path.join(self.worktree_root, f"issue-{issue}")
 
+    def _managed_issue_checkout(self, issue: int) -> str:
+        repo_root = os.path.realpath(self.repo_dir)
+        managed_root = os.path.realpath(
+            os.path.join(self.repo_dir, self.worktree_root)
+        )
+        cwd = os.path.join(self.repo_dir, self.path(issue))
+        checkout = os.path.realpath(cwd)
+        exact_child = os.path.normpath(
+            os.path.join(managed_root, f"issue-{issue}")
+        )
+        try:
+            checkout_inside_managed = (
+                os.path.commonpath((checkout, managed_root)) == managed_root
+            )
+        except ValueError:
+            checkout_inside_managed = False
+        if (
+            checkout == repo_root
+            or checkout == managed_root
+            or checkout != exact_child
+            or not checkout_inside_managed
+        ):
+            raise WorktreeUnavailable(
+                f"workspace path for issue #{issue} is outside its managed root"
+            )
+        return cwd
+
+    def _repository_remote(
+        self, repository: str, approved_host: str
+    ) -> str:
+        top = _contract_git(
+            self._git,
+            ["rev-parse", "--show-toplevel"],
+            self.repo_dir,
+            "cannot verify the configured repository root",
+        )
+        if (
+            top.code != 0
+            or os.path.realpath(top.out.strip())
+            != os.path.realpath(self.repo_dir)
+        ):
+            raise WorktreeUnavailable(
+                "workspace repository is not its exact Git toplevel"
+            )
+        remote = _contract_git(
+            self._git,
+            ["remote", "get-url", "origin"],
+            self.repo_dir,
+            "configured origin URL is unavailable",
+        )
+        remote_url = remote.out.strip()
+        if remote.code != 0 or not remote_url or "\n" in remote_url:
+            raise WorktreeUnavailable("configured origin URL is unavailable")
+        try:
+            require_repository_remote(remote_url, repository, approved_host)
+            require_safe_fetch_url(remote_url)
+        except (TypeError, ValueError) as exc:
+            raise WorktreeUnavailable(
+                "configured origin is not a safe matching workspace repository; "
+                "use a credential helper instead of URL credentials"
+            ) from exc
+        return remote_url
+
+    def _check_branch_ref(self, ref: str) -> None:
+        checked = _contract_git(
+            self._git,
+            ["check-ref-format", ref],
+            self.repo_dir,
+            f"Git branch reference {ref!r} is invalid",
+        )
+        if checked.code != 0:
+            raise WorktreeUnavailable(f"Git branch reference {ref!r} is invalid")
+
+    def _verify_episode_pin(self, base: ObservedResolveBase) -> None:
+        pinned = _read_ref(self._git, self.repo_dir, base.pin_ref)
+        if pinned != base.commit_sha:
+            raise WorktreeUnavailable(
+                f"episode base pin {base.pin_ref!r} is missing or conflicts"
+            )
+        commit = _contract_git(
+            self._git,
+            ["rev-parse", "--verify", f"{base.pin_ref}^{{commit}}"],
+            self.repo_dir,
+            f"episode base pin {base.pin_ref!r} is not a commit",
+        )
+        if commit.code != 0 or commit.out.strip() != base.commit_sha:
+            raise WorktreeUnavailable(
+                f"episode base pin {base.pin_ref!r} is not the observed commit"
+            )
+
+    def _verify_workspace_common_dir(self, cwd: str) -> None:
+        root_common = _contract_git(
+            self._git,
+            ["rev-parse", "--git-common-dir"],
+            self.repo_dir,
+            "cannot verify repository common directory",
+        )
+        checkout_common = _contract_git(
+            self._git,
+            ["rev-parse", "--git-common-dir"],
+            cwd,
+            "cannot verify workspace common directory",
+        )
+        if (
+            root_common.code != 0
+            or checkout_common.code != 0
+            or _resolved_git_path(self.repo_dir, root_common.out)
+            != _resolved_git_path(cwd, checkout_common.out)
+        ):
+            raise WorktreeUnavailable(
+                "episode workspace belongs to another Git repository"
+            )
+
+    def observe_and_pin_episode_base(
+        self,
+        repository: str,
+        *,
+        observed_at: datetime,
+        approved_host: str = "github.com",
+    ) -> ObservedResolveBase:
+        """Fetch and pin one exact configured upstream branch observation.
+
+        The caller must hold exclusive deployment authority and prove the
+        repository quiescent. This local Git operation grants no workflow
+        authority; its stable scratch ref is safe only under that barrier.
+        """
+
+        with self._mutation_lock:
+            remote_url = self._repository_remote(repository, approved_host)
+            base_ref = f"refs/heads/{self.base_branch}"
+            self._check_branch_ref(base_ref)
+            if (
+                not isinstance(observed_at, datetime)
+                or observed_at.tzinfo is None
+                or observed_at.utcoffset() is None
+            ):
+                raise WorktreeUnavailable(
+                    "workspace observation requires an aware datetime"
+                )
+            canonical_repository = canonical_workflow_repository(repository)
+            observation_ref = (
+                "refs/issue-agent/episode-observations/"
+                + hashlib.sha256(
+                    f"{canonical_repository}\0{base_ref}".encode()
+                ).hexdigest()
+            )
+            fetched = _contract_git(
+                self._git,
+                [
+                    "fetch",
+                    "--no-tags",
+                    "--no-recurse-submodules",
+                    "--no-write-fetch-head",
+                    "--force",
+                    remote_url,
+                    f"+{base_ref}:{observation_ref}",
+                ],
+                self.repo_dir,
+                "cannot fetch the configured upstream base",
+            )
+            if fetched.code != 0:
+                # Never consult the observation ref after a failed fetch: it
+                # may contain a prior same-clock retry, which is not freshness.
+                raise WorktreeUnavailable(
+                    "cannot fetch the configured upstream base"
+                )
+            commit = _contract_git(
+                self._git,
+                ["rev-parse", "--verify", f"{observation_ref}^{{commit}}"],
+                self.repo_dir,
+                "fetched upstream base is not a commit",
+            )
+            if commit.code != 0:
+                raise WorktreeUnavailable("fetched upstream base is not a commit")
+            try:
+                base = ObservedResolveBase(
+                    repository, base_ref, commit.out.strip(), observed_at
+                )
+            except (TypeError, ValueError) as exc:
+                raise WorktreeUnavailable(
+                    "fetched upstream base identity is invalid"
+                ) from exc
+            _create_or_verify_ref(
+                self._git, self.repo_dir, base.pin_ref, base.commit_sha
+            )
+            self._verify_episode_pin(base)
+            return base
+
+    def _prepare_episode_checkout(
+        self, handoff: EpisodeWorkspaceHandoff
+    ) -> str:
+        issue = handoff.source.fence.key.target.number
+        branch = handoff.branch
+        branch_ref = f"refs/heads/{branch}"
+        self._check_branch_ref(branch_ref)
+        cwd = self._managed_issue_checkout(issue)
+        listing = _contract_git(
+            self._git,
+            ["worktree", "list", "--porcelain"],
+            self.repo_dir,
+            f"cannot inspect worktrees for issue #{issue}",
+        )
+        if listing.code != 0:
+            raise WorktreeUnavailable(f"cannot inspect worktrees for issue #{issue}")
+        registered = _registered_branch(listing.out, cwd)
+        if registered is not None:
+            if registered != branch:
+                raise WorktreeUnavailable(
+                    f"episode workspace for issue #{issue} is registered on "
+                    f"unexpected branch {registered!r}"
+                )
+        else:
+            if self._path_exists(cwd):
+                raise WorktreeUnavailable(
+                    f"episode workspace path for issue #{issue} is not registered"
+                )
+            refs = _contract_git(
+                self._git,
+                ["for-each-ref", "--format=%(refname:short)", "refs/heads"],
+                self.repo_dir,
+                f"cannot inspect retained branches for issue #{issue}",
+            )
+            if refs.code != 0:
+                raise WorktreeUnavailable(
+                    f"cannot inspect retained branches for issue #{issue}"
+                )
+            retained = [
+                value
+                for value in refs.out.splitlines()
+                if issue_from_branch(value) == issue
+            ]
+            if retained == [branch]:
+                added = _contract_git(
+                    self._git,
+                    ["worktree", "add", self.path(issue), branch],
+                    self.repo_dir,
+                    f"cannot restore retained workspace for issue #{issue}",
+                )
+            elif retained:
+                raise WorktreeUnavailable(
+                    f"retained workspace branches for issue #{issue} are ambiguous: {retained!r}"
+                )
+            elif not isinstance(
+                handoff.predecessor, NoPriorResolveAdmission
+            ):
+                raise WorktreeUnavailable(
+                    f"prior admitted workspace for issue #{issue} is unavailable"
+                )
+            else:
+                added = _contract_git(
+                    self._git,
+                    [
+                        "worktree",
+                        "add",
+                        "-b",
+                        branch,
+                        self.path(issue),
+                        handoff.base.pin_ref,
+                    ],
+                    self.repo_dir,
+                    f"cannot create episode workspace for issue #{issue}",
+                )
+            if added.code != 0 or not self._path_exists(cwd):
+                raise WorktreeUnavailable(
+                    f"cannot prepare episode workspace for issue #{issue}"
+                )
+        self._verify_workspace_common_dir(cwd)
+        _validate_contract_checkout(
+            cwd, issue, branch, self._git, require_clean=False
+        )
+        return cwd
+
+    def prepare_episode_workspace(
+        self,
+        handoff: EpisodeWorkspaceHandoff,
+        *,
+        approved_host: str = "github.com",
+    ) -> ContractResetResult:
+        """Archive displaced work and restore the handoff's pinned base.
+
+        The caller must hold exclusive deployment authority, prove quiescence,
+        and supply its durable predecessor/absence proof. This method performs
+        local Git effects only; the handoff is not admission authority.
+        """
+
+        if not isinstance(handoff, EpisodeWorkspaceHandoff):
+            raise WorktreeUnavailable("episode workspace requires an exact handoff")
+        with self._mutation_lock:
+            self._repository_remote(handoff.base.repository, approved_host)
+            expected_base_ref = f"refs/heads/{self.base_branch}"
+            if handoff.base.base_ref != expected_base_ref:
+                raise WorktreeUnavailable(
+                    "episode base disagrees with the configured base branch"
+                )
+            self._check_branch_ref(handoff.base.base_ref)
+            self._verify_episode_pin(handoff.base)
+            cwd = self._prepare_episode_checkout(handoff)
+            result = self._reset_contract(
+                handoff.source.fence.key.target.number,
+                handoff.revision,
+                handoff.handoff_id,
+            )
+            # Preservation must not displace or rewrite the upstream pin it is
+            # resetting to. Verify both retained identities before returning.
+            self._verify_episode_pin(handoff.base)
+            if result.archive_ref != handoff.archive_ref:
+                raise WorktreeUnavailable(
+                    "episode workspace reset returned a foreign archive"
+                )
+            archived = _read_ref(self._git, cwd, result.archive_ref)
+            if archived is None:
+                raise WorktreeUnavailable(
+                    "episode workspace reset archive is unavailable"
+                )
+            _archive_original_head(
+                self._git,
+                cwd,
+                result.archive_ref,
+                _archive_marker(result.archive_ref, handoff.revision),
+                handoff.branch,
+            )
+            return result
+
+    def verify_episode_workspace(
+        self,
+        completed: EpisodeWorkspacePrepared,
+        *,
+        approved_host: str = "github.com",
+    ) -> None:
+        """Read-only verification of a completed workspace acknowledgement.
+
+        The acknowledgement and its caller-owned workflow authority remain the
+        permission boundary; this method only checks retained local evidence.
+        """
+
+        if not isinstance(completed, EpisodeWorkspacePrepared):
+            raise WorktreeUnavailable(
+                "episode workspace verification requires its acknowledgement"
+            )
+        handoff = completed.handoff
+        with self._mutation_lock:
+            self._repository_remote(handoff.base.repository, approved_host)
+            expected_base_ref = f"refs/heads/{self.base_branch}"
+            if handoff.base.base_ref != expected_base_ref:
+                raise WorktreeUnavailable(
+                    "episode base disagrees with the configured base branch"
+                )
+            self._check_branch_ref(handoff.base.base_ref)
+            self._verify_episode_pin(handoff.base)
+            issue = handoff.source.fence.key.target.number
+            cwd = self._managed_issue_checkout(issue)
+            self._verify_workspace_common_dir(cwd)
+            observed = _validate_contract_checkout(
+                cwd, issue, handoff.branch, self._git, require_clean=True
+            )
+            if observed != handoff.revision or _checkout_status(
+                self._git, cwd, issue, include_ignored=True
+            ):
+                raise WorktreeUnavailable(
+                    f"episode workspace for issue #{issue} is not at its exact base"
+                )
+            archived = _read_ref(
+                self._git, cwd, completed.result.archive_ref
+            )
+            if archived is None:
+                raise WorktreeUnavailable(
+                    f"episode workspace archive for issue #{issue} is unavailable"
+                )
+            marker = _archive_marker(
+                completed.result.archive_ref, handoff.revision
+            )
+            _archive_original_head(
+                self._git,
+                cwd,
+                completed.result.archive_ref,
+                marker,
+                handoff.branch,
+            )
+
     def prune_validate(self) -> int:
         """Prune stale metadata and validate the remaining worktree registry."""
 
@@ -725,19 +1120,7 @@ class Worktrees:
             )
         archive_ref = _contract_ref("contract-reset", intent_id)
         marker = _archive_marker(archive_ref, revision)
-        cwd = os.path.join(self.repo_dir, self.path(issue))
-        repo_root = os.path.realpath(self.repo_dir)
-        managed_root = os.path.realpath(
-            os.path.join(self.repo_dir, self.worktree_root)
-        )
-        checkout = os.path.realpath(cwd)
-        if (
-            checkout == repo_root
-            or os.path.commonpath((checkout, managed_root)) != managed_root
-        ):
-            raise WorktreeUnavailable(
-                f"contract reset path for issue #{issue} is outside its managed root"
-            )
+        cwd = self._managed_issue_checkout(issue)
         if not self._path_exists(cwd):
             raise WorktreeUnavailable(
                 f"managed contract checkout for issue #{issue} is unavailable"

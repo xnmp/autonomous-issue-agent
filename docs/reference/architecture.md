@@ -467,7 +467,7 @@ narrow conditions under which it may state a verdict rather than facts),
 (the #124 reviewer-granted gate exemptions: declaration/grant grammar, the
 exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
-`domain/governor_policy.py`, `domain/identity.py`,
+`domain/governor_policy.py`, `domain/git_remote.py`, `domain/identity.py`,
 `domain/infra_breaker.py`, `domain/jira.py`,
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/liveness.py`,
@@ -481,9 +481,11 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
-`domain/workflow_reconciliation.py`, `domain/resolve_return.py`, `domain/resolve_split.py`
+`domain/workflow_reconciliation.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
+`domain/resolve_workspace.py`
 (cycle-free typed target, generation, epoch and episode identities for the
-incremental gate/re-arm authority migration).
+incremental gate/re-arm authority migration; workspace handoffs are explicit
+preparation obligations, not AUTHOR evidence or independent execution authority).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/agent_publish.py`,

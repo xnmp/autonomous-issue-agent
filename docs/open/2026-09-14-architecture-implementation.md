@@ -11,7 +11,11 @@ increment passed full-suite verification and independent review; phase 3 overall
 remains incomplete.
 The subsequent split-recovery checkpoint `73c63bb` also passed the final full suite and
 independent review, including replacement-author isolation. Its handover above
-records the remaining re-arm/activation and bounded-adjudication-query work.
+records the remaining re-arm/activation work. The bounded-adjudication-query
+gap was subsequently closed by `4685ef0`; workspace preparation is the current
+verified checkpoint, with production re-arm wiring still outstanding. The
+checkpoint passed independent adversarial review and full `make test`; it adds
+no live activation or self-authorizing workspace reset API.
 Implementation and its phase agent are authorized to resume;
 live operation and live migrations remain paused. Phase 3 must be accepted before
 phase 4 starts. The six-phase goal remains incomplete.
@@ -25,6 +29,18 @@ generation fencing, actual settlement provenance, atomic outbox insertion and
 bounded reconciliation. Use isolated databases, `uv`, Pyrefly and `apply_patch`;
 no live services, target writes, paid harness runs or commits by agents. Full
 `make test` and fresh independent adversarial review precede every parent commit.
+
+Workspace-handoff collaboration brief (current increment): exact base and
+handoff values live in `domain/resolve_workspace.py`; the parent owns these
+values and codec/shared seams. The worktree agent owns strict upstream pinning
+and preparation using the existing preserving reset, plus real-Git tests.
+Astra owns behavioral domain/codec tests and checks the re-arm integration
+contract before its policy changes. No fabricated AUTHOR baseline, mutable
+episode reset counter, new queue, or local-base fallback is permitted. A handoff
+is an obligation, not execution authority: callers must hold the existing
+exclusive deployment barrier and establish quiescence before Git mutation.
+Use `uv`, Pyrefly, `apply_patch`, isolated repos/databases, and no agent commits
+or live operations. Independent review and full `make test` precede integration.
 
 Split-recovery collaboration brief (current increment): new bounded cursor,
 reply/selection/trail and exact contract/reset values live in
@@ -110,13 +126,14 @@ only exercised in a controlled double.
 - Committed: `eaa1cc5` exceptional Astra/Fable implementer routing and launcher
   status propagation; `d26e935` shared branch identity and decision ownership;
   `4c365a8` shared PR repair context and revision-bound CI logs.
-- Uncommitted #198 triage lifecycle/withdrawal change remains in the checkout.
-  Independent review requires adding observed issue-author identity before
-  treating a comment as author withdrawal. Its last full-suite attempt failed
-  `test_shutdown_deadline_forces_process_teardown_and_exits_transient`; do not
-  label the tree fully verified or discard the failure without investigation.
-- Existing `docs/README.md` and the critique document belong to concurrent
-  review work and must be preserved.
+- At the review baseline, #198 triage lifecycle/withdrawal work was uncommitted.
+  Independent review required observed issue-author identity before treating
+  a comment as author withdrawal. Its then-current full-suite attempt failed
+  `test_shutdown_deadline_forces_process_teardown_and_exits_transient`.
+  These are historical inputs, not the current working-tree or test status;
+  the accepted phase-1/2 integration at `1703195` supersedes that checkpoint.
+- The pre-existing `docs/README.md` and critique work was preserved in the
+  phase-1/2 integration.
 - Tauri #696 remains blocked pending interactive Mac access; #523 badges and
   #514 explicit-opt-in Gravatar were authorized. User clarified #722 means
   pasting an image from another app; this answer has not been posted remotely.
@@ -179,7 +196,7 @@ including both original reproductions) and the full `make test`: 1,345 domain,
 1,411 adapter and 2,361 application tests, hooks/parity/import contracts and both
 Pyrefly passes. Final log: `/tmp/phase3-continuation-full-final.log`.
 
-The current **uncommitted** integration replaces selected resolve scheduling and
+The integration later committed at `99bc61d` replaced selected resolve scheduling and
 workflow file reads/writes with the episode authority, carries decision bindings
 through claims, and checks AUTHOR applicability against a fingerprint of the
 authoritative task inputs. Scratch handover and repository-guidance enrichment

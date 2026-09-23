@@ -16,6 +16,11 @@ from .workflow_identity import (
 MAX_SPLIT_TRAIL = 4
 
 
+def validate_git_object_id(value: str) -> None:
+    if not isinstance(value, str) or len(value) not in (40, 64) or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError("revision requires a complete Git object ID")
+
+
 def validate_contract_rounds(value: int) -> None:
     validate_workflow_integer(value, "adjudication ceiling")
     if value > MAX_SPLIT_TRAIL:
@@ -31,8 +36,7 @@ class ContractRevision:
         validate_workflow_identifier(self.branch, "contract branch")
         if issue_from_branch(self.branch) is None:
             raise ValueError("contract revision requires an issue-owned branch")
-        if not isinstance(self.head_sha, str) or len(self.head_sha) not in (40, 64) or any(char not in "0123456789abcdef" for char in self.head_sha):
-            raise ValueError("contract revision requires a complete Git object ID")
+        validate_git_object_id(self.head_sha)
 
 
 @dataclass(frozen=True)
