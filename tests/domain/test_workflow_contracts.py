@@ -9,7 +9,7 @@ from issue_agent.domain.workflow import (
     AuthorizedOperatorCommand, CancelRearm, KeepGuidance, OperatorActor,
     RequestRearm, ResolveAttemptResult, ResolveEpisode, ResolveResultKind,
     WorkflowChanged, WorkflowMutation, WorkflowSnapshot,
-    ResolveRearmPreflight, ObservedIssue, NoLinkedPr,
+    ResolveRearmAcceptance, ResolveRearmPreflight, ObservedIssue, NoLinkedPr,
     AuthoredResolve, FreshResolve, ResolveAdmission, ResolveSession, ResolveStage,
     adjudication_allowed,
 )
@@ -18,6 +18,7 @@ from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey,
     WorkflowRevision,
 )
+from tests.fakes.workflow_workspace import workspace_observation
 
 
 def snapshot(number=7):
@@ -56,10 +57,10 @@ def test_rearm_cannot_advance_generation_without_pending_intent():
     audit = AuthorizedOperatorCommand(
         OperatorActor("operator", "test"),
         RequestRearm("request", before.revision, "gate", KeepGuidance()),
-        ResolveRearmPreflight(
+        ResolveRearmAcceptance(ResolveRearmPreflight(
             ObservedIssue(before.revision.fence.key, IssueView(7, updated_at="revision"), datetime(2026, 9, 14, tzinfo=timezone.utc)),
             NoLinkedPr(before.revision.fence.key, datetime(2026, 9, 14, tzinfo=timezone.utc)),
-        ),
+        ), workspace_observation(before.binding, datetime(2026, 9, 14, tzinfo=timezone.utc))),
     )
     with pytest.raises(ValueError, match="pending intent"):
         WorkflowChanged(before.revision, WorkflowMutation.REQUEST_REARM, after, audit)

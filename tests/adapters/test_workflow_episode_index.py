@@ -28,12 +28,14 @@ def test_episode_index_uses_stable_wire_discriminator_and_ignores_generation():
 def _downgrade_fixture_to_v19(store):
     # Isolated historical fixture construction, never a supported rollback.
     with store.transaction() as db:
+        db.execute("DROP INDEX runs_workflow_scope")
+        db.execute("DROP INDEX lifecycle_publication_runs")
         db.execute("DROP TRIGGER runs_require_workflow_episode_insert")
         db.execute("DROP TRIGGER runs_require_workflow_episode_update")
         db.execute("DROP INDEX runs_adjudication_episode")
         db.execute("ALTER TABLE runs DROP COLUMN workflow_episode_key")
         db.execute("UPDATE runs SET outcome='released' WHERE outcome='unlaunched_released'")
-        db.execute("DELETE FROM schema_migrations WHERE version=20")
+        db.execute("DELETE FROM schema_migrations WHERE version>=20")
 
 
 def test_malformed_unrelated_historical_binding_does_not_block_adjudication(control):

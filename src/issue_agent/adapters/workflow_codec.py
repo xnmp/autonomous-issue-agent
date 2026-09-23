@@ -28,6 +28,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    workspace.ResolveWorkspaceObserved, w.ResolveRearmAcceptance,
     workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
     workspace.PriorResolveAdmission, workspace.EpisodeWorkspaceHandoff,
     workspace.PrepareResolveWorkspace, workspace.EpisodeWorkspacePrepared,

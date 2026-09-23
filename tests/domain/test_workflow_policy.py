@@ -15,6 +15,7 @@ from issue_agent.domain.workflow import (
     EvidenceUnavailable, HeldProjection, IssueAbsent, IssueUnavailable, KeepGuidance,
     LinkedPrPresent, LinkedPrUnavailable, NoAuthorizedRemediation, NoLinkedPr,
     ObservedIssue, OpenGate, OperatorActor, PendingRearm, RearmingGate,
+    AuthorizedOperatorCommand, RenewResolveAllowance, ResolveRearmAcceptance, ResolveRearmPreflight,
     RemoteOutcomeUncertain, RequestRearm, ResolveCeiling, ResolveEpisode,
     ResolveResultKind, SetGuidance, StopReason, SupersededRearm, WorkflowChanged,
     WorkflowRejected, WorkflowRejection, WorkflowSnapshot, WorkflowUnchanged,
@@ -32,6 +33,8 @@ from issue_agent.domain.world import IssueView
 from issue_agent.domain.actions import Relabel, RemoveWorktree
 from issue_agent.domain.resolve_return import PendingResolveReturn, ResolveInputs, ReturnedResolve
 from issue_agent.domain.workflow_policy import decide_return, defer_return_observation
+from tests.fakes.workflow_workspace import workspace_ack, workspace_observation
+from issue_agent.domain.resolve_workspace import PrepareResolveWorkspace
 
 NOW = datetime(2026, 9, 14, 9, tzinfo=timezone.utc)
 ACTOR = OperatorActor("operator:alice", "dashboard")
@@ -200,6 +203,7 @@ def request(state, request_id="request:1", guidance=None):
 
 
 def start(state, command=None, **kwargs):
+    kwargs.setdefault("workspace", workspace_observation(state.binding, NOW))
     return request_resolve_rearm(
         state, command or request(state), ACTOR, observed(state), no_pr(state),
         now=NOW, active_attempts=(), **kwargs,
@@ -357,6 +361,12 @@ def test_rearm_grants_one_bounded_episode_with_durable_guidance_and_required_rem
     assert after.episode.guidance == expected
     assert isinstance(after.intent, PendingRearm)
     assert after.intent.required_commands == (resolve_projection_command_id(before.revision.fence.key, command.request_id),)
+    assert after.intent.handoff.source == before.binding
+    assert after.intent.handoff.destination == after.binding
+    assert after.intent.handoff.grant_request_id == command.request_id
+    assert isinstance(transition.audit, AuthorizedOperatorCommand)
+    assert isinstance(transition.audit.preflight, ResolveRearmAcceptance)
+    assert transition.audit.preflight.workspace == after.intent.handoff.observation
     assert HeldProjection(after).held
     assert isinstance(start(after, command, prior_request=command), WorkflowUnchanged)
     assert isinstance(start(after, replace(command, request_id="other")), WorkflowRejected)
@@ -381,7 +391,7 @@ def test_rearm_never_grants_allowance_from_missing_stale_or_terminal_facts(case)
     if case == "future": issue = replace(issue, observed_at=NOW + timedelta(seconds=1))
     if case == "linked_read_failed": linkage = LinkedPrUnavailable(key, NOW, "outage")
     if case == "linked_pr": linkage = LinkedPrPresent(key, 70, "head", NOW)
-    transition = request_resolve_rearm(state, request(state), ACTOR, issue, linkage, now=NOW, active_attempts=())
+    transition = request_resolve_rearm(state, request(state), ACTOR, issue, linkage, now=NOW, active_attempts=(), workspace=workspace_observation(state.binding, NOW))
     assert isinstance(transition, WorkflowRejected)
     assert state.episode.failures == 3
 
@@ -389,7 +399,7 @@ def test_rearm_never_grants_allowance_from_missing_stale_or_terminal_facts(case)
 def test_active_attempt_must_drain_before_grant_can_be_accepted():
     state = exhausted()
     active = WorkflowAttemptIdentity(state.binding, RunId("running"), "leg")
-    transition = request_resolve_rearm(state, request(state), ACTOR, observed(state), no_pr(state), now=NOW, active_attempts=(active,))
+    transition = request_resolve_rearm(state, request(state), ACTOR, observed(state), no_pr(state), now=NOW, active_attempts=(active,), workspace=workspace_observation(state.binding, NOW))
     assert transition.code is WorkflowRejection.OTHER_HOLD
 
 
@@ -411,6 +421,8 @@ def test_cancellation_keeps_allowance_and_uncertainty_then_continuation_does_not
     assert HeldProjection(continued).held
     assert any(isinstance(g, OpenGate) and isinstance(g.cause, RemoteOutcomeUncertain) for g in continued.gates)
     assert continued.intent.required_commands != pending.intent.required_commands
+    assert continued.intent.handoff == stopped.intent.handoff == pending.intent.handoff
+    assert not any(isinstance(operation, RenewResolveAllowance) for operation in continued.intent.operations)
 
 
 def test_terminal_supersession_preserves_verified_effect_and_cannot_become_clean_completion():
@@ -421,6 +433,7 @@ def test_terminal_supersession_preserves_verified_effect_and_cannot_become_clean
     assert stopped.intent.verified_commands == ids
     assert stopped.intent.retired_obligations == ()
     assert stopped.episode == pending.episode
+    assert stopped.intent.handoff == pending.intent.handoff
     assert HeldProjection(stopped).held
     result = complete_resolve_rearm(stopped, observed(stopped), no_pr(stopped), verified_commands=ids, evidence_ids=("receipt",), now=NOW)
     assert isinstance(result, WorkflowUnchanged)
@@ -429,18 +442,151 @@ def test_terminal_supersession_preserves_verified_effect_and_cannot_become_clean
 def test_completion_requires_receipts_and_fresh_ready_projection():
     pending = start(exhausted()).snapshot
     ready = observed(pending, labels=frozenset({Label.AI_READY}))
-    assert isinstance(complete_resolve_rearm(pending, ready, no_pr(pending), verified_commands=(), evidence_ids=("read",), now=NOW), WorkflowRejected)
-    assert isinstance(complete_resolve_rearm(pending, observed(pending), no_pr(pending), verified_commands=pending.intent.required_commands, evidence_ids=("read",), now=NOW), WorkflowRejected)
-    completed = complete_resolve_rearm(pending, ready, no_pr(pending), verified_commands=pending.intent.required_commands, evidence_ids=("receipt", "read"), now=NOW).snapshot
+    ack = workspace_ack(pending.intent.handoff, NOW)
+    assert isinstance(complete_resolve_rearm(pending, ready, no_pr(pending), verified_commands=(), evidence_ids=("read",), now=NOW, workspace=ack), WorkflowRejected)
+    assert isinstance(complete_resolve_rearm(pending, observed(pending), no_pr(pending), verified_commands=pending.intent.required_commands, evidence_ids=("read",), now=NOW, workspace=ack), WorkflowRejected)
+    completed = complete_resolve_rearm(pending, ready, no_pr(pending), verified_commands=pending.intent.required_commands, evidence_ids=("receipt", "read"), now=NOW, workspace=ack).snapshot
     assert isinstance(completed.intent, CompletedRearm)
     assert not HeldProjection(completed).held
     assert completed.episode == pending.episode
+    assert completed.intent.workspace == ack
+
+
+@pytest.mark.parametrize("workspace", [None, {}, "ready"])
+def test_rearm_missing_workspace_cannot_renew_allowance(workspace):
+    before = exhausted()
+    rejected = start(before, workspace=workspace)
+    assert isinstance(rejected, WorkflowRejected)
+    assert rejected.code is WorkflowRejection.OBSERVATION_UNAVAILABLE
+    assert before.episode.failures == 3
+
+
+@pytest.mark.parametrize("field", ["target", "repository", "epoch", "generation", "episode"])
+def test_rearm_workspace_must_match_exact_current_source(field):
+    before = exhausted()
+    source = before.binding
+    if field == "target":
+        source = snapshot(number=8).binding
+    elif field == "repository":
+        source = replace(source, fence=replace(source.fence, key=replace(source.fence.key, repository="other/repo")))
+    elif field == "epoch":
+        source = replace(source, authority=replace(source.authority, epoch=2))
+    elif field == "generation":
+        source = replace(source, fence=replace(source.fence, generation=1))
+    else:
+        source = replace(source, episode_id="foreign")
+    rejected = start(before, workspace=workspace_observation(source, NOW))
+    assert isinstance(rejected, WorkflowRejected) and rejected.code is WorkflowRejection.INVALID_SCOPE
+
+
+@pytest.mark.parametrize("age,accepted", [(0, True), (300, True), (301, False), (-1, False)])
+def test_rearm_workspace_base_must_be_fresh_at_acceptance(age, accepted):
+    before = exhausted()
+    proposal = start(before, workspace=workspace_observation(before.binding, NOW - timedelta(seconds=age)))
+    assert isinstance(proposal, WorkflowChanged if accepted else WorkflowRejected)
+
+
+def test_replay_returns_existing_grant_without_requiring_new_workspace_evidence():
+    before = exhausted()
+    command = request(before)
+    accepted = start(before, command).snapshot
+    replay = request_resolve_rearm(accepted, command, ACTOR, observed(accepted), no_pr(accepted),
+                                   now=NOW, active_attempts=(), prior_request=command)
+    assert isinstance(replay, WorkflowUnchanged) and replay.snapshot == accepted
+
+
+@pytest.mark.parametrize("case", ["missing", "wrong_handoff", "future_generation", "future_time"])
+def test_remote_success_cannot_finish_without_exact_nonfuture_workspace_ack(case):
+    pending = start(exhausted()).snapshot
+    ack = workspace_ack(pending.intent.handoff, NOW)
+    if case == "missing":
+        ack = None
+    elif case == "wrong_handoff":
+        ack = workspace_ack(replace(pending.intent.handoff, branch="fix/7-other"), NOW)
+    elif case == "future_generation":
+        ack = workspace_ack(pending.intent.handoff, NOW, performed_under=replace(pending.binding, fence=replace(pending.binding.fence, generation=2)))
+    else:
+        ack = workspace_ack(pending.intent.handoff, NOW + timedelta(seconds=1))
+    result = complete_resolve_rearm(pending, observed(pending, labels=frozenset({Label.AI_READY})), no_pr(pending),
+        verified_commands=pending.intent.required_commands, evidence_ids=("verified-remote",), now=NOW, workspace=ack)
+    assert isinstance(result, WorkflowRejected)
+    assert HeldProjection(pending).held
+
+
+def test_continued_grant_completes_with_original_workspace_receipt_without_expiry_or_new_grant():
+    pending = start(exhausted(guidance="retained guidance")).snapshot
+    ack = workspace_ack(pending.intent.handoff, NOW)
+    stopped = cancel_resolve_rearm(pending, CancelRearm("cancel", pending.revision, pending.intent.request_id, "pause"), ACTOR).snapshot
+    command = ContinueGrantedRearm("continue", stopped.revision, stopped.intent.request_id)
+    continued = continue_resolve_rearm(stopped, command, ACTOR, observed(stopped), no_pr(stopped), now=NOW, active_attempts=()).snapshot
+    later = NOW + timedelta(days=1)
+    ready = replace(observed(continued, labels=frozenset({Label.AI_READY})), observed_at=later)
+    no_link = replace(no_pr(continued), observed_at=later)
+    completed = complete_resolve_rearm(continued, ready, no_link, verified_commands=continued.intent.required_commands,
+                                     evidence_ids=("fresh-remote",), now=later, workspace=ack)
+    assert isinstance(completed, WorkflowChanged)
+    assert completed.snapshot.intent.workspace == ack
+    assert completed.snapshot.episode == pending.episode
+    assert not HeldProjection(completed.snapshot).held
+    validate_resolve_transition(continued, completed, ceiling=3, now=later,
+                               observations=(ResolveRearmPreflight(ready, no_link),))
+
+
+def test_transition_validation_rejects_substituted_workspace_after_cancellation():
+    pending = start(exhausted()).snapshot
+    proposal = cancel_resolve_rearm(pending, CancelRearm("cancel", pending.revision, pending.intent.request_id, "pause"), ACTOR)
+    assert isinstance(proposal, WorkflowChanged)
+    assert isinstance(proposal.snapshot.intent, CancelledRearm)
+    changed = replace(proposal.snapshot.intent.handoff, branch="fix/7-substituted")
+    forged = replace(proposal, snapshot=replace(proposal.snapshot, intent=replace(proposal.snapshot.intent, handoff=changed)))
+    with pytest.raises(ValueError):
+        validate_resolve_transition(pending, forged, ceiling=3, now=NOW)
+
+
+def test_transition_validation_rechecks_request_workspace_freshness_not_just_final_values():
+    before = exhausted()
+    old = NOW - timedelta(seconds=301)
+    proposal = request_resolve_rearm(before, request(before), ACTOR,
+        replace(observed(before), observed_at=old), replace(no_pr(before), observed_at=old),
+        now=old, active_attempts=(), workspace=workspace_observation(before.binding, old))
+    assert isinstance(proposal, WorkflowChanged)
+    assert isinstance(proposal.audit, AuthorizedOperatorCommand)
+    assert isinstance(proposal.audit.preflight, ResolveRearmAcceptance)
+    refreshed_remote = replace(proposal.audit.preflight, preflight=ResolveRearmPreflight(observed(before), no_pr(before)))
+    proposal = replace(proposal, audit=replace(proposal.audit, preflight=refreshed_remote))
+    with pytest.raises(ValueError, match="authorized state transition"):
+        validate_resolve_transition(before, proposal, ceiling=3, now=NOW)
+
+
+@pytest.mark.parametrize("case", ["missing", "duplicate", "different_episode"])
+def test_pending_value_cannot_omit_or_replace_its_workspace_obligation(case):
+    pending = start(exhausted()).snapshot.intent
+    assert isinstance(pending, PendingRearm)
+    operation = next(item for item in pending.operations if isinstance(item, PrepareResolveWorkspace))
+    with pytest.raises(ValueError):
+        if case == "missing":
+            replace(pending, operations=tuple(item for item in pending.operations if item != operation))
+        elif case == "duplicate":
+            replace(pending, operations=(*pending.operations, operation))
+        else:
+            handoff = replace(operation.handoff, destination=replace(operation.handoff.destination, episode_id="ungranted"))
+            replace(pending, operations=tuple(PrepareResolveWorkspace(handoff) if item == operation else item for item in pending.operations))
+
+
+def test_request_and_continue_audits_cannot_exchange_observation_purposes():
+    before = exhausted()
+    remote = ResolveRearmPreflight(observed(before), no_pr(before))
+    acceptance = ResolveRearmAcceptance(remote, workspace_observation(before.binding, NOW))
+    with pytest.raises(ValueError):
+        AuthorizedOperatorCommand(ACTOR, request(before), remote)
+    with pytest.raises(ValueError):
+        AuthorizedOperatorCommand(ACTOR, ContinueGrantedRearm("continue", before.revision, "stopped"), acceptance)
 
 
 def test_selected_rearm_can_complete_while_an_independent_gate_remains_held():
     other = OpenGate("other", 0, EvidenceUnavailable("approval", NOW, 1, "read failed"), NoAuthorizedRemediation("read required"))
     pending = start(exhausted(extra_gates=(other,))).snapshot
-    completed = complete_resolve_rearm(pending, observed(pending), no_pr(pending), verified_commands=pending.intent.required_commands, evidence_ids=("receipt", "read"), now=NOW).snapshot
+    completed = complete_resolve_rearm(pending, observed(pending), no_pr(pending), verified_commands=pending.intent.required_commands, evidence_ids=("receipt", "read"), now=NOW, workspace=workspace_ack(pending.intent.handoff, NOW)).snapshot
     assert isinstance(completed.intent, CompletedRearm)
     assert other in completed.gates
     assert HeldProjection(completed).held
@@ -494,6 +640,7 @@ def test_new_exhaustion_after_rearm_opens_a_distinct_visible_gate():
     current = complete_resolve_rearm(
         pending, observed(pending, labels=frozenset({Label.AI_READY})), no_pr(pending),
         verified_commands=pending.intent.required_commands, evidence_ids=("receipt", "read"), now=NOW,
+        workspace=workspace_ack(pending.intent.handoff, NOW),
     ).snapshot
     for number in range(3):
         current = record_resolve_attempt(current, result(current, run=f"new:{number}"), ceiling=3, admission=admission(current, result(current, run=f"new:{number}"))).snapshot

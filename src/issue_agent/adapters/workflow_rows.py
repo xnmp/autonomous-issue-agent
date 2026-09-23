@@ -2,6 +2,8 @@
 
 import sqlite3
 
+from ..domain.resolve_workspace import EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
+
 from ..domain.workflow import (
     CancelledRearm, CompletedRearm, OpenGate, PendingRearm, RearmingGate,
     ResolveEpisode, SupersededRearm, WorkflowSnapshot,
@@ -15,6 +17,25 @@ from .workflow_codec import WorkflowEncodingError, decode_workflow
 
 class WorkflowAuthorityError(ValueError):
     pass
+
+
+WORKSPACE_ACK_NAMESPACE = "workflow-workspace-completed"
+
+
+def load_workspace_ack(db: sqlite3.Connection, handoff: EpisodeWorkspaceHandoff) -> EpisodeWorkspacePrepared | None:
+    row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (WORKSPACE_ACK_NAMESPACE, handoff.destination.fence.key.repository, handoff.handoff_id),
+    ).fetchone()
+    if row is None:
+        return None
+    try:
+        completed = decode_workflow(row["payload_json"], EpisodeWorkspacePrepared)
+        if completed.handoff != handoff:
+            raise ValueError("stored preparation names another workspace handoff")
+        return completed
+    except (ValueError, TypeError) as exc:
+        raise WorkflowAuthorityError(f"invalid workspace acknowledgement: {exc}") from exc
 
 
 def workflow_scope(key: WorkflowKey) -> tuple[str, str, int]:
@@ -63,10 +84,17 @@ def load_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> WorkflowSnaps
             states = {PendingRearm: "pending", CompletedRearm: "completed", SupersededRearm: "superseded", CancelledRearm: "cancelled"}
             if intent_row["request_id"] != intent.request_id or intent_row["gate_id"] != intent.gate_id or intent_row["to_generation"] != intent.to_generation or intent_row["state"] != states[type(intent)]:
                 raise WorkflowEncodingError("rearm index disagrees with its validated payload")
-        return WorkflowSnapshot(
+        snapshot = WorkflowSnapshot(
             WorkflowRevision(WorkflowFence(key, row["generation"]), row["version"]),
             authority, episode, tuple(gates), intent,
         )
+        if intent is not None:
+            acknowledgement = load_workspace_ack(db, intent.handoff)
+            if acknowledgement is not None and acknowledgement.performed_under.fence.generation > snapshot.revision.fence.generation:
+                raise WorkflowAuthorityError("workspace acknowledgement belongs to a future execution generation")
+            if isinstance(intent, CompletedRearm) and acknowledgement != intent.workspace:
+                raise WorkflowAuthorityError("completed rearm lacks its exact durable workspace acknowledgement")
+        return snapshot
     except (ValueError, TypeError, KeyError) as exc:
         raise WorkflowAuthorityError(f"invalid workflow authority: {exc}") from exc
 

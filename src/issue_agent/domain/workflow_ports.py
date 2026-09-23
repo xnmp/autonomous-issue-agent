@@ -6,9 +6,10 @@ from contextlib import AbstractContextManager
 from .contracts import CommandId, WorkflowAttemptIdentity
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
 from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetIntent, ContractRevision
+from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
 from .workflow import (
     CommandAbsenceEvidence, CommandRetryApplicability, HeldProjection, RearmIntent, RetryAlreadyConsumed,
-    RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead,
+    RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead, WorkflowSnapshot,
 )
 from .workflow_identity import (
     FamilyAuthority, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
@@ -55,6 +56,18 @@ class WorkflowControl(Protocol):
     def contract_reset_authority(self, intent: ResetIntent) -> AbstractContextManager[ContractResetCompleted | None]: ...
 
     def complete_contract_reset(self, completed: ContractResetCompleted) -> ContractResetCompleted: ...
+
+    def rearm_authority(self, expected: WorkflowRevision) -> AbstractContextManager[WorkflowSnapshot]: ...
+
+    def observe_workspace(
+        self, binding: WorkflowBinding, base: ObservedResolveBase, branch: str,
+    ) -> ResolveWorkspaceObserved: ...
+
+    def workspace_handoff_authority(
+        self, handoff_id: str, expected: WorkflowRevision,
+    ) -> AbstractContextManager[EpisodeWorkspacePrepared | None]: ...
+
+    def complete_workspace_handoff(self, completed: EpisodeWorkspacePrepared) -> EpisodeWorkspacePrepared: ...
 
     def finalize_return(
         self, returned: ReturnedResolve, issue: ObservedIssue,

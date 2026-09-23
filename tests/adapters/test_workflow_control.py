@@ -42,8 +42,11 @@ from issue_agent.domain.workflow_policy import (
 )
 from issue_agent.domain.world import IssueView
 from issue_agent.domain.resolve_return import PendingResolveReturn, ResolveCleanupCompleted, ResolveInputs, ReturnedResolve, UnavailableResolveReturn
+from issue_agent.domain.resolve_workspace import PriorResolveAdmission
 from issue_agent.domain.workflow_policy import return_gate_id
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot as initial_snapshot
+from tests.fakes.workflow_workspace import workspace_observation
+from tests.fakes.workflow_workspace import workspace_ack
 
 NOW = datetime(2026, 9, 14, 12, tzinfo=timezone.utc)
 WRITER = WorkflowWriter("o/r", "fix", "o/r:fix:deployment")
@@ -87,17 +90,23 @@ def enrich(proposal):
     return replace(proposal, commands=(command,))
 
 
-def request(state, name="request:1", *, guidance=None, external_holds=()):
+def request(state, name="request:1", *, guidance=None, external_holds=(), predecessor=None):
     gate = next(g for g in state.gates if getattr(g.cause, "episode_id", None) == state.episode.episode_id)
     return enrich(request_resolve_rearm(
         state, RequestRearm(name, state.revision, gate.gate_id, guidance or KeepGuidance()),
         ACTOR, observation(state), NoLinkedPr(state.revision.fence.key, NOW),
         now=NOW, active_attempts=(), external_holds=external_holds,
+        workspace=workspace_observation(state.binding, NOW, predecessor=predecessor),
     ))
 
 
 def commit(store, proposal):
     return adapter(store).commit_workflow(proposal.expected, (proposal.snapshot.authority,), proposal)
+
+
+def prepare_workspace(store, pending):
+    acknowledgement = workspace_ack(pending.intent.handoff, NOW, performed_under=pending.binding)
+    return adapter(store).complete_workspace_handoff(acknowledgement)
 
 
 def evidence(control, state, name="observation:1", payload=None):
@@ -110,12 +119,19 @@ def evidence(control, state, name="observation:1", payload=None):
 def run(control, state, *, name="run:1", status="completed", leg="leg:1", stage=ResolveStage.RESOLVE, session_id=None, runtime="codex", model="<runtime-default>"):
     """An isolated completed admission, including its immutable ordering receipt."""
     result = ResolveAttemptResult(WorkflowAttemptIdentity(state.binding, RunId(name), leg), ResolveResultKind.COUNTED_REQUEUE, "failed experiment", stage)
-    control.start_run(RunId(name), json.dumps({"repository": "o/r", "issue": state.revision.fence.key.target.number, "number": state.revision.fence.key.target.number, "leg_id": leg, "kind": stage.value, "runtime": runtime, "input_fingerprint": "a" * 64}), stage.value, WRITER.owner_id, "config", state=status)
+    control.start_run(RunId(name), json.dumps({"repository": "o/r", "issue": state.revision.fence.key.target.number, "number": state.revision.fence.key.target.number, "leg_id": leg, "kind": stage.value, "runtime": runtime, "input_fingerprint": "a" * 64, "publication_branch": f"fix/{state.revision.fence.key.target.number}-workspace"}), stage.value, WRITER.owner_id, "config", state=status)
     with control.transaction() as db:
         from issue_agent.adapters.control_store import workflow_episode_key
         db.execute("UPDATE runs SET workflow_binding_json=?,workflow_episode_key=? WHERE run_id=?", (encode_workflow(state.binding), workflow_episode_key(state.binding), name))
+        admitted = admission(state, result)
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission', ?, ?, ?, ?)",
-                   (WRITER.repository, name, NOW.isoformat(), encode_workflow(admission(state, result))))
+                   (WRITER.repository, name, NOW.isoformat(), encode_workflow(admitted)))
+        if stage is not ResolveStage.ROUTE:
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-work-latest',?,?,?,?) "
+                "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,payload_json=excluded.payload_json",
+                (WRITER.repository, f"issue:{state.revision.fence.key.target.number}", NOW.isoformat(), encode_workflow(admitted)),
+            )
         if session_id is not None:
             result = replace(result, session=ResolveSession(result.attempt, session_id, runtime, model))
         if status == "completed" or session_id is not None:
@@ -142,7 +158,7 @@ def command_row(control, command_id):
         return db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
 
 
-def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runtime-default>", session_id=None, launch=True, settle=True):
+def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runtime-default>", session_id=None, launch=True, settle=True, historical=False):
     """Real accounting with historical split rows for pre-cutover recovery.
 
     These tests deliberately deliver concurrent/reversed legacy split stages.
@@ -156,13 +172,14 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
     request = ReservationRequest(
         ReservationId(f"reservation:{name}"), attempt.run_id,
         json.dumps({"repository": "o/r", "role": "fix", "kind": stage.value, "leg_id": attempt.leg_id,
-                    "runtime": "codex", "input_fingerprint": "a" * 64, "issue": state.revision.fence.key.target.number}),
+                    "runtime": "codex", "input_fingerprint": "a" * 64, "issue": state.revision.fence.key.target.number,
+                    "publication_branch": f"fix/{state.revision.fence.key.target.number}-workspace"}),
         BudgetScope(money_scope, "daily", "USD", "2026-09-14", NOW, NOW + timedelta(days=1), ZoneInfo("UTC")),
         PriceQuote(model, "card", "1", NOW, Money("USD", 1)), Money("USD", 100), "config", "o/r",
         kind=stage.value, owner_id=WRITER.owner_id, workflow=state.binding,
         adjudication_ceiling=3 if stage is ResolveStage.ADJUDICATE else None,
     )
-    if stage in (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE):
+    if historical or stage in (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE):
         assert control.reserve(replace(request, kind="historical-fixture", workflow=None, adjudication_ceiling=None)).admitted
         with control.transaction() as db:
             current = load_workflow_row(db, state.revision.fence.key)
@@ -176,6 +193,11 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
             legacy = ResolveAdmission(attempt, revision, stage, request.adjudication_ceiling, "a" * 64)
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission',?,?,?,?)",
                        (WRITER.repository, name, NOW.isoformat(), encode_workflow(legacy)))
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-work-latest',?,?,?,?) "
+                "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,payload_json=excluded.payload_json",
+                (WRITER.repository, f"issue:{state.revision.fence.key.target.number}", NOW.isoformat(), encode_workflow(legacy)),
+            )
     else:
         assert control.reserve(request).admitted
     if not launch:
@@ -190,8 +212,8 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
                                 session=None if stage is ResolveStage.ROUTE else session)
 
 
-def paid_return(control, before, *, name="paid-return", stage=ResolveStage.RESOLVE, status="pushed"):
-    paid = paid_result(control, before, name, stage)
+def paid_return(control, before, *, name="paid-return", stage=ResolveStage.RESOLVE, status="pushed", historical=False):
+    paid = paid_result(control, before, name, stage, historical=historical)
     return ReturnedResolve(paid.attempt, stage, ResolveInputs("title", "body", "alice"), False,
                            status, "paid summary", "which API?", "", None, paid.session, NOW)
 
@@ -423,7 +445,7 @@ def test_closed_return_finishes_only_after_matching_idempotent_cleanup_acknowled
     authored = paid_result(control, before, "earned-author", ResolveStage.AUTHOR)
     before = adapter(control).record_attempt(authored).snapshot
     assert isinstance(before.episode.continuation, AuthoredResolve)
-    returned = paid_return(control, before, status="done")
+    returned = paid_return(control, before, status="done", historical=True)
     workflow = adapter(control)
     workflow.capture_return(returned)
     issue, linkage = return_observations(returned, state="closed")
@@ -603,7 +625,7 @@ def test_actual_resume_blocked_clears_session_without_losing_authored_checkpoint
     install_workflow(control, before)
     author = paid_result(control, before, "author", ResolveStage.AUTHOR)
     authored = adapter(control).record_attempt(author).snapshot
-    blocked = replace(paid_result(control, authored, "resume", ResolveStage.RESUME), kind=ResolveResultKind.BLOCKED)
+    blocked = replace(paid_result(control, authored, "resume", ResolveStage.RESUME, historical=True), kind=ResolveResultKind.BLOCKED)
     assert blocked.session is not None
     cleared = adapter(control).record_attempt(blocked).snapshot
     assert isinstance(cleared.episode.continuation, AuthoredResolve)
@@ -669,7 +691,7 @@ def test_result_proposal_uses_durable_admission_not_a_forged_newer_order(control
     before = initial_snapshot()
     install_workflow(control, before)
     result = paid_result(control, before, "old", ResolveStage.AUTHOR)
-    latest_result = paid_result(control, adapter(control).load_workflow(before.revision.fence.key), "new", ResolveStage.RESOLVE)
+    latest_result = paid_result(control, adapter(control).load_workflow(before.revision.fence.key), "new", ResolveStage.RESOLVE, historical=True)
     latest = adapter(control).record_attempt(latest_result).snapshot
     forged_proof = ResolveAdmission(result.attempt, latest.revision, result.stage, input_fingerprint="a" * 64)
     forged = record_resolve_attempt(latest, result, ceiling=3, admission=forged_proof)
@@ -730,7 +752,7 @@ def test_real_multiple_author_successes_and_blocked_resume_converge_independentl
     results = []
     for name, stage in (("author-one", ResolveStage.AUTHOR), ("author-two", ResolveStage.AUTHOR),
                         ("implement", ResolveStage.IMPLEMENT), ("resume", ResolveStage.RESUME)):
-        result = paid_result(control, current, name, stage)
+        result = paid_result(control, current, name, stage, historical=stage is ResolveStage.RESUME)
         results.append(replace(result, kind=ResolveResultKind.BLOCKED) if stage is ResolveStage.RESUME else result)
         current = adapter(control).load_workflow(current.revision.fence.key)
     for index in order:
@@ -939,7 +961,7 @@ def test_reconstructed_request_replays_original_acceptance_after_fresh_observati
     reconstructed = enrich(request_resolve_rearm(
         before, original.audit.command, ACTOR,
         observation(before, at=later), NoLinkedPr(before.revision.fence.key, later),
-        now=later, active_attempts=(),
+        now=later, active_attempts=(), workspace=workspace_observation(before.binding, later),
     ))
     reconstructed = replace(reconstructed, commands=(replace(reconstructed.commands[0], config_version="new-config"),))
     reopened_store = SQLiteControlStore(control.path, now=lambda: later)
@@ -1039,7 +1061,7 @@ def test_acceptance_checks_real_active_runs_and_leases(control, status, lease):
     if lease:
         with control.transaction() as db:
             db.execute("INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, started_at) VALUES ('run:1', 'dispatch', ?, 1, 1, ?)", (WRITER.owner_id, NOW.isoformat()))
-    with pytest.raises(WorkflowAuthorityError, match="active admitted"):
+    with pytest.raises(WorkflowAuthorityError, match="requires drained"):
         commit(control, request(before))
     assert adapter(control).load_workflow(before.revision.fence.key) == before
 
@@ -1103,8 +1125,9 @@ def test_cancel_pending_obligation_is_audited_and_never_reexecutes(control):
     assert state.episode == pending.episode
     row = command_row(control, proposal.commands[0].command_id)
     assert isinstance(decode_workflow(row["workflow_reconciliation_json"], RetiredSettledCommand), RetiredSettledCommand)
-    with pytest.raises(ControlStoreError, match="retired"):
+    with pytest.raises((ControlStoreError, WorkflowAuthorityError), match="retired|pending authorized"):
         control.begin_command(proposal.commands[0].command_id)
+    assert command_row(control, proposal.commands[0].command_id)["attempts"] == 0
     continued = enrich(continue_resolve_rearm(
         state, ContinueGrantedRearm("continue", state.revision, "request:1"), ACTOR,
         observation(state), NoLinkedPr(state.revision.fence.key, NOW), now=NOW, active_attempts=(),
@@ -1119,6 +1142,10 @@ def test_cancel_unknown_retains_uncertainty_receipt_and_stops_new_writes(control
     proposal = request(before)
     pending = commit(control, proposal).snapshot
     command_id = proposal.commands[0].command_id
+    with pytest.raises(ControlStoreError, match="awaits verified workspace"):
+        control.begin_command(command_id)
+    assert command_row(control, command_id)["attempts"] == 0
+    prepare_workspace(control, pending)
     control.begin_command(command_id)
     receipt = EffectReceipt(command_id, WRITER.owner_id, NOW, NOW, EffectStatus.UNKNOWN_OUTCOME, error="connection lost")
     control.record_effect(receipt)
@@ -1132,7 +1159,7 @@ def test_cancel_unknown_retains_uncertainty_receipt_and_stops_new_writes(control
     retired = decode_workflow(command_row(control, command_id)["workflow_reconciliation_json"], RetiredUncertainCommand)
     assert retired.uncertainty.history.failed_reads == 3
     assert adapter(control).held_projection(before.revision.fence.key).held
-    with pytest.raises(ControlStoreError, match="retired"):
+    with pytest.raises((ControlStoreError, WorkflowAuthorityError), match="retired|pending authorized"):
         control.begin_command(command_id)
 
 
@@ -1142,9 +1169,11 @@ def test_completion_requires_durable_evidence_and_success_receipt(control):
     proposal = request(before)
     pending = commit(control, proposal).snapshot
     command_id = proposal.commands[0].command_id
+    workspace = prepare_workspace(control, pending)
     complete = complete_resolve_rearm(
         pending, observation(pending, frozenset({Label.AI_READY})), NoLinkedPr(pending.revision.fence.key, NOW),
         verified_commands=(command_id,), evidence_ids=("observation:1",), now=NOW,
+        workspace=workspace,
     )
     with pytest.raises(WorkflowAuthorityError, match="evidence"):
         commit(control, complete)
@@ -1195,11 +1224,13 @@ def test_completed_receipt_cannot_override_fresh_remote_hold_evidence(control):
     proposal = request(before)
     pending = commit(control, proposal).snapshot
     command_id = proposal.commands[0].command_id
+    workspace = prepare_workspace(control, pending)
     control.begin_command(command_id)
     control.record_effect(EffectReceipt(command_id, WRITER.owner_id, NOW, NOW, EffectStatus.SUCCEEDED))
     complete = complete_resolve_rearm(
         pending, observation(pending, frozenset({Label.AI_READY})), NoLinkedPr(pending.revision.fence.key, NOW),
         verified_commands=(command_id,), evidence_ids=("observation:1",), now=NOW,
+        workspace=workspace,
     )
     evidence(control, pending, payload=ResolveRearmPreflight(observation(pending), NoLinkedPr(pending.revision.fence.key, NOW)))
     with pytest.raises(ValueError, match="authorized state"):
@@ -1244,6 +1275,7 @@ def test_required_effect_rejection_cannot_be_faked_by_an_observation(control):
     with pytest.raises(WorkflowAuthorityError, match="exact required"):
         commit(control, stopped)
     command_id = proposal.commands[0].command_id
+    prepare_workspace(control, pending)
     control.begin_command(command_id)
     receipt = EffectReceipt(command_id, WRITER.owner_id, NOW, NOW, EffectStatus.PERMANENT_FAILURE, error="stale revision")
     control.record_effect(receipt)
@@ -1287,7 +1319,10 @@ def test_old_generation_result_is_audited_but_never_charges_renewed_allowance(co
     before = held()
     install_workflow(control, before)
     late = run(control, before)
-    current = commit(control, request(before)).snapshot
+    current = commit(control, request(
+        before,
+        predecessor=PriorResolveAdmission(late.attempt, admission(before, late).revision.version),
+    )).snapshot
     recorded = adapter(control).record_attempt(late)
     assert recorded.snapshot.episode == current.episode
     assert recorded.snapshot.revision == current.revision
@@ -1325,6 +1360,7 @@ def test_workflow_progression_refuses_foreign_persisted_receipt_executor(control
     proposal = request(before)
     pending = commit(control, proposal).snapshot
     command_id = proposal.commands[0].command_id
+    workspace = prepare_workspace(control, pending)
     control.begin_command(command_id)
     control.record_effect(EffectReceipt(command_id, WRITER.owner_id, NOW, NOW, status,
                                        error=None if status is EffectStatus.SUCCEEDED else "failed"))
@@ -1336,7 +1372,7 @@ def test_workflow_progression_refuses_foreign_persisted_receipt_executor(control
         evidence(control, pending)
         transition = complete_resolve_rearm(pending, observation(pending, frozenset({Label.AI_READY})),
             NoLinkedPr(pending.revision.fence.key, NOW), verified_commands=(command_id,),
-            evidence_ids=("observation:1",), now=NOW)
+            evidence_ids=("observation:1",), now=NOW, workspace=workspace)
     elif status is EffectStatus.PERMANENT_FAILURE:
         evidence(control, pending, payload=observation(pending))
         transition = supersede_resolve_rearm(pending, StopReason.REQUIRED_EFFECT_REJECTED, "observation:1")
@@ -1355,6 +1391,7 @@ def test_terminal_receipt_remains_valid_after_audited_command_owner_adoption(con
     proposal = request(before)
     pending = commit(control, proposal).snapshot
     command_id = proposal.commands[0].command_id
+    workspace = prepare_workspace(control, pending)
     control.begin_command(command_id)
     receipt = EffectReceipt(command_id, WRITER.owner_id, NOW, NOW, status,
                             error=None if status is EffectStatus.SUCCEEDED else "stale revision")
@@ -1365,7 +1402,7 @@ def test_terminal_receipt_remains_valid_after_audited_command_owner_adoption(con
         evidence(control, pending)
         transition = complete_resolve_rearm(pending, observation(pending, frozenset({Label.AI_READY})),
             NoLinkedPr(pending.revision.fence.key, NOW), verified_commands=(command_id,),
-            evidence_ids=("observation:1",), now=NOW)
+            evidence_ids=("observation:1",), now=NOW, workspace=workspace)
     else:
         evidence(control, pending, payload=observation(pending))
         transition = supersede_resolve_rearm(pending, StopReason.REQUIRED_EFFECT_REJECTED, "observation:1")
@@ -1384,6 +1421,7 @@ def test_unknown_receipt_retains_original_executor_after_active_command_adoption
     proposal = request(before)
     pending = commit(control, proposal).snapshot
     command_id = proposal.commands[0].command_id
+    prepare_workspace(control, pending)
     control.begin_command(command_id)
     receipt = EffectReceipt(command_id, WRITER.owner_id, NOW, NOW, EffectStatus.UNKNOWN_OUTCOME, error="lost connection")
     control.record_effect(receipt)

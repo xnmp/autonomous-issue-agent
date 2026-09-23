@@ -9,7 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
-from contextlib import closing, contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -25,11 +25,15 @@ from ..domain.resolve_split import (
     ContractRevision, NeedsAdjudication, ReauthorInput, ReauthorResetIntent, ResetIntent,
     SplitContext, SplitImplement, split_context, validate_contract_rounds,
 )
+from ..domain.resolve_workspace import (
+    EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared, NoPriorResolveAdmission,
+    ObservedResolveBase, PriorResolveAdmission, ResolveWorkspaceObserved,
+)
 from ..domain.workflow import (
     AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, HeldProjection, LinkedPrPresent, NoLinkedPr, ObservedIssue, ObservedTransition, OpenGate,
     PendingRearm, RearmingGate, RearmIntent, RemoteOutcomeUncertain,
-    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmPreflight, ResolveResultKind, ResolveStage,
+    RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind, ResolveStage,
     StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
     WorkflowConflict, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
     WorkflowUnchanged, WorkflowRejected,
@@ -43,11 +47,19 @@ from ..domain.workflow_policy import (
     reauthor_baseline, record_resolve_attempt, resolve_return_actions, return_gate_id,
     update_return_observation, validate_resolve_transition, split_return_continuation,
 )
-from .control_store import AccountingDisposition, SettlementRequest, SettlementResult, SQLiteControlStore, _command_from_row, admitted_adjudications, latest_work_admission, proven_unlaunched_run, reset_predecessor_admission
+from .control_store import (
+    AccountingDisposition, SettlementRequest, SettlementResult, SQLiteControlStore,
+    _command_from_row, admitted_adjudications, latest_work_admission,
+    proven_unlaunched_run, require_workspace_predecessor, reset_predecessor_admission,
+    target_has_work_admissions, workflow_run_scope_bounds,
+)
 from .effects import command_for_action
 from .deployment_authority import DeploymentAuthority, deployment_role, deployment_effect_barrier
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, load_workflow_row, workflow_scope
+from .workflow_rows import (
+    WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, load_workflow_row,
+    load_workspace_ack, workflow_scope,
+)
 
 
 def _opened(gate: OpenGate | RearmingGate) -> OpenGate:
@@ -570,6 +582,10 @@ class SQLiteWorkflowControl:
         continuation = state.episode.continuation
         if isinstance(continuation, AuthoredResolve) and continuation.author_admission.input_fingerprint == input_fingerprint:
             raise WorkflowAuthorityError("applicable author inputs do not require replacement")
+        workspace_predecessor = require_workspace_predecessor(db, state)
+        if (workspace_predecessor is not None
+                and workspace_predecessor.attempt.binding.episode_id != binding.episode_id):
+            return None
         latest = reset_predecessor_admission(db, binding)
         if latest is None:
             if isinstance(continuation, AuthoredResolve):
@@ -636,6 +652,207 @@ class SQLiteWorkflowControl:
         if disposition.result.attempt != latest.attempt or disposition.result.split != intent.petition:
             raise WorkflowAuthorityError("contract reset predecessor does not own this petition")
         return state
+
+    @contextmanager
+    def _rearm_barriers(self):
+        """Workspace I/O requires all resolve-adjacent deployments quiescent."""
+        with ExitStack() as barriers:
+            for role in ("fix", "review", "steward"):
+                barriers.enter_context(deployment_effect_barrier(
+                    self._control.path, self.writer.repository, role,
+                ))
+            yield
+
+    def _assert_target_quiescent(self, db: sqlite3.Connection, key: WorkflowKey) -> None:
+        lower, upper = workflow_run_scope_bounds(key)
+        active = db.execute(
+            "SELECT 1 FROM runs r LEFT JOIN leases l USING(run_id) "
+            "LEFT JOIN budget_reservations b USING(run_id) "
+            "WHERE r.workflow_episode_key>=? AND r.workflow_episode_key<? "
+            "AND (r.state IN ('reserved','starting','running') OR l.run_id IS NOT NULL "
+            "OR b.state='active') LIMIT 1",
+            (lower, upper),
+        ).fetchone()
+        if active is not None:
+            raise WorkflowAuthorityError(
+                "workspace authority requires drained runs, leases and reservations"
+            )
+        pending_return = db.execute(
+            "SELECT 1 FROM runs r INDEXED BY runs_workflow_scope CROSS JOIN dedupe_keys captured "
+            "ON captured.namespace='workflow-return' AND captured.scope=? "
+            "AND captured.key=r.run_id LEFT JOIN dedupe_keys finalized "
+            "ON finalized.namespace='workflow-return-disposition' "
+            "AND finalized.scope=? AND finalized.key=r.run_id "
+            "WHERE r.workflow_episode_key>=? AND r.workflow_episode_key<? "
+            "AND finalized.key IS NULL LIMIT 1",
+            (self.writer.repository, self.writer.repository, lower, upper),
+        ).fetchone()
+        if pending_return is not None:
+            raise WorkflowAuthorityError(
+                "workspace authority requires every captured paid return finalized"
+            )
+        # Match TEXT affinity on both sides so SQLite probes the partial index;
+        # an uncast JSON expression makes this join scan retained publications.
+        publication = db.execute(
+            "SELECT 1 FROM runs r INDEXED BY runs_workflow_scope "
+            "CROSS JOIN lifecycle_commands c INDEXED BY lifecycle_publication_runs "
+            "ON r.run_id=CAST(json_extract(c.payload_json,'$.run_id') AS TEXT) "
+            "WHERE c.repository=? AND c.kind IN ('publish_branch','open_pull_request','update_pull_request_body') "
+            "AND c.state NOT IN ('succeeded','permanent_failure') "
+            "AND r.workflow_episode_key>=? AND r.workflow_episode_key<? LIMIT 1",
+            (self.writer.repository, lower, upper),
+        ).fetchone()
+        if publication is not None:
+            raise WorkflowAuthorityError(
+                "workspace authority requires every publication effect resolved"
+            )
+
+    def _workspace_predecessor(
+        self, db: sqlite3.Connection, state: WorkflowSnapshot,
+        binding: WorkflowBinding, branch: str,
+    ) -> NoPriorResolveAdmission | PriorResolveAdmission:
+        latest = latest_work_admission(db, binding)
+        if latest is None:
+            if target_has_work_admissions(db, binding.fence.key):
+                raise WorkflowAuthorityError(
+                    "workspace predecessor pointer is missing from retained admissions"
+                )
+            return NoPriorResolveAdmission(binding)
+        if latest.revision.version > state.revision.version:
+            raise WorkflowAuthorityError(
+                "workspace predecessor belongs to a future workflow revision"
+            )
+        row = db.execute(
+            "SELECT dispatch_id FROM runs WHERE run_id=?",
+            (str(latest.attempt.run_id),),
+        ).fetchone()
+        try:
+            metadata = json.loads(row["dispatch_id"]) if row is not None else None
+        except (ValueError, TypeError):
+            metadata = None
+        if not isinstance(metadata, dict) or metadata.get("publication_branch") != branch:
+            raise WorkflowAuthorityError(
+                "workspace branch lacks exact admitted publication provenance"
+            )
+        return PriorResolveAdmission(latest.attempt, latest.revision.version)
+
+    def _assert_workspace_predecessor(
+        self, db: sqlite3.Connection, state: WorkflowSnapshot,
+        handoff: EpisodeWorkspaceHandoff,
+    ) -> None:
+        if self._workspace_predecessor(db, state, handoff.source, handoff.branch) != handoff.predecessor:
+            raise WorkflowAuthorityError(
+                "workspace handoff predecessor changed after observation"
+            )
+
+    def _pending_handoff(
+        self, db: sqlite3.Connection, expected: WorkflowRevision, handoff_id: str,
+    ) -> tuple[WorkflowSnapshot, EpisodeWorkspaceHandoff]:
+        self._scope(expected.fence.key)
+        validate_workflow_identifier(handoff_id, "workspace handoff")
+        self._control._assert_owner_active(db, self.writer.owner_id)
+        state = load_workflow_row(db, expected.fence.key)
+        if state is None or state.revision != expected or not isinstance(state.intent, PendingRearm):
+            raise WorkflowAuthorityError(
+                "workspace preparation requires the exact current pending re-arm"
+            )
+        handoff = state.intent.handoff
+        if handoff.handoff_id != handoff_id:
+            raise WorkflowAuthorityError("workspace preparation names another handoff")
+        self._assert_target_quiescent(db, expected.fence.key)
+        self._assert_workspace_predecessor(db, state, handoff)
+        return state, handoff
+
+    @contextmanager
+    def rearm_authority(self, expected: WorkflowRevision):
+        """Fence remote observation; callers perform no SQLite work while yielded."""
+        if not isinstance(expected, WorkflowRevision):
+            raise ValueError("re-arm authority requires a typed revision")
+        self._scope(expected.fence.key)
+        with self._rearm_barriers():
+            with self._control.transaction() as db:
+                self._control._assert_owner_active(db, self.writer.owner_id)
+                state = load_workflow_row(db, expected.fence.key)
+                if state is None or state.revision != expected:
+                    raise WorkflowAuthorityError(
+                        "re-arm authority requires the exact current workflow revision"
+                    )
+                self._assert_target_quiescent(db, expected.fence.key)
+            yield state
+
+    def observe_workspace(
+        self, binding: WorkflowBinding, base: ObservedResolveBase, branch: str,
+    ) -> ResolveWorkspaceObserved:
+        """Mint observed workspace evidence while the caller holds rearm_authority."""
+        if not isinstance(binding, WorkflowBinding) or not isinstance(base, ObservedResolveBase):
+            raise ValueError("workspace observation requires typed binding and base")
+        self._scope(binding.fence.key)
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            state = load_workflow_row(db, binding.fence.key)
+            if state is None or state.binding != binding:
+                raise WorkflowAuthorityError(
+                    "workspace observation requires the exact current workflow binding"
+                )
+            self._assert_target_quiescent(db, binding.fence.key)
+            predecessor = self._workspace_predecessor(db, state, binding, branch)
+            return ResolveWorkspaceObserved(binding, predecessor, branch, base)
+
+    @contextmanager
+    def workspace_handoff_authority(
+        self, handoff_id: str, expected: WorkflowRevision,
+    ):
+        """Fence preparation and yield outside SQL; callers then perform local Git I/O."""
+        if not isinstance(expected, WorkflowRevision):
+            raise ValueError("workspace preparation requires a typed revision")
+        with self._rearm_barriers():
+            with self._control.transaction() as db:
+                _, handoff = self._pending_handoff(db, expected, handoff_id)
+                acknowledgement = load_workspace_ack(db, handoff)
+            yield acknowledgement
+
+    def complete_workspace_handoff(
+        self, completed: EpisodeWorkspacePrepared,
+    ) -> EpisodeWorkspacePrepared:
+        """Persist verified preparation while workspace_handoff_authority remains held."""
+        if not isinstance(completed, EpisodeWorkspacePrepared):
+            raise ValueError("workspace completion requires verified preparation evidence")
+        handoff = completed.handoff
+        self._scope(handoff.destination.fence.key)
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            state = load_workflow_row(db, handoff.destination.fence.key)
+            if state is None or not isinstance(state.intent, PendingRearm) or state.intent.handoff != handoff:
+                raise WorkflowAuthorityError(
+                    "workspace completion requires its exact current pending re-arm"
+                )
+            self._assert_target_quiescent(db, handoff.destination.fence.key)
+            self._assert_workspace_predecessor(db, state, handoff)
+            prior = load_workspace_ack(db, handoff)
+            if prior is not None:
+                if prior.handoff != completed.handoff or prior.result != completed.result:
+                    raise WorkflowAuthorityError(
+                        "workspace completion disagrees with retained evidence"
+                    )
+                return prior
+            if completed.performed_under != state.binding:
+                raise WorkflowAuthorityError(
+                    "workspace completion was not verified under current authority"
+                )
+            if not 0 <= (self._control._now() - completed.observed_at).total_seconds() <= 300:
+                raise WorkflowAuthorityError("workspace completion evidence is not fresh")
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,?,?,?,?)",
+                (WORKSPACE_ACK_NAMESPACE, self.writer.repository, handoff.handoff_id,
+                 completed.observed_at.isoformat(), encode_workflow(completed)),
+            )
+            self._control._transition(
+                db, "workflow_workspace", handoff.handoff_id, "verified",
+                {"archive_ref": completed.result.archive_ref,
+                 "generation": completed.performed_under.fence.generation},
+            )
+            return completed
 
     @contextmanager
     def contract_reset_authority(self, intent: ResetIntent):
@@ -785,27 +1002,27 @@ class SQLiteWorkflowControl:
         audit = proposal.audit
         scope = workflow_scope(prior.revision.fence.key)
         if isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, (RequestRearm, ContinueGrantedRearm)):
-            for row in db.execute(
-                "SELECT runs.workflow_binding_json, runs.dispatch_id FROM runs LEFT JOIN leases USING(run_id) "
-                "WHERE (runs.state IN ('reserved', 'starting', 'running') OR leases.run_id IS NOT NULL) "
-                "AND (runs.owner_id=? OR substr(runs.owner_id, 1, ?)=?)",
-                (self.writer.repository, len(self.writer.repository) + 1, self.writer.repository + ":"),
-            ):
-                if row["workflow_binding_json"] is not None:
-                    binding = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
-                    if binding.fence.key == prior.revision.fence.key:
-                        raise WorkflowAuthorityError("workflow has an active admitted run or process lease")
-                else:
-                    # Legacy live runs are fenced by the same repository/issue
-                    # metadata; migration must not conceal an undrained writer.
-                    try:
-                        metadata = json.loads(row["dispatch_id"])
-                    except (ValueError, TypeError):
-                        raise WorkflowAuthorityError("active run lacks verifiable workflow scope") from None
-                    if not isinstance(metadata, dict):
-                        raise WorkflowAuthorityError("active run lacks verifiable workflow scope")
-                    if metadata.get("repository") == scope[0] and (metadata.get("issue") == scope[2] or metadata.get("number") == scope[2]):
-                        raise WorkflowAuthorityError("workflow has an undrained legacy run")
+            self._assert_target_quiescent(db, prior.revision.fence.key)
+            if isinstance(audit.command, RequestRearm):
+                if not isinstance(audit.preflight, ResolveRearmAcceptance):
+                    raise WorkflowAuthorityError(
+                        "re-arm request lacks its accepted workspace observation"
+                    )
+                observed = audit.preflight.workspace
+                if observed.source != prior.binding:
+                    raise WorkflowAuthorityError(
+                        "workspace observation no longer names the current source binding"
+                    )
+                if self._workspace_predecessor(db, prior, observed.source, observed.branch) != observed.predecessor:
+                    raise WorkflowAuthorityError(
+                        "workspace observation predecessor changed before acceptance"
+                    )
+            else:
+                if not isinstance(prior.intent, (CancelledRearm, SupersededRearm)):
+                    raise WorkflowAuthorityError(
+                        "continued re-arm lacks its stopped workspace handoff"
+                    )
+                self._assert_workspace_predecessor(db, prior, prior.intent.handoff)
         observations: list[ResolveRearmPreflight | ObservedIssue | LinkedPrPresent] = []
         if isinstance(audit, ObservedTransition):
             for evidence_id in audit.evidence_ids:
@@ -820,6 +1037,12 @@ class SQLiteWorkflowControl:
                         raise WorkflowAuthorityError("workflow progression requires an observation evidence variant")
                     observations.append(decode_workflow(row["payload_json"], ResolveRearmPreflight | ObservedIssue | LinkedPrPresent))
         intent = proposal.snapshot.intent
+        if isinstance(intent, CompletedRearm):
+            acknowledgement = load_workspace_ack(db, intent.handoff)
+            if acknowledgement is None or acknowledgement != intent.workspace:
+                raise WorkflowAuthorityError(
+                    "re-arm completion lacks its exact persisted workspace acknowledgement"
+                )
         if isinstance(intent, (CompletedRearm, CancelledRearm, SupersededRearm)):
             for command_id in intent.verified_commands:
                 row = db.execute(

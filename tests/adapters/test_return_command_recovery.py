@@ -21,9 +21,10 @@ from issue_agent.domain.workflow import (
 )
 from tests.adapters.test_effects import Gateway
 from tests.adapters.test_workflow_control import (
-    NOW, WRITER, adapter, command_row, commit, paid_result, paid_return,
-    request, return_observations,
+    NOW, WRITER, adapter, command_row, commit, paid_result, paid_return, prepare_workspace,
+    return_observations,
 )
+from tests.adapters.test_workspace_handoff_control import _observed_request
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 
@@ -60,7 +61,7 @@ def rearm(control, snapshot):
     for index in range(2):
         result = paid_result(control, snapshot, f"next-{index}", ResolveStage.RESOLVE)
         snapshot = adapter(control).record_attempt(replace(result, kind=ResolveResultKind.COUNTED_REQUEUE)).snapshot
-    renewed = commit(control, request(snapshot))
+    renewed = commit(control, _observed_request(control, snapshot))
     assert isinstance(renewed, WorkflowCommitted)
     assert renewed.snapshot.binding.fence.generation == snapshot.binding.fence.generation + 1
     return renewed.snapshot
@@ -161,7 +162,7 @@ def test_reconciliation_only_absence_does_not_authorize_write_and_obeys_due_time
 
 def test_corrupt_command_does_not_starve_a_healthy_command(control):
     snapshot, command = finalized(control)
-    rearm(control, snapshot)
+    prepare_workspace(control, rearm(control, snapshot))
     with control.transaction() as db:
         db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json='{}' WHERE command_id=?", (str(command.command_id),))
     logs = []

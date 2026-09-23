@@ -12,10 +12,14 @@ remains incomplete.
 The subsequent split-recovery checkpoint `73c63bb` also passed the final full suite and
 independent review, including replacement-author isolation. Its handover above
 records the remaining re-arm/activation work. The bounded-adjudication-query
-gap was subsequently closed by `4685ef0`; workspace preparation is the current
-verified checkpoint, with production re-arm wiring still outstanding. The
-checkpoint passed independent adversarial review and full `make test`; it adds
-no live activation or self-authorizing workspace reset API.
+gap was subsequently closed by `4685ef0`; workspace preparation at `8552c2a`
+preceded the current durable-handoff authority checkpoint. It binds re-arm policy,
+persisted preparation acknowledgement, quiescence, paid admission and projection
+commands to that exact handoff. Independent review and full `make test` passed:
+1,592 domain, 1,695 adapter and 2,421 app tests, plus all remaining checks.
+Log: `/tmp/phase3-durable-handoff-full-second.log`. Production operator/daemon
+wiring, first-entry Git verification and activation/import remain outstanding;
+this is not full vertical-slice acceptance or live activation.
 Implementation and its phase agent are authorized to resume;
 live operation and live migrations remain paused. Phase 3 must be accepted before
 phase 4 starts. The six-phase goal remains incomplete.
@@ -41,6 +45,20 @@ is an obligation, not execution authority: callers must hold the existing
 exclusive deployment barrier and establish quiescence before Git mutation.
 Use `uv`, Pyrefly, `apply_patch`, isolated repos/databases, and no agent commits
 or live operations. Independent review and full `make test` precede integration.
+
+Re-arm integration collaboration brief: the parent owns workspace/workflow
+values, codec, ports, admission/command guards and application composition.
+Astra owns the pure request/continue/stop/complete policy and domain tests;
+the adapter agent owns agreed SQLite acceptance, quiescence and acknowledgement
+methods and tests. A Request-only acceptance wrapper joins fresh remote facts
+to observed workspace input. Every intent retains the original handoff;
+continuation cannot renew allowance or replace that handoff. Existing dedupe
+receipts and deployment barriers own preparation acknowledgement—no new queue,
+schema authority or mutable readiness flag. Production effects and paid admission
+must require the persisted acknowledgement, not a constructed value. Domain is
+pure, adapters perform I/O, app composes; use `uv`, Pyrefly and `apply_patch`,
+isolated tests, no agent commits or live operations. Parent integrates only after
+independent adversarial review and full `make test`.
 
 Split-recovery collaboration brief (current increment): new bounded cursor,
 reply/selection/trail and exact contract/reset values live in

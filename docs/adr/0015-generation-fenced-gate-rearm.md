@@ -349,7 +349,8 @@ cannot mint an allowance renewal or authorize review dismissal.
 
 Schema changes are additive and versioned by the parent in the next available
 control-store migrations (v19 installs workflow foundations; v20 indexes admitted
-episode work and backfills only validated immutable historical bindings).
+episode work and backfills only validated immutable historical bindings; v21
+indexes existing target run scope and unresolved publication run identities).
 Family activation is scoped to canonical repository plus family and records
 epoch, source digest, verified deployment inventory and imported targets.
 Schema installation is not family activation. Live authority must not be
@@ -357,7 +358,9 @@ initialized or migrated during the deployment pause; tests use isolated DBs.
 
 Before activation, inventory every writer and custom role-state path for the
 selected repository/family, stop affected admission and drain or durably
-recover runs, leases and commands. Shadow-read old authority into a comparison
+recover runs, leases and commands. Unbound legacy runs must be refused, drained or explicitly
+mapped; indexed bound-workflow queries cannot establish their quiescence.
+Shadow-read old authority into a comparison
 artifact: absent is distinct from corrupt/unreadable, and all discovered keys
 are checked, including unlabelled held targets. Compare cause, allowance and
 eligibility under the same observations. Shadow data makes no decisions.

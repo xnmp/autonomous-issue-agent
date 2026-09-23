@@ -18,6 +18,10 @@ from .workflow_identity import (
 from .world import Comment, IssueView
 from .labels import Label
 from .resolve_split import NeedsAdjudication, SplitContinuation, SplitImplement, split_sources
+from .resolve_workspace import (
+    EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared, PrepareResolveWorkspace,
+    ResolveWorkspaceObserved,
+)
 
 GUIDANCE_MAX_CHARS = 4000
 MAX_DETAIL_CHARS = 16384
@@ -452,7 +456,7 @@ class EnsureLifecycleProjection:
             raise ValueError("resolve projection requires an issue target")
 
 
-RearmOperation = RenewResolveAllowance | EnsureLifecycleProjection
+RearmOperation = RenewResolveAllowance | PrepareResolveWorkspace | EnsureLifecycleProjection
 
 
 @dataclass(frozen=True)
@@ -471,12 +475,32 @@ class PendingRearm:
         _count(self.to_generation, "rearm generation", minimum=1)
         if self.to_generation != self.from_generation + 1:
             raise ValueError("a rearm advances generation exactly once")
-        _items(self.operations, "operations", (RenewResolveAllowance, EnsureLifecycleProjection), 2)
+        _items(self.operations, "operations", (RenewResolveAllowance, PrepareResolveWorkspace, EnsureLifecycleProjection), 3)
         if sum(isinstance(item, EnsureLifecycleProjection) for item in self.operations) != 1:
             raise ValueError("resolve rearm requires exactly one lifecycle projection obligation")
+        if sum(isinstance(item, PrepareResolveWorkspace) for item in self.operations) != 1:
+            raise ValueError("resolve rearm requires exactly one workspace preparation obligation")
+        renewals = tuple(item for item in self.operations if isinstance(item, RenewResolveAllowance))
+        if len(renewals) > 1:
+            raise ValueError("resolve rearm cannot grant multiple allowances")
+        handoff = self.handoff
+        if renewals:
+            if (handoff.grant_request_id != self.request_id
+                    or handoff.source.fence.generation != self.from_generation
+                    or handoff.destination.fence.generation != self.to_generation
+                    or renewals[0].episode_id != handoff.destination.episode_id):
+                raise ValueError("allowance renewal must own its exact workspace handoff")
+        elif handoff.destination.fence.generation >= self.to_generation or handoff.grant_request_id == self.request_id:
+            raise ValueError("continued rearm must retain an earlier granted workspace handoff")
+        if any(isinstance(item, EnsureLifecycleProjection) and item.target != handoff.destination.fence.key.target for item in self.operations):
+            raise ValueError("projection and workspace obligations must belong to one target")
         _command_ids(self.required_commands, "required commands")
         if not self.required_commands:
             raise ValueError("pending rearm requires durable command obligations")
+
+    @property
+    def handoff(self) -> EpisodeWorkspaceHandoff:
+        return next(item.handoff for item in self.operations if isinstance(item, PrepareResolveWorkspace))
 
 
 @dataclass(frozen=True)
@@ -485,12 +509,19 @@ class CompletedRearm:
     gate_id: str
     to_generation: int
     verified_commands: tuple[CommandId, ...]
+    workspace: EpisodeWorkspacePrepared
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
         _text(self.gate_id, "gate")
         _count(self.to_generation, "rearm generation", minimum=1)
         _command_ids(self.verified_commands, "verified commands")
+        if not isinstance(self.workspace, EpisodeWorkspacePrepared) or self.workspace.performed_under.fence.generation > self.to_generation:
+            raise ValueError("completed rearm requires a nonfuture verified workspace")
+
+    @property
+    def handoff(self) -> EpisodeWorkspaceHandoff:
+        return self.workspace.handoff
 
 
 @dataclass(frozen=True)
@@ -502,6 +533,7 @@ class SupersededRearm:
     evidence_id: str
     verified_commands: tuple[CommandId, ...]
     retired_obligations: tuple[CommandId, ...]
+    handoff: EpisodeWorkspaceHandoff
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
@@ -514,6 +546,8 @@ class SupersededRearm:
         _command_ids(self.retired_obligations, "retired obligations")
         if set(self.verified_commands) & set(self.retired_obligations):
             raise ValueError("a verified obligation cannot also be retired")
+        if not isinstance(self.handoff, EpisodeWorkspaceHandoff) or self.handoff.destination.fence.generation > self.to_generation:
+            raise ValueError("superseded rearm requires its original workspace handoff")
 
 
 @dataclass(frozen=True)
@@ -525,6 +559,7 @@ class CancelledRearm:
     reason: str
     verified_commands: tuple[CommandId, ...]
     retired_obligations: tuple[CommandId, ...]
+    handoff: EpisodeWorkspaceHandoff
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
@@ -536,6 +571,8 @@ class CancelledRearm:
         _command_ids(self.retired_obligations, "retired obligations")
         if set(self.verified_commands) & set(self.retired_obligations):
             raise ValueError("a verified obligation cannot also be retired")
+        if not isinstance(self.handoff, EpisodeWorkspaceHandoff) or self.handoff.destination.fence.generation > self.to_generation:
+            raise ValueError("cancelled rearm requires its original workspace handoff")
 
 
 RearmIntent = PendingRearm | CompletedRearm | SupersededRearm | CancelledRearm
@@ -603,6 +640,12 @@ class WorkflowSnapshot:
             raise ValueError("rearming gate requires a pending owning intent")
         if self.intent is not None and self.intent.to_generation > self.revision.fence.generation:
             raise ValueError("intent cannot belong to a future generation")
+        if self.intent is not None:
+            destination = self.intent.handoff.destination
+            if (destination.fence.key != self.revision.fence.key or destination.authority != self.authority
+                    or destination.episode_id != self.episode.episode_id
+                    or destination.fence.generation > self.intent.to_generation):
+                raise ValueError("rearm workspace handoff must belong to the current episode")
 
     @property
     def binding(self) -> WorkflowBinding:
@@ -742,6 +785,30 @@ class ResolveRearmPreflight:
         _items(self.external_holds, "external holds", (str,), MAX_WORKFLOW_GATES)
         for hold in self.external_holds:
             _text(hold, "external hold", limit=MAX_DETAIL_CHARS)
+
+
+@dataclass(frozen=True)
+class ResolveRearmAcceptance:
+    preflight: ResolveRearmPreflight
+    workspace: ResolveWorkspaceObserved
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.preflight, ResolveRearmPreflight)
+                or not isinstance(self.workspace, ResolveWorkspaceObserved)
+                or self.workspace.source.fence.key != self.preflight.issue.key):
+            raise ValueError("rearm acceptance requires matching remote and workspace observations")
+
+    @property
+    def issue(self) -> ObservedIssue:
+        return self.preflight.issue
+
+    @property
+    def linkage(self) -> NoLinkedPr:
+        return self.preflight.linkage
+
+    @property
+    def external_holds(self) -> tuple[str, ...]:
+        return self.preflight.external_holds
 
 
 @dataclass(frozen=True)
@@ -962,14 +1029,18 @@ class WorkflowMutation(str, Enum):
 class AuthorizedOperatorCommand:
     actor: OperatorActor
     command: OperatorCommand
-    preflight: ResolveRearmPreflight | None = None
+    preflight: ResolveRearmPreflight | ResolveRearmAcceptance | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.actor, OperatorActor) or not isinstance(
             self.command, (RequestRearm, ContinueGrantedRearm, CancelRearm, AuthorizeAbsentRetry)
         ):
             raise ValueError("operator transition requires authenticated actor and typed command")
-        if isinstance(self.command, (RequestRearm, ContinueGrantedRearm)):
+        if isinstance(self.command, RequestRearm):
+            if (not isinstance(self.preflight, ResolveRearmAcceptance)
+                    or self.preflight.workspace.source.fence != self.command.expected.fence):
+                raise ValueError("new allowance requires this workflow's observed workspace acceptance")
+        elif isinstance(self.command, ContinueGrantedRearm):
             if not isinstance(self.preflight, ResolveRearmPreflight) or self.preflight.issue.key != self.command.expected.fence.key:
                 raise ValueError("rearm authorization requires this workflow's harness preflight")
         elif self.preflight is not None:

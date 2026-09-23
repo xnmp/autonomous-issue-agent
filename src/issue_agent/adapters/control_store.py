@@ -39,13 +39,14 @@ from ..domain.contracts import (
     TokenUsage,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import WorkflowBinding, WorkflowRevision, validate_workflow_integer
+from ..domain.workflow_identity import WorkflowBinding, WorkflowKey, WorkflowRevision, validate_workflow_integer
 from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation,
     NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
     RemoteOutcomeUncertain, RetiredSettledCommand, RetiredUncertainCommand, RetryAuthorizationRequired,
-    AuthoredResolve, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
+    AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
+from ..domain.resolve_workspace import PriorResolveAdmission
 from ..domain.workflow_reconciliation import ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
 from ..domain.outcome import AuthorFollowup, author_followup
@@ -75,9 +76,9 @@ from .deployment_authority import (
     deployment_role,
 )
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, load_workflow_row, require_workflow_binding, workflow_scope
+from .workflow_rows import WorkflowAuthorityError, load_workflow_row, load_workspace_ack, require_workflow_binding, workflow_scope
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -86,11 +87,26 @@ def workflow_episode_key(binding: WorkflowBinding) -> str:
                        binding.authority.epoch, binding.episode_id), ensure_ascii=False, separators=(",", ":"))
 
 
+def workflow_run_scope_bounds(key: WorkflowKey) -> tuple[str, str]:
+    """Indexed target scope across retained epochs/episodes, never JSON payload scans."""
+    prefix = json.dumps(workflow_scope(key), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
+    return prefix, prefix + "\uffff"
+
+
+def target_has_work_admissions(db: sqlite3.Connection, key: WorkflowKey) -> bool:
+    return db.execute(
+        "SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? "
+        "AND kind<>'ROUTE' LIMIT 1", workflow_run_scope_bounds(key),
+    ).fetchone() is not None
+
+
 def admitted_adjudications(db: sqlite3.Connection, binding: WorkflowBinding) -> int:
     """Saturate above every supported ceiling without scanning other episodes."""
+    # The full target-scope index also matches this key, but scanning excluded
+    # never-launched history would violate the bounded allowance-query contract.
     admitted = 0
     for row in db.execute(
-        "SELECT r.run_id,r.kind,r.dispatch_id,r.workflow_binding_json FROM runs r "
+        "SELECT r.run_id,r.kind,r.dispatch_id,r.workflow_binding_json FROM runs r INDEXED BY runs_adjudication_episode "
         "WHERE r.workflow_episode_key=? AND r.kind='ADJUDICATE' "
         "AND NOT(r.state='cancelled' AND r.outcome IS 'unlaunched_released' AND r.provider_receipt_id IS NULL) "
         "LIMIT ?", (workflow_episode_key(binding), MAX_SPLIT_TRAIL + 1),
@@ -152,6 +168,30 @@ def latest_work_admission(db: sqlite3.Connection, binding: WorkflowBinding) -> R
     return admission
 
 
+def require_workspace_predecessor(db: sqlite3.Connection, snapshot: WorkflowSnapshot) -> ResolveAdmission | None:
+    """Only a verified completed handoff may bridge a retained episode pointer."""
+    latest = latest_work_admission(db, snapshot.binding)
+    if snapshot.intent is not None and not isinstance(snapshot.intent, CompletedRearm):
+        raise WorkflowAuthorityError("workspace admission requires a completed rearm")
+    if latest is None:
+        if target_has_work_admissions(db, snapshot.revision.fence.key):
+            raise WorkflowAuthorityError("retained workflow work has lost its latest-admission pointer")
+        if isinstance(snapshot.intent, CompletedRearm) and isinstance(snapshot.intent.handoff.predecessor, PriorResolveAdmission):
+            raise WorkflowAuthorityError("completed workspace handoff has lost its admitted predecessor")
+        return None
+    previous = latest.attempt.binding
+    if previous.fence.generation > snapshot.binding.fence.generation or latest.revision.version > snapshot.revision.version:
+        raise WorkflowAuthorityError("latest workspace admission belongs to a future revision")
+    if (previous.authority, previous.episode_id) == (snapshot.binding.authority, snapshot.binding.episode_id):
+        return latest
+    intent = snapshot.intent
+    if (not isinstance(intent, CompletedRearm)
+            or intent.handoff.predecessor != PriorResolveAdmission(latest.attempt, latest.revision.version)
+            or load_workspace_ack(db, intent.handoff) != intent.workspace):
+        raise WorkflowAuthorityError("foreign episode predecessor requires its exact completed workspace handoff")
+    return latest
+
+
 def proven_unlaunched_run(db: sqlite3.Connection, run_id: RunId) -> bool:
     row = db.execute(
         "SELECT 1 FROM runs r JOIN budget_reservations b USING(run_id) JOIN reservation_recovery rr USING(run_id) "
@@ -200,7 +240,11 @@ def reset_predecessor_admission(db: sqlite3.Connection, binding: WorkflowBinding
 
 def _validate_split_admission(db: sqlite3.Connection, snapshot: WorkflowSnapshot, stage: ResolveStage, metadata: dict, model: str) -> None:
     supplied = _split_admission_input(metadata)
-    last = latest_work_admission(db, snapshot.binding)
+    last = require_workspace_predecessor(db, snapshot)
+    if last is not None and (last.attempt.binding.authority, last.attempt.binding.episode_id) != (snapshot.authority, snapshot.episode.episode_id):
+        # The exact completed handoff above preserves the old pointer as audit,
+        # not as a contract cursor in the newly prepared allowance.
+        last = None
     split_stages = (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE)
     if supplied is None:
         if stage in split_stages:
@@ -1184,6 +1228,12 @@ _SCHEMA_MIGRATIONS = (
     SchemaMigration(18, _MIGRATION_V18),
     SchemaMigration(19, _MIGRATION_V19),
     SchemaMigration(20, _MIGRATION_V20, _V20_TRANSFORM_SPEC),
+    SchemaMigration(21, """
+CREATE INDEX runs_workflow_scope ON runs(workflow_episode_key);
+CREATE INDEX lifecycle_publication_runs ON lifecycle_commands(CAST(json_extract(payload_json,'$.run_id') AS TEXT))
+WHERE kind IN ('publish_branch','open_pull_request','update_pull_request_body')
+AND state NOT IN ('succeeded','permanent_failure');
+"""),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -4687,6 +4737,9 @@ class SQLiteControlStore:
                         self._require_retirement_evidence(db, command, reconciliation)
                     if isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
                         self._require_reconciliation_gate(db, command, reconciliation)
+                    if reconciliation is None or isinstance(reconciliation, ActiveReconciliation):
+                        if not self._workspace_projection_ready(db, command):
+                            continue
                     attempt = self._return_projection_attempt(db, command)
                     if attempt is not None:
                         current = load_workflow_row(db, attempt.binding.fence.key)
@@ -4897,6 +4950,8 @@ class SQLiteControlStore:
                 raise KeyError(str(command_id))
             command = _command_from_row(row)
             self._validate_workflow_command(db, command)
+            if not self._workspace_projection_ready(db, command):
+                raise ControlStoreError("rearm projection awaits verified workspace preparation")
             self._validate_return_projection(db, command)
             self._validate_workflow_reexecution(row)
             if row["state"] not in {"pending", "retryable_failure"}:
@@ -4916,6 +4971,28 @@ class SQLiteControlStore:
                 str(command_id),
                 "executing",
             )
+
+    @staticmethod
+    def _workspace_projection_ready(db: sqlite3.Connection, command: LifecycleCommand) -> bool:
+        association = db.execute(
+            "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?",
+            (str(command.command_id),),
+        ).fetchone()
+        if association is None:
+            if command.workflow is not None:
+                current = load_workflow_row(db, command.workflow.fence.key)
+                if current is not None and isinstance(current.intent, PendingRearm) and command.command_id in current.intent.required_commands:
+                    raise WorkflowAuthorityError("rearm projection lacks its recorded operation association")
+            return True
+        if command.workflow is None:
+            raise WorkflowAuthorityError("rearm projection lacks its workflow binding")
+        current = require_workflow_binding(db, command.workflow, allow_gated=True)
+        intent = current.intent
+        if (association["disposition"] != "required" or not isinstance(intent, PendingRearm)
+                or intent.request_id != association["request_id"]
+                or command.command_id not in intent.required_commands):
+            raise WorkflowAuthorityError("rearm projection no longer belongs to a pending authorized intent")
+        return load_workspace_ack(db, intent.handoff) is not None
 
     def _return_projection_attempt(self, db: sqlite3.Connection, command: LifecycleCommand) -> WorkflowAttemptIdentity | None:
         if not command.idempotency_key.startswith("resolve-return:"):

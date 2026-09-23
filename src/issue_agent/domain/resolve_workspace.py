@@ -80,24 +80,17 @@ ResolveWorkspacePredecessor = NoPriorResolveAdmission | PriorResolveAdmission
 
 
 @dataclass(frozen=True)
-class EpisodeWorkspaceHandoff:
-    grant_request_id: str
+class ResolveWorkspaceObserved:
+    """Harness-observed input to a new allowance, before a grant exists."""
+
     source: WorkflowBinding
-    destination: WorkflowBinding
     predecessor: ResolveWorkspacePredecessor
     branch: str
     base: ObservedResolveBase
 
     def __post_init__(self) -> None:
-        validate_workflow_identifier(self.grant_request_id, "workspace grant request")
-        if not isinstance(self.source, WorkflowBinding) or not isinstance(self.destination, WorkflowBinding):
-            raise ValueError("workspace handoff requires source and destination bindings")
-        if (self.source.authority.family is not WorkflowFamily.RESOLVE
-                or self.source.fence.key != self.destination.fence.key
-                or self.source.authority != self.destination.authority
-                or self.destination.fence.generation != self.source.fence.generation + 1
-                or self.source.episode_id == self.destination.episode_id):
-            raise ValueError("workspace handoff requires one new generation and a new episode in the same authority")
+        if not isinstance(self.source, WorkflowBinding) or self.source.authority.family is not WorkflowFamily.RESOLVE:
+            raise ValueError("workspace observation requires its resolve source binding")
         if not isinstance(self.base, ObservedResolveBase) or self.base.repository != self.source.fence.key.repository:
             raise ValueError("workspace handoff base belongs to another repository")
         ContractRevision(self.branch, self.base.commit_sha)
@@ -116,6 +109,31 @@ class EpisodeWorkspaceHandoff:
                 raise ValueError("workspace predecessor is foreign or from a future generation")
         else:
             raise ValueError("workspace handoff requires verified admission or explicit absence")
+
+
+@dataclass(frozen=True)
+class EpisodeWorkspaceHandoff:
+    grant_request_id: str
+    source: WorkflowBinding
+    destination: WorkflowBinding
+    predecessor: ResolveWorkspacePredecessor
+    branch: str
+    base: ObservedResolveBase
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.grant_request_id, "workspace grant request")
+        self.observation
+        if not isinstance(self.destination, WorkflowBinding):
+            raise ValueError("workspace handoff requires its destination binding")
+        if (self.source.fence.key != self.destination.fence.key
+                or self.source.authority != self.destination.authority
+                or self.destination.fence.generation != self.source.fence.generation + 1
+                or self.source.episode_id == self.destination.episode_id):
+            raise ValueError("workspace handoff requires one new generation and a new episode in the same authority")
+
+    @property
+    def observation(self) -> ResolveWorkspaceObserved:
+        return ResolveWorkspaceObserved(self.source, self.predecessor, self.branch, self.base)
 
     @property
     def revision(self) -> ContractRevision:

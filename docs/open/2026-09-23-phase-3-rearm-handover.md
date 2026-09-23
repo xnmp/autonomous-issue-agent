@@ -3,8 +3,9 @@
 Goal remains **active and incomplete**: complete the remaining phases of the
 [six-phase plan](2026-09-14-architecture-implementation.md). Phases 1–2 are
 accepted; phase 3 is current. No phase-4 implementation or live activation is
-authorized by this checkpoint. Base is `4685ef0` on `dev`; that commit accepted
-the bounded episode-index increment below. The preceding `73c63bb` accepted
+authorized by this checkpoint. The durable handoff increment builds on `8552c2a`
+on `dev`. Earlier `4685ef0` accepted the bounded episode-index increment below;
+`73c63bb` accepted
 [split recovery](2026-09-23-phase-3-split-recovery-handover.md), not the complete
 resolve or phase-3 vertical slice.
 
@@ -110,7 +111,88 @@ No database schema, live authority, target repository or service was changed.
 The checkpoint commit subject is
 `feat: prepare resolve episode workspaces from pinned upstream`.
 
-## Agreed next re-arm handoff design
+## Durable handoff authority integration
+
+The current increment connects preparation evidence to workflow policy and SQLite
+authority. It does not yet add production operator or daemon callers.
+
+- New request acceptance carries both fresh remote facts and a typed workspace
+  observation. Pending, cancelled and superseded intents retain the original
+  handoff; completed intent requires its exact preparation acknowledgement.
+  Continue preserves the grant, base and archive instead of selecting new ones.
+- The bound workflow adapter acquires existing fix/review/steward barriers in
+  order and checks current authority and target quiescence. Active runs, process
+  leases, unsettled reservations, captured unfinished returns and unresolved
+  publication commands prevent preparation. Git work occurs outside SQL.
+- Preparation acknowledgement uses the existing dedupe receipt table, keyed by
+  exact handoff identity. A caller-constructed proof cannot by itself complete
+  the workflow or make its remote projection runnable. Reads validate the
+  persisted acknowledgement, and paid admission requires a completed re-arm.
+- The latest admitted-work pointer remains intact. Bridging a previous episode
+  requires a completed handoff naming that exact admission/version. Missing
+  pointer plus retained work is corruption, not a clean workspace.
+- Schema v21 adds indexes over the existing immutable episode projection and
+  unresolved publication command run IDs for target-wide quiescence/absence
+  checks. It adds no authority rows or second queue. The allowance query explicitly
+  selects its existing partial index: a regression showed SQLite otherwise
+  chose the new full index and scanned excluded historical adjudications.
+
+Parent owns types, ports, codec, schema and central admission/effect guards;
+Astra owns pure transition behavior; the adapter agent owns SQLite authority
+and its tests. Independent adversarial review accepted the increment after two
+corrections: reject future predecessor admission versions before workspace I/O,
+and force target-first indexed joins for both captured returns and unresolved
+publications. A CAST matching the TEXT run ID is necessary for SQLite to probe
+the publication expression index instead of scanning it. Behavioral execution-
+step tests cover 4,000 unrelated return records, 4,000 unrelated active commands
+and 4,000 terminal commands; scope and v21 rollback tests also pass.
+
+The first full run passed 1,592 domain tests but exposed eight return-command
+fixture failures: they claimed no predecessor despite actual paid admissions.
+Those fixtures now observe the real predecessor, and the healthy-command test
+acknowledges preparation before expecting it to run. Its 13 focused cases pass.
+The second full run, `/tmp/phase3-durable-handoff-full-second.log`, passed:
+1,592 domain, 1,695 adapter and 2,421 application tests, plus hooks, parity,
+configuration, all import contracts and both Pyrefly checks. The independent review ran 267 focused tests;
+additional paid-bridge tests cover old ordinary/legacy AUTHOR work, new ordinary
+and AUTHOR entry, missing/corrupt acknowledgement, crash rollback and cancel/
+continue without another allowance. No live database has been migrated.
+The checkpoint commit subject is `feat: fence resolve rearm with durable workspace handoffs`.
+This accepts the bounded authority increment, not the complete resolve slice or
+phase 3. Services were rechecked inactive/dead, disabled and MainPID=0.
+
+Activation/import must refuse, drain or map legacy runs without a bound workflow
+projection before enabling this family; the current index cannot prove those
+runs quiescent. This remains an explicit activation prerequisite, not an implicit
+claim that existing live history is ready for import.
+
+## Next production integration
+
+Add a small `app/workflows/resolve_rearm.py` service, recovered by the existing
+fix workflow callback already bound to both `Executor.replay_pending` and
+`EffectRecovery`. Use bounded due selection and persisted observation backoff;
+do not add another queue. Required remaining shared ports are canonical accepted
+request lookup, pending intent inventory, deferred observation recording,
+atomic observation/receipt-based completion or supersession, and first-workspace
+entry lookup. Extend the existing worktree port with observe/pin, prepare and
+verify operations.
+
+Acceptance must keep its exclusive barriers across fresh observation, upstream
+pinning, proposal and commit, then release them before remote execution. The
+daemon prepares or verifies the workspace and acknowledges it before the existing
+command drain runs the fix-owned projection. A later reconciliation joins its
+durable receipt with fresh facts to complete the intent. Dashboard transport
+must supply authenticated actor, stable request ID and expected revision, never
+new command owners or file resets for this migrated family.
+
+Before first paid entry to the new episode, verify the actual checkout against
+its persisted acknowledgement **before** `prepare_cwd` writes harness context.
+Tie this to admission authority (including router entry and unlaunched retries),
+not a local marker or mere presence of `CompletedRearm`. Later legitimate
+AUTHOR/IMPLEMENT edits must not be compared to a pristine base. This app seam
+is not implemented by the current durable receipt increment.
+
+## Agreed re-arm handoff design
 
 The Astra phase owner inspected existing policy, persistence, dashboard and
 worktree behavior. Current request/continue/cancel/completion primitives still

@@ -18,6 +18,10 @@ from .resolve_split import (
     AdjudicationInput, AdjudicationStep, ContractBaseline, ContractRevision,
     NeedsAdjudication, ReauthorInput, SplitContext, SplitContinuation, SplitImplement, split_context,
 )
+from .resolve_workspace import (
+    EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared, PrepareResolveWorkspace,
+    ResolveWorkspaceObserved,
+)
 from .workflow import (
     AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, EnsureLifecycleProjection, EvidenceUnavailable, FreshResolve, IssueObservation,
@@ -25,12 +29,12 @@ from .workflow import (
     ObservedTransition, OpenGate, OperatorActor, PendingRearm, RearmingGate,
     RearmNeedsDecision, RemoteOutcomeUncertain, RenewResolveAllowance,
     RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveCeiling, ResolveEpisode,
-    ResolveRearmPreflight, ResolveResultKind, ResolveStage, SetGuidance, ClearGuidance, StopReason, SupersededRearm,
+    ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind, ResolveStage, SetGuidance, ClearGuidance, StopReason, SupersededRearm,
     UnresolvedGate, WorkflowChanged, WorkflowMutation, WorkflowRejected, adjudication_allowed,
     WorkflowRejection, WorkflowSnapshot, WorkflowTransition, WorkflowUnchanged,
 )
 from .workflow_identity import (
-    FamilyAuthority, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier,
+    FamilyAuthority, WorkflowBinding, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier,
 )
 
 
@@ -549,6 +553,7 @@ def request_resolve_rearm(
     active_attempts: tuple[WorkflowAttemptIdentity, ...],
     prior_request: RequestRearm | None = None,
     external_holds: tuple[str, ...] = (),
+    workspace: ResolveWorkspaceObserved | None = None,
 ) -> WorkflowTransition:
     if command.expected.fence.key != snapshot.revision.fence.key:
         return _reject(WorkflowRejection.INVALID_SCOPE, "request belongs to a different workflow")
@@ -568,12 +573,20 @@ def request_resolve_rearm(
     if failure is not None:
         return failure
     assert isinstance(issue, ObservedIssue) and isinstance(linkage, NoLinkedPr)
-    return _request_rearm(snapshot, command, actor, ResolveRearmPreflight(issue, linkage, external_holds))
+    if not isinstance(workspace, ResolveWorkspaceObserved):
+        return _reject(WorkflowRejection.OBSERVATION_UNAVAILABLE, "resolve re-arm requires verified workspace observations")
+    if workspace.source != snapshot.binding:
+        return _reject(WorkflowRejection.INVALID_SCOPE, "workspace observation belongs to a different source binding")
+    if not 0 <= (now - workspace.base.observed_at).total_seconds() <= 300:
+        return _reject(WorkflowRejection.OBSERVATION_UNAVAILABLE, "workspace base observation is stale or from the future")
+    return _request_rearm(snapshot, command, actor, ResolveRearmAcceptance(
+        ResolveRearmPreflight(issue, linkage, external_holds), workspace,
+    ))
 
 
 def _request_rearm(
     snapshot: WorkflowSnapshot, command: RequestRearm, actor: OperatorActor,
-    preflight: ResolveRearmPreflight,
+    preflight: ResolveRearmAcceptance,
 ) -> WorkflowTransition:
     if command.expected != snapshot.revision:
         return _reject(WorkflowRejection.STALE_REVISION, "workflow changed before re-arm acceptance")
@@ -595,10 +608,16 @@ def _request_rearm(
         _identity(snapshot, "resolve-episode", str(revision.fence.generation)),
         guidance=guidance,
     )
+    observed = preflight.workspace
+    handoff = EpisodeWorkspaceHandoff(
+        command.request_id, snapshot.binding,
+        WorkflowBinding(revision.fence, snapshot.authority, episode.episode_id),
+        observed.predecessor, observed.branch, observed.base,
+    )
     pending = PendingRearm(
         command.request_id, gate.gate_id, snapshot.revision.fence.generation,
         revision.fence.generation,
-        (RenewResolveAllowance(episode.episode_id), EnsureLifecycleProjection(revision.fence.key.target)),
+        (RenewResolveAllowance(episode.episode_id), PrepareResolveWorkspace(handoff), EnsureLifecycleProjection(revision.fence.key.target)),
         (resolve_projection_command_id(revision.fence.key, command.request_id),),
     )
     after = replace(
@@ -634,12 +653,14 @@ def _retire_rearm(
         intent = CancelledRearm(
             pending.request_id, pending.gate_id, pending.to_generation,
             command.cancellation_id, command.reason, verified_commands, retired,
+            pending.handoff,
         )
         audit = AuthorizedOperatorCommand(actor, command)
     else:
         intent = SupersededRearm(
             pending.request_id, pending.gate_id, pending.to_generation,
             reason, evidence_id, verified_commands, retired,
+            pending.handoff,
         )
         audit = ObservedTransition((evidence_id,))
     gates = tuple(g for g in snapshot.gates if _open(g).gate_id != pending.gate_id)
@@ -728,7 +749,7 @@ def _continue_rearm(
     revision = _next(snapshot, advance_generation=True)
     pending = PendingRearm(
         command.request_id, gate.gate_id, snapshot.revision.fence.generation,
-        revision.fence.generation, (EnsureLifecycleProjection(revision.fence.key.target),),
+        revision.fence.generation, (PrepareResolveWorkspace(snapshot.intent.handoff), EnsureLifecycleProjection(revision.fence.key.target)),
         (resolve_projection_command_id(revision.fence.key, command.request_id),),
     )
     after = replace(
@@ -746,6 +767,7 @@ def complete_resolve_rearm(
     *, verified_commands: tuple[CommandId, ...], evidence_ids: tuple[str, ...],
     now: datetime,
     external_holds: tuple[str, ...] = (),
+    workspace: EpisodeWorkspacePrepared | None = None,
 ) -> WorkflowTransition:
     pending = snapshot.intent
     if not isinstance(pending, PendingRearm):
@@ -753,6 +775,12 @@ def complete_resolve_rearm(
     failure = _observations(snapshot, issue, linkage, now)
     if failure is not None:
         return failure
+    if not isinstance(workspace, EpisodeWorkspacePrepared):
+        return _reject(WorkflowRejection.OBSERVATION_UNAVAILABLE, "workspace preparation must be verified before re-arm completion")
+    if workspace.handoff != pending.handoff or workspace.performed_under.fence.generation > snapshot.revision.fence.generation:
+        return _reject(WorkflowRejection.INVALID_SCOPE, "workspace acknowledgement does not belong to this granted obligation")
+    if workspace.observed_at > now:
+        return _reject(WorkflowRejection.OBSERVATION_UNAVAILABLE, "workspace acknowledgement is from the future")
     if not pending.required_commands or set(verified_commands) != set(pending.required_commands) or len(set(verified_commands)) != len(verified_commands):
         return _reject(WorkflowRejection.OBSERVATION_UNAVAILABLE, "every required remote obligation must be verified")
     remaining = tuple(g for g in snapshot.gates if _open(g).gate_id != pending.gate_id)
@@ -762,7 +790,7 @@ def complete_resolve_rearm(
             return _reject(WorkflowRejection.OTHER_HOLD, "the remote projection must preserve remaining holds")
     elif not isinstance(issue_eligibility(issue.issue, LifecycleOperation.RESOLVE), AllowedEligibility):
         return _reject(WorkflowRejection.OTHER_HOLD, "the verified remote state is not resolve-eligible")
-    intent = CompletedRearm(pending.request_id, pending.gate_id, pending.to_generation, verified_commands)
+    intent = CompletedRearm(pending.request_id, pending.gate_id, pending.to_generation, verified_commands, workspace)
     after = replace(snapshot, revision=_next(snapshot), intent=intent, gates=remaining)
     return WorkflowChanged(
         snapshot.revision, WorkflowMutation.RECONCILE_REARM, after,
@@ -774,7 +802,7 @@ def validate_resolve_transition(
     prior: WorkflowSnapshot, proposal: WorkflowChanged, *, ceiling: int,
     now: datetime,
     observations: tuple[ResolveRearmPreflight | ObservedIssue | LinkedPrPresent, ...] = (),
-    accepted_preflight: ResolveRearmPreflight | None = None,
+    accepted_preflight: ResolveRearmPreflight | ResolveRearmAcceptance | None = None,
     admission: ResolveAdmission | None = None,
 ) -> None:
     """Recompute authoritative deltas; a well-formed snapshot is not permission.
@@ -798,8 +826,8 @@ def validate_resolve_transition(
         expected = reconcile_resolve_ceiling(prior, ceiling=ceiling, evidence_ids=audit.evidence_ids)
     elif proposal.mutation is WorkflowMutation.REQUEST_REARM and isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, RequestRearm):
         preflight = audit.preflight
-        assert preflight is not None
-        expected = request_resolve_rearm(prior, audit.command, audit.actor, preflight.issue, preflight.linkage, now=now, active_attempts=(), external_holds=preflight.external_holds)
+        assert isinstance(preflight, ResolveRearmAcceptance)
+        expected = request_resolve_rearm(prior, audit.command, audit.actor, preflight.issue, preflight.linkage, now=now, active_attempts=(), external_holds=preflight.external_holds, workspace=preflight.workspace)
     elif proposal.mutation is WorkflowMutation.CONTINUE_REARM and isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, ContinueGrantedRearm):
         preflight = audit.preflight
         assert preflight is not None
@@ -849,7 +877,7 @@ def validate_resolve_transition(
         observation = observations[0]
         expected = complete_resolve_rearm(prior, observation.issue, observation.linkage,
             verified_commands=completed.verified_commands, evidence_ids=audit.evidence_ids,
-            now=now, external_holds=observation.external_holds)
+            now=now, external_holds=observation.external_holds, workspace=completed.workspace)
     else:
         raise ValueError("workflow mutation is not supported by resolve policy")
     if not isinstance(expected, WorkflowChanged):
