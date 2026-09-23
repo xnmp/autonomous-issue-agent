@@ -1,5 +1,9 @@
 # Phase 3 paid-return integration — 2026-09-23
 
+Historical checkpoint: this increment is now committed as `99bc61d`.
+The goal is active; the [split-recovery handover](2026-09-23-phase-3-split-recovery-handover.md)
+supersedes the working-tree/goal status below. Live operation remains paused.
+
 ## Status and scope
 
 The user explicitly resumed implementation after the earlier diagnostic

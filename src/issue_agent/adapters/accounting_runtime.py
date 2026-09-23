@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import uuid
 import contextvars
+import hashlib
 import json
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
@@ -41,6 +42,11 @@ from ..domain.refs import is_governed_branch
 from ..domain.workflow_identity import WorkflowBinding, WorkflowWriter
 from ..domain.workflow import ResolveSession, ResolveStage
 from ..domain.resolve_return import ReturnedResolve
+from ..domain.resolve_split import (
+    AdjudicationInput, ReauthorInput, ContractRevision, SplitContext, SplitImplement,
+    UnavailableContractRevision, split_context, validate_contract_rounds,
+)
+from .worktree import WorktreeUnavailable, capture_contract_revision
 from .workflow_control import SQLiteWorkflowControl
 from .workflow_codec import WorkflowEncodingError, encode_workflow
 from ..domain.agent_task import run_input_fingerprint
@@ -59,8 +65,19 @@ _UNLIMITED_ACCOUNTING_MICROS = 9_000_000_000_000_000_000
 def _return_text(value: object) -> str:
     if not isinstance(value, str):
         return "" if value is None else f"[invalid provider text: {type(value).__name__}]"
-    normalized = value.replace("\x00", "\\0")
-    return normalized if len(normalized) <= 4000 else normalized[:3980] + "\n[truncated]"
+    normalized = value[:4001].replace("\x00", "\\0")
+    # Bound encoded bytes, not code points: astral text expands twelvefold in
+    # the ASCII durable codec and must not break settlement after paid work.
+    if len(json.dumps(normalized, ensure_ascii=True)) <= 4000:
+        return normalized
+    low, high = 0, min(len(normalized), 3980)
+    while low < high:
+        middle = (low + high + 1) // 2
+        if len(json.dumps(normalized[:middle], ensure_ascii=True)) <= 3980:
+            low = middle
+        else:
+            high = middle - 1
+    return normalized[:low] + "\n[truncated]"
 
 
 def _normalize_resolve_result(result: AgentResult) -> AgentResult:
@@ -254,16 +271,40 @@ class AccountingRuntime(AgentRuntime):
     async def run(self, task: RuntimePlan) -> AgentResult:
         now = datetime.now(timezone.utc)
         issue, kind, number, claim_target, workflow = self._context.get()
+        if workflow is not None and kind in ("AUTHOR", "IMPLEMENT", "ADJUDICATE") and task.resolve_inputs is None:
+            return _return_refused("split completion requires durable stage inputs")
         if task.resolve_inputs is not None:
-            if workflow is None or self.role != "fix" or kind not in ("RESOLVE", "RESUME"):
+            split_types = {"AUTHOR": (SplitContext, ReauthorInput), "IMPLEMENT": SplitImplement, "ADJUDICATE": AdjudicationInput}
+            expected = split_types.get(kind or "")
+            if workflow is None or self.role != "fix" or kind not in ("RESOLVE", "RESUME", *split_types) or (
+                (expected is None and task.split_input is not None)
+                or (expected is not None and not isinstance(task.split_input, expected))
+            ):
                 return _return_refused("returned-result context does not match the admitted workflow")
             # Bound persisted input before paying. Provider prose is normalized
             # separately below, leaving room for its receipt and provenance.
             try:
-                encoded_inputs = encode_workflow(task.resolve_inputs)
+                encoded_inputs = encode_workflow((task.resolve_inputs, task.split_input))
             except WorkflowEncodingError:
                 return _return_refused("resolve completion inputs exceed durable receipt capacity")
-            if len(encoded_inputs.encode()) > 100000:
+            # Context persists across legs; reset acknowledgements are transient
+            # input envelopes. Charging both against the context allowance makes
+            # an accepted contract impossible to re-author near the size limit.
+            if len(encoded_inputs.encode()) > 200000:
+                return _return_refused("resolve completion inputs exceed durable receipt capacity")
+            if kind == "AUTHOR":
+                rounds = self.max_contract_rounds if self.max_contract_rounds is not None else 2
+                try:
+                    validate_contract_rounds(rounds)
+                except ValueError as exc:
+                    return _return_refused(str(exc))
+                # Reserve space for all permitted verdicts/provenance before
+                # buying the initial contract. Later stages retain that space.
+                assert task.split_input is not None
+                retained = encode_workflow((task.resolve_inputs, split_context(task.split_input)))
+                if len(retained.encode()) > 100000 - rounds * 20000:
+                    return _return_refused("resolve completion inputs exceed durable receipt capacity")
+            elif task.split_input is None and len(encoded_inputs.encode()) > 100000:
                 return _return_refused("resolve completion inputs exceed durable receipt capacity")
         # ADR 0008: paid admission binds the decision-side target unchanged;
         # review convergence remains PR-owned even when spend is issue-scoped.
@@ -325,7 +366,11 @@ class AccountingRuntime(AgentRuntime):
                 "kind": kind or "unknown",
                 "leg_id": _leg_id or str(run_id),
                 "runtime": self.runtime_name,
+                "effort": task.effort.value if task.effort is not None else None,
                 "input_fingerprint": run_input_fingerprint(task.intent),
+                "split_input": encode_workflow(task.split_input) if task.split_input is not None else None,
+                "resolve_inputs": encode_workflow(task.resolve_inputs) if task.resolve_inputs is not None else None,
+                "split_fingerprint": hashlib.sha256(encode_workflow(task.split_input).encode()).hexdigest() if task.split_input is not None else None,
                 "number": number,
                 "issue": issue,
                 "breaker_key": retry_key,
@@ -369,6 +414,8 @@ class AccountingRuntime(AgentRuntime):
         # doing so makes a transport failure look live until daemon restart.
         reservation = self._reserve_reclaiming_dead_headroom(request)
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
+            if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
+                return _return_refused(reservation.detail or reservation.disposition.value)
             headroom = max(
                 0, reservation.cap.micros - reservation.committed.micros
             )
@@ -505,15 +552,30 @@ class AccountingRuntime(AgentRuntime):
         returned = None
         if task.resolve_inputs is not None:
             result = _normalize_resolve_result(result)
+            verdict = rationale = ""
+            if kind == "ADJUDICATE":
+                verdict = _return_text(result.field("verdict"))
+                rationale = _return_text(result.field("rationale"))
+                result = replace(result, structured={"verdict": verdict, "rationale": rationale})
             assert result.workflow_attempt is not None
             session = None
             if result.session_id and not (infra_class_failure(result) or budget_exhausted(result.exit_reason)):
                 session = ResolveSession(result.workflow_attempt, result.session_id, self.runtime_name, reserved_model)
+            revision: ContractRevision | UnavailableContractRevision | None = None
+            if task.split_input is not None and kind in ("AUTHOR", "ADJUDICATE"):
+                try:
+                    if task.cwd is None or issue is None:
+                        raise WorktreeUnavailable("contract capture requires an owned worktree")
+                    revision = capture_contract_revision(task.cwd, issue, str(run_id), split_context(task.split_input).branch)
+                except (WorktreeUnavailable, OSError, ValueError) as exc:
+                    revision = UnavailableContractRevision(_return_text(str(exc)) or "contract revision capture failed")
             returned = ReturnedResolve(
                 result.workflow_attempt, ResolveStage(kind), task.resolve_inputs,
                 result.is_error,
                 result.status, result.summary, result.needs, result.envelope_subtype,
                 result.exit_reason, session, datetime.now(timezone.utc),
+                split_input=task.split_input, verdict=verdict, rationale=rationale,
+                contract_revision=revision,
             )
         return self._settle_result(
             run_id, task.model or result.model or reserved_model, result, returned=returned,

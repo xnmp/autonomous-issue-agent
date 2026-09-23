@@ -514,6 +514,12 @@ def test_validation_rejects_invalid_retry_caps_and_poll_seconds():
     })
 
 
+def test_contract_round_limit_matches_durable_context_capacity():
+    for value, rejected in (("4", False), ("5", True), ("1000000", True)):
+        config = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "MAX_CONTRACT_ROUNDS": value})
+        assert any("MAX_CONTRACT_ROUNDS" in error for error in config.validation_errors()) is rejected
+
+
 def test_validation_rejects_invalid_budgets():
     c = from_env({
         "REPO": "x",

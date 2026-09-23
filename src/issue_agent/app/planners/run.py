@@ -8,6 +8,7 @@ from ...adapters.runtime_plan import McpServer, RuntimePlan, SubagentDef
 from ...domain.agent_task import RunIntent, RuntimeName
 from ...domain.effort import Effort
 from ...domain.resolve_return import ResolveInputs
+from ...domain.resolve_split import AdjudicationInput, ReauthorInput, SplitContext, SplitImplement, SplitInput
 
 
 @dataclass(frozen=True, init=False)
@@ -25,6 +26,7 @@ class PlannedRun:
     subagents: tuple[SubagentDef, ...]
     env: dict[str, str]
     resolve_inputs: ResolveInputs | None
+    split_input: SplitInput | None
 
     def __init__(
         self,
@@ -46,6 +48,7 @@ class PlannedRun:
         intent: RunIntent | None = None,
         runtime: RuntimeName | None = None,
         resolve_inputs: ResolveInputs | None = None,
+        split_input: SplitInput | None = None,
     ) -> None:
         selected_intent = intent or (
             prompt
@@ -72,6 +75,9 @@ class PlannedRun:
         if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
             raise ValueError("resolve completion inputs must be validated")
         object.__setattr__(self, "resolve_inputs", resolve_inputs)
+        if split_input is not None and (resolve_inputs is None or not isinstance(split_input, (SplitContext, SplitImplement, AdjudicationInput, ReauthorInput))):
+            raise ValueError("split launch requires validated stage and completion inputs")
+        object.__setattr__(self, "split_input", split_input)
 
     @property
     def prompt(self) -> str:
@@ -120,4 +126,5 @@ def compose_runtime_plan(plan: PlannedRun) -> RuntimePlan:
         subagents=plan.subagents,
         env=plan.env,
         resolve_inputs=plan.resolve_inputs,
+        split_input=plan.split_input,
     )

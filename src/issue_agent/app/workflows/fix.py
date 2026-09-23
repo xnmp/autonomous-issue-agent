@@ -32,11 +32,29 @@ from ...domain.agent_task import RuntimeName, run_input_fingerprint
 from ...domain.workflow import AuthoredResolve, HeldProjection, ResolveResultKind, ResolveSession, ResolveStage, WorkflowConflict, WorkflowSnapshot
 from ...domain.workflow import ObservedIssue, NoLinkedPr, LinkedPrPresent
 from ...domain.resolve_return import ResolveCleanupCompleted, ResolveInputs, ReturnedResolve, UnavailableResolveReturn
+from ...domain.resolve_split import (
+    AdjudicationInput,
+    ContractResetCompleted,
+    ContractResetIntent,
+    NeedsAdjudication,
+    ReauthorInput,
+    ResetIntent,
+    SplitContext,
+    SplitImplement,
+    SplitReply,
+    SplitSelection,
+    UnavailableContractRevision,
+    split_context,
+)
 from ...domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowKey
 from ...domain.workflow_policy import classify_resolve_attempt, decide_return
 from ...adapters.workflow_rows import WorkflowAuthorityError
 from ...adapters.runtime_plan import AgentRuntime, ContextualRuntime, RunTelemetryRuntime
 from ...adapters.github import format_pr_discussion
+from ...adapters.worktree import (
+    read_captured_contract_revision,
+    verify_contract_revision,
+)
 from ...domain.ports import (
     ActionExecutor,
     CiPromptReads,
@@ -223,8 +241,92 @@ class FixWorkflow:
         assert isinstance(key.target, IssueRef)
         try:
             observed, linkage = self._observe_return(returned)
-            _, actions = decide_return(returned, observed, linkage, now=datetime.now(timezone.utc))
-            if any(isinstance(action, (RemoveWorktree, ClearIssueState)) for action in actions):
+            classified, actions = decide_return(
+                returned, observed, linkage, now=datetime.now(timezone.utc)
+            )
+            recover_contract = isinstance(
+                returned.contract_revision, UnavailableContractRevision
+            ) and (
+                classified.kind is ResolveResultKind.STAGE_PROGRESSED
+                and observed.issue.state == "open"
+                and isinstance(linkage, NoLinkedPr)
+            ) and (
+                (
+                    returned.stage is ResolveStage.AUTHOR
+                    and outcome.author_followup(returned.result())
+                    is outcome.AuthorFollowup.AUTHORED
+                )
+                or (
+                    returned.stage is ResolveStage.ADJUDICATE
+                    and not returned.is_error
+                    and not outcome.infra_class_failure(returned.result())
+                    and not outcome.budget_exhausted(returned.exit_reason)
+                )
+            )
+            if recover_contract:
+                assert returned.split_input is not None
+                context = split_context(returned.split_input)
+                with control.return_effect_authority(returned):
+                    observed, linkage = self._observe_return(returned)
+                    refreshed, refreshed_actions = decide_return(
+                        returned,
+                        observed,
+                        linkage,
+                        now=datetime.now(timezone.utc),
+                    )
+                    if any(
+                        isinstance(action, (RemoveWorktree, ClearIssueState))
+                        for action in refreshed_actions
+                    ):
+                        if not refreshed_actions or not all(
+                            isinstance(action, (RemoveWorktree, ClearIssueState))
+                            for action in refreshed_actions
+                        ):
+                            raise WorkflowAuthorityError(
+                                "returned cleanup contains unsupported effects"
+                            )
+                        if not self.executor.execute_all(refreshed_actions):
+                            raise WorkflowAuthorityError(
+                                "returned issue cleanup remains incomplete"
+                            )
+                        assert isinstance(linkage, NoLinkedPr)
+                        cleanup = ResolveCleanupCompleted(
+                            returned.attempt, observed, linkage
+                        )
+                        committed = control.finalize_return(
+                            returned,
+                            observed,
+                            linkage,
+                            cleanup=cleanup,
+                        )
+                    elif (
+                        refreshed.kind is ResolveResultKind.STAGE_PROGRESSED
+                        and observed.issue.state == "open"
+                        and isinstance(linkage, NoLinkedPr)
+                    ):
+                        cwd = self.worktrees.ensure(
+                            key.target.number, context.branch
+                        )
+                        revision = read_captured_contract_revision(
+                            cwd,
+                            key.target.number,
+                            str(returned.attempt.run_id),
+                            context.branch,
+                        )
+                        verify_contract_revision(
+                            cwd, key.target.number, revision
+                        )
+                        committed = control.finalize_return(
+                            returned,
+                            observed,
+                            linkage,
+                            contract_revision=revision,
+                        )
+                    else:
+                        committed = control.finalize_return(
+                            returned, observed, linkage
+                        )
+            elif any(isinstance(action, (RemoveWorktree, ClearIssueState)) for action in actions):
                 # Re-arm/owner retirement cannot race deletion of this episode's
                 # worktree. A crash leaves the receipt held for idempotent replay.
                 with control.return_effect_authority(returned):
@@ -855,13 +957,247 @@ class FixWorkflow:
             human_reply=as_untrusted(human_reply),
         ), state)
 
+    @staticmethod
+    def _split_issue_available(iss, *, reply_resume: bool = False) -> bool:
+        if isinstance(
+            issue_eligibility(iss, LifecycleOperation.COMPLETE_RESOLVE),
+            AllowedEligibility,
+        ):
+            return True
+        return reply_resume and isinstance(
+            issue_eligibility(iss, LifecycleOperation.RESUME),
+            AllowedEligibility,
+        )
+
+    def _split_cfg(self, context: SplitContext) -> FixTaskConfig:
+        cfg = self.cfg.fix
+        if cfg is None:
+            raise WorkflowAuthorityError("resolve configuration is unavailable")
+        if context.selection.runtime != self._resolve_runtime_name():
+            raise WorkflowAuthorityError("split context belongs to a different runtime")
+        model = (
+            None
+            if context.selection.model == "<runtime-default>"
+            else context.selection.model
+        )
+        return dataclasses.replace(
+            cfg,
+            model=model,
+            effort=context.selection.effort,
+            difficulty_notice=context.selection.difficulty_notice,
+        )
+
+    def _split_reply(
+        self,
+        iss,
+        requested: str,
+        prior: SplitReply | None,
+    ) -> SplitReply | None:
+        latest = fix_domain.last_human_reply(iss, self.cfg.fix_bot)
+        if requested:
+            if prior is not None and requested == prior.body:
+                return prior
+            if (
+                latest is None
+                or latest.body != requested
+                or not latest.author
+                or not latest.created_at
+            ):
+                raise WorkflowAuthorityError(
+                    "split reply identity is unavailable or changed"
+                )
+            return SplitReply(latest.author, latest.created_at, latest.body)
+        if prior is None or latest is None:
+            return prior
+        identity = (prior.author, prior.created_at, prior.body)
+        observed = [(item.author, item.created_at, item.body) for item in iss.comments]
+        latest_identity = (latest.author, latest.created_at, latest.body)
+        if (
+            identity not in observed
+            or latest_identity == identity
+            or latest.body == prior.body
+        ):
+            return prior
+        if not latest.author or not latest.created_at:
+            raise WorkflowAuthorityError("new split reply lacks a stable identity")
+        return SplitReply(latest.author, latest.created_at, latest.body)
+
+    def _authored_inputs_current(
+        self,
+        checkpoint: object,
+        task,
+        iss,
+    ) -> bool:
+        if (
+            not isinstance(checkpoint, AuthoredResolve)
+            or checkpoint.author_admission.input_fingerprint
+            != run_input_fingerprint(task.intent)
+        ):
+            return False
+        control = self.workflow_control
+        assert control is not None
+        authored = control.returned_result(checkpoint.author_attempt)
+        return (
+            authored is not None
+            and authored.inputs == ResolveInputs(iss.title, iss.body, iss.author)
+        )
+
+    def _complete_split_reset(
+        self,
+        issue: int,
+        intent: ResetIntent,
+    ) -> ContractResetCompleted:
+        control = self.workflow_control
+        assert control is not None
+        with control.contract_reset_authority(intent) as existing_ack:
+            if existing_ack is not None:
+                return existing_ack
+            reset = self.worktrees.reset_contract(
+                issue, intent.baseline.revision, intent.intent_id
+            )
+            return control.complete_contract_reset(
+                ContractResetCompleted(
+                    intent, reset, datetime.now(timezone.utc)
+                )
+            )
+
+    def _fresh_reauthor_task(
+        self,
+        issue: int,
+        cwd: str,
+        context: SplitContext,
+        binding: WorkflowBinding,
+        expected_inputs: ResolveInputs,
+        input_fingerprint: str,
+    ):
+        """Rebuild replacement AUTHOR inputs around each destructive reset."""
+
+        latest = self.gateway.get_issue(issue)
+        latest_state = self._resolve_state(issue, binding)
+        if (
+            not self._split_issue_available(
+                latest, reply_resume=context.reply is not None
+            )
+            or self.gateway.pr_for_issue(issue) is not None
+        ):
+            return None
+        latest_reply = self._split_reply(latest, "", context.reply)
+        if latest_reply != context.reply:
+            return None
+        latest_task = self._author_task(
+            issue,
+            latest,
+            cwd,
+            self._split_cfg(context),
+            context.human_reply,
+            latest_state,
+        )
+        latest_inputs = ResolveInputs(
+            latest.title, latest.body, latest.author
+        )
+        latest_task = dataclasses.replace(
+            latest_task,
+            resolve_inputs=latest_inputs,
+            split_input=context,
+        )
+        if (
+            latest_inputs != expected_inputs
+            or run_input_fingerprint(latest_task.intent) != input_fingerprint
+        ):
+            return None
+        return latest_task
+
+    async def _run_split_author(
+        self,
+        issue: int,
+        iss,
+        task,
+        context: SplitContext,
+        binding: WorkflowBinding,
+    ) -> bool:
+        task = dataclasses.replace(
+            task,
+            resolve_inputs=ResolveInputs(iss.title, iss.body, iss.author),
+            split_input=context,
+        )
+        control = self.workflow_control
+        assert control is not None
+        expected_inputs = task.resolve_inputs
+        assert expected_inputs is not None
+        input_fingerprint = run_input_fingerprint(task.intent)
+        intent = control.reauthor_reset_intent(binding, input_fingerprint)
+        if intent is not None:
+            fresh_task = self._fresh_reauthor_task(
+                issue,
+                task.cwd,
+                context,
+                binding,
+                expected_inputs,
+                input_fingerprint,
+            )
+            if fresh_task is None:
+                self.cfg.log(
+                    f"resolve #{issue}: replacement author reset deferred for fresh inputs"
+                )
+                return False
+            acknowledgement = self._complete_split_reset(issue, intent)
+            # GitHub is not covered by the local deployment barrier. Refuse a
+            # paid replacement if issue, lifecycle, reply, or guidance changed
+            # while the displaced implementation was being archived.
+            task = self._fresh_reauthor_task(
+                issue,
+                task.cwd,
+                context,
+                binding,
+                expected_inputs,
+                input_fingerprint,
+            )
+            if task is None:
+                self.cfg.log(
+                    f"resolve #{issue}: replacement author inputs changed during reset"
+                )
+                return False
+            task = dataclasses.replace(
+                task,
+                split_input=ReauthorInput(acknowledgement, context),
+            )
+        author = await self._run_logged("author", issue, task, kind="AUTHOR")
+        returned = self._returned_result(author, binding)
+        if outcome.infra_class_failure(author):
+            self._charge_infra_death(issue, "author", author)
+        else:
+            self._decay_infra_deaths(issue, author)
+        if returned is not None:
+            completed = self._finish_return(returned)
+            if completed:
+                self.executor.replay_pending()
+            return completed
+        return False
+
     async def resolve_split(self, issue: int, human_reply: str = "", *, binding: WorkflowBinding | None = None) -> None:
         state = self._resolve_state(issue, binding)
         assert binding is not None
         iss = self.gateway.get_issue(issue)
-        branch = self._resume_branch(issue, iss.title)
+        if (
+            not self._split_issue_available(
+                iss, reply_resume=bool(human_reply)
+            )
+            or self.gateway.pr_for_issue(issue) is not None
+        ):
+            return
+        checkpoint = state.episode.continuation
+        retained = (
+            checkpoint.split.context
+            if isinstance(checkpoint, AuthoredResolve)
+            and checkpoint.split is not None
+            else None
+        )
+        branch = retained.branch if retained is not None else self._resume_branch(issue, iss.title)
         cwd = self._ensure_cwd(issue, branch)
-        if human_reply:
+        if retained is not None:
+            fix_cfg = self._split_cfg(retained)
+            deferred_for_overlap = False
+        elif human_reply:
             fix_cfg = self._resolve_resume_cfg(issue, state, iss)
             deferred_for_overlap = False
         else:
@@ -869,96 +1205,207 @@ class FixWorkflow:
         if deferred_for_overlap:
             self._execute_resolve_actions(issue, [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)], binding)
             return
-        state = self._resolve_state(issue, binding)
-        author_task = self._author_task(issue, iss, cwd, fix_cfg, human_reply, state)
-        checkpoint = state.episode.continuation
-        if not isinstance(checkpoint, AuthoredResolve) or checkpoint.author_admission.input_fingerprint != run_input_fingerprint(author_task.intent):
-            author = await self._run_logged("author", issue, author_task, kind="AUTHOR")
-            fu_author = outcome.author_followup(author)
-            pr = self.gateway.pr_for_issue(issue) if fu_author is not outcome.AuthorFollowup.AUTHORED else None
-            current = self.gateway.get_issue(issue)
-            changed = fu_author is outcome.AuthorFollowup.BLOCKED and (
-                current.title, current.body, current.author
-            ) != (iss.title, iss.body, iss.author)
-            followup = (
-                outcome.ResolveFollowup.PR_OPENED if pr is not None else
-                outcome.ResolveFollowup.RETRY if changed or fu_author is outcome.AuthorFollowup.RETRY else
-                outcome.ResolveFollowup.BLOCKED
+
+        selection = (
+            retained.selection
+            if retained is not None
+            else SplitSelection(
+                self._resolve_runtime_name(),
+                fix_cfg.model or "<runtime-default>",
+                fix_cfg.effort,
+                fix_cfg.difficulty_notice,
             )
-            if not self._record_resolve_result(issue, author, ResolveStage.AUTHOR, author_task, binding, followup,
-                                               progressed=fu_author is outcome.AuthorFollowup.AUTHORED):
+        )
+        state = self._resolve_state(issue, binding)
+        iss = self.gateway.get_issue(issue)
+        if (
+            not self._split_issue_available(
+                iss,
+                reply_resume=(
+                    bool(human_reply)
+                    or (
+                        retained is not None
+                        and retained.reply is not None
+                    )
+                ),
+            )
+            or self.gateway.pr_for_issue(issue) is not None
+        ):
+            return
+        reply = self._split_reply(
+            iss,
+            human_reply,
+            retained.reply if retained is not None else None,
+        )
+        context = (
+            dataclasses.replace(retained, reply=reply)
+            if retained is not None
+            else SplitContext(branch, selection, reply)
+        )
+        author_task = self._author_task(
+            issue, iss, cwd, fix_cfg, context.human_reply, state
+        )
+        checkpoint = state.episode.continuation
+        if not self._authored_inputs_current(checkpoint, author_task, iss):
+            if not await self._run_split_author(
+                issue,
+                iss,
+                author_task,
+                dataclasses.replace(context, trail=()),
+                binding,
+            ):
                 return
-            self._decay_infra_deaths(issue, author)
-            if outcome.infra_class_failure(author):
-                self._charge_infra_death(issue, "author", author)
-            if fu_author is not outcome.AuthorFollowup.AUTHORED:
-                self._record_block_state(issue, Target.ISSUE, issue, author, pr=pr)
-                self._journal_budget_path(issue, "author", author.exit_reason, pr)
-                actions = (
-                    [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)] if changed else
-                    self._resolve_actions(issue, author, pr) if pr is not None else outcome.author_actions(issue, author)
-                )
-                self._execute_resolve_actions(issue, actions, binding, current=current)
+            state = self._resolve_state(issue, binding, allow_held=True)
+            checkpoint = state.episode.continuation
+            if not isinstance(checkpoint, AuthoredResolve) or not isinstance(
+                checkpoint.split, SplitImplement
+            ):
                 return
-        await self._implement_loop(issue, iss, cwd, fix_cfg, human_reply=human_reply, binding=binding)
+        await self._implement_loop(issue, cwd, binding=binding)
 
     async def _implement_loop(
-        self, issue: int, iss, cwd: str, fix_cfg=None, human_reply: str = "", *, binding: WorkflowBinding,
+        self, issue: int, cwd: str, *, binding: WorkflowBinding,
     ) -> None:
-        fix_cfg = fix_cfg if fix_cfg is not None else self.cfg.fix
-        uphold_note = ""
-        trail: list[str] = []
-        rounds = 0
         while True:
             state = self._resolve_state(issue, binding)
             fresh = self.gateway.get_issue(issue)
-            current_inputs = self._author_task(issue, fresh, cwd, fix_cfg, human_reply, state)
             checkpoint = state.episode.continuation
-            if not isinstance(checkpoint, AuthoredResolve) or checkpoint.author_admission.input_fingerprint != run_input_fingerprint(current_inputs.intent):
-                self.cfg.log(f"resolve #{issue}: author inputs changed; a fresh author is required")
-                self._execute_resolve_actions(issue, [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)], binding, current=fresh)
+            if not isinstance(checkpoint, AuthoredResolve) or checkpoint.split is None:
                 return
-            iss = fresh
-            task = self._guided(task_builders.build_implement_task(
-                issue, as_untrusted(iss.title), as_untrusted(iss.body), cwd, fix_cfg,
-                uphold_note=as_untrusted(uphold_note), human_reply=as_untrusted(human_reply),
-            ), state)
-            impl = await self._run_logged("implement", issue, task, kind="IMPLEMENT")
-            self._decay_infra_deaths(issue, impl)
-            pr = self.gateway.pr_for_issue(issue)
-            fu = outcome.implement_followup(impl, pr is not None)
-            if fu is not outcome.ImplementFollowup.CONTRACT_CHANGE:
-                self._journal_budget_path(issue, "implement", impl.exit_reason, pr)
-                self._complete_resolve(issue, impl, pr, observed=iss, task=task, stage=ResolveStage.IMPLEMENT, binding=binding)
+            cursor = checkpoint.split
+            context = cursor.context
+            fix_cfg = self._split_cfg(context)
+            reply = self._split_reply(fresh, "", context.reply)
+            current_context = dataclasses.replace(context, reply=reply)
+            author_task = self._author_task(
+                issue, fresh, cwd, fix_cfg, current_context.human_reply, state
+            )
+            if (
+                not self._split_issue_available(
+                    fresh, reply_resume=context.reply is not None
+                )
+                or self.gateway.pr_for_issue(issue) is not None
+            ):
                 return
-            if not self._record_resolve_result(issue, impl, ResolveStage.IMPLEMENT, task, binding,
-                                               outcome.ResolveFollowup.BLOCKED, progressed=True):
+            if not self._authored_inputs_current(checkpoint, author_task, fresh):
+                self.cfg.log(
+                    f"resolve #{issue}: author inputs changed; re-authoring the contract"
+                )
+                if not await self._run_split_author(
+                    issue,
+                    fresh,
+                    author_task,
+                    dataclasses.replace(current_context, trail=()),
+                    binding,
+                ):
+                    return
+                continue
+            if isinstance(cursor, NeedsAdjudication):
+                control = self.workflow_control
+                assert control is not None
+                intent = ContractResetIntent(binding, cursor)
+                latest = self.gateway.get_issue(issue)
+                latest_state = self._resolve_state(issue, binding)
+                latest_reply = self._split_reply(
+                    latest, "", context.reply
+                )
+                latest_task = self._author_task(
+                    issue,
+                    latest,
+                    cwd,
+                    fix_cfg,
+                    latest_reply.body if latest_reply is not None else "",
+                    latest_state,
+                )
+                if (
+                    not self._split_issue_available(
+                        latest, reply_resume=context.reply is not None
+                    )
+                    or self.gateway.pr_for_issue(issue) is not None
+                    or latest_reply != context.reply
+                    or not self._authored_inputs_current(
+                        latest_state.episode.continuation,
+                        latest_task,
+                        latest,
+                    )
+                ):
+                    self.cfg.log(
+                        f"resolve #{issue}: contract reset deferred for fresh inputs"
+                    )
+                    return
+                acknowledgement = self._complete_split_reset(issue, intent)
+                split_input = AdjudicationInput(acknowledgement)
+                task = self._guided(
+                    task_builders.build_adjudicate_task(
+                        issue,
+                        as_untrusted(fresh.title),
+                        as_untrusted(fresh.body),
+                        as_untrusted(cursor.objection),
+                        cwd,
+                        fix_cfg,
+                        human_reply=as_untrusted(context.human_reply),
+                    ),
+                    state,
+                )
+                leg = "adjudicate"
+                kind = "ADJUDICATE"
+            else:
+                split_input = cursor
+                first_implementation = (
+                    cursor.source == cursor.baseline.source
+                    or (
+                        bool(context.trail)
+                        and context.trail[-1].attempt == cursor.source
+                    )
+                )
+                if first_implementation:
+                    verify_contract_revision(
+                        cwd, issue, cursor.baseline.revision
+                    )
+                task = self._guided(
+                    task_builders.build_implement_task(
+                        issue,
+                        as_untrusted(fresh.title),
+                        as_untrusted(fresh.body),
+                        cwd,
+                        fix_cfg,
+                        uphold_note=as_untrusted(context.uphold_note),
+                        human_reply=as_untrusted(context.human_reply),
+                    ),
+                    state,
+                )
+                leg = "implement"
+                kind = "IMPLEMENT"
+            task = dataclasses.replace(
+                task,
+                resolve_inputs=ResolveInputs(
+                    fresh.title, fresh.body, fresh.author
+                ),
+                split_input=split_input,
+            )
+            result = await self._run_logged(leg, issue, task, kind=kind)
+            returned = self._returned_result(result, binding)
+            if outcome.infra_class_failure(result):
+                self._charge_infra_death(issue, leg, result)
+            else:
+                self._decay_infra_deaths(issue, result)
+            if returned is None:
+                # Only legacy non-accounting infra/budget fakes can arrive
+                # without the captured return this split plan requested.
                 return
-            objection = impl.needs or impl.summary or "see logs"
-            if rounds >= self.cfg.max_contract_rounds:
-                self._execute_resolve_actions(issue, outcome.contract_escalation_actions(issue, objection, "\n".join(trail)), binding)
+            if not self._finish_return(returned):
                 return
-            rounds += 1
-            self._resolve_state(issue, binding)
-            self.worktrees.reset(issue)
-            adj_task = self._guided(task_builders.build_adjudicate_task(
-                issue, as_untrusted(iss.title), as_untrusted(iss.body), as_untrusted(objection),
-                cwd, fix_cfg, human_reply=as_untrusted(human_reply),
-            ), state)
-            adj = await self._run_logged("adjudicate", issue, adj_task, kind="ADJUDICATE")
-            if not self._record_resolve_result(issue, adj, ResolveStage.ADJUDICATE, adj_task, binding,
-                                               outcome.ResolveFollowup.BLOCKED, progressed=not adj.is_error):
+            self.executor.replay_pending()
+            if outcome.infra_class_failure(result) or outcome.budget_exhausted(
+                result.exit_reason
+            ):
                 return
-            if outcome.infra_class_failure(adj):
-                self._charge_infra_death(issue, "adjudicate", adj)
+            if (
+                leg == "implement"
+                and outcome.implement_followup(result, False)
+                is not outcome.ImplementFollowup.CONTRACT_CHANGE
+            ):
                 return
-            if outcome.budget_exhausted(adj.exit_reason):
-                self._journal_budget_path(issue, "adjudicate", adj.exit_reason, None)
-                self._execute_resolve_actions(issue, outcome.budget_actions(issue), binding)
-                return
-            verdict = outcome.adjudication(adj)
-            trail.append(f"round {rounds}: {adj.field('verdict') or 'upheld'} — {adj.field('rationale') or adj.summary}")
-            uphold_note = "" if verdict is outcome.Adjudication.REVISED else (adj.field("rationale") or adj.summary or "the contract is correct")
 
     def _charge_infra_death(self, issue: int, leg: str, result) -> None:
         """Bill an infra-class failure to the infra ceiling, and journal it.

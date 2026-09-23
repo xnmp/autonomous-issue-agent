@@ -22,6 +22,13 @@ def validate_workflow_identifier(value: str, name: str) -> None:
         raise ValueError(f"{name} must be a nonempty bounded identifier")
 
 
+def validate_workflow_text(value: str, name: str, *, limit: int = 512, empty: bool = False) -> None:
+    if limit == 512 and not empty:
+        validate_workflow_identifier(value, name)
+    elif not isinstance(value, str) or len(value) > limit or (not empty and not value.strip()) or "\x00" in value:
+        raise ValueError(f"{name} must be a bounded string")
+
+
 def _repository(value: str) -> str:
     if not isinstance(value, str):
         raise ValueError("workflow repository must be a string")

@@ -207,10 +207,13 @@ def test_oversized_recovery_inputs_are_refused_before_paid_admission(tmp_path, b
 def test_author_runtime_persists_fingerprint_of_supplied_inputs_before_provider_runs(tmp_path) -> None:
     from issue_agent.adapters.workflow_codec import decode_workflow
     from issue_agent.domain.workflow import ResolveAdmission
+    from issue_agent.domain.resolve_split import SplitContext, SplitSelection
 
     state = resolve_snapshot()
     task = RuntimePlan("Author the issue contract", schema={"type": "object"},
-                       append_system_prompt="Keep public behavior stable", max_budget_usd=2)
+                       append_system_prompt="Keep public behavior stable", max_budget_usd=2,
+                       resolve_inputs=ResolveInputs("title", "body", "alice"),
+                       split_input=SplitContext("fix/1-test", SplitSelection("codex", "<runtime-default>")))
     seen = []
 
     class InspectingRuntime:

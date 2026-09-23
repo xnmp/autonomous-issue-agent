@@ -6,11 +6,14 @@ shrinking into a router without losing behavior coverage.
 
 import asyncio
 import dataclasses
+from pathlib import Path
 import sqlite3
+import subprocess
 import pytest
 
 from issue_agent.adapters.journal import _legacy_event_record
 from issue_agent.adapters.store import Store
+from issue_agent.adapters.worktree import Worktrees
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.workflows.fix import FixWorkflow, FixWorkflowConfig
 from issue_agent.domain.events import Correlation, TelemetryWarning
@@ -28,6 +31,12 @@ from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.workflow import AuthoredResolve, FreshResolve, ResolveSession
+from issue_agent.domain.resolve_split import (
+    AdjudicationInput,
+    ReauthorInput,
+    SplitContext,
+    SplitImplement,
+)
 from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
@@ -83,7 +92,9 @@ def _workflow(gw, store, runner, wt=None, **cfg_overrides):
         remove_worktree=worktrees.remove,
         clear_issue_state=getattr(store, "cleanup_pr", None),
     )
-    attach_workflow_authority(gw, store)
+    attach_workflow_authority(
+        gw, store, max_contract_rounds=cfg.max_contract_rounds
+    )
     return AccountedFixtureWorkflow(cfg, gw, store, worktrees, runner, executor, workflow_control=store._workflow_authority)
 
 
@@ -917,10 +928,19 @@ def test_address_review_infra_death_does_not_burn_a_review_retry():
 def test_split_majority_case_author_then_implement_opens_pr():
     gw = FakeGateway(
         issues={5: IssueView(5, title="Null token", body="x")},
-        pr_for_issue={5: 100},
+        prs={100: PRView(100)},
+        pr_for_issue={},
     )
     store, wt = FakeStore(), FakeWorktrees()
-    runner = SeqRunner([
+
+    class PrOpeningRunner(SeqRunner):
+        async def run(self, task):
+            result = await super().run(task)
+            if result.status == "pr_opened":
+                gw._pr_for_issue[5] = 100
+            return result
+
+    runner = PrOpeningRunner([
         AgentResult(is_error=False, status="tests_authored", session_id="a5"),
         AgentResult(is_error=False, status="pr_opened", session_id="i5"),
     ])
@@ -930,6 +950,9 @@ def test_split_majority_case_author_then_implement_opens_pr():
     prompts = [t.prompt for t in runner.tasks]
     assert "AUTHOR" in prompts[0]
     assert "IMPLEMENTER" in prompts[1]
+    assert isinstance(runner.tasks[0].split_input, SplitContext)
+    assert isinstance(runner.tasks[1].split_input, SplitImplement)
+    assert runner.tasks[0].resolve_inputs.title == "Null token"
     assert runner.tasks[1].resume is None
     assert wt.resets == []
     assert ("relabel", "issue", 5, "ai-working", "ai-pr-open") in gw.calls
@@ -945,20 +968,30 @@ def test_split_author_blocked_stops_before_implement():
     asyncio.run(_workflow(gw, FakeStore(), runner, author_tests_split=True).resolve(5))
 
     assert len(runner.tasks) == 1
-    assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
+    assert Label.AI_BLOCKED in gw.issues[5].labels
 
 
 def test_split_contract_change_revised_then_pr():
-    gw = FakeGateway(issues={5: IssueView(5, title="t", body="b")}, pr_for_issue={5: 100})
+    gw = FakeGateway(
+        issues={5: IssueView(5, title="t", body="b")},
+        prs={100: PRView(100)},
+        pr_for_issue={},
+    )
     store, wt = FakeStore(), FakeWorktrees()
-    runner = SeqRunner([
+
+    class PrOpeningRunner(SeqRunner):
+        async def run(self, task):
+            result = await super().run(task)
+            if result.status == "pr_opened":
+                gw._pr_for_issue[5] = 100
+            return result
+
+    runner = PrOpeningRunner([
         AgentResult(is_error=False, status="tests_authored", session_id="a"),
         AgentResult(is_error=False, status="contract_change", needs="test asserts wrong layer", session_id="i1"),
         AgentResult(is_error=False, session_id="adj", structured={"verdict": "revised", "summary": "fixed AC"}),
         AgentResult(is_error=False, status="pr_opened", session_id="i2"),
     ])
-    seq_pr = [None, 100]
-    gw.pr_for_issue = lambda i: seq_pr.pop(0) if seq_pr else 100
 
     asyncio.run(_workflow(gw, store, runner, wt=wt, author_tests_split=True).resolve(5))
 
@@ -967,6 +1000,8 @@ def test_split_contract_change_revised_then_pr():
     assert "adjudicating" in prompts[2]
     assert "test asserts wrong layer" in prompts[2]
     assert "IMPLEMENTER" in prompts[3]
+    assert isinstance(runner.tasks[2].split_input, AdjudicationInput)
+    assert isinstance(runner.tasks[3].split_input, SplitImplement)
     assert wt.resets == [5]
     assert ("relabel", "issue", 5, "ai-working", "ai-pr-open") in gw.calls
 
@@ -992,7 +1027,8 @@ def test_split_contract_change_upheld_then_escalates():
     ).resolve(5))
 
     assert "UPHELD" in runner.tasks[3].prompt
-    assert ("relabel", "issue", 5, "ai-working", "needs-human-review") in gw.calls
+    assert Label.NEEDS_HUMAN_REVIEW in gw.issues[5].labels
+    assert Label.AI_WORKING not in gw.issues[5].labels
     assert any(c[0] == "comment" and "objection 2" in c[3] for c in gw.calls)
     assert not any(c[0] == "relabel" and c[-1] == "ai-pr-open" for c in gw.calls)
 
@@ -1018,7 +1054,78 @@ def test_split_contract_change_resets_before_adjudication_and_escalates_at_cap()
 
     assert wt.resets == []
     assert isinstance(_resolve_snapshot(store).episode.continuation, AuthoredResolve)
-    assert ("relabel", "issue", 5, "ai-working", "needs-human-review") in gw.calls
+    assert Label.NEEDS_HUMAN_REVIEW in gw.issues[5].labels
+    assert Label.AI_WORKING not in gw.issues[5].labels
+
+
+def test_unlaunched_adjudication_restart_reuses_reset_and_single_round_allowance():
+    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")})
+    store, worktrees = FakeStore(), FakeWorktrees()
+
+    class AdjudicationProviderFailure:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            if len(self.tasks) == 1:
+                return AgentResult(
+                    is_error=False,
+                    status="tests_authored",
+                    session_id="author",
+                )
+            if len(self.tasks) == 2:
+                return AgentResult(
+                    is_error=False,
+                    status="contract_change",
+                    needs="contract objection",
+                    session_id="implementation",
+                )
+            assert isinstance(task.split_input, AdjudicationInput)
+            raise RuntimeError("adjudication provider failed before launch")
+
+    failed = AdjudicationProviderFailure()
+    with pytest.raises(RuntimeError, match="failed before launch"):
+        asyncio.run(_workflow(
+            gateway,
+            store,
+            failed,
+            wt=worktrees,
+            author_tests_split=True,
+            max_contract_rounds=1,
+        ).resolve(5))
+
+    assert len(failed.tasks) == 3
+    failed_input = failed.tasks[-1].split_input
+    assert isinstance(failed_input, AdjudicationInput)
+    assert worktrees.resets == [5]
+
+    class RetryObserved(Exception):
+        pass
+
+    class ExactAdjudicationRetry:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            assert isinstance(task.split_input, AdjudicationInput)
+            assert task.split_input == failed_input
+            raise RetryObserved
+
+    retry = ExactAdjudicationRetry()
+    with pytest.raises(RetryObserved):
+        asyncio.run(_workflow(
+            gateway,
+            store,
+            retry,
+            wt=worktrees,
+            author_tests_split=True,
+            max_contract_rounds=1,
+        ).resolve(5))
+
+    assert len(retry.tasks) == 1
+    assert worktrees.resets == [5]
 
 
 # ── review M13: the two repair prompts must carry their primary inputs ───────
@@ -2311,6 +2418,253 @@ def test_restart_reuses_matching_authored_checkpoint_without_rerunning_author(ne
     assert _resolve_snapshot(store).episode.continuation.session.session_id == "implementation"
 
 
+def test_infra_implementation_restart_preserves_real_git_partial_work(tmp_path):
+    """An executed IMPLEMENT may have valuable local work before its runner dies.
+
+    The durable successor must resume that leg in place: resetting to the clean
+    contract or buying another AUTHOR would both destroy information the next
+    IMPLEMENT needs to finish the issue.
+    """
+
+    repo = tmp_path / "repo"
+    origin = tmp_path / "origin.git"
+    repo.mkdir()
+
+    def git(cwd: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git(tmp_path, "init", "--bare", str(origin))
+    git(repo, "init", "-b", "dev")
+    git(repo, "config", "user.email", "tests@example.invalid")
+    git(repo, "config", "user.name", "Test Runner")
+    (repo / "baseline.txt").write_text("contract\n")
+    git(repo, "add", "baseline.txt")
+    git(repo, "commit", "-m", "baseline contract")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-u", "origin", "dev")
+    git(repo, "branch", "fix/5-t")
+
+    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")})
+    store = FakeStore()
+    worktrees = Worktrees(str(repo))
+
+    class PartialImplementationRunner:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            if len(self.tasks) == 1:
+                return AgentResult(
+                    is_error=False,
+                    status="tests_authored",
+                    session_id="author-session",
+                )
+            checkout = Path(task.cwd)
+            (checkout / "implementation.txt").write_text("committed partial\n")
+            git(checkout, "add", "implementation.txt")
+            git(checkout, "commit", "-m", "partial implementation")
+            (checkout / "implementation.txt").write_text("tracked dirty partial\n")
+            (checkout / "untracked.txt").write_text("untracked partial\n")
+            return AgentResult(
+                is_error=True,
+                status="timeout",
+                exit_reason=ExitReason.KILLED_EXTERNALLY,
+                session_id="implementation-infra",
+            )
+
+    initial = PartialImplementationRunner()
+    asyncio.run(_workflow(
+        gateway, store, initial, wt=worktrees, author_tests_split=True,
+    ).resolve(5))
+    checkout = repo / worktrees.path(5)
+    assert len(initial.tasks) == 2
+    assert "TEST/INTERFACE AUTHOR" in initial.tasks[0].prompt
+    assert "IMPLEMENTER" in initial.tasks[1].prompt
+    assert git(checkout, "log", "-1", "--format=%s") == "partial implementation"
+    assert (checkout / "implementation.txt").read_text() == "tracked dirty partial\n"
+    assert (checkout / "untracked.txt").read_text() == "untracked partial\n"
+
+    class InspectingRetryRunner:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            assert "IMPLEMENTER" in task.prompt
+            assert isinstance(task.split_input, SplitImplement)
+            retry_checkout = Path(task.cwd)
+            assert git(retry_checkout, "log", "-1", "--format=%s") == "partial implementation"
+            assert (retry_checkout / "implementation.txt").read_text() == "tracked dirty partial\n"
+            assert (retry_checkout / "untracked.txt").read_text() == "untracked partial\n"
+            return AgentResult(
+                is_error=False,
+                status="blocked",
+                needs="operator input",
+                session_id="implementation-retry",
+            )
+
+    retry = InspectingRetryRunner()
+    asyncio.run(_workflow(
+        gateway, store, retry, wt=worktrees, author_tests_split=True,
+    ).resolve(5))
+
+    assert len(retry.tasks) == 1
+    assert "TEST/INTERFACE AUTHOR" not in retry.tasks[0].prompt
+
+
+@pytest.mark.parametrize("changed", ["issue", "guidance"])
+def test_replacement_author_resets_real_partial_work_and_reuses_ack_after_crash(
+    tmp_path,
+    changed,
+):
+    repo = tmp_path / "repo"
+    origin = tmp_path / "origin.git"
+    repo.mkdir()
+
+    def git(cwd: Path, *args: str) -> str:
+        return subprocess.run(
+            ["git", *args], cwd=cwd, check=True, capture_output=True, text=True,
+        ).stdout.strip()
+
+    git(tmp_path, "init", "--bare", str(origin))
+    git(repo, "init", "-b", "dev")
+    git(repo, "config", "user.email", "tests@example.invalid")
+    git(repo, "config", "user.name", "Test Runner")
+    (repo / "baseline.txt").write_text("contract\n")
+    (repo / ".gitignore").write_text("ignored-work/\n")
+    git(repo, "add", "baseline.txt", ".gitignore")
+    git(repo, "commit", "-m", "baseline contract")
+    baseline_head = git(repo, "rev-parse", "HEAD")
+    git(repo, "remote", "add", "origin", str(origin))
+    git(repo, "push", "-u", "origin", "dev")
+    git(repo, "branch", "fix/5-t")
+
+    class RecordingWorktrees(Worktrees):
+        def __init__(self, root):
+            super().__init__(root)
+            self.resets = []
+
+        def reset_contract(self, issue, revision, intent_id):
+            self.resets.append((issue, revision, intent_id))
+            return super().reset_contract(issue, revision, intent_id)
+
+    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="old")})
+    store = FakeStore()
+    worktrees = RecordingWorktrees(str(repo))
+    implementation_head = ""
+
+    class PartialImplementation:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            nonlocal implementation_head
+            self.tasks.append(task)
+            if len(self.tasks) == 1:
+                return AgentResult(
+                    is_error=False,
+                    status="tests_authored",
+                    session_id="author",
+                )
+            checkout = Path(task.cwd)
+            (checkout / "implementation.py").write_text("committed\n")
+            git(checkout, "add", "implementation.py")
+            git(checkout, "commit", "-m", "partial implementation")
+            implementation_head = git(checkout, "rev-parse", "HEAD")
+            (checkout / "implementation.py").write_text("tracked dirty\n")
+            (checkout / "untracked.txt").write_text("untracked\n")
+            ignored = checkout / "ignored-work"
+            ignored.mkdir()
+            (ignored / "secret.py").write_text("ignored\n")
+            return AgentResult(
+                is_error=True,
+                status="timeout",
+                exit_reason=ExitReason.KILLED_EXTERNALLY,
+                session_id="implementation-infra",
+            )
+
+    initial = PartialImplementation()
+    asyncio.run(_workflow(
+        gateway, store, initial, wt=worktrees, author_tests_split=True,
+    ).resolve(5))
+    assert len(initial.tasks) == 2
+
+    if changed == "issue":
+        gateway.issues[5] = dataclasses.replace(
+            gateway.issues[5], body="new requirement"
+        )
+    else:
+        from issue_agent.adapters.workflow_codec import encode_workflow
+        state = _resolve_snapshot(store)
+        with store._workflow_db.transaction() as db:
+            db.execute(
+                "UPDATE workflows SET version=version+1, episode_json=?",
+                (encode_workflow((
+                    state.authority,
+                    dataclasses.replace(
+                        state.episode, guidance="new operator guidance"
+                    ),
+                )),),
+            )
+
+    class ReplacementProviderCrash:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            assert isinstance(task.split_input, ReauthorInput)
+            checkout = Path(task.cwd)
+            assert git(checkout, "rev-parse", "HEAD") == baseline_head
+            assert not (checkout / "implementation.py").exists()
+            assert not (checkout / "untracked.txt").exists()
+            assert not (checkout / "ignored-work").exists()
+            raise RuntimeError("replacement provider failed before launch")
+
+    crashed = ReplacementProviderCrash()
+    with pytest.raises(RuntimeError, match="failed before launch"):
+        asyncio.run(_workflow(
+            gateway, store, crashed, wt=worktrees, author_tests_split=True,
+        ).resolve(5))
+    assert len(crashed.tasks) == 1
+    assert len(worktrees.resets) == 1
+    reset_input = crashed.tasks[0].split_input
+    assert isinstance(reset_input, ReauthorInput)
+
+    class RestartObserved(Exception):
+        pass
+
+    class ReplacementRestart:
+        def __init__(self):
+            self.tasks = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            assert isinstance(task.split_input, ReauthorInput)
+            assert task.split_input.reset == reset_input.reset
+            raise RestartObserved
+
+    restarted = ReplacementRestart()
+    with pytest.raises(RestartObserved):
+        asyncio.run(_workflow(
+            gateway, store, restarted, wt=worktrees, author_tests_split=True,
+        ).resolve(5))
+    assert len(restarted.tasks) == 1
+    assert len(worktrees.resets) == 1
+
+    checkout = repo / worktrees.path(5)
+    archive_ref = reset_input.reset.result.archive_ref
+    assert git(checkout, "rev-parse", f"{archive_ref}^1") == implementation_head
+    git(checkout, "reset", "--hard", f"{archive_ref}^1")
+    git(checkout, "stash", "apply", "--index", archive_ref)
+    assert (checkout / "implementation.py").read_text() == "tracked dirty\n"
+    assert (checkout / "untracked.txt").read_text() == "untracked\n"
+    assert (checkout / "ignored-work" / "secret.py").read_text() == "ignored\n"
+
+
 def test_selected_runtime_enum_is_normalized_in_durable_session_provenance():
     gateway = FakeGateway(issues={5: IssueView(5, title="t", body="b")})
     store = FakeStore()
@@ -2359,6 +2713,38 @@ def test_changed_author_inputs_require_new_author_before_implementation(changed)
     assert _resolve_snapshot(store).episode.continuation.author_attempt != original
 
 
+def test_replacement_author_refuses_issue_change_during_reset():
+    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="old")})
+    store = FakeStore()
+    _author_then_crash(gateway, store)
+    gateway.issues[5] = dataclasses.replace(
+        gateway.issues[5], body="replacement requirement"
+    )
+
+    class RacingWorktrees(FakeWorktrees):
+        def reset_contract(self, issue, revision, intent_id):
+            result = super().reset_contract(issue, revision, intent_id)
+            gateway.issues[issue] = dataclasses.replace(
+                gateway.issues[issue], body="changed while archiving"
+            )
+            return result
+
+    worktrees = RacingWorktrees()
+    runner = FakeRunner(AgentResult(
+        is_error=False, status="tests_authored", session_id="must-not-run",
+    ))
+    asyncio.run(_workflow(
+        gateway,
+        store,
+        runner,
+        wt=worktrees,
+        author_tests_split=True,
+    ).resolve(5))
+
+    assert worktrees.resets == [5]
+    assert runner.tasks == []
+
+
 def test_requirements_changing_during_author_are_rechecked_before_implementation():
     gateway = FakeGateway(issues={5: IssueView(5, title="t", body="old")})
     store = FakeStore()
@@ -2373,7 +2759,56 @@ def test_requirements_changing_during_author_are_rechecked_before_implementation
     asyncio.run(_workflow(gateway, store, runner, author_tests_split=True).resolve(5))
     assert len(runner.tasks) == 1
     assert Label.AI_READY in gateway.issues[5].labels
-    assert _resolve_snapshot(store).episode.failures == 0
+    # The paid author result is honestly inapplicable to the changed issue.
+    # Requeueing the fresh facts consumes one resolve attempt; it must not look
+    # like an unspent contract that can be bought again without bound.
+    assert _resolve_snapshot(store).episode.failures == 1
+
+
+def test_changed_facts_after_author_use_durable_baseline_when_cursor_was_cleared():
+    gateway = FakeGateway(issues={5: IssueView(5, title="t", body="old")})
+    store, worktrees = FakeStore(), FakeWorktrees()
+
+    class ChangedWhileAuthoring(FakeRunner):
+        async def run(self, task):
+            result = await super().run(task)
+            gateway.issues[5] = dataclasses.replace(
+                gateway.issues[5], body="changed during author"
+            )
+            return result
+
+    first = ChangedWhileAuthoring(AgentResult(
+        is_error=False, status="tests_authored", session_id="first-author",
+    ))
+    asyncio.run(_workflow(
+        gateway,
+        store,
+        first,
+        wt=worktrees,
+        author_tests_split=True,
+    ).resolve(5))
+    assert len(first.tasks) == 1
+    assert not isinstance(
+        _resolve_snapshot(store).episode.continuation, AuthoredResolve
+    )
+
+    replacement = FakeRunner(AgentResult(
+        is_error=False,
+        status="blocked",
+        needs="stop after replacement author",
+        session_id="replacement-author",
+    ))
+    asyncio.run(_workflow(
+        gateway,
+        store,
+        replacement,
+        wt=worktrees,
+        author_tests_split=True,
+    ).resolve(5))
+
+    assert len(replacement.tasks) == 1
+    assert isinstance(replacement.tasks[0].split_input, ReauthorInput)
+    assert worktrees.resets == [5]
 
 
 def test_classification_is_committed_before_remote_completion_actions():

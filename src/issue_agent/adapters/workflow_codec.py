@@ -17,6 +17,9 @@ from ..domain.contracts import WorkflowAttemptIdentity
 from ..domain.labels import Label
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
+from ..domain.outcome import Adjudication
+from ..domain.effort import Effort
+from ..domain import resolve_split as split
 from ..domain.resolve_return import ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted
 
 MAX_WORKFLOW_PAYLOAD_BYTES = 262144
@@ -24,6 +27,11 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    split.ContractRevision, split.ContractBaseline, split.UnavailableContractRevision,
+    split.SplitSelection, split.SplitReply, split.AdjudicationStep, split.SplitContext,
+    split.SplitImplement, split.NeedsAdjudication, split.ContractResetIntent,
+    split.ContractResetResult, split.ContractResetCompleted, split.AdjudicationInput,
+    split.ReauthorResetIntent, split.ReauthorInput,
     ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted,
     identity.IssueRef, identity.PullRequestRef, identity.WorkflowKey,
     identity.WorkflowFence, identity.FamilyAuthority, identity.WorkflowRevision,
@@ -44,11 +52,20 @@ _VALUES = (
     w.AuthorizedOperatorCommand, w.ObservedTransition,
 )
 _ENUMS = (
-    ExitReason,
+    ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.StopReason, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
 )
 _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
+
+# Explicit evolution of already-persisted variants. Never infer defaults from
+# dataclass declarations: new authority fields require a deliberate read rule.
+_LEGACY_FIELDS = {
+    "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
+    "ResolveAdmission": {"split_fingerprint": None},
+    "ResolveAttemptResult": {"split": None},
+    "ReturnedResolve": {"split_input": None, "verdict": "", "rationale": "", "contract_revision": None},
+}
 
 
 class WorkflowEncodingError(ValueError):
@@ -119,6 +136,9 @@ def _decode(value: object, depth: int = 0) -> object:
     payload = value.get("fields")
     if set(value) != {"type", "fields"} or not isinstance(payload, dict):
         raise WorkflowEncodingError("malformed workflow fields")
+    legacy = _LEGACY_FIELDS.get(tag, {})
+    if legacy and set(payload) == {field.name for field in fields(constructor)} - legacy.keys():
+        payload = {**legacy, **payload}
     if set(payload) != {field.name for field in fields(constructor)}:
         raise WorkflowEncodingError(f"wrong fields for workflow variant: {tag}")
     return constructor(**{key: _decode(item, depth + 1) for key, item in payload.items()})

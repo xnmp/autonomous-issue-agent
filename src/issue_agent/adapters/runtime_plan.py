@@ -19,6 +19,7 @@ from ..domain.effort import Effort
 from ..domain.outcome import AgentResult
 from ..domain.workflow_identity import WorkflowBinding
 from ..domain.resolve_return import ResolveInputs
+from ..domain.resolve_split import AdjudicationInput, ReauthorInput, SplitContext, SplitImplement, SplitInput
 
 
 @dataclass(frozen=True)
@@ -61,6 +62,7 @@ class RuntimePlan:
     context_prefix: str
     context_suffix: str
     resolve_inputs: ResolveInputs | None
+    split_input: SplitInput | None
 
     def __init__(
         self,
@@ -84,6 +86,7 @@ class RuntimePlan:
         context_prefix: str = "",
         context_suffix: str = "",
         resolve_inputs: ResolveInputs | None = None,
+        split_input: SplitInput | None = None,
     ) -> None:
         selected_intent = intent
         if selected_intent is None:
@@ -116,6 +119,9 @@ class RuntimePlan:
         if resolve_inputs is not None and not isinstance(resolve_inputs, ResolveInputs):
             raise ValueError("resolve completion inputs must be validated")
         object.__setattr__(self, "resolve_inputs", resolve_inputs)
+        if split_input is not None and (resolve_inputs is None or not isinstance(split_input, (SplitContext, SplitImplement, AdjudicationInput, ReauthorInput))):
+            raise ValueError("split launch requires validated stage and completion inputs")
+        object.__setattr__(self, "split_input", split_input)
 
     @property
     def prompt(self) -> str:

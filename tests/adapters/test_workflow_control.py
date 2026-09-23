@@ -18,7 +18,7 @@ from issue_agent.adapters.control_store import (
 from issue_agent.adapters.effects import command_for_action
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, workflow_scope
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, workflow_scope, load_workflow_row
 from issue_agent.domain.contracts import (
     BudgetScope, CommandKind, EffectReceipt, EffectStatus, Money, PriceQuote,
     PricingBasis, ReservationId, RunId, WorkflowAttemptIdentity,
@@ -142,7 +142,13 @@ def command_row(control, command_id):
 
 
 def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runtime-default>", session_id=None, launch=True, settle=True):
-    """Use real admission and settlement for continuation integration cases."""
+    """Real accounting with historical split rows for pre-cutover recovery.
+
+    These tests deliberately deliver concurrent/reversed legacy split stages.
+    New split admission serializes stages; its full pipeline is exercised in
+    test_split_workflow_control and test_split_runtime. Only this fixture may
+    install the historical shape, never the production admission path.
+    """
     attempt = WorkflowAttemptIdentity(state.binding, RunId(name), f"leg:{name}")
     session_id = f"session:{name}" if session_id is None else session_id
     session = ResolveSession(attempt, session_id, "codex", model) if session_id else None
@@ -155,7 +161,21 @@ def paid_result(control, state, name, stage, *, money_scope="o/r", model="<runti
         kind=stage.value, owner_id=WRITER.owner_id, workflow=state.binding,
         adjudication_ceiling=3 if stage is ResolveStage.ADJUDICATE else None,
     )
-    assert control.reserve(request).admitted
+    if stage in (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE):
+        assert control.reserve(replace(request, kind="historical-fixture", workflow=None, adjudication_ceiling=None)).admitted
+        with control.transaction() as db:
+            current = load_workflow_row(db, state.revision.fence.key)
+            assert current is not None
+            revision = replace(current.revision, version=current.revision.version + 1)
+            db.execute("UPDATE runs SET kind=?,workflow_binding_json=? WHERE run_id=?",
+                       (stage.value, encode_workflow(state.binding), name))
+            db.execute("UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",
+                       (revision.version, *workflow_scope(state.revision.fence.key)))
+            legacy = ResolveAdmission(attempt, revision, stage, request.adjudication_ceiling, "a" * 64)
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission',?,?,?,?)",
+                       (WRITER.repository, name, NOW.isoformat(), encode_workflow(legacy)))
+    else:
+        assert control.reserve(request).admitted
     if not launch:
         released = control.release_unlaunched(attempt.run_id, "spawn never started")
         assert released.disposition is AccountingDisposition.AVAILABLE

@@ -9,7 +9,10 @@ def with_resolve_authority(dispatcher, *, resolve_ceiling=3):
     workflow = dispatcher.fix_workflow
     values = {field.name: getattr(workflow, field.name) for field in fields(workflow)}
     values["workflow_control"] = attach_workflow_authority(
-        workflow.gateway, workflow.store, resolve_ceiling=resolve_ceiling,
+        workflow.gateway,
+        workflow.store,
+        resolve_ceiling=resolve_ceiling,
+        max_contract_rounds=workflow.cfg.max_contract_rounds,
     )
     dispatcher.fix_workflow = AccountedFixtureWorkflow(**values)
     return dispatcher

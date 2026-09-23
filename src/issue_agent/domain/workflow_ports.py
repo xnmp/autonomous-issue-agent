@@ -5,12 +5,13 @@ from contextlib import AbstractContextManager
 
 from .contracts import CommandId, WorkflowAttemptIdentity
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
+from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetIntent, ContractRevision
 from .workflow import (
     CommandAbsenceEvidence, CommandRetryApplicability, HeldProjection, RearmIntent, RetryAlreadyConsumed,
     RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead,
 )
 from .workflow_identity import (
-    FamilyAuthority, WorkflowKey, WorkflowRevision, WorkflowWriter,
+    FamilyAuthority, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
 )
 
 
@@ -49,10 +50,17 @@ class WorkflowControl(Protocol):
 
     def return_effect_authority(self, returned: ReturnedResolve) -> AbstractContextManager[None]: ...
 
+    def reauthor_reset_intent(self, binding: WorkflowBinding, input_fingerprint: str) -> ReauthorResetIntent | None: ...
+
+    def contract_reset_authority(self, intent: ResetIntent) -> AbstractContextManager[ContractResetCompleted | None]: ...
+
+    def complete_contract_reset(self, completed: ContractResetCompleted) -> ContractResetCompleted: ...
+
     def finalize_return(
         self, returned: ReturnedResolve, issue: ObservedIssue,
         linkage: NoLinkedPr | LinkedPrPresent,
         *, cleanup: ResolveCleanupCompleted | None = None,
+        contract_revision: ContractRevision | None = None,
     ) -> WorkflowCommitted | WorkflowConflict: ...
 
     def lookup_rearm(

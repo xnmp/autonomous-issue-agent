@@ -285,16 +285,6 @@ def test_remove_never_deletes_an_arbitrary_branch_from_the_issue_worktree():
     assert not any(args[:2] == ["branch", "-D"] for args, _cwd in git.calls)
 
 
-def test_reset_discards_uncommitted_in_the_issue_worktree():
-    fg = FakeGit()
-    Worktrees("/repo", worktree_root=".claude/worktrees", run=fg).reset(5)
-    kinds = [a[0] for a in fg.calls]
-    assert ["checkout", "--", "."] in kinds
-    assert ["clean", "-fd"] in kinds
-    # both run IN the issue's worktree, not the repo root
-    assert all(cwd.endswith("issue-5") for _, cwd in fg.calls)
-
-
 # ── GateContext builder ──
 def _builder_git(branch="fix/5-x", subjects="red: t\ngreen: impl", changed="src/x.py\ntests/test_x.py"):
     return FakeGit({

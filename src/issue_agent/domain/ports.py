@@ -29,6 +29,7 @@ from .contracts import (
 )
 from .world import IssueView, PRView, PullRequestDiff, WorldState
 from .self_clear import BudgetBlock, MachineBlock
+from .resolve_split import ContractRevision, ContractResetResult
 
 T = TypeVar("T")
 
@@ -196,7 +197,7 @@ class WorktreePort(Protocol):
 
 
 class FixWorktreePort(WorktreePort, Protocol):
-    def reset(self, issue: int) -> None: ...
+    def reset_contract(self, issue: int, revision: "ContractRevision", intent_id: str) -> "ContractResetResult": ...
 
 
 class EventSink(Protocol):

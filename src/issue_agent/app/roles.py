@@ -2654,6 +2654,7 @@ def build_fix_daemon(
     workflow_control = SQLiteWorkflowControl(
         control, WorkflowWriter(cfg.repo, "fix", owner_id),
         resolve_ceiling=cfg.max_resolve_retries,
+        max_contract_rounds=fix_runtime.max_contract_rounds,
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,

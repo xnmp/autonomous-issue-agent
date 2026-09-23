@@ -1,12 +1,16 @@
 # Architecture implementation phases
 
 **Phase 3 resumed on 2026-09-23 at the user's request.** See the
-[current handover](2026-09-23-phase-3-paid-return-handover.md) and the
+[current split-recovery handover](2026-09-23-phase-3-split-recovery-handover.md),
+[ordinary-return checkpoint](2026-09-23-phase-3-paid-return-handover.md) and the
 [earlier integration inventory](2026-09-14-phase-3-integration-handover.md).
-The integration is uncommitted. The documented ordinary-resolve crash boundary
+The ordinary-return checkpoint is committed as `99bc61d`. The documented crash boundary
 now has atomic paid-return receipts and composed restart coverage. The bounded
 increment passed full-suite verification and independent review; phase 3 overall
 remains incomplete.
+The subsequent split-recovery checkpoint also passed the final full suite and
+independent review, including replacement-author isolation. Its handover above
+records the remaining re-arm/activation and bounded-adjudication-query work.
 Implementation and its phase agent are authorized to resume;
 live operation and live migrations remain paused. Phase 3 must be accepted before
 phase 4 starts. The six-phase goal remains incomplete.
@@ -20,6 +24,19 @@ generation fencing, actual settlement provenance, atomic outbox insertion and
 bounded reconciliation. Use isolated databases, `uv`, Pyrefly and `apply_patch`;
 no live services, target writes, paid harness runs or commits by agents. Full
 `make test` and fresh independent adversarial review precede every parent commit.
+
+Split-recovery collaboration brief (current increment): new bounded cursor,
+reply/selection/trail and exact contract/reset values live in
+`domain/resolve_split.py`, reused by the existing workflow episode and receipt.
+The parent owns these values, ports, codec, runtime-plan/accounting and admission
+seams. Astra owns agreed pure completion policy and workflow persistence; the
+scoped worktree agent owns verified local revision capture/reset and its tests.
+No agent may invent a second phase queue or reset counter. Run/admission rows
+and existing dedupe/evidence records own consumption and reset acknowledgement.
+Use typed immutable values, short SQL transactions, deployment effect barriers
+around Git I/O, and current role composition. Preserve displaced local work
+under exact harness-owned recovery refs before a verified reset. Every agent
+uses isolated tests, `uv`, Pyrefly and `apply_patch`; no live/target operations.
 
 Authority: the revised six-stage plan in
 [the archived review](2026-09-14-architecture-review.md), copied from
@@ -189,10 +206,14 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
    integration; held/stale command projection debt uses shared typed retirement
    and read-only reconciliation. Independent review has no blocking findings;
    full `make test` passed with 1,406 domain, 1,521 adapter and 2,408 app tests,
-   plus other targets. Log: `/tmp/phase3-return-full-accepted.log`. Uncommitted.
-2. Extend crash recovery to the AUTHOR/IMPLEMENT/ADJUDICATE split flow, including
-   durable contract-objection/adjudication context. Ordinary receipts deliberately
-   reject these stages rather than promise recovery without that context.
+   plus other targets. Log: `/tmp/phase3-return-full-accepted.log`. Committed as
+   `99bc61d`.
+2. **Checkpoint verified:** AUTHOR/IMPLEMENT/ADJUDICATE settlement and restart
+   recovery, durable dispute context, preserving reset authority and replacement-
+   author isolation bound to exact new task inputs. Real-Git application coverage,
+   final independent review and the full suite passed. Final log:
+   `/tmp/phase3-split-final-verified.log`. This accepts the bounded recovery increment,
+   not phase 3 overall.
 3. Complete resolve operator activation/import, re-arm, cancellation and explicit
    absence-authorized retry, with exclusive effect barriers and daemon recovery.
 4. Wire authoritative dashboard projection and aged-command uncertainty;
@@ -201,6 +222,12 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
    composed failure coverage, then implement/accept the review-rejection slice.
 6. Only then accept phase 3 and start phase 4. Live activation and soak remain
    separately blocked by the deployment pause, not simulated as completed.
+
+Before full phase-3 acceptance, replace the repository-wide historical
+adjudication-binding scan with an indexed, bounded per-episode admission query.
+Independent review records both hot-path growth and unrelated corrupt-record
+coupling; strict proven-never-launched exclusions must remain intact. This is
+tracked acceptance work, not permission to reset or duplicate the allowance.
 
 Receipt recovery trusts atomically written terminal dispositions and schedule
 indexes. It isolates corrupt selected unfinished payloads, not arbitrary at-rest

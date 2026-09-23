@@ -42,6 +42,7 @@ from ..domain.ports import (
     WorkflowState,
 )
 from ..domain.workflow_ports import WorkflowControl
+from ..domain.resolve_split import ContractRevision, ContractResetResult
 from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
@@ -208,8 +209,8 @@ class _NoFixWorktrees:
         del issue, fallback
         raise self._unavailable()
 
-    def reset(self, issue: int) -> None:
-        del issue
+    def reset_contract(self, issue: int, revision: ContractRevision, intent_id: str) -> ContractResetResult:
+        del issue, revision, intent_id
         raise self._unavailable()
 
 

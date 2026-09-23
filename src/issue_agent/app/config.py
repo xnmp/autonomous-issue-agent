@@ -23,6 +23,7 @@ from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
+from ..domain.resolve_split import MAX_SPLIT_TRAIL
 from ..domain.infra_breaker import (
     DEFAULT_BREAKER_COOLDOWN_SECONDS,
     DEFAULT_BREAKER_DEATHS,
@@ -514,7 +515,8 @@ class HarnessConfig:
     # can't anticipate the impl; the implementer can't weaken the tests (gate).
     author_tests_split: bool = False
     # Max contract-renegotiation rounds (implementer petition → fresh-author
-    # adjudication) before escalating the dispute to a human. Only used in split mode.
+    # adjudication) before escalating the dispute to a human. Supported range 0–4
+    # reserves bounded durable reply/verdict context before the initial paid leg.
     max_contract_rounds: int = 2
     # FIX_MCP_CONFIG: JSON map {check-name-regex: {config: <mcp.json path>, tools:
     # <glob>}}. On the CI-fix leg, servers whose regex matches a PR check are attached
@@ -910,6 +912,8 @@ class HarnessConfig:
             )
         _require_non_negative(errors, "REVIEW_MAX_REJECTIONS", self.max_review_rejections)
         _require_non_negative(errors, "MAX_CONTRACT_ROUNDS", self.max_contract_rounds)
+        if self.max_contract_rounds > MAX_SPLIT_TRAIL:
+            errors.append(f"MAX_CONTRACT_ROUNDS must be <= {MAX_SPLIT_TRAIL} (durable contract context capacity)")
         for name, value in (
             ("MAX_BUDGET_USD", self.fix_budget_usd),
             ("ROUTER_BUDGET_USD", self.router_budget_usd),

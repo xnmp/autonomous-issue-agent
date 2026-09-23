@@ -44,10 +44,12 @@ from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation,
     NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
     RemoteOutcomeUncertain, RetiredSettledCommand, RetiredUncertainCommand, RetryAuthorizationRequired,
-    ResolveAdmission, ResolveStage, WorkflowSnapshot, adjudication_allowed,
+    AuthoredResolve, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.workflow_reconciliation import ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
-from ..domain.resolve_return import FinalizedResolveReturn
+from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
+from ..domain.outcome import AuthorFollowup, author_followup
+from ..domain.resolve_split import AdjudicationInput, ContractResetCompleted, ReauthorInput, ReauthorResetIntent, SplitContext, SplitImplement, SplitInput, split_context, validate_contract_rounds
 from ..domain.events import (
     ActionApplied,
     ActionFailed,
@@ -69,13 +71,202 @@ from ..domain.events import (
 from ..domain.repository import canonical_repository
 from ..domain.refs import issue_from_branch
 from .deployment_authority import (
-    deployment_effect_barrier,
+    deployment_effect_barrier, deployment_effect_authority,
     deployment_role,
 )
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, load_workflow_row, require_workflow_binding, workflow_scope
 
 SCHEMA_VERSION = 19
+
+
+def admitted_adjudications(db: sqlite3.Connection, binding: WorkflowBinding) -> int:
+    """Unknown execution consumes allowance; proven never-launched work does not."""
+    admitted = 0
+    for row in db.execute(
+        "SELECT r.run_id,r.workflow_binding_json FROM runs r JOIN budget_reservations b USING(run_id) "
+        "WHERE b.workload_repository=? AND r.kind='ADJUDICATE' AND r.workflow_binding_json IS NOT NULL",
+        (binding.fence.key.repository,),
+    ):
+        previous = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
+        if (previous.fence.key, previous.authority, previous.episode_id) == (binding.fence.key, binding.authority, binding.episode_id):
+            admitted += int(not proven_unlaunched_run(db, RunId(row["run_id"])))
+    return admitted
+
+
+def _split_admission_input(metadata: dict) -> SplitInput | None:
+    raw = metadata.get("split_input")
+    fingerprint = metadata.get("split_fingerprint")
+    if raw is None and fingerprint is None:
+        return None
+    if not isinstance(raw, str) or fingerprint != hashlib.sha256(raw.encode()).hexdigest():
+        raise WorkflowAuthorityError("split admission lacks exact input provenance")
+    return decode_workflow(raw, SplitContext | SplitImplement | AdjudicationInput | ReauthorInput)
+
+
+def _split_consumption_key(snapshot: WorkflowSnapshot, stage: ResolveStage, supplied: SplitInput | None = None) -> str:
+    # The token belongs to the current phase, not caller-supplied input: two
+    # differently routed requests must not both consume one ready phase.
+    continuation = snapshot.episode.continuation
+    cursor = continuation.split if isinstance(continuation, AuthoredResolve) else None
+    predecessor = cursor.source if cursor is not None and stage is not ResolveStage.AUTHOR else continuation.last_applied_admission_version
+    if stage is ResolveStage.AUTHOR and isinstance(supplied, ReauthorInput):
+        predecessor = supplied.reset.intent.source
+    return hashlib.sha256(encode_workflow((snapshot.binding, stage, predecessor)).encode()).hexdigest()
+
+
+def latest_work_admission(db: sqlite3.Connection, binding: WorkflowBinding) -> ResolveAdmission | None:
+    latest = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-work-latest' AND scope=? AND key=?",
+                        (binding.fence.key.repository, f"issue:{binding.fence.key.target.number}")).fetchone()
+    if latest is None:
+        return None
+    admission = decode_workflow(latest["payload_json"], ResolveAdmission)
+    receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
+                         (binding.fence.key.repository, str(admission.attempt.run_id))).fetchone()
+    run = db.execute("SELECT workflow_binding_json,kind FROM runs WHERE run_id=?", (str(admission.attempt.run_id),)).fetchone()
+    if admission.attempt.binding.fence.key != binding.fence.key or receipt is None or decode_workflow(receipt["payload_json"], ResolveAdmission) != admission or run is None or run["kind"] != admission.stage.value or decode_workflow(run["workflow_binding_json"], WorkflowBinding) != admission.attempt.binding:
+        raise WorkflowAuthorityError("latest split admission disagrees with its admitted target and run")
+    return admission
+
+
+def proven_unlaunched_run(db: sqlite3.Connection, run_id: RunId) -> bool:
+    row = db.execute(
+        "SELECT 1 FROM runs r JOIN budget_reservations b USING(run_id) JOIN reservation_recovery rr USING(run_id) "
+        "WHERE r.run_id=? AND r.state='cancelled' AND r.outcome='released' AND b.state='released' "
+        "AND rr.policy='spawn_pending' AND r.provider_receipt_id IS NULL "
+        "AND NOT EXISTS(SELECT 1 FROM charges c WHERE c.run_id=r.run_id) "
+        "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id)", (str(run_id),),
+    ).fetchone()
+    return row is not None
+
+
+def reset_predecessor_admission(db: sqlite3.Connection, binding: WorkflowBinding) -> ResolveAdmission | None:
+    """A released launch retains its executed predecessor in immutable input."""
+    latest = latest_work_admission(db, binding)
+    if latest is None or not proven_unlaunched_run(db, latest.attempt.run_id):
+        return latest
+    run = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(latest.attempt.run_id),)).fetchone()
+    metadata = json.loads(run["dispatch_id"])
+    supplied = _split_admission_input(metadata)
+    if latest.split_fingerprint != metadata.get("split_fingerprint"):
+        raise WorkflowAuthorityError("unlaunched input disagrees with its immutable admission")
+    if isinstance(supplied, SplitImplement):
+        source = supplied.source
+    elif isinstance(supplied, AdjudicationInput):
+        source = supplied.petition.source
+    elif isinstance(supplied, ReauthorInput):
+        source = supplied.reset.intent.source
+    else:
+        return latest
+    if isinstance(supplied, (AdjudicationInput, ReauthorInput)):
+        ack = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset-completed' AND scope=? AND key=?", (binding.fence.key.repository, supplied.reset.intent.intent_id)).fetchone()
+        if ack is None or decode_workflow(ack["payload_json"], ContractResetCompleted) != supplied.reset:
+            raise WorkflowAuthorityError("unlaunched reset input lacks its immutable acknowledgement")
+    receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?", (binding.fence.key.repository, str(source.run_id))).fetchone()
+    prior_run = db.execute("SELECT workflow_binding_json,kind FROM runs WHERE run_id=?", (str(source.run_id),)).fetchone()
+    if receipt is None or prior_run is None:
+        raise WorkflowAuthorityError("unlaunched input lacks its admitted predecessor")
+    prior = decode_workflow(receipt["payload_json"], ResolveAdmission)
+    if (prior.attempt != source or prior.revision.version >= latest.revision.version
+        or prior_run["kind"] != prior.stage.value or decode_workflow(prior_run["workflow_binding_json"], WorkflowBinding) != source.binding
+        or (source.binding.fence.key, source.binding.authority, source.binding.episode_id) != (binding.fence.key, binding.authority, binding.episode_id)
+        or source.binding.fence.generation > binding.fence.generation):
+        raise WorkflowAuthorityError("unlaunched input names a foreign or future predecessor")
+    return prior
+
+
+def _validate_split_admission(db: sqlite3.Connection, snapshot: WorkflowSnapshot, stage: ResolveStage, metadata: dict, model: str) -> None:
+    supplied = _split_admission_input(metadata)
+    last = latest_work_admission(db, snapshot.binding)
+    split_stages = (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE)
+    if supplied is None:
+        if stage in split_stages:
+            raise WorkflowAuthorityError("new split admission requires a typed stage input")
+        checkpoint = snapshot.episode.continuation
+        same_episode = last is not None and (last.attempt.binding.authority, last.attempt.binding.episode_id) == (snapshot.binding.authority, snapshot.binding.episode_id)
+        if stage in (ResolveStage.RESOLVE, ResolveStage.RESUME) and (
+            (isinstance(checkpoint, AuthoredResolve) and checkpoint.split is not None)
+            or (same_episode and last is not None and last.stage in split_stages)
+        ):
+            raise WorkflowAuthorityError("ordinary work cannot bypass this episode's split continuation")
+        return
+    if last is not None:
+        if (last.stage in (ResolveStage.RESOLVE, ResolveStage.RESUME)
+            and (last.attempt.binding.authority, last.attempt.binding.episode_id) == (snapshot.binding.authority, snapshot.binding.episode_id)):
+            raise WorkflowAuthorityError("split contract writing cannot inherit an ordinary implementation episode")
+        run = db.execute(
+            "SELECT r.state,d.payload_json AS disposition FROM runs r "
+            "LEFT JOIN dedupe_keys d ON d.namespace='workflow-return-disposition' AND d.scope=? AND d.key=r.run_id WHERE r.run_id=?",
+            (snapshot.binding.fence.key.repository, str(last.attempt.run_id)),
+        ).fetchone()
+        if (run is None or run["state"] in ("reserved", "starting", "running") or run["disposition"] is None) and not proven_unlaunched_run(db, last.attempt.run_id):
+            raise WorkflowAuthorityError("another split phase is still active or awaiting finalization")
+    context = split_context(supplied)
+    selection = context.selection
+    if metadata.get("runtime") != selection.runtime or model != selection.model or metadata.get("effort") != (selection.effort.value if selection.effort is not None else None):
+        raise WorkflowAuthorityError("split admission changed its selected runtime, model or effort")
+    if issue_from_branch(context.branch) != snapshot.binding.fence.key.target.number:
+        raise WorkflowAuthorityError("split admission belongs to another issue branch")
+    continuation = snapshot.episode.continuation
+    cursor = continuation.split if isinstance(continuation, AuthoredResolve) else None
+    if stage is ResolveStage.AUTHOR:
+        if not isinstance(supplied, (SplitContext, ReauthorInput)) or context.trail:
+            raise WorkflowAuthorityError("author admission requires fresh split context")
+        if isinstance(continuation, AuthoredResolve) and continuation.author_admission.input_fingerprint == metadata.get("input_fingerprint"):
+            raise WorkflowAuthorityError("the applicable author stage is already complete")
+        if isinstance(continuation, AuthoredResolve) and not isinstance(supplied, ReauthorInput):
+            raise WorkflowAuthorityError("replacement author requires a verified isolation reset")
+        if isinstance(supplied, SplitContext) and last is not None:
+            predecessor = reset_predecessor_admission(db, snapshot.binding)
+            if predecessor is not None and (predecessor.attempt.binding.authority, predecessor.attempt.binding.episode_id) == (snapshot.binding.authority, snapshot.binding.episode_id):
+                raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?", (snapshot.binding.fence.key.repository, str(predecessor.attempt.run_id))).fetchone()
+                returned = decode_workflow(raw["payload_json"], ReturnedResolve) if raw is not None else None
+                if (predecessor.stage in (ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE)
+                    or (returned is not None and (isinstance(returned.split_input, ReauthorInput)
+                        or (returned.stage is ResolveStage.AUTHOR and author_followup(returned.result()) is AuthorFollowup.AUTHORED)))):
+                    raise WorkflowAuthorityError("prior split work requires an isolation reset before replacement author")
+        if isinstance(supplied, ReauthorInput):
+            intent = supplied.reset.intent
+            assert isinstance(intent, ReauthorResetIntent)
+            predecessor = reset_predecessor_admission(db, snapshot.binding)
+            if (intent.binding != snapshot.binding
+                or intent.input_fingerprint != metadata.get("input_fingerprint")
+                or predecessor is None or predecessor.attempt != intent.source):
+                raise WorkflowAuthorityError("replacement author reset does not match current authority and input")
+    elif stage is ResolveStage.IMPLEMENT:
+        if not isinstance(supplied, SplitImplement) or supplied != cursor:
+            raise WorkflowAuthorityError("implementation does not consume the current contract continuation")
+    elif stage is ResolveStage.ADJUDICATE:
+        if not isinstance(supplied, AdjudicationInput) or supplied.petition != cursor or supplied.reset.intent.binding != snapshot.binding:
+            raise WorkflowAuthorityError("adjudication does not consume the current dispute")
+    else:
+        raise WorkflowAuthorityError("ordinary resolve cannot consume split context")
+    if isinstance(supplied, (AdjudicationInput, ReauthorInput)):
+        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-contract-reset-completed' AND scope=? AND key=?",
+                         (snapshot.binding.fence.key.repository, supplied.reset.intent.intent_id)).fetchone()
+        if row is None or decode_workflow(row["payload_json"], ContractResetCompleted) != supplied.reset:
+            raise WorkflowAuthorityError("contract writing requires the exact durable reset acknowledgement")
+    prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-split-consumed' AND scope=? AND key=?",
+                       (snapshot.binding.fence.key.repository, _split_consumption_key(snapshot, stage, supplied))).fetchone()
+    if prior is None:
+        return
+    admission = decode_workflow(prior["payload_json"], ResolveAdmission)
+    unlaunched = proven_unlaunched_run(db, admission.attempt.run_id)
+    if stage is ResolveStage.ADJUDICATE and not unlaunched:
+        raise WorkflowAuthorityError("adjudication retry requires a new failed-attempt predecessor and reset")
+    finalized = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return-disposition' AND scope=? AND key=?",
+                           (snapshot.binding.fence.key.repository, str(admission.attempt.run_id))).fetchone()
+    if finalized is None and not unlaunched:
+        raise WorkflowAuthorityError("split phase is already consumed by an unfinished paid attempt")
+    if finalized is not None:
+        receipt = decode_workflow(finalized["payload_json"], FinalizedResolveReturn)
+        if receipt.result.attempt != admission.attempt or receipt.result.kind is not ResolveResultKind.INFRA_FAILURE:
+            raise WorkflowAuthorityError("split phase is already completed")
+    if admission.split_fingerprint != metadata.get("split_fingerprint") or admission.input_fingerprint != metadata.get("input_fingerprint"):
+        raise WorkflowAuthorityError("split retry cannot replace the admitted continuation inputs")
+    run = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(admission.attempt.run_id),)).fetchone()
+    if run is None or json.loads(run["dispatch_id"]).get("resolve_inputs") != metadata.get("resolve_inputs"):
+        raise WorkflowAuthorityError("split retry cannot replace its issue observation inputs")
 SCHEMA_BASELINE_VERSION = 9
 LEGACY_V8_SCHEMA_DIGEST = (
     "1740c6b03aae7ba5beccea7dd522d0859396e901dee6a40d12ff4284621745b5"
@@ -3096,6 +3287,22 @@ class SQLiteControlStore:
         *,
         lease: Lease | None = None,
     ) -> ReservationResult:
+        if request.workflow is None:
+            return self._reserve(request, lease=lease)
+        # A reset/retirement owns the exclusive side of this existing barrier.
+        # Never wait for Git while retaining a reservation or SQL transaction.
+        try:
+            with deployment_effect_authority(self.path, request.workload_repository,
+                                             deployment_role(request.workload_repository, request.owner_id), blocking=False):
+                return self._reserve(request, lease=lease)
+        except OSError as exc:
+            return ReservationResult(AccountingDisposition.UNAVAILABLE, None,
+                Money.zero(request.scope.currency), request.quote.maximum_charge,
+                request.cap, f"deployment effect authority unavailable: {exc}")
+
+    def _reserve(
+        self, request: ReservationRequest, *, lease: Lease | None = None,
+    ) -> ReservationResult:
         requested = request.quote.maximum_charge
         if lease is not None and (
             lease.run_id != request.run_id
@@ -3352,18 +3559,12 @@ class SQLiteControlStore:
             fingerprint = dispatch.get("input_fingerprint")
             if stage is ResolveStage.AUTHOR and fingerprint is None:
                 raise WorkflowAuthorityError("author admission requires its supplied input fingerprint")
+            _validate_split_admission(db, snapshot, stage, dispatch, request.quote.model)
             if stage is ResolveStage.ADJUDICATE:
                 if request.adjudication_ceiling is None:
                     raise WorkflowAuthorityError("adjudication admission requires a configured contract-round ceiling")
-                admitted = 0
-                for row in db.execute(
-                    "SELECT r.workflow_binding_json FROM runs r JOIN budget_reservations b USING(run_id) "
-                    "WHERE b.workload_repository=? AND r.kind='ADJUDICATE' AND r.workflow_binding_json IS NOT NULL",
-                    (request.workload_repository,),
-                ):
-                    previous = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
-                    if (previous.fence.key, previous.authority, previous.episode_id) == (binding.fence.key, binding.authority, binding.episode_id):
-                        admitted += 1
+                validate_contract_rounds(request.adjudication_ceiling)
+                admitted = admitted_adjudications(db, binding)
                 if not adjudication_allowed(admitted, request.adjudication_ceiling):
                     raise WorkflowAuthorityError("resolve episode's admitted adjudication allowance is exhausted")
             return snapshot
@@ -3380,7 +3581,7 @@ class SQLiteControlStore:
             revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
             admission = ResolveAdmission(
                 WorkflowAttemptIdentity(snapshot.binding, request.run_id, metadata["leg_id"]),
-                revision, ResolveStage(request.kind), request.adjudication_ceiling, metadata.get("input_fingerprint"),
+                revision, ResolveStage(request.kind), request.adjudication_ceiling, metadata.get("input_fingerprint"), metadata.get("split_fingerprint"),
             )
             db.execute(
                 "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",
@@ -3390,6 +3591,17 @@ class SQLiteControlStore:
                 "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('workflow-admission',?,?,?,?)",
                 (request.workload_repository, str(request.run_id), now, encode_workflow(admission)),
             )
+            indexes = []
+            if admission.stage is not ResolveStage.ROUTE:
+                indexes.append(("workflow-work-latest", f"issue:{snapshot.binding.fence.key.target.number}"))
+            if _split_admission_input(metadata) is not None:
+                indexes.append(("workflow-split-consumed", _split_consumption_key(snapshot, admission.stage, _split_admission_input(metadata))))
+            for namespace, key in indexes:
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,payload_json=excluded.payload_json",
+                    (namespace, request.workload_repository, key, now, encode_workflow(admission)),
+                )
         except (ValueError, TypeError, KeyError) as exc:
             raise WorkflowAuthorityError(f"invalid workflow admission: {exc}") from exc
 
@@ -3424,7 +3636,7 @@ class SQLiteControlStore:
                 current = load_workflow_row(db, request.workflow.fence.key)
             except (ValueError, TypeError, KeyError) as exc:
                 raise WorkflowAuthorityError("invalid admitted workflow receipt") from exc
-            if current is None or admission.attempt != expected_attempt or admission.stage.value != request.kind or admission.adjudication_ceiling != request.adjudication_ceiling or admission.input_fingerprint != metadata.get("input_fingerprint") or admission.revision.version > current.revision.version:
+            if current is None or admission.attempt != expected_attempt or admission.stage.value != request.kind or admission.adjudication_ceiling != request.adjudication_ceiling or admission.input_fingerprint != metadata.get("input_fingerprint") or admission.split_fingerprint != metadata.get("split_fingerprint") or admission.revision.version > current.revision.version:
                 return False
         actual_reservation = tuple(
             prior[name]

@@ -10,6 +10,10 @@ from .workflow import (
     ResolveSession, ResolveStage, _command_ids, _count, _text, _time,
 )
 from .workflow_identity import WorkflowBinding
+from .resolve_split import (
+    AdjudicationInput, ReauthorInput, ContractRevision, SplitContext, SplitImplement, SplitInput,
+    UnavailableContractRevision, split_context,
+)
 
 
 @dataclass(frozen=True)
@@ -36,14 +40,33 @@ class ReturnedResolve:
     exit_reason: ExitReason | None
     session: ResolveSession | None
     returned_at: datetime
+    split_input: SplitInput | None = None
+    verdict: str = ""
+    rationale: str = ""
+    contract_revision: ContractRevision | UnavailableContractRevision | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, WorkflowAttemptIdentity):
             raise ValueError("returned resolve requires its accounting-owned attempt")
-        # Split legs need an additional durable adjudication continuation;
-        # admitting them here would promise recovery this receipt cannot provide.
-        if self.stage not in (ResolveStage.RESOLVE, ResolveStage.RESUME) or not isinstance(self.stage, ResolveStage):
-            raise ValueError("returned resolve supports ordinary resolve and resume only")
+        if not isinstance(self.stage, ResolveStage) or self.stage is ResolveStage.ROUTE:
+            raise ValueError("returned resolve requires a supported work stage")
+        split_types = {ResolveStage.AUTHOR: (SplitContext, ReauthorInput), ResolveStage.IMPLEMENT: SplitImplement, ResolveStage.ADJUDICATE: AdjudicationInput}
+        expected = split_types.get(self.stage)
+        if (expected is None and self.split_input is not None) or (expected is not None and not isinstance(self.split_input, expected)):
+            raise ValueError("returned split stage requires its exact admitted stage input")
+        for name in ("verdict", "rationale"):
+            _text(getattr(self, name), name, limit=4000, empty=True)
+        if self.stage is not ResolveStage.ADJUDICATE and (self.verdict or self.rationale):
+            raise ValueError("only adjudication returns carry a verdict")
+        if self.contract_revision is not None and (
+            not isinstance(self.contract_revision, (ContractRevision, UnavailableContractRevision))
+            or self.stage not in (ResolveStage.AUTHOR, ResolveStage.ADJUDICATE)
+        ):
+            raise ValueError("only contract-writing stages capture contract revisions")
+        if isinstance(self.contract_revision, ContractRevision) and (
+            self.split_input is None or self.contract_revision.branch != split_context(self.split_input).branch
+        ):
+            raise ValueError("returned contract revision belongs to another branch")
         if not isinstance(self.inputs, ResolveInputs) or type(self.is_error) is not bool:
             raise ValueError("returned resolve requires validated inputs and outcome")
         for name in ("status", "envelope_subtype"):
@@ -65,6 +88,7 @@ class ReturnedResolve:
             exit_reason=self.exit_reason,
             session_id=self.session.session_id if self.session is not None else "",
             workflow_attempt=self.attempt,
+            structured={"verdict": self.verdict, "rationale": self.rationale} if self.stage is ResolveStage.ADJUDICATE else None,
         )
 
 

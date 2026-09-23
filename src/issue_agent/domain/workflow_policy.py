@@ -13,7 +13,11 @@ from .eligibility import AllowedEligibility, LifecycleOperation
 from .labels import Label
 from .lifecycle import completion_guard, issue_eligibility
 from .outcome import AgentResult, ResolveFollowup, budget_exhausted, infra_class_failure
-from .resolve_return import PendingResolveReturn, ResolveCleanupCompleted, ReturnedResolve
+from .resolve_return import FinalizedResolveReturn, PendingResolveReturn, ResolveCleanupCompleted, ReturnedResolve
+from .resolve_split import (
+    AdjudicationInput, AdjudicationStep, ContractBaseline, ContractRevision,
+    NeedsAdjudication, ReauthorInput, SplitContext, SplitContinuation, SplitImplement, split_context,
+)
 from .workflow import (
     AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, EnsureLifecycleProjection, EvidenceUnavailable, FreshResolve, IssueObservation,
@@ -22,7 +26,7 @@ from .workflow import (
     RearmNeedsDecision, RemoteOutcomeUncertain, RenewResolveAllowance,
     RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveCeiling, ResolveEpisode,
     ResolveRearmPreflight, ResolveResultKind, ResolveStage, SetGuidance, ClearGuidance, StopReason, SupersededRearm,
-    UnresolvedGate, WorkflowChanged, WorkflowMutation, WorkflowRejected,
+    UnresolvedGate, WorkflowChanged, WorkflowMutation, WorkflowRejected, adjudication_allowed,
     WorkflowRejection, WorkflowSnapshot, WorkflowTransition, WorkflowUnchanged,
 )
 from .workflow_identity import (
@@ -79,6 +83,17 @@ def apply_return_cleanup(snapshot: WorkflowSnapshot, cleanup: ResolveCleanupComp
     return replace(snapshot, episode=replace(snapshot.episode, continuation=fresh))
 
 
+def clear_return_split(snapshot: WorkflowSnapshot, admission: ResolveAdmission) -> WorkflowSnapshot:
+    """Verified PR/terminal lifecycle retires the cursor without changing sessions."""
+    if admission.attempt.binding != snapshot.binding or admission.revision.version > snapshot.revision.version:
+        raise ValueError("split retirement requires current admitted authority")
+    continuation = snapshot.episode.continuation
+    if not isinstance(continuation, AuthoredResolve) or admission.revision.version <= continuation.split_applied_admission_version:
+        return snapshot
+    continuation = replace(continuation, split=None, split_applied_admission_version=admission.revision.version)
+    return replace(snapshot, episode=replace(snapshot.episode, continuation=continuation))
+
+
 def defer_return_observation(pending: PendingResolveReturn, error: str, *, now: datetime) -> PendingResolveReturn:
     # Observation continues at a bounded cadence even after prolonged failure;
     # neither elapsed time nor a failed read authorizes a new execution.
@@ -94,9 +109,9 @@ def defer_return_observation(pending: PendingResolveReturn, error: str, *, now: 
 
 def decide_return(
     returned: ReturnedResolve, issue: ObservedIssue, linkage: NoLinkedPr | LinkedPrPresent,
-    *, now: datetime,
+    *, now: datetime, adjudications: int = 0, adjudication_ceiling: int | None = None,
 ) -> tuple[ResolveAttemptResult, tuple[Action, ...]]:
-    """The immediate and recovered ordinary resolve tail share one decision."""
+    """Immediate and recovered completion share stage-aware classification."""
     if not isinstance(returned, ReturnedResolve) or not isinstance(issue, ObservedIssue) or not isinstance(linkage, (NoLinkedPr, LinkedPrPresent)):
         raise ValueError("completion requires a typed return and complete observations")
     key = returned.attempt.binding.fence.key
@@ -110,12 +125,13 @@ def decide_return(
     result = returned.result()
     number = key.target.number
     pr = linkage.pr if isinstance(linkage, LinkedPrPresent) else None
-    changed = pr is None and result.status == "blocked" and not (
+    is_split = returned.split_input is not None
+    changed = pr is None and (result.status == "blocked" or is_split) and not (
         infra_class_failure(result) or budget_exhausted(result.exit_reason)
     ) and (issue.issue.title, issue.issue.body, issue.issue.author) != (
         returned.inputs.title, returned.inputs.body, returned.inputs.author,
     )
-    closed_success = pr is None and issue.issue.state == "closed" and not result.is_error and result.status in ("pushed", "done")
+    closed_success = pr is None and issue.issue.state == "closed" and not result.is_error and (result.status in ("pushed", "done") or is_split)
     followup = (ResolveFollowup.PR_OPENED if pr is not None else ResolveFollowup.RETRY if changed
                 else ResolveFollowup.BLOCKED if returned.stage is ResolveStage.RESUME
                 else outcome.resolve_followup(result, False))
@@ -130,6 +146,14 @@ def decide_return(
         kind = ResolveResultKind.STAGE_PROGRESSED
     elif issue.issue.state == "closed" and pr is None:
         kind = ResolveResultKind.BLOCKED
+    elif pr is None and not changed and returned.stage is ResolveStage.AUTHOR:
+        author = outcome.author_followup(result)
+        kind = (ResolveResultKind.STAGE_PROGRESSED if author is outcome.AuthorFollowup.AUTHORED else
+                ResolveResultKind.BLOCKED if author is outcome.AuthorFollowup.BLOCKED else ResolveResultKind.COUNTED_REQUEUE)
+    elif pr is None and not changed and returned.stage is ResolveStage.IMPLEMENT and outcome.implement_followup(result, False) is outcome.ImplementFollowup.CONTRACT_CHANGE:
+        kind = ResolveResultKind.STAGE_PROGRESSED
+    elif pr is None and not changed and returned.stage is ResolveStage.ADJUDICATE:
+        kind = ResolveResultKind.BLOCKED if result.is_error else ResolveResultKind.STAGE_PROGRESSED
     classified = replace(classified, kind=kind, stage=returned.stage,
                          session=None if kind in (ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL) else returned.session)
     if closed_success:
@@ -138,6 +162,23 @@ def decide_return(
         return classified, ()
     if changed:
         actions: list[Action] = [Relabel(Target.ISSUE, number, Label.AI_WORKING, Label.AI_READY)]
+    elif pr is None and returned.stage is ResolveStage.AUTHOR:
+        actions = outcome.author_actions(number, result)
+    elif pr is None and returned.stage is ResolveStage.IMPLEMENT and kind is ResolveResultKind.STAGE_PROGRESSED:
+        if adjudication_ceiling is not None and not adjudication_allowed(adjudications, adjudication_ceiling):
+            assert isinstance(returned.split_input, SplitImplement)
+            trail = "\n".join(f"round {index}: {item.verdict.value} — {item.rationale}" for index, item in enumerate(returned.split_input.context.trail, 1))
+            actions = outcome.contract_escalation_actions(number, result.needs or result.summary or "see logs", trail)
+        else:
+            actions = []
+    elif pr is None and returned.stage is ResolveStage.ADJUDICATE:
+        if kind is ResolveResultKind.INFRA_FAILURE and adjudication_ceiling is not None and not adjudication_allowed(adjudications, adjudication_ceiling):
+            assert isinstance(returned.split_input, AdjudicationInput)
+            petition = returned.split_input.petition
+            trail = "\n".join(f"round {index}: {item.verdict.value} — {item.rationale}" for index, item in enumerate(petition.context.trail, 1))
+            actions = outcome.contract_escalation_actions(number, petition.objection, trail)
+        else:
+            actions = outcome.budget_actions(number) if budget_exhausted(result.exit_reason) else []
     elif returned.stage is ResolveStage.RESUME and pr is None and not budget_exhausted(result.exit_reason):
         actions = outcome.resume_actions(number, result, None)
     else:
@@ -169,6 +210,103 @@ def decide_return(
             workflow=returned.attempt.binding,
         ),)
     return classified, compact + tuple(others)
+
+
+def split_return_continuation(
+    returned: ReturnedResolve, admission: ResolveAdmission, classified: ResolveAttemptResult,
+    *, issue: ObservedIssue, contract_revision: ContractRevision | None = None,
+    adjudications: int = 0, adjudication_ceiling: int | None = None,
+) -> SplitContinuation | None:
+    """Derive the next split planner input from an executed, classified return."""
+    if admission.attempt != returned.attempt or admission.stage is not returned.stage or classified.attempt != returned.attempt:
+        raise ValueError("split continuation requires the same admitted return")
+    if not isinstance(issue, ObservedIssue) or issue.key != returned.attempt.binding.fence.key:
+        raise ValueError("split continuation requires its observed issue")
+    if issue.issue.state == "closed" or (issue.issue.title, issue.issue.body, issue.issue.author) != (
+        returned.inputs.title, returned.inputs.body, returned.inputs.author,
+    ):
+        return None
+    if classified.kind is ResolveResultKind.INFRA_FAILURE and returned.stage is ResolveStage.ADJUDICATE:
+        if adjudication_ceiling is not None and not adjudication_allowed(adjudications, adjudication_ceiling):
+            return None
+        assert isinstance(returned.split_input, AdjudicationInput)
+        petition = returned.split_input.petition
+        return NeedsAdjudication(returned.attempt, admission.revision.version, petition.context, petition.baseline, petition.objection)
+    if classified.kind is ResolveResultKind.INFRA_FAILURE and returned.stage is ResolveStage.IMPLEMENT:
+        assert isinstance(returned.split_input, SplitImplement)
+        prior = returned.split_input
+        return SplitImplement(returned.attempt, admission.revision.version, prior.context, prior.baseline)
+    if returned.split_input is None or classified.kind in (
+        ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL,
+        ResolveResultKind.PR_OPENED,
+    ):
+        return None
+    result = returned.result()
+    version = admission.revision.version
+    context = split_context(returned.split_input)
+    revision = returned.contract_revision if isinstance(returned.contract_revision, ContractRevision) else contract_revision
+    if contract_revision is not None and isinstance(returned.contract_revision, ContractRevision) and returned.contract_revision != contract_revision:
+        raise ValueError("recovered contract revision disagrees with captured baseline")
+    if returned.stage is ResolveStage.AUTHOR:
+        if outcome.author_followup(result) is not outcome.AuthorFollowup.AUTHORED:
+            return None
+        if revision is None:
+            raise ValueError("authored contract baseline is unavailable")
+        return SplitImplement(returned.attempt, version, context, ContractBaseline(returned.attempt, revision))
+    if returned.stage is ResolveStage.IMPLEMENT:
+        assert isinstance(returned.split_input, SplitImplement)
+        if outcome.implement_followup(result, False) is not outcome.ImplementFollowup.CONTRACT_CHANGE:
+            if classified.kind in (ResolveResultKind.BLOCKED, ResolveResultKind.COUNTED_REQUEUE):
+                return SplitImplement(returned.attempt, version, context, returned.split_input.baseline)
+            return None
+        if adjudication_ceiling is not None and not adjudication_allowed(adjudications, adjudication_ceiling):
+            return None
+        return NeedsAdjudication(returned.attempt, version, context, returned.split_input.baseline,
+                                 (result.needs or result.summary or "see logs")[:4000])
+    assert isinstance(returned.split_input, AdjudicationInput)
+    verdict = outcome.adjudication(result)
+    baseline = returned.split_input.petition.baseline
+    if verdict is outcome.Adjudication.REVISED:
+        if revision is None:
+            raise ValueError("revised contract baseline is unavailable")
+        if revision == baseline.revision:
+            raise ValueError("revised adjudication requires a changed captured contract")
+        baseline = ContractBaseline(returned.attempt, revision)
+    elif revision is None or revision != baseline.revision:
+        raise ValueError("upheld adjudication requires the unchanged captured contract baseline")
+    reason = (returned.rationale or returned.summary or "the contract is correct")[:4000]
+    step = AdjudicationStep(returned.attempt, version, verdict, reason)
+    context = replace(context, trail=context.trail + (step,))
+    return SplitImplement(returned.attempt, version, context, baseline)
+
+
+def reauthor_baseline(
+    returned: ReturnedResolve, finalized: FinalizedResolveReturn,
+    *, recovered: ContractBaseline | None = None,
+) -> ContractBaseline | None:
+    """Failed replacement writing cannot promote its possibly dirty HEAD."""
+    if finalized.result.attempt != returned.attempt or finalized.result.stage is not returned.stage:
+        raise ValueError("re-author baseline requires the exact finalized source")
+    if recovered is not None and (recovered.source != returned.attempt or returned.split_input is None or recovered.revision.branch != split_context(returned.split_input).branch):
+        raise ValueError("recovered re-author baseline belongs to another source")
+    if finalized.result.split is not None:
+        return finalized.result.split.baseline
+    supplied = returned.split_input
+    if isinstance(supplied, SplitImplement):
+        return supplied.baseline
+    if isinstance(supplied, AdjudicationInput):
+        return supplied.petition.baseline
+    if returned.stage is ResolveStage.AUTHOR and outcome.author_followup(returned.result()) is outcome.AuthorFollowup.AUTHORED:
+        if isinstance(returned.contract_revision, ContractRevision):
+            return ContractBaseline(returned.attempt, returned.contract_revision)
+        if recovered is not None:
+            return recovered
+        raise ValueError("successful author has no verified contract baseline")
+    if isinstance(supplied, ReauthorInput):
+        return supplied.reset.intent.baseline
+    if returned.stage is ResolveStage.AUTHOR and isinstance(supplied, SplitContext):
+        return None
+    raise ValueError("reset predecessor has no safe contract baseline")
 
 
 def initial_resolve_workflow(
@@ -353,6 +491,15 @@ def record_resolve_attempt(
     # Router selection is audited but does not own a resolve continuation or a
     # resolve strike. Infrastructure/admission failures cannot replace a usable
     # checkpoint with an unproven provider handle.
+    if result.kind is ResolveResultKind.INFRA_FAILURE and result.split is not None:
+        continuation = snapshot.episode.continuation
+        if result.split.admission_version != admission.revision.version or not isinstance(continuation, AuthoredResolve):
+            return _reject(WorkflowRejection.INVALID_SCOPE, "split retry requires its existing authored provenance")
+        if admission.revision.version <= continuation.split_applied_admission_version:
+            return WorkflowUnchanged(snapshot)
+        continuation = replace(continuation, split=result.split, split_applied_admission_version=admission.revision.version)
+        after = replace(snapshot, revision=_next(snapshot), episode=replace(snapshot.episode, continuation=continuation))
+        return WorkflowChanged(snapshot.revision, WorkflowMutation.RECORD_RESULT, after, result)
     if result.stage is ResolveStage.ROUTE or result.kind in (ResolveResultKind.INFRA_FAILURE, ResolveResultKind.BUDGET_REFUSAL):
         return WorkflowUnchanged(snapshot)
     continuation = snapshot.episode.continuation
@@ -367,7 +514,18 @@ def record_resolve_attempt(
         not isinstance(continuation, AuthoredResolve)
         or admission.revision.version > continuation.author_admission.revision.version
     ):
-        continuation = AuthoredResolve(admission, continuation.last_applied_admission_version, continuation.session)
+        existing_split = continuation.split if isinstance(continuation, AuthoredResolve) else None
+        existing_split_version = continuation.split_applied_admission_version if isinstance(continuation, AuthoredResolve) else 0
+        continuation = AuthoredResolve(admission, continuation.last_applied_admission_version, continuation.session, existing_split, existing_split_version)
+    if result.split is not None:
+        if result.split.admission_version != admission.revision.version:
+            return _reject(WorkflowRejection.INVALID_SCOPE, "split cursor disagrees with its admitted ordering")
+        if not isinstance(continuation, AuthoredResolve):
+            return _reject(WorkflowRejection.INVALID_SCOPE, "split continuation lacks its authored checkpoint")
+        if admission.revision.version > continuation.split_applied_admission_version:
+            continuation = replace(continuation, split=result.split, split_applied_admission_version=admission.revision.version)
+    elif isinstance(continuation, AuthoredResolve) and (continuation.split is not None or continuation.split_applied_admission_version > 0) and admission.revision.version > continuation.split_applied_admission_version:
+        continuation = replace(continuation, split=None, split_applied_admission_version=admission.revision.version)
     episode = replace(snapshot.episode, continuation=continuation)
     if result.kind is ResolveResultKind.COUNTED_REQUEUE:
         if episode.failures == 2**63 - 1:

@@ -41,6 +41,7 @@ from ..domain.exemptions import (
 )
 from ..domain.gate import OpenPrLookup, resolve_test_cmd
 from ..domain.refs import issue_from_branch
+from ..domain.resolve_split import ContractResetResult, ContractRevision
 from .governor import GateContext, run_target_command
 from .store import HarnessMarkers
 
@@ -168,6 +169,326 @@ class WorktreeBranchAmbiguous(RuntimeError):
     branch and strand the blocked work. Callers must surface the ambiguity
     rather than silently falling back to a title-derived branch name.
     """
+
+
+def _contract_ref(namespace: str, identity: str) -> str:
+    if not isinstance(identity, str) or not identity or len(identity) > 4096:
+        raise WorktreeUnavailable("contract reference identity is invalid")
+    digest = hashlib.sha256(identity.encode()).hexdigest()
+    return f"refs/issue-agent/{namespace}/{digest}"
+
+
+def _contract_git(
+    run: GitRunner, args: list[str], cwd: str, failure: str
+) -> GitResult:
+    try:
+        result = run(args, cwd)
+    except Exception as exc:
+        raise WorktreeUnavailable(failure) from exc
+    if not isinstance(result, GitResult):
+        raise WorktreeUnavailable(failure)
+    return result
+
+
+def _validate_contract_checkout(
+    cwd: str,
+    issue: int,
+    expected_branch: str,
+    run: GitRunner,
+    *,
+    require_clean: bool,
+) -> ContractRevision:
+    if isinstance(issue, bool) or not isinstance(issue, int) or issue < 1:
+        raise WorktreeUnavailable("contract checkout requires a positive issue number")
+    if not isinstance(cwd, str) or not cwd:
+        raise WorktreeUnavailable("contract checkout path is invalid")
+    if issue_from_branch(expected_branch) != issue:
+        raise WorktreeUnavailable(
+            f"branch {expected_branch!r} does not belong to issue #{issue}"
+        )
+
+    top = _contract_git(
+        run,
+        ["rev-parse", "--show-toplevel"],
+        cwd,
+        f"cannot verify the contract checkout for issue #{issue}",
+    )
+    if top.code != 0 or os.path.realpath(top.out.strip()) != os.path.realpath(cwd):
+        raise WorktreeUnavailable(
+            f"contract checkout for issue #{issue} is not its exact Git toplevel"
+        )
+    listing = _contract_git(
+        run,
+        ["worktree", "list", "--porcelain"],
+        cwd,
+        f"cannot inspect worktrees for issue #{issue}",
+    )
+    registered = (
+        _registered_branch(listing.out, cwd) if listing.code == 0 else None
+    )
+    if registered != expected_branch:
+        raise WorktreeUnavailable(
+            f"contract checkout for issue #{issue} is not registered on "
+            f"{expected_branch!r}"
+        )
+    branch = _contract_git(
+        run,
+        ["branch", "--show-current"],
+        cwd,
+        f"cannot verify the contract branch for issue #{issue}",
+    )
+    if branch.code != 0 or branch.out.strip() != expected_branch:
+        raise WorktreeUnavailable(
+            f"contract checkout for issue #{issue} is detached or on another branch"
+        )
+    head = _contract_git(
+        run,
+        ["rev-parse", "--verify", "HEAD^{commit}"],
+        cwd,
+        f"cannot resolve the contract HEAD for issue #{issue}",
+    )
+    if head.code != 0:
+        raise WorktreeUnavailable(f"contract HEAD is unavailable for issue #{issue}")
+    try:
+        revision = ContractRevision(expected_branch, head.out.strip())
+    except (TypeError, ValueError) as exc:
+        raise WorktreeUnavailable(
+            f"contract HEAD is invalid for issue #{issue}"
+        ) from exc
+    if require_clean:
+        status = _contract_git(
+            run,
+            ["status", "--porcelain=v1", "--untracked-files=all"],
+            cwd,
+            f"cannot inspect contract checkout state for issue #{issue}",
+        )
+        if status.code != 0 or status.out:
+            raise WorktreeUnavailable(
+                f"contract checkout for issue #{issue} is not clean"
+            )
+    return revision
+
+
+def _read_ref(run: GitRunner, cwd: str, ref: str) -> str | None:
+    result = _contract_git(
+        run,
+        ["rev-parse", "--verify", "--quiet", ref],
+        cwd,
+        f"cannot inspect retained Git reference {ref!r}",
+    )
+    if result.code == 1:
+        return None
+    if result.code != 0:
+        raise WorktreeUnavailable(f"cannot inspect retained Git reference {ref!r}")
+    value = result.out.strip()
+    if len(value) not in (40, 64) or any(c not in "0123456789abcdef" for c in value):
+        raise WorktreeUnavailable(f"retained Git reference {ref!r} is invalid")
+    return value
+
+
+def _create_or_verify_ref(
+    run: GitRunner, cwd: str, ref: str, target: str
+) -> None:
+    existing = _read_ref(run, cwd, ref)
+    if existing is not None:
+        if existing != target:
+            raise WorktreeUnavailable(
+                f"retained Git reference {ref!r} conflicts with this operation"
+            )
+        return
+    _contract_git(
+        run,
+        ["update-ref", ref, target, "0" * len(target)],
+        cwd,
+        f"cannot create retained Git reference {ref!r}",
+    )
+    # A concurrent creator of the identical pin is harmless; a different pin
+    # is never overwritten.
+    observed = _read_ref(run, cwd, ref)
+    if observed != target:
+        raise WorktreeUnavailable(f"cannot create retained Git reference {ref!r}")
+
+
+def capture_contract_revision(
+    cwd: str,
+    issue: int,
+    capture_id: str,
+    expected_branch: str,
+    run: GitRunner = _subprocess_git,
+) -> ContractRevision:
+    """Capture a clean issue checkout's exact HEAD under an immutable pin."""
+
+    revision = _validate_contract_checkout(
+        cwd, issue, expected_branch, run, require_clean=True
+    )
+    ref = _contract_ref("contracts", capture_id)
+    _create_or_verify_ref(run, cwd, ref, revision.head_sha)
+    pinned = _read_ref(run, cwd, ref)
+    verified = _validate_contract_checkout(
+        cwd, issue, expected_branch, run, require_clean=True
+    )
+    if pinned != revision.head_sha or verified != revision:
+        raise WorktreeUnavailable(f"contract pin {ref!r} could not be verified")
+    return revision
+
+
+def read_captured_contract_revision(
+    cwd: str,
+    issue: int,
+    capture_id: str,
+    expected_branch: str,
+    run: GitRunner = _subprocess_git,
+) -> ContractRevision:
+    """Read an existing contract pin without changing refs or checkout state."""
+
+    _validate_contract_checkout(
+        cwd, issue, expected_branch, run, require_clean=False
+    )
+    ref = _contract_ref("contracts", capture_id)
+    pinned = _read_ref(run, cwd, ref)
+    if pinned is None:
+        raise WorktreeUnavailable(f"contract pin {ref!r} does not exist")
+    commit = _contract_git(
+        run,
+        ["rev-parse", "--verify", f"{ref}^{{commit}}"],
+        cwd,
+        f"contract pin {ref!r} does not name a commit",
+    )
+    if commit.code != 0 or commit.out.strip() != pinned:
+        raise WorktreeUnavailable(f"contract pin {ref!r} does not name a commit")
+    try:
+        return ContractRevision(expected_branch, pinned)
+    except (TypeError, ValueError) as exc:
+        raise WorktreeUnavailable(f"contract pin {ref!r} is invalid") from exc
+
+
+def verify_contract_revision(
+    cwd: str,
+    issue: int,
+    revision: ContractRevision,
+    run: GitRunner = _subprocess_git,
+) -> ContractRevision:
+    """Prove a clean owned checkout is still at an exact captured revision."""
+
+    if not isinstance(revision, ContractRevision):
+        raise WorktreeUnavailable("contract verification requires an exact revision")
+    observed = _validate_contract_checkout(
+        cwd, issue, revision.branch, run, require_clean=True
+    )
+    if observed != revision:
+        raise WorktreeUnavailable(
+            f"contract checkout for issue #{issue} changed after capture"
+        )
+    return observed
+
+
+def _checkout_status(
+    run: GitRunner,
+    cwd: str,
+    issue: int,
+    *,
+    include_ignored: bool = False,
+) -> str:
+    args = ["status", "--porcelain=v1", "--untracked-files=all"]
+    if include_ignored:
+        args.append("--ignored=matching")
+    status = _contract_git(
+        run,
+        args,
+        cwd,
+        f"cannot inspect reset state for issue #{issue}",
+    )
+    if status.code != 0:
+        raise WorktreeUnavailable(f"cannot inspect reset state for issue #{issue}")
+    return status.out
+
+
+def _archive_marker(
+    archive_ref: str, revision: ContractRevision
+) -> str:
+    digest = archive_ref.rsplit("/", 1)[-1]
+    return (
+        f"issue-agent contract reset {digest} "
+        f"{revision.branch} {revision.head_sha}"
+    )
+
+
+def _archive_original_head(
+    run: GitRunner,
+    cwd: str,
+    archive_ref: str,
+    marker: str,
+    branch: str,
+) -> str:
+    row = _contract_git(
+        run,
+        ["rev-list", "--parents", "-n", "1", archive_ref],
+        cwd,
+        f"cannot verify reset archive {archive_ref!r}",
+    )
+    subject = _contract_git(
+        run,
+        ["show", "-s", "--format=%s", archive_ref],
+        cwd,
+        f"cannot verify reset archive {archive_ref!r}",
+    )
+    if row.code != 0 or subject.code != 0:
+        raise WorktreeUnavailable(f"cannot verify reset archive {archive_ref!r}")
+    parts = row.out.split()
+    actual_subject = subject.out.rstrip("\n")
+    clean_marker = actual_subject == marker and len(parts) == 2
+    stash_marker = actual_subject == f"On {branch}: {marker}" and len(parts) in (3, 4)
+    if not (clean_marker or stash_marker):
+        raise WorktreeUnavailable(
+            f"reset archive {archive_ref!r} conflicts with this operation"
+        )
+    original = parts[1]
+    if len(original) not in (40, 64):
+        raise WorktreeUnavailable(f"reset archive {archive_ref!r} is invalid")
+    return original
+
+
+def _recover_interrupted_stash(
+    run: GitRunner,
+    cwd: str,
+    archive_ref: str,
+    marker: str,
+    branch: str,
+    current_head: str,
+    clean: bool,
+) -> str | None:
+    stashes = _contract_git(
+        run,
+        ["stash", "list", "--format=%H%x09%gs"],
+        cwd,
+        f"cannot inspect retained reset work for {archive_ref!r}",
+    )
+    if stashes.code != 0:
+        raise WorktreeUnavailable(
+            f"cannot inspect retained reset work for {archive_ref!r}"
+        )
+    expected_subject = f"On {branch}: {marker}"
+    candidates = [
+        row.split("\t", 1)[0]
+        for row in stashes.out.splitlines()
+        if "\t" in row and row.split("\t", 1)[1] == expected_subject
+    ]
+    if not candidates:
+        return None
+    if len(candidates) != 1 or not clean:
+        raise WorktreeUnavailable(
+            f"interrupted reset archive {archive_ref!r} is ambiguous or stale"
+        )
+    candidate = candidates[0]
+    original = _archive_original_head(
+        run, cwd, candidate, marker, branch
+    )
+    if original != current_head:
+        raise WorktreeUnavailable(
+            f"interrupted reset archive {archive_ref!r} is stale"
+        )
+    _create_or_verify_ref(run, cwd, archive_ref, candidate)
+    return candidate
 
 
 class Worktrees:
@@ -375,15 +696,216 @@ class Worktrees:
                     f"branch deletion for {branch!r} could not be verified"
                 )
 
-    def reset(self, issue: int) -> None:
-        """Discard all uncommitted work in the issue's worktree (tracked + untracked),
-        leaving only the committed branch state. Used before contract adjudication so
-        the adjudicating author sees the committed contract, never the implementer's
-        in-progress code (argument-only blindness)."""
-        wt = os.path.join(self.repo_dir, self.path(issue))
-        self._git(["checkout", "--", "."], wt)
-        self._git(["clean", "-fd"], wt)
+    def reset_contract(
+        self,
+        issue: int,
+        revision: ContractRevision,
+        intent_id: str,
+    ) -> ContractResetResult:
+        """Restore one managed issue checkout to an exact retained contract.
 
+        The displaced branch state remains reachable through the returned ref.
+        Existing refs are replay evidence, never permission to overwrite them.
+        """
+
+        with self._mutation_lock:
+            return self._reset_contract(issue, revision, intent_id)
+
+    def _reset_contract(
+        self,
+        issue: int,
+        revision: ContractRevision,
+        intent_id: str,
+    ) -> ContractResetResult:
+        if not isinstance(revision, ContractRevision):
+            raise WorktreeUnavailable("contract reset requires an exact revision")
+        if issue_from_branch(revision.branch) != issue:
+            raise WorktreeUnavailable(
+                f"contract revision does not belong to issue #{issue}"
+            )
+        archive_ref = _contract_ref("contract-reset", intent_id)
+        marker = _archive_marker(archive_ref, revision)
+        cwd = os.path.join(self.repo_dir, self.path(issue))
+        repo_root = os.path.realpath(self.repo_dir)
+        managed_root = os.path.realpath(
+            os.path.join(self.repo_dir, self.worktree_root)
+        )
+        checkout = os.path.realpath(cwd)
+        if (
+            checkout == repo_root
+            or os.path.commonpath((checkout, managed_root)) != managed_root
+        ):
+            raise WorktreeUnavailable(
+                f"contract reset path for issue #{issue} is outside its managed root"
+            )
+        if not self._path_exists(cwd):
+            raise WorktreeUnavailable(
+                f"managed contract checkout for issue #{issue} is unavailable"
+            )
+
+        current = _validate_contract_checkout(
+            cwd, issue, revision.branch, self._git, require_clean=False
+        )
+        baseline = _contract_git(
+            self._git,
+            ["rev-parse", "--verify", f"{revision.head_sha}^{{commit}}"],
+            cwd,
+            f"contract baseline is unavailable for issue #{issue}",
+        )
+        if baseline.code != 0 or baseline.out.strip() != revision.head_sha:
+            raise WorktreeUnavailable(
+                f"contract baseline is unavailable for issue #{issue}"
+            )
+        # Reset is an argument-blind boundary: ignored files can contain just
+        # as much implementer work as tracked files. Capture deliberately does
+        # not impose this rule because pre-contract build caches are harmless;
+        # reset archives and removes every file class before adjudication.
+        status = _checkout_status(
+            self._git, cwd, issue, include_ignored=True
+        )
+
+        archived = _read_ref(self._git, cwd, archive_ref)
+        if archived is not None:
+            original_head = _archive_original_head(
+                self._git, cwd, archive_ref, marker, revision.branch
+            )
+            if status:
+                raise WorktreeUnavailable(
+                    f"reset archive {archive_ref!r} is stale: checkout changed after preservation"
+                )
+            if current.head_sha == revision.head_sha:
+                return ContractResetResult(revision, archive_ref)
+            if current.head_sha != original_head:
+                raise WorktreeUnavailable(
+                    f"reset archive {archive_ref!r} conflicts with current branch history"
+                )
+        else:
+            recovered = _recover_interrupted_stash(
+                self._git,
+                cwd,
+                archive_ref,
+                marker,
+                revision.branch,
+                current.head_sha,
+                not status,
+            )
+            if recovered is not None:
+                archived = recovered
+                original_head = _archive_original_head(
+                    self._git, cwd, archive_ref, marker, revision.branch
+                )
+            elif status:
+                stashed = _contract_git(
+                    self._git,
+                    ["stash", "push", "--all", "--message", marker],
+                    cwd,
+                    f"cannot preserve displaced work for issue #{issue}",
+                )
+                if stashed.code != 0:
+                    raise WorktreeUnavailable(
+                        f"cannot preserve displaced work for issue #{issue}"
+                    )
+                preserved_head = _validate_contract_checkout(
+                    cwd,
+                    issue,
+                    revision.branch,
+                    self._git,
+                    require_clean=True,
+                )
+                if preserved_head.head_sha != current.head_sha:
+                    raise WorktreeUnavailable(
+                        f"preserving issue #{issue} unexpectedly changed its branch"
+                    )
+                if _checkout_status(
+                    self._git, cwd, issue, include_ignored=True
+                ):
+                    raise WorktreeUnavailable(
+                        f"preserving issue #{issue} left displaced files in its checkout"
+                    )
+                stash = _contract_git(
+                    self._git,
+                    ["rev-parse", "--verify", "refs/stash^{commit}"],
+                    cwd,
+                    f"cannot verify displaced work for issue #{issue}",
+                )
+                if stash.code != 0:
+                    raise WorktreeUnavailable(
+                        f"cannot verify displaced work for issue #{issue}"
+                    )
+                archived = stash.out.strip()
+                if _archive_original_head(
+                    self._git, cwd, archived, marker, revision.branch
+                ) != current.head_sha:
+                    raise WorktreeUnavailable(
+                        f"displaced work archive is stale for issue #{issue}"
+                    )
+                _create_or_verify_ref(self._git, cwd, archive_ref, archived)
+                original_head = current.head_sha
+            else:
+                tree = _contract_git(
+                    self._git,
+                    ["rev-parse", "--verify", f"{current.head_sha}^{{tree}}"],
+                    cwd,
+                    f"cannot preserve branch history for issue #{issue}",
+                )
+                if tree.code != 0:
+                    raise WorktreeUnavailable(
+                        f"cannot preserve branch history for issue #{issue}"
+                    )
+                marker_commit = _contract_git(
+                    self._git,
+                    [
+                        "commit-tree",
+                        tree.out.strip(),
+                        "-p",
+                        current.head_sha,
+                        "-m",
+                        marker,
+                    ],
+                    cwd,
+                    f"cannot preserve branch history for issue #{issue}",
+                )
+                if marker_commit.code != 0:
+                    raise WorktreeUnavailable(
+                        f"cannot preserve branch history for issue #{issue}"
+                    )
+                archived = marker_commit.out.strip()
+                _create_or_verify_ref(self._git, cwd, archive_ref, archived)
+                original_head = _archive_original_head(
+                    self._git, cwd, archive_ref, marker, revision.branch
+                )
+                if original_head != current.head_sha:
+                    raise WorktreeUnavailable(
+                        f"branch archive is stale for issue #{issue}"
+                    )
+
+        reset = _contract_git(
+            self._git,
+            ["reset", "--hard", revision.head_sha],
+            cwd,
+            f"cannot restore contract baseline for issue #{issue}",
+        )
+        if reset.code != 0:
+            raise WorktreeUnavailable(
+                f"cannot restore contract baseline for issue #{issue}"
+            )
+        verified = _validate_contract_checkout(
+            cwd, issue, revision.branch, self._git, require_clean=True
+        )
+        if (
+            verified != revision
+            or _checkout_status(
+                self._git, cwd, issue, include_ignored=True
+            )
+        ):
+            raise WorktreeUnavailable(
+                f"contract reset postconditions failed for issue #{issue}"
+            )
+        if _read_ref(self._git, cwd, archive_ref) != archived:
+            raise WorktreeUnavailable(
+                f"reset archive could not be verified for issue #{issue}"
+            )
+        return ContractResetResult(revision, archive_ref)
 
 class ReviewCheckouts:
     """Detached per-PR worktrees pinned at the exact reviewed head SHA.

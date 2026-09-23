@@ -74,6 +74,7 @@ def deployment_effect_authority(
     control_path: str,
     repository: str,
     role: str,
+    *, blocking: bool = True,
 ) -> Iterator[None]:
     """Share authority with peer effects while excluding owner retirement."""
 
@@ -82,6 +83,7 @@ def deployment_effect_authority(
         repository,
         role,
         exclusive=False,
+        blocking=blocking,
     ):
         yield
 
@@ -93,6 +95,7 @@ def _deployment_effect_lock(
     role: str,
     *,
     exclusive: bool,
+    blocking: bool = True,
 ) -> Iterator[None]:
     if not control_path or not repository or not role:
         raise ValueError("deployment effect authority scope is incomplete")
@@ -111,7 +114,8 @@ def _deployment_effect_lock(
                 f"{path}"
             )
         os.fchmod(fd, stat.S_IRUSR | stat.S_IWUSR)
-        fcntl.flock(fd, fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH)
+        mode = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+        fcntl.flock(fd, mode if blocking else mode | fcntl.LOCK_NB)
         try:
             yield
         finally:

@@ -2,6 +2,7 @@
 
 import asyncio
 from dataclasses import replace
+from datetime import datetime, timezone
 import json
 
 import pytest
@@ -16,13 +17,16 @@ from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
 from issue_agent.domain.agent_task import run_input_fingerprint
 from issue_agent.domain.contracts import Money
-from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.pricing import BudgetPolicy, ModelRates, RateTable
+from issue_agent.domain.resolve_return import ResolveInputs
+from issue_agent.domain.resolve_split import ContractRevision, ContractResetCompleted, ContractResetResult, ReauthorInput, SplitContext, SplitSelection
 from issue_agent.domain.workflow import (
-    AuthoredResolve, ResolveAdmission, ResolveAttemptResult, ResolveResultKind,
-    ResolveSession, ResolveStage,
+    AuthoredResolve, NoLinkedPr, ObservedIssue, ResolveAdmission, ResolveStage,
+    WorkflowCommitted, WorkflowSnapshot,
 )
 from issue_agent.domain.workflow_identity import WorkflowWriter
+from tests.domain.builders import issue
 from tests.fakes.legacy_journal import Journal
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
@@ -45,10 +49,15 @@ def test_author_checkpoint_fingerprints_authoritative_inputs_not_delivered_hando
             str(worktree), "fix/1-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin",
         ),
     )
+    monkeypatch.setattr(accounting_runtime, "capture_contract_revision",
+                        lambda _cwd, _issue, _capture, branch: ContractRevision(branch, "a" * 40))
+    runtime_name = "codex" if repository_guidance else "claude"
     original = RuntimePlan(
         "Author the current issue contract", cwd=str(worktree), model="test-model",
         append_system_prompt="Preserve public behavior", schema={"type": "object"},
         context_prefix="Existing scratch context\n\n", context_suffix="\n\nExisting trailing context", max_budget_usd=2,
+        resolve_inputs=ResolveInputs("title", "body", "alice"),
+        split_input=SplitContext("fix/1-test", SplitSelection(runtime_name, "test-model")),
     )
     changes = {
         "prompt": "Author the newly corrected requirements",
@@ -62,7 +71,6 @@ def test_author_checkpoint_fingerprints_authoritative_inputs_not_delivered_hando
     notes = ("First exhausted experiment", "A different failed experiment", "A different failed experiment")
     admissions = []
     supplied = []
-    runtime_name = "codex" if repository_guidance else "claude"
 
     class Provider:
         async def run(self, task):
@@ -75,11 +83,12 @@ def test_author_checkpoint_fingerprints_authoritative_inputs_not_delivered_hando
                 ).fetchone()
             receipt = decode_workflow(row[0], ResolveAdmission)
             assert receipt.stage is ResolveStage.AUTHOR
-            assert receipt.input_fingerprint == run_input_fingerprint(planned[index].intent)
-            assert task.intent is planned[index].intent
+            expected = (original, revised)[index]
+            assert receipt.input_fingerprint == run_input_fingerprint(expected.intent)
+            assert task.intent is expected.intent
             admissions.append(receipt)
             supplied.append(task)
-            return AgentResult(False, status="ok", cost_usd=1, session_id=f"author-session-{index}")
+            return AgentResult(False, status="tests_authored", cost_usd=1, session_id=f"author-session-{index}")
 
     provider = RepositoryGuidanceRuntime(Provider()) if repository_guidance else Provider()
     accounting = AccountingRuntime(
@@ -103,10 +112,31 @@ def test_author_checkpoint_fingerprints_authoritative_inputs_not_delivered_hando
             (worktree / "AGENTS.md").write_text(guidance, encoding="utf-8")
         runtime.set_context("fix", "AUTHOR", 1, 1, workflow=snapshot.binding)
 
+        if index == 2:
+            intent = workflow.reauthor_reset_intent(snapshot.binding, run_input_fingerprint(task.intent))
+            assert intent is not None
+            with workflow.contract_reset_authority(intent):
+                ack = workflow.complete_contract_reset(ContractResetCompleted(
+                    intent, ContractResetResult(intent.baseline.revision, intent.archive_ref), datetime.now(timezone.utc),
+                ))
+            assert isinstance(task.split_input, SplitContext)
+            task = replace(task, split_input=ReauthorInput(ack, task.split_input))
+
         result = asyncio.run(runtime.run(task))
 
+        if index == 1:
+            assert result.workflow_attempt is None
+            assert result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
+            assert len(supplied) == 1
+            current = workflow.load_workflow(snapshot.binding.fence.key)
+            assert isinstance(current, WorkflowSnapshot)
+            assert isinstance(current.episode.continuation, AuthoredResolve)
+            assert current.episode.continuation.author_admission == admissions[0]
+            with control._connect() as db:
+                assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+            continue
         assert result.workflow_attempt is not None
-        delivered = supplied[index]
+        delivered = supplied[-1]
         encoded = delivered.prompt.split("<untrusted_handover_json>\n", 1)[1].split(
             "\n</untrusted_handover_json>", 1,
         )[0]
@@ -124,15 +154,19 @@ def test_author_checkpoint_fingerprints_authoritative_inputs_not_delivered_hando
         assert task.context_prefix == "Existing scratch context\n\n"
         assert task.context_suffix == "\n\nExisting trailing context"
         assert not handover_path.exists()
-        recorded = workflow.record_attempt(ResolveAttemptResult(
-            result.workflow_attempt, ResolveResultKind.STAGE_PROGRESSED, stage=ResolveStage.AUTHOR,
-            session=ResolveSession(result.workflow_attempt, result.session_id, runtime_name, "test-model"),
-        ))
+        returned = workflow.returned_result(result.workflow_attempt)
+        assert returned is not None
+        observed_at = datetime.now(timezone.utc)
+        key = result.workflow_attempt.binding.fence.key
+        recorded = workflow.finalize_return(returned, ObservedIssue(
+            key, issue(1, title="title", body="body", author="alice", updated_at="revision"), observed_at,
+        ), NoLinkedPr(key, observed_at))
+        assert isinstance(recorded, WorkflowCommitted)
         checkpoint = recorded.snapshot.episode.continuation
         assert isinstance(checkpoint, AuthoredResolve)
-        assert checkpoint.author_admission == admissions[index]
+        assert checkpoint.author_admission == admissions[-1]
 
+    assert len(supplied) == len(admissions) == 2
     assert supplied[0].prompt != supplied[1].prompt
-    assert admissions[0].input_fingerprint == admissions[1].input_fingerprint
-    assert admissions[2].input_fingerprint != admissions[1].input_fingerprint
+    assert admissions[0].input_fingerprint != admissions[1].input_fingerprint
     assert original.intent.prompt == "Author the current issue contract"

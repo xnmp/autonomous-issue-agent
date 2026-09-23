@@ -39,6 +39,35 @@ def test_unclassified_return_roundtrip_retains_exact_provider_evidence():
     assert decode_workflow(encode_workflow(pending), PendingResolveReturn) == pending
 
 
+def test_split_reply_routing_and_contract_provenance_survive_restart():
+    from tests.domain.test_resolve_split import split_example
+    from issue_agent.domain.resolve_split import SplitImplement
+    original = split_example()
+    recovered = decode_workflow(encode_workflow(original), SplitImplement)
+    assert recovered.context.human_reply == "Keep the old API."
+    assert recovered.context.selection.model == "model"
+    assert recovered.baseline.revision.head_sha == "a" * 40
+    assert recovered.source == original.source
+
+
+def test_old_ordinary_return_does_not_gain_split_authority():
+    from tests.domain.test_resolve_return import returned
+    receipt = returned()
+    raw = json.loads(encode_workflow(receipt))
+    for field in ("split_input", "verdict", "rationale", "contract_revision"):
+        del raw["value"]["fields"][field]
+    recovered = decode_workflow(json.dumps(raw), ReturnedResolve)
+    assert recovered == receipt
+
+
+def test_partially_missing_new_receipt_fields_are_not_treated_as_legacy():
+    from tests.domain.test_resolve_return import returned
+    raw = json.loads(encode_workflow(returned()))
+    del raw["value"]["fields"]["split_input"]
+    with pytest.raises(WorkflowEncodingError):
+        decode_workflow(json.dumps(raw), ReturnedResolve)
+
+
 def test_roundtrip_preserves_scope_provenance_and_multiline_guidance():
     original = snapshot()
     recovered = decode_workflow(encode_workflow(original), WorkflowSnapshot)

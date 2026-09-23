@@ -5,6 +5,7 @@ proving the dispatcher routes inputs→task→run→follow-up correctly. The DEC
 are tested in tests/domain; here we verify the wiring."""
 
 import asyncio
+import hashlib
 from dataclasses import replace
 
 import pytest
@@ -15,6 +16,7 @@ from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.domain.actions import AgentKind, RunAgent
 from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.resolve_split import ContractResetResult
 from issue_agent.app.planners.tasks import (
     FixTaskConfig,
     JiraTaskConfig,
@@ -218,8 +220,12 @@ class FakeWorktrees:
     def remove(self, issue):
         pass
 
-    def reset(self, issue):
+    def reset_contract(self, issue, revision, intent_id):
         self.resets.append(issue)
+        digest = hashlib.sha256(intent_id.encode()).hexdigest()
+        return ContractResetResult(
+            revision, f"refs/issue-agent/contract-reset/{digest}"
+        )
 
     def branch_for_issue(self, issue, fallback, *, preferred=""):
         del issue
@@ -381,10 +387,21 @@ def _split_dispatcher(gw, store, runner, wt=None, max_contract_rounds=2):
 
 
 def test_split_resolve_routes_to_fix_workflow():
-    gw = FakeGateway(issues={5: IssueView(5, title="Null token", body="x")},
-                     pr_for_issue={5: 100})
+    gw = FakeGateway(
+        issues={5: IssueView(5, title="Null token", body="x")},
+        prs={100: PRView(100)},
+        pr_for_issue={},
+    )
     store, wt = FakeStore(), FakeWorktrees()
-    runner = SeqRunner([
+
+    class PrOpeningRunner(SeqRunner):
+        async def run(self, task):
+            result = await super().run(task)
+            if result.status == "pr_opened":
+                gw._pr_for_issue[5] = 100
+            return result
+
+    runner = PrOpeningRunner([
         AgentResult(is_error=False, status="tests_authored", session_id="a5"),
         AgentResult(is_error=False, status="pr_opened", session_id="i5"),
     ])

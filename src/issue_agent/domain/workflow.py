@@ -13,10 +13,11 @@ from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
 from .workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily,
     WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowTarget,
-    validate_workflow_identifier, validate_workflow_integer,
+    validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
 )
 from .world import Comment, IssueView
 from .labels import Label
+from .resolve_split import NeedsAdjudication, SplitContinuation, SplitImplement, split_sources
 
 GUIDANCE_MAX_CHARS = 4000
 MAX_DETAIL_CHARS = 16384
@@ -25,13 +26,7 @@ MAX_REARM_COMMANDS = 64
 
 
 def _text(value: str, name: str, *, limit: int = 512, empty: bool = False) -> None:
-    if limit == 512 and not empty:
-        validate_workflow_identifier(value, name)
-        return
-    if not isinstance(value, str) or len(value) > limit or (
-        not empty and not value.strip()
-    ) or "\x00" in value:
-        raise ValueError(f"{name} must be a bounded string")
+    validate_workflow_text(value, name, limit=limit, empty=empty)
 
 
 def _count(value: int, name: str, *, minimum: int = 0) -> None:
@@ -90,6 +85,8 @@ class AuthoredResolve:
     author_admission: ResolveAdmission
     last_applied_admission_version: int
     session: ResolveSession | None = None
+    split: SplitContinuation | None = None
+    split_applied_admission_version: int = 0
 
     def __post_init__(self) -> None:
         if not isinstance(self.author_admission, ResolveAdmission) or self.author_admission.stage is not ResolveStage.AUTHOR:
@@ -101,6 +98,11 @@ class AuthoredResolve:
             raise ValueError("authored checkpoint cannot exceed the applied admission watermark")
         if self.session is not None and not isinstance(self.session, ResolveSession):
             raise ValueError("authored resolve session must be validated")
+        if self.split is not None and not isinstance(self.split, (SplitImplement, NeedsAdjudication)):
+            raise ValueError("split continuation must belong to an applied admission")
+        _count(self.split_applied_admission_version, "split admission watermark")
+        if self.split is not None and self.split.admission_version > self.split_applied_admission_version:
+            raise ValueError("split cursor cannot exceed its applied admission watermark")
 
     @property
     def author_attempt(self) -> WorkflowAttemptIdentity:
@@ -126,6 +128,7 @@ class ResolveAdmission:
     stage: ResolveStage
     adjudication_ceiling: int | None = None
     input_fingerprint: str | None = None
+    split_fingerprint: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, WorkflowAttemptIdentity) or not isinstance(self.revision, WorkflowRevision):
@@ -140,11 +143,14 @@ class ResolveAdmission:
             _count(self.adjudication_ceiling, "adjudication ceiling")
         elif self.adjudication_ceiling is not None:
             raise ValueError("only adjudication admits against a contract-round ceiling")
-        if self.input_fingerprint is not None and (
-            not isinstance(self.input_fingerprint, str) or len(self.input_fingerprint) != 64
-            or any(character not in "0123456789abcdef" for character in self.input_fingerprint)
-        ):
-            raise ValueError("admission input fingerprint must be a SHA-256 digest")
+        for fingerprint in (self.input_fingerprint, self.split_fingerprint):
+            if fingerprint is not None and (
+                not isinstance(fingerprint, str) or len(fingerprint) != 64
+                or any(character not in "0123456789abcdef" for character in fingerprint)
+            ):
+                raise ValueError("admission input fingerprint must be a SHA-256 digest")
+        if self.split_fingerprint is not None and self.stage not in (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE):
+            raise ValueError("only split stages carry split input provenance")
 
 
 def adjudication_allowed(admitted: int, ceiling: int) -> bool:
@@ -170,7 +176,9 @@ class ResolveEpisode:
             raise ValueError("resolve episode requires a validated continuation")
         sources = (
             (self.continuation.author_attempt,) if isinstance(self.continuation, AuthoredResolve) else ()
-        ) + ((self.continuation.session.source,) if self.continuation.session is not None else ())
+        ) + ((self.continuation.session.source,) if self.continuation.session is not None else ()) + (
+            split_sources(self.continuation.split) if isinstance(self.continuation, AuthoredResolve) and self.continuation.split is not None else ()
+        )
         if any(source.binding.episode_id != self.episode_id for source in sources):
             raise ValueError("resolve continuation cannot inherit another episode")
 
@@ -553,9 +561,13 @@ class WorkflowSnapshot:
         continuation = self.episode.continuation
         if continuation.last_applied_admission_version > self.revision.version:
             raise ValueError("continuation cannot originate in a future admission")
+        if isinstance(continuation, AuthoredResolve) and continuation.split_applied_admission_version > self.revision.version:
+            raise ValueError("split cursor cannot originate in a future admission")
         sources = (
             (continuation.author_attempt,) if isinstance(continuation, AuthoredResolve) else ()
-        ) + ((continuation.session.source,) if continuation.session is not None else ())
+        ) + ((continuation.session.source,) if continuation.session is not None else ()) + (
+            split_sources(continuation.split) if isinstance(continuation, AuthoredResolve) and continuation.split is not None else ()
+        )
         if any(
             source.binding.fence.key != self.revision.fence.key
             or source.binding.authority != self.authority
@@ -910,6 +922,7 @@ class ResolveAttemptResult:
     summary: str = ""
     stage: ResolveStage = ResolveStage.RESOLVE
     session: ResolveSession | None = None
+    split: SplitContinuation | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, WorkflowAttemptIdentity) or not isinstance(self.kind, ResolveResultKind):
@@ -922,6 +935,17 @@ class ResolveAttemptResult:
             or self.stage is ResolveStage.ROUTE
         ):
             raise ValueError("resolve session must belong to this non-router attempt")
+        if self.split is not None and (
+            not isinstance(self.split, (SplitImplement, NeedsAdjudication))
+            or self.split.source != self.attempt
+            or self.stage not in (ResolveStage.AUTHOR, ResolveStage.IMPLEMENT, ResolveStage.ADJUDICATE)
+            or self.kind in (ResolveResultKind.BUDGET_REFUSAL, ResolveResultKind.PR_OPENED)
+            or (self.kind is ResolveResultKind.INFRA_FAILURE and not (
+                (self.stage is ResolveStage.ADJUDICATE and isinstance(self.split, NeedsAdjudication))
+                or (self.stage is ResolveStage.IMPLEMENT and isinstance(self.split, SplitImplement))
+            ))
+        ):
+            raise ValueError("split progression requires this executed split attempt")
 
 
 class WorkflowMutation(str, Enum):
