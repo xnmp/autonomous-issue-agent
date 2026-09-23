@@ -32,6 +32,8 @@ from ..adapters.agent_runner import AgentRunner
 from ..adapters.agent_publish import AgentPublicationBroker
 from ..adapters.control_store import (
     LegacySpendMigrationError,
+    ReservationRequest,
+    ReservationResult,
     SQLiteControlStore,
 )
 from ..adapters.control_path import control_store_path
@@ -413,6 +415,8 @@ def _with_accounting(
     runtime_name: str,
     journal: TypedJournal,
     reconciler: _LateReservationReconciler | None = None,
+    *,
+    admit: Callable[[ReservationRequest], ReservationResult] | None = None,
 ) -> AgentRuntime:
     money = (
         lambda value: Money.from_major("USD", value)
@@ -442,6 +446,7 @@ def _with_accounting(
         require_dispatch_claim=True,
         reservation_reconciler=reconciler,
         max_contract_rounds=cfg.max_contract_rounds,
+        admit=admit,
     )
 
 
@@ -2633,9 +2638,12 @@ def build_fix_daemon(
     # Wrapped LAST, so the decorator sees whichever runtime actually ran (Claude or
     # the Codex swap above) and the ledger is runtime-agnostic.
     fix_reconciler = _LateReservationReconciler()
+    from ..adapters.workspace_admission import WorkspaceAdmission
+
     fix_runner = _with_accounting(
         fix_runner, control, cfg, "fix", cfg.fixer_runtime.value, journal,
         fix_reconciler,
+        admit=WorkspaceAdmission(control, worktrees, os.environ.get("GH_HOST", "github.com")),
     )
     fix_runner = JournalingRuntime(
         fix_runner,
@@ -2664,8 +2672,21 @@ def build_fix_daemon(
         dispatch_claim_target=reservations.issue_for,
         workflow_control=workflow_control,
     )
-    executor.bind_workflow_reconciliation(dispatcher.fix_workflow.reconcile_returns)
-    effect_executor = replace(effect_executor, reconcile_workflow=dispatcher.fix_workflow.reconcile_returns)
+    from .resolve_control import compose_resolve_rearm
+
+    rearm_workflow = compose_resolve_rearm(
+        cfg, control, gateway, worktrees, store,
+        now=lambda: datetime.now(timezone.utc), log=_log("fix"),
+        approved_host=os.environ.get("GH_HOST", "github.com"),
+    )
+
+    def reconcile_workflows() -> int:
+        # Both startup/wake recovery and every command drain use these same
+        # authorities, including when paid admission or world polling is held.
+        return dispatcher.fix_workflow.reconcile_returns() + rearm_workflow.reconcile()
+
+    executor.bind_workflow_reconciliation(reconcile_workflows)
+    effect_executor = replace(effect_executor, reconcile_workflow=reconcile_workflows)
     dispatch_runtime = CancellableAsyncDispatch(
         dispatcher.dispatch,
         finished=reservations.finish,

@@ -30,6 +30,7 @@ from .contracts import (
 from .world import IssueView, PRView, PullRequestDiff, WorldState
 from .self_clear import BudgetBlock, MachineBlock
 from .resolve_split import ContractRevision, ContractResetResult
+from .resolve_workspace import ObservedResolveBase, EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
 
 T = TypeVar("T")
 
@@ -198,6 +199,14 @@ class WorktreePort(Protocol):
 
 class FixWorktreePort(WorktreePort, Protocol):
     def reset_contract(self, issue: int, revision: "ContractRevision", intent_id: str) -> "ContractResetResult": ...
+
+    def observe_and_pin_episode_base(self, repository: str, *, observed_at: datetime, approved_host: str = "github.com") -> ObservedResolveBase: ...
+
+    def prepare_episode_workspace(self, handoff: EpisodeWorkspaceHandoff, *, approved_host: str = "github.com") -> ContractResetResult: ...
+
+    def verify_episode_workspace(self, completed: EpisodeWorkspacePrepared, *, approved_host: str = "github.com") -> None: ...
+
+    def episode_workspace_path(self, completed: EpisodeWorkspacePrepared) -> str: ...
 
 
 class EventSink(Protocol):

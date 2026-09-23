@@ -13,7 +13,7 @@ from issue_agent.adapters.codex_runner import (
     spend_evidence_path,
     write_spend_evidence,
 )
-from issue_agent.adapters.control_store import Lease, SQLiteControlStore
+from issue_agent.adapters.control_store import AccountingDisposition, Lease, ReservationResult, SQLiteControlStore
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -141,6 +141,40 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     blocked = asyncio.run(wrapper.run(RuntimePlan("more", max_budget_usd=4)))
     assert blocked.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 1
+
+
+@pytest.mark.parametrize("reclaim", [False, True])
+def test_composed_admission_refusal_prevents_provider_even_after_budget_reclaim(tmp_path, reclaim):
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=1))
+    wrapper, store = _wrapper(tmp_path, runtime)
+    attempts = []
+
+    def admit(request):
+        attempts.append(request)
+        disposition = AccountingDisposition.EXHAUSTED if reclaim and len(attempts) == 1 else AccountingDisposition.UNAVAILABLE
+        return ReservationResult(disposition, None, Money.zero("USD"), request.quote.maximum_charge,
+                                 request.cap, "workspace authority unavailable")
+
+    class Reconciler:
+        calls = 0
+
+        def reconcile_stale_reservations(self):
+            self.calls += 1
+            return 1
+
+    reconciler = Reconciler()
+    wrapper = dataclasses.replace(wrapper, admit=admit, reservation_reconciler=reconciler)
+    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert result.is_error
+    assert runtime.calls == 0
+    assert len(attempts) == (2 if reclaim else 1)
+    assert reconciler.calls == int(reclaim)
+    if reclaim:
+        assert attempts[0] == attempts[1]
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
 
 
 def test_provider_cannot_mint_workflow_result_authority(tmp_path) -> None:

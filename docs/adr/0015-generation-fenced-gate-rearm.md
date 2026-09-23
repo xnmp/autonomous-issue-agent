@@ -112,6 +112,25 @@ Keep the selected gate held until workspace preparation and remote projection
 are both verified. Wire these checks before activating operator re-arm; the
 standalone workspace primitives do not establish vertical-slice acceptance.
 
+First paid entry to a completed handoff re-verifies the exact prepared checkout
+under deployment authority and the local worktree mutation lock, then reserves
+in a short SQLite transaction before releasing those locks. The immutable
+admission records the handoff identity; the first admitted leg, including ROUTE
+or a subsequently released never-launched reservation, consumes that entry
+proof. Later admissions retain ordinary shared/fail-fast authority and existing
+continuation rules, rather than repeatedly demanding a pristine checkout or
+resetting admitted work. This records admission, not attribution of every later
+file edit. A reservation rollback consumes nothing. Task construction must not
+recreate a missing prepared checkout before this boundary.
+
+Pending re-arm recovery uses observation history attached to the existing
+intent. Failed reads back off and open an evidence-unavailable gate; successful
+workspace verification removes only the original handoff's observation gate,
+including after Continue. An immutable remote projection reflects its accepted
+hold facts. A change in those facts supersedes that request; continuation emits
+a fresh projection without another allowance grant or workspace reset. A stale
+worker cannot charge read failures to a revision it never observed.
+
 Paid admission allocates a workflow revision and records its ordered admission
 receipt in the existing SQLite transaction. Neither UUID order nor timestamps
 establish invocation order. Result recording uses that receipt and the existing

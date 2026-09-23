@@ -25,6 +25,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 
@@ -916,6 +917,40 @@ class Worktrees:
                 marker,
                 handoff.branch,
             )
+
+    @contextmanager
+    def verified_episode_entry(
+        self,
+        completed: EpisodeWorkspacePrepared,
+        *,
+        approved_host: str = "github.com",
+    ):
+        """Hold local Git serialization from pristine verification through admission.
+
+        The caller supplies SQLite workflow authority separately. The yielded
+        path is the exact managed issue checkout verified by this lock holder.
+        """
+
+        with self._mutation_lock:
+            self.verify_episode_workspace(
+                completed, approved_host=approved_host,
+            )
+            yield self._managed_issue_checkout(
+                completed.handoff.source.fence.key.target.number
+            )
+
+    def episode_workspace_path(
+        self, completed: EpisodeWorkspacePrepared,
+    ) -> str:
+        """Return the exact managed destination path without creating or verifying it."""
+
+        if not isinstance(completed, EpisodeWorkspacePrepared):
+            raise WorktreeUnavailable(
+                "episode workspace path requires its acknowledgement"
+            )
+        return self._managed_issue_checkout(
+            completed.handoff.destination.fence.key.target.number
+        )
 
     def prune_validate(self) -> int:
         """Prune stale metadata and validate the remaining worktree registry."""

@@ -15,7 +15,7 @@ import sqlite3
 import stat
 import tempfile
 from collections.abc import Callable, Iterator, Mapping
-from contextlib import contextmanager
+from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -46,7 +46,7 @@ from ..domain.workflow import (
     RemoteOutcomeUncertain, RetiredSettledCommand, RetiredUncertainCommand, RetryAuthorizationRequired,
     AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
-from ..domain.resolve_workspace import PriorResolveAdmission
+from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.workflow_reconciliation import ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
 from ..domain.outcome import AuthorFollowup, author_followup
@@ -98,6 +98,28 @@ def target_has_work_admissions(db: sqlite3.Connection, key: WorkflowKey) -> bool
         "SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? "
         "AND kind<>'ROUTE' LIMIT 1", workflow_run_scope_bounds(key),
     ).fetchone() is not None
+
+
+def episode_entry_admitted(db: sqlite3.Connection, snapshot: WorkflowSnapshot) -> bool:
+    """The first immutable paid admission consumes the handoff, including routing."""
+    row = db.execute(
+        "SELECT run_id,kind,dispatch_id,workflow_binding_json FROM runs "
+        "WHERE workflow_episode_key=? LIMIT 1", (workflow_episode_key(snapshot.binding),),
+    ).fetchone()
+    if row is None:
+        return False
+    binding = _indexed_run_binding(db, row)
+    if workflow_episode_key(binding) != workflow_episode_key(snapshot.binding):
+        raise WorkflowAuthorityError("episode entry index disagrees with its admitted scope")
+    receipt = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-admission' AND scope=? AND key=?",
+        (binding.fence.key.repository, row["run_id"]),
+    ).fetchone()
+    admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
+    expected = snapshot.intent.handoff.handoff_id if isinstance(snapshot.intent, CompletedRearm) else None
+    if admission.workspace_handoff_id != expected:
+        raise WorkflowAuthorityError("episode admission lacks its immutable workspace handoff")
+    return True
 
 
 def admitted_adjudications(db: sqlite3.Connection, binding: WorkflowBinding) -> int:
@@ -1410,6 +1432,14 @@ class SQLiteControlStore:
     @property
     def authority_witness_path(self) -> str:
         return f"{self.path}.authority"
+
+    def require_initialized(self) -> None:
+        """Open operator authority without creating, migrating or adopting it."""
+        if not self._database_exists() or not self._authority_witness_exists():
+            raise CorruptControlStore("operator control requires initialized authority")
+        self._validate_authority_witness()
+        with self._connect() as db:
+            self._validate_migration_history(self._migration_history(db), require_current=True)
 
     def _database_exists(self, *, allow_empty: bool = False) -> bool:
         try:
@@ -3450,8 +3480,38 @@ class SQLiteControlStore:
                 Money.zero(request.scope.currency), request.quote.maximum_charge,
                 request.cap, f"deployment effect authority unavailable: {exc}")
 
+    @contextmanager
+    def workspace_entry_authority(self, request: ReservationRequest) -> Iterator[EpisodeWorkspacePrepared | None]:
+        """Keep Git verification and first admission inside the deployment fence."""
+        if request.workflow is None:
+            raise WorkflowAuthorityError("workspace entry requires a workflow binding")
+        with ExitStack() as barriers:
+            for role in ("fix", "review", "steward"):
+                barriers.enter_context(deployment_effect_barrier(self.path, request.workload_repository, role))
+            with self.transaction() as db:
+                prepared = self._workspace_entry(db, request)
+            yield prepared
+
+    def requires_workspace_entry(self, request: ReservationRequest) -> bool:
+        if request.workflow is None:
+            return False
+        with closing(self._connect()) as db:
+            db.execute("BEGIN")
+            return self._workspace_entry(db, request) is not None
+
+    def _workspace_entry(self, db: sqlite3.Connection, request: ReservationRequest) -> EpisodeWorkspacePrepared | None:
+        self._assert_owner_active(db, request.owner_id)
+        if request.workflow is None or deployment_role(request.workload_repository, request.owner_id) != "fix":
+            raise WorkflowAuthorityError("workspace entry requires the bound fix owner")
+        snapshot = require_workflow_binding(db, request.workflow)
+        if not isinstance(snapshot.intent, CompletedRearm):
+            return None
+        require_workspace_predecessor(db, snapshot)
+        return None if episode_entry_admitted(db, snapshot) else snapshot.intent.workspace
+
     def _reserve(
         self, request: ReservationRequest, *, lease: Lease | None = None,
+        workspace_verified: EpisodeWorkspacePrepared | None = None,
     ) -> ReservationResult:
         requested = request.quote.maximum_charge
         if lease is not None and (
@@ -3493,7 +3553,7 @@ class SQLiteControlStore:
                         request.cap,
                         "idempotent reservation" if identical else "conflicting reservation",
                     )
-                workflow_snapshot = self._validate_workflow_reservation(db, request)
+                workflow_snapshot = self._validate_workflow_reservation(db, request, workspace_verified=workspace_verified)
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
                     settled, reserved = self._balance(db, limit.scope)
@@ -3680,7 +3740,7 @@ class SQLiteControlStore:
             )
 
     @staticmethod
-    def _validate_workflow_reservation(db: sqlite3.Connection, request: ReservationRequest) -> WorkflowSnapshot | None:
+    def _validate_workflow_reservation(db: sqlite3.Connection, request: ReservationRequest, *, workspace_verified: EpisodeWorkspacePrepared | None = None) -> WorkflowSnapshot | None:
         binding = request.workflow
         activation = db.execute(
             "SELECT 1 FROM workflow_authority_epochs WHERE repository=? AND family='resolve'",
@@ -3705,6 +3765,11 @@ class SQLiteControlStore:
             if not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository or type(dispatch.get("issue")) is not int or dispatch["issue"] != binding.fence.key.target.number:
                 raise WorkflowAuthorityError("paid dispatch identity disagrees with its workflow")
             stage = ResolveStage(request.kind)
+            if isinstance(snapshot.intent, CompletedRearm) and not episode_entry_admitted(db, snapshot):
+                if workspace_verified != snapshot.intent.workspace:
+                    raise WorkflowAuthorityError("first episode admission requires fresh workspace verification")
+                if stage not in (ResolveStage.ROUTE, ResolveStage.RESOLVE, ResolveStage.AUTHOR):
+                    raise WorkflowAuthorityError("first episode admission must start fresh work")
             if dispatch.get("kind") != stage.value or not isinstance(dispatch.get("leg_id"), str) or not dispatch["leg_id"]:
                 raise WorkflowAuthorityError("resolve admission requires its captured stage and leg identity")
             fingerprint = dispatch.get("input_fingerprint")
@@ -3733,6 +3798,7 @@ class SQLiteControlStore:
             admission = ResolveAdmission(
                 WorkflowAttemptIdentity(snapshot.binding, request.run_id, metadata["leg_id"]),
                 revision, ResolveStage(request.kind), request.adjudication_ceiling, metadata.get("input_fingerprint"), metadata.get("split_fingerprint"),
+                snapshot.intent.handoff.handoff_id if isinstance(snapshot.intent, CompletedRearm) else None,
             )
             db.execute(
                 "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=?",

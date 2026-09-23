@@ -21,6 +21,7 @@ from ..domain.outcome import Adjudication
 from ..domain.effort import Effort
 from ..domain import resolve_split as split
 from ..domain import resolve_workspace as workspace
+from ..domain.resolve_rearm import RearmObservation
 from ..domain.resolve_return import ResolveInputs, ReturnedResolve, PendingResolveReturn, FinalizedResolveReturn, RetiredResolveReturn, ResolveCleanupCompleted
 
 MAX_WORKFLOW_PAYLOAD_BYTES = 262144
@@ -28,6 +29,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    RearmObservation,
     workspace.ResolveWorkspaceObserved, w.ResolveRearmAcceptance,
     workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
     workspace.PriorResolveAdmission, workspace.EpisodeWorkspaceHandoff,
@@ -67,7 +69,7 @@ _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS = {
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
-    "ResolveAdmission": {"split_fingerprint": None},
+    "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
     "ResolveAttemptResult": {"split": None},
     "ReturnedResolve": {"split_input": None, "verdict": "", "rationale": "", "contract_revision": None},
 }

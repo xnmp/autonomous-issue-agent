@@ -42,6 +42,7 @@ from ..domain.contracts import (
     parse_test_failure_exit_codes,
 )
 from ..domain.dashboard import STALE_AFTER_S
+from ..domain.deployment import canonical_deployment_name
 from ..domain.repository import canonical_repository, repository_equal
 from .codex_resolution import (
     CodexResolutionReport,
@@ -173,17 +174,6 @@ def read_repo_env_field(path: str, field: str) -> str:
     """Read `FIELD`'s value out of a shell env file the way bash actually
     resolves it (M12) — see `_source_env_file`. "" for missing/unset."""
     return _source_env_file(path).get(field, "")
-
-
-def canonical_deployment_name(value: str) -> str:
-    """Canonical service/config identity accepted at mutating boundaries."""
-
-    normalized = re.sub(
-        r"[^a-z0-9._-]",
-        "-",
-        value.strip().lower(),
-    ).strip("-")
-    return normalized or "target"
 
 
 def _deployment_name_arg(value: str) -> str:

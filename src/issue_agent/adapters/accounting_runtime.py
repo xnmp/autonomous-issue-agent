@@ -11,6 +11,7 @@ import uuid
 import contextvars
 import hashlib
 import json
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
@@ -137,6 +138,7 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     max_contract_rounds: int | None = None
+    admit: Callable[[ReservationRequest], ReservationResult] | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, WorkflowBinding | None]
     ] = field(
@@ -212,7 +214,8 @@ class AccountingRuntime(AgentRuntime):
         exhaustion in the same tick escalates immediately.
         """
 
-        reservation = self.store.reserve(request)
+        admit = self.admit or self.store.reserve
+        reservation = admit(request)
         if (
             reservation.disposition is not AccountingDisposition.EXHAUSTED
             or self.reservation_reconciler is None
@@ -231,7 +234,7 @@ class AccountingRuntime(AgentRuntime):
                 f"reconciliation unavailable: {exc}",
             )
             return reservation
-        retried = self.store.reserve(request)
+        retried = admit(request)
         self._journal_reconciled(
             request,
             reservation,

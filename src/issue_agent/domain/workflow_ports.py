@@ -7,7 +7,9 @@ from .contracts import CommandId, WorkflowAttemptIdentity
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
 from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetIntent, ContractRevision
 from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
+from .resolve_rearm import PendingResolveRearm, UnavailableResolveRearm
 from .workflow import (
+    AuthorizedOperatorCommand, CancelRearm, OperatorActor,
     CommandAbsenceEvidence, CommandRetryApplicability, HeldProjection, RearmIntent, RetryAlreadyConsumed,
     RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead, WorkflowSnapshot,
 )
@@ -68,6 +70,22 @@ class WorkflowControl(Protocol):
     ) -> AbstractContextManager[EpisodeWorkspacePrepared | None]: ...
 
     def complete_workspace_handoff(self, completed: EpisodeWorkspacePrepared) -> EpisodeWorkspacePrepared: ...
+
+    def prepared_workspace(self, expected: WorkflowRevision) -> EpisodeWorkspacePrepared | None: ...
+
+    def accepted_rearm(self, key: WorkflowKey, request_id: str) -> AuthorizedOperatorCommand | None: ...
+
+    def pending_rearms(self, *, limit: int = 32) -> tuple[PendingResolveRearm | UnavailableResolveRearm, ...]: ...
+
+    def defer_rearm(self, expected: WorkflowRevision, error: str) -> None: ...
+
+    def reconcile_rearm(
+        self, expected: WorkflowRevision, issue: ObservedIssue,
+        linkage: NoLinkedPr | LinkedPrPresent, *, external_holds: tuple[str, ...] = (),
+        workspace_verified: EpisodeWorkspacePrepared | None = None,
+    ) -> WorkflowCommitted | WorkflowConflict: ...
+
+    def cancel_rearm(self, command: CancelRearm, actor: OperatorActor) -> WorkflowCommitted | WorkflowConflict: ...
 
     def finalize_return(
         self, returned: ReturnedResolve, issue: ObservedIssue,

@@ -443,8 +443,17 @@ class FixWorkflow:
                 issue, target, number, pr, blocker, blocked_head
             ))
 
-    def _ensure_cwd(self, issue: int, branch: str) -> str:
-        cwd = self.worktrees.ensure(issue, branch)
+    def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None) -> str:
+        from ...domain.workflow import CompletedRearm
+
+        if state is not None and isinstance(state.intent, CompletedRearm):
+            if branch != state.intent.handoff.branch:
+                raise WorkflowAuthorityError("selected branch differs from the prepared workspace handoff")
+            # Admission verifies this exact checkout under the deployment fence;
+            # constructing a task must never recreate a missing prepared tree.
+            cwd = self.worktrees.episode_workspace_path(state.intent.workspace)
+        else:
+            cwd = self.worktrees.ensure(issue, branch)
         self.store.save_branch(issue, branch)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
@@ -882,7 +891,7 @@ class FixWorkflow:
             return
         iss = self.gateway.get_issue(issue)
         branch = self._resume_branch(issue, iss.title)
-        cwd = self._ensure_cwd(issue, branch)
+        cwd = self._ensure_cwd(issue, branch, state)
         fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd, binding)
         if deferred_for_overlap:
             self._execute_resolve_actions(issue, [
@@ -1193,7 +1202,7 @@ class FixWorkflow:
             else None
         )
         branch = retained.branch if retained is not None else self._resume_branch(issue, iss.title)
-        cwd = self._ensure_cwd(issue, branch)
+        cwd = self._ensure_cwd(issue, branch, state)
         if retained is not None:
             fix_cfg = self._split_cfg(retained)
             deferred_for_overlap = False
@@ -1517,7 +1526,7 @@ class FixWorkflow:
             await self.resolve_split(issue, human_reply=reply, binding=binding)
             return
         branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else self._resume_branch(issue, iss.title)
-        cwd = self._ensure_cwd(issue, branch)
+        cwd = self._ensure_cwd(issue, branch, state)
         fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         if state is not None:
             session = state.episode.continuation.session

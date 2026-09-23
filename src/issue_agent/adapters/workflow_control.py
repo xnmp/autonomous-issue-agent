@@ -17,6 +17,11 @@ from ..domain.contracts import EffectStatus, PricingBasis, WorkflowAttemptIdenti
 from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
 from ..domain.contracts import CommandId
 from ..domain.outcome import budget_exhausted, infra_class_failure
+from ..domain.resolve_rearm import (
+    PendingResolveRearm, RearmObservation, UnavailableResolveRearm,
+    decide_rearm_reconciliation, defer_rearm_observation,
+    schedule_rearm_observation, update_rearm_observation,
+)
 from ..domain.resolve_return import (
     FinalizedResolveReturn, PendingResolveReturn, ResolveCleanupCompleted, ReturnedResolve, RetiredResolveReturn, UnavailableResolveReturn,
 )
@@ -30,8 +35,8 @@ from ..domain.resolve_workspace import (
     ObservedResolveBase, PriorResolveAdmission, ResolveWorkspaceObserved,
 )
 from ..domain.workflow import (
-    AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
-    ContinueGrantedRearm, HeldProjection, LinkedPrPresent, NoLinkedPr, ObservedIssue, ObservedTransition, OpenGate,
+    ActiveReconciliation, AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
+    ContinueGrantedRearm, HeldProjection, LinkedPrPresent, NoLinkedPr, ObservedIssue, ObservedTransition, OpenGate, OperatorActor,
     PendingRearm, RearmingGate, RearmIntent, RemoteOutcomeUncertain,
     RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind, ResolveStage,
     StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
@@ -44,7 +49,7 @@ from ..domain.workflow_identity import (
 )
 from ..domain.workflow_policy import (
     apply_return_cleanup, clear_return_split, decide_return, defer_return_observation, initial_resolve_workflow,
-    reauthor_baseline, record_resolve_attempt, resolve_return_actions, return_gate_id,
+    cancel_resolve_rearm, reauthor_baseline, record_resolve_attempt, resolve_return_actions, return_gate_id,
     update_return_observation, validate_resolve_transition, split_return_continuation,
 )
 from .control_store import (
@@ -201,6 +206,382 @@ class SQLiteWorkflowControl:
             if intent.request_id != request_id or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"] or row["state"] != _intent_state(intent):
                 raise WorkflowAuthorityError("re-arm history disagrees with its typed payload")
             return intent
+
+    def accepted_rearm(
+        self, key: WorkflowKey, request_id: str,
+    ) -> AuthorizedOperatorCommand | None:
+        self._scope(key)
+        validate_workflow_identifier(request_id, "request")
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            load_workflow_row(db, key)
+            return self._accepted_rearm(db, key, request_id)
+
+    def _accepted_rearm(
+        self, db: sqlite3.Connection, key: WorkflowKey, request_id: str,
+    ) -> AuthorizedOperatorCommand | None:
+        row = db.execute(
+            "SELECT * FROM workflow_rearms WHERE request_id=?", (request_id,),
+        ).fetchone()
+        if row is None:
+            return None
+        if (row["repository"], row["target_kind"], row["target_number"]) != workflow_scope(key):
+            raise WorkflowAuthorityError(
+                "re-arm request identity belongs to another workflow"
+            )
+        try:
+            audit = decode_workflow(row["actor_json"], AuthorizedOperatorCommand)
+            intent = decode_workflow(
+                row["intent_json"],
+                PendingRearm | CompletedRearm | CancelledRearm | SupersededRearm,
+            )
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError("invalid accepted re-arm audit") from exc
+        command = audit.command
+        if (
+            not isinstance(command, (RequestRearm, ContinueGrantedRearm))
+            or command.request_id != request_id
+            or command.expected.fence.key != key
+            or audit.preflight is None
+            or encode_workflow(audit) != row["actor_json"]
+            or intent.request_id != request_id
+            or intent.gate_id != row["gate_id"]
+            or intent.to_generation != row["to_generation"]
+            or row["state"] != _intent_state(intent)
+            or row["request_digest"] != hashlib.sha256(
+                encode_workflow((audit.actor.subject, command)).encode()
+            ).hexdigest()
+        ):
+            raise WorkflowAuthorityError(
+                "accepted re-arm audit disagrees with its durable identity"
+            )
+        return audit
+
+    def _rearm_observation(
+        self, db: sqlite3.Connection, state: WorkflowSnapshot,
+    ) -> RearmObservation:
+        intent = state.intent
+        if not isinstance(intent, PendingRearm):
+            raise WorkflowAuthorityError("re-arm observation requires a pending intent")
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-rearm-observation' "
+            "AND scope=? AND key=?",
+            (self.writer.repository, intent.request_id),
+        ).fetchone()
+        if row is None:
+            raise WorkflowAuthorityError("pending re-arm lacks observation scheduling evidence")
+        try:
+            observation = decode_workflow(row["payload_json"], RearmObservation)
+            PendingResolveRearm(state, observation)
+            return observation
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError("invalid pending re-arm observation") from exc
+
+    def _schedule_rearm_audit(
+        self, db: sqlite3.Connection, request_id: str, at: datetime,
+    ) -> None:
+        changed = db.execute(
+            "UPDATE dedupe_keys SET claimed_at=? WHERE namespace='workflow-rearm-observation' "
+            "AND scope=? AND key=?",
+            (at.isoformat(), self.writer.repository, request_id),
+        ).rowcount
+        if not changed:
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES ('workflow-rearm-observation',?,?,?,NULL)",
+                (self.writer.repository, request_id, at.isoformat()),
+            )
+
+    def pending_rearms(
+        self, *, limit: int = 32,
+    ) -> tuple[PendingResolveRearm | UnavailableResolveRearm, ...]:
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("re-arm reconciliation limit must be between 1 and 128")
+        pending: list[PendingResolveRearm | UnavailableResolveRearm] = []
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            now = self._control._now()
+            rows = db.execute(
+                "SELECT rearm.request_id,rearm.target_kind,rearm.target_number "
+                "FROM workflow_rearms rearm INDEXED BY workflow_one_pending_rearm "
+                "LEFT JOIN dedupe_keys observation "
+                "ON observation.namespace='workflow-rearm-observation' "
+                "AND observation.scope=rearm.repository AND observation.key=rearm.request_id "
+                "WHERE rearm.repository=? AND rearm.state='pending' "
+                "AND COALESCE(julianday(observation.claimed_at),0)<=julianday(?) "
+                "ORDER BY rearm.target_kind,rearm.target_number,rearm.request_id LIMIT ?",
+                (self.writer.repository, now.isoformat(), limit),
+            ).fetchall()
+            for row in rows:
+                db.execute("SAVEPOINT pending_rearm")
+                try:
+                    if row["target_kind"] != "issue":
+                        raise WorkflowAuthorityError("pending resolve re-arm has a non-issue target")
+                    key = WorkflowKey(self.writer.repository, IssueRef(row["target_number"]))
+                    state = load_workflow_row(db, key)
+                    if state is None or not isinstance(state.intent, PendingRearm):
+                        raise WorkflowAuthorityError("pending re-arm index lacks current workflow authority")
+                    if state.intent.request_id != row["request_id"]:
+                        raise WorkflowAuthorityError("pending re-arm index disagrees with current intent")
+                    if self._accepted_rearm(db, key, row["request_id"]) is None:
+                        raise WorkflowAuthorityError("pending re-arm lacks accepted operator audit")
+                    observation = self._rearm_observation(db, state)
+                    if observation.history.next_read_at <= now:
+                        pending.append(PendingResolveRearm(state, observation))
+                except (ValueError, TypeError, KeyError) as exc:
+                    db.execute("ROLLBACK TO pending_rearm")
+                    next_read = now + timedelta(hours=1)
+                    raw_key = row["request_id"]
+                    reason = (str(exc) or type(exc).__name__).replace("\x00", "\\0")[:16384]
+                    try:
+                        validate_workflow_identifier(raw_key, "re-arm request index")
+                        record_key = raw_key
+                    except ValueError:
+                        record_key = "invalid-index:" + hashlib.sha256(
+                            repr(raw_key).encode("utf-8", "backslashreplace")
+                        ).hexdigest()
+                        reason = "Invalid re-arm request index; " + reason[:16000]
+                    self._schedule_rearm_audit(db, raw_key, next_read)
+                    self._control._transition(
+                        db, "workflow_rearm", record_key, "authority_unavailable",
+                        {"reason": reason, "next_read_at": next_read.isoformat()},
+                    )
+                    pending.append(UnavailableResolveRearm(record_key, reason, next_read))
+                finally:
+                    db.execute("RELEASE pending_rearm")
+        return tuple(pending)
+
+    def defer_rearm(self, expected: WorkflowRevision, error: str) -> None:
+        if not isinstance(expected, WorkflowRevision):
+            raise ValueError("re-arm deferral requires a typed revision")
+        self._scope(expected.fence.key)
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            state = load_workflow_row(db, expected.fence.key)
+            if state is None or state.revision != expected or not isinstance(state.intent, PendingRearm):
+                raise WorkflowAuthorityError("re-arm deferral requires exact pending authority")
+            previous = self._rearm_observation(db, state)
+            now = self._control._now()
+            deferred = defer_rearm_observation(previous, error, now=now)
+            after = update_rearm_observation(state, deferred, now=now)
+            changed = db.execute(
+                "UPDATE dedupe_keys SET claimed_at=?,payload_json=? "
+                "WHERE namespace='workflow-rearm-observation' AND scope=? AND key=?",
+                (deferred.history.next_read_at.isoformat(), encode_workflow(deferred),
+                 self.writer.repository, state.intent.request_id),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("re-arm observation schedule changed before deferral")
+            if after != state:
+                self._persist_snapshot(db, after)
+            self._control._transition(
+                db, "workflow_rearm", state.intent.request_id, "observation_deferred",
+                {"failed_reads": deferred.history.failed_reads,
+                 "next_read_at": deferred.history.next_read_at.isoformat()},
+            )
+
+    def _rearm_command_facts(
+        self, db: sqlite3.Connection, state: WorkflowSnapshot,
+    ) -> tuple[tuple[CommandId, ...], tuple[CommandId, ...], tuple[RemoteOutcomeUncertain, ...]]:
+        intent = state.intent
+        if not isinstance(intent, PendingRearm):
+            raise WorkflowAuthorityError("re-arm command facts require a pending intent")
+        rows = db.execute(
+            "SELECT association.disposition,command.*,receipt.executor_identity AS receipt_executor,"
+            "receipt.started_at AS receipt_started,receipt.completed_at AS receipt_completed,"
+            "receipt.status AS receipt_status,receipt.error AS receipt_error "
+            "FROM workflow_rearm_commands association JOIN lifecycle_commands command USING(command_id) "
+            "LEFT JOIN effect_receipts receipt USING(command_id) WHERE association.request_id=?",
+            (intent.request_id,),
+        ).fetchall()
+        required = set(intent.required_commands)
+        if {CommandId(row["command_id"]) for row in rows} != required or len(rows) != len(required):
+            raise WorkflowAuthorityError("pending re-arm commands disagree with required obligations")
+        verified: list[CommandId] = []
+        rejected: list[CommandId] = []
+        uncertainty: list[RemoteOutcomeUncertain] = []
+        for row in rows:
+            command = _command_from_row(row)
+            if (
+                row["disposition"] != "required"
+                or command.workflow != state.binding
+                or not self._owns_command(db, command.executor_identity)
+            ):
+                raise WorkflowAuthorityError("pending re-arm command belongs to another authority")
+            receipt_status = row["receipt_status"]
+            reconciliation = self._control._command_reconciliation(row)
+            if reconciliation is not None and not isinstance(reconciliation, ActiveReconciliation):
+                raise WorkflowAuthorityError("pending re-arm command has incompatible read history")
+            if receipt_status is None:
+                if row["state"] not in ("pending", "executing"):
+                    raise WorkflowAuthorityError("settled re-arm command lacks its exact receipt")
+                if isinstance(reconciliation, ActiveReconciliation):
+                    uncertainty.append(RemoteOutcomeUncertain(
+                        command.command_id, reconciliation.unresolved_since,
+                        reconciliation.failed_reads, "command outcome remains unresolved",
+                    ))
+                continue
+            try:
+                status = EffectStatus(receipt_status)
+                started = datetime.fromisoformat(row["receipt_started"])
+                completed = datetime.fromisoformat(row["receipt_completed"])
+            except (ValueError, TypeError) as exc:
+                raise WorkflowAuthorityError("re-arm command has malformed receipt evidence") from exc
+            if (
+                row["state"] != status.value
+                or not row["attempt_owner"]
+                or row["receipt_executor"] != row["attempt_owner"]
+                or completed < started
+            ):
+                raise WorkflowAuthorityError("re-arm command receipt disagrees with its execution")
+            if status is EffectStatus.SUCCEEDED:
+                verified.append(command.command_id)
+            elif status is EffectStatus.PERMANENT_FAILURE:
+                rejected.append(command.command_id)
+            elif status is EffectStatus.UNKNOWN_OUTCOME:
+                history = reconciliation or ActiveReconciliation(
+                    completed, max(completed, self._control._now()), 0,
+                )
+                uncertainty.append(RemoteOutcomeUncertain(
+                    command.command_id, history.unresolved_since, history.failed_reads,
+                    row["receipt_error"] or "command outcome remains unresolved",
+                ))
+            elif reconciliation is not None:
+                raise WorkflowAuthorityError("settled command retained incompatible uncertainty")
+        return tuple(verified), tuple(rejected), tuple(uncertainty)
+
+    @staticmethod
+    def _rearm_evidence_payload(
+        proposal: WorkflowChanged, issue: ObservedIssue,
+        linkage: NoLinkedPr | LinkedPrPresent, external_holds: tuple[str, ...],
+    ) -> ResolveRearmPreflight | ObservedIssue | LinkedPrPresent:
+        intent = proposal.snapshot.intent
+        if isinstance(intent, CompletedRearm):
+            if not isinstance(linkage, NoLinkedPr):
+                raise WorkflowAuthorityError("completed re-arm requires verified absent linkage")
+            return ResolveRearmPreflight(issue, linkage, external_holds)
+        if isinstance(intent, SupersededRearm) and intent.reason is StopReason.DECISION_CHANGED and isinstance(linkage, LinkedPrPresent):
+            return linkage
+        if isinstance(intent, SupersededRearm) and intent.reason is StopReason.DECISION_CHANGED and isinstance(linkage, NoLinkedPr):
+            return ResolveRearmPreflight(issue, linkage, external_holds)
+        return issue
+
+    def reconcile_rearm(
+        self, expected: WorkflowRevision, issue: ObservedIssue,
+        linkage: NoLinkedPr | LinkedPrPresent, *, external_holds: tuple[str, ...] = (),
+        workspace_verified: EpisodeWorkspacePrepared | None = None,
+    ) -> WorkflowCommitted | WorkflowConflict:
+        if not isinstance(expected, WorkflowRevision) or not isinstance(issue, ObservedIssue) or not isinstance(linkage, (NoLinkedPr, LinkedPrPresent)):
+            raise ValueError("re-arm reconciliation requires typed authority and observations")
+        self._scope(expected.fence.key)
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            prior = load_workflow_row(db, expected.fence.key)
+            if prior is None or prior.revision != expected or not isinstance(prior.intent, PendingRearm):
+                raise WorkflowAuthorityError("re-arm reconciliation requires exact pending authority")
+            previous = self._rearm_observation(db, prior)
+            audit = self._accepted_rearm(db, expected.fence.key, prior.intent.request_id)
+            if audit is None or not isinstance(audit.preflight, (ResolveRearmPreflight, ResolveRearmAcceptance)):
+                raise WorkflowAuthorityError("pending re-arm lacks its accepted decision facts")
+            verified, rejected, uncertainty = self._rearm_command_facts(db, prior)
+            stored_workspace = load_workspace_ack(db, prior.intent.handoff)
+            if workspace_verified is not None and (
+                not isinstance(workspace_verified, EpisodeWorkspacePrepared)
+                or workspace_verified != stored_workspace
+            ):
+                raise WorkflowAuthorityError("re-arm reconciliation lacks exact verified workspace evidence")
+            now = self._control._now()
+            working = prior
+            if workspace_verified is not None:
+                working = update_rearm_observation(prior, None, now=now)
+                if working != prior:
+                    self._persist_snapshot(db, working)
+            evidence_id = "rearm-observation:" + hashlib.sha256(encode_workflow((
+                prior.intent.request_id, issue, linkage, external_holds,
+            )).encode()).hexdigest()
+            proposal = decide_rearm_reconciliation(
+                working, audit.preflight, issue, linkage,
+                verified_commands=verified, rejected_commands=rejected,
+                uncertainty=uncertainty, workspace=workspace_verified,
+                evidence_id=evidence_id, now=now, external_holds=external_holds,
+            )
+            if isinstance(proposal, WorkflowRejected):
+                return WorkflowConflict(working.revision, proposal.reason)
+            if isinstance(proposal, WorkflowChanged):
+                payload = self._rearm_evidence_payload(proposal, issue, linkage, external_holds)
+                scope = workflow_scope(expected.fence.key)
+                existing = db.execute(
+                    "SELECT payload_json FROM workflow_evidence WHERE evidence_id=?", (evidence_id,),
+                ).fetchone()
+                encoded = encode_workflow(payload)
+                if existing is not None and existing["payload_json"] != encoded:
+                    raise WorkflowAuthorityError("re-arm evidence identity contains different facts")
+                if existing is None:
+                    db.execute(
+                        "INSERT INTO workflow_evidence VALUES (?, ?, ?, ?, NULL, 'observation', ?)",
+                        (evidence_id, *scope, encoded),
+                    )
+                return self._commit_workflow(
+                    db, working.revision, (working.authority,), proposal,
+                )
+            assert isinstance(proposal, WorkflowUnchanged)
+            scheduled = schedule_rearm_observation(previous, now=now)
+            retained = previous if previous.last_error and workspace_verified is None else scheduled
+            changed = db.execute(
+                "UPDATE dedupe_keys SET claimed_at=?,payload_json=? "
+                "WHERE namespace='workflow-rearm-observation' AND scope=? AND key=?",
+                (scheduled.history.next_read_at.isoformat(), encode_workflow(retained),
+                 self.writer.repository, prior.intent.request_id),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("re-arm observation schedule changed during reconciliation")
+            return WorkflowCommitted(working)
+
+    def cancel_rearm(
+        self, command: CancelRearm, actor: OperatorActor,
+    ) -> WorkflowCommitted | WorkflowConflict:
+        if not isinstance(command, CancelRearm) or not isinstance(actor, OperatorActor):
+            raise ValueError("re-arm cancellation requires typed command and actor")
+        self._scope(command.expected.fence.key)
+        with self._rearm_barriers():
+            with self._control.transaction() as db:
+                self._control._assert_owner_active(db, self.writer.owner_id)
+                prior = load_workflow_row(db, command.expected.fence.key)
+                if prior is None:
+                    raise WorkflowAuthorityError("re-arm cancellation requires workflow authority")
+                receipt = db.execute(
+                    "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-cancellation' "
+                    "AND scope=? AND key=?",
+                    (self.writer.repository, command.cancellation_id),
+                ).fetchone()
+                if receipt is not None:
+                    try:
+                        accepted = json.loads(receipt["payload_json"])
+                        accepted_audit = accepted.get("audit") if isinstance(accepted, dict) else None
+                        if not isinstance(accepted_audit, str):
+                            raise ValueError("cancellation receipt lacks its accepted audit")
+                        audit = decode_workflow(accepted_audit, AuthorizedOperatorCommand)
+                    except (ValueError, TypeError) as exc:
+                        raise WorkflowAuthorityError("invalid accepted cancellation audit") from exc
+                    if audit.command == command and audit.actor.subject == actor.subject:
+                        return WorkflowCommitted(prior, idempotent=True)
+                    return WorkflowConflict(
+                        prior.revision,
+                        "durable workflow identity was reused with different content",
+                    )
+                if prior.revision != command.expected or not isinstance(prior.intent, PendingRearm):
+                    raise WorkflowAuthorityError("re-arm cancellation requires exact pending authority")
+                verified, _, uncertainty = self._rearm_command_facts(db, prior)
+                proposal = cancel_resolve_rearm(
+                    prior, command, actor, verified_commands=verified, uncertainty=uncertainty,
+                )
+                if isinstance(proposal, WorkflowRejected):
+                    return WorkflowConflict(prior.revision, proposal.reason)
+                if not isinstance(proposal, WorkflowChanged):
+                    return WorkflowCommitted(prior, idempotent=True)
+                return self._commit_workflow(
+                    db, prior.revision, (prior.authority,), proposal,
+                )
 
     def held_projection(self, key: WorkflowKey) -> HeldProjection:
         state = self.load_workflow(key)
@@ -854,6 +1235,24 @@ class SQLiteWorkflowControl:
             )
             return completed
 
+    def prepared_workspace(
+        self, expected: WorkflowRevision,
+    ) -> EpisodeWorkspacePrepared | None:
+        """Read exact preparation after caller-owned Git verification under rearm_authority."""
+        if not isinstance(expected, WorkflowRevision):
+            raise ValueError("prepared workspace lookup requires a typed revision")
+        self._scope(expected.fence.key)
+        with self._control.transaction() as db:
+            state = load_workflow_row(db, expected.fence.key)
+            if state is None or state.revision != expected or not isinstance(state.intent, PendingRearm):
+                raise WorkflowAuthorityError(
+                    "prepared workspace lookup requires exact pending authority"
+                )
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            self._assert_target_quiescent(db, expected.fence.key)
+            self._assert_workspace_predecessor(db, state, state.intent.handoff)
+            return load_workspace_ack(db, state.intent.handoff)
+
     @contextmanager
     def contract_reset_authority(self, intent: ResetIntent):
         with deployment_effect_barrier(self._control.path, self.writer.repository, self.writer.role):
@@ -944,6 +1343,13 @@ class SQLiteWorkflowControl:
         self, expected: WorkflowRevision, authorities: tuple[FamilyAuthority, ...],
         transition: WorkflowChanged,
     ) -> WorkflowCommitted | WorkflowConflict:
+        with self._control.transaction() as db:
+            return self._commit_workflow(db, expected, authorities, transition)
+
+    def _commit_workflow(
+        self, db: sqlite3.Connection, expected: WorkflowRevision, authorities: tuple[FamilyAuthority, ...],
+        transition: WorkflowChanged,
+    ) -> WorkflowCommitted | WorkflowConflict:
         if not isinstance(expected, WorkflowRevision) or not isinstance(transition, WorkflowChanged):
             raise ValueError("commit requires a typed revision and proposed transition")
         self._scope(expected.fence.key)
@@ -953,48 +1359,47 @@ class SQLiteWorkflowControl:
             raise WorkflowAuthorityError("resolve commit requires exactly its captured family authority")
         encoded = encode_workflow(transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else _accepted_proposal(transition)
         namespace, dedupe = _dedupe_key(transition)
-        with self._control.transaction() as db:
-            self._control._assert_owner_active(db, self.writer.owner_id)
-            prior = load_workflow_row(db, expected.fence.key)
-            if prior is None:
-                raise WorkflowAuthorityError("workflow must be explicitly imported before mutation")
-            if authorities != (prior.authority,):
-                raise WorkflowAuthorityError("workflow family activation epoch changed")
-            if isinstance(transition.audit, ResolveAttemptResult) and db.execute(
-                "SELECT 1 FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?",
-                (self.writer.repository, str(transition.audit.attempt.run_id)),
-            ).fetchone() is not None:
-                return WorkflowConflict(prior.revision, "captured paid return must use observation finalization")
-            receipt = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (namespace, self.writer.repository, dedupe),
-            ).fetchone()
-            if receipt is not None:
-                if not _same_receipt(receipt["payload_json"], transition, encoded):
-                    return WorkflowConflict(prior.revision, "durable workflow identity was reused with different content")
-                return WorkflowCommitted(prior, idempotent=True)
-            if prior.revision != expected:
-                return WorkflowConflict(prior.revision, "workflow revision changed before commit")
-            observations = self._validate_evidence(db, prior, transition)
-            admission = self._validate_attempt_run(db, transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else None
-            accepted_preflight = None
-            if isinstance(prior.intent, PendingRearm):
-                row = db.execute("SELECT actor_json FROM workflow_rearms WHERE request_id=?", (prior.intent.request_id,)).fetchone()
-                if row is None:
-                    raise WorkflowAuthorityError("pending intent lacks its accepted audit")
-                accepted_preflight = decode_workflow(row["actor_json"], AuthorizedOperatorCommand).preflight
-            validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight, admission=admission)
-            self._persist(db, prior, transition, encoded)
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) VALUES (?, ?, ?, ?, ?)",
-                (namespace, self.writer.repository, dedupe, self._control._now().isoformat(), encoded),
-            )
-            self._control._transition(
-                db, "workflow", encode_workflow(expected.fence.key), transition.mutation.value,
-                {"generation": transition.snapshot.revision.fence.generation,
-                 "version": transition.snapshot.revision.version},
-            )
-            return WorkflowCommitted(transition.snapshot)
+        self._control._assert_owner_active(db, self.writer.owner_id)
+        prior = load_workflow_row(db, expected.fence.key)
+        if prior is None:
+            raise WorkflowAuthorityError("workflow must be explicitly imported before mutation")
+        if authorities != (prior.authority,):
+            raise WorkflowAuthorityError("workflow family activation epoch changed")
+        if isinstance(transition.audit, ResolveAttemptResult) and db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?",
+            (self.writer.repository, str(transition.audit.attempt.run_id)),
+        ).fetchone() is not None:
+            return WorkflowConflict(prior.revision, "captured paid return must use observation finalization")
+        receipt = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (namespace, self.writer.repository, dedupe),
+        ).fetchone()
+        if receipt is not None:
+            if not _same_receipt(receipt["payload_json"], transition, encoded):
+                return WorkflowConflict(prior.revision, "durable workflow identity was reused with different content")
+            return WorkflowCommitted(prior, idempotent=True)
+        if prior.revision != expected:
+            return WorkflowConflict(prior.revision, "workflow revision changed before commit")
+        observations = self._validate_evidence(db, prior, transition)
+        admission = self._validate_attempt_run(db, transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else None
+        accepted_preflight = None
+        if isinstance(prior.intent, PendingRearm):
+            row = db.execute("SELECT actor_json FROM workflow_rearms WHERE request_id=?", (prior.intent.request_id,)).fetchone()
+            if row is None:
+                raise WorkflowAuthorityError("pending intent lacks its accepted audit")
+            accepted_preflight = decode_workflow(row["actor_json"], AuthorizedOperatorCommand).preflight
+        validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight, admission=admission)
+        self._persist(db, prior, transition, encoded)
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) VALUES (?, ?, ?, ?, ?)",
+            (namespace, self.writer.repository, dedupe, self._control._now().isoformat(), encoded),
+        )
+        self._control._transition(
+            db, "workflow", encode_workflow(expected.fence.key), transition.mutation.value,
+            {"generation": transition.snapshot.revision.fence.generation,
+             "version": transition.snapshot.revision.version},
+        )
+        return WorkflowCommitted(transition.snapshot)
 
     def _validate_evidence(
         self, db: sqlite3.Connection, prior: WorkflowSnapshot, proposal: WorkflowChanged,
@@ -1044,6 +1449,10 @@ class SQLiteWorkflowControl:
                     "re-arm completion lacks its exact persisted workspace acknowledgement"
                 )
         if isinstance(intent, (CompletedRearm, CancelledRearm, SupersededRearm)):
+            if isinstance(prior.intent, PendingRearm):
+                verified, _, _ = self._rearm_command_facts(db, prior)
+                if set(intent.verified_commands) != set(verified):
+                    raise WorkflowAuthorityError("re-arm disposition must retain every successful required receipt")
             for command_id in intent.verified_commands:
                 row = db.execute(
                     "SELECT lifecycle_commands.state, lifecycle_commands.executor_identity, lifecycle_commands.attempt_owner, "
@@ -1183,11 +1592,22 @@ class SQLiteWorkflowControl:
         if intent is not None and intent != prior.intent:
             if isinstance(intent, PendingRearm):
                 assert isinstance(proposal.audit, AuthorizedOperatorCommand)
+                now = self._control._now()
                 db.execute(
                     "INSERT INTO workflow_rearms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (intent.request_id, *scope, intent.gate_id, intent.from_generation, intent.to_generation,
                      "pending", hashlib.sha256(encode_workflow((proposal.audit.actor.subject, proposal.audit.command)).encode()).hexdigest(),
                      encode_workflow(proposal.audit), encode_workflow(intent)),
+                )
+                seed = RearmObservation(
+                    intent.request_id, after.binding, ActiveReconciliation(now, now, 0),
+                )
+                observation = schedule_rearm_observation(seed, now=now)
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                    "VALUES ('workflow-rearm-observation',?,?,?,?)",
+                    (self.writer.repository, intent.request_id,
+                     observation.history.next_read_at.isoformat(), encode_workflow(observation)),
                 )
             else:
                 db.execute(

@@ -482,7 +482,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
-`domain/resolve_workspace.py`
+`domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration; workspace handoffs are explicit
 preparation obligations, not AUTHOR evidence or independent execution authority).
@@ -507,7 +507,8 @@ preparation obligations, not AUTHOR evidence or independent execution authority)
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
 `adapters/typed_journal.py`, `adapters/untrusted.py`,
 `adapters/wake.py`, `adapters/worktree.py`, `adapters/workflow_codec.py`,
-`adapters/workflow_rows.py`, and `adapters/workflow_control.py`. Dashboard-specific read
+`adapters/workflow_rows.py`, `adapters/workflow_control.py`, and
+`adapters/workspace_admission.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
@@ -517,6 +518,7 @@ adapters live under `adapters/dashweb/`.
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
+`app/resolve_control.py`,
 `app/service_doctor.py`, `app/webhook.py`,
 `app/world_probe.py`, and `app/world_reporter.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid

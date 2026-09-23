@@ -17,9 +17,13 @@ preceded the current durable-handoff authority checkpoint. It binds re-arm polic
 persisted preparation acknowledgement, quiescence, paid admission and projection
 commands to that exact handoff. Independent review and full `make test` passed:
 1,592 domain, 1,695 adapter and 2,421 app tests, plus all remaining checks.
-Log: `/tmp/phase3-durable-handoff-full-second.log`. Production operator/daemon
-wiring, first-entry Git verification and activation/import remain outstanding;
-this is not full vertical-slice acceptance or live activation.
+Log: `/tmp/phase3-durable-handoff-full-second.log`. The next production increment
+implements daemon recovery, shared operator composition and first-entry Git
+verification. Independent review and final full `make test` passed: 1,624 domain,
+1,721 adapter and 2,482 app tests, hooks/parity, configuration, import contracts
+and both Pyrefly checks. Log: `/tmp/phase3-rearm-production-full-verified.log`.
+Operator transport/dashboard and activation/import remain outstanding.
+This is not full vertical-slice acceptance or live activation.
 Implementation and its phase agent are authorized to resume;
 live operation and live migrations remain paused. Phase 3 must be accepted before
 phase 4 starts. The six-phase goal remains incomplete.
@@ -33,6 +37,19 @@ generation fencing, actual settlement provenance, atomic outbox insertion and
 bounded reconciliation. Use isolated databases, `uv`, Pyrefly and `apply_patch`;
 no live services, target writes, paid harness runs or commits by agents. Full
 `make test` and fresh independent adversarial review precede every parent commit.
+
+Production re-arm integration brief (after `2ff5151`): the parent owns shared
+values/ports/codec, transition transaction seams and role/API composition. Astra
+owns the focused application re-arm service and its composed tests after the
+ports are agreed; the adapter agent owns bounded pending-intent observation,
+request replay and atomic receipt-based reconciliation. Scheduling metadata is
+attached to existing re-arm intent via existing dedupe receipts, never a second
+work queue. Fixed deployment barriers surround observation/preparation but no
+remote write or nested SQL transaction. Reuse the current fix owner, worktree
+adapter and effect executor; inactive authority refuses instead of importing or
+falling back. Independent review and full `make test` precede commit. Use isolated
+repositories/databases, `uv`, Pyrefly and `apply_patch`; no agent commits or live
+services, target changes, paid runs or live migrations.
 
 Workspace-handoff collaboration brief (current increment): exact base and
 handoff values live in `domain/resolve_workspace.py`; the parent owns these

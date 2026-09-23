@@ -1,5 +1,97 @@
 # Phase 3 re-arm preparation — checkpoint handover
 
+## Production integration checkpoint (2026-09-23)
+
+The current increment builds on `2ff5151`. Production daemon recovery and
+first-paid-entry composition are implemented; operator HTTP/CLI transport,
+dashboard projection, explicit activation/import and the second gate family
+remain outstanding. Phase 3 is not accepted. The six-phase goal remains active;
+phases 4–6 retain their dependencies. Services and live migrations remain paused.
+
+- `app/workflows/resolve_rearm.py` composes Request/Continue/Cancel with the
+  existing fix-owned workflow adapter and durable projection command. It never
+  drains remote writes under its exclusive deployment barriers. Replays retain
+  canonical operator subject and exact command identity without another fetch,
+  allowance grant or reset.
+- Recovery uses existing re-arm intent plus dedupe observation history, with
+  bounded batches, backoff and aged observation holds. Healthy peers continue
+  after corrupt per-target records. Healthy Git verification removes only the
+  observation hold belonging to the original handoff, including after Continue.
+  Fresh facts supersede obsolete decisions before workspace mutation; completion
+  requires actual persisted command receipts and exact verified workspace proof.
+- `app/resolve_control.py` supplies shared daemon/operator composition and a
+  fail-closed operator factory. It requires existing current authority, the
+  canonical configured deployment and fix owner; it does not initialize,
+  migrate, adopt or fall back to legacy writes. There is no operator transport
+  caller yet. Snapshot host disagreement is refused because the existing GitHub
+  runner inherits process host.
+- The fix role's existing recovery callback now reconciles both paid returns
+  and pending re-arms, including startup and effect replay without world
+  construction or paid dispatch.
+- `WorkspaceAdmission` fences actual Git verification and first reservation
+  together: deployment barriers, then the Worktrees mutation lock, then short
+  SQLite admission. All locks release before provider execution. Direct public
+  reservation cannot create the first completed-handoff admission without this
+  proof. Task construction uses the exact read-only managed path and never
+  recreates a missing prepared checkout through `ensure`.
+- The immutable paid admission records `workspace_handoff_id`. One indexed
+  current-episode admission, including ROUTE or an unlaunched reservation,
+  consumes first-entry verification. Later legitimate agent edits are not
+  compared with the pristine base or reset again. This proves admission, not
+  attribution of every later dirty file. Existing continuation/recovery rules
+  govern those files. No new readiness flag, counter, queue or schema is added.
+- Codex hook preparation writes outside the checkout in the state directory;
+  earlier assumptions that it dirtied the prepared tree were incorrect. The
+  actual mutating pre-admission hazard was `ensure` recreating a missing tree.
+
+Independent review corrections include preserving normal/shared fail-fast
+admission outside the one-shot handoff boundary; deferring a failed read only
+against the exact acquired revision; superseding requests when external holds
+change the required remote projection; rejecting contradictory uncertainty;
+retaining observation holds until healthy verification; and making generic
+terminal transitions retain every successful required-command receipt, not
+just the receipts named by their caller. The optimistic entry lookup uses a
+deferred read transaction rather than taking another SQLite writer lock.
+
+The metric is fewer mechanical re-arm interventions and duplicate paid retries.
+Guardrails are unchanged allowance/spend conservation, preservation of displaced
+work and independent holds, exact remote receipts, and no additional exclusive
+locking on ordinary admissions. Composed fault replay is the current evidence;
+live intervention/cost measurement remains phase 5 work under the user's pause.
+
+Focused domain, adapter, real-Git and actual-executor tests pass. The executor
+suite includes a spawned process exiting after remote success before receipt,
+then restart reconciliation with exactly one remote relabel. Independent review
+accepted the bounded checkpoint after the corrections above (111 focused
+domain/adapter and 194 focused app checks, Pyrefly zero errors). The first full
+attempt found architecture manifest/no-op logging contract violations; the
+second collected a new test before its correction; the third passed 1,624 domain
+and 1,719 adapter cases but found nine role-composition cases rejected by an
+unnecessary concrete worktree-adapter type check. Removing that nominal check
+preserves the existing injected adapter contract without weakening Git proof;
+all 124 role tests now pass. The next full run passed 1,624 domain, 1,721 adapter
+and 2,482 app cases, then import-linter caught a daemon-to-optional-web dependency
+through the CLI naming helper. That unchanged pure helper now lives in
+`domain/deployment.py`, shared by CLI and operator composition. All four import
+contracts pass. Final frozen `make test` passed at
+`/tmp/phase3-rearm-production-full-verified.log`: 1,624 domain, 1,721 adapter and
+2,482 app tests, hooks 123, parity 13, configuration checks, all four import
+contracts and both Pyrefly checks (zero errors). Independent review also accepted
+the dependency correction after verifying unchanged CLI normalization/re-export
+and 34 operator-composition cases. Services were rechecked inactive/dead,
+disabled, MainPID=0. The checkpoint subject is
+`feat: reconcile resolve rearms and verify first paid workspace entry`.
+This accepts only the bounded production integration, not phase 3 overall.
+
+Next: expose typed operator Request/Continue/Cancel and held-state reads through
+the authenticated local dashboard boundary; retain stable IDs/revision CAS and
+canonical server-minted actor. Refuse legacy unblock for an activated resolve
+family. Exercise explicit offline import/rollback against isolated copies,
+including legacy unbound run refusal/draining/mapping, before any authorized
+activation. Complete the resolve slice before starting review rejection.
+
+The sections below retain the preceding accepted checkpoint history.
+
 Goal remains **active and incomplete**: complete the remaining phases of the
 [six-phase plan](2026-09-14-architecture-implementation.md). Phases 1–2 are
 accepted; phase 3 is current. No phase-4 implementation or live activation is
@@ -166,7 +258,7 @@ projection before enabling this family; the current index cannot prove those
 runs quiescent. This remains an explicit activation prerequisite, not an implicit
 claim that existing live history is ready for import.
 
-## Next production integration
+## Prior production integration brief (now implemented above)
 
 Add a small `app/workflows/resolve_rearm.py` service, recovered by the existing
 fix workflow callback already bound to both `Executor.replay_pending` and
@@ -185,12 +277,10 @@ durable receipt with fresh facts to complete the intent. Dashboard transport
 must supply authenticated actor, stable request ID and expected revision, never
 new command owners or file resets for this migrated family.
 
-Before first paid entry to the new episode, verify the actual checkout against
-its persisted acknowledgement **before** `prepare_cwd` writes harness context.
-Tie this to admission authority (including router entry and unlaunched retries),
-not a local marker or mere presence of `CompletedRearm`. Later legitimate
-AUTHOR/IMPLEMENT edits must not be compared to a pristine base. This app seam
-is not implemented by the current durable receipt increment.
+Before first paid entry, verify the actual checkout against its persisted
+acknowledgement atomically with reservation. Hook preparation is external to the
+checkout. The current production increment above implements this seam, including
+router entry and reservation replay, without a separate readiness marker.
 
 ## Agreed re-arm handoff design
 

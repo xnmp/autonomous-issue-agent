@@ -77,11 +77,14 @@ def test_completed_handoff_bridges_retained_predecessor_then_advances_normally(c
     pending = pending_rearm(control, prior_stage=prior_stage)
     with control.transaction() as db:
         old_pointer = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-work-latest'").fetchone()[0]
-    completed = complete(control, pending, prepare_workspace(control, pending))
+    acknowledgement = prepare_workspace(control, pending)
+    completed = complete(control, pending, acknowledgement)
     with control.transaction() as db:
         assert db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-work-latest'").fetchone()[0] == old_pointer
     split = SplitContext(completed.intent.handoff.branch, SplitSelection("codex", "model")) if next_stage == "AUTHOR" else None
-    assert control.reserve(paid_request("new-work", binding=completed.binding, stage=next_stage, split_input=split)).admitted
+    first = paid_request("new-work", binding=completed.binding, stage=next_stage, split_input=split)
+    assert not control.reserve(first).admitted
+    assert control._reserve(first, workspace_verified=acknowledgement).admitted
     assert adapter(control).load_workflow(completed.revision.fence.key).revision.version == completed.revision.version + 1
     with control.transaction() as db:
         assert db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-work-latest'").fetchone()[0] != old_pointer
@@ -136,4 +139,6 @@ def test_cancel_continue_reuses_original_preparation_receipt_without_new_allowan
     ) == ack
     completed = complete(control, resumed, ack)
     assert completed.episode == pending.episode
-    assert control.reserve(paid_request("after-continue", binding=completed.binding)).admitted
+    first = paid_request("after-continue", binding=completed.binding)
+    assert not control.reserve(first).admitted
+    assert control._reserve(first, workspace_verified=ack).admitted

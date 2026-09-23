@@ -846,16 +846,28 @@ def validate_resolve_transition(
             if len(observations) != 1:
                 raise ValueError("supersession requires one exact durable observation")
             observation = observations[0]
-            if not isinstance(observation, (ObservedIssue, LinkedPrPresent)):
+            if not isinstance(observation, (ResolveRearmPreflight, ObservedIssue, LinkedPrPresent)):
                 raise ValueError("absent or unavailable targets cannot justify supersession")
-            observed_key = observation.key if isinstance(observation, ObservedIssue) else observation.issue
-            if observed_key != prior.revision.fence.key or not 0 <= (now - observation.observed_at).total_seconds() <= 300:
+            observed_target = observation.issue if isinstance(observation, ResolveRearmPreflight) else observation
+            observed_key = observed_target.key if isinstance(observed_target, ObservedIssue) else observed_target.issue
+            if observed_key != prior.revision.fence.key or not 0 <= (now - observed_target.observed_at).total_seconds() <= 300:
                 raise ValueError("supersession observation is foreign or stale")
             if intent.reason is StopReason.TARGET_TERMINAL:
                 if not isinstance(observation, ObservedIssue) or (observation.issue.state == "open" and not observation.issue.labels & {Label.AI_DONE, Label.AI_CLOSED}):
                     raise ValueError("terminal supersession requires observed terminal issue state")
             elif intent.reason is StopReason.DECISION_CHANGED:
-                if isinstance(observation, ObservedIssue):
+                if isinstance(observation, ResolveRearmPreflight):
+                    if not 0 <= (now - observation.linkage.observed_at).total_seconds() <= 300:
+                        raise ValueError("supersession linkage is stale")
+                    if accepted_preflight is None or (
+                        observation.issue.issue.title, observation.issue.issue.body, observation.issue.issue.state,
+                        set(observation.external_holds),
+                    ) == (
+                        accepted_preflight.issue.issue.title, accepted_preflight.issue.issue.body,
+                        accepted_preflight.issue.issue.state, set(accepted_preflight.external_holds),
+                    ):
+                        raise ValueError("supersession requires changed decision or hold facts")
+                elif isinstance(observation, ObservedIssue):
                     if accepted_preflight is None or (
                         observation.issue.title, observation.issue.body, observation.issue.state,
                     ) == (

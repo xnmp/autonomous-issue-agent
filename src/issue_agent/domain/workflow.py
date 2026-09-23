@@ -133,6 +133,7 @@ class ResolveAdmission:
     adjudication_ceiling: int | None = None
     input_fingerprint: str | None = None
     split_fingerprint: str | None = None
+    workspace_handoff_id: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.attempt, WorkflowAttemptIdentity) or not isinstance(self.revision, WorkflowRevision):
@@ -141,6 +142,8 @@ class ResolveAdmission:
             raise ValueError("resolve admission requires its newly allocated workflow revision")
         if not isinstance(self.stage, ResolveStage):
             raise ValueError("resolve admission requires a supported stage")
+        if self.workspace_handoff_id is not None:
+            _text(self.workspace_handoff_id, "workspace handoff")
         if self.stage is ResolveStage.ADJUDICATE:
             if self.adjudication_ceiling is None:
                 raise ValueError("adjudication admission requires its configured ceiling")
