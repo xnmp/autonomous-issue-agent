@@ -6,6 +6,7 @@ from datetime import datetime
 import sqlite3
 
 from issue_agent.adapters.effects import command_for_action
+from issue_agent.adapters.workflow_rows import WorkflowRevisionConflict
 from issue_agent.domain.ports import FixWorktreePort, WorkflowGitHubReads
 from issue_agent.domain.refs import slugify
 from issue_agent.domain.resolve_rearm import UnavailableResolveRearm
@@ -15,7 +16,7 @@ from issue_agent.domain.workflow import (
     OperatorActor, PendingRearm, RequestRearm, WorkflowCommitted, WorkflowConflict,
     WorkflowRejected, WorkflowRejection, WorkflowSnapshot, WorkflowUnchanged,
 )
-from issue_agent.domain.workflow_identity import WorkflowKey, WorkflowRevision
+from issue_agent.domain.workflow_identity import WorkflowBinding, WorkflowKey, WorkflowRevision
 from issue_agent.domain.workflow_policy import (
     continue_resolve_rearm, request_resolve_rearm, resolve_rearm_projection,
 )
@@ -47,15 +48,17 @@ class ResolveRearmWorkflow:
 
     def submit(
         self, command: RequestRearm | ContinueGrantedRearm | CancelRearm,
-        actor: OperatorActor,
+        actor: OperatorActor, *, binding: WorkflowBinding | None = None,
     ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected:
         if not isinstance(command, (RequestRearm, ContinueGrantedRearm, CancelRearm)) or not isinstance(actor, OperatorActor):
             return WorkflowRejected(WorkflowRejection.INVALID_SCOPE, "re-arm requires a typed command and authenticated operator")
+        if binding is not None and (not isinstance(binding, WorkflowBinding) or binding.fence != command.expected.fence):
+            return WorkflowRejected(WorkflowRejection.INVALID_SCOPE, "re-arm binding disagrees with its expected revision")
         key = command.expected.fence.key
         try:
             if isinstance(command, CancelRearm):
                 # Cancellation owns its barrier so canonical replay precedes CAS.
-                return self.control.cancel_rearm(command, actor)
+                return self.control.cancel_rearm(command, actor, binding=binding)
             accepted = self.control.accepted_rearm(key, command.request_id)
             if accepted is not None:
                 current = self.control.load_workflow(key)
@@ -63,8 +66,18 @@ class ResolveRearmWorkflow:
                     raise ValueError("accepted re-arm workflow is unavailable")
                 if accepted.command != command or accepted.actor.subject != actor.subject:
                     return WorkflowConflict(current.revision, "request identity was reused with different content or operator")
+                if binding is not None:
+                    intent = self.control.lookup_rearm(key, command.request_id)
+                    from issue_agent.domain.workflow import ResolveRearmAcceptance
+
+                    accepted_binding = (accepted.preflight.workspace.source
+                                        if isinstance(accepted.preflight, ResolveRearmAcceptance)
+                                        else WorkflowBinding(command.expected.fence, intent.handoff.destination.authority, intent.handoff.destination.episode_id)
+                                        if intent is not None else None)
+                    if binding != accepted_binding:
+                        return WorkflowConflict(current.revision, "request replay names another family epoch or episode")
                 return WorkflowCommitted(current, idempotent=True)
-            with self.control.rearm_authority(command.expected) as current:
+            with self.control.rearm_authority(command.expected, binding=binding) as current:
                 issue, linkage, holds = self._observe(key)
                 if isinstance(command, RequestRearm):
                     fallback = f"fix/{key.target.number}-{slugify(issue.issue.title) or 'issue'}"
@@ -104,6 +117,8 @@ class ResolveRearmWorkflow:
                 return self.control.commit_workflow(
                     command.expected, (current.authority,), replace(proposal, commands=(projection,)),
                 )
+        except WorkflowRevisionConflict as exc:
+            return WorkflowConflict(exc.current, str(exc))
         except sqlite3.Error:
             raise
         except Exception as exc:

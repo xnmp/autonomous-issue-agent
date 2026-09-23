@@ -225,6 +225,44 @@ CLI and dashboard quota totals are read-only projections of settled SQLite
 charges for the current budget period; the legacy spend ledger is migration
 input only.
 
+### Resolve operator API
+
+The loopback dashboard exposes `GET /api/repos/{name}/issues/{number}/resolve-control`
+and `POST` to the same path plus `/commands`. This is a backend/API checkpoint;
+the SPA does not yet expose these controls. Live activation remains paused under
+the [architecture plan](docs/open/2026-09-14-architecture-implementation.md).
+
+GET reads existing SQLite authority only. It distinguishes inactive family,
+active-but-absent target (404), available workflow, and unavailable/corrupt
+authority (503). Optional `request_id` selects historical intent separately from
+the current intent and holds. `workflow_held` describes SQLite holds, not remote
+readiness; submission checks external facts again. Inspection never creates or
+migrates a database, performs Git recovery, or drains commands.
+
+Commands are `request_rearm`, `continue_rearm`, and `cancel_rearm`. Copy the exact
+`expected` identity from GET (repository, issue, family, epoch, generation,
+version, episode). Use stable request/cancellation IDs. Request includes gate ID
+and tagged guidance (`keep`, `clear`, or `set` with text); Continue names the
+stopped request; Cancel names the pending request and reason. Actor identity is
+minted by the server for its local OS account, never accepted from the body.
+
+Accepted (202) means durable intent, not completed recovery. Canonical replay
+returns 200, stale identity/content conflicts 409, invalid requests 422, and
+unavailable observations/authority 503. After a lost response, retry the exact
+same command and ID; do not invent a new grant. Later GET reports progress while
+the existing daemon recovery and durable executor establish completion.
+
+Both typed and legacy commands use one validated active launch snapshot, without
+per-field overlay fallback. Missing snapshots refuse; edits during a request do
+not redirect its repository, credentials or local state writes.
+
+The listener permits literal `127.0.0.1` or `::1` only; existing Host, same-Origin,
+and `X-Issue-Agent-Dashboard: 1` write guards apply. This trusts the local operator
+account; it is not a multi-user authentication service. Legacy `/unblock` refuses
+activated resolve authority, including missing targets. It also refuses absent,
+unwitnessed, corrupt or outdated databases; operators must use the explicit
+offline migration/activation procedure when that slice is accepted.
+
 ## Testing
 
 ```bash

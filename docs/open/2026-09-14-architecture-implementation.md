@@ -1,5 +1,20 @@
 # Architecture implementation phases
 
+Overall status: **1–2 accepted; 3 in progress; 4–6 dependency-gated.** The
+[phase table](#phases-and-acceptance) below covers all six phases. The latest
+bounded increment is the [operator API checkpoint](2026-09-23-phase-3-operator-handover.md):
+typed commands, coherent status reads, generated client contracts and legacy
+authority fencing. It is not full phase-3 acceptance or permission to restart.
+
+The operator checkpoint passed independent adversarial review and the final
+frozen full suite: 1,624 domain, 1,753 adapter, 2,577 application tests, all
+remaining checks and both Pyrefly passes. Dashboard contracts/typecheck and
+247 Vitest + 3 build tests passed. Verification:
+`/tmp/phase3-operator-full-verified.log` and
+`/tmp/phase3-operator-dashboard-verified.log`. All four services remain disabled
+and inactive. Next is visible operator UX, then explicit offline activation/import
+and complete resolve-slice acceptance; phase 4 has not started.
+
 **Phase 3 resumed on 2026-09-23 at the user's request.** See the
 [current re-arm preparation handover](2026-09-23-phase-3-rearm-handover.md),
 [split-recovery checkpoint](2026-09-23-phase-3-split-recovery-handover.md),
@@ -22,7 +37,8 @@ implements daemon recovery, shared operator composition and first-entry Git
 verification. Independent review and final full `make test` passed: 1,624 domain,
 1,721 adapter and 2,482 app tests, hooks/parity, configuration, import contracts
 and both Pyrefly checks. Log: `/tmp/phase3-rearm-production-full-verified.log`.
-Operator transport/dashboard and activation/import remain outstanding.
+The following operator API increment supplies transport and authoritative
+projection; visible SPA controls and explicit activation/import remain outstanding.
 This is not full vertical-slice acceptance or live activation.
 Implementation and its phase agent are authorized to resume;
 live operation and live migrations remain paused. Phase 3 must be accepted before
@@ -50,6 +66,23 @@ adapter and effect executor; inactive authority refuses instead of importing or
 falling back. Independent review and full `make test` precede commit. Use isolated
 repositories/databases, `uv`, Pyrefly and `apply_patch`; no agent commits or live
 services, target changes, paid runs or live migrations.
+
+Operator-boundary integration brief (after `82fe5c7`): the parent owns wire
+contracts, workflow identity/port changes, coherent SQLite projection reads,
+server-minted local operator identity, and legacy-authority fencing. The Astra
+phase agent owns assigned endpoint/application tests after those contracts land;
+the adapter agent owns agreed authority-fencing tests. HTTP requests carry full
+expected binding plus revision, stable command identities and typed guidance,
+never actor/owner/effect/workspace evidence. Verify binding inside the existing
+acceptance barrier. Replays report the original intent separately from current
+held state. Status reads do not initialize, migrate, reconcile or drain effects.
+Reuse the existing loopback Host/Origin/CSRF boundary; its trust domain is the
+local operator account, not arbitrary browser-supplied identity. Preserve
+distinct inactive/absent/unavailable results and never fall back from an active
+family to legacy file/label choreography. No new queue or mutation authority.
+Use isolated SQLite/Git fixtures, `uv`, Pyrefly and `apply_patch`, no agent
+commits or live operations. Full tests and fresh adversarial review precede
+parent integration. Visual UI work remains a subsequent explicit slice.
 
 Workspace-handoff collaboration brief (current increment): exact base and
 handoff values live in `domain/resolve_workspace.py`; the parent owns these
@@ -267,10 +300,14 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
    final independent review and the full suite passed. Final log:
    `/tmp/phase3-split-final-verified.log`. This accepts the bounded recovery increment,
    not phase 3 overall.
-3. Complete resolve operator activation/import, re-arm, cancellation and explicit
-   absence-authorized retry, with exclusive effect barriers and daemon recovery.
-4. Wire authoritative dashboard projection and aged-command uncertainty;
-   complete migration, rollback, old-writer fencing and legacy-path deletion.
+3. Re-arm/continuation/cancellation, exclusive barriers and daemon recovery now
+   have production composition. The operator API supplies exact-bound commands
+   and coherent authoritative reads; legacy unblock is fenced. Complete explicit
+   offline activation/import and remaining absence-authorized retry controls.
+4. Build visible dashboard controls over the new API (not yet implemented), and
+   finish aged-command uncertainty operator outcomes. Complete migration,
+   rollback, old-writer fencing and remaining legacy-path deletion. The existing
+   inactive-family legacy path is preserved, not claimed deleted.
 5. Accept the complete resolve vertical slice with independent review and full
    composed failure coverage, then implement/accept the review-rejection slice.
 6. Only then accept phase 3 and start phase 4. Live activation and soak remain

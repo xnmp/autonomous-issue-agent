@@ -12,9 +12,14 @@ from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .resolve_contracts import CommandResult, ResolveCommand, ResolveControl
 
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
 from ...adapters.control_store import SQLiteControlStore
+from ...adapters.control_path import control_store_path
 from ...adapters.event_log import EventLog
 from ...adapters.github import parse_pr
 from ...adapters.journal import default_ledger_path
@@ -36,6 +41,7 @@ from ...domain.events import (
 )
 from .. import cli, config
 from ..review_identity import review_identity
+from ..resolve_control import load_operator_configuration, open_resolve_operator
 from . import snapshots
 from .guidance import GuidanceError, parse_guidance
 from .ports import GitHubQueries
@@ -200,6 +206,7 @@ class Backend:
         gh_enrichment_executor: ThreadPoolExecutor | None = None,
         effects_factory=build_operator_effects,
         control_db_path: str = "",
+        resolve_factory=open_resolve_operator,
     ):
         self.harness_root = harness_root or cli.HARNESS_ROOT
         self.gh = gh or ghdata.GhReader()
@@ -226,7 +233,8 @@ class Backend:
         self._self_repo = system.remote_repo(self.harness_root)
         self.effects_factory = effects_factory
         self.control_db_path = control_db_path
-        self._journals: dict[str, TypedJournal | None] = {}
+        self._resolve_factory = resolve_factory
+        self._journals: dict[tuple[str, str, str], TypedJournal | None] = {}
 
     # ── journal side ──
     def names(self) -> tuple[str, ...]:
@@ -248,17 +256,18 @@ class Backend:
                 return cached
         return self._snapshots.put(
             name,
-            self._collector.collect(
-                name=name,
-                repo=self.overlay_field(name, "REPO"),
-                target_dir=self.overlay_field(name, "TARGET_DIR"),
-                journal_paths=cli.journal_paths(name),
-                log_dir=cli.log_dir(),
-                ledger_path=default_ledger_path(),
-                now_fn=self.now_fn,
-                stale_after_s=self.stale_after_s,
-                control_db_path=self.control_db_path,
-            ),
+            self._deployment_snapshot(name, self.overlay_field(name, "REPO"),
+                                      self.overlay_field(name, "TARGET_DIR"),
+                                      tuple(cli.journal_paths(name)), self.control_db_path),
+        )
+
+    def _deployment_snapshot(
+        self, name: str, repo: str, target_dir: str, journal_paths: tuple[str, ...], control_db_path: str,
+    ) -> dash.Snapshot:
+        return self._collector.collect(
+            name=name, repo=repo, target_dir=target_dir, journal_paths=list(journal_paths),
+            log_dir=cli.log_dir(), ledger_path=default_ledger_path(), now_fn=self.now_fn,
+            stale_after_s=self.stale_after_s, control_db_path=control_db_path,
         )
 
     def repos(self) -> dict:
@@ -680,12 +689,51 @@ class Backend:
             remove=remove,
         )
 
+    def _resolve_operator(self, name: str):
+        if not self.known(name):
+            raise ValueError(f"unknown deployment '{name}'")
+        return self._resolve_factory(name, harness_root=self.harness_root,
+                                     control_db_path=self.control_db_path, now=self.now_fn)
+
+    def resolve_control(self, name: str, number: int, request_id: str | None = None) -> ResolveControl:
+        from .resolve_control import read_control
+
+        return read_control(self._resolve_operator(name), number, request_id)
+
+    def resolve_command(self, name: str, number: int, body: ResolveCommand) -> CommandResult:
+        from .resolve_control import submit_control
+
+        # Reject malformed direct callers before opening configured authority.
+        body.command()
+        return submit_control(self._resolve_operator(name), number, body)
+
     def unblock(
+        self, name: str, number: int, channel: str = "api", guidance: str | None = None,
+    ) -> tuple[bool, str]:
+        if not self.known(name):
+            return False, f"unknown deployment '{name}'"
+        try:
+            guidance = parse_guidance(guidance)
+            cfg, env = load_operator_configuration(name, harness_root=self.harness_root)
+            repo = cfg.repo
+            state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+            path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
+            if self.control_db_path and os.path.realpath(self.control_db_path) != os.path.realpath(path):
+                return False, "unblock control authority differs from the configured deployment"
+            control = SQLiteControlStore(path)
+            with control.legacy_resolve_authority(repo):
+                return self._legacy_unblock(name, number, channel, guidance, control=control, cfg=cfg, env=env)
+        except Exception as exc:  # noqa: BLE001 - failure cannot authorize legacy resets
+            return False, f"unblock unavailable ({type(exc).__name__}: {exc})"
+
+    def _legacy_unblock(
         self,
         name: str,
         number: int,
         channel: str = "api",
         guidance: str | None = None,
+        *, control: SQLiteControlStore, cfg: config.HarnessConfig,
+        env: Mapping[str, str],
     ) -> tuple[bool, str]:
         """Undo a hold a human is expected to clear: dismiss the reviewer's
         standing change requests, drop the labels that stop re-dispatch, and
@@ -727,19 +775,21 @@ class Backend:
             guidance = parse_guidance(guidance)
         except GuidanceError as exc:
             return False, str(exc)
-        repo = self.overlay_field(name, "REPO")
-        if not repo:
-            return False, f"no REPO configured for deployment '{name}'"
-        held, pr_held, unreadable = self._attention_labels(
-            name, repo, number
-        )
+        repo = cfg.repo
+        state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+        journal_paths = tuple(os.path.join(path, "journal.jsonl") for path in state_dirs)
+        # Admission provenance must share mutation scope and bypass the UI cache.
+        snapshot = self._deployment_snapshot(name, repo, cfg.target_dir, journal_paths, control.path)
+        row = snapshots.find_row(snapshot, number)
+        prs = tuple(row.prs) if row is not None else ()
+        held, pr_held, unreadable = self._attention_labels(repo, number, prs)
         if unreadable:
             return False, unreadable
         if not held and not pr_held:
             return False, f"nothing to unblock on #{number}"
         issue_add, issue_remove = actions.issue_unblock_change(held)
         raw_trigger = (
-            cli.deployment_env_field(name, "REVIEW_TRIGGER_LABEL")
+            env.get("REVIEW_TRIGGER_LABEL")
             or Label.AI_PR_OPEN.value
         )
         try:
@@ -754,7 +804,7 @@ class Backend:
         try:
             for pr, labels in pr_held.items():
                 candidate_pr = pr
-                hold_role = self._pr_hold_role(name, number, pr)
+                hold_role = self._pr_hold_role(row, pr)
                 pr_hold_roles[pr] = hold_role
                 pr_changes[pr] = actions.pr_unblock_change(
                     labels,
@@ -771,20 +821,17 @@ class Backend:
         # against a breaker that is still tripped. The guidance lands in the
         # same window and for the same reason: a PR re-armed before its scope
         # note is durable would run one more unscoped round.
-        cleared = self._clear_retry_counters(name, number)
+        review_dir = next((path for role, path in zip(dash.ROLE_NAMES, state_dirs) if role == "review"), "")
+        effects = self._operator_effects(name, repo, journalled=False, control=control, state_dirs=state_dirs, env=env)
+        review_effects = self._operator_effects(name, repo, journalled=False, credential_role="review", control=control, state_dirs=state_dirs, env=env)
+        journal = self._operator_journal(name, repo, legacy_path=journal_paths[0])
+        cleared = self._clear_retry_counters(state_dirs, number, prs)
         guidance_action, guided_prs, guidance_failures = (
-            self._apply_operator_guidance(name, tuple(pr_held), guidance)
+            self._apply_operator_guidance(review_dir, tuple(pr_held), guidance)
         )
         # Unjournalled effects: this flow writes its own single event below,
         # because the counter reset happened whatever GitHub then did with the
         # labels — including the no-op path, which emits nothing of its own.
-        effects = self._operator_effects(name, repo, journalled=False)
-        review_effects = self._operator_effects(
-            name,
-            repo,
-            journalled=False,
-            credential_role="review",
-        )
         # Before the labels, and never allowed to wedge them: the counters and
         # labels are still worth clearing when a dismissal cannot happen. But a
         # re-arm that failed must NOT read as a clean unblock — the whole
@@ -795,6 +842,7 @@ class Backend:
             repo,
             number,
             review_effects,
+            prs=prs, review_dir=review_dir, journal=journal, env=env,
             reviewer_held_prs=frozenset(
                 pr
                 for pr, labels in pr_held.items()
@@ -856,6 +904,7 @@ class Backend:
             channel=channel,
             guidance_action=guidance_action,
             guided_prs=guided_prs,
+            journal=journal,
         )
         # A guidance write that failed leaves the re-arm itself intact, so it
         # reads like a failed dismissal: the action still happened, and the
@@ -1072,6 +1121,8 @@ class Backend:
         number: int,
         effects,
         *,
+        prs: tuple[int, ...], review_dir: str, journal: TypedJournal | None,
+        env: Mapping[str, str],
         reviewer_held_prs: frozenset[int] = frozenset(),
     ) -> list[str]:
         """Dismiss the review bot's standing change requests on this issue's
@@ -1096,12 +1147,11 @@ class Backend:
         empty list means the ceiling is not what is holding anything here, or
         it was fully re-armed.
         """
-        review_bot = cli.deployment_env_field(name, "REVIEW_BOT")
+        review_bot = env.get("REVIEW_BOT", "")
         ceiling = _positive_int(
-            cli.deployment_env_field(name, "REVIEW_MAX_REJECTIONS"),
+            env.get("REVIEW_MAX_REJECTIONS", ""),
             review_dom.DEFAULT_MAX_REVIEW_REJECTIONS,
         )
-        prs = self._issue_prs(name, number)
         # A disabled ceiling (REVIEW_MAX_REJECTIONS=0, the harness-wide
         # "breaker off" convention) can never be what holds a PR, so there is
         # never anything here to re-arm.
@@ -1127,7 +1177,7 @@ class Backend:
             except Exception as exc:  # noqa: BLE001 - operator-facing result
                 note = f"pr #{pr} reviews unreadable: {_detail(exc)}"
                 failures.append(note)
-                self._journal_rearm_failure(name, repo, number, pr, note)
+                self._journal_rearm_failure(repo, number, pr, note, journal=journal)
                 continue
             # A PR carrying no change request at all has no ceiling to re-arm:
             # say nothing rather than journal a "could not dismiss" line on
@@ -1157,7 +1207,7 @@ class Backend:
             ):
                 if bot_reviewed and not bot_live:
                     failures.extend(
-                        self._reset_review_baseline(name, repo, number, pr)
+                        self._reset_review_baseline(review_dir, repo, number, pr, journal=journal)
                     )
                 continue
             if not review_bot:
@@ -1167,7 +1217,7 @@ class Backend:
                     "still armed"
                 )
                 failures.append(note)
-                self._journal_rearm_failure(name, repo, number, pr, note)
+                self._journal_rearm_failure(repo, number, pr, note, journal=journal)
                 continue
             counted = review_dom.stale_rejections(
                 reviews,
@@ -1192,7 +1242,7 @@ class Backend:
                         f"{detail}"
                     )
                 self._journal_dismissal(
-                    name, repo, number, pr, review, ok, detail
+                    repo, number, pr, review, ok, detail, journal=journal,
                 )
             # If the dismissals just retracted the bot's LAST live verdict, the
             # fixer has nothing to address and the reviewer thinks this head is
@@ -1202,12 +1252,12 @@ class Backend:
                 r.review_id not in dismissed_ids for r in bot_live
             ):
                 failures.extend(
-                    self._reset_review_baseline(name, repo, number, pr)
+                    self._reset_review_baseline(review_dir, repo, number, pr, journal=journal)
                 )
         return failures
 
     def _reset_review_baseline(
-        self, name: str, repo: str, number: int, pr: int
+        self, state_dir: str, repo: str, number: int, pr: int, *, journal: TypedJournal | None,
     ) -> list[str]:
         """Clear the review role's `last-sha` for `pr` so `needs_re_review`
         reads the current head as unreviewed and dispatches a fresh round.
@@ -1222,13 +1272,12 @@ class Backend:
         Returns operator-facing notes on failure; an empty list means the
         baseline is cleared (or there was no state dir to clear it in, which is
         itself a failure worth surfacing)."""
-        state_dir = self._review_state_dir(name)
         if not state_dir:
             note = (
                 f"pr #{pr}: review state dir unresolvable — baseline not "
                 "reset, a fresh review round may not dispatch"
             )
-            self._journal_rearm_failure(name, repo, number, pr, note)
+            self._journal_rearm_failure(repo, number, pr, note, journal=journal)
             return [note]
         try:
             Store(state_dir).set_last_sha(pr, "")
@@ -1238,9 +1287,8 @@ class Backend:
                 f"({type(exc).__name__}: {exc}) — a fresh review round may "
                 "not dispatch"
             )
-            self._journal_rearm_failure(name, repo, number, pr, note)
+            self._journal_rearm_failure(repo, number, pr, note, journal=journal)
             return [note]
-        journal = self._operator_journal(name, repo)
         if journal is not None:
             try:
                 journal.emit(
@@ -1282,15 +1330,14 @@ class Backend:
 
     def _journal_dismissal(
         self,
-        name: str,
         repo: str,
         number: int,
         pr: int,
         review,
         ok: bool,
         detail: str,
+        *, journal: TypedJournal | None,
     ) -> None:
-        journal = self._operator_journal(name, repo)
         if journal is None:
             return
         try:
@@ -1325,9 +1372,8 @@ class Backend:
             pass
 
     def _journal_rearm_failure(
-        self, name: str, repo: str, number: int, pr: int, detail: str
+        self, repo: str, number: int, pr: int, detail: str, *, journal: TypedJournal | None,
     ) -> None:
-        journal = self._operator_journal(name, repo)
         if journal is None:
             return
         try:
@@ -1355,7 +1401,7 @@ class Backend:
             pass
 
     def _attention_labels(
-        self, name: str, repo: str, number: int
+        self, repo: str, number: int, prs: tuple[int, ...],
     ) -> tuple[
         tuple[str, ...], dict[int, tuple[str, ...]], str
     ]:
@@ -1383,7 +1429,7 @@ class Backend:
             if label in set(issue_labels)
         )
         pr_held: dict[int, tuple[str, ...]] = {}
-        for pr in self._issue_prs(name, number):
+        for pr in prs:
             labels = set(snapshots.labels_of(gh_prs.get(pr) or {}))
             held = tuple(
                 label for label in actions.UNBLOCK_LABELS if label in labels
@@ -1392,7 +1438,7 @@ class Backend:
                 pr_held[pr] = held
         return issue_held, pr_held, ""
 
-    def _pr_hold_role(self, name: str, issue: int, pr: int) -> str:
+    def _pr_hold_role(self, row: dash.IssueRow | None, pr: int) -> str:
         """Role whose successful relabel placed this PR on human review.
 
         ``needs-human-review`` is a shared destination but custom review
@@ -1402,14 +1448,6 @@ class Backend:
         GitHub state.  Missing provenance returns ``""`` and the caller may
         proceed only when both roles share the same trigger.
         """
-        try:
-            # Admission safety cannot use the UI's short stale cache: a fresh
-            # GitHub hold may arrive just after the prior unblock event was
-            # journalled, and reusing the previous episode's source label can
-            # admit the wrong role on custom-trigger deployments.
-            row = snapshots.find_row(self.snapshot(name, refresh=True), issue)
-        except OSError:
-            return ""
         if row is None:
             return ""
         source = ""
@@ -1492,8 +1530,8 @@ class Backend:
         channel: str = "api",
         guidance_action: str = "",
         guided_prs: tuple[int, ...] = (),
+        *, journal: TypedJournal | None,
     ) -> None:
-        journal = self._operator_journal(name, repo)
         if journal is None:
             return
         # One desc per target so parse_action sees each clear (the PR's labels
@@ -1582,7 +1620,7 @@ class Backend:
             pass
 
     def _apply_operator_guidance(
-        self, name: str, prs: tuple[int, ...], guidance: str | None
+        self, state_dir: str, prs: tuple[int, ...], guidance: str | None
     ) -> tuple[str, tuple[int, ...], list[str]]:
         """Set or clear the operator's scope note for each held PR, in the
         review role's state dir (review and repairs share this authority).
@@ -1603,7 +1641,6 @@ class Backend:
         """
         if guidance is None or not prs:
             return "", (), []
-        state_dir = self._review_state_dir(name)
         if not state_dir:
             return "", (), ["review state dir unresolvable: guidance not stored"]
         store = Store(state_dir)
@@ -1627,19 +1664,7 @@ class Backend:
             return "", (), failures
         return action, tuple(touched), failures
 
-    def _review_state_dir(self, name: str) -> str:
-        """The review role's state dir — where operator guidance and the
-        re-review baseline live. Empty string when unresolvable."""
-        return next(
-            (
-                os.path.dirname(path)
-                for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name))
-                if role == "review"
-            ),
-            "",
-        )
-
-    def _clear_retry_counters(self, name: str, number: int) -> int:
+    def _clear_retry_counters(self, state_dirs: tuple[str, ...], number: int, prs: tuple[int, ...]) -> int:
         """Reset the per-attempt ceilings in every role's state dir.
 
         The operator cannot be asked which role wedged: ci-/rebase-retries are
@@ -1661,11 +1686,9 @@ class Backend:
         Returns how many counters were actually retired, so the journalled
         event reports what happened rather than what was attempted.
         """
-        prs = self._issue_prs(name, number)
         keys = [number, *(-pr for pr in prs if pr > 0)]
         cleared = 0
-        for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name)):
-            state_dir = os.path.dirname(path)
+        for role, state_dir in zip(dash.ROLE_NAMES, state_dirs):
             if not state_dir:
                 continue
             store = Store(state_dir)
@@ -1695,6 +1718,9 @@ class Backend:
         *,
         journalled: bool = True,
         credential_role: str = "",
+        control: SQLiteControlStore | None = None,
+        state_dirs: tuple[str, ...] | None = None,
+        env: Mapping[str, str] | None = None,
     ):
         # Derived from journal_paths like _clear_retries, NOT read raw from the
         # overlay: the STATE_DIR keys are optional and standard deployments
@@ -1702,13 +1728,13 @@ class Backend:
         # refused — every journaled operator action (promote/priority/unblock)
         # 500'd on a normal deployment (keifu 2026-08-02). journal_paths
         # resolves snapshot → overlay → the daemon's own default per role.
-        state_dirs = tuple(
-            os.path.dirname(path) for path in cli.journal_paths(name)
-        )
+        if state_dirs is None:
+            state_dirs = tuple(os.path.dirname(path) for path in cli.journal_paths(name))
         journal = self._operator_journal(name, repo) if journalled else None
+        established = {"control": control} if control is not None else {}
         if credential_role == "review":
-            env = {
-                field: cli.deployment_env_field(name, field)
+            identity_env = {
+                field: cli.deployment_env_field(name, field) if env is None else env.get(field, "")
                 for field in (
                     "GH_APP_ID",
                     "GH_APP_INSTALL_ID",
@@ -1717,7 +1743,7 @@ class Backend:
                     "REVIEW_BOT_TOKEN",
                 )
             }
-            identity = review_identity(env)
+            identity = review_identity(identity_env)
             source = (
                 "github_app"
                 if identity.token_provider is not None
@@ -1732,21 +1758,24 @@ class Backend:
                     identity=f"{repo}:dashboard:review:{source}",
                     journal=journal,
                     run=_identity_run(identity),
+                    **established,
                 )
             return self.effects_factory(
                 repo,
                 state_dirs,
                 identity=f"{repo}:dashboard:review:ambient",
                 journal=journal,
+                **established,
             )
         return self.effects_factory(
             repo,
             state_dirs,
             identity=f"{repo}:dashboard",
             journal=journal,
+            **established,
         )
 
-    def _operator_journal(self, name: str, repo: str) -> TypedJournal | None:
+    def _operator_journal(self, name: str, repo: str, *, legacy_path: str | None = None) -> TypedJournal | None:
         """Where an operator intervention becomes visible to the fold.
 
         It is written to the fix role's canonical feed because the dashboard
@@ -1763,9 +1792,10 @@ class Backend:
         """
         if not repo:
             return None
-        if name in self._journals:
-            return self._journals[name]
-        legacy = cli.journal_paths(name)[0]
+        legacy = cli.journal_paths(name)[0] if legacy_path is None else legacy_path
+        key = name, repo, os.path.realpath(legacy)
+        if key in self._journals:
+            return self._journals[key]
         journal: TypedJournal | None = None
         try:
             events = EventLog(
@@ -1782,7 +1812,7 @@ class Backend:
             journal = None  # telemetry never blocks the mutation
         else:
             journal = TypedJournal(legacy, events)
-        self._journals[name] = journal
+        self._journals[key] = journal
         return journal
 
 

@@ -1,6 +1,39 @@
 {
   "components": {
     "schemas": {
+      "AbsentControl": {
+        "additionalProperties": false,
+        "properties": {
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "issue": {
+            "title": "Issue",
+            "type": "integer"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "const": "absent",
+            "enum": [
+              "absent"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "repository",
+          "issue",
+          "epoch"
+        ],
+        "title": "AbsentControl",
+        "type": "object"
+      },
       "ActionResult": {
         "additionalProperties": true,
         "properties": {
@@ -18,6 +51,42 @@
           "detail"
         ],
         "title": "ActionResult",
+        "type": "object"
+      },
+      "AttemptedRemediation": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "kind": {
+            "const": "attempted",
+            "enum": [
+              "attempted"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "outcome": {
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "operation",
+          "evidence_ids",
+          "outcome"
+        ],
+        "title": "AttemptedRemediation",
         "type": "object"
       },
       "AttentionItem": {
@@ -59,6 +128,97 @@
           "kind"
         ],
         "title": "AttentionItem",
+        "type": "object"
+      },
+      "AvailableControl": {
+        "additionalProperties": false,
+        "properties": {
+          "current_intent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Rearm"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ResolveExpected"
+          },
+          "failures": {
+            "title": "Failures",
+            "type": "integer"
+          },
+          "gates": {
+            "items": {
+              "$ref": "#/components/schemas/Gate"
+            },
+            "title": "Gates",
+            "type": "array"
+          },
+          "guidance": {
+            "title": "Guidance",
+            "type": "string"
+          },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Observation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requested_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Id"
+          },
+          "requested_intent": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Rearm"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "status": {
+            "const": "available",
+            "enum": [
+              "available"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "workflow_held": {
+            "description": "SQLite workflow holds only, not a remote readiness assertion; submission rechecks external holds.",
+            "title": "Workflow Held",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "expected",
+          "workflow_held",
+          "gates",
+          "guidance",
+          "failures",
+          "current_intent",
+          "requested_id",
+          "requested_intent",
+          "observation"
+        ],
+        "title": "AvailableControl",
         "type": "object"
       },
       "BacklogCard": {
@@ -205,6 +365,49 @@
           "steward_state"
         ],
         "title": "BacklogCard",
+        "type": "object"
+      },
+      "CancelRearm": {
+        "additionalProperties": false,
+        "properties": {
+          "cancellation_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Cancellation Id",
+            "type": "string"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ResolveExpected"
+          },
+          "operation": {
+            "const": "cancel_rearm",
+            "enum": [
+              "cancel_rearm"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 16384,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "cancellation_id",
+          "request_id",
+          "reason"
+        ],
+        "title": "CancelRearm",
         "type": "object"
       },
       "Caps": {
@@ -381,6 +584,24 @@
         "title": "ClaudeUsage",
         "type": "object"
       },
+      "ClearGuidance": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "clear",
+            "enum": [
+              "clear"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ClearGuidance",
+        "type": "object"
+      },
       "CodexUsage": {
         "additionalProperties": true,
         "properties": {
@@ -474,6 +695,95 @@
         "title": "CodexUsage",
         "type": "object"
       },
+      "CommandResult": {
+        "additionalProperties": false,
+        "properties": {
+          "control": {
+            "discriminator": {
+              "mapping": {
+                "absent": "#/components/schemas/AbsentControl",
+                "available": "#/components/schemas/AvailableControl",
+                "inactive": "#/components/schemas/InactiveControl",
+                "unavailable": "#/components/schemas/UnavailableControl"
+              },
+              "propertyName": "status"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/AvailableControl"
+              },
+              {
+                "$ref": "#/components/schemas/InactiveControl"
+              },
+              {
+                "$ref": "#/components/schemas/AbsentControl"
+              },
+              {
+                "$ref": "#/components/schemas/UnavailableControl"
+              }
+            ],
+            "title": "Control"
+          },
+          "outcome": {
+            "enum": [
+              "accepted",
+              "replayed",
+              "conflict",
+              "rejected",
+              "unavailable"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome",
+          "reason",
+          "control"
+        ],
+        "title": "CommandResult",
+        "type": "object"
+      },
+      "ContinueRearm": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {
+            "$ref": "#/components/schemas/ResolveExpected"
+          },
+          "operation": {
+            "const": "continue_rearm",
+            "enum": [
+              "continue_rearm"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "stopped_request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Stopped Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "request_id",
+          "stopped_request_id"
+        ],
+        "title": "ContinueRearm",
+        "type": "object"
+      },
       "CostMix": {
         "additionalProperties": true,
         "properties": {
@@ -554,6 +864,135 @@
           "issue"
         ],
         "title": "EscalationReason",
+        "type": "object"
+      },
+      "EvidenceUnavailable": {
+        "additionalProperties": false,
+        "properties": {
+          "failed_reads": {
+            "title": "Failed Reads",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "evidence_unavailable",
+            "enum": [
+              "evidence_unavailable"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_error": {
+            "title": "Last Error",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "unresolved_since": {
+            "title": "Unresolved Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "source",
+          "unresolved_since",
+          "failed_reads",
+          "last_error"
+        ],
+        "title": "EvidenceUnavailable",
+        "type": "object"
+      },
+      "Gate": {
+        "additionalProperties": false,
+        "properties": {
+          "available_commands": {
+            "items": {
+              "enum": [
+                "request_rearm",
+                "continue_rearm",
+                "cancel_rearm"
+              ],
+              "type": "string"
+            },
+            "title": "Available Commands",
+            "type": "array"
+          },
+          "cause": {
+            "discriminator": {
+              "mapping": {
+                "evidence_unavailable": "#/components/schemas/EvidenceUnavailable",
+                "rearm_needs_decision": "#/components/schemas/RearmNeedsDecision",
+                "remote_uncertain": "#/components/schemas/RemoteUncertain",
+                "resolve_ceiling": "#/components/schemas/ResolveCeiling",
+                "retry_authorization_required": "#/components/schemas/RetryAuthorizationRequired"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ResolveCeiling"
+              },
+              {
+                "$ref": "#/components/schemas/RemoteUncertain"
+              },
+              {
+                "$ref": "#/components/schemas/RetryAuthorizationRequired"
+              },
+              {
+                "$ref": "#/components/schemas/EvidenceUnavailable"
+              },
+              {
+                "$ref": "#/components/schemas/RearmNeedsDecision"
+              }
+            ],
+            "title": "Cause"
+          },
+          "gate_id": {
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "opened_generation": {
+            "title": "Opened Generation",
+            "type": "integer"
+          },
+          "remediation": {
+            "discriminator": {
+              "mapping": {
+                "attempted": "#/components/schemas/AttemptedRemediation",
+                "none_authorized": "#/components/schemas/NoRemediation"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NoRemediation"
+              },
+              {
+                "$ref": "#/components/schemas/AttemptedRemediation"
+              }
+            ],
+            "title": "Remediation"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "rearming"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gate_id",
+          "state",
+          "opened_generation",
+          "cause",
+          "remediation",
+          "available_commands"
+        ],
+        "title": "Gate",
         "type": "object"
       },
       "HTTPValidationError": {
@@ -696,6 +1135,34 @@
           "first_observation"
         ],
         "title": "HealthTrendDay",
+        "type": "object"
+      },
+      "InactiveControl": {
+        "additionalProperties": false,
+        "properties": {
+          "issue": {
+            "title": "Issue",
+            "type": "integer"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "const": "inactive",
+            "enum": [
+              "inactive"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "repository",
+          "issue"
+        ],
+        "title": "InactiveControl",
         "type": "object"
       },
       "InterventionCount": {
@@ -1836,6 +2303,24 @@
         "title": "IssuesPayload",
         "type": "object"
       },
+      "KeepGuidance": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "keep",
+            "enum": [
+              "keep"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "KeepGuidance",
+        "type": "object"
+      },
       "KindCost": {
         "additionalProperties": true,
         "properties": {
@@ -2034,6 +2519,58 @@
           "effort"
         ],
         "title": "ModelBadge",
+        "type": "object"
+      },
+      "NoRemediation": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "none_authorized",
+            "enum": [
+              "none_authorized"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reason"
+        ],
+        "title": "NoRemediation",
+        "type": "object"
+      },
+      "Observation": {
+        "additionalProperties": false,
+        "properties": {
+          "failed_reads": {
+            "title": "Failed Reads",
+            "type": "integer"
+          },
+          "last_error": {
+            "title": "Last Error",
+            "type": "string"
+          },
+          "next_read_at": {
+            "title": "Next Read At",
+            "type": "string"
+          },
+          "unresolved_since": {
+            "title": "Unresolved Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "unresolved_since",
+          "next_read_at",
+          "failed_reads",
+          "last_error"
+        ],
+        "title": "Observation",
         "type": "object"
       },
       "OverviewPayload": {
@@ -2338,6 +2875,174 @@
         "title": "PullRequestLink",
         "type": "object"
       },
+      "Rearm": {
+        "additionalProperties": false,
+        "properties": {
+          "base_commit": {
+            "title": "Base Commit",
+            "type": "string"
+          },
+          "base_ref": {
+            "title": "Base Ref",
+            "type": "string"
+          },
+          "branch": {
+            "title": "Branch",
+            "type": "string"
+          },
+          "episode_id": {
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "gate_id": {
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "grant_request_id": {
+            "title": "Grant Request Id",
+            "type": "string"
+          },
+          "handoff_id": {
+            "title": "Handoff Id",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "required_commands": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Required Commands",
+            "type": "array"
+          },
+          "retired_commands": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Retired Commands",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "pending",
+              "completed",
+              "cancelled",
+              "superseded"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "verified_commands": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Verified Commands",
+            "type": "array"
+          }
+        },
+        "required": [
+          "request_id",
+          "state",
+          "gate_id",
+          "generation",
+          "grant_request_id",
+          "episode_id",
+          "handoff_id",
+          "branch",
+          "base_ref",
+          "base_commit",
+          "required_commands",
+          "verified_commands",
+          "retired_commands",
+          "reason"
+        ],
+        "title": "Rearm",
+        "type": "object"
+      },
+      "RearmNeedsDecision": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "rearm_needs_decision",
+            "enum": [
+              "rearm_needs_decision"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "obligations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Obligations",
+            "type": "array"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "stopped_request_id": {
+            "title": "Stopped Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "stopped_request_id",
+          "obligations",
+          "reason"
+        ],
+        "title": "RearmNeedsDecision",
+        "type": "object"
+      },
+      "RemoteUncertain": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "failed_reads": {
+            "title": "Failed Reads",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "remote_uncertain",
+            "enum": [
+              "remote_uncertain"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_error": {
+            "title": "Last Error",
+            "type": "string"
+          },
+          "unresolved_since": {
+            "title": "Unresolved Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "command_id",
+          "unresolved_since",
+          "failed_reads",
+          "last_error"
+        ],
+        "title": "RemoteUncertain",
+        "type": "object"
+      },
       "RepoSummary": {
         "additionalProperties": true,
         "properties": {
@@ -2453,6 +3158,191 @@
         "title": "ReposPayload",
         "type": "object"
       },
+      "RequestRearm": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {
+            "$ref": "#/components/schemas/ResolveExpected"
+          },
+          "gate_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "guidance": {
+            "discriminator": {
+              "mapping": {
+                "clear": "#/components/schemas/ClearGuidance",
+                "keep": "#/components/schemas/KeepGuidance",
+                "set": "#/components/schemas/SetGuidance"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeepGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/ClearGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/SetGuidance"
+              }
+            ],
+            "title": "Guidance"
+          },
+          "operation": {
+            "const": "request_rearm",
+            "enum": [
+              "request_rearm"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "request_id",
+          "gate_id",
+          "guidance"
+        ],
+        "title": "RequestRearm",
+        "type": "object"
+      },
+      "ResolveCeiling": {
+        "additionalProperties": false,
+        "properties": {
+          "ceiling": {
+            "title": "Ceiling",
+            "type": "integer"
+          },
+          "episode_id": {
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "failures": {
+            "title": "Failures",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "resolve_ceiling",
+            "enum": [
+              "resolve_ceiling"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_failure": {
+            "title": "Last Failure",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "episode_id",
+          "failures",
+          "ceiling",
+          "last_failure"
+        ],
+        "title": "ResolveCeiling",
+        "type": "object"
+      },
+      "ResolveExpected": {
+        "additionalProperties": false,
+        "properties": {
+          "episode_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "epoch": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "family": {
+            "const": "resolve",
+            "enum": [
+              "resolve"
+            ],
+            "title": "Family",
+            "type": "string"
+          },
+          "generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "issue": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Issue",
+            "type": "integer"
+          },
+          "repository": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Repository",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "issue",
+          "family",
+          "epoch",
+          "generation",
+          "version",
+          "episode_id"
+        ],
+        "title": "ResolveExpected",
+        "type": "object"
+      },
+      "RetryAuthorizationRequired": {
+        "additionalProperties": false,
+        "properties": {
+          "absence_evidence_id": {
+            "title": "Absence Evidence Id",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "retry_authorization_required",
+            "enum": [
+              "retry_authorization_required"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "command_id",
+          "absence_evidence_id"
+        ],
+        "title": "RetryAuthorizationRequired",
+        "type": "object"
+      },
       "RoleHealth": {
         "additionalProperties": true,
         "properties": {
@@ -2523,6 +3413,31 @@
           "log_path"
         ],
         "title": "RoleHealth",
+        "type": "object"
+      },
+      "SetGuidance": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "set",
+            "enum": [
+              "set"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "text": {
+            "maxLength": 4000,
+            "minLength": 1,
+            "title": "Text",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "text"
+        ],
+        "title": "SetGuidance",
         "type": "object"
       },
       "SpendBucket": {
@@ -2691,6 +3606,29 @@
           "cache_creation_input_tokens"
         ],
         "title": "TokenUsage",
+        "type": "object"
+      },
+      "UnavailableControl": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "const": "unavailable",
+            "enum": [
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "UnavailableControl",
         "type": "object"
       },
       "UnblockRequest": {
@@ -3236,6 +4174,171 @@
           }
         },
         "summary": "Api Promote"
+      }
+    },
+    "/api/repos/{name}/issues/{number}/resolve-control": {
+      "get": {
+        "operationId": "api_resolve_control_api_repos__name__issues__number__resolve_control_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "number",
+            "required": true,
+            "schema": {
+              "title": "Number",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "discriminator": {
+                    "mapping": {
+                      "absent": "#/components/schemas/AbsentControl",
+                      "available": "#/components/schemas/AvailableControl",
+                      "inactive": "#/components/schemas/InactiveControl",
+                      "unavailable": "#/components/schemas/UnavailableControl"
+                    },
+                    "propertyName": "status"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/AvailableControl"
+                    },
+                    {
+                      "$ref": "#/components/schemas/InactiveControl"
+                    },
+                    {
+                      "$ref": "#/components/schemas/AbsentControl"
+                    },
+                    {
+                      "$ref": "#/components/schemas/UnavailableControl"
+                    }
+                  ],
+                  "title": "Response Api Resolve Control Api Repos  Name  Issues  Number  Resolve Control Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Resolve Control"
+      }
+    },
+    "/api/repos/{name}/issues/{number}/resolve-control/commands": {
+      "post": {
+        "operationId": "api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "number",
+            "required": true,
+            "schema": {
+              "title": "Number",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "cancel_rearm": "#/components/schemas/CancelRearm",
+                    "continue_rearm": "#/components/schemas/ContinueRearm",
+                    "request_rearm": "#/components/schemas/RequestRearm"
+                  },
+                  "propertyName": "operation"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/RequestRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ContinueRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/CancelRearm"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CommandResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Resolve Command"
       }
     },
     "/api/repos/{name}/issues/{number}/steps/{idx}/events": {

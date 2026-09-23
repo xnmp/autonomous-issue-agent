@@ -7,7 +7,7 @@ from .contracts import CommandId, WorkflowAttemptIdentity
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
 from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetIntent, ContractRevision
 from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
-from .resolve_rearm import PendingResolveRearm, UnavailableResolveRearm
+from .resolve_rearm import PendingResolveRearm, ResolveControlRead, UnavailableResolveRearm
 from .workflow import (
     AuthorizedOperatorCommand, CancelRearm, OperatorActor,
     CommandAbsenceEvidence, CommandRetryApplicability, HeldProjection, RearmIntent, RetryAlreadyConsumed,
@@ -29,6 +29,8 @@ class WorkflowControl(Protocol):
     def writer(self) -> WorkflowWriter: ...
 
     def load_workflow(self, key: WorkflowKey) -> WorkflowRead: ...
+
+    def resolve_control_view(self, key: WorkflowKey, *, request_id: str | None = None) -> ResolveControlRead: ...
 
     def ensure_observed_workflow(self, observation: ObservedIssue) -> WorkflowCommitted: ...
 
@@ -59,7 +61,7 @@ class WorkflowControl(Protocol):
 
     def complete_contract_reset(self, completed: ContractResetCompleted) -> ContractResetCompleted: ...
 
-    def rearm_authority(self, expected: WorkflowRevision) -> AbstractContextManager[WorkflowSnapshot]: ...
+    def rearm_authority(self, expected: WorkflowRevision, *, binding: WorkflowBinding | None = None) -> AbstractContextManager[WorkflowSnapshot]: ...
 
     def observe_workspace(
         self, binding: WorkflowBinding, base: ObservedResolveBase, branch: str,
@@ -85,7 +87,7 @@ class WorkflowControl(Protocol):
         workspace_verified: EpisodeWorkspacePrepared | None = None,
     ) -> WorkflowCommitted | WorkflowConflict: ...
 
-    def cancel_rearm(self, command: CancelRearm, actor: OperatorActor) -> WorkflowCommitted | WorkflowConflict: ...
+    def cancel_rearm(self, command: CancelRearm, actor: OperatorActor, *, binding: WorkflowBinding | None = None) -> WorkflowCommitted | WorkflowConflict: ...
 
     def finalize_return(
         self, returned: ReturnedResolve, issue: ObservedIssue,

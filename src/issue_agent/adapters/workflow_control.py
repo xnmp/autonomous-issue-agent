@@ -18,6 +18,7 @@ from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
 from ..domain.contracts import CommandId
 from ..domain.outcome import budget_exhausted, infra_class_failure
 from ..domain.resolve_rearm import (
+    AbsentResolveControl, InactiveResolveControl, ResolveControlRead, ResolveControlView,
     PendingResolveRearm, RearmObservation, UnavailableResolveRearm,
     decide_rearm_reconciliation, defer_rearm_observation,
     schedule_rearm_observation, update_rearm_observation,
@@ -62,8 +63,8 @@ from .effects import command_for_action
 from .deployment_authority import DeploymentAuthority, deployment_role, deployment_effect_barrier
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
-    WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, load_workflow_row,
-    load_workspace_ack, workflow_scope,
+    WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict, load_workflow_row,
+    load_resolve_authority, load_workspace_ack, workflow_scope,
 )
 
 
@@ -157,6 +158,29 @@ class SQLiteWorkflowControl:
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")
 
+    def resolve_control_view(self, key: WorkflowKey, *, request_id: str | None = None) -> ResolveControlRead:
+        """One read snapshot; inspection never schedules recovery or initializes state."""
+        self._scope(key)
+        if request_id is not None:
+            validate_workflow_identifier(request_id, "requested rearm")
+        try:
+            with closing(self._control._connect()) as db:
+                db.execute("BEGIN")
+                self._control._assert_owner_active(db, self.writer.owner_id)
+                authority = load_resolve_authority(db, self.writer.repository)
+                if authority is None:
+                    return InactiveResolveControl(key)
+                snapshot = load_workflow_row(db, key)
+                if snapshot is None:
+                    return AbsentResolveControl(key, authority)
+                selected_id = request_id or (snapshot.intent.request_id if snapshot.intent is not None else None)
+                requested = self._lookup_rearm(db, key, selected_id) if selected_id is not None else None
+                observation = self._rearm_observation(db, snapshot) if isinstance(snapshot.intent, PendingRearm) else None
+                return ResolveControlView(snapshot, selected_id, requested, observation)
+        except (sqlite3.Error, ValueError, TypeError) as exc:
+            reason = (str(exc) or type(exc).__name__).replace("\x00", "")[:16384]
+            return WorkflowUnavailable(key, reason)
+
     def ensure_observed_workflow(self, observation: ObservedIssue) -> WorkflowCommitted:
         if not isinstance(observation, ObservedIssue):
             raise ValueError("workflow discovery requires a verified present issue")
@@ -196,16 +220,20 @@ class SQLiteWorkflowControl:
         with closing(self._control._connect()) as db:
             db.execute("BEGIN")
             load_workflow_row(db, key)
-            row = db.execute(
-                "SELECT * FROM workflow_rearms WHERE request_id=? AND repository=? "
-                "AND target_kind=? AND target_number=?", (request_id, *workflow_scope(key)),
-            ).fetchone()
-            if row is None:
-                return None
-            intent = decode_workflow(row["intent_json"], PendingRearm | CompletedRearm | CancelledRearm | SupersededRearm)
-            if intent.request_id != request_id or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"] or row["state"] != _intent_state(intent):
-                raise WorkflowAuthorityError("re-arm history disagrees with its typed payload")
-            return intent
+            return self._lookup_rearm(db, key, request_id)
+
+    @staticmethod
+    def _lookup_rearm(db: sqlite3.Connection, key: WorkflowKey, request_id: str) -> RearmIntent | None:
+        row = db.execute(
+            "SELECT * FROM workflow_rearms WHERE request_id=? AND repository=? "
+            "AND target_kind=? AND target_number=?", (request_id, *workflow_scope(key)),
+        ).fetchone()
+        if row is None:
+            return None
+        intent = decode_workflow(row["intent_json"], PendingRearm | CompletedRearm | CancelledRearm | SupersededRearm)
+        if intent.request_id != request_id or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"] or row["state"] != _intent_state(intent):
+            raise WorkflowAuthorityError("re-arm history disagrees with its typed payload")
+        return intent
 
     def accepted_rearm(
         self, key: WorkflowKey, request_id: str,
@@ -538,7 +566,7 @@ class SQLiteWorkflowControl:
             return WorkflowCommitted(working)
 
     def cancel_rearm(
-        self, command: CancelRearm, actor: OperatorActor,
+        self, command: CancelRearm, actor: OperatorActor, *, binding: WorkflowBinding | None = None,
     ) -> WorkflowCommitted | WorkflowConflict:
         if not isinstance(command, CancelRearm) or not isinstance(actor, OperatorActor):
             raise ValueError("re-arm cancellation requires typed command and actor")
@@ -549,6 +577,8 @@ class SQLiteWorkflowControl:
                 prior = load_workflow_row(db, command.expected.fence.key)
                 if prior is None:
                     raise WorkflowAuthorityError("re-arm cancellation requires workflow authority")
+                if binding is not None and (not isinstance(binding, WorkflowBinding) or binding.fence != command.expected.fence):
+                    raise WorkflowAuthorityError("cancellation binding disagrees with its expected revision")
                 receipt = db.execute(
                     "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-cancellation' "
                     "AND scope=? AND key=?",
@@ -564,13 +594,18 @@ class SQLiteWorkflowControl:
                     except (ValueError, TypeError) as exc:
                         raise WorkflowAuthorityError("invalid accepted cancellation audit") from exc
                     if audit.command == command and audit.actor.subject == actor.subject:
+                        intent = self._lookup_rearm(db, command.expected.fence.key, command.request_id)
+                        if binding is not None and (intent is None or (binding.authority, binding.episode_id) != (intent.handoff.destination.authority, intent.handoff.destination.episode_id)):
+                            return WorkflowConflict(prior.revision, "cancellation replay names another family epoch or episode")
                         return WorkflowCommitted(prior, idempotent=True)
                     return WorkflowConflict(
                         prior.revision,
                         "durable workflow identity was reused with different content",
                     )
                 if prior.revision != command.expected or not isinstance(prior.intent, PendingRearm):
-                    raise WorkflowAuthorityError("re-arm cancellation requires exact pending authority")
+                    return WorkflowConflict(prior.revision, "re-arm cancellation requires exact pending authority")
+                if binding is not None and prior.binding != binding:
+                    return WorkflowConflict(prior.revision, "cancellation family epoch or episode changed")
                 verified, _, uncertainty = self._rearm_command_facts(db, prior)
                 proposal = cancel_resolve_rearm(
                     prior, command, actor, verified_commands=verified, uncertainty=uncertainty,
@@ -1145,19 +1180,25 @@ class SQLiteWorkflowControl:
         return state, handoff
 
     @contextmanager
-    def rearm_authority(self, expected: WorkflowRevision):
+    def rearm_authority(self, expected: WorkflowRevision, *, binding: WorkflowBinding | None = None):
         """Fence remote observation; callers perform no SQLite work while yielded."""
         if not isinstance(expected, WorkflowRevision):
             raise ValueError("re-arm authority requires a typed revision")
+        if binding is not None and (not isinstance(binding, WorkflowBinding) or binding.fence != expected.fence):
+            raise ValueError("re-arm binding disagrees with its expected revision")
         self._scope(expected.fence.key)
         with self._rearm_barriers():
             with self._control.transaction() as db:
                 self._control._assert_owner_active(db, self.writer.owner_id)
                 state = load_workflow_row(db, expected.fence.key)
-                if state is None or state.revision != expected:
+                if state is None:
                     raise WorkflowAuthorityError(
                         "re-arm authority requires the exact current workflow revision"
                     )
+                if state.revision != expected:
+                    raise WorkflowRevisionConflict(state.revision, "re-arm workflow revision changed")
+                if binding is not None and state.binding != binding:
+                    raise WorkflowRevisionConflict(state.revision, "re-arm family epoch or episode changed")
                 self._assert_target_quiescent(db, expected.fence.key)
             yield state
 

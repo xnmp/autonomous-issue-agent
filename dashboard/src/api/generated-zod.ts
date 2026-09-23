@@ -257,6 +257,174 @@ const IssueDetailPayload = z
 const ActionResult = z
   .object({ detail: z.string(), ok: z.boolean() })
   .passthrough();
+const request_id = z.union([z.string(), z.null()]).optional();
+const Rearm = z.object({
+  base_commit: z.string(),
+  base_ref: z.string(),
+  branch: z.string(),
+  episode_id: z.string(),
+  gate_id: z.string(),
+  generation: z.number().int(),
+  grant_request_id: z.string(),
+  handoff_id: z.string(),
+  reason: z.string(),
+  request_id: z.string(),
+  required_commands: z.array(z.string()),
+  retired_commands: z.array(z.string()),
+  state: z.enum(["pending", "completed", "cancelled", "superseded"]),
+  verified_commands: z.array(z.string()),
+});
+const ResolveExpected = z.object({
+  episode_id: z.string().min(1).max(512),
+  epoch: z.number().int().gte(1).lte(9007199254740991),
+  family: z.literal("resolve"),
+  generation: z.number().int().gte(0).lte(9007199254740991),
+  issue: z.number().int().gte(1).lte(9007199254740991),
+  repository: z.string().min(1).max(512),
+  version: z.number().int().gte(0).lte(9007199254740991),
+});
+const ResolveCeiling = z.object({
+  ceiling: z.number().int(),
+  episode_id: z.string(),
+  failures: z.number().int(),
+  kind: z.literal("resolve_ceiling"),
+  last_failure: z.string(),
+});
+const RemoteUncertain = z.object({
+  command_id: z.string(),
+  failed_reads: z.number().int(),
+  kind: z.literal("remote_uncertain"),
+  last_error: z.string(),
+  unresolved_since: z.string(),
+});
+const RetryAuthorizationRequired = z.object({
+  absence_evidence_id: z.string(),
+  command_id: z.string(),
+  kind: z.literal("retry_authorization_required"),
+});
+const EvidenceUnavailable = z.object({
+  failed_reads: z.number().int(),
+  kind: z.literal("evidence_unavailable"),
+  last_error: z.string(),
+  source: z.string(),
+  unresolved_since: z.string(),
+});
+const RearmNeedsDecision = z.object({
+  kind: z.literal("rearm_needs_decision"),
+  obligations: z.array(z.string()),
+  reason: z.string(),
+  stopped_request_id: z.string(),
+});
+const NoRemediation = z.object({
+  kind: z.literal("none_authorized"),
+  reason: z.string(),
+});
+const AttemptedRemediation = z.object({
+  evidence_ids: z.array(z.string()),
+  kind: z.literal("attempted"),
+  operation: z.string(),
+  outcome: z.string(),
+});
+const Gate = z.object({
+  available_commands: z.array(
+    z.enum(["request_rearm", "continue_rearm", "cancel_rearm"])
+  ),
+  cause: z.discriminatedUnion("kind", [
+    ResolveCeiling,
+    RemoteUncertain,
+    RetryAuthorizationRequired,
+    EvidenceUnavailable,
+    RearmNeedsDecision,
+  ]),
+  gate_id: z.string(),
+  opened_generation: z.number().int(),
+  remediation: z.discriminatedUnion("kind", [
+    NoRemediation,
+    AttemptedRemediation,
+  ]),
+  state: z.enum(["open", "rearming"]),
+});
+const Observation = z.object({
+  failed_reads: z.number().int(),
+  last_error: z.string(),
+  next_read_at: z.string(),
+  unresolved_since: z.string(),
+});
+const AvailableControl = z.object({
+  current_intent: z.union([Rearm, z.null()]),
+  expected: ResolveExpected,
+  failures: z.number().int(),
+  gates: z.array(Gate),
+  guidance: z.string(),
+  observation: z.union([Observation, z.null()]),
+  requested_id: z.union([z.string(), z.null()]),
+  requested_intent: z.union([Rearm, z.null()]),
+  status: z.literal("available"),
+  workflow_held: z.boolean(),
+});
+const InactiveControl = z.object({
+  issue: z.number().int(),
+  repository: z.string(),
+  status: z.literal("inactive"),
+});
+const AbsentControl = z.object({
+  epoch: z.number().int(),
+  issue: z.number().int(),
+  repository: z.string(),
+  status: z.literal("absent"),
+});
+const UnavailableControl = z.object({
+  reason: z.string(),
+  status: z.literal("unavailable"),
+});
+const KeepGuidance = z.object({ kind: z.literal("keep") });
+const ClearGuidance = z.object({ kind: z.literal("clear") });
+const SetGuidance = z.object({
+  kind: z.literal("set"),
+  text: z.string().min(1).max(4000),
+});
+const RequestRearm = z.object({
+  expected: ResolveExpected,
+  gate_id: z.string().min(1).max(512),
+  guidance: z.discriminatedUnion("kind", [
+    KeepGuidance,
+    ClearGuidance,
+    SetGuidance,
+  ]),
+  operation: z.literal("request_rearm"),
+  request_id: z.string().min(1).max(512),
+});
+const ContinueRearm = z.object({
+  expected: ResolveExpected,
+  operation: z.literal("continue_rearm"),
+  request_id: z.string().min(1).max(512),
+  stopped_request_id: z.string().min(1).max(512),
+});
+const CancelRearm = z.object({
+  cancellation_id: z.string().min(1).max(512),
+  expected: ResolveExpected,
+  operation: z.literal("cancel_rearm"),
+  reason: z.string().min(1).max(16384),
+  request_id: z.string().min(1).max(512),
+});
+const api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body =
+  z.discriminatedUnion("operation", [RequestRearm, ContinueRearm, CancelRearm]);
+const CommandResult = z.object({
+  control: z.discriminatedUnion("status", [
+    AvailableControl,
+    InactiveControl,
+    AbsentControl,
+    UnavailableControl,
+  ]),
+  outcome: z.enum([
+    "accepted",
+    "replayed",
+    "conflict",
+    "rejected",
+    "unavailable",
+  ]),
+  reason: z.string(),
+});
 const StepEventsPayload = z
   .object({
     events: z.array(z.object({}).partial().passthrough()),
@@ -270,7 +438,6 @@ const api_unblock_api_repos__name__issues__number__unblock_post_Body = z.union([
   UnblockRequest,
   z.null(),
 ]);
-const timezone = z.union([z.string(), z.null()]).optional();
 const Caps = z
   .object({
     daily_cap_usd: z.union([z.number(), z.null()]),
@@ -445,10 +612,33 @@ export const schemas = {
   IssueStep,
   IssueDetailPayload,
   ActionResult,
+  request_id,
+  Rearm,
+  ResolveExpected,
+  ResolveCeiling,
+  RemoteUncertain,
+  RetryAuthorizationRequired,
+  EvidenceUnavailable,
+  RearmNeedsDecision,
+  NoRemediation,
+  AttemptedRemediation,
+  Gate,
+  Observation,
+  AvailableControl,
+  InactiveControl,
+  AbsentControl,
+  UnavailableControl,
+  KeepGuidance,
+  ClearGuidance,
+  SetGuidance,
+  RequestRearm,
+  ContinueRearm,
+  CancelRearm,
+  api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body,
+  CommandResult,
   StepEventsPayload,
   UnblockRequest,
   api_unblock_api_repos__name__issues__number__unblock_post_Body,
-  timezone,
   Caps,
   CostMix,
   EscalationReason,
@@ -697,6 +887,76 @@ const endpoints = makeApi([
   },
   {
     method: "get",
+    path: "/api/repos/:name/issues/:number/resolve-control",
+    alias:
+      "api_resolve_control_api_repos__name__issues__number__resolve_control_get",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "number",
+        type: "Path",
+        schema: z.number().int(),
+      },
+      {
+        name: "request_id",
+        type: "Query",
+        schema: request_id,
+      },
+    ],
+    response: z.discriminatedUnion("status", [
+      AvailableControl,
+      InactiveControl,
+      AbsentControl,
+      UnavailableControl,
+    ]),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "post",
+    path: "/api/repos/:name/issues/:number/resolve-control/commands",
+    alias:
+      "api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        type: "Body",
+        schema:
+          api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body,
+      },
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "number",
+        type: "Path",
+        schema: z.number().int(),
+      },
+    ],
+    response: CommandResult,
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "get",
     path: "/api/repos/:name/issues/:number/steps/:idx/events",
     alias:
       "api_step_events_api_repos__name__issues__number__steps__idx__events_get",
@@ -803,7 +1063,7 @@ const endpoints = makeApi([
       {
         name: "timezone",
         type: "Query",
-        schema: timezone,
+        schema: request_id,
       },
     ],
     response: z

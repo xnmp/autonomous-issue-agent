@@ -1,6 +1,7 @@
 """Transaction-local workflow reads shared by admission and progression; ADR 0015."""
 
 import sqlite3
+import json
 
 from ..domain.resolve_workspace import EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
 
@@ -17,6 +18,12 @@ from .workflow_codec import WorkflowEncodingError, decode_workflow
 
 class WorkflowAuthorityError(ValueError):
     pass
+
+
+class WorkflowRevisionConflict(WorkflowAuthorityError):
+    def __init__(self, current: WorkflowRevision, reason: str):
+        super().__init__(reason)
+        self.current = current
 
 
 WORKSPACE_ACK_NAMESPACE = "workflow-workspace-completed"
@@ -42,26 +49,58 @@ def workflow_scope(key: WorkflowKey) -> tuple[str, str, int]:
     return key.repository, "issue" if isinstance(key.target, IssueRef) else "pr", key.target.number
 
 
+def workflow_run_scope_bounds(key: WorkflowKey) -> tuple[str, str]:
+    """Indexed target scope across retained epochs/episodes, never JSON payload scans."""
+    prefix = json.dumps(workflow_scope(key), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
+    return prefix, prefix + "\uffff"
+
+
+def load_resolve_authority(db: sqlite3.Connection, repository: str) -> FamilyAuthority | None:
+    row = db.execute("SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family='resolve'",
+                     (repository,)).fetchone()
+    if row is not None:
+        try:
+            return FamilyAuthority(WorkflowFamily.RESOLVE, row["epoch"])
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError(f"invalid resolve activation epoch: {exc}") from exc
+    prefix = json.dumps((repository,), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
+    retained = (
+        db.execute("SELECT 1 FROM workflows WHERE repository=? LIMIT 1", (repository,)).fetchone()
+        or db.execute("SELECT 1 FROM workflow_rearms WHERE repository=? LIMIT 1", (repository,)).fetchone()
+        or db.execute("SELECT 1 FROM workflow_gates WHERE repository=? LIMIT 1", (repository,)).fetchone()
+        or db.execute("SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? LIMIT 1",
+                      (prefix, prefix + "\uffff")).fetchone()
+    )
+    if retained is not None:
+        raise WorkflowAuthorityError("resolve activation is missing despite retained workflow authority")
+    return None
+
+
 def load_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> WorkflowSnapshot | None:
     """A missing row is absence only after this family's activation is verified."""
     scope = workflow_scope(key)
-    activation = db.execute(
-        "SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family=?",
-        (key.repository, WorkflowFamily.RESOLVE.value),
-    ).fetchone()
+    activation = load_resolve_authority(db, key.repository)
     if activation is None:
         raise WorkflowAuthorityError("resolve workflow migration is required")
     row = db.execute(
         "SELECT * FROM workflows WHERE repository=? AND target_kind=? AND target_number=?", scope,
     ).fetchone()
     if row is None:
+        retained = (
+            db.execute("SELECT 1 FROM workflow_rearms WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
+            or db.execute("SELECT 1 FROM workflow_gates WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
+            or db.execute("SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? LIMIT 1",
+                          workflow_run_scope_bounds(key)).fetchone()
+        )
+        if retained is not None:
+            raise WorkflowAuthorityError("workflow is missing despite retained target authority")
         return None
     try:
         family = decode_workflow(row["episode_json"], tuple)
         if len(family) != 2 or not isinstance(family[0], FamilyAuthority) or not isinstance(family[1], ResolveEpisode):
             raise WorkflowEncodingError("invalid resolve family episode")
         authority, episode = family
-        if authority != FamilyAuthority(WorkflowFamily.RESOLVE, activation["epoch"]):
+        if authority != activation:
             raise WorkflowEncodingError("workflow activation epoch does not match its episode")
         gates = []
         for gate_row in db.execute(

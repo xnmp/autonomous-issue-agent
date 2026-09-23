@@ -33,7 +33,7 @@ def deployment(tmp_path, monkeypatch):
         "REPO": "o/r", "TARGET_DIR": str(tmp_path / "checkout"),
         "STATE_DIR": str(tmp_path / "state" / "fix"),
         "REVIEW_STATE_DIR": str(tmp_path / "state" / "review"),
-        "SDIR": str(tmp_path / "state" / "steward"),
+        "STEWARD_STATE_DIR": str(tmp_path / "state" / "steward"),
         "CONTROL_AUTHORITY_ROOT": str(tmp_path / "authority"),
         "ROLES": "fix review steward", "BASE_BRANCH": "release",
         "FIX_BOT_TOKEN": "isolated-fix-token", "FIX_BOT": "fix-bot", "GH_HOST": "git.example.test",
@@ -100,6 +100,9 @@ def test_factory_preserves_configured_fix_owner_credentials_base_host_and_author
 @pytest.mark.parametrize("damage", ["missing-database", "missing-witness", "invalid-witness", "stale-schema", "wrong-schema", "empty-database"])
 def test_operator_refuses_uninitialized_or_invalid_authority_without_repair(deployment, damage):
     root, env, store, write = deployment
+    # Damage the durable database, not a main file recoverable from a live WAL.
+    with closing(store._connect()) as db:
+        db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
     database = Path(store.path)
     witness = Path(store.authority_witness_path)
     if damage == "missing-database":

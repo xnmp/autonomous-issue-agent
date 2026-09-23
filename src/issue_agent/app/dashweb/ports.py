@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
+
+if TYPE_CHECKING:
+    from .resolve_contracts import CommandResult, ResolveCommand, ResolveControl
 
 
 class GitHubQueries(Protocol):
@@ -29,6 +32,8 @@ class IssueQueries(Protocol):
     def step_events(self, name: str, number: int, idx: int) -> dict | None: ...
     def cost_chart(self, session_id: str) -> tuple[str, str]: ...
 
+    def resolve_control(self, name: str, number: int, request_id: str | None = None) -> ResolveControl: ...
+
 
 class OperatorQueries(Protocol):
     def usage(self) -> dict: ...
@@ -41,6 +46,8 @@ class DashboardCommands(Protocol):
     def priority(
         self, name: str, number: int, priority: str | None
     ) -> tuple[bool, str]: ...
+
+    def resolve_command(self, name: str, number: int, body: ResolveCommand) -> CommandResult: ...
 
 
 class DashboardBackend(

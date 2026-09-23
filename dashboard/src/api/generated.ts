@@ -123,6 +123,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/repos/{name}/issues/{number}/resolve-control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Resolve Control */
+        get: operations["api_resolve_control_api_repos__name__issues__number__resolve_control_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/repos/{name}/issues/{number}/resolve-control/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Resolve Command */
+        post: operations["api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/repos/{name}/issues/{number}/steps/{idx}/events": {
         parameters: {
             query?: never;
@@ -263,6 +297,20 @@ export interface paths {
 export type webhooks = Record<string, never>;
 export interface components {
     schemas: {
+        /** AbsentControl */
+        AbsentControl: {
+            /** Epoch */
+            epoch: number;
+            /** Issue */
+            issue: number;
+            /** Repository */
+            repository: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "absent";
+        };
         /** ActionResult */
         ActionResult: {
             /** Detail */
@@ -271,6 +319,20 @@ export interface components {
             ok: boolean;
         } & {
             [key: string]: unknown;
+        };
+        /** AttemptedRemediation */
+        AttemptedRemediation: {
+            /** Evidence Ids */
+            evidence_ids: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "attempted";
+            /** Operation */
+            operation: string;
+            /** Outcome */
+            outcome: string;
         };
         /** AttentionItem */
         AttentionItem: {
@@ -284,6 +346,31 @@ export interface components {
             title?: string | null;
         } & {
             [key: string]: unknown;
+        };
+        /** AvailableControl */
+        AvailableControl: {
+            current_intent: components["schemas"]["Rearm"] | null;
+            expected: components["schemas"]["ResolveExpected"];
+            /** Failures */
+            failures: number;
+            /** Gates */
+            gates: components["schemas"]["Gate"][];
+            /** Guidance */
+            guidance: string;
+            observation: components["schemas"]["Observation"] | null;
+            /** Requested Id */
+            requested_id: string | null;
+            requested_intent: components["schemas"]["Rearm"] | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "available";
+            /**
+             * Workflow Held
+             * @description SQLite workflow holds only, not a remote readiness assertion; submission rechecks external holds.
+             */
+            workflow_held: boolean;
         };
         /** BacklogCard */
         BacklogCard: {
@@ -320,6 +407,21 @@ export interface components {
             url: string | null;
         } & {
             [key: string]: unknown;
+        };
+        /** CancelRearm */
+        CancelRearm: {
+            /** Cancellation Id */
+            cancellation_id: string;
+            expected: components["schemas"]["ResolveExpected"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "cancel_rearm";
+            /** Reason */
+            reason: string;
+            /** Request Id */
+            request_id: string;
         };
         /** Caps */
         Caps: {
@@ -367,6 +469,14 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** ClearGuidance */
+        ClearGuidance: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "clear";
+        };
         /** CodexUsage */
         CodexUsage: {
             /** Error */
@@ -385,6 +495,31 @@ export interface components {
             window_minutes: number | null;
         } & {
             [key: string]: unknown;
+        };
+        /** CommandResult */
+        CommandResult: {
+            /** Control */
+            control: components["schemas"]["AvailableControl"] | components["schemas"]["InactiveControl"] | components["schemas"]["AbsentControl"] | components["schemas"]["UnavailableControl"];
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "accepted" | "replayed" | "conflict" | "rejected" | "unavailable";
+            /** Reason */
+            reason: string;
+        };
+        /** ContinueRearm */
+        ContinueRearm: {
+            expected: components["schemas"]["ResolveExpected"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "continue_rearm";
+            /** Request Id */
+            request_id: string;
+            /** Stopped Request Id */
+            stopped_request_id: string;
         };
         /** CostMix */
         CostMix: {
@@ -407,6 +542,40 @@ export interface components {
             reason?: string | null;
         } & {
             [key: string]: unknown;
+        };
+        /** EvidenceUnavailable */
+        EvidenceUnavailable: {
+            /** Failed Reads */
+            failed_reads: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "evidence_unavailable";
+            /** Last Error */
+            last_error: string;
+            /** Source */
+            source: string;
+            /** Unresolved Since */
+            unresolved_since: string;
+        };
+        /** Gate */
+        Gate: {
+            /** Available Commands */
+            available_commands: ("request_rearm" | "continue_rearm" | "cancel_rearm")[];
+            /** Cause */
+            cause: components["schemas"]["ResolveCeiling"] | components["schemas"]["RemoteUncertain"] | components["schemas"]["RetryAuthorizationRequired"] | components["schemas"]["EvidenceUnavailable"] | components["schemas"]["RearmNeedsDecision"];
+            /** Gate Id */
+            gate_id: string;
+            /** Opened Generation */
+            opened_generation: number;
+            /** Remediation */
+            remediation: components["schemas"]["NoRemediation"] | components["schemas"]["AttemptedRemediation"];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "open" | "rearming";
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -453,6 +622,18 @@ export interface components {
             recurrences: number;
         } & {
             [key: string]: unknown;
+        };
+        /** InactiveControl */
+        InactiveControl: {
+            /** Issue */
+            issue: number;
+            /** Repository */
+            repository: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "inactive";
         };
         /** InterventionCount */
         InterventionCount: {
@@ -728,6 +909,14 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** KeepGuidance */
+        KeepGuidance: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "keep";
+        };
         /** KindCost */
         KindCost: {
             /** Kind */
@@ -790,6 +979,27 @@ export interface components {
             model: string;
         } & {
             [key: string]: unknown;
+        };
+        /** NoRemediation */
+        NoRemediation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "none_authorized";
+            /** Reason */
+            reason: string;
+        };
+        /** Observation */
+        Observation: {
+            /** Failed Reads */
+            failed_reads: number;
+            /** Last Error */
+            last_error: string;
+            /** Next Read At */
+            next_read_at: string;
+            /** Unresolved Since */
+            unresolved_since: string;
         };
         /** OverviewPayload */
         OverviewPayload: {
@@ -874,6 +1084,70 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** Rearm */
+        Rearm: {
+            /** Base Commit */
+            base_commit: string;
+            /** Base Ref */
+            base_ref: string;
+            /** Branch */
+            branch: string;
+            /** Episode Id */
+            episode_id: string;
+            /** Gate Id */
+            gate_id: string;
+            /** Generation */
+            generation: number;
+            /** Grant Request Id */
+            grant_request_id: string;
+            /** Handoff Id */
+            handoff_id: string;
+            /** Reason */
+            reason: string;
+            /** Request Id */
+            request_id: string;
+            /** Required Commands */
+            required_commands: string[];
+            /** Retired Commands */
+            retired_commands: string[];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "pending" | "completed" | "cancelled" | "superseded";
+            /** Verified Commands */
+            verified_commands: string[];
+        };
+        /** RearmNeedsDecision */
+        RearmNeedsDecision: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "rearm_needs_decision";
+            /** Obligations */
+            obligations: string[];
+            /** Reason */
+            reason: string;
+            /** Stopped Request Id */
+            stopped_request_id: string;
+        };
+        /** RemoteUncertain */
+        RemoteUncertain: {
+            /** Command Id */
+            command_id: string;
+            /** Failed Reads */
+            failed_reads: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "remote_uncertain";
+            /** Last Error */
+            last_error: string;
+            /** Unresolved Since */
+            unresolved_since: string;
+        };
         /** RepoSummary */
         RepoSummary: {
             /** Active */
@@ -908,6 +1182,70 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** RequestRearm */
+        RequestRearm: {
+            expected: components["schemas"]["ResolveExpected"];
+            /** Gate Id */
+            gate_id: string;
+            /** Guidance */
+            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "request_rearm";
+            /** Request Id */
+            request_id: string;
+        };
+        /** ResolveCeiling */
+        ResolveCeiling: {
+            /** Ceiling */
+            ceiling: number;
+            /** Episode Id */
+            episode_id: string;
+            /** Failures */
+            failures: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "resolve_ceiling";
+            /** Last Failure */
+            last_failure: string;
+        };
+        /** ResolveExpected */
+        ResolveExpected: {
+            /** Episode Id */
+            episode_id: string;
+            /** Epoch */
+            epoch: number;
+            /**
+             * Family
+             * @constant
+             * @enum {string}
+             */
+            family: "resolve";
+            /** Generation */
+            generation: number;
+            /** Issue */
+            issue: number;
+            /** Repository */
+            repository: string;
+            /** Version */
+            version: number;
+        };
+        /** RetryAuthorizationRequired */
+        RetryAuthorizationRequired: {
+            /** Absence Evidence Id */
+            absence_evidence_id: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "retry_authorization_required";
+        };
         /** RoleHealth */
         RoleHealth: {
             /** Alive */
@@ -926,6 +1264,16 @@ export interface components {
             stale: boolean;
         } & {
             [key: string]: unknown;
+        };
+        /** SetGuidance */
+        SetGuidance: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "set";
+            /** Text */
+            text: string;
         };
         /** SpendBucket */
         SpendBucket: {
@@ -981,6 +1329,16 @@ export interface components {
             output_tokens: number | null;
         } & {
             [key: string]: unknown;
+        };
+        /** UnavailableControl */
+        UnavailableControl: {
+            /** Reason */
+            reason: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "unavailable";
         };
         /**
          * UnblockRequest
@@ -1262,6 +1620,76 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActionResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_resolve_control_api_repos__name__issues__number__resolve_control_get: {
+        parameters: {
+            query?: {
+                request_id?: string | null;
+            };
+            header?: never;
+            path: {
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["AvailableControl"] | components["schemas"]["InactiveControl"] | components["schemas"]["AbsentControl"] | components["schemas"]["UnavailableControl"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                number: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RequestRearm"] | components["schemas"]["ContinueRearm"] | components["schemas"]["CancelRearm"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["CommandResult"];
                 };
             };
             /** @description Validation Error */

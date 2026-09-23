@@ -12,8 +12,9 @@ from .workflow import (
     NoLinkedPr, ObservedIssue, OpenGate, PendingRearm, RearmingGate, ReconciliationPolicy,
     RemoteOutcomeUncertain, ResolveRearmAcceptance, ResolveRearmPreflight,
     StopReason, WorkflowSnapshot, WorkflowTransition, WorkflowUnchanged,
+    RearmIntent, WorkflowUnavailable,
 )
-from .workflow_identity import WorkflowBinding, validate_workflow_identifier, validate_workflow_text
+from .workflow_identity import FamilyAuthority, WorkflowBinding, WorkflowKey, validate_workflow_identifier, validate_workflow_text
 from .workflow_policy import complete_resolve_rearm, supersede_resolve_rearm
 
 
@@ -58,6 +59,56 @@ class UnavailableResolveRearm:
         validate_workflow_text(self.reason, "unavailable rearm reason", limit=16384)
         if not isinstance(self.next_read_at, datetime) or self.next_read_at.utcoffset() is None:
             raise ValueError("unavailable rearm requires an aware next-read time")
+
+
+@dataclass(frozen=True)
+class InactiveResolveControl:
+    key: WorkflowKey
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, WorkflowKey):
+            raise ValueError("inactive resolve control requires a queried workflow")
+
+
+@dataclass(frozen=True)
+class AbsentResolveControl:
+    key: WorkflowKey
+    authority: FamilyAuthority
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, WorkflowKey) or not isinstance(self.authority, FamilyAuthority):
+            raise ValueError("absent resolve control requires its active family authority")
+
+
+@dataclass(frozen=True)
+class ResolveControlView:
+    snapshot: WorkflowSnapshot
+    requested_id: str | None
+    requested: RearmIntent | None
+    observation: RearmObservation | None
+
+    def __post_init__(self) -> None:
+        from .workflow import CancelledRearm, CompletedRearm, SupersededRearm
+
+        if not isinstance(self.snapshot, WorkflowSnapshot):
+            raise ValueError("resolve control view requires current workflow authority")
+        if self.requested_id is not None:
+            validate_workflow_identifier(self.requested_id, "requested rearm")
+        if self.requested is not None and (
+            not isinstance(self.requested, (PendingRearm, CompletedRearm, CancelledRearm, SupersededRearm))
+            or self.requested.request_id != self.requested_id
+            or self.requested.handoff.destination.fence.key != self.snapshot.binding.fence.key
+        ):
+            raise ValueError("requested rearm must belong to this exact workflow and request")
+        if isinstance(self.snapshot.intent, PendingRearm):
+            if self.observation is None:
+                raise ValueError("pending resolve control requires its observation history")
+            PendingResolveRearm(self.snapshot, self.observation)
+        elif self.observation is not None:
+            raise ValueError("only current pending control carries observation history")
+
+
+ResolveControlRead = InactiveResolveControl | AbsentResolveControl | ResolveControlView | WorkflowUnavailable
 
 
 def _clock(previous: RearmObservation, now: datetime) -> None:

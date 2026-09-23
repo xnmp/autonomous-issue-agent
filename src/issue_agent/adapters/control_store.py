@@ -76,7 +76,7 @@ from .deployment_authority import (
     deployment_role,
 )
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, load_workflow_row, load_workspace_ack, require_workflow_binding, workflow_scope
+from .workflow_rows import WorkflowAuthorityError, load_resolve_authority, load_workflow_row, load_workspace_ack, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 21
 
@@ -85,12 +85,6 @@ def workflow_episode_key(binding: WorkflowBinding) -> str:
     """An indexed projection of immutable admission scope, not an allowance."""
     return json.dumps((*workflow_scope(binding.fence.key), binding.authority.family.value,
                        binding.authority.epoch, binding.episode_id), ensure_ascii=False, separators=(",", ":"))
-
-
-def workflow_run_scope_bounds(key: WorkflowKey) -> tuple[str, str]:
-    """Indexed target scope across retained epochs/episodes, never JSON payload scans."""
-    prefix = json.dumps(workflow_scope(key), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
-    return prefix, prefix + "\uffff"
 
 
 def target_has_work_admissions(db: sqlite3.Connection, key: WorkflowKey) -> bool:
@@ -1440,6 +1434,24 @@ class SQLiteControlStore:
         self._validate_authority_witness()
         with self._connect() as db:
             self._validate_migration_history(self._migration_history(db), require_current=True)
+
+    @contextmanager
+    def legacy_resolve_authority(self, repository: str) -> Iterator[None]:
+        """A legacy operator write cannot cross a resolve-family activation."""
+        from ..domain.workflow_identity import canonical_workflow_repository
+
+        repository = canonical_workflow_repository(repository)
+        # Initialization has a different lock order; operator writes never
+        # create, adopt or migrate accounting while holding these barriers.
+        self.require_initialized()
+        with ExitStack() as barriers:
+            for role in ("fix", "review", "steward"):
+                barriers.enter_context(deployment_effect_barrier(self.path, repository, role))
+            with closing(self._connect()) as db:
+                db.execute("BEGIN")
+                if load_resolve_authority(db, repository) is not None:
+                    raise WorkflowAuthorityError("legacy unblock is retired for active resolve control; use a typed re-arm command")
+            yield
 
     def _database_exists(self, *, allow_empty: bool = False) -> bool:
         try:

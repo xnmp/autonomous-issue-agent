@@ -28,6 +28,7 @@ from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
 from ...adapters.control_path import canonical_control_store_path
 from .. import cli
 from . import contracts
+from . import resolve_contracts
 from .ports import DashboardBackend
 from .service import Backend
 
@@ -269,6 +270,40 @@ def create_app(
         ok, detail = await invoke(backend.promote, name, number)
         return JSONResponse({"ok": ok, "detail": detail}, status_code=200 if ok else 400)
 
+    @app.get("/api/repos/{name}/issues/{number}/resolve-control", response_model=resolve_contracts.ResolveControl)
+    async def api_resolve_control(name: str, number: int, request_id: str | None = Query(default=None, max_length=512)):
+        await require_known(name)
+        if number < 1 or number > 2**63 - 1:
+            raise HTTPException(422, "issue number is outside the supported range")
+        if request_id is not None:
+            try:
+                resolve_contracts.validate_identifier(request_id)
+            except ValueError as exc:
+                raise HTTPException(422, str(exc)) from exc
+        try:
+            result = await invoke(backend.resolve_control, name, number, request_id)
+        except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
+            result = resolve_contracts.UnavailableControl(status="unavailable", reason=_control_error(exc))
+        code = 503 if result.status == "unavailable" else 404 if result.status == "absent" else 200
+        return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
+
+    @app.post("/api/repos/{name}/issues/{number}/resolve-control/commands", response_model=resolve_contracts.CommandResult)
+    async def api_resolve_command(name: str, number: int, body: resolve_contracts.ResolveCommand):
+        await require_known(name)
+        if number < 1 or number > 2**63 - 1:
+            raise HTTPException(422, "issue number is outside the supported range")
+        try:
+            body.command()
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from exc
+        try:
+            result = await invoke(backend.resolve_command, name, number, body)
+        except Exception as exc:  # noqa: BLE001 - command identity makes an uncertain response retryable
+            result = resolve_contracts.CommandResult(outcome="unavailable", reason=_control_error(exc),
+                control=resolve_contracts.UnavailableControl(status="unavailable", reason="control read unavailable"))
+        code = {"accepted": 202, "replayed": 200, "conflict": 409, "rejected": 422, "unavailable": 503}[result.outcome]
+        return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
+
     @app.post(
         "/api/repos/{name}/issues/{number}/unblock",
         response_model=contracts.ActionResult,
@@ -371,6 +406,10 @@ def create_app(
     return app
 
 
+def _control_error(error: Exception) -> str:
+    return str(error).replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")[:16384]
+
+
 def _encodable(value):
     """The same structure with every string forced to encodable UTF-8, so a
     JSONResponse over it cannot raise. Lone surrogates become U+FFFD."""
@@ -466,6 +505,8 @@ def serve(
 ) -> int:
     """Run the dashboard on loopback. Loopback is not a default but a
     constraint: the POST actions launch daemons and relabel issues."""
+    if host not in ("127.0.0.1", "::1"):
+        raise ValueError("dashboard actions require a literal loopback listener")
     import uvicorn
 
     reload_check = None

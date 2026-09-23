@@ -8,6 +8,8 @@ edit so a half-applied change cannot leave an issue with no priority at all.
 """
 
 from datetime import datetime, timezone
+import os
+import shlex
 
 import pytest
 
@@ -225,6 +227,13 @@ def test_a_custom_trigger_without_hold_provenance_is_refused():
         actions.pr_unblock_change(("needs-human-review",), "ai-review")
 
 
+def _active_values(tmp_path, **values):
+    active = tmp_path / "config" / ".active.demo.env"
+    active.parent.mkdir(exist_ok=True)
+    with active.open("a") as snapshot:
+        snapshot.writelines(f"{key}={shlex.quote(value)}\n" for key, value in values.items())
+
+
 def _unblock_backend(
     monkeypatch,
     tmp_path,
@@ -296,7 +305,7 @@ def _unblock_backend(
             calls.append(("dismiss", pr, review.review_id, message))
             return dismissed
 
-    def factory(repo, state_dirs, *, identity, journal=None, run=None):
+    def factory(repo, state_dirs, *, identity, journal=None, run=None, control=None):
         calls.append(("factory", journal is not None))
         return Effects()
 
@@ -318,12 +327,27 @@ def _unblock_backend(
             } for pr in prs], "")
 
     monkeypatch.setattr(service.system, "remote_repo", lambda _root: "harness/repo")
-    monkeypatch.setattr(
-        cli,
-        "deployment_env_field",
-        lambda _name, field: review_bot if field == "REVIEW_BOT" else "",
+    from issue_agent.app import config
+    from issue_agent.adapters import control_path
+    from issue_agent.adapters.control_store import SQLiteControlStore
+
+    authority_root = str(tmp_path / "authority")
+    monkeypatch.setattr(control_path, "machine_control_authority_root", lambda: authority_root)
+    monkeypatch.setattr(config, "machine_control_authority_root", lambda: authority_root)
+    target = tmp_path / "checkout"
+    target.mkdir()
+    _active_values(
+        tmp_path, REPO="o/r", TARGET_DIR=str(target),
+        STATE_DIR=str(dirs["fix"]), REVIEW_STATE_DIR=str(dirs["review"]),
+        STEWARD_STATE_DIR=str(dirs["steward"]), CONTROL_AUTHORITY_ROOT=authority_root,
+        FIX_BOT="fixer[bot]", REVIEW_BOT=review_bot,
+        GH_HOST=os.environ.get("GH_HOST", "github.com"),
+        ROLES="fix review steward",
     )
-    backend = service.Backend(gh=Gh(), effects_factory=factory)
+    control = SQLiteControlStore(control_path.canonical_control_store_path(authority_root=authority_root))
+    control.initialize()
+    backend = service.Backend(harness_root=str(tmp_path), gh=Gh(), effects_factory=factory,
+                              control_db_path=control.path)
     monkeypatch.setattr(backend, "known", lambda _name: True)
     monkeypatch.setattr(backend, "overlay_field", lambda _name, _field: "o/r")
 
@@ -390,9 +414,9 @@ def _unblock_backend(
         now_fn=lambda: datetime(2026, 7, 29, 12, 0, tzinfo=timezone.utc),
     )
     monkeypatch.setattr(
-        backend,
-        "snapshot",
-        lambda _name, **_kwargs: dash.Snapshot(
+        backend._collector,
+        "collect",
+        lambda **_kwargs: dash.Snapshot(
             "demo", "o/r", "/t", deployment, ()
         ),
     )
@@ -489,15 +513,7 @@ def test_pr_unblock_restores_a_custom_reviewer_trigger(monkeypatch, tmp_path):
         monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
         hold_role="review",
     )
-    monkeypatch.setattr(
-        service.cli,
-        "deployment_env_field",
-        lambda _name, field: (
-            "reviewer[bot]" if field == "REVIEW_BOT"
-            else "ai-review" if field == "REVIEW_TRIGGER_LABEL"
-            else ""
-        ),
-    )
+    _active_values(tmp_path, REVIEW_TRIGGER_LABEL="ai-review")
 
     assert backend.unblock("demo", 7) == (True, "ok")
 
@@ -514,15 +530,7 @@ def test_custom_trigger_restores_fixer_source_for_a_fixer_escalation(
         monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
         hold_role="fix",
     )
-    monkeypatch.setattr(
-        service.cli,
-        "deployment_env_field",
-        lambda _name, field: (
-            "reviewer[bot]" if field == "REVIEW_BOT"
-            else "ai-review" if field == "REVIEW_TRIGGER_LABEL"
-            else ""
-        ),
-    )
+    _active_values(tmp_path, REVIEW_TRIGGER_LABEL="ai-review")
 
     assert backend.unblock("demo", 7) == (True, "ok")
 
@@ -539,15 +547,7 @@ def test_custom_trigger_restores_fixer_after_stalled_ci_escalation(
         monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
         hold_role="fix", composite_hold=True,
     )
-    monkeypatch.setattr(
-        service.cli,
-        "deployment_env_field",
-        lambda _name, field: (
-            "reviewer[bot]" if field == "REVIEW_BOT"
-            else "ai-review" if field == "REVIEW_TRIGGER_LABEL"
-            else ""
-        ),
-    )
+    _active_values(tmp_path, REVIEW_TRIGGER_LABEL="ai-review")
 
     assert backend.unblock("demo", 7) == (True, "ok")
 
@@ -563,11 +563,7 @@ def test_ambiguous_custom_trigger_refuses_before_resetting_counters(
     backend, dirs, calls = _unblock_backend(
         monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",)
     )
-    monkeypatch.setattr(
-        service.cli,
-        "deployment_env_field",
-        lambda _name, field: "ai-review" if field == "REVIEW_TRIGGER_LABEL" else "",
-    )
+    _active_values(tmp_path, REVIEW_TRIGGER_LABEL="ai-review", REVIEW_BOT="")
     counter = dirs["review"] / "issue--12.infra-deaths"
     counter.write_text("5")
 
@@ -589,11 +585,7 @@ def test_a_prior_hold_episode_cannot_supply_provenance_to_a_new_hold(
         hold_role="review",
         prior_unblock=True,
     )
-    monkeypatch.setattr(
-        service.cli,
-        "deployment_env_field",
-        lambda _name, field: "ai-review" if field == "REVIEW_TRIGGER_LABEL" else "",
-    )
+    _active_values(tmp_path, REVIEW_TRIGGER_LABEL="ai-review", REVIEW_BOT="")
     counter = dirs["review"] / "issue--12.infra-deaths"
     counter.write_text("5")
 
@@ -1093,7 +1085,6 @@ def test_review_dismissals_use_the_configured_review_identity(
 ):
     from issue_agent.adapters.operator_effects import LabelEffect
 
-    real_deployment_env_field = service.cli.deployment_env_field
     reviews = _at_ceiling("3")
     backend, _dirs, _calls = _unblock_backend(
         monkeypatch, tmp_path, reviews=_at_ceiling("3"),
@@ -1125,19 +1116,12 @@ def test_review_dismissals_use_the_configured_review_identity(
             )
 
     def credential_factory(
-        _repo, _state_dirs, *, identity, journal=None, run=None
+        _repo, _state_dirs, *, identity, journal=None, run=None, control=None
     ):
         return CredentialEffects(identity, run)
 
     backend.effects_factory = credential_factory
-    active = tmp_path / "active.env"
-    active.write_text(
-        'REPO="o/r"\nREVIEW_BOT="reviewer[bot]"\n'
-        'REVIEW_BOT_TOKEN="review-secret"\n'
-    )
-    monkeypatch.setattr(service.cli, "deployment_env_field", real_deployment_env_field)
-    monkeypatch.setattr(service.cli, "_active_env_path", lambda _name: str(active))
-    monkeypatch.setattr(service.cli, "REPOS_DIR", str(tmp_path / "repos"))
+    _active_values(tmp_path, REVIEW_BOT_TOKEN="review-secret")
     subprocess_calls = []
     real_subprocess_run = service.subprocess.run
 
@@ -1221,11 +1205,7 @@ def test_a_disabled_rejection_ceiling_has_nothing_to_re_arm(monkeypatch, tmp_pat
         tmp_path,
         reviews=tuple(_rejection(str(n)) for n in range(1, 6)),
     )
-    monkeypatch.setattr(
-        service.cli,
-        "deployment_env_field",
-        lambda _name, field: "reviewer[bot]" if field == "REVIEW_BOT" else "0",
-    )
+    _active_values(tmp_path, REVIEW_MAX_REJECTIONS="0")
 
     assert backend.unblock("demo", 7) == (True, "ok")
     assert [c for c in calls if c[0] == "dismiss"] == []
@@ -1261,11 +1241,7 @@ def test_the_dismissal_fan_out_is_bounded_by_the_configured_ceiling(
         tmp_path,
         reviews=tuple(_rejection(str(n)) for n in range(1, 6)),
     )
-    monkeypatch.setattr(
-        service.cli,
-        "deployment_env_field",
-        lambda _name, field: "reviewer[bot]" if field == "REVIEW_BOT" else "2",
-    )
+    _active_values(tmp_path, REVIEW_MAX_REJECTIONS="2")
 
     backend.unblock("demo", 7)
 

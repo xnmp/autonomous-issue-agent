@@ -1,8 +1,9 @@
 """Shared fix-owned re-arm composition for daemon and local operator transport."""
 
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import datetime, timezone
 import os
+from types import MappingProxyType
 
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import SQLiteControlStore
@@ -54,11 +55,8 @@ def compose_resolve_rearm(
                                 approved_host=approved_host, external_holds=external_holds)
 
 
-def open_resolve_operator(
-    name: str, *, harness_root: str, control_db_path: str = "",
-    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
-    log: Callable[[str], None] = _ignore_log,
-) -> ResolveRearmWorkflow:
+def load_operator_configuration(name: str, *, harness_root: str) -> tuple[HarnessConfig, Mapping[str, str]]:
+    """Mutation scope comes from one launch snapshot, never per-field overlay fallbacks."""
     if not isinstance(name, str) or not name or name != canonical_deployment_name(name) or name in (".", ".."):
         raise ValueError("resolve re-arm requires a canonical deployment name")
     snapshot = os.path.join(harness_root, "config", f".active.{name}.env")
@@ -69,12 +67,22 @@ def open_resolve_operator(
     host = env.get("GH_HOST", "github.com")
     if host != os.environ.get("GH_HOST", "github.com"):
         raise ValueError("operator GitHub host differs from the deployment snapshot")
-    if "fix" not in env.get("ROLES", "fix review steward").split():
-        raise ValueError("resolve re-arm requires the configured fix role")
     cfg = from_env(env)
     cfg.validate()
     if not cfg.repo or not cfg.target_dir or not os.path.isabs(cfg.target_dir):
         raise ValueError("resolve re-arm requires an explicit repository checkout")
+    return cfg, MappingProxyType(env)
+
+
+def open_resolve_operator(
+    name: str, *, harness_root: str, control_db_path: str = "",
+    now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
+    log: Callable[[str], None] = _ignore_log,
+) -> ResolveRearmWorkflow:
+    cfg, env = load_operator_configuration(name, harness_root=harness_root)
+    if "fix" not in env.get("ROLES", "fix review steward").split():
+        raise ValueError("resolve re-arm requires the configured fix role")
+    host = env.get("GH_HOST", "github.com")
     path = control_store_path((cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir),
                               authority_root=cfg.control_authority_root)
     if control_db_path and os.path.realpath(control_db_path) != os.path.realpath(path):

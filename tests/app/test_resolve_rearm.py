@@ -1,6 +1,6 @@
 """Re-arm application recovery against real SQLite and isolated Git workspaces."""
 
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import timedelta
 import multiprocessing
@@ -14,6 +14,7 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.agent_publish import AgentPublicationBroker
 from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.app.workflows.resolve_rearm import ResolveRearmWorkflow
 from issue_agent.app.execute import Executor
 from issue_agent.app.roles import EffectRecovery
@@ -29,6 +30,7 @@ from issue_agent.domain.workflow_policy import reconcile_resolve_ceiling
 from issue_agent.domain.world import IssueView
 from tests.adapters.test_episode_workspace import EpisodeRepo, episode_repo, _git
 from tests.adapters.test_workflow_control import ACTOR, NOW, WRITER
+from tests.adapters.test_operator_binding import authority_dump, different_binding
 from tests.fakes.in_memory_github import InMemoryGitHub
 from tests.fakes.persistent_github import PersistentGitHub
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
@@ -513,3 +515,99 @@ def test_hold_drift_supersedes_before_git_then_continue_completes_fresh_projecti
     assert completed.intent.handoff == original_handoff
     assert completed.episode == accepted.snapshot.episode
     assert logs == []
+
+
+@pytest.mark.parametrize("operation", ["request", "cancel", "continue"])
+@pytest.mark.parametrize("difference", ["epoch", "episode"])
+def test_operator_binding_conflict_precedes_remote_or_git_observation(environment, monkeypatch, operation, difference):
+    service, store, gateway, repo, clock, logs, command = environment
+    workflow = service()
+    current = _state(workflow, command)
+    if operation != "request":
+        accepted = workflow.submit(command, ACTOR, binding=current.binding)
+        assert isinstance(accepted, WorkflowCommitted)
+        current = accepted.snapshot
+        cancellation = CancelRearm("cancel-binding", current.revision, command.request_id, "pause")
+        if operation == "cancel":
+            command = cancellation
+        else:
+            cancelled = workflow.submit(cancellation, ACTOR, binding=current.binding)
+            assert isinstance(cancelled, WorkflowCommitted)
+            current = cancelled.snapshot
+            command = ContinueGrantedRearm("continue-binding", current.revision, command.request_id)
+    before = authority_dump(store)
+    monkeypatch.setattr(gateway, "get_issue", lambda *a: pytest.fail("wrong epoch/episode fetched GitHub"))
+    monkeypatch.setattr(repo.worktrees, "observe_and_pin_episode_base", lambda *a, **kw: pytest.fail("wrong binding fetched Git"))
+    result = workflow.submit(command, ACTOR, binding=different_binding(current.binding, difference))
+    assert isinstance(result, WorkflowConflict)
+    assert result.current == current.revision
+    assert authority_dump(store) == before
+
+
+@pytest.mark.parametrize("difference", ["generation", "target", "malformed"])
+def test_operator_invalid_binding_is_rejected_without_any_authority_change(environment, monkeypatch, difference):
+    service, store, gateway, repo, clock, logs, command = environment
+    workflow = service()
+    current = _state(workflow, command)
+    binding = {} if difference == "malformed" else different_binding(current.binding, difference)
+    before = authority_dump(store)
+    monkeypatch.setattr(gateway, "get_issue", lambda *a: pytest.fail("invalid binding fetched GitHub"))
+    result = workflow.submit(command, ACTOR, binding=binding)
+    assert isinstance(result, WorkflowRejected)
+    assert authority_dump(store) == before
+
+
+def test_binding_fenced_request_cancel_and_continue_replay_against_their_historical_intents(environment, monkeypatch):
+    service, store, gateway, repo, clock, logs, request = environment
+    workflow = service()
+    before = _state(workflow, request)
+    granted = workflow.submit(request, ACTOR, binding=before.binding)
+    assert isinstance(granted, WorkflowCommitted)
+    cancel = CancelRearm("cancel-first", granted.snapshot.revision, request.request_id, "pause")
+    cancelled = workflow.submit(cancel, ACTOR, binding=granted.snapshot.binding)
+    assert isinstance(cancelled, WorkflowCommitted)
+    continuation = ContinueGrantedRearm("continue-first", cancelled.snapshot.revision, request.request_id)
+    continued = workflow.submit(continuation, ACTOR, binding=cancelled.snapshot.binding)
+    assert isinstance(continued, WorkflowCommitted)
+    second_cancel = CancelRearm("cancel-second", continued.snapshot.revision, continuation.request_id, "pause again")
+    stopped_again = workflow.submit(second_cancel, ACTOR, binding=continued.snapshot.binding)
+    assert isinstance(stopped_again, WorkflowCommitted)
+    latest = workflow.submit(
+        ContinueGrantedRearm("continue-second", stopped_again.snapshot.revision, continuation.request_id),
+        ACTOR, binding=stopped_again.snapshot.binding,
+    )
+    assert isinstance(latest, WorkflowCommitted)
+    persisted = authority_dump(store)
+    monkeypatch.setattr(gateway, "get_issue", lambda *a: pytest.fail("historical replay fetched remote state"))
+    monkeypatch.setattr(repo.worktrees, "observe_and_pin_episode_base", lambda *a, **kw: pytest.fail("historical replay fetched Git"))
+    for original, binding in ((request, before.binding), (cancel, granted.snapshot.binding), (continuation, cancelled.snapshot.binding)):
+        result = service().submit(original, OperatorActor(ACTOR.subject, "cli"), binding=binding)
+        assert isinstance(result, WorkflowCommitted) and result.idempotent
+        assert result.snapshot == latest.snapshot
+        for difference in ("epoch", "episode"):
+            wrong = service().submit(original, ACTOR, binding=different_binding(binding, difference))
+            assert isinstance(wrong, WorkflowConflict)
+    assert authority_dump(store) == persisted
+    assert isinstance(workflow.control.lookup_rearm(request.expected.fence.key, request.request_id), CancelledRearm)
+    assert isinstance(workflow.control.lookup_rearm(request.expected.fence.key, continuation.request_id), CancelledRearm)
+
+
+def test_changed_binding_during_barrier_acquisition_refuses_before_gateway(environment, monkeypatch):
+    service, store, gateway, repo, clock, logs, command = environment
+    workflow = service()
+    original = _state(workflow, command)
+    changed = replace(original, episode=replace(original.episode, episode_id="concurrent-episode"))
+    barrier = workflow.control._rearm_barriers
+    @contextmanager
+    def advance_at_acquisition():
+        with barrier():
+            with store.transaction() as db:
+                db.execute("UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='issue' AND target_number=1",
+                           (encode_workflow((changed.authority, changed.episode)),))
+            yield
+    monkeypatch.setattr(workflow.control, "_rearm_barriers", advance_at_acquisition)
+    monkeypatch.setattr(gateway, "get_issue", lambda *a: pytest.fail("stale binding fetched GitHub"))
+    result = workflow.submit(command, ACTOR, binding=original.binding)
+    assert isinstance(result, WorkflowConflict)
+    assert _state(workflow, command) == changed
+    assert repo.runner.calls == []

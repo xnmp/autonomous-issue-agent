@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -57,13 +58,19 @@ def build_operator_effects(
     config_version: str = "",
     run: Callable[..., Any] = subprocess.run,
     journal: EventSink | None = None,
+    control: SQLiteControlStore | None = None,
 ) -> "GitHubOperatorEffects":
     path = control_store_path(
         state_dirs,
         temporary_on_missing=False,
     )
-    store = SQLiteControlStore(path)
-    store.initialize()
+    if control is None:
+        store = SQLiteControlStore(path)
+        store.initialize()
+    else:
+        if os.path.realpath(control.path) != os.path.realpath(path):
+            raise ValueError("operator effects disagree with the established control authority")
+        store = control
     return GitHubOperatorEffects(
         repository,
         store,
