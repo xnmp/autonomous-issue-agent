@@ -22,6 +22,26 @@ describe("validated API client", () => {
     );
   });
 
+  it("never reports a success body's detail as the error of a contract violation", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response(JSON.stringify({ repos: "not-an-array", detail: "updated" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })),
+    );
+
+    await expect(api.repos()).rejects.toThrow(/invalid response/);
+  });
+
+  it("reports a request that timed out distinctly from an unreachable backend", async () => {
+    vi.stubGlobal("fetch", vi.fn(async () => {
+      throw new DOMException("request timed out", "TimeoutError");
+    }));
+
+    await expect(api.repos()).rejects.toThrow("the dashboard backend did not respond in time");
+  });
+
   it("keeps the issues payload usable when a card names an unknown review state", async () => {
     // `pr_review_state` is a closed enum in the contract. A backend that grows a
     // third value must cost one badge, not the whole Issues tab.

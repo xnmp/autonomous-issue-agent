@@ -16,7 +16,7 @@ import { Chip } from "./ui/Chip";
 import { JsonBlock } from "./ui/Json";
 import { EmptyState, ErrorBanner, Loading, SkeletonRows, WarningList } from "./ui/Feedback";
 import { EventTimeline } from "./EventTimeline";
-import { UnblockModal } from "./UnblockModal";
+import { ResolveControls } from "./resolve/ResolveControls";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
 import { StepBadge, StepStatusChip } from "./ui/StepBadge";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
@@ -73,9 +73,6 @@ export function IssueTab({
     POLL_MS,
   );
   const [openStep, setOpenStep] = useState<number | null>(null);
-  const [confirmUnblock, setConfirmUnblock] = useState(false);
-  const [unblocking, setUnblocking] = useState(false);
-  const [unblockError, setUnblockError] = useState<string | null>(null);
   const [pane, setPane] = useState<"tasks" | "events">("tasks");
   const [taskQuery, setTaskQuery] = useState("");
   const [columnVisibility, setColumnVisibility] = useState(storedIssueColumns);
@@ -151,26 +148,14 @@ export function IssueTab({
   }, { key: "when", direction: "asc" }, "issue-tasks");
 
   // The detail payload carries no `human_action`; a live issue that escalated,
-  // blocked, or asked a question is exactly the set an unblock applies to.
+  // blocked, or asked a question is held by legacy choreography until its
+  // resolve authority says otherwise.
   const heldForHuman = !!d && !d.done && (
     !!d.escalation_reason
     || d.stage === "blocked"
     || d.stage === "escalated"
     || d.stage === "awaiting human reply"
   );
-  const doUnblock = async () => {
-    setUnblocking(true);
-    setUnblockError(null);
-    try {
-      await api.unblock(repo, issue);
-      setConfirmUnblock(false);
-      detail.refresh();
-    } catch (caught) {
-      setUnblockError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setUnblocking(false);
-    }
-  };
 
   return (
     <div className="tabbody" onContextMenu={openColumnMenu}>
@@ -207,17 +192,6 @@ export function IssueTab({
             <div className="issue-hd-line issue-hd-meta">
               {d.stage === "awaiting human reply" && d.attention_reason ? (
                 <span className="issue-attention">{d.attention_reason}</span>
-              ) : null}
-              {heldForHuman ? (
-                <button
-                  className="btn btn-xs"
-                  onClick={() => {
-                    setUnblockError(null);
-                    setConfirmUnblock(true);
-                  }}
-                >
-                  Unblock
-                </button>
               ) : null}
               {d.pull_requests.map((pr) =>
                 pr.url ? (
@@ -290,7 +264,14 @@ export function IssueTab({
               </span>
             </div>
           ) : null}
-          {unblockError ? <ErrorBanner message={unblockError} /> : null}
+          {d.done ? null : (
+            <ResolveControls
+              deployment={repo}
+              issue={issue}
+              heldForHuman={heldForHuman}
+              onChanged={detail.refresh}
+            />
+          )}
 
           <div className="subtabs issue-section-tabs" role="tablist" aria-label="Issue detail">
             {(["tasks", "events"] as const).map((option) => (
@@ -389,15 +370,6 @@ export function IssueTab({
             </div>
           ) : null}
 
-          {confirmUnblock ? (
-            <UnblockModal
-              issue={issue}
-              busy={unblocking}
-              error={unblockError}
-              onConfirm={() => void doUnblock()}
-              onCancel={() => setConfirmUnblock(false)}
-            />
-          ) : null}
         </>
       ) : null}
     </div>

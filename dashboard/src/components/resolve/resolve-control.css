@@ -1,0 +1,42 @@
+.resolve-control { min-width: 0; }
+.resolve-header { flex-wrap: wrap; gap: var(--space-4); }
+.resolve-header h2 { margin: 0; font-size: var(--text-lg); font-weight: var(--weight-semibold); }
+.resolve-header h2 .mono { color: var(--ink-muted); font-size: var(--text-sm); }
+.resolve-body { display: grid; gap: var(--space-5); }
+.resolve-control p { margin: var(--space-2) 0 var(--space-4); max-width: 75ch; overflow-wrap: anywhere; }
+.resolve-control h3 { margin: 0 0 var(--space-4); font-size: var(--text-base); font-weight: var(--weight-semibold); }
+.resolve-control .mono { overflow-wrap: anywhere; font-variant-numeric: tabular-nums; }
+.resolve-status-note { display: block; color: var(--ink-muted); margin-top: var(--space-2); font-weight: var(--weight-normal); }
+.resolve-held > strong { color: var(--running-br); }
+.resolve-error { color: var(--fail-br); }
+.resolve-state { font-size: var(--text-sm); color: var(--ink-muted); font-weight: var(--weight-normal); margin-left: var(--space-4); }
+.resolve-gates { list-style: none; margin: 0; padding: 0; }
+.resolve-gates > li { border-top: 1px solid var(--border); padding: var(--space-5) 0; }
+.resolve-gate-heading > .resolve-state { display: block; margin: 0 0 var(--space-4); }
+.resolve-control summary { cursor: pointer; color: var(--ink-muted); padding: var(--space-4) 0; overflow-wrap: anywhere; }
+.resolve-control summary:hover { color: var(--ink); }
+.resolve-control details[open] > summary { color: var(--ink); margin-bottom: var(--space-4); }
+.resolve-intent, .resolve-history, .resolve-operation { border-top: 1px solid var(--border); padding-top: var(--space-5); min-width: 0; }
+.resolve-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: var(--space-4) var(--space-5); margin: var(--space-4) 0 var(--space-5); }
+.resolve-facts dt { color: var(--ink-muted); }
+.resolve-facts dd { margin: 0; min-width: 0; }
+.resolve-prose { white-space: pre-wrap; overflow-wrap: anywhere; }
+.resolve-command-ids { padding-left: var(--space-6); }
+.resolve-actions { display: flex; flex-wrap: wrap; gap: var(--space-4); margin-top: var(--space-4); }
+.resolve-command-form fieldset { border: 0; margin: var(--space-5) 0 0; padding: 0; min-width: 0; display: grid; gap: var(--space-4); }
+.resolve-command-form legend { padding: 0; margin-bottom: var(--space-4); font-weight: var(--weight-semibold); }
+.resolve-control label { font-size: var(--text-sm); font-weight: var(--weight-medium); }
+.resolve-control input, .resolve-control select, .resolve-control textarea { width: 100%; min-width: 0; max-width: 100%; background: var(--surface-sunken); color: var(--ink); border: 1px solid var(--border-strong); border-radius: var(--radius-sm); padding: var(--space-4); font: inherit; }
+.resolve-control textarea { resize: vertical; }
+.resolve-control textarea:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.resolve-control [aria-invalid="true"] { border-color: var(--fail-br); }
+.resolve-control :disabled { opacity: .45; cursor: not-allowed; }
+.resolve-history-form { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: var(--space-4); }
+.resolve-history-form label, .resolve-history-form p { grid-column: 1 / -1; }
+@media (max-width: 480px) {
+  .resolve-control .btn, .resolve-control summary, .resolve-control input, .resolve-control select { min-height: 44px; }
+  .resolve-facts { grid-template-columns: minmax(0, 1fr); gap: var(--space-2); }
+  .resolve-facts dd { margin-bottom: var(--space-4); }
+  .resolve-history-form { grid-template-columns: minmax(0, 1fr); }
+  .resolve-actions > .btn { flex: 1 1 auto; white-space: normal; }
+}

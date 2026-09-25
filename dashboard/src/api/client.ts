@@ -18,6 +18,9 @@ import type {
   StepEventsPayload,
   UsagePayload,
   VerificationPayload,
+  ResolveControl,
+  ResolveCommand,
+  ResolveCommandResult,
 } from "./types";
 import { z } from "zod";
 import { schemas } from "./generated-zod";
@@ -31,6 +34,9 @@ export class ApiError extends Error {
   }
 }
 
+/** A validated pre-command rejection, not an ambiguous malformed reply. */
+export class RejectedRequest extends ApiError {}
+
 /** Thrown-abort detection: callers treat this as "not an error, just stale". */
 export function isAbort(e: unknown): boolean {
   return e instanceof DOMException && e.name === "AbortError";
@@ -40,15 +46,25 @@ async function decodeError(res: Response): Promise<never> {
   let detail = `${res.status} ${res.statusText}`;
   try {
     const body: unknown = await res.json();
-    if (body && typeof body === "object" && "detail" in body) {
-      const d = (body as { detail: unknown }).detail;
-      if (typeof d === "string" && d) detail = d;
-    }
+    detail = errorDetail(body) ?? detail;
   } catch {
     /* non-JSON body: keep the status line */
   }
   throw new ApiError(detail, res.status);
 }
+
+function errorDetail(body: unknown): string | null {
+  if (!body || typeof body !== "object" || !("detail" in body)) return null;
+  const detail = body.detail;
+  if (typeof detail === "string" && detail) return detail;
+  if (Array.isArray(detail)) {
+    const messages = detail.flatMap((item: unknown) => item && typeof item === "object" && "msg" in item && typeof item.msg === "string" ? [item.msg] : []);
+    if (messages.length) return messages.join("; ");
+  }
+  return null;
+}
+
+type ResponseOutcomes = Readonly<Record<number, z.ZodTypeAny>>;
 
 /**
  * A closed enum in the contract must not be able to blank a whole tab.
@@ -89,12 +105,16 @@ async function request<T>(
   init: RequestInit & { signal?: AbortSignal },
   schema?: z.ZodTypeAny,
   normalise?: (payload: unknown) => unknown,
+  outcomes?: ResponseOutcomes,
 ): Promise<T> {
   let res: Response;
   try {
     res = await fetch(path, { ...init, headers: { Accept: "application/json", ...init.headers } });
   } catch (e) {
     if (isAbort(e)) throw e;
+    if (e instanceof DOMException && e.name === "TimeoutError") {
+      throw new ApiError("the dashboard backend did not respond in time", 0);
+    }
     // The backend is loopback-only; the overwhelmingly likely cause is "not
     // running", so say that instead of the browser's opaque "Failed to fetch".
     throw new ApiError(
@@ -102,14 +122,30 @@ async function request<T>(
       0,
     );
   }
-  if (!res.ok) await decodeError(res);
-  const body: unknown = await res.json();
+  const responseSchema = outcomes ? outcomes[res.status] : schema;
+  if (outcomes ? !responseSchema : !res.ok) await decodeError(res);
+  let body: unknown;
+  try {
+    body = await res.json();
+  } catch (error) {
+    if (isAbort(error)) throw error;
+    if (error instanceof DOMException && error.name === "TimeoutError") {
+      throw new ApiError("the dashboard backend did not respond in time", res.status);
+    }
+    throw new ApiError(`dashboard backend returned an invalid response for ${path}`, res.status);
+  }
   const payload = normalise ? normalise(body) : body;
-  if (!schema) return payload as T;
-  const parsed = schema.safeParse(payload);
+  if (!responseSchema) return payload as T;
+  const parsed = responseSchema.safeParse(payload);
   if (!parsed.success) {
+    // A success body's `detail` is not an error message; only a failure
+    // status may lend its detail to the error.
+    const detail = res.ok ? null : errorDetail(body);
+    if (res.status === 422 && detail && body && typeof body === "object" && !("outcome" in body)) {
+      throw new RejectedRequest(detail, res.status);
+    }
     throw new ApiError(
-      `dashboard backend returned an invalid response for ${path}`,
+      detail ?? `dashboard backend returned an invalid response for ${path}`,
       res.status,
     );
   }
@@ -121,8 +157,9 @@ export function getJson<T>(
   schema: z.ZodTypeAny,
   signal?: AbortSignal,
   normalise?: (payload: unknown) => unknown,
+  outcomes?: ResponseOutcomes,
 ): Promise<T> {
-  return request<T>(path, { method: "GET", signal }, schema, normalise);
+  return request<T>(path, { method: "GET", signal }, schema, normalise, outcomes);
 }
 
 export function postJson<T>(
@@ -130,6 +167,7 @@ export function postJson<T>(
   body: unknown,
   schema: z.ZodTypeAny,
   signal?: AbortSignal,
+  outcomes?: ResponseOutcomes,
 ): Promise<T> {
   return request<T>(path, {
     method: "POST",
@@ -138,14 +176,35 @@ export function postJson<T>(
     headers: { "Content-Type": "application/json", "X-Issue-Agent-Dashboard": "1" },
     body: JSON.stringify(body ?? {}),
     signal,
-  }, schema);
+  }, schema, undefined, outcomes);
 }
 
 const enc = encodeURIComponent;
+const resolveReads = {
+  200: z.discriminatedUnion("status", [schemas.AvailableControl, schemas.InactiveControl]),
+  404: schemas.AbsentControl,
+  503: schemas.UnavailableControl,
+};
+const resolveWrites = Object.fromEntries(
+  [[202, "accepted"], [200, "replayed"], [409, "conflict"], [422, "rejected"], [503, "unavailable"]]
+    .map(([status, outcome]) => [status, schemas.CommandResult.refine((value) => value.outcome === outcome)]),
+);
 
 /* -------------------------------------------------------------- endpoints */
 
 export const api = {
+  resolveControl: (name: string, n: number, requestId?: string, s?: AbortSignal) =>
+    getJson<ResolveControl>(
+      `/api/repos/${enc(name)}/issues/${n}/resolve-control${requestId ? `?request_id=${enc(requestId)}` : ""}`,
+      schemas.CommandResult.shape.control, s, undefined, resolveReads,
+    ),
+
+  resolveCommand: (name: string, n: number, command: ResolveCommand, s?: AbortSignal) =>
+    postJson<ResolveCommandResult>(
+      `/api/repos/${enc(name)}/issues/${n}/resolve-control/commands`, command,
+      schemas.CommandResult, s, resolveWrites,
+    ),
+
   repos: (s?: AbortSignal) =>
     getJson<ReposPayload>("/api/repos", schemas.ReposPayload, s),
 

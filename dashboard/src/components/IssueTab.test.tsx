@@ -302,7 +302,7 @@ describe("IssueTab", () => {
   it("shows a sortable model column by default and keeps compact resize floors", async () => {
     vi.stubGlobal(
       "fetch",
-      vi.fn().mockResolvedValue(
+      vi.fn().mockImplementation(async () =>
         new Response(JSON.stringify({
           issue: 50,
           title: "Compact columns",
@@ -399,7 +399,7 @@ describe("IssueTab", () => {
       usage: null,
       ts: `2026-07-29T08:${String(idx).padStart(2, "0")}:00Z`,
     }));
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue(new Response(JSON.stringify({
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(async () => new Response(JSON.stringify({
       issue: 50,
       title: "Long task history",
       url: null,

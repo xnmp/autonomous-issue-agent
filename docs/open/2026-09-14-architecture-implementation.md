@@ -1,5 +1,25 @@
 # Architecture implementation phases
 
+**Resumed by the user on 2026-09-25** ("resume implementing the plan and don't
+stop until it's complete"). The [paused handover](2026-09-25-architecture-resume-handover.md)
+is historical input. The operator UI checkpoint below is accepted; offline
+activation/import is the current increment. Live operation, family activation on
+real deployment data and paid harness runs remain separately withheld.
+
+Operator UI checkpoint (2026-09-25): the issue page owns one keyed resolve
+controller; the board's "Review holds" opens it rather than mutating from a row.
+Commands are prepared from the fresh available status, rechecked against its
+binding at confirmation, saved in tab session storage before POST, and retried
+only byte-identically after an ambiguous reply; definite outcomes clear the
+saved record. The legacy unblock is offered only for a witnessed inactive family
+on a held issue. Shared polling now bounds each attempt (30 s) instead of letting a
+hung request silently stop a poll. Evidence: 380 Vitest + 3 build tests, 15
+Playwright scenarios against the real FastAPI app and production bundle (lost
+reply/reload/exact replay, cancel/continue, history lookup, legacy fence,
+keyboard flow, 320–1440 px layout), two independent adversarial reviews with
+all substantiated findings fixed and regression-tested. Python `make test` was
+green on the unchanged backend (1,624 domain / 1,753 adapter / 2,577 app).
+
 Overall status: **1–2 accepted; 3 in progress; 4–6 dependency-gated.** The
 [phase table](#phases-and-acceptance) below covers all six phases. The latest
 bounded increment is the [operator API checkpoint](2026-09-23-phase-3-operator-handover.md):
@@ -14,6 +34,19 @@ remaining checks and both Pyrefly passes. Dashboard contracts/typecheck and
 `/tmp/phase3-operator-dashboard-verified.log`. All four services remain disabled
 and inactive. Next is visible operator UX, then explicit offline activation/import
 and complete resolve-slice acceptance; phase 4 has not started.
+
+Operator UI collaboration brief (after `5e2d004`): extend the existing dashboard
+visual system, not its API authority. Parent owns generated-type aliases, the
+single HTTP client boundary, command lifecycle/state and persistent retry identity,
+polling/race semantics, and board/detail integration. Astra owns agreed presentational
+controls and behavioral UI tests after those contracts are fixed. Keep current
+and historical requests distinct; accepted is not completed. A lost response retains
+the exact command for retry, never a renewed ID or edited payload. Unknown/absent/
+unavailable state never falls back to legacy unblock; verified inactive authority
+is the only legacy entry. Reuse existing tokens, controls and polling primitives;
+no new framework, dependency or state/queue authority. Independent functional and
+visual review, isolated real-browser outcomes and full `make test` precede commit.
+No live service, target mutation, paid harness run or activation is authorized.
 
 **Phase 3 resumed on 2026-09-23 at the user's request.** See the
 [current re-arm preparation handover](2026-09-23-phase-3-rearm-handover.md),

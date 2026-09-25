@@ -58,7 +58,6 @@ import {
   type TableColumn,
 } from "./ui/ResizableTable";
 import { ConfirmModal } from "./ui/Modal";
-import { UnblockModal } from "./UnblockModal";
 import {
   EmptyState,
   ErrorBanner,
@@ -1101,7 +1100,6 @@ function TaskDetailRow({
   onRefresh: () => void;
   taskTableStorageKey?: string;
 }) {
-  const [confirming, setConfirming] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const detail = usePolled(
@@ -1114,21 +1112,6 @@ function TaskDetailRow({
   // Park only makes sense for the blocked-with-an-open-PR shape: a human is
   // taking the PR over, and the queue must stop waiting for it.
   const parkable = unblockable && card.pr !== null && card.pr_state === "open";
-
-  const doUnblock = async () => {
-    setBusy(true);
-    setError(null);
-    try {
-      await api.unblock(repo, card.issue);
-      setConfirming(false);
-      detail.refresh();
-      onRefresh();
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setBusy(false);
-    }
-  };
 
   const doPark = async () => {
     setBusy(true);
@@ -1152,15 +1135,17 @@ function TaskDetailRow({
             <strong>What happened</strong>
             <span className="row-wrap">
               {unblockable ? (
+                // Holds are released only from the issue page, where the
+                // current resolve authority decides which command applies.
                 <button
                   className="btn btn-xs"
+                  {...tipProps("Open the issue's resolve controls to review and release its holds")}
                   onClick={(event) => {
                     event.stopPropagation();
-                    setError(null);
-                    setConfirming(true);
+                    onOpen();
                   }}
                 >
-                  Unblock
+                  Review holds
                 </button>
               ) : null}
               {parkable ? (
@@ -1204,15 +1189,6 @@ function TaskDetailRow({
           ) : null}
           {(steps ?? card.steps).length === 0 ? (
             <EmptyState>no tasks recorded yet</EmptyState>
-          ) : null}
-          {confirming ? (
-            <UnblockModal
-              issue={card.issue}
-              busy={busy}
-              error={error}
-              onConfirm={() => void doUnblock()}
-              onCancel={() => setConfirming(false)}
-            />
           ) : null}
         </div>
       </td>

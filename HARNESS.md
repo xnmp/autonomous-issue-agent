@@ -228,9 +228,14 @@ input only.
 ### Resolve operator API
 
 The loopback dashboard exposes `GET /api/repos/{name}/issues/{number}/resolve-control`
-and `POST` to the same path plus `/commands`. This is a backend/API checkpoint;
-the SPA does not yet expose these controls. Live activation remains paused under
-the [architecture plan](docs/open/2026-09-14-architecture-implementation.md).
+and `POST` to the same path plus `/commands`. The issue page renders these as
+its resolve controls; the board's "Review holds" opens that page rather than
+mutating from the row. The browser saves the exact in-flight command in the
+tab's session storage before sending it, so a lost reply or reload offers only
+a byte-identical retry, never a new request ID. The legacy label unblock is
+offered only when this API reports the family `inactive`. Live activation
+remains paused under the
+[architecture plan](docs/open/2026-09-14-architecture-implementation.md).
 
 GET reads existing SQLite authority only. It distinguishes inactive family,
 active-but-absent target (404), available workflow, and unavailable/corrupt

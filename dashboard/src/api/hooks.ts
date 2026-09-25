@@ -27,6 +27,9 @@ interface PollState<T> {
 }
 
 const successfulPolls = new Map<string, CachedPoll>();
+/** Upper bound on one poll request. A polling caller retries on its next
+ * tick; a one-shot caller (interval <= 0) shows the error until refreshed. */
+export const POLL_TIMEOUT_MS = 30_000;
 const MAX_CACHED_POLLS = 64;
 
 function cachedPoll<T>(key: string | null): { data: T | null; updatedAt: number | null } {
@@ -76,8 +79,10 @@ export function usePolled<T>(
   key: string | null,
   fetcher: (signal: AbortSignal) => Promise<T>,
   intervalMs: number,
+  options: { cache?: boolean } = {},
 ): Polled<T> {
-  const initial = cachedPoll<T>(key);
+  const cache = options.cache !== false;
+  const initial = cachedPoll<T>(cache ? key : null);
   const [state, setState] = useState<PollState<T>>({
     key,
     data: initial.data,
@@ -88,7 +93,7 @@ export function usePolled<T>(
   const visible = useDocumentVisible();
   const current = state.key === key
     ? state
-    : { key, ...cachedPoll<T>(key), error: null };
+    : { key, ...cachedPoll<T>(cache ? key : null), error: null };
 
   const fetcherRef = useRef(fetcher);
   fetcherRef.current = fetcher;
@@ -97,31 +102,47 @@ export function usePolled<T>(
   // This keeps tab navigation instant without ever showing one repo's data
   // under another repo's heading; the effect below still refreshes immediately.
   useEffect(() => {
-    const cached = cachedPoll<T>(key);
+    const cached = cachedPoll<T>(cache ? key : null);
     setState({ key, data: cached.data, error: null, updatedAt: cached.updatedAt });
-  }, [key]);
+  }, [key, cache]);
 
   useEffect(() => {
     if (key === null) return;
     let cancelled = false;
+    let running = false;
     const ac = new AbortController();
 
     const run = async () => {
+      if (running) return;
+      running = true;
+      // A hung request would otherwise hold `running` forever and silently
+      // stop the poll; a bounded attempt surfaces as an ordinary read error.
+      const attempt = new AbortController();
+      const forward = () => attempt.abort(ac.signal.reason);
+      ac.signal.addEventListener("abort", forward);
+      const timer = window.setTimeout(
+        () => attempt.abort(new DOMException("request timed out", "TimeoutError")),
+        POLL_TIMEOUT_MS,
+      );
       try {
-        const value = await fetcherRef.current(ac.signal);
+        const value = await fetcherRef.current(attempt.signal);
         if (cancelled) return;
         const completedAt = Date.now();
-        rememberSuccessfulPoll(key, { data: value, updatedAt: completedAt });
+        if (cache) rememberSuccessfulPoll(key, { data: value, updatedAt: completedAt });
         setState({ key, data: value, error: null, updatedAt: completedAt });
       } catch (e) {
         if (cancelled || isAbort(e)) return;
-        const cached = cachedPoll<T>(key);
+        const cached = cachedPoll<T>(cache ? key : null);
         setState((previous) => ({
           key,
           data: previous.key === key ? previous.data : cached.data,
           error: e instanceof Error ? e.message : String(e),
           updatedAt: previous.key === key ? previous.updatedAt : cached.updatedAt,
         }));
+      } finally {
+        window.clearTimeout(timer);
+        ac.signal.removeEventListener("abort", forward);
+        running = false;
       }
     };
 
@@ -138,7 +159,7 @@ export function usePolled<T>(
       ac.abort();
       window.clearInterval(id);
     };
-  }, [key, intervalMs, visible, nonce]);
+  }, [key, intervalMs, visible, nonce, cache]);
 
   const refresh = useCallback(() => setNonce((n) => n + 1), []);
   return {

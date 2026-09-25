@@ -57,9 +57,9 @@ function polled(
   };
 }
 
-function board(issues: Polled<IssuesPayload>) {
+function board(issues: Polled<IssuesPayload>, onOpenIssue = vi.fn()) {
   return render(
-    <IssuesTab repo="demo" sub="inflight" issues={issues} onOpenIssue={vi.fn()} />,
+    <IssuesTab repo="demo" sub="inflight" issues={issues} onOpenIssue={onOpenIssue} />,
   );
 }
 
@@ -95,7 +95,7 @@ describe("board explainability", () => {
     expect(annotation).not.toHaveClass("trunc");
   });
 
-  it("offers Park beside Unblock only when a blocked issue has an open PR", async () => {
+  it("offers Park beside the hold review only when a blocked issue has an open PR", async () => {
     vi.stubGlobal(
       "fetch",
       vi.fn(async () =>
@@ -121,7 +121,7 @@ describe("board explainability", () => {
     }]));
     await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
     expect(await screen.findByRole("button", { name: "Park" })).toBeVisible();
-    expect(screen.getByRole("button", { name: "Unblock" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Review holds" })).toBeVisible();
     vi.unstubAllGlobals();
   });
 
@@ -141,10 +141,15 @@ describe("board explainability", () => {
         ),
       ),
     );
-    board(polled([{ ...base, human_action: "escalated", flags: ["escalated"] }]));
+    const onOpenIssue = vi.fn();
+    board(polled([{ ...base, human_action: "escalated", flags: ["escalated"] }]), onOpenIssue);
     await userEvent.click(screen.getByRole("row", { name: /Explain the board/ }));
-    expect(await screen.findByRole("button", { name: "Unblock" })).toBeVisible();
     expect(screen.queryByRole("button", { name: "Park" })).not.toBeInTheDocument();
+    // The board never releases holds itself: it hands off to the issue page,
+    // where current resolve authority decides which command applies.
+    await userEvent.click(await screen.findByRole("button", { name: "Review holds" }));
+    expect(onOpenIssue).toHaveBeenCalledWith(200);
+    expect(vi.mocked(fetch).mock.calls.some(([, init]) => (init as RequestInit | undefined)?.method === "POST")).toBe(false);
     vi.unstubAllGlobals();
   });
 

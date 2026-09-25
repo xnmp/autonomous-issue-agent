@@ -42,6 +42,13 @@ export type IssueStep = Schema["IssueStep"];
 export type IssueDetailPayload = Schema["IssueDetailPayload"];
 export type StepEventsPayload = Schema["StepEventsPayload"];
 export type ActionResult = Schema["ActionResult"];
+export type ResolveControl = Schema["CommandResult"]["control"];
+export type AvailableResolveControl = Schema["AvailableControl"];
+export type ResolveGate = Schema["Gate"];
+export type ResolveRearm = Schema["Rearm"];
+export type ResolveCommand = Schema["RequestRearm"] | Schema["ContinueRearm"] | Schema["CancelRearm"];
+export type ResolveCommandResult = Schema["CommandResult"];
+export type ResolveGuidance = Schema["RequestRearm"]["guidance"];
 
 export type RoleName = "fix" | "review" | "steward";
 export type VerificationStatus =
