@@ -864,7 +864,8 @@ def validate_resolve_transition(
         expected = request_resolve_rearm(prior, audit.command, audit.actor, preflight.issue, preflight.linkage, now=now, active_attempts=(), external_holds=preflight.external_holds, workspace=preflight.workspace)
     elif proposal.mutation is WorkflowMutation.CONTINUE_REARM and isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, ContinueGrantedRearm):
         preflight = audit.preflight
-        assert preflight is not None
+        if not isinstance(preflight, (ResolveRearmPreflight, ResolveRearmAcceptance)):
+            raise ValueError("resolve continuation requires its resolve preflight")
         expected = continue_resolve_rearm(prior, audit.command, audit.actor, preflight.issue, preflight.linkage, now=now, active_attempts=(), external_holds=preflight.external_holds)
     elif proposal.mutation is WorkflowMutation.STOP_REARM:
         intent = proposal.snapshot.intent
@@ -929,7 +930,9 @@ def validate_resolve_transition(
         assert isinstance(intent, PendingRearm)
         if {c.command_id for c in proposal.commands} != set(intent.required_commands):
             raise ValueError("accepted intent and durable outbox obligations must match exactly")
-        assert isinstance(audit, AuthorizedOperatorCommand) and audit.preflight is not None
+        assert isinstance(audit, AuthorizedOperatorCommand)
+        if not isinstance(audit.preflight, (ResolveRearmPreflight, ResolveRearmAcceptance)):
+            raise ValueError("resolve projection requires its resolve preflight")
         for command in proposal.commands:
             if command.kind is not CommandKind.RELABEL or command.target != f"issue:{proposal.expected.fence.key.target.number}" or not command.expected_revision:
                 raise ValueError("resolve projection requires a revision-fenced issue relabel")

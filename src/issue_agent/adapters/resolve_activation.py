@@ -10,7 +10,6 @@ import decisions in one short transaction.
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 import re
 import shutil
@@ -32,7 +31,9 @@ from ..domain.workflow_identity import IssueRef, WorkflowFamily, WorkflowKey, ca
 from .control_store import SQLiteControlStore
 from .deployment_authority import deployment_effect_barrier
 from .workflow_codec import encode_workflow
-from .workflow_rows import WorkflowAuthorityError, persist_workflow_snapshot, workflow_scope
+from .workflow_rows import (
+    WorkflowAuthorityError, family_run_scope_bounds, family_target_kind, persist_workflow_snapshot, workflow_scope,
+)
 
 _LEGACY_NAME = re.compile(r"issue-(.+)\.(" + "|".join(re.escape(s) for s in LEGACY_SUFFIXES) + r")")
 _ISSUE_NUMBER = re.compile(r"[1-9][0-9]{0,18}")
@@ -190,15 +191,18 @@ def read_inventory(db: sqlite3.Connection, repository: str) -> DeploymentInvento
         if (scoped := [v for v in (row["repository"], row["workload_repository"]) if v != "*"]) == []
         or any(_ours(value, repository) for value in scoped)
     }))
+    # Only resolve-family rows are retained resolve authority; a review-family
+    # PR row belongs to its own activation and never blocks this one.
+    kind = family_target_kind(WorkflowFamily.RESOLVE)
     retained = {
         f"{row[0]}:{row[1]}" for table in ("workflows", "workflow_gates", "workflow_rearms")
-        for row in db.execute(f"SELECT target_kind, target_number FROM {table} WHERE repository=?", (repository,))
+        for row in db.execute(f"SELECT target_kind, target_number FROM {table} WHERE repository=? AND target_kind=?",
+                              (repository, kind))
     }
-    prefix = json.dumps((repository,), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
     retained |= {
         f"run:{row[0]}" for row in db.execute(
             "SELECT run_id FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<?",
-            (prefix, prefix + "￿"),
+            family_run_scope_bounds(repository, WorkflowFamily.RESOLVE),
         )
     }
     return DeploymentInventory(

@@ -1,6 +1,8 @@
-"""Resolve workflow values and transition contracts; ADR 0015.
+"""Resolve workflow values and family-shared transition contracts; ADR 0015.
 
 Adapters mint observations and operator provenance. These values perform no I/O.
+Review-family values live in `review_workflow`; only the shared unions and
+transition envelopes below admit them.
 """
 
 from __future__ import annotations
@@ -8,13 +10,15 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
 from .workflow_identity import (
-    FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily,
-    WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowTarget,
+    MAX_DETAIL_CHARS, MAX_REARM_COMMANDS, MAX_WORKFLOW_GATES, FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily,
+    WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowTarget, target_family,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
 )
+from .review_rejection import ReviewRearmPreflight, ReviewRejectionCeiling
 from .world import Comment, IssueView
 from .labels import Label
 from .resolve_split import NeedsAdjudication, SplitContinuation, SplitImplement, split_sources
@@ -23,10 +27,16 @@ from .resolve_workspace import (
     ResolveWorkspaceObserved,
 )
 
+if TYPE_CHECKING:
+    from .review_workflow import AnyWorkflowSnapshot, ReviewWorkflowSnapshot
+
 GUIDANCE_MAX_CHARS = 4000
-MAX_DETAIL_CHARS = 16384
-MAX_WORKFLOW_GATES = 64
-MAX_REARM_COMMANDS = 64
+
+
+def _snapshot_types() -> tuple[type, ...]:
+    """Review snapshots build on the gate values below, so envelopes import them lazily."""
+    from .review_workflow import ReviewWorkflowSnapshot
+    return (WorkflowSnapshot, ReviewWorkflowSnapshot)
 
 
 def _text(value: str, name: str, *, limit: int = 512, empty: bool = False) -> None:
@@ -264,8 +274,8 @@ class RearmNeedsDecision:
             raise ValueError("rearm stop reason must be typed")
 
 
-GateCause = ResolveCeiling | RemoteOutcomeUncertain | RetryAuthorizationRequired | EvidenceUnavailable | RearmNeedsDecision
-_CAUSES = (ResolveCeiling, RemoteOutcomeUncertain, RetryAuthorizationRequired, EvidenceUnavailable, RearmNeedsDecision)
+GateCause = ResolveCeiling | ReviewRejectionCeiling | RemoteOutcomeUncertain | RetryAuthorizationRequired | EvidenceUnavailable | RearmNeedsDecision
+_CAUSES = (ResolveCeiling, ReviewRejectionCeiling, RemoteOutcomeUncertain, RetryAuthorizationRequired, EvidenceUnavailable, RearmNeedsDecision)
 
 
 class RemediationOperation(str, Enum):
@@ -621,6 +631,8 @@ class WorkflowSnapshot:
             raise ValueError("gate identities must be unique")
         if any(g.opened_generation > self.revision.fence.generation for g in opened):
             raise ValueError("a gate cannot originate in a future generation")
+        if any(isinstance(g.cause, ReviewRejectionCeiling) for g in opened):
+            raise ValueError("a resolve workflow cannot hold a review rejection cause")
         if self.intent is not None and not isinstance(
             self.intent, (PendingRearm, CompletedRearm, SupersededRearm, CancelledRearm)
         ):
@@ -677,17 +689,20 @@ class WorkflowUnavailable:
 
 @dataclass(frozen=True)
 class WorkflowMigrationRequired:
-    """The repository's resolve family has no activation; never file fallback."""
+    """The target's family has no activation in this repository; never file fallback."""
 
     key: WorkflowKey
+    family: WorkflowFamily = WorkflowFamily.RESOLVE
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, WorkflowKey):
             raise ValueError("migration-required state requires a queried workflow identity")
+        if not isinstance(self.family, WorkflowFamily) or target_family(self.key.target) is not self.family:
+            raise ValueError("migration-required family must own the queried target")
 
     @property
     def reason(self) -> str:
-        return "resolve_migration_required"
+        return f"{self.family.value}_migration_required"
 
 
 WorkflowRead = WorkflowSnapshot | WorkflowAbsent | WorkflowMigrationRequired | WorkflowUnavailable
@@ -1088,20 +1103,26 @@ class WorkflowMutation(str, Enum):
     RECONCILE_REARM = "reconcile_rearm"
     STOP_REARM = "stop_rearm"
     AUTHORIZE_RETRY = "authorize_retry"
+    RECORD_REVIEW = "record_review"
 
 
 @dataclass(frozen=True)
 class AuthorizedOperatorCommand:
     actor: OperatorActor
     command: OperatorCommand
-    preflight: ResolveRearmPreflight | ResolveRearmAcceptance | None = None
+    preflight: ResolveRearmPreflight | ResolveRearmAcceptance | ReviewRearmPreflight | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.actor, OperatorActor) or not isinstance(
             self.command, (RequestRearm, ContinueGrantedRearm, CancelRearm, AuthorizeAbsentRetry)
         ):
             raise ValueError("operator transition requires authenticated actor and typed command")
-        if isinstance(self.command, RequestRearm):
+        if isinstance(self.command, (RequestRearm, ContinueGrantedRearm)) and target_family(
+            self.command.expected.fence.key.target
+        ) is WorkflowFamily.REVIEW_REJECTIONS:
+            if not isinstance(self.preflight, ReviewRearmPreflight) or self.preflight.pr_key != self.command.expected.fence.key:
+                raise ValueError("review rearm authorization requires this pull request's complete review preflight")
+        elif isinstance(self.command, RequestRearm):
             if (not isinstance(self.preflight, ResolveRearmAcceptance)
                     or self.preflight.workspace.source.fence != self.command.expected.fence):
                 raise ValueError("new allowance requires this workflow's observed workspace acceptance")
@@ -1129,15 +1150,24 @@ TransitionAudit = AuthorizedOperatorCommand | ResolveAttemptResult | ObservedTra
 class WorkflowChanged:
     expected: WorkflowRevision
     mutation: WorkflowMutation
-    snapshot: WorkflowSnapshot
+    snapshot: AnyWorkflowSnapshot
     audit: TransitionAudit
     commands: tuple[LifecycleCommand, ...] = ()
+    # Review transitions carry the exact snapshot they replace so provenance
+    # (continuation, authorization chain) is checked at construction. The
+    # commit adapter proves it equal to the stored row; it is never persisted.
+    prior: "ReviewWorkflowSnapshot | None" = None
 
     def __post_init__(self) -> None:
+        from .review_workflow import (
+            BoundReviewSubmission, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm,
+            ReviewedBaseline, ReviewWorkflowSnapshot, SupersededReviewRearm, validate_review_change,
+        )
         if not isinstance(self.expected, WorkflowRevision) or not isinstance(
-            self.snapshot, WorkflowSnapshot
+            self.snapshot, (WorkflowSnapshot, ReviewWorkflowSnapshot)
         ) or not isinstance(self.mutation, WorkflowMutation):
             raise ValueError("transition requires typed revision, mutation and snapshot")
+        review = isinstance(self.snapshot, ReviewWorkflowSnapshot)
         before, after = self.expected, self.snapshot.revision
         if before.fence.key != after.fence.key or after.version != before.version + 1:
             raise ValueError("a transition advances one version of the same workflow")
@@ -1156,12 +1186,25 @@ class WorkflowChanged:
             if not isinstance(self.audit, AuthorizedOperatorCommand) or not isinstance(self.audit.command, required_command) or self.audit.command.expected != self.expected:
                 raise ValueError("operator transition requires matching authorized request")
         elif self.mutation is WorkflowMutation.RECORD_RESULT:
+            if review:
+                raise ValueError("attempt results belong to the resolve family")
             if not isinstance(self.audit, ResolveAttemptResult) or self.audit.attempt.binding != self.snapshot.binding:
                 raise ValueError("result transition requires this episode's trusted attempt identity")
+        elif self.mutation is WorkflowMutation.RECORD_REVIEW:
+            if not review:
+                raise ValueError("review completion belongs to the review rejection family")
+            continuation = self.snapshot.episode.continuation
+            if (not isinstance(continuation, ReviewedBaseline)
+                    or not isinstance(continuation.source, BoundReviewSubmission)
+                    or continuation.reviewed_generation != self.snapshot.revision.fence.generation):
+                raise ValueError("recorded review must establish a bound baseline of the current generation")
+            if not isinstance(self.audit, ObservedTransition) or str(continuation.source.command_id) not in self.audit.evidence_ids:
+                raise ValueError("recorded review requires its bound submission evidence")
         elif self.mutation is WorkflowMutation.STOP_REARM:
-            if not isinstance(self.snapshot.intent, (SupersededRearm, CancelledRearm)):
+            terminal = (SupersededReviewRearm, CancelledReviewRearm) if review else (SupersededRearm, CancelledRearm)
+            if not isinstance(self.snapshot.intent, terminal):
                 raise ValueError("stopped rearm requires a terminal intent")
-            if isinstance(self.snapshot.intent, CancelledRearm):
+            if isinstance(self.snapshot.intent, (CancelledRearm, CancelledReviewRearm)):
                 if not isinstance(self.audit, AuthorizedOperatorCommand) or not isinstance(self.audit.command, CancelRearm) or self.audit.command.expected != self.expected or self.audit.command.request_id != self.snapshot.intent.request_id or self.audit.command.cancellation_id != self.snapshot.intent.cancellation_id:
                     raise ValueError("cancelled rearm requires the matching operator cancellation")
             elif not isinstance(self.audit, ObservedTransition):
@@ -1170,11 +1213,13 @@ class WorkflowChanged:
             raise ValueError("observed transition requires observed audit provenance")
         if advances:
             intent = self.snapshot.intent
-            if not isinstance(intent, PendingRearm) or not isinstance(self.audit, AuthorizedOperatorCommand) or not isinstance(self.audit.command, (RequestRearm, ContinueGrantedRearm)) or intent.request_id != self.audit.command.request_id:
+            pending = PendingReviewRearm if review else PendingRearm
+            if not isinstance(intent, pending) or not isinstance(self.audit, AuthorizedOperatorCommand) or not isinstance(self.audit.command, (RequestRearm, ContinueGrantedRearm)) or intent.request_id != self.audit.command.request_id:
                 raise ValueError("accepted rearm must own a matching pending intent")
             if isinstance(self.audit.command, RequestRearm) and intent.gate_id != self.audit.command.gate_id:
                 raise ValueError("accepted rearm must own its selected gate")
-        if self.mutation is WorkflowMutation.RECONCILE_REARM and not isinstance(self.snapshot.intent, CompletedRearm):
+        completed = CompletedReviewRearm if review else CompletedRearm
+        if self.mutation is WorkflowMutation.RECONCILE_REARM and not isinstance(self.snapshot.intent, completed):
             raise ValueError("completed rearm requires a completed intent")
         _items(self.commands, "commands", (LifecycleCommand,), MAX_REARM_COMMANDS)
         if len({c.command_id for c in self.commands}) != len(self.commands):
@@ -1183,14 +1228,18 @@ class WorkflowChanged:
             raise ValueError("transition cannot cross repository authority")
         if any(c.workflow != self.snapshot.binding for c in self.commands):
             raise ValueError("transition commands require the resulting workflow binding")
+        if review:
+            validate_review_change(self)
+        elif self.prior is not None:
+            raise ValueError("resolve transitions do not carry a review prior")
 
 
 @dataclass(frozen=True)
 class WorkflowUnchanged:
-    snapshot: WorkflowSnapshot
+    snapshot: AnyWorkflowSnapshot
 
     def __post_init__(self) -> None:
-        if not isinstance(self.snapshot, WorkflowSnapshot):
+        if not isinstance(self.snapshot, _snapshot_types()):
             raise ValueError("unchanged transition requires a validated snapshot")
 
 
@@ -1221,11 +1270,11 @@ WorkflowTransition = WorkflowChanged | WorkflowUnchanged | WorkflowRejected
 
 @dataclass(frozen=True)
 class WorkflowCommitted:
-    snapshot: WorkflowSnapshot
+    snapshot: AnyWorkflowSnapshot
     idempotent: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.snapshot, WorkflowSnapshot) or type(self.idempotent) is not bool:
+        if not isinstance(self.snapshot, _snapshot_types()) or type(self.idempotent) is not bool:
             raise ValueError("workflow commit requires a snapshot and boolean replay marker")
 
 
@@ -1242,11 +1291,11 @@ class WorkflowConflict:
 
 @dataclass(frozen=True)
 class HeldProjection:
-    snapshot: WorkflowSnapshot
+    snapshot: AnyWorkflowSnapshot
     external_holds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.snapshot, WorkflowSnapshot):
+        if not isinstance(self.snapshot, _snapshot_types()):
             raise ValueError("held projection requires a validated snapshot")
         _items(self.external_holds, "external holds", (str,), MAX_WORKFLOW_GATES)
         for reason in self.external_holds:

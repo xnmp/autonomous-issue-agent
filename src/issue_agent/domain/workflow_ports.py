@@ -1,4 +1,4 @@
-"""Bound repository/owner ports for resolve workflow control; ADR 0015."""
+"""Bound repository/owner ports for resolve and review-rejection workflow control; ADR 0015."""
 
 from typing import Protocol
 from contextlib import AbstractContextManager
@@ -10,11 +10,12 @@ from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, Ep
 from .resolve_rearm import PendingResolveRearm, ResolveControlRead, UnavailableResolveRearm
 from .workflow import (
     AuthorizeAbsentRetry, ReconciliationOnly, UnconsumedRetryAuthorization, WorkflowRejected,
-    AuthorizedOperatorCommand, CancelRearm, OperatorActor,
+    AuthorizedOperatorCommand, CancelRearm, ContinueGrantedRearm, OperatorActor, RequestRearm,
     HeldProjection, RearmIntent, RetryAlreadyConsumed, RetryDeclined, RetryStale,
     RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead, WorkflowSnapshot,
 )
 from .workflow_retry import RetryAbsenceRead
+from .review_workflow import ReviewRearmPreflight, ReviewWorkflowRead
 from .workflow_identity import (
     FamilyAuthority, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
 )
@@ -105,6 +106,40 @@ class WorkflowControl(Protocol):
     ) -> RearmIntent | None: ...
 
     def held_projection(self, key: WorkflowKey) -> HeldProjection: ...
+
+
+class ReviewWorkflowControl(Protocol):
+    """PR-scoped review-rejection authority bound to the repository's review owner.
+
+    Declared ahead of its SQLite implementation (review slice increment 5).
+    Reads distinguish absence, unavailability and a never-activated family
+    (`WorkflowMigrationRequired(family=REVIEW_REJECTIONS)`). Acceptance takes
+    the deployment barriers, refreshes facts read-only and commits local intent
+    only; the preflight is harness-minted from a complete review read and is
+    never parsed from operator input. No method accepts an owner identity.
+    """
+
+    @property
+    def writer(self) -> WorkflowWriter: ...
+
+    def load_workflow(self, key: WorkflowKey) -> ReviewWorkflowRead: ...
+
+    def commit_workflow(
+        self,
+        expected: WorkflowRevision,
+        authorities: tuple[FamilyAuthority, ...],
+        transition: WorkflowChanged,
+    ) -> WorkflowCommitted | WorkflowConflict: ...
+
+    def request_rearm(
+        self, command: RequestRearm, actor: OperatorActor, preflight: ReviewRearmPreflight,
+    ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected: ...
+
+    def continue_rearm(
+        self, command: ContinueGrantedRearm, actor: OperatorActor, preflight: ReviewRearmPreflight,
+    ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected: ...
+
+    def cancel_rearm(self, command: CancelRearm, actor: OperatorActor) -> WorkflowCommitted | WorkflowConflict: ...
 
 
 class WorkflowRetryControl(Protocol):

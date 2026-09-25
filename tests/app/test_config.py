@@ -520,6 +520,14 @@ def test_contract_round_limit_matches_durable_context_capacity():
         assert any("MAX_CONTRACT_ROUNDS" in error for error in config.validation_errors()) is rejected
 
 
+def test_review_rejection_ceiling_fits_one_rearm_dismissal_fan_out():
+    for value, rejected in (("0", False), ("4", False), ("63", False), ("64", True), ("1000000", True)):
+        config = from_env({"REPO": "x", "FIX_BOT": "fix-bot", "REVIEW_MAX_REJECTIONS": value})
+        errors = [error for error in config.validation_errors() if "REVIEW_MAX_REJECTIONS" in error]
+        assert bool(errors) is rejected
+        assert not rejected or "<= 63" in errors[0]
+
+
 def test_validation_rejects_invalid_budgets():
     c = from_env({
         "REPO": "x",

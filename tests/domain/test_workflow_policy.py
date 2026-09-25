@@ -193,7 +193,7 @@ def exhausted(*, extra_gates=(), guidance=""):
     state = snapshot(failures=2, guidance=guidance)
     state = replace(state, gates=extra_gates)
     transition = record_resolve_attempt(state, result(state, summary="failed experiment"), ceiling=3, admission=admission(state, result(state, summary="failed experiment")))
-    assert isinstance(transition, WorkflowChanged)
+    assert isinstance(transition, WorkflowChanged) and isinstance(transition.snapshot, WorkflowSnapshot)
     return transition.snapshot
 
 
@@ -283,7 +283,7 @@ def test_initial_workflow_requires_a_valid_aware_transaction_clock(now):
 def test_prior_proposal_validation_rejects_arbitrary_counter_replacement():
     before = snapshot()
     proposal = record_resolve_attempt(before, result(before), ceiling=3, admission=admission(before, result(before)))
-    assert isinstance(proposal, WorkflowChanged)
+    assert isinstance(proposal, WorkflowChanged) and isinstance(proposal.snapshot, WorkflowSnapshot)
     validate_resolve_transition(before, proposal, ceiling=3, now=NOW, admission=admission(before, proposal.audit))
     forged = replace(proposal, snapshot=replace(proposal.snapshot, episode=replace(proposal.snapshot.episode, failures=10)))
     with pytest.raises(ValueError, match="pure transition"):
@@ -660,7 +660,7 @@ def authored_state():
     before = snapshot()
     author = staged_result(before, ResolveStage.AUTHOR)
     changed = record_resolve_attempt(before, author, ceiling=3, admission=admission(before, author))
-    assert isinstance(changed, WorkflowChanged)
+    assert isinstance(changed, WorkflowChanged) and isinstance(changed.snapshot, WorkflowSnapshot)
     return changed.snapshot
 
 

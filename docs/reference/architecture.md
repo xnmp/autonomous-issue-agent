@@ -483,9 +483,12 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
+`domain/review_rejection.py`, `domain/review_workflow.py`,
 `domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
-incremental gate/re-arm authority migration; workspace handoffs are explicit
+incremental gate/re-arm authority migration; the PR-owned review-rejection
+family has its own snapshot, continuation and handoff-free intents, sharing only
+the gate values and transition envelopes with resolve; workspace handoffs are explicit
 preparation obligations, not AUTHOR evidence or independent execution authority;
 family activation plans legacy imports offline and refuses rather than defaulting;
 an operator retry authorization buys exactly one execution of an existing
@@ -511,7 +514,9 @@ reconciliation-only command after harness-proven absence).
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
 `adapters/typed_journal.py`, `adapters/untrusted.py`,
 `adapters/wake.py`, `adapters/worktree.py`, `adapters/workflow_codec.py`,
-`adapters/workflow_rows.py`, `adapters/workflow_control.py`, and
+`adapters/workflow_rows.py` (family-scoped authority reads),
+`adapters/workflow_commit.py` (family-neutral CAS receipt helpers),
+`adapters/workflow_control.py`, and
 `adapters/workspace_admission.py`. Dashboard-specific read
 adapters live under `adapters/dashweb/`.
 

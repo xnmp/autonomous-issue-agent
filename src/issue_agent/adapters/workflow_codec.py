@@ -12,6 +12,7 @@ import json
 from typing import TypeVar
 
 from ..domain import workflow as w
+from ..domain import review_workflow as rw
 from ..domain import workflow_identity as identity
 from ..domain.contracts import WorkflowAttemptIdentity
 from ..domain.labels import Label
@@ -57,13 +58,23 @@ _VALUES = (
     w.ConsumedRetryAuthorization, w.ClosedRetryAuthorization, w.ActiveReconciliation, w.ReconciliationOnly,
     w.RetiredUncertainCommand, w.RetiredSettledCommand, w.ResolveAttemptResult,
     w.AuthorizedOperatorCommand, w.ObservedTransition,
+    # Review-rejection family (ADR 0015 review slice).
+    rw.CountedReview, rw.ReviewRejectionCeiling, rw.ReviewRearmPreflight,
+    rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ImportedBaseline, rw.ReviewedBaseline,
+    rw.ReviewEpisode, rw.DismissCountedReview, rw.RequireFreshReview, rw.EnsureReviewProjection,
+    rw.PendingReviewRearm, rw.CompletedReviewRearm, rw.SupersededReviewRearm, rw.CancelledReviewRearm,
+    rw.ReviewWorkflowSnapshot, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
+    rw.ObservedPullRequest, rw.PullRequestAbsent, rw.PullRequestUnavailable,
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.StopReason, w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
+    rw.SubmittedReviewState, rw.PullRequestState,
 )
 _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
+if len(_TAGS) != len(_VALUES) + len(_ENUMS):
+    raise RuntimeError("workflow codec tags must name exactly one registered variant")
 
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.

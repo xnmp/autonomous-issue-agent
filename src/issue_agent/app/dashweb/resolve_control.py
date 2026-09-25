@@ -45,8 +45,12 @@ def _cause(cause: w.GateCause) -> wire.GateCause:
         return wire.EvidenceUnavailable(kind="evidence_unavailable", source=cause.required_fact,
                                         unresolved_since=cause.unresolved_since.isoformat(), failed_reads=cause.failed_reads,
                                         last_error=cause.last_error)
-    return wire.RearmNeedsDecision(kind="rearm_needs_decision", stopped_request_id=cause.stopped_request_id,
-                                   obligations=list(cause.obligations), reason=cause.reason.value)
+    if isinstance(cause, w.RearmNeedsDecision):
+        return wire.RearmNeedsDecision(kind="rearm_needs_decision", stopped_request_id=cause.stopped_request_id,
+                                       obligations=list(cause.obligations), reason=cause.reason.value)
+    # A resolve snapshot cannot hold a review rejection cause; the resolve wire
+    # contract stays byte-stable rather than growing a PR-scoped variant.
+    raise ValueError(f"resolve control has no wire form for {type(cause).__name__}")
 
 
 def _gate(gate: w.UnresolvedGate, snapshot: w.WorkflowSnapshot, retry_authorizable: frozenset[str] = frozenset(),

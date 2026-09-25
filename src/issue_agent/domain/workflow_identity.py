@@ -6,6 +6,12 @@ from typing import Literal
 
 from .repository import canonical_repository, repository_validation_error
 
+# Shared workflow bounds live with the identities so family modules below
+# `workflow.py` can derive their own bounds without an import cycle.
+MAX_REARM_COMMANDS = 64   # durable obligations of one transition or re-arm
+MAX_WORKFLOW_GATES = 64
+MAX_DETAIL_CHARS = 16384
+
 
 def validate_workflow_integer(value: int, name: str, *, minimum: int = 0) -> None:
     if type(value) is not int or not minimum <= value <= 2**63 - 1:
@@ -70,6 +76,17 @@ class WorkflowKey:
 
 class WorkflowFamily(str, Enum):
     RESOLVE = "resolve"
+    REVIEW_REJECTIONS = "review_rejections"
+
+
+def target_family(target: WorkflowTarget) -> WorkflowFamily:
+    """Phase 3 owns one family per target: resolve is issue-owned and review
+    rejection is PR-owned regardless of changing issue linkage (ADR 0015)."""
+    if isinstance(target, IssueRef):
+        return WorkflowFamily.RESOLVE
+    if isinstance(target, PullRequestRef):
+        return WorkflowFamily.REVIEW_REJECTIONS
+    raise ValueError("workflow target must be an issue or pull request identity")
 
 
 @dataclass(frozen=True)
@@ -116,6 +133,8 @@ class WorkflowBinding:
             raise ValueError("workflow binding requires a validated fence and authority")
         if self.authority.family is WorkflowFamily.RESOLVE and not isinstance(self.fence.key.target, IssueRef):
             raise ValueError("resolve episodes belong to issues, not pull requests")
+        if self.authority.family is WorkflowFamily.REVIEW_REJECTIONS and not isinstance(self.fence.key.target, PullRequestRef):
+            raise ValueError("review rejection episodes belong to pull requests, not issues")
         validate_workflow_identifier(self.episode_id, "workflow episode")
 
 

@@ -63,69 +63,14 @@ from .control_store import (
 from .effects import command_for_action
 from .deployment_authority import DeploymentAuthority, deployment_role, deployment_effect_barrier
 from .workflow_codec import decode_workflow, encode_workflow
+from .workflow_commit import (
+    insert_pending_rearm, intent_state, opened_gate, owns_command, record_commit, record_stop_evidence,
+    replay_or_conflict, retire_rearm_obligation, transition_receipt, update_rearm_state,
+)
 from .workflow_rows import (
-    WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict, load_workflow_row,
+    WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict, load_resolve_workflow_row,
     load_resolve_authority, load_workspace_ack, persist_workflow_snapshot, workflow_scope,
 )
-
-
-def _opened(gate: OpenGate | RearmingGate) -> OpenGate:
-    return gate.gate if isinstance(gate, RearmingGate) else gate
-
-
-def _accepted_proposal(proposal: WorkflowChanged) -> str:
-    """Retain accepted facts and plan; these are not the operator's identity."""
-    snapshot = replace(proposal.snapshot, gates=tuple(sorted(proposal.snapshot.gates, key=lambda g: _opened(g).gate_id)))
-    return json.dumps({
-        "mutation": proposal.mutation.value,
-        "expected": encode_workflow(proposal.expected),
-        "snapshot": encode_workflow(snapshot),
-        "audit": encode_workflow(proposal.audit),
-        "commands": [{
-            "id": c.command_id, "idempotency": c.idempotency_key,
-            "kind": c.kind.value, "target": c.target,
-            "revision": c.expected_revision, "payload": dict(c.payload),
-            "config": c.config_version, "repository": c.repository,
-            "owner": c.executor_identity, "workflow": encode_workflow(c.workflow),
-        } for c in proposal.commands],
-    }, sort_keys=True, separators=(",", ":"), allow_nan=False)
-
-
-def _same_receipt(raw: str, proposal: WorkflowChanged, encoded: str) -> bool:
-    if not isinstance(proposal.audit, AuthorizedOperatorCommand):
-        return raw == encoded
-    try:
-        accepted = json.loads(raw)
-        if not isinstance(accepted, dict):
-            raise ValueError("accepted workflow audit must be an object")
-        accepted_audit = accepted.get("audit")
-        if not isinstance(accepted_audit, str):
-            raise ValueError("accepted workflow audit is missing its typed payload")
-        audit = decode_workflow(accepted_audit, AuthorizedOperatorCommand)
-    except (ValueError, TypeError) as exc:
-        raise WorkflowAuthorityError("invalid accepted operator audit") from exc
-    # Authentication is established before this bound port is called. Replay
-    # belongs to the same authenticated subject and exact operator command;
-    # refreshed observations, channel provenance and regenerated plans do not
-    # authorize a second write or replace the original accepted audit.
-    return audit.actor.subject == proposal.audit.actor.subject and audit.command == proposal.audit.command
-
-
-def _dedupe_key(proposal: WorkflowChanged) -> tuple[str, str]:
-    audit = proposal.audit
-    if isinstance(audit, ResolveAttemptResult):
-        # A run is one paid leg. The full payload also binds the leg identity;
-        # changing just that identity cannot buy another allowance charge.
-        return "workflow-result", str(audit.attempt.run_id)
-    if isinstance(audit, AuthorizedOperatorCommand):
-        command = audit.command
-        if isinstance(command, (RequestRearm, ContinueGrantedRearm)):
-            return "workflow-request", command.request_id
-        if isinstance(command, CancelRearm):
-            return "workflow-cancellation", command.cancellation_id
-        if isinstance(command, AuthorizeAbsentRetry):
-            return "workflow-retry-authorization", command.authorization_id
-    return "workflow-transition", hashlib.sha256(encode_workflow(proposal.expected).encode()).hexdigest()
 
 
 class SQLiteWorkflowControl:
@@ -158,7 +103,7 @@ class SQLiteWorkflowControl:
                 db.execute("BEGIN")
                 if load_resolve_authority(db, key.repository) is None:
                     return WorkflowMigrationRequired(key)
-                snapshot = load_workflow_row(db, key)
+                snapshot = load_resolve_workflow_row(db, key)
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")
@@ -175,7 +120,7 @@ class SQLiteWorkflowControl:
                 authority = load_resolve_authority(db, self.writer.repository)
                 if authority is None:
                     return InactiveResolveControl(key)
-                snapshot = load_workflow_row(db, key)
+                snapshot = load_resolve_workflow_row(db, key)
                 if snapshot is None:
                     return AbsentResolveControl(key, authority)
                 selected_id = request_id or (snapshot.intent.request_id if snapshot.intent is not None else None)
@@ -193,7 +138,7 @@ class SQLiteWorkflowControl:
         self._scope(observation.key)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self.writer.owner_id)
-            prior = load_workflow_row(db, observation.key)
+            prior = load_resolve_workflow_row(db, observation.key)
             activation = db.execute(
                 "SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family=?",
                 (self.writer.repository, WorkflowFamily.RESOLVE.value),
@@ -225,7 +170,7 @@ class SQLiteWorkflowControl:
         validate_workflow_identifier(request_id, "request")
         with closing(self._control._connect()) as db:
             db.execute("BEGIN")
-            load_workflow_row(db, key)
+            load_resolve_workflow_row(db, key)
             return self._lookup_rearm(db, key, request_id)
 
     @staticmethod
@@ -237,7 +182,7 @@ class SQLiteWorkflowControl:
         if row is None:
             return None
         intent = decode_workflow(row["intent_json"], PendingRearm | CompletedRearm | CancelledRearm | SupersededRearm)
-        if intent.request_id != request_id or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"] or row["state"] != _intent_state(intent):
+        if intent.request_id != request_id or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"] or row["state"] != intent_state(intent):
             raise WorkflowAuthorityError("re-arm history disagrees with its typed payload")
         return intent
 
@@ -248,7 +193,7 @@ class SQLiteWorkflowControl:
         validate_workflow_identifier(request_id, "request")
         with closing(self._control._connect()) as db:
             db.execute("BEGIN")
-            load_workflow_row(db, key)
+            load_resolve_workflow_row(db, key)
             return self._accepted_rearm(db, key, request_id)
 
     def _accepted_rearm(
@@ -281,7 +226,7 @@ class SQLiteWorkflowControl:
             or intent.request_id != request_id
             or intent.gate_id != row["gate_id"]
             or intent.to_generation != row["to_generation"]
-            or row["state"] != _intent_state(intent)
+            or row["state"] != intent_state(intent)
             or row["request_digest"] != hashlib.sha256(
                 encode_workflow((audit.actor.subject, command)).encode()
             ).hexdigest()
@@ -341,7 +286,7 @@ class SQLiteWorkflowControl:
                 "LEFT JOIN dedupe_keys observation "
                 "ON observation.namespace='workflow-rearm-observation' "
                 "AND observation.scope=rearm.repository AND observation.key=rearm.request_id "
-                "WHERE rearm.repository=? AND rearm.state='pending' "
+                "WHERE rearm.repository=? AND rearm.target_kind='issue' AND rearm.state='pending' "
                 "AND COALESCE(julianday(observation.claimed_at),0)<=julianday(?) "
                 "ORDER BY rearm.target_kind,rearm.target_number,rearm.request_id LIMIT ?",
                 (self.writer.repository, now.isoformat(), limit),
@@ -352,7 +297,7 @@ class SQLiteWorkflowControl:
                     if row["target_kind"] != "issue":
                         raise WorkflowAuthorityError("pending resolve re-arm has a non-issue target")
                     key = WorkflowKey(self.writer.repository, IssueRef(row["target_number"]))
-                    state = load_workflow_row(db, key)
+                    state = load_resolve_workflow_row(db, key)
                     if state is None or not isinstance(state.intent, PendingRearm):
                         raise WorkflowAuthorityError("pending re-arm index lacks current workflow authority")
                     if state.intent.request_id != row["request_id"]:
@@ -391,7 +336,7 @@ class SQLiteWorkflowControl:
         self._scope(expected.fence.key)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self.writer.owner_id)
-            state = load_workflow_row(db, expected.fence.key)
+            state = load_resolve_workflow_row(db, expected.fence.key)
             if state is None or state.revision != expected or not isinstance(state.intent, PendingRearm):
                 raise WorkflowAuthorityError("re-arm deferral requires exact pending authority")
             previous = self._rearm_observation(db, state)
@@ -439,7 +384,7 @@ class SQLiteWorkflowControl:
             if (
                 row["disposition"] != "required"
                 or command.workflow != state.binding
-                or not self._owns_command(db, command.executor_identity)
+                or not owns_command(db, self.writer, command.executor_identity)
             ):
                 raise WorkflowAuthorityError("pending re-arm command belongs to another authority")
             receipt_status = row["receipt_status"]
@@ -520,7 +465,7 @@ class SQLiteWorkflowControl:
         self._scope(expected.fence.key)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self.writer.owner_id)
-            prior = load_workflow_row(db, expected.fence.key)
+            prior = load_resolve_workflow_row(db, expected.fence.key)
             if prior is None or prior.revision != expected or not isinstance(prior.intent, PendingRearm):
                 raise WorkflowAuthorityError("re-arm reconciliation requires exact pending authority")
             previous = self._rearm_observation(db, prior)
@@ -590,7 +535,7 @@ class SQLiteWorkflowControl:
         with self._rearm_barriers():
             with self._control.transaction() as db:
                 self._control._assert_owner_active(db, self.writer.owner_id)
-                prior = load_workflow_row(db, command.expected.fence.key)
+                prior = load_resolve_workflow_row(db, command.expected.fence.key)
                 if prior is None:
                     raise WorkflowAuthorityError("re-arm cancellation requires workflow authority")
                 if binding is not None and (not isinstance(binding, WorkflowBinding) or binding.fence != command.expected.fence):
@@ -637,7 +582,7 @@ class SQLiteWorkflowControl:
     def _retry_facts(self, db: sqlite3.Connection, command: AuthorizeAbsentRetry) -> RetryAuthorizationFacts:
         facts = load_retry_authorization_facts(self._control, db, command.command_id, command.evidence_id)
         row = db.execute("SELECT executor_identity FROM lifecycle_commands WHERE command_id=?", (str(command.command_id),)).fetchone()
-        if facts.command_binding.fence.key != command.expected.fence.key or not self._owns_command(db, row["executor_identity"]):
+        if facts.command_binding.fence.key != command.expected.fence.key or not owns_command(db, self.writer, row["executor_identity"]):
             raise WorkflowAuthorityError("retry authorization names a command outside this fix owner's workflow")
         return facts
 
@@ -649,7 +594,7 @@ class SQLiteWorkflowControl:
             try:
                 facts = load_retry_authorization_facts(self._control, db, gate.cause.command_id, gate.cause.absence_evidence_id)
                 row = db.execute("SELECT executor_identity FROM lifecycle_commands WHERE command_id=?", (str(gate.cause.command_id),)).fetchone()
-                owned = facts.command_binding.fence.key == snapshot.revision.fence.key and self._owns_command(db, row["executor_identity"])
+                owned = facts.command_binding.fence.key == snapshot.revision.fence.key and owns_command(db, self.writer, row["executor_identity"])
             except (WorkflowAuthorityError, ControlStoreError, ValueError, TypeError):
                 continue  # Unreadable authority is never offered as an action.
             if owned and retry_authorization_available(snapshot, gate, facts):
@@ -704,7 +649,7 @@ class SQLiteWorkflowControl:
         with self._rearm_barriers():
             with self._control.transaction() as db:
                 self._control._assert_owner_active(db, self.writer.owner_id)
-                prior = load_workflow_row(db, command.expected.fence.key)
+                prior = load_resolve_workflow_row(db, command.expected.fence.key)
                 if prior is None:
                     raise WorkflowAuthorityError("retry authorization requires workflow authority")
                 stored = db.execute(
@@ -760,7 +705,7 @@ class SQLiteWorkflowControl:
     def _return_prior(self, db: sqlite3.Connection, returned: ReturnedResolve) -> tuple[WorkflowSnapshot, ResolveAdmission]:
         self._scope(returned.attempt.binding.fence.key)
         self._control._assert_owner_active(db, self.writer.owner_id)
-        prior = load_workflow_row(db, returned.attempt.binding.fence.key)
+        prior = load_resolve_workflow_row(db, returned.attempt.binding.fence.key)
         if prior is None:
             raise WorkflowAuthorityError("paid return requires existing workflow authority")
         admission = self._validate_attempt_run(db, self._return_proof(returned))
@@ -1006,7 +951,7 @@ class SQLiteWorkflowControl:
                 self._require_return(db, returned)
                 if self._return_disposition(db, returned) is not None or prior.binding != returned.attempt.binding:
                     raise WorkflowAuthorityError("returned local effects require current unfinished authority")
-                if not prior.gates or any(_opened(g).gate_id != return_gate_id(returned) for g in prior.gates):
+                if not prior.gates or any(opened_gate(g).gate_id != return_gate_id(returned) for g in prior.gates):
                     raise WorkflowAuthorityError("returned local effects are held by another cause")
             # Acceptance/owner retirement requires the exclusive deployment
             # barrier; the shared barrier spans I/O but no SQL transaction does.
@@ -1025,7 +970,7 @@ class SQLiteWorkflowControl:
             classified, actions = decide_return(returned, issue, linkage, now=self._control._now(),
                                                adjudications=adjudications,
                                                adjudication_ceiling=self._max_contract_rounds)
-            remaining = replace(prior, gates=tuple(g for g in prior.gates if _opened(g).gate_id != return_gate_id(returned)))
+            remaining = replace(prior, gates=tuple(g for g in prior.gates if opened_gate(g).gate_id != return_gate_id(returned)))
             if any(not isinstance(action, Relabel) for action in actions):
                 if remaining.gates:
                     return WorkflowConflict(prior.revision, "another workflow gate still holds local cleanup")
@@ -1052,7 +997,7 @@ class SQLiteWorkflowControl:
             after = proposal.snapshot
             # Capture did not advance the continuation watermark, so the final
             # blocked RESUME can still clear this exact run's returned session.
-            after = replace(after, gates=tuple(g for g in after.gates if _opened(g).gate_id != return_gate_id(returned)),
+            after = replace(after, gates=tuple(g for g in after.gates if opened_gate(g).gate_id != return_gate_id(returned)),
                             revision=replace(prior.revision, version=prior.revision.version + 1))
             if issue.issue.state == "closed" or isinstance(linkage, LinkedPrPresent) or (
                 returned.stage is ResolveStage.ADJUDICATE and classified.kind is ResolveResultKind.INFRA_FAILURE and cursor is None
@@ -1116,7 +1061,7 @@ class SQLiteWorkflowControl:
             raise ValueError("re-author reset requires the replacement input SHA-256 digest")
         self._scope(binding.fence.key)
         self._control._assert_owner_active(db, self.writer.owner_id)
-        state = load_workflow_row(db, binding.fence.key)
+        state = load_resolve_workflow_row(db, binding.fence.key)
         if state is None or state.binding != binding or state.gates:
             raise WorkflowAuthorityError("re-author reset requires current unheld authority")
         continuation = state.episode.continuation
@@ -1161,7 +1106,7 @@ class SQLiteWorkflowControl:
             raise ValueError("contract reset requires a typed intent")
         self._scope(intent.binding.fence.key)
         self._control._assert_owner_active(db, self.writer.owner_id)
-        state = load_workflow_row(db, intent.binding.fence.key)
+        state = load_resolve_workflow_row(db, intent.binding.fence.key)
         if state is None or state.binding != intent.binding or state.gates:
             raise WorkflowAuthorityError("contract reset requires current unheld authority")
         if isinstance(intent, ReauthorResetIntent):
@@ -1291,7 +1236,7 @@ class SQLiteWorkflowControl:
         self._scope(expected.fence.key)
         validate_workflow_identifier(handoff_id, "workspace handoff")
         self._control._assert_owner_active(db, self.writer.owner_id)
-        state = load_workflow_row(db, expected.fence.key)
+        state = load_resolve_workflow_row(db, expected.fence.key)
         if state is None or state.revision != expected or not isinstance(state.intent, PendingRearm):
             raise WorkflowAuthorityError(
                 "workspace preparation requires the exact current pending re-arm"
@@ -1314,7 +1259,7 @@ class SQLiteWorkflowControl:
         with self._rearm_barriers():
             with self._control.transaction() as db:
                 self._control._assert_owner_active(db, self.writer.owner_id)
-                state = load_workflow_row(db, expected.fence.key)
+                state = load_resolve_workflow_row(db, expected.fence.key)
                 if state is None:
                     raise WorkflowAuthorityError(
                         "re-arm authority requires the exact current workflow revision"
@@ -1335,7 +1280,7 @@ class SQLiteWorkflowControl:
         self._scope(binding.fence.key)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self.writer.owner_id)
-            state = load_workflow_row(db, binding.fence.key)
+            state = load_resolve_workflow_row(db, binding.fence.key)
             if state is None or state.binding != binding:
                 raise WorkflowAuthorityError(
                     "workspace observation requires the exact current workflow binding"
@@ -1367,7 +1312,7 @@ class SQLiteWorkflowControl:
         self._scope(handoff.destination.fence.key)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self.writer.owner_id)
-            state = load_workflow_row(db, handoff.destination.fence.key)
+            state = load_resolve_workflow_row(db, handoff.destination.fence.key)
             if state is None or not isinstance(state.intent, PendingRearm) or state.intent.handoff != handoff:
                 raise WorkflowAuthorityError(
                     "workspace completion requires its exact current pending re-arm"
@@ -1408,7 +1353,7 @@ class SQLiteWorkflowControl:
             raise ValueError("prepared workspace lookup requires a typed revision")
         self._scope(expected.fence.key)
         with self._control.transaction() as db:
-            state = load_workflow_row(db, expected.fence.key)
+            state = load_resolve_workflow_row(db, expected.fence.key)
             if state is None or state.revision != expected or not isinstance(state.intent, PendingRearm):
                 raise WorkflowAuthorityError(
                     "prepared workspace lookup requires exact pending authority"
@@ -1467,7 +1412,7 @@ class SQLiteWorkflowControl:
         encoded = encode_workflow(result)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self.writer.owner_id)
-            prior = load_workflow_row(db, key)
+            prior = load_resolve_workflow_row(db, key)
             if prior is None:
                 raise WorkflowAuthorityError("workflow must be explicitly imported before recording results")
             admission = self._validate_attempt_run(db, result)
@@ -1522,10 +1467,9 @@ class SQLiteWorkflowControl:
             raise WorkflowAuthorityError("commit and transition expect different workflow revisions")
         if not isinstance(authorities, tuple) or authorities != (transition.snapshot.authority,):
             raise WorkflowAuthorityError("resolve commit requires exactly its captured family authority")
-        encoded = encode_workflow(transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else _accepted_proposal(transition)
-        namespace, dedupe = _dedupe_key(transition)
+        encoded = transition_receipt(transition)
         self._control._assert_owner_active(db, self.writer.owner_id)
-        prior = load_workflow_row(db, expected.fence.key)
+        prior = load_resolve_workflow_row(db, expected.fence.key)
         if prior is None:
             raise WorkflowAuthorityError("workflow must be explicitly imported before mutation")
         if authorities != (prior.authority,):
@@ -1535,16 +1479,9 @@ class SQLiteWorkflowControl:
             (self.writer.repository, str(transition.audit.attempt.run_id)),
         ).fetchone() is not None:
             return WorkflowConflict(prior.revision, "captured paid return must use observation finalization")
-        receipt = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (namespace, self.writer.repository, dedupe),
-        ).fetchone()
-        if receipt is not None:
-            if not _same_receipt(receipt["payload_json"], transition, encoded):
-                return WorkflowConflict(prior.revision, "durable workflow identity was reused with different content")
-            return WorkflowCommitted(prior, idempotent=True)
-        if prior.revision != expected:
-            return WorkflowConflict(prior.revision, "workflow revision changed before commit")
+        replayed = replay_or_conflict(db, self.writer.repository, prior, transition, encoded)
+        if replayed is not None:
+            return replayed
         observations = self._validate_evidence(db, prior, transition)
         admission = self._validate_attempt_run(db, transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else None
         accepted_preflight = None
@@ -1558,16 +1495,7 @@ class SQLiteWorkflowControl:
         self._persist(db, prior, transition, encoded)
         if retry_facts is not None:
             self._persist_retry_authorization(db, transition, retry_facts)
-        db.execute(
-            "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) VALUES (?, ?, ?, ?, ?)",
-            (namespace, self.writer.repository, dedupe, self._control._now().isoformat(), encoded),
-        )
-        self._control._transition(
-            db, "workflow", encode_workflow(expected.fence.key), transition.mutation.value,
-            {"generation": transition.snapshot.revision.fence.generation,
-             "version": transition.snapshot.revision.version},
-        )
-        return WorkflowCommitted(transition.snapshot)
+        return record_commit(db, self._control, self.writer.repository, transition, encoded)
 
     def _validate_evidence(
         self, db: sqlite3.Connection, prior: WorkflowSnapshot, proposal: WorkflowChanged,
@@ -1627,7 +1555,7 @@ class SQLiteWorkflowControl:
                     "lifecycle_commands.workflow_binding_json, effect_receipts.status, effect_receipts.executor_identity AS receipt_owner FROM lifecycle_commands "
                     "JOIN effect_receipts USING(command_id) WHERE command_id=?", (str(command_id),),
                 ).fetchone()
-                if row is None or row["state"] != EffectStatus.SUCCEEDED.value or row["status"] != EffectStatus.SUCCEEDED.value or not self._owns_command(db, row["executor_identity"]) or not row["attempt_owner"] or row["receipt_owner"] != row["attempt_owner"] or decode_workflow(row["workflow_binding_json"], WorkflowBinding) != prior.binding:
+                if row is None or row["state"] != EffectStatus.SUCCEEDED.value or row["status"] != EffectStatus.SUCCEEDED.value or not owns_command(db, self.writer, row["executor_identity"]) or not row["attempt_owner"] or row["receipt_owner"] != row["attempt_owner"] or decode_workflow(row["workflow_binding_json"], WorkflowBinding) != prior.binding:
                     raise WorkflowAuthorityError("re-arm verification lacks a successful durable command receipt")
         if isinstance(intent, SupersededRearm) and intent.reason is StopReason.REQUIRED_EFFECT_REJECTED:
             rejected = False
@@ -1638,7 +1566,7 @@ class SQLiteWorkflowControl:
                 "AND attempt_owner IS NOT NULL AND effect_receipts.executor_identity=attempt_owner AND workflow_binding_json=?",
                 (str(command_id), encode_workflow(prior.binding)),
                 ).fetchone()
-                if row is not None and self._owns_command(db, row["executor_identity"]):
+                if row is not None and owns_command(db, self.writer, row["executor_identity"]):
                     rejected = True
                 elif command_id in self._rearm_command_facts(db, prior)[1]:
                     rejected = True  # A grant judged the obligation inapplicable.
@@ -1709,23 +1637,6 @@ class SQLiteWorkflowControl:
                 raise WorkflowAuthorityError("resolve session lacks exact provider and selected-model provenance")
         return admission
 
-    def _owns_command(self, db: sqlite3.Connection, owner: str) -> bool:
-        """Terminal receipts retain their executor through audited adoption."""
-        seen: set[str] = set()
-        for _ in range(64):
-            if owner == self.writer.owner_id:
-                return True
-            if owner in seen:
-                return False
-            seen.add(owner)
-            row = db.execute(
-                "SELECT successor_owner_id, repository, role FROM retired_owners WHERE owner_id=?", (owner,),
-            ).fetchone()
-            if row is None or row["repository"] != self.writer.repository or row["role"] != self.writer.role:
-                return False
-            owner = row["successor_owner_id"]
-        return False
-
     def _persist_snapshot(self, db: sqlite3.Connection, after: WorkflowSnapshot) -> None:
         persist_workflow_snapshot(db, after)
 
@@ -1741,12 +1652,7 @@ class SQLiteWorkflowControl:
             if isinstance(intent, PendingRearm):
                 assert isinstance(proposal.audit, AuthorizedOperatorCommand)
                 now = self._control._now()
-                db.execute(
-                    "INSERT INTO workflow_rearms VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (intent.request_id, *scope, intent.gate_id, intent.from_generation, intent.to_generation,
-                     "pending", hashlib.sha256(encode_workflow((proposal.audit.actor.subject, proposal.audit.command)).encode()).hexdigest(),
-                     encode_workflow(proposal.audit), encode_workflow(intent)),
-                )
+                insert_pending_rearm(db, scope, intent, proposal.audit)
                 seed = RearmObservation(
                     intent.request_id, after.binding, ActiveReconciliation(now, now, 0),
                 )
@@ -1758,10 +1664,7 @@ class SQLiteWorkflowControl:
                      observation.history.next_read_at.isoformat(), encode_workflow(observation)),
                 )
             else:
-                db.execute(
-                    "UPDATE workflow_rearms SET state=?, intent_json=? WHERE request_id=?",
-                    (_intent_state(intent), encode_workflow(intent), intent.request_id),
-                )
+                update_rearm_state(db, intent)
         for command in proposal.commands:
             self._control._enqueue_command(db, command)
             assert isinstance(intent, PendingRearm)
@@ -1770,17 +1673,9 @@ class SQLiteWorkflowControl:
                 (intent.request_id, "ensure_lifecycle_projection", str(command.command_id), encode_workflow(proposal.audit)),
             )
         if isinstance(intent, (CancelledRearm, SupersededRearm)) and intent != prior.intent:
-            retirement_id = "workflow-stop:" + hashlib.sha256(encode_workflow(proposal.audit).encode()).hexdigest()
-            db.execute(
-                "INSERT INTO workflow_evidence VALUES (?, ?, ?, ?, NULL, 'observation', ?)",
-                (retirement_id, *scope, encode_workflow(proposal.audit)),
-            )
+            retirement_id = record_stop_evidence(db, scope, proposal)
             for command_id in intent.retired_obligations:
-                db.execute(
-                    "UPDATE workflow_rearm_commands SET disposition='retired', disposition_evidence_json=? "
-                    "WHERE request_id=? AND command_id=?",
-                    (encode_workflow(intent), intent.request_id, str(command_id)),
-                )
+                retire_rearm_obligation(db, intent, str(command_id))
                 self._retire_command(db, after, str(command_id), retirement_id)
 
     def _retire_command(
@@ -1790,15 +1685,9 @@ class SQLiteWorkflowControl:
         row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (command_id,)).fetchone()
         if row is None:
             raise WorkflowAuthorityError("retired obligation has no durable command")
-        if not self._owns_command(db, row["executor_identity"]) or decode_workflow(row["workflow_binding_json"], WorkflowBinding) != snapshot.binding:
+        if not owns_command(db, self.writer, row["executor_identity"]) or decode_workflow(row["workflow_binding_json"], WorkflowBinding) != snapshot.binding:
             raise WorkflowAuthorityError("retired obligation belongs to a different workflow owner")
         self._control._retire_workflow_command(
             db, row, _command_from_row(row), snapshot, retirement_id,
         )
 
-
-def _intent_state(intent: RearmIntent) -> str:
-    return {
-        PendingRearm: "pending", CompletedRearm: "completed",
-        CancelledRearm: "cancelled", SupersededRearm: "superseded",
-    }[type(intent)]

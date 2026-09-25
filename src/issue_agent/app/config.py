@@ -24,6 +24,7 @@ from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.resolve_split import MAX_SPLIT_TRAIL
+from ..domain.review_rejection import MAX_COUNTED_REVIEWS
 from ..domain.infra_breaker import (
     DEFAULT_BREAKER_COOLDOWN_SECONDS,
     DEFAULT_BREAKER_DEATHS,
@@ -912,6 +913,11 @@ class HarnessConfig:
             )
         _require_non_negative(errors, "REVIEW_MAX_REJECTIONS", self.max_review_rejections)
         _require_non_negative(errors, "MAX_CONTRACT_ROUNDS", self.max_contract_rounds)
+        if self.max_review_rejections > MAX_COUNTED_REVIEWS:
+            errors.append(
+                f"REVIEW_MAX_REJECTIONS must be <= {MAX_COUNTED_REVIEWS} "
+                "(one review re-arm can dismiss at most that many counted reviews)"
+            )
         if self.max_contract_rounds > MAX_SPLIT_TRAIL:
             errors.append(f"MAX_CONTRACT_ROUNDS must be <= {MAX_SPLIT_TRAIL} (durable contract context capacity)")
         for name, value in (

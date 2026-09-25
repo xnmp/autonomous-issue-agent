@@ -39,7 +39,7 @@ from ..domain.contracts import (
     TokenUsage,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import WorkflowBinding, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
+from ..domain.workflow_identity import WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
 from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, CommandRetryApplicability,
     ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryAlreadyConsumed,
@@ -85,7 +85,7 @@ from .deployment_authority import (
     deployment_role,
 )
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, load_resolve_authority, load_workflow_row, load_workspace_ack, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import WorkflowAuthorityError, load_family_authority, load_resolve_authority, load_resolve_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 23
 
@@ -365,6 +365,12 @@ LEGACY_V8_SCHEMA_DIGEST = (
 )
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _RESOLVE_PAID_KINDS = frozenset(stage.value for stage in ResolveStage)
+# ADR 0015 review slice: the only effects a review-rejection re-arm or review
+# completion may own. The PR target is enforced separately. Executor-side
+# readers (command reconciliation gates, rearm projection readiness) still load
+# resolve rows only; increment 4 makes them family-aware before any review
+# command can execute.
+_REVIEW_FAMILY_COMMAND_KINDS = frozenset({CommandKind.DISMISS_REVIEW, CommandKind.RELABEL, CommandKind.SUBMIT_REVIEW})
 AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
 
@@ -1540,6 +1546,11 @@ class SQLiteControlStore:
                 db.execute("BEGIN")
                 if load_resolve_authority(db, repository) is not None:
                     raise WorkflowAuthorityError("legacy unblock is retired for active resolve control; use a typed re-arm command")
+                # Family-scoped reads no longer count PR rows as resolve
+                # authority; the legacy unblock still never crosses them
+                # (ADR 0015: never two authorities, no fallback).
+                if load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, repository) is not None:
+                    raise WorkflowAuthorityError("legacy unblock is retired for active review rejection control; use a typed re-arm command")
             yield
 
     def _database_exists(self, *, allow_empty: bool = False) -> bool:
@@ -3608,7 +3619,7 @@ class SQLiteControlStore:
         self._assert_owner_active(db, request.owner_id)
         if request.workflow is None or deployment_role(request.workload_repository, request.owner_id) != "fix":
             raise WorkflowAuthorityError("workspace entry requires the bound fix owner")
-        snapshot = require_workflow_binding(db, request.workflow)
+        snapshot = require_resolve_binding(db, request.workflow)
         if not isinstance(snapshot.intent, CompletedRearm):
             return None
         require_workspace_predecessor(db, snapshot)
@@ -3862,10 +3873,21 @@ class SQLiteControlStore:
             if affected:
                 raise WorkflowAuthorityError("activated resolve admission requires a captured workflow binding")
             return
+        if binding.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
+            if role != "review":
+                raise WorkflowAuthorityError("review rejection admission requires the repository's review owner")
+            try:
+                require_review_binding(db, binding)
+            except (ValueError, TypeError) as exc:
+                raise WorkflowAuthorityError(str(exc)) from exc
+            # No review admission receipt exists before the review runtime
+            # switch (ADR 0015 review slice, increment 6); refuse rather than
+            # record a resolve receipt against a pull request.
+            raise WorkflowAuthorityError("review rejection paid admission has no admission receipt yet")
         if role != "fix":
             raise WorkflowAuthorityError("resolve admission requires the repository's fix owner")
         try:
-            snapshot = require_workflow_binding(db, binding)
+            snapshot = require_resolve_binding(db, binding)
             dispatch = json.loads(request.dispatch_id)
             if not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository or type(dispatch.get("issue")) is not int or dispatch["issue"] != binding.fence.key.target.number:
                 raise WorkflowAuthorityError("paid dispatch identity disagrees with its workflow")
@@ -3897,6 +3919,8 @@ class SQLiteControlStore:
         db: sqlite3.Connection, request: ReservationRequest, snapshot: WorkflowSnapshot, now: str,
     ) -> None:
         """Admission order is a durable revision, independent of clocks and delivery."""
+        if request.workflow is None or request.workflow.authority.family is not WorkflowFamily.RESOLVE or snapshot.binding != request.workflow:
+            raise WorkflowAuthorityError("only a resolve binding records a resolve admission receipt")
         try:
             metadata = json.loads(request.dispatch_id)
             revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
@@ -3957,7 +3981,7 @@ class SQLiteControlStore:
                 admission = decode_workflow(receipt["payload_json"], ResolveAdmission)
                 metadata = json.loads(request.dispatch_id)
                 expected_attempt = WorkflowAttemptIdentity(request.workflow, request.run_id, metadata["leg_id"])
-                current = load_workflow_row(db, request.workflow.fence.key)
+                current = load_resolve_workflow_row(db, request.workflow.fence.key)
             except (ValueError, TypeError, KeyError) as exc:
                 raise WorkflowAuthorityError("invalid admitted workflow receipt") from exc
             if current is None or admission.attempt != expected_attempt or admission.stage.value != request.kind or admission.adjudication_ceiling != request.adjudication_ceiling or admission.input_fingerprint != metadata.get("input_fingerprint") or admission.split_fingerprint != metadata.get("split_fingerprint") or admission.revision.version > current.revision.version:
@@ -4612,9 +4636,21 @@ class SQLiteControlStore:
             return
         self._assert_owner_active(db, command.executor_identity)
         try:
-            if deployment_role(command.repository, command.executor_identity) != "fix":
+            role = deployment_role(command.repository, command.executor_identity)
+            if binding.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
+                if role != "review":
+                    raise WorkflowAuthorityError("review rejection commands require the repository's review owner")
+                # Allowlist, not a denylist: publication, issue and merge kinds
+                # can never ride on review-family authority.
+                if command.kind not in _REVIEW_FAMILY_COMMAND_KINDS:
+                    raise WorkflowAuthorityError(f"review rejection workflow cannot enqueue {command.kind.value} commands")
+                require_review_binding(db, binding, allow_gated=True)
+                if command.target != f"pr:{binding.fence.key.target.number}":
+                    raise WorkflowAuthorityError("review rejection command target disagrees with its pull request")
+                return
+            if role != "fix":
                 raise WorkflowAuthorityError("resolve commands require the repository's fix owner")
-            require_workflow_binding(db, binding, allow_gated=True)
+            require_resolve_binding(db, binding, allow_gated=True)
             if command.target.startswith("issue:") and command.target != f"issue:{binding.fence.key.target.number}":
                 raise WorkflowAuthorityError("issue command target disagrees with its workflow")
             if publication and captured_run is None:
@@ -4843,7 +4879,8 @@ class SQLiteControlStore:
         binding = command.workflow
         if binding is None:
             raise WorkflowAuthorityError("command uncertainty has no captured workflow")
-        current = load_workflow_row(db, binding.fence.key)
+        # Resolve-only until increment 4 (review commands cannot execute yet).
+        current = load_resolve_workflow_row(db, binding.fence.key)
         if current is None:
             raise WorkflowAuthorityError("command uncertainty workflow is absent")
         uncertainty = state.uncertainty if isinstance(state, RetiredUncertainCommand) else state
@@ -4925,7 +4962,7 @@ class SQLiteControlStore:
                             continue
                     attempt = self._return_projection_attempt(db, command)
                     if attempt is not None:
-                        current = load_workflow_row(db, attempt.binding.fence.key)
+                        current = load_resolve_workflow_row(db, attempt.binding.fence.key)
                         if current is None:
                             raise WorkflowAuthorityError("returned command workflow is absent")
                         if current.binding != attempt.binding and not isinstance(reconciliation, (RetiredSettledCommand, RetiredUncertainCommand)):
@@ -5082,7 +5119,8 @@ class SQLiteControlStore:
         self, db: sqlite3.Connection, binding: WorkflowBinding, gate_id: str, gate: OpenGate | None,
     ) -> None:
         scope = workflow_scope(binding.fence.key)
-        current = load_workflow_row(db, binding.fence.key)
+        # Resolve-only until increment 4 (review commands cannot execute yet).
+        current = load_resolve_workflow_row(db, binding.fence.key)
         if current is None:
             raise WorkflowAuthorityError("command reconciliation workflow is absent")
         existing = db.execute("SELECT * FROM workflow_gates WHERE gate_id=?", (gate_id,)).fetchone()
@@ -5363,13 +5401,14 @@ class SQLiteControlStore:
         ).fetchone()
         if association is None:
             if command.workflow is not None:
-                current = load_workflow_row(db, command.workflow.fence.key)
+                # Resolve-only until increment 4 makes rearm projection family-aware.
+                current = load_resolve_workflow_row(db, command.workflow.fence.key)
                 if current is not None and isinstance(current.intent, PendingRearm) and command.command_id in current.intent.required_commands:
                     raise WorkflowAuthorityError("rearm projection lacks its recorded operation association")
             return True
         if command.workflow is None:
             raise WorkflowAuthorityError("rearm projection lacks its workflow binding")
-        current = require_workflow_binding(db, command.workflow, allow_gated=True)
+        current = require_resolve_binding(db, command.workflow, allow_gated=True)
         intent = current.intent
         if (association["disposition"] != "required" or not isinstance(intent, PendingRearm)
                 or intent.request_id != association["request_id"]
@@ -5411,7 +5450,7 @@ class SQLiteControlStore:
             return
         # Classification and its outbox obligation may commit while another
         # gate holds. Only execution needs an unheld current generation.
-        require_workflow_binding(db, attempt.binding)
+        require_resolve_binding(db, attempt.binding)
 
     def retry_reconciled_command(self, command_id: CommandId) -> None:
         """A trusted read proved an ambiguous mutation did not land."""
@@ -5618,7 +5657,7 @@ class SQLiteControlStore:
             self._require_reconciliation_gate(db, command, expected)
             if row["state"] not in ("executing", "unknown_outcome"):
                 raise WorkflowAuthorityError("reconciliation-only command lacks an unresolved outcome")
-            current = load_workflow_row(db, binding.fence.key)
+            current = load_resolve_workflow_row(db, binding.fence.key)
             if current is None:
                 raise WorkflowAuthorityError("authorized retry workflow is absent")
             decision = retry_spend_decision(
@@ -6411,7 +6450,7 @@ def load_retry_authorization_facts(
     link = db.execute(
         "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?", (str(command_id),),
     ).fetchone()
-    current = load_workflow_row(db, binding.fence.key)
+    current = load_resolve_workflow_row(db, binding.fence.key)
     intent = current.intent if current is not None else None
     workspace_ready = (
         link is not None and isinstance(intent, PendingRearm) and intent.request_id == link["request_id"]

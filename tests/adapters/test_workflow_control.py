@@ -1205,7 +1205,7 @@ def test_well_formed_arbitrary_replacement_count_does_not_become_authority(contr
     install_workflow(control, before)
     attempted = run(control, before)
     proposal = record_resolve_attempt(before, attempted, ceiling=3, admission=admission(before, attempted))
-    assert isinstance(proposal, WorkflowChanged)
+    assert isinstance(proposal, WorkflowChanged) and isinstance(proposal.snapshot, WorkflowSnapshot)
     forged = replace(proposal, snapshot=replace(proposal.snapshot, episode=replace(proposal.snapshot.episode, failures=10)))
     with pytest.raises(ValueError, match="pure transition"):
         commit(control, forged)
