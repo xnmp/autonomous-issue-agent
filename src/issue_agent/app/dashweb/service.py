@@ -696,16 +696,22 @@ class Backend:
                                      control_db_path=self.control_db_path, now=self.now_fn)
 
     def resolve_control(self, name: str, number: int, request_id: str | None = None) -> ResolveControl:
-        from .resolve_control import read_control
+        from .resolve_control import read_control, unavailable_control
 
-        return read_control(self._resolve_operator(name), number, request_id)
+        try:
+            return read_control(self._resolve_operator(name), number, request_id)
+        except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
+            return unavailable_control(exc)
 
     def resolve_command(self, name: str, number: int, body: ResolveCommand) -> CommandResult:
-        from .resolve_control import submit_control
+        from .resolve_control import submit_control, unavailable_command
 
         # Reject malformed direct callers before opening configured authority.
         body.command()
-        return submit_control(self._resolve_operator(name), number, body)
+        try:
+            return submit_control(self._resolve_operator(name), number, body)
+        except Exception as exc:  # noqa: BLE001 - storage or authority failure is a 503, never a crash
+            return unavailable_command(exc)
 
     def unblock(
         self, name: str, number: int, channel: str = "api", guidance: str | None = None,

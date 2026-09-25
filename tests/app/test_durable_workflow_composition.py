@@ -125,9 +125,15 @@ class SplitProvider(Provider):
         return AgentResult(False, status="contract_change", needs="The contract requires the wrong API.", session_id="implementer", cost_usd=.25)
 
 
-def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix", split=False) -> Composition:
+# ADR 0015 initial reconciliation delay: an unknown outcome's first read is due then.
+UNKNOWN_READ_DELAY = timedelta(seconds=31)
+
+
+def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix", split=False,
+            later: timedelta = timedelta(0)) -> Composition:
+    """``later`` restarts the process that much after the prior one (store clock)."""
     remote = PersistentGitHub(root / "github.db", fault=fault)
-    control = SQLiteControlStore(str(root / "control.db"))
+    control = SQLiteControlStore(str(root / "control.db"), now=lambda: datetime.now(timezone.utc) + later)
     control.initialize()
     workflow = SQLiteWorkflowControl(
         control, WorkflowWriter("o/r", "fix", "o/r:fix"),
@@ -478,7 +484,8 @@ def test_remote_success_before_receipt_reconciles_once_after_restart(tmp_path, m
     assert len(pending) == 1
     command = pending[0].command
     assert pending[0].state in {"executing", "unknown_outcome"}
-    restarted = compose(tmp_path, decide=lambda _: [action])
+    # An unknown outcome is re-read on its persisted schedule, not at once.
+    restarted = compose(tmp_path, decide=lambda _: [action], later=UNKNOWN_READ_DELAY)
     for _ in range(3):
         restarted.daemon.tick()
     assert restarted.control.pending_commands() == ()
@@ -638,7 +645,7 @@ def test_paid_attempt_settlement_is_conserved_when_completion_receipt_is_lost(tm
     pending = first.control.pending_commands()[0].command
     assert pending.workflow == run_binding
     command_id = pending.command_id
-    restarted = compose(tmp_path)
+    restarted = compose(tmp_path, later=UNKNOWN_READ_DELAY)
     for _ in range(4):
         restarted.daemon.tick()
     assert restarted.provider.tasks == []
@@ -690,7 +697,7 @@ def test_guarded_partial_relabel_recovery_preserves_completion_authority(tmp_pat
         human.relabel("issue", 7, None, "needs-human-review")
     # Exercise replay before new admission; the next fresh attempt is a separate
     # scheduler decision, not a recovery of the interrupted remote mutation.
-    restarted = compose(tmp_path, decide=lambda _: [])
+    restarted = compose(tmp_path, decide=lambda _: [], later=UNKNOWN_READ_DELAY)
     for _ in range(3):
         restarted.daemon.tick()
     current = restarted.remote.get_issue(7)

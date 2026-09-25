@@ -95,6 +95,46 @@ bad-return = "ignore"
 unsafe-overlap = "ignore"
 no-matching-overload = "ignore"
 
+# ADR 0015 resolve slice: attribute typos on authority/wire projections are
+# re-enabled here while the project-wide backlog above is retired. A disabled
+# missing-attribute rule once hid `EvidenceUnavailable.source` (the field is
+# `required_fact`), which made every projection of that gate raise.
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/app/dashweb/resolve_*.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/app/resolve_control.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/app/workflows/resolve_rearm.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/domain/workflow*.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/domain/resolve_rearm.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/adapters/workflow_control.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
 # ── Architectural linting (import-linter) ─────────────────────────────────────
 # Enforces the hexagonal layering the design depends on: the domain is pure
 # (no adapters, no app, no SDK), and dependencies only ever point downward

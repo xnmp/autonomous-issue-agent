@@ -19,7 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import Union
 
-from .eligibility import IssueCompletionGuard, LifecycleOperation
+from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from .labels import Label
 from .workflow_identity import IssueRef, WorkflowBinding
 
@@ -91,11 +91,22 @@ class Relabel:
     workflow: WorkflowBinding | None = None
     adds: tuple[Label, ...] = ()
     comment: str = ""
+    # ADR 0015 semantic fence for a workflow hold projection. When present it,
+    # not the raw `expected_revision` (kept as the accepted observation for
+    # audit), decides whether this write still applies: comments and body
+    # edits cannot supersede it, while hold/terminal/intervention labels, a
+    # close/reopen or a linked PR do.
+    hold_guard: IssueHoldGuard | None = None
 
     def __post_init__(self) -> None:
         _validate_action_workflow(self.workflow, self.target, self.number)
         if not isinstance(self.adds, tuple) or any(not isinstance(label, Label) for label in self.adds):
             raise ValueError("additional labels must be a tuple of labels")
+        if self.hold_guard is not None and (
+            not isinstance(self.hold_guard, IssueHoldGuard) or self.target is not Target.ISSUE
+            or self.harness_signal or self.completion_guard is not None or self.workflow is None
+        ):
+            raise ValueError("a hold guard fences only a workflow-bound issue projection")
         if not isinstance(self.comment, str) or len(self.comment) > 65536 or "\x00" in self.comment:
             raise ValueError("projection comment must be bounded text")
         if self.adds or self.comment:

@@ -29,6 +29,7 @@ from ...adapters.control_path import canonical_control_store_path
 from .. import cli
 from . import contracts
 from . import resolve_contracts
+from .resolve_control import unavailable_command, unavailable_control
 from .ports import DashboardBackend
 from .service import Backend
 
@@ -283,7 +284,7 @@ def create_app(
         try:
             result = await invoke(backend.resolve_control, name, number, request_id)
         except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
-            result = resolve_contracts.UnavailableControl(status="unavailable", reason=_control_error(exc))
+            result = unavailable_control(exc)
         code = 503 if result.status == "unavailable" else 404 if result.status == "absent" else 200
         return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
 
@@ -299,8 +300,7 @@ def create_app(
         try:
             result = await invoke(backend.resolve_command, name, number, body)
         except Exception as exc:  # noqa: BLE001 - command identity makes an uncertain response retryable
-            result = resolve_contracts.CommandResult(outcome="unavailable", reason=_control_error(exc),
-                control=resolve_contracts.UnavailableControl(status="unavailable", reason="control read unavailable"))
+            result = unavailable_command(exc)
         code = {"accepted": 202, "replayed": 200, "conflict": 409, "rejected": 422, "unavailable": 503}[result.outcome]
         return JSONResponse(_encodable(jsonable_encoder(result)), status_code=code)
 
@@ -404,10 +404,6 @@ def create_app(
         return Response(content, media_type=media_type)
 
     return app
-
-
-def _control_error(error: Exception) -> str:
-    return str(error).replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")[:16384]
 
 
 def _encodable(value):

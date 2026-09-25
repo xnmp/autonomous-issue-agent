@@ -40,11 +40,14 @@ class CompletionGateway(Gateway):
         self.labels = {("issue", 1, Label.AI_WORKING.value)}
         self.fail_relabel = False
         self.fail_reads = False
+        self.body = "body"
+        self.conversation = ()
 
     def get_issue(self, issue):
         if self.fail_reads:
             raise ConnectionError("GitHub unavailable")
-        return replace(super().get_issue(issue), title="title", body="body", author="alice")
+        return replace(super().get_issue(issue), title="title", body=self.body, author="alice",
+                       comments=self.conversation)
 
     def has_label(self, kind, number, label):
         if self.fail_reads:
@@ -304,10 +307,30 @@ def test_transient_read_failure_keeps_the_grant_open_under_backoff_then_spends_i
     assert len(gateway.writes()) == 1 and _grant_row(control)["disposition"] == "consumed"
 
 
-def test_changed_guard_retires_instead_of_adopting_new_revision(control, absent, clock):
+def test_new_human_comment_between_grant_and_spend_makes_the_completion_retry_inapplicable(control, absent, clock):
+    """ADR 0015: the retry proves the ORIGINAL decision, and a completion's guard
+    includes the conversation. A completion that asked a question must never be
+    re-posted over the human's answer."""
+    from issue_agent.domain.world import Comment
+
     command, gateway = absent
     assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
     gateway.issue_revision = "revision:2"
+    gateway.conversation = (Comment("alice", "Use the v2 endpoint.", "revision:2"),)
+    clock[0] += timedelta(seconds=5)
+    assert executor(control, gateway).drain_pending_commands() == 0
+    assert gateway.writes() == []
+    assert _grant_row(control)["consumed_attempt"] is None
+    assert _grant_row(control)["disposition"] == "inapplicable"
+    assert isinstance(control.command_reconciliation(command.command_id), RetiredSettledCommand)
+
+
+def test_changed_guard_retires_instead_of_adopting_new_revision(control, absent, clock):
+    command, gateway = absent
+    assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
+    # The completion's requirements changed: its original decision no longer applies.
+    gateway.issue_revision = "revision:2"
+    gateway.body = "new requirements"
     clock[0] += timedelta(seconds=5)
     assert executor(control, gateway).drain_pending_commands() == 0
     assert gateway.writes() == []
@@ -447,7 +470,7 @@ def test_consumption_requires_the_grant_executor_and_original_revision(control, 
     with pytest.raises(WorkflowAuthorityError):
         _begin(control, command, state, clock, "missing-grant")
     assert _grant_row(control)["disposition"] is None
-    declined = _begin(control, command, state, clock, revision="revision:2")
+    declined = _begin(control, command, state, clock, revision="revision:2", guard=False)
     assert isinstance(declined, RetryDeclined) and declined.closed.disposition is RetryDisposition.INAPPLICABLE
     assert _grant_row(control)["consumed_attempt"] is None
     assert command_row(control, command.command_id)["attempts"] == 1
@@ -729,6 +752,7 @@ def obligation(control):
                    if item.command.command_id == proposal.commands[0].command_id)
     _expire(control, pending, command)
     gateway = CountingGateway()
+    gateway.labels = {("issue", 1, Label.NEEDS_HUMAN_REVIEW.value)}  # the accepted hold facts
     assert executor(control, gateway).drain_pending_commands() == 0
     assert isinstance(_gate(control, command).cause, RetryAuthorizationRequired)
     return command, gateway, pending
@@ -769,6 +793,7 @@ def test_inapplicable_obligation_ends_its_grant_and_can_never_be_granted_again(c
     command, gateway, _ = obligation
     assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
     gateway.issue_revision = "revision:2"
+    gateway.labels.add(("issue", 1, Label.RECURRENCE.value))  # a real intervention
     clock[0] += timedelta(seconds=5)
     assert executor(control, gateway).drain_pending_commands() == 0
     assert gateway.writes() == []
@@ -781,6 +806,7 @@ def test_inapplicable_obligation_ends_its_grant_and_can_never_be_granted_again(c
     assert isinstance(control.command_reconciliation(command.command_id), ReconciliationOnly)
     assert isinstance(_gate(control, command).cause, RetryAuthorizationRequired)
     gateway.issue_revision = "revision:1"
+    gateway.labels.discard(("issue", 1, Label.RECURRENCE.value))
     assert not _offered(control, command)
     rejected = _authorize(control, _grant(control, command, "grant-2"))
     assert isinstance(rejected, WorkflowRejected) and "inapplicable" in rejected.reason
@@ -788,6 +814,39 @@ def test_inapplicable_obligation_ends_its_grant_and_can_never_be_granted_again(c
         clock[0] += timedelta(hours=1)
         executor(control, gateway).drain_pending_commands()
     assert gateway.writes() == []
+
+
+@pytest.mark.parametrize("activity", ["comment", "body", "priority"])
+def test_harmless_activity_keeps_the_obligation_retry_applicable(control, obligation, clock, activity):
+    """ADR 0015 semantic fence: only hold facts decide a projection's applicability."""
+    command, gateway, _ = obligation
+    assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
+    gateway.issue_revision = "revision:2"
+    if activity == "comment":
+        gateway.comments.add(("issue", 1, "is this unblocked yet?"))
+    elif activity == "body":
+        gateway.body = "clarified requirements"
+    else:
+        gateway.labels.add(("issue", 1, Label.P1.value))
+    clock[0] += timedelta(seconds=5)
+    assert executor(control, gateway).drain_pending_commands() == 1
+    assert len(gateway.writes()) == 1
+    assert _grant_row(control)["disposition"] == "consumed"
+    assert control.effect_receipt(command.command_id).status is EffectStatus.SUCCEEDED
+
+
+def test_obligation_half_applied_by_its_own_attempt_stays_applicable(control, obligation, clock):
+    """The retry exists to repair its own partial write; that is never a changed guard."""
+    command, gateway, _ = obligation
+    assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
+    gateway.labels.add(("issue", 1, Label.AI_READY.value))  # own add landed, hold removal did not
+    gateway.issue_revision = "revision:2"
+    clock[0] += timedelta(seconds=5)
+    assert executor(control, gateway).drain_pending_commands() == 1
+    assert _grant_row(control)["disposition"] == "consumed"
+    assert len(gateway.writes()) == 1
+    assert {label for kind, number, label in gateway.labels} == {Label.AI_READY.value}
+    assert control.effect_receipt(command.command_id).status is EffectStatus.SUCCEEDED
 
 
 def test_obligation_retired_after_grant_voids_it_without_a_write(control, obligation, clock):
@@ -873,6 +932,7 @@ def test_inapplicable_obligation_supersedes_its_intent_and_the_operator_can_cont
     command, gateway, pending = obligation
     assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
     gateway.issue_revision = "revision:2"
+    gateway.labels.add(("issue", 1, Label.RECURRENCE.value))
     clock[0] += timedelta(seconds=5)
     assert executor(control, gateway).drain_pending_commands() == 0
     assert _grant_row(control)["disposition"] == "inapplicable"
@@ -1098,3 +1158,26 @@ def test_cancel_uses_one_durable_uncertainty_start_despite_executor_clock_skew(c
     retired = control.command_reconciliation(command_id)
     assert isinstance(retired, RetiredUncertainCommand)
     assert retired.uncertainty.history.unresolved_since == clock[0]
+
+
+def test_human_comment_landing_after_the_spend_decision_still_refuses_the_authorized_write(control, absent, clock):
+    """The authorized write re-validates the same full guard, conversation included."""
+    from issue_agent.domain.world import Comment
+
+    command, gateway = absent
+    assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
+    reads = [0]
+    original = gateway.get_issue
+
+    def racing_answer(issue):
+        reads[0] += 1
+        if reads[0] > 1:  # after the spend decision's own read
+            gateway.conversation = (Comment("alice", "Use the v2 endpoint.", "revision:2"),)
+        return original(issue)
+
+    gateway.get_issue = racing_answer
+    clock[0] += timedelta(seconds=5)
+    executor(control, gateway).drain_pending_commands()
+    assert gateway.writes() == []
+    receipt = control.effect_receipt(command.command_id)
+    assert receipt is None or receipt.status is not EffectStatus.SUCCEEDED

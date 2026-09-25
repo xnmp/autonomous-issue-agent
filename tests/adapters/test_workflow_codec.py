@@ -171,3 +171,14 @@ def test_checkpoint_without_valid_input_provenance_cannot_be_recovered(fingerpri
     raw["value"]["fields"]["author_admission"]["fields"]["input_fingerprint"] = fingerprint
     with pytest.raises(WorkflowEncodingError):
         decode_workflow(json.dumps(raw), AuthoredResolve)
+
+
+def test_histories_persisted_before_re_execution_counting_decode_as_none_spent():
+    from issue_agent.domain.workflow import ActiveReconciliation
+
+    now = datetime(2026, 9, 14, tzinfo=timezone.utc)
+    history = ActiveReconciliation(now, now, 3, 2)
+    raw = json.loads(encode_workflow(history))
+    assert decode_workflow(json.dumps(raw), ActiveReconciliation) == history
+    del raw["value"]["fields"]["reexecutions"]
+    assert decode_workflow(json.dumps(raw), ActiveReconciliation) == ActiveReconciliation(now, now, 3, 0)

@@ -242,13 +242,16 @@ def decide_rearm_reconciliation(
             or not set(uncertain_commands) <= required
             or set(uncertain_commands) & (set(verified_commands) | set(rejected_commands))):
         raise ValueError("rearm uncertainty must name unique unresolved required commands")
-    accepted = accepted_preflight.issue.issue
     current = issue.issue
-    current_preflight = ResolveRearmPreflight(issue, linkage, external_holds) if isinstance(linkage, NoLinkedPr) else None
+    # Decision facts are hold facts (ADR 0015): terminal state, a linked PR and
+    # the holds this projection must preserve. Conversation and title/body
+    # edits change the raw revision only; a hold/intervention label the
+    # projection did not account for is refused by its semantic command fence
+    # and arrives here as a rejected obligation.
     reason = (
         StopReason.TARGET_TERMINAL if current.state != "open" or current.labels & {Label.AI_DONE, Label.AI_CLOSED}
-        else StopReason.DECISION_CHANGED if isinstance(linkage, LinkedPrPresent) or (current.title, current.body, current.state) != (accepted.title, accepted.body, accepted.state)
-        or current_preflight is not None and set(current_preflight.external_holds) != set(accepted_preflight.external_holds)
+        else StopReason.DECISION_CHANGED if isinstance(linkage, LinkedPrPresent)
+        or set(external_holds) != set(accepted_preflight.external_holds)
         else StopReason.REQUIRED_EFFECT_REJECTED if rejected_commands else None
     )
     if reason is not None:

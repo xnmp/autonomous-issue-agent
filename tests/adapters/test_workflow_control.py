@@ -83,8 +83,7 @@ def observation(state, labels=frozenset({Label.NEEDS_HUMAN_REVIEW}), at=NOW):
 def enrich(proposal):
     preflight = proposal.audit.preflight
     action = resolve_rearm_projection(
-        proposal.snapshot, expected_revision=preflight.issue.issue.updated_at,
-        external_holds=preflight.external_holds,
+        proposal.snapshot, preflight.issue.issue, external_holds=preflight.external_holds,
     )
     command = command_for_action(action, repository="o/r", executor_identity=WRITER.owner_id, workflow=proposal.snapshot.binding)
     command = replace(command, command_id=proposal.snapshot.intent.required_commands[0], idempotency_key=f"workflow:{proposal.snapshot.intent.request_id}")
@@ -1152,12 +1151,16 @@ def test_cancel_unknown_retains_uncertainty_receipt_and_stops_new_writes(control
     command = CancelRearm("cancel", pending.revision, "request:1", "operator cancelled")
     with pytest.raises(WorkflowAuthorityError, match="uncertainty gate"):
         commit(control, cancel_resolve_rearm(pending, command, ACTOR))
-    stopped = cancel_resolve_rearm(pending, command, ACTOR, uncertainty=(RemoteOutcomeUncertain(command_id, NOW, 3, "read unavailable"),))
+    # A fabricated read count cannot replace the history persisted with the outcome.
+    forged = cancel_resolve_rearm(pending, command, ACTOR, uncertainty=(RemoteOutcomeUncertain(command_id, NOW, 3, "read unavailable"),))
+    with pytest.raises(WorkflowAuthorityError, match="cannot reset"):
+        commit(control, forged)
+    stopped = cancel_resolve_rearm(pending, command, ACTOR, uncertainty=(RemoteOutcomeUncertain(command_id, NOW, 0, "connection lost"),))
     state = commit(control, stopped).snapshot
     assert state.episode == pending.episode
     assert control.effect_receipt(command_id) == receipt
     retired = decode_workflow(command_row(control, command_id)["workflow_reconciliation_json"], RetiredUncertainCommand)
-    assert retired.uncertainty.history.failed_reads == 3
+    assert retired.uncertainty.history.unresolved_since == NOW and retired.uncertainty.history.failed_reads == 0
     assert adapter(control).held_projection(before.revision.fence.key).held
     with pytest.raises((ControlStoreError, WorkflowAuthorityError), match="retired|pending authorized"):
         control.begin_command(command_id)
@@ -1244,10 +1247,15 @@ def test_unchanged_remote_revision_is_not_material_decision_supersession(control
     pending = commit(control, request(before)).snapshot
     evidence(control, pending, payload=observation(pending))
     proposal = supersede_resolve_rearm(pending, StopReason.DECISION_CHANGED, "observation:1")
-    with pytest.raises(ValueError, match="materially changed"):
+    with pytest.raises(ValueError, match="linked PR or changed holds"):
         commit(control, proposal)
-    changed = replace(observation(pending), issue=replace(observation(pending).issue, body="new requirements"))
-    evidence(control, pending, "changed", changed)
+    # A requirements edit is not a hold fact (ADR 0015 semantic fence).
+    edited = replace(observation(pending), issue=replace(observation(pending).issue, body="new requirements"))
+    evidence(control, pending, "edited", edited)
+    with pytest.raises(ValueError, match="linked PR or changed holds"):
+        commit(control, supersede_resolve_rearm(pending, StopReason.DECISION_CHANGED, "edited"))
+    held_now = ResolveRearmPreflight(observation(pending), NoLinkedPr(pending.revision.fence.key, NOW), ("ai-parked",))
+    evidence(control, pending, "changed", held_now)
     accepted = commit(control, supersede_resolve_rearm(pending, StopReason.DECISION_CHANGED, "changed"))
     assert accepted.snapshot.episode == pending.episode
     assert adapter(control).held_projection(before.revision.fence.key).held

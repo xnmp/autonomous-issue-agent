@@ -49,6 +49,10 @@ class Gateway:
         self.advance_before_update = ""
         self.advance_before_review = ""
         self.issue_closures = {}
+        self.linked_prs = {}
+
+    def pr_for_issue(self, number):
+        return self.linked_prs.get(number)
 
     def relabel(self, kind, number, remove, add):
         self.calls.append(("relabel", kind, number, remove, add))

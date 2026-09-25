@@ -11,7 +11,7 @@ from .actions import Action, PostComment, Relabel, Target
 from .contracts import CommandId, CommandKind, WorkflowAttemptIdentity
 from .eligibility import AllowedEligibility, LifecycleOperation
 from .labels import Label
-from .lifecycle import completion_guard, issue_eligibility
+from .lifecycle import completion_guard, hold_guard, issue_eligibility
 from .outcome import AgentResult, ResolveFollowup, budget_exhausted, infra_class_failure
 from .resolve_return import FinalizedResolveReturn, PendingResolveReturn, ResolveCleanupCompleted, ReturnedResolve
 from .resolve_split import (
@@ -27,13 +27,14 @@ from .workflow import (
     ContinueGrantedRearm, EnsureLifecycleProjection, EvidenceUnavailable, FreshResolve, IssueObservation,
     LinkedPrObservation, LinkedPrPresent, NoAuthorizedRemediation, NoLinkedPr, ObservedIssue,
     ObservedTransition, OpenGate, OperatorActor, PendingRearm, RearmingGate,
-    RearmNeedsDecision, RemoteOutcomeUncertain, RenewResolveAllowance,
+    RearmNeedsDecision, RemoteOutcomeUncertain, RenewResolveAllowance, RetryAuthorizationRequired,
     RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveCeiling, ResolveEpisode,
     ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind, ResolveStage, SetGuidance, ClearGuidance, StopReason, SupersededRearm,
     UnresolvedGate, WorkflowChanged, WorkflowMutation, WorkflowRejected, adjudication_allowed,
     WorkflowRejection, WorkflowSnapshot, WorkflowTransition, WorkflowUnchanged,
 )
 from .workflow_retry import RetryAuthorizationFacts, authorize_absent_retry
+from .world import IssueView
 from .workflow_identity import (
     FamilyAuthority, WorkflowBinding, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier,
 )
@@ -347,21 +348,52 @@ def resolve_projection_command_id(key: WorkflowKey, request_id: str) -> CommandI
 
 
 def resolve_rearm_projection(
-    snapshot: WorkflowSnapshot, *, expected_revision: str,
+    snapshot: WorkflowSnapshot, issue: IssueView, *,
     external_holds: tuple[str, ...] = (),
 ) -> Relabel:
-    """Only the selected gate's shared attention label may be released."""
+    """Only the selected gate's shared attention label may be released.
+
+    The command is fenced by the accepted hold facts (ADR 0015), not by the
+    raw issue revision: harmless activity cannot supersede it, and its own
+    half-applied relabel still satisfies the guard on retry.
+    """
     if not isinstance(snapshot.intent, PendingRearm):
         raise ValueError("resolve projection requires a pending re-arm")
-    if not expected_revision or not isinstance(expected_revision, str):
+    if not isinstance(issue, IssueView) or issue.number != snapshot.revision.fence.key.target.number:
+        raise ValueError("resolve projection requires its accepted issue observation")
+    if not issue.updated_at or not isinstance(issue.updated_at, str):
         raise ValueError("resolve projection requires a fresh remote revision")
-    remaining = any(_open(g).gate_id != snapshot.intent.gate_id for g in snapshot.gates)
+    remaining = any(
+        _open(g).gate_id != snapshot.intent.gate_id and not _retired_uncertainty(snapshot, g)
+        for g in snapshot.gates
+    )
     return Relabel(
         Target.ISSUE, snapshot.revision.fence.key.target.number,
         None if remaining or external_holds else Label.NEEDS_HUMAN_REVIEW,
         Label.NEEDS_HUMAN_REVIEW if remaining or external_holds else Label.AI_READY,
-        expected_revision=expected_revision,
+        expected_revision=issue.updated_at,
         workflow=snapshot.binding,
+        hold_guard=hold_guard(issue),
+    )
+
+
+def _retired_uncertainty(snapshot: WorkflowSnapshot, gate: UnresolvedGate) -> bool:
+    """An uncertainty gate over an obligation this continuation replaces.
+
+    It is not an independent hold: the replacement projects the same outcome
+    and stays held until reconciliation resolves the prior effect (ADR 0015),
+    so planning a hold-preserving write around it would conflict with the
+    prior write if that write landed.
+    """
+    pending = snapshot.intent
+    assert isinstance(pending, PendingRearm)
+    selected = next((_open(g) for g in snapshot.gates if _open(g).gate_id == pending.gate_id), None)
+    if selected is None or not isinstance(selected.cause, RearmNeedsDecision):
+        return False
+    cause = _open(gate).cause
+    return (
+        isinstance(cause, (RemoteOutcomeUncertain, RetryAuthorizationRequired))
+        and cause.command_id in selected.cause.obligations
     )
 
 
@@ -861,22 +893,11 @@ def validate_resolve_transition(
                 if isinstance(observation, ResolveRearmPreflight):
                     if not 0 <= (now - observation.linkage.observed_at).total_seconds() <= 300:
                         raise ValueError("supersession linkage is stale")
-                    if accepted_preflight is None or (
-                        observation.issue.issue.title, observation.issue.issue.body, observation.issue.issue.state,
-                        set(observation.external_holds),
-                    ) == (
-                        accepted_preflight.issue.issue.title, accepted_preflight.issue.issue.body,
-                        accepted_preflight.issue.issue.state, set(accepted_preflight.external_holds),
-                    ):
-                        raise ValueError("supersession requires changed decision or hold facts")
+                    if accepted_preflight is None or set(observation.external_holds) == set(accepted_preflight.external_holds):
+                        raise ValueError("supersession requires changed hold facts")
                 elif isinstance(observation, ObservedIssue):
-                    if accepted_preflight is None or (
-                        observation.issue.title, observation.issue.body, observation.issue.state,
-                    ) == (
-                        accepted_preflight.issue.issue.title, accepted_preflight.issue.issue.body,
-                        accepted_preflight.issue.issue.state,
-                    ):
-                        raise ValueError("supersession requires materially changed issue decision facts")
+                    # Title/body/comment edits are not decision facts (ADR 0015).
+                    raise ValueError("decision supersession requires an observed linked PR or changed holds")
             elif intent.reason is not StopReason.REQUIRED_EFFECT_REJECTED:
                 raise ValueError("supersession reason is not authorized")
             expected = supersede_resolve_rearm(prior, intent.reason, intent.evidence_id, verified_commands=intent.verified_commands, uncertainty=uncertainty)
@@ -914,13 +935,16 @@ def validate_resolve_transition(
                 raise ValueError("resolve projection requires a revision-fenced issue relabel")
             if command.expected_revision != audit.preflight.issue.issue.updated_at:
                 raise ValueError("projection revision disagrees with its trusted observation")
-            action = resolve_rearm_projection(proposal.snapshot, expected_revision=command.expected_revision, external_holds=audit.preflight.external_holds)
+            action = resolve_rearm_projection(proposal.snapshot, audit.preflight.issue.issue, external_holds=audit.preflight.external_holds)
+            assert action.hold_guard is not None
             expected_payload = {
                 "target": Target.ISSUE.value, "number": action.number,
                 "remove": action.remove.value if action.remove else None,
                 "add": action.add.value if action.add else None,
                 "expected_revision": action.expected_revision,
                 "harness_signal": False, "removes": [], "completion_guard": None,
+                "hold_guard": {"state_reason": action.hold_guard.state_reason,
+                               "labels": sorted(label.value for label in action.hold_guard.labels)},
             }
             if dict(command.payload) != expected_payload:
                 raise ValueError("projection command must preserve every unrelated hold and label")

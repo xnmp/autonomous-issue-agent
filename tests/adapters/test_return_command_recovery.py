@@ -125,11 +125,14 @@ def test_ambiguous_superseded_return_is_read_only_even_with_changed_guard(contro
         if action.comment:
             gateway.comments.add(("issue", 1, action.comment))
     # Isolate the old obligation from the new operator projection.
-    selected = control.runnable_commands(repository="o/r", executor_identity=WRITER.owner_id, diagnose=logs.append)
-    assert command.command_id in {item.command.command_id for item in selected}
+    control.runnable_commands(repository="o/r", executor_identity=WRITER.owner_id, diagnose=logs.append)
     state = control.command_reconciliation(command.command_id)
     assert isinstance(state, RetiredUncertainCommand)
-    attempts = next(item.attempts for item in selected if item.command.command_id == command.command_id)
+    # Retirement keeps the bounded schedule the command entered when its
+    # outcome became unknown; it is not an immediately due read.
+    assert state.uncertainty.history.unresolved_since == NOW
+    assert state.uncertainty.history.next_read_at > NOW
+    attempts = command_row(control, command.command_id)["attempts"]
     assert executor(control, gateway, logs)._reconcile_uncertain(command, state, attempts) is present
     assert isinstance(control.command_reconciliation(command.command_id), RetiredSettledCommand)
     assert gateway.calls == [] and logs == []

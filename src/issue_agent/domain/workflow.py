@@ -972,14 +972,18 @@ class ReconciliationPolicy:
     maximum_delay_seconds: int = 1800
     maximum_age_seconds: int = 3600
     maximum_reads: int = 20
+    # Proven-absent re-executions of one unresolved command before an operator
+    # grant is required; unknown outcomes charge no effect refusals.
+    maximum_reexecutions: int = 4
 
     def __post_init__(self) -> None:
-        for name in ("initial_delay_seconds", "maximum_delay_seconds", "maximum_age_seconds", "maximum_reads"):
+        for name in ("initial_delay_seconds", "maximum_delay_seconds", "maximum_age_seconds", "maximum_reads",
+                     "maximum_reexecutions"):
             _count(getattr(self, name), name, minimum=1)
         if not self.initial_delay_seconds <= self.maximum_delay_seconds <= 86400:
             raise ValueError("reconciliation delay must be bounded to one day")
-        if self.maximum_age_seconds > 30 * 86400 or self.maximum_reads > 10000:
-            raise ValueError("reconciliation age/read ceiling is excessive")
+        if self.maximum_age_seconds > 30 * 86400 or self.maximum_reads > 10000 or self.maximum_reexecutions > 100:
+            raise ValueError("reconciliation age/read/re-execution ceiling is excessive")
 
 
 @dataclass(frozen=True)
@@ -987,11 +991,14 @@ class ActiveReconciliation:
     unresolved_since: datetime
     next_read_at: datetime
     failed_reads: int
+    # Proven-absent re-executions spent under this history (ADR 0015 backoff).
+    reexecutions: int = 0
 
     def __post_init__(self) -> None:
         _time(self.unresolved_since, "unresolved since")
         _time(self.next_read_at, "next read")
         _count(self.failed_reads, "failed reads")
+        _count(self.reexecutions, "re-executions")
         if self.next_read_at < self.unresolved_since:
             raise ValueError("next reconciliation cannot precede unresolved history")
 

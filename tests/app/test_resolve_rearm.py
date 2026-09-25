@@ -129,14 +129,25 @@ def test_restart_grant_then_ack_then_remote_receipt_completes_without_second_res
     assert logs == []
 
 
-def test_changed_requirements_supersede_before_any_workspace_reset(environment, monkeypatch):
+def test_changed_decision_facts_supersede_before_any_workspace_reset(environment, monkeypatch):
     service, store, gateway, repo, clock, logs, command = environment
     assert isinstance(service().submit(command, ACTOR), WorkflowCommitted)
-    gateway.issues[1] = replace(gateway.issues[1], body="New requirements", updated_at="changed")
+    issue = gateway.issues[1]
+    gateway.issues[1] = replace(issue, labels=issue.labels | {Label.AI_DONE}, updated_at="changed")
     monkeypatch.setattr(repo.worktrees, "prepare_episode_workspace", lambda *a, **kw: pytest.fail("changed decision reset work"))
     clock[0] += timedelta(minutes=1)
     assert service().reconcile() == 1
     assert isinstance(_state(service(), command).intent, SupersededRearm)
+
+
+def test_edited_requirements_are_not_hold_facts_and_keep_the_rearm_pending(environment):
+    """ADR 0015: a body edit bumps the raw revision but decides nothing about the hold."""
+    service, store, gateway, repo, clock, logs, command = environment
+    assert isinstance(service().submit(command, ACTOR), WorkflowCommitted)
+    gateway.issues[1] = replace(gateway.issues[1], body="New requirements", updated_at="changed")
+    clock[0] += timedelta(minutes=1)
+    service().reconcile()
+    assert isinstance(_state(service(), command).intent, PendingRearm)
 
 
 def test_cancel_continue_reuses_original_preparation_without_another_grant(environment, monkeypatch):

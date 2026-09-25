@@ -208,12 +208,15 @@ def test_death_after_consumption_reconciles_read_only_and_needs_a_fresh_grant(wo
     assert client.post(PATH + "/commands", json=body).status_code == 200
     spent = client.post(PATH + "/commands", json={**_body(state, gate, "grant-2")})
     assert spent.status_code == 422
-    # The partial write changed the issue; the original guard no longer holds,
-    # so the fresh grant retires the command instead of adopting the revision.
+    # The partial write is this command's own effect: the original decision
+    # still applies (ADR 0015 semantic fence), so the fresh grant repairs it
+    # with exactly one more write instead of retiring the completion.
     assert client.post(PATH + "/commands", json=_body(state, fresh, "grant-2")).status_code == 202
     clock[0] += timedelta(seconds=10)
     _recovery(restarted, PersistentGitHub(remote.path), clock, logs).drain_pending_commands()
-    assert len(remote.calls) == 1
+    assert len(remote.calls) == 2
+    assert remote.get_issue(1).labels == frozenset({Label.AI_READY})
+    assert restarted.effect_receipt(command.command_id).status is EffectStatus.SUCCEEDED
     final = client.get(PATH).json()
     assert all(item["gate_id"] != "uncertain" for item in final["gates"])
     _no_new_allowance(store, before, final)

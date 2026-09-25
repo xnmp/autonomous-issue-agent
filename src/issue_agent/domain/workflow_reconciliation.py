@@ -71,6 +71,50 @@ def absent_reconciliation(
     )
 
 
+def unknown_outcome_history(
+    prior: ActiveReconciliation | None, now: datetime, policy: ReconciliationPolicy = ReconciliationPolicy(),
+) -> ActiveReconciliation:
+    """The pre-expiry schedule a newly unknown outcome enters (ADR 0015).
+
+    A first unknown starts the history. A later one (after a proven-absent
+    re-execution) keeps its start and read count and waits exponentially
+    longer per re-execution spent, so a request that keeps getting lost is
+    never retried at a fixed rate.
+    """
+    if not isinstance(now, datetime) or now.tzinfo is None or not isinstance(policy, ReconciliationPolicy):
+        raise ValueError("unknown outcome scheduling requires an aware time and a policy")
+    if prior is None:
+        return ActiveReconciliation(now, now + timedelta(seconds=policy.initial_delay_seconds), 0)
+    if not isinstance(prior, ActiveReconciliation):
+        raise ValueError("only pre-expiry history can schedule another unknown outcome")
+    delay = min(policy.maximum_delay_seconds,
+                policy.initial_delay_seconds * 2 ** min(prior.reexecutions, 17))
+    return replace(prior, next_read_at=max(prior.next_read_at, now + timedelta(seconds=delay)))
+
+
+def absent_reexecution(history: ActiveReconciliation) -> ActiveReconciliation:
+    """Spend one proven-absent re-execution under the same unresolved history."""
+    if not isinstance(history, ActiveReconciliation):
+        raise ValueError("re-execution requires pre-expiry history")
+    return replace(history, reexecutions=history.reexecutions + 1)
+
+
+def reexecution_exhausted(
+    history: ActiveReconciliation, now: datetime, policy: ReconciliationPolicy = ReconciliationPolicy(),
+) -> bool:
+    """Whether proven absence may still re-execute an unresolved command.
+
+    Unknown outcomes charge no refusals, so without this bound an
+    unknown -> absent -> re-execute cycle never ends. At the re-execution or
+    age ceiling the command expires to reconciliation-only, where absence
+    needs an operator grant (ADR 0015; ADR 0012 loops carry a ceiling).
+    """
+    if not isinstance(history, ActiveReconciliation) or not isinstance(policy, ReconciliationPolicy):
+        raise ValueError("re-execution bound requires pre-expiry history and a policy")
+    return (history.reexecutions >= policy.maximum_reexecutions
+            or (now - history.unresolved_since).total_seconds() >= policy.maximum_age_seconds)
+
+
 def reconciliation_due(state: CommandReconciliation, now: datetime) -> bool:
     if isinstance(state, RetiredSettledCommand):
         return False
@@ -89,11 +133,17 @@ def unavailable_reconciliation(
     evidence_id: str,
     error: str,
     policy: ReconciliationPolicy = ReconciliationPolicy(),
+    reexecution_ceiling: bool = False,
 ) -> ReconciliationProgress:
-    """Record an actual failed read; expiry can only remove execution permission."""
+    """Record an actual failed read; expiry can only remove execution permission.
+
+    ``reexecution_ceiling`` records a proven absence that may no longer
+    re-execute: it expires at once instead of backing off.
+    """
     validate_workflow_identifier(command_id, "command")
     validate_workflow_identifier(evidence_id, "reconciliation evidence")
-    if not isinstance(binding, WorkflowBinding) or not isinstance(policy, ReconciliationPolicy):
+    if (not isinstance(binding, WorkflowBinding) or not isinstance(policy, ReconciliationPolicy)
+            or not isinstance(reexecution_ceiling, bool)):
         raise ValueError("reconciliation requires validated authority and policy")
     if isinstance(prior, RetiredSettledCommand):
         return ReconciliationProgress(prior, None)
@@ -104,10 +154,11 @@ def unavailable_reconciliation(
     since = old_history.unresolved_since if old_history is not None else now
     reads = min(old_history.failed_reads + 1, 2**63 - 1) if old_history is not None else 1
     delay = min(policy.maximum_delay_seconds, policy.initial_delay_seconds * 2 ** min(reads - 1, 17))
-    history = ActiveReconciliation(since, now + timedelta(seconds=delay), reads)
+    history = ActiveReconciliation(since, now + timedelta(seconds=delay), reads,
+                                   old_history.reexecutions if old_history is not None else 0)
     if now < since:
         raise ValueError("reconciliation observation precedes unresolved history")
-    expired = isinstance(previous, ReconciliationOnly) or reads >= policy.maximum_reads or (
+    expired = reexecution_ceiling or isinstance(previous, ReconciliationOnly) or reads >= policy.maximum_reads or (
         now - since
     ).total_seconds() >= policy.maximum_age_seconds
     if not expired:

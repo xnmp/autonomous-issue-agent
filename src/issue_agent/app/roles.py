@@ -174,6 +174,7 @@ from .dispatch import AgentDispatcher, DispatchConfig
 from .infra_breaker import InfraBreaker
 from ..domain.infra_breaker import BreakerPolicy
 from .execute import Executor
+from .workflows.resolve_rearm import ResolveRearmWorkflow
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
 from .world_reporter import WorldReporter
@@ -2536,6 +2537,27 @@ def _recurrence_reporter(
     return report
 
 
+@dataclass(frozen=True)
+class FixDaemonComposition:
+    """The fix role's composed authorities.
+
+    Exposed so acceptance tests drive the exact production wiring (drain and
+    recovery bindings, spend gate, worktree removal, outbox flush) instead of a
+    hand-copied replica that can drift from it.
+    """
+
+    daemon: Daemon
+    control: SQLiteControlStore
+    journal: TypedJournal
+    executor: Executor
+    effects: EffectRecovery
+    dispatcher: AgentDispatcher
+    workflow_control: SQLiteWorkflowControl
+    rearm: ResolveRearmWorkflow
+    recovery: _RecoveryHooks
+    owner_id: str
+
+
 def build_fix_daemon(
     cfg: HarnessConfig,
     gateway: GitHubGateway,
@@ -2544,6 +2566,20 @@ def build_fix_daemon(
     runner: AgentRunner,
     fixer_busy=lambda: False,
 ) -> Daemon:
+    return compose_fix_daemon(cfg, gateway, store, worktrees, runner, fixer_busy).daemon
+
+
+def compose_fix_daemon(
+    cfg: HarnessConfig,
+    gateway: GitHubGateway,
+    store: Store,
+    worktrees: Worktrees,
+    runner: AgentRunner,
+    fixer_busy=lambda: False,
+    *,
+    log: Callable[[str], None] | None = None,
+) -> FixDaemonComposition:
+    log = log or _log("fix")
     repo_cfg = cfg.repository
     fix_runtime = cfg.fix_runtime
     codex_runtime = cfg.codex_runtime
@@ -2568,7 +2604,7 @@ def build_fix_daemon(
         arm_on_open=cfg.arm_on_open_active,
     )
     journal = _typed_journal(_journal(store), cfg, "fix", store.state_dir)
-    infra_breaker = _infra_breaker(cfg, journal, _log("fix"))
+    infra_breaker = _infra_breaker(cfg, journal, log)
     dcfg = DispatchConfig(
         base_branch=repo_cfg.base_branch,
         fix=FixTaskConfig(
@@ -2589,7 +2625,7 @@ def build_fix_daemon(
         max_contract_rounds=fix_runtime.max_contract_rounds,
         fix_mcp_config=fix_runtime.mcp_config,
         harness_root=cfg.runtime_paths.harness_root,
-        log=_log("fix"),
+        log=log,
         fix_bot=fix_runtime.bot,
         # Scope notes keep one owner; repairs and review read the same record.
         operator_guidance=Store(cfg.review_state_dir).get_operator_guidance,
@@ -2619,10 +2655,10 @@ def build_fix_daemon(
         retry_ceiling=cfg.effect_retry_ceiling,
         journal=journal,
         alert_cmd=cfg.alert_cmd,
-        log=_log("fix"),
+        log=log,
     )
     executor = Executor(
-        gateway, remove_worktree=worktrees.remove, log=_log("fix"),
+        gateway, remove_worktree=worktrees.remove, log=log,
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
         mark_ci_cancel=store.set_ci_cancel_head,
         mark_branch_update=store.set_update_branch_head,
@@ -2678,7 +2714,7 @@ def build_fix_daemon(
 
     rearm_workflow = compose_resolve_rearm(
         cfg, control, gateway, worktrees, store,
-        now=lambda: datetime.now(timezone.utc), log=_log("fix"),
+        now=lambda: datetime.now(timezone.utc), log=log,
         approved_host=os.environ.get("GH_HOST", "github.com"),
     )
 
@@ -2698,25 +2734,25 @@ def build_fix_daemon(
     report_holds = _hold_reporter(
         journal,
         cfg.repo,
-        _log("fix"),
+        log,
         issue_is_blocked=lambda issue: gateway.get_issue(issue).has(
             Label.AI_BLOCKED
         ),
         control=control,
     )
     report_prediction_outcomes = _prediction_outcome_reporter(
-        journal, cfg.repo, store, _log("fix"), control
+        journal, cfg.repo, store, log, control
     )
     report_ci_stalls = _ci_stall_reporter(
-        journal, cfg.repo, fix_cfg, _log("fix"), control
+        journal, cfg.repo, fix_cfg, log, control
     )
     report_duplicates = _duplicate_pr_reporter(
-        journal, cfg.repo, fix_cfg, _log("fix"), control
+        journal, cfg.repo, fix_cfg, log, control
     )
     report_ci_flakes = _ci_flake_reporter(
-        journal, cfg.repo, fix_cfg, _log("fix"), control
+        journal, cfg.repo, fix_cfg, log, control
     )
-    report_stalls = _stall_reporter(journal, store, _log("fix"))
+    report_stalls = _stall_reporter(journal, store, log)
     daemon_ref: dict[str, Daemon] = {}
 
     issue_kinds = frozenset({AgentKind.RESOLVE, AgentKind.RESUME})
@@ -2783,21 +2819,21 @@ def build_fix_daemon(
             inflight,
             control.abandoned_dispatch_counts(owner_id),
             _collect_test_exemptions(
-                gateway, world, fix_cfg, fix_cfg.review_bot, _log("fix")
+                gateway, world, fix_cfg, fix_cfg.review_bot, log
             ),
             workflow_control=workflow_control,
         )
         for target, reason in state.control_errors.items():
-            _log("fix")(f"workflow {target} held: {reason}")
+            log(f"workflow {target} held: {reason}")
         migration_required = sorted(
             target for target, workflow in state.resolve_workflows.items()
             if isinstance(workflow, WorkflowMigrationRequired)
         )
         if migration_required:
-            _log("fix")(f"resolve workflows held ({len(migration_required)}): resolve_migration_required")
+            log(f"resolve workflows held ({len(migration_required)}): resolve_migration_required")
         for target, workflow in state.resolve_workflows.items():
             if isinstance(workflow, WorkflowUnavailable):
-                _log("fix")(f"resolve workflow {target} held: {workflow.reason}")
+                log(f"resolve workflow {target} held: {workflow.reason}")
         budget_blocks, budget_worlds = _budget_self_clear_worlds(
             control, cfg, world, state.budget_blocks
         )
@@ -2835,7 +2871,7 @@ def build_fix_daemon(
             if not reservations.reserve(action, issue, paths):
                 rejected.append(action)
                 rejected_issues.add(issue)
-                _log("fix")(
+                log(
                     f"dispatch {action.kind.name} #{action.number}: deferred — "
                     "path reservation changed during decision"
                 )
@@ -2853,7 +2889,7 @@ def build_fix_daemon(
             )
         ]
 
-    _log("fix")(fix_capability_line(
+    log(fix_capability_line(
         auto_merge=fix_cfg.auto_merge,
         auto_rebase=fix_cfg.auto_rebase_conflicts,
         escalate_on_evidence=cfg.escalate_on_evidence,
@@ -2870,7 +2906,7 @@ def build_fix_daemon(
         reconciler=fix_reconciler,
     )
     reported_world = _reported_world(
-        gateway.build_world, control, cfg, "fix", _log("fix")
+        gateway.build_world, control, cfg, "fix", log
     )
 
     def observe_with_prefetch_reservations():
@@ -2883,7 +2919,7 @@ def build_fix_daemon(
         decide,
         executor,
         cfg.tick_interval_seconds,
-        _log("fix"),
+        log,
         journal=journal,
         tick_gate=_first_gate(
             _control_spend_gate(cfg, control),
@@ -2920,7 +2956,10 @@ def build_fix_daemon(
         ),
     )
     daemon_ref["daemon"] = daemon
-    return daemon
+    return FixDaemonComposition(
+        daemon, control, journal, executor, effect_executor, dispatcher,
+        workflow_control, rearm_workflow, recovery, owner_id,
+    )
 
 
 def _review_state(

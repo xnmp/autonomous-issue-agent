@@ -15,7 +15,7 @@ from .actions import PostComment, Relabel, Target
 from .labels import Label
 from .eligibility import (
     AllowedEligibility, Eligibility, HeldEligibility, InvalidEligibility,
-    LifecycleOperation, IssueCompletionGuard,
+    LifecycleOperation, IssueCompletionGuard, IssueHoldGuard, ORDERING_LABELS,
 )
 
 
@@ -32,6 +32,12 @@ def completion_guard(issue, operation: LifecycleOperation) -> IssueCompletionGua
     )
 
 
+def _labels_within(before: frozenset[Label], current: frozenset[Label],
+                   removed: tuple[Label, ...], added: tuple[Label, ...]) -> bool:
+    """Only this command's own declared label effects may separate the two sets."""
+    return not (current - before - set(added) or before - current - set(removed))
+
+
 def completion_matches(
     guard: IssueCompletionGuard, issue, *, removed: tuple[Label, ...] = (),
     added: tuple[Label, ...] = (), comment: str = "",
@@ -41,7 +47,7 @@ def completion_matches(
         issue.title, issue.body, issue.author, issue.state_reason
     ) != (guard.title, guard.body, guard.author, guard.state_reason):
         return False
-    if issue.labels - guard.labels - set(added) or guard.labels - issue.labels - set(removed):
+    if not _labels_within(guard.labels, issue.labels, removed, added):
         return False
     current = [(c.author, c.body, c.created_at) for c in issue.comments]
     for original in guard.comments:
@@ -49,6 +55,29 @@ def completion_matches(
             return False
         current.remove(original)
     return not current or (bool(comment) and len(current) == 1 and current[0][1] == comment)
+
+
+def hold_guard(issue) -> IssueHoldGuard:
+    """Capture the hold facts an accepted projection decision depends on."""
+    if issue.state != "open":
+        raise ValueError("a hold projection guard requires an open issue")
+    return IssueHoldGuard(issue.state_reason, frozenset(issue.labels) - ORDERING_LABELS)
+
+
+def hold_guard_applies(
+    guard: IssueHoldGuard, issue, *, linked_pr: int | None,
+    removed: tuple[Label, ...] = (), added: tuple[Label, ...] = (),
+) -> bool:
+    """Whether the accepted hold facts still hold, modulo this command's own effects.
+
+    A comment or body edit leaves every one of these facts unchanged; a new
+    hold, recurrence or terminal label, a close/reopen, or a linked PR does not.
+    """
+    if not isinstance(guard, IssueHoldGuard):
+        raise ValueError("hold guard evaluation requires a typed guard")
+    if issue.state != "open" or issue.state_reason != guard.state_reason or linked_pr is not None:
+        return False
+    return _labels_within(guard.labels, frozenset(issue.labels) - ORDERING_LABELS, removed, added)
 
 
 def completion_eligibility(issue, operation: LifecycleOperation, action) -> Eligibility:

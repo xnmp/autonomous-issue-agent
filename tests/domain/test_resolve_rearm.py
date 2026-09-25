@@ -28,12 +28,14 @@ def reading(state):
     return RearmObservation(state.intent.request_id, state.binding, ActiveReconciliation(NOW, NOW, 0))
 
 
-def reconcile(proposal, *, workspace=None, verified=(), rejected=(), uncertainty=(), issue=None, linkage=None, now=NOW):
+def reconcile(proposal, *, workspace=None, verified=(), rejected=(), uncertainty=(), issue=None, linkage=None, now=NOW,
+              external_holds=()):
     state = proposal.snapshot
     return decide_rearm_reconciliation(
         state, proposal.audit.preflight, issue or observed(state, labels=frozenset({Label.AI_READY})),
         linkage or no_pr(state), verified_commands=verified, rejected_commands=rejected,
         uncertainty=uncertainty, workspace=workspace, evidence_id="observation", now=now,
+        external_holds=external_holds,
     )
 
 
@@ -57,7 +59,7 @@ def test_matching_workspace_and_all_receipts_complete_selected_rearm():
 
 
 @pytest.mark.parametrize("change,reason", [("closed", StopReason.TARGET_TERMINAL),
-                                           ("body", StopReason.DECISION_CHANGED),
+                                           ("hold", StopReason.DECISION_CHANGED),
                                            ("pr", StopReason.DECISION_CHANGED),
                                            ("rejected", StopReason.REQUIRED_EFFECT_REJECTED)])
 def test_obsolete_decision_stops_before_workspace_preparation(change, reason):
@@ -66,14 +68,28 @@ def test_obsolete_decision_stops_before_workspace_preparation(change, reason):
     issue = observed(state)
     if change == "closed":
         issue = replace(issue, issue=replace(issue.issue, state="closed"))
-    elif change == "body":
-        issue = replace(issue, issue=replace(issue.issue, body="new requirements"))
     result = reconcile(proposal, issue=issue,
                        linkage=LinkedPrPresent(issue.key, 99, "head", NOW) if change == "pr" else None,
-                       rejected=state.intent.required_commands if change == "rejected" else ())
+                       rejected=state.intent.required_commands if change == "rejected" else (),
+                       external_holds=("ai-parked",) if change == "hold" else ())
     assert isinstance(result.snapshot.intent, SupersededRearm)
     assert result.snapshot.intent.reason is reason
     assert result.snapshot.episode == state.episode
+
+
+@pytest.mark.parametrize("edit", ["body", "title", "comment"])
+def test_conversation_and_requirement_edits_are_not_hold_facts(edit):
+    """ADR 0015: only hold facts supersede a pending re-arm."""
+    from issue_agent.domain.world import Comment
+
+    proposal = pending()
+    state = proposal.snapshot
+    issue = observed(state)
+    changed = (replace(issue.issue, body="new requirements") if edit == "body" else
+               replace(issue.issue, title="new title") if edit == "title" else
+               replace(issue.issue, comments=(Comment("human", "any update?", "2026-09-14T00:00:00Z"),)))
+    result = reconcile(proposal, issue=replace(issue, issue=changed))
+    assert isinstance(result, WorkflowUnchanged) and result.snapshot == state
 
 
 @pytest.mark.parametrize("seconds", [-1, 301])
@@ -213,7 +229,7 @@ def test_unchanged_preflight_cannot_fabricate_decision_changed_supersession():
     assert isinstance(stopped, WorkflowChanged)
     accepted = proposal.audit.preflight
     unchanged = ResolveRearmPreflight(accepted.issue, accepted.linkage, accepted.external_holds)
-    with pytest.raises(ValueError, match="changed decision or hold facts"):
+    with pytest.raises(ValueError, match="changed hold facts"):
         validate_resolve_transition(
             state, stopped, ceiling=3, now=NOW, observations=(unchanged,),
             accepted_preflight=accepted,

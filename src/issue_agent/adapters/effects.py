@@ -25,17 +25,18 @@ from ..domain.actions import (
     UpdateBranch,
 )
 from ..domain.labels import Label
-from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
+from ..domain.eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from ..domain.lifecycle import (
     AllowedEligibility, completion_guard, completion_matches, issue_eligibility,
-    completion_eligibility,
+    completion_eligibility, hold_guard_applies,
 )
 from ..domain.repository import canonical_repository
 from ..domain.workflow_identity import WorkflowBinding
 from ..domain.workflow import (
-    ReconciliationOnly, RetiredUncertainCommand,
+    ActiveReconciliation, ReconciliationOnly, RetiredUncertainCommand,
     RetryBegan, RetryDeclined,
 )
+from ..domain.workflow_reconciliation import reconciliation_due, reexecution_exhausted
 from ..domain.workflow_retry import RetryAbsenceRead
 from ..domain.contracts import (
     CommandId,
@@ -129,6 +130,11 @@ class LabelVerifier(Protocol):
 @runtime_checkable
 class CommentVerifier(Protocol):
     def has_comment(self, kind: str, number: int, body: str) -> bool: ...
+
+
+@runtime_checkable
+class LinkedPullRequestReads(Protocol):
+    def pr_for_issue(self, number: int) -> int | None: ...
 
 
 @runtime_checkable
@@ -355,6 +361,47 @@ class GitHubEffectExecutor:
 
     def execute(self, action: Action):
         pending = self._pending_for_action(action)
+        if pending is not None and _unresolved_workflow_command(pending):
+            return self._reconcile_scheduled(pending, raise_unresolved=True)
+        return self._execute(action, pending)
+
+    def _reconcile_scheduled(self, pending, *, raise_unresolved: bool) -> bool:
+        """Bounded pre-expiry read of an unresolved workflow command (ADR 0015).
+
+        Presence settles the same command; unavailability advances the
+        persisted schedule toward its uncertainty gate; only proven absence
+        reaches the existing re-execution path. Expired or retired commands
+        are read solely by the drain's reconciliation-only path.
+        """
+        command = pending.command
+        state = self.store.command_reconciliation(command.command_id)
+        if state is not None and not isinstance(state, ActiveReconciliation):
+            if raise_unresolved:
+                raise UnknownEffectOutcome(f"{command.command_id}: outcome is reconciliation-only")
+            return False
+        if state is not None and not reconciliation_due(state, self.store.now()):
+            if raise_unresolved:
+                raise UnknownEffectOutcome(
+                    f"{command.command_id}: unresolved outcome is next read at {state.next_read_at.isoformat()}"
+                )
+            return False
+        started = self.store.now()
+        present, error = self._observe_postcondition(command)
+        ceiling = present is False and state is not None and reexecution_exhausted(state, started)
+        if ceiling:
+            error = "repeated unknown outcomes reached the re-execution ceiling; absence needs an operator grant"
+        elif present is False:
+            return self._execute(action_from_command(command), pending)
+        if self.store.record_scheduled_read(
+            command.command_id, state, expected_attempts=pending.attempts, read_started_at=started,
+            executor_identity=self.identity, observed=present, error=error, reexecution_ceiling=ceiling,
+        ):
+            return True
+        if raise_unresolved:
+            raise UnknownEffectOutcome(f"{command.command_id}: remote outcome remains unknown ({error or 'unverified'})")
+        return False
+
+    def _execute(self, action: Action, pending):
         if pending is None and isinstance(action, CloseIssue) and self._reconcile(action) is True:
             return True
         if isinstance(action, CloseIssue) or (
@@ -631,6 +678,8 @@ class GitHubEffectExecutor:
                 reconciliation = self.store.command_reconciliation(command.command_id)
                 if isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
                     applied = self._reconcile_uncertain(command, reconciliation, pending.attempts)
+                elif _unresolved_workflow_command(pending):
+                    applied = self._reconcile_scheduled(pending, raise_unresolved=False)
                 elif command.kind is CommandKind.SUBMIT_REVIEW:
                     applied = self._run_review_command(pending)
                 else:
@@ -729,7 +778,7 @@ class GitHubEffectExecutor:
                 settled = record(started, present, error)
                 return False
             try:
-                guard_holds = self._revision_matches(command)
+                guard_holds = self._decision_applies(command)
                 revision = self._current_revision(command)
                 outcome = self.store.begin_authorized_retry(
                     command.command_id, grant.authorization_id, expected=state, expected_attempts=attempts,
@@ -848,6 +897,7 @@ class GitHubEffectExecutor:
         action: Action,
         command: LifecycleCommand | None = None,
     ):
+        """Apply one effect, re-validating its completion facts between writes."""
         if isinstance(action, Relabel):
             if _is_compound_relabel(action):
                 self._validate_completion(action, partial=True)
@@ -1140,6 +1190,7 @@ class GitHubEffectExecutor:
         )
 
     def _relabel_partially_applied(self, action: Relabel) -> bool:
+        # A hold guard already admits this command's own partial effects.
         if action.completion_guard is None:
             return False
         current = self.gateway.get_issue(action.number)
@@ -1259,7 +1310,53 @@ class GitHubEffectExecutor:
                 continue
         return None
 
+    def _hold_guard_holds(self, action: Relabel) -> bool:
+        """ADR 0015: the accepted hold facts, never the raw issue revision."""
+        guard = action.hold_guard
+        assert guard is not None
+        current = self.gateway.get_issue(action.number)
+        if not isinstance(self.gateway, LinkedPullRequestReads):
+            raise UnknownEffectOutcome(f"issue:{action.number}: linked-PR absence cannot be verified")
+        return hold_guard_applies(
+            guard, current, linked_pr=self.gateway.pr_for_issue(action.number),
+            removed=action.removed_labels, added=action.added_labels,
+        )
+
+    def _decision_applies(self, command: LifecycleCommand) -> bool:
+        """Whether the original decision still applies to an authorized retry.
+
+        Re-evaluates the command's own decision facts and never adopts a newer
+        revision (ADR 0015). Its own partially applied effect satisfies them:
+        repairing that half-landed write is what the retry is for. A
+        completion is judged on its full original guard, conversation
+        included: a completion that asks a question must not be re-posted over
+        a human's answer. Only a re-arm hold projection uses the semantic hold
+        fence. Commands carrying only a raw revision are re-derived from fresh
+        observations each tick, so their raw fence stays authoritative.
+        """
+        if command.kind in {CommandKind.RELABEL, CommandKind.CLOSE_ISSUE}:
+            action = action_from_command(command)
+            if isinstance(action, Relabel) and action.hold_guard is not None:
+                return self._hold_guard_holds(action)
+            if isinstance(action, (Relabel, CloseIssue)) and action.completion_guard is not None:
+                guard = action.completion_guard
+                current = self.gateway.get_issue(action.number)
+                removed, added = (
+                    (action.removed_labels, action.added_labels) if isinstance(action, Relabel)
+                    else (action.remove_labels, action.add_labels)
+                )
+                return completion_matches(
+                    guard, current, removed=removed, added=added, comment=action.comment,
+                ) and isinstance(
+                    completion_eligibility(current, guard.operation, action), AllowedEligibility,
+                )
+        return self._revision_matches(command)
+
     def _revision_matches(self, command: LifecycleCommand) -> bool:
+        if command.kind is CommandKind.RELABEL:
+            action = action_from_command(command)
+            if isinstance(action, Relabel) and action.hold_guard is not None:
+                return self._hold_guard_holds(action)
         if command.kind in {CommandKind.RELABEL, CommandKind.CLOSE_ISSUE}:
             action = action_from_command(command)
             try:
@@ -1337,6 +1434,8 @@ def command_for_action(
             action_payload.pop("adds", None)
         if not action.comment:
             action_payload.pop("comment", None)
+        if action.hold_guard is None:
+            action_payload.pop("hold_guard", None)
     payload = {**action_payload, **dict(payload_extra or {})}
     encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     revision = (
@@ -1397,6 +1496,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
             workflow=command.workflow,
             adds=adds,
             comment=comment,
+            hold_guard=_hold_guard_from_payload(payload.get("hold_guard")),
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(
@@ -1507,6 +1607,16 @@ def _expected_revision(action: Action) -> str | None:
     )
 
 
+def _unresolved_workflow_command(pending) -> bool:
+    """A migrated-slice command whose outcome is not yet known (ADR 0015)."""
+    command = pending.command
+    return (
+        command.workflow is not None
+        and command.kind is not CommandKind.SUBMIT_REVIEW
+        and pending.state in ("executing", EffectStatus.UNKNOWN_OUTCOME.value)
+    )
+
+
 def _is_compound_relabel(action: Relabel) -> bool:
     return bool(action.adds or action.comment)
 
@@ -1569,6 +1679,19 @@ def _completion_guard_from_payload(raw: object) -> IssueCompletionGuard | None:
         raw["state_reason"], frozenset(Label(label) for label in labels),
         tuple(tuple(comment) for comment in comments),
     )
+
+
+def _hold_guard_from_payload(raw: object) -> IssueHoldGuard | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or set(raw) != {"state_reason", "labels"}:
+        raise ValueError("malformed hold guard")
+    labels = raw["labels"]
+    if not isinstance(raw["state_reason"], str) or not isinstance(labels, (tuple, list)) or not all(
+        isinstance(label, str) for label in labels
+    ):
+        raise ValueError("malformed hold guard facts")
+    return IssueHoldGuard(raw["state_reason"], frozenset(Label(label) for label in labels))
 
 
 def _jsonable(value: object) -> Any:

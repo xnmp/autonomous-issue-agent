@@ -24,6 +24,7 @@ class PersistentGitHub:
             db.execute("CREATE TABLE IF NOT EXISTS issues (number INTEGER PRIMARY KEY, body TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS prs (number INTEGER PRIMARY KEY, body TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS calls (body TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS links (issue INTEGER PRIMARY KEY, pr INTEGER NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS clock (revision INTEGER NOT NULL)")
             if db.execute("SELECT revision FROM clock").fetchone() is None:
                 db.execute("INSERT INTO clock VALUES (0)")
@@ -121,6 +122,9 @@ class PersistentGitHub:
                 db.execute("UPDATE prs SET body = ? WHERE number = ?", (json.dumps(body), number))
             return
         assert kind == "issue"
+        # A request lost before GitHub applied it: the caller cannot tell it
+        # from a lost reply, but the remote never changes.
+        self.fault("relabel_requested")
         self._call("relabel", number, remove, add)
         if add:
             self._update(number, lambda body: body.update(labels=sorted(set(body["labels"]) | {add})))
@@ -150,5 +154,41 @@ class PersistentGitHub:
         issue = self.get_issue(number)
         return issue.state.lower() == "closed", issue.state_reason
 
-    def pr_for_issue(self, number: int) -> None:
-        return None
+    def pr_for_issue(self, number: int) -> int | None:
+        # A failed linkage read is unavailable, never an observed absence.
+        self.fault("linkage")
+        with self._connect() as db:
+            row = db.execute("SELECT pr FROM links WHERE issue = ?", (number,)).fetchone()
+        return None if row is None else int(row[0])
+
+    def link_pr(self, issue: int, pr: int) -> None:
+        """Model GitHub linkage appearing outside the harness (not a harness call)."""
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO links VALUES (?, ?)", (issue, pr))
+
+    def external_change(
+        self, number: int, *, add: tuple[str, ...] = (), remove: tuple[str, ...] = (),
+        state: str | None = None, state_reason: str = "", body: str | None = None,
+        comment: tuple[str, str] | None = None,
+    ) -> None:
+        """A human/remote edit: advances the revision but is not a harness call.
+
+        ``comment`` is ``(author, body)`` appended as third-party conversation.
+        """
+        def change(issue: dict) -> None:
+            issue["labels"] = sorted((set(issue["labels"]) | set(add)) - set(remove))
+            if state is not None:
+                issue.update(state=state, state_reason=state_reason)
+            if body is not None:
+                issue["body"] = body
+            if comment is not None:
+                author, text = comment
+                issue["comments"].append({"author": author, "body": text, "created_at": issue["updated_at"]})
+        self._update(number, change)
+
+    def external_pr_change(self, number: int, **fields) -> None:
+        """A remote PR edit (for example a pushed head) outside the harness."""
+        with self._connect() as db:
+            body = json.loads(db.execute("SELECT body FROM prs WHERE number = ?", (number,)).fetchone()[0])
+            body.update(fields)
+            db.execute("UPDATE prs SET body = ? WHERE number = ?", (json.dumps(body), number))

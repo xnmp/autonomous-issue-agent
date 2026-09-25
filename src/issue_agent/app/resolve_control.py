@@ -78,7 +78,15 @@ def open_resolve_operator(
     name: str, *, harness_root: str, control_db_path: str = "",
     now: Callable[[], datetime] = lambda: datetime.now(timezone.utc),
     log: Callable[[str], None] = _ignore_log,
+    gateway: Callable[[HarnessConfig, Mapping[str, str]], WorkflowGitHubReads] | None = None,
+    worktrees: Callable[[HarnessConfig], FixWorktreePort] | None = None,
 ) -> ResolveRearmWorkflow:
+    """Operator composition from the deployment's launch snapshot.
+
+    ``gateway``/``worktrees`` replace only the remote transport and checkout
+    adapters (acceptance tests); configuration, authority path and owner
+    binding are always derived here.
+    """
     cfg, env = load_operator_configuration(name, harness_root=harness_root)
     if "fix" not in env.get("ROLES", "fix review steward").split():
         raise ValueError("resolve re-arm requires the configured fix role")
@@ -90,8 +98,10 @@ def open_resolve_operator(
     control = SQLiteControlStore(path, now=now)
     control.require_initialized()
     control.bind_active_owner(owner_identity_for_target(cfg.repo, cfg.target_dir, "fix"))
-    gateway = GitHubGateway(cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None), base_branch=cfg.base_branch)
-    worktrees = Worktrees(cfg.target_dir, cfg.worktree_root, cfg.base_branch)
+    remote = gateway(cfg, env) if gateway is not None else GitHubGateway(
+        cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None), base_branch=cfg.base_branch,
+    )
+    checkout = worktrees(cfg) if worktrees is not None else Worktrees(cfg.target_dir, cfg.worktree_root, cfg.base_branch)
     store = Store(cfg.state_dir, runtime=cfg.fixer_runtime.value)
-    return compose_resolve_rearm(cfg, control, gateway, worktrees, store, now=now, log=log,
+    return compose_resolve_rearm(cfg, control, remote, checkout, store, now=now, log=log,
                                   approved_host=host)

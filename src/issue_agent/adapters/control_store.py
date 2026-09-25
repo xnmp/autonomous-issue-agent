@@ -53,7 +53,10 @@ from ..domain.workflow_retry import (
     MAX_AUTHORIZED_ATTEMPTS, MAX_RELEVANT_AUTHORIZATIONS, BeginRetry, DeclineRetry, grant_unavailable_void, RetryAbsenceRead, RetryAuthorization, RetryAuthorizationFacts,
     retry_spend_decision,
 )
-from ..domain.workflow_reconciliation import ABSENCE_FRESHNESS_SECONDS, ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
+from ..domain.workflow_reconciliation import (
+    ABSENCE_FRESHNESS_SECONDS, ReconciliationProgress, absent_reconciliation, absent_reexecution, reconciliation_due,
+    unavailable_reconciliation, unknown_outcome_history,
+)
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
 from ..domain.outcome import AuthorFollowup, author_followup
 from ..domain.resolve_split import MAX_SPLIT_TRAIL, AdjudicationInput, ContractResetCompleted, ReauthorInput, ReauthorResetIntent, SplitContext, SplitImplement, SplitInput, split_context, validate_contract_rounds
@@ -4977,6 +4980,33 @@ class SQLiteControlStore:
         since = datetime.fromisoformat(row["updated_at"])
         return ActiveReconciliation(since, since, 0)
 
+    @classmethod
+    def _schedule_unresolved(
+        cls, db: sqlite3.Connection, row: sqlite3.Row, status: EffectStatus | None, now: datetime,
+    ) -> None:
+        """Enter or leave the bounded pre-expiry schedule with the outcome itself.
+
+        ADR 0015: a workflow command whose outcome becomes unknown persists its
+        first unresolved time, next read and read count in the same transaction
+        that records the outcome, so it is never re-read on every drain. An
+        already-running history keeps its start and count, including across
+        a proven-absent re-execution (`retry_reconciled_command` keeps it), so
+        repeated unknowns reach the age/read ceiling. A known outcome ends a
+        pre-expiry history; expired or retired histories are owned by the
+        reconciliation-only and retirement paths.
+        """
+        if row["workflow_binding_json"] is None:
+            return
+        prior = cls._command_reconciliation(row)
+        if prior is not None and not isinstance(prior, ActiveReconciliation):
+            return
+        if status is EffectStatus.UNKNOWN_OUTCOME:
+            encoded: str | None = encode_workflow(unknown_outcome_history(prior, now))
+        else:
+            encoded = None
+        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                   (encoded, row["command_id"]))
+
     @staticmethod
     def _retry_judged_inapplicable(db: sqlite3.Connection, command_id: CommandId) -> bool:
         return db.execute(
@@ -5182,6 +5212,82 @@ class SQLiteControlStore:
             self._transition(db, "lifecycle_command", str(command_id), "reconciled_read_only", {"evidence_id": evidence_id})
             return observed is True
 
+    def record_scheduled_read(
+        self, command_id: CommandId, expected: ActiveReconciliation | None,
+        *, expected_attempts: int, read_started_at: datetime, executor_identity: str,
+        observed: bool | None, error: str = "", reexecution_ceiling: bool = False,
+    ) -> bool:
+        """Persist one pre-expiry read of an unresolved workflow command (ADR 0015).
+
+        An unavailable read backs off on the persisted schedule; at the
+        configured age/read ceiling the command becomes reconciliation-only
+        behind one `RemoteOutcomeUncertain` gate. Verified presence settles the
+        same command. Proven absence is recorded here only at the
+        re-execution ceiling (``reexecution_ceiling``), where it expires the
+        command behind its uncertainty gate; below it, absence is the existing
+        authority to re-execute, taken through `retry_reconciled`.
+        True means this read settled the command as succeeded.
+        """
+        if not isinstance(reexecution_ceiling, bool) or (observed is not None and not isinstance(observed, bool)):
+            raise ValueError("a scheduled read requires typed observation facts")
+        if (observed is False) != reexecution_ceiling:
+            raise ValueError("a scheduled read records absence only at the re-execution ceiling")
+        if expected is not None and not isinstance(expected, ActiveReconciliation):
+            raise ValueError("a scheduled read requires pre-expiry history")
+        if type(expected_attempts) is not int or expected_attempts < 0:
+            raise ValueError("reconciliation requires the attempt count observed before the read")
+        if not isinstance(read_started_at, datetime) or read_started_at.tzinfo is None or read_started_at.utcoffset() is None:
+            raise ValueError("reconciliation requires the timezone-aware start of its read")
+        with self.transaction() as db:
+            self._assert_owner_active(db, executor_identity)
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+            if row is None or row["executor_identity"] != executor_identity:
+                raise WorkflowAuthorityError("command reconciliation belongs to another executor")
+            command = _command_from_row(row)
+            binding = command.workflow
+            if binding is None:
+                raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
+            self._return_projection_attempt(db, command)
+            if (row["state"] not in ("executing", "unknown_outcome")
+                    or self._command_reconciliation(row) != expected or int(row["attempts"]) != expected_attempts):
+                return False  # Another read or attempt already advanced this command.
+            now = self._now()
+            if not 0 <= (now - read_started_at).total_seconds() <= ABSENCE_FRESHNESS_SECONDS:
+                raise ValueError("a reconciliation read must be recorded fresh and cannot start in the future")
+            history = expected if expected is not None else self._unresolved_history(row)
+            evidence_payload = json.dumps({"command": str(command_id), "observed_at": _stamp(read_started_at),
+                                           "postcondition_present": observed, "error": error[:4096],
+                                           "prior": encode_workflow(history)}, sort_keys=True)
+            evidence_id = "command-read:" + hashlib.sha256(evidence_payload.encode()).hexdigest()
+            db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                       (evidence_id, *workflow_scope(binding.fence.key), str(command_id), "observation", evidence_payload))
+            if observed is True:
+                receipt = EffectReceipt(command_id, executor_identity, now, now, EffectStatus.SUCCEEDED)
+                self._replace_effect_receipt(db, command)
+                db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (executor_identity, str(command_id)))
+                self._insert_effect(db, receipt, _receipt_digest(receipt))
+                self._transition(db, "lifecycle_command", str(command_id), "reconciled_read_only", {"evidence_id": evidence_id})
+                return True
+            progress = unavailable_reconciliation(
+                binding, command_id, history, now=now, evidence_id=evidence_id,
+                error=error[:4096] or "postcondition verification unavailable",
+                reexecution_ceiling=reexecution_ceiling,
+            )
+            db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                       (encode_workflow(progress.state), str(command_id)))
+            if progress.gate is not None:
+                self._reconciliation_gate(db, binding, progress.gate.gate_id, progress.gate)
+            state = progress.state
+            active = state.history if isinstance(state, ReconciliationOnly) else state
+            self._transition(db, "lifecycle_command", str(command_id),
+                             "reexecution_ceiling" if reexecution_ceiling else
+                             "reconciliation_expired" if isinstance(state, ReconciliationOnly) else "reconciliation_deferred", {
+                                 "evidence_id": evidence_id,
+                                 "failed_reads": active.failed_reads,
+                                 "reexecutions": active.reexecutions,
+                             })
+            return False
+
     @staticmethod
     def _grant_accepted_at(db: sqlite3.Connection, grant: UnconsumedRetryAuthorization) -> datetime | None:
         value = db.execute("SELECT accepted_at FROM workflow_retry_authorizations WHERE authorization_id=?",
@@ -5269,6 +5375,10 @@ class SQLiteControlStore:
                 or intent.request_id != association["request_id"]
                 or command.command_id not in intent.required_commands):
             raise WorkflowAuthorityError("rearm projection no longer belongs to a pending authorized intent")
+        # ADR 0015: an unresolved prior effect on this workflow could conflict
+        # with the replacement projection, so it waits for reconciliation.
+        if any(isinstance((g.gate if isinstance(g, RearmingGate) else g).cause, RemoteOutcomeUncertain) for g in current.gates):
+            return False
         return load_workspace_ack(db, intent.handoff) is not None
 
     @staticmethod
@@ -5326,6 +5436,15 @@ class SQLiteControlStore:
                 "updated_at=? WHERE command_id=?",
                 (_stamp(self._now()), str(command_id)),
             )
+            # The pre-expiry history is kept and charged one re-execution: an
+            # attempt that is unknown again continues the same age and read
+            # count and backs off exponentially, so the unknown -> absent ->
+            # re-execute cycle reaches the ADR 0015 ceiling (unknown outcomes
+            # charge no refusals).
+            history = self._command_reconciliation(row)
+            if isinstance(history, ActiveReconciliation):
+                db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                           (encode_workflow(absent_reexecution(history)), str(command_id)))
             self._transition(
                 db,
                 "lifecycle_command",
@@ -5799,6 +5918,7 @@ class SQLiteControlStore:
         # (which lets an outage retire a good command) nor clearing on them
         # (which lets a flaky network make the ceiling unreachable for a
         # permanently denied write) is correct — ADR 0012.
+        now = self._now()
         db.execute(
             "UPDATE lifecycle_commands SET state=?, updated_at=?, "
             "refusals=CASE ?"
@@ -5808,11 +5928,12 @@ class SQLiteControlStore:
             "WHERE command_id=?",
             (
                 receipt.status.value,
-                _stamp(self._now()),
+                _stamp(now),
                 receipt.status.value,
                 str(receipt.command_id),
             ),
         )
+        self._schedule_unresolved(db, command_row, receipt.status, now)
         if receipt.status is EffectStatus.SUCCEEDED:
             self._event(
                 db,
@@ -6322,7 +6443,6 @@ def load_retry_authorization_facts(
     return RetryAuthorizationFacts(
         command.command_id, binding, SQLiteControlStore._command_reconciliation(row), evidence,
         RearmObligation(link["request_id"]) if link is not None else StandaloneCommand(), prior,
-        decision_revision=command.expected_revision,
         returns_resolve_result=SQLiteControlStore._return_projection_attempt(db, command) is not None,
         obligation_active=link is not None and link["disposition"] == "required",
         workspace_ready=workspace_ready,

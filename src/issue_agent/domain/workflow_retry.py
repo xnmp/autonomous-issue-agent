@@ -60,8 +60,6 @@ class RetryAuthorizationFacts:
     evidence: CommandAbsenceEvidence | None
     association: CommandAssociation
     prior: tuple[RetryAuthorization, ...] = ()
-    # The original decision's revision guard; a retry never adopts a newer one.
-    decision_revision: str | None = None
     # Returned-result projections execute only on an unheld generation.
     returns_resolve_result: bool = False
     # Re-arm linkage still 'required' and its workspace handoff acknowledged.
@@ -95,8 +93,6 @@ class RetryAuthorizationFacts:
             for item in self.prior
         ):
             raise ValueError("prior authorizations must be a bounded tuple for this command")
-        if self.decision_revision is not None:
-            validate_workflow_identifier(self.decision_revision, "decision revision")
         for name in ("returns_resolve_result", "obligation_active", "workspace_ready"):
             if not isinstance(getattr(self, name), bool):
                 raise ValueError(f"{name} must be a boolean fact")
@@ -217,7 +213,10 @@ class RetryAbsenceRead:
 
     `observed_at` is taken on the control store's clock after both the
     postcondition read (absent) and the target revision read completed;
-    `guard_holds` is the executor's re-evaluation of the original decision.
+    `guard_holds` is the executor's re-evaluation of the original decision's
+    own facts (ADR 0015 semantic fence), the only applicability authority.
+    `target_revision` is recorded as evidence; a raw revision change such as a
+    comment is not by itself a changed decision.
     """
     observed_at: datetime
     target_revision: str
@@ -281,10 +280,10 @@ def retry_spend_decision(
         return DeclineRetry(RetryDisposition.VOID, "a newer observation superseded the grant's absence evidence", True)
     if grant.binding != snapshot.binding:
         return DeclineRetry(RetryDisposition.VOID, "the grant belongs to another workflow generation, epoch or episode", True)
-    if not read.guard_holds or (facts.decision_revision is not None and read.target_revision != facts.decision_revision):
+    if not read.guard_holds:
         return DeclineRetry(
             RetryDisposition.INAPPLICABLE,
-            f"original decision guard no longer holds (expected {facts.decision_revision!r}, observed {read.target_revision!r})",
+            f"original decision guard no longer holds (observed revision {read.target_revision!r})",
             True,
         )
     return BeginRetry()

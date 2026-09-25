@@ -295,7 +295,8 @@ def test_an_inapplicable_judgement_is_terminal_for_the_command_even_with_new_evi
 def test_spend_begins_only_for_a_fresh_applicable_read_of_the_granted_scope():
     state = gated(snapshot())
     assert spend(state, facts(state)) == BeginRetry()
-    assert spend(state, facts(state, decision_revision="revision-1")) == BeginRetry()
+    # A raw revision change (a comment) is not a changed decision on its own.
+    assert spend(state, facts(state), revision="revision-2") == BeginRetry()
 
 
 @pytest.mark.parametrize("at, reason", [
@@ -341,10 +342,10 @@ def test_cancelled_rearm_after_the_grant_voids_the_obligation_grant():
     assert decision.disposition is RetryDisposition.VOID and "no longer pending" in decision.reason
 
 
-@pytest.mark.parametrize("guard, revision", [(False, "revision-1"), (True, "revision-2")])
-def test_changed_original_guard_is_inapplicable_not_void(guard, revision):
+@pytest.mark.parametrize("revision", ["revision-1", "revision-2"])
+def test_changed_original_guard_is_inapplicable_not_void(revision):
     state = gated(snapshot())
-    decision = spend(state, facts(state, decision_revision="revision-1"), guard=guard, revision=revision)
+    decision = spend(state, facts(state), guard=False, revision=revision)
     assert decision.disposition is RetryDisposition.INAPPLICABLE and decision.fresh_read
 
 
@@ -365,7 +366,7 @@ def test_malformed_terminal_grants_and_facts_are_refused():
         ClosedRetryAuthorization(grant(state), RetryDisposition.VOID, "")
     with pytest.raises(ValueError):
         DeclineRetry(RetryDisposition.NOT_NEEDED, "x", True)
-    for changes in ({"last_attempt_at": NOW.replace(tzinfo=None)}, {"workspace_ready": 1}, {"decision_revision": ""}):
+    for changes in ({"last_attempt_at": NOW.replace(tzinfo=None)}, {"workspace_ready": 1}, {"authorized_attempts": -1}):
         with pytest.raises((ValueError, TypeError)):
             replace(facts(state), **changes)
 

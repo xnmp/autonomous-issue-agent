@@ -42,7 +42,7 @@ def _cause(cause: w.GateCause) -> wire.GateCause:
         return wire.RetryAuthorizationRequired(kind="retry_authorization_required", command_id=cause.command_id,
                                                absence_evidence_id=cause.absence_evidence_id)
     if isinstance(cause, w.EvidenceUnavailable):
-        return wire.EvidenceUnavailable(kind="evidence_unavailable", source=cause.source,
+        return wire.EvidenceUnavailable(kind="evidence_unavailable", source=cause.required_fact,
                                         unresolved_since=cause.unresolved_since.isoformat(), failed_reads=cause.failed_reads,
                                         last_error=cause.last_error)
     return wire.RearmNeedsDecision(kind="rearm_needs_decision", stopped_request_id=cause.stopped_request_id,
@@ -73,6 +73,21 @@ def _gate(gate: w.UnresolvedGate, snapshot: w.WorkflowSnapshot, retry_authorizab
                      remediation=remedy, available_commands=commands,
                      pending_retry=None if pending is None else wire.PendingRetry(
                          authorization_id=pending.authorization_id, command_id=pending.command_id))
+
+
+def control_error(error: BaseException) -> str:
+    return str(error).replace("\x00", "").encode("utf-8", errors="replace").decode("utf-8")[:16384] or type(error).__name__
+
+
+def unavailable_control(error: BaseException) -> wire.UnavailableControl:
+    """A failed authority read is unavailable, never an empty or absent gate set."""
+    return wire.UnavailableControl(status="unavailable", reason=control_error(error))
+
+
+def unavailable_command(error: BaseException) -> wire.CommandResult:
+    """The stable request identity makes an uncertain response safe to replay."""
+    return wire.CommandResult(outcome="unavailable", reason=control_error(error),
+                              control=wire.UnavailableControl(status="unavailable", reason="control read unavailable"))
 
 
 def read_control(workflow: ResolveRearmWorkflow, number: int, request_id: str | None = None) -> wire.ResolveControl:
@@ -117,5 +132,6 @@ def submit_control(workflow: ResolveRearmWorkflow, number: int, body: wire.Resol
         return wire.CommandResult(outcome="replayed" if result.idempotent else "accepted", reason="", control=control)
     if isinstance(result, w.WorkflowConflict):
         return wire.CommandResult(outcome="conflict", reason=result.reason, control=control)
+    assert isinstance(result, w.WorkflowRejected)
     return wire.CommandResult(outcome="unavailable" if result.code is w.WorkflowRejection.OBSERVATION_UNAVAILABLE else "rejected",
                               reason=result.reason, control=control)

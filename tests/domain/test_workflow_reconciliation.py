@@ -11,7 +11,10 @@ from issue_agent.domain.workflow import (
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
 )
-from issue_agent.domain.workflow_reconciliation import absent_reconciliation, reconciliation_due, unavailable_reconciliation
+from issue_agent.domain.workflow_reconciliation import (
+    absent_reconciliation, absent_reexecution, reconciliation_due, reexecution_exhausted,
+    unavailable_reconciliation, unknown_outcome_history,
+)
 
 NOW = datetime(2026, 9, 14, tzinfo=timezone.utc)
 BINDING = WorkflowBinding(WorkflowFence(WorkflowKey("o/r", IssueRef(7)), 1), FamilyAuthority(WorkflowFamily.RESOLVE, 1), "episode")
@@ -157,3 +160,75 @@ def test_absence_reconciliation_rejects_naive_clock():
     expired = failure(policy=ReconciliationPolicy(maximum_reads=1))
     with pytest.raises(ValueError, match="timezone"):
         absent(expired.state, now=NOW.replace(tzinfo=None))
+
+
+@pytest.mark.parametrize("age, exhausted", [
+    (timedelta(0), False), (timedelta(seconds=3599), False),
+    (timedelta(seconds=3600), True), (timedelta(days=365), True),
+])
+def test_absent_re_execution_is_bounded_by_the_unresolved_age(age, exhausted):
+    history = ActiveReconciliation(NOW, NOW + timedelta(seconds=30), 0)
+    assert reexecution_exhausted(history, NOW + age) is exhausted
+
+
+def test_re_execution_bound_follows_a_tighter_policy():
+    history = ActiveReconciliation(NOW, NOW, 0)
+    policy = ReconciliationPolicy(maximum_age_seconds=60)
+    assert reexecution_exhausted(history, NOW + timedelta(seconds=60), policy)
+
+
+@pytest.mark.parametrize("history", [None, "active", ReconciliationOnly(ActiveReconciliation(NOW, NOW, 1), "gate")])
+def test_re_execution_bound_rejects_anything_but_pre_expiry_history(history):
+    with pytest.raises(ValueError):
+        reexecution_exhausted(history, NOW)
+
+
+def test_repeated_unknowns_back_off_exponentially_per_re_execution_and_keep_their_age():
+    history = unknown_outcome_history(None, NOW)
+    assert history == ActiveReconciliation(NOW, NOW + timedelta(seconds=30), 0)
+    delays = []
+    for _ in range(12):
+        history = absent_reexecution(history)
+        now = history.next_read_at
+        history = unknown_outcome_history(history, now)
+        delays.append((history.next_read_at - now).total_seconds())
+        assert history.unresolved_since == NOW
+    assert delays[:5] == [60, 120, 240, 480, 960]
+    assert max(delays) == ReconciliationPolicy().maximum_delay_seconds
+    assert history.reexecutions == 12
+
+
+def test_an_unknown_never_pulls_a_later_scheduled_read_earlier():
+    later = ActiveReconciliation(NOW, NOW + timedelta(hours=1), 3, 1)
+    assert unknown_outcome_history(later, NOW).next_read_at == later.next_read_at
+
+
+@pytest.mark.parametrize("prior, now", [
+    ("history", NOW), (ReconciliationOnly(ActiveReconciliation(NOW, NOW, 1), "gate"), NOW),
+    (None, datetime(2026, 9, 14)),
+])
+def test_unknown_scheduling_rejects_malformed_inputs(prior, now):
+    with pytest.raises(ValueError):
+        unknown_outcome_history(prior, now)
+
+
+@pytest.mark.parametrize("reexecutions, exhausted", [(0, False), (3, False), (4, True), (10**6, True)])
+def test_re_executions_are_capped_by_count_before_the_age_ceiling(reexecutions, exhausted):
+    history = ActiveReconciliation(NOW, NOW, 0, reexecutions)
+    assert reexecution_exhausted(history, NOW + timedelta(seconds=1)) is exhausted
+
+
+def test_failed_reads_and_the_ceiling_read_keep_the_re_execution_count():
+    history = ActiveReconciliation(NOW, NOW, 0, 2)
+    progress = failure(history, now=NOW + timedelta(seconds=5))
+    assert progress.state.reexecutions == 2 and progress.gate is None
+    capped = unavailable_reconciliation(BINDING, CommandId("command"), history, now=NOW + timedelta(seconds=5),
+                                        evidence_id="observed-absence", error="ceiling", reexecution_ceiling=True)
+    assert isinstance(capped.state, ReconciliationOnly) and capped.state.history.reexecutions == 2
+    assert capped.gate is not None
+
+
+@pytest.mark.parametrize("value", [-1, True, "2", 2.0])
+def test_malformed_re_execution_counts_are_rejected(value):
+    with pytest.raises(ValueError):
+        ActiveReconciliation(NOW, NOW, 0, value)

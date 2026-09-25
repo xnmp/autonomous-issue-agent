@@ -106,10 +106,7 @@ class ResolveRearmWorkflow:
                 if isinstance(proposal, WorkflowUnchanged):
                     return WorkflowCommitted(proposal.snapshot, idempotent=True)
                 assert isinstance(proposal.snapshot.intent, PendingRearm)
-                action = resolve_rearm_projection(
-                    proposal.snapshot, expected_revision=issue.issue.updated_at,
-                    external_holds=holds,
-                )
+                action = resolve_rearm_projection(proposal.snapshot, issue.issue, external_holds=holds)
                 projection = command_for_action(
                     action, repository=key.repository, executor_identity=self.control.writer.owner_id,
                 )

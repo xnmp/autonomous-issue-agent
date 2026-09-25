@@ -68,6 +68,8 @@ _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS = {
+    # Histories persisted before re-executions were counted had spent none.
+    "ActiveReconciliation": {"reexecutions": 0},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
     "ResolveAttemptResult": {"split": None},
