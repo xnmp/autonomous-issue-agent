@@ -3,8 +3,11 @@
 **Resumed by the user on 2026-09-25** ("resume implementing the plan and don't
 stop until it's complete"). The [paused handover](2026-09-25-architecture-resume-handover.md)
 is historical input. The operator UI checkpoint below is accepted, as is the
-offline activation/import checkpoint that follows it. Current work: the
-absence-authorized retry control and full composed resolve acceptance. Live operation, family activation on
+offline activation/import checkpoint that follows it. The **resolve slice is
+accepted** at `6905184` (absence-authorized retry `bba05c8`; composed fault-matrix
+acceptance through the production fix-daemon composition `6905184`). Current work:
+the review-rejection slice per the
+[review slice plan](2026-09-25-phase-3-review-slice-plan.md). Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 
 Offline activation checkpoint (2026-09-25): `issue-agent resolve-activation
@@ -358,8 +361,9 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
    finish aged-command uncertainty operator outcomes. Complete migration,
    rollback, old-writer fencing and remaining legacy-path deletion. The existing
    inactive-family legacy path is preserved, not claimed deleted.
-5. Accept the complete resolve vertical slice with independent review and full
-   composed failure coverage, then implement/accept the review-rejection slice.
+5. **Resolve slice accepted** at `6905184` with independent review and full
+   composed failure coverage. Next: implement/accept the review-rejection slice
+   ([plan](2026-09-25-phase-3-review-slice-plan.md)).
 6. Only then accept phase 3 and start phase 4. Live activation and soak remain
    separately blocked by the deployment pause, not simulated as completed.
 

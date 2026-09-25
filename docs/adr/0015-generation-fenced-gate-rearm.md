@@ -1,8 +1,11 @@
 # ADR 0015 — Generation-fenced gate re-arm authority
 
-Status: Proposed (2026-09-14). Phases 1–2 accepted at `1703195`; resolve
-foundations accepted at `05aa54a`, with the vertical slice still under implementation. No phase 3 slice
-is accepted and no live workflow family has been activated.
+Status: Proposed (2026-09-14). Phases 1–2 accepted at `1703195`. The resolve
+slice is accepted (2026-09-25) at `6905184` (operator UI `6a6d769`, offline
+activation `f559282`, absence-authorized retry `bba05c8`, composed fault-matrix
+acceptance `6905184`); the review-rejection slice is not yet accepted. No live
+workflow family has been activated: acceptance of implementation does not
+authorize activation on real deployment data.
 
 Governs: src/issue_agent/domain/workflow.py src/issue_agent/domain/workflow_policy.py src/issue_agent/adapters/workflow_control.py src/issue_agent/adapters/control_store.py
 
