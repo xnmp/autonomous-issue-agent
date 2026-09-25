@@ -349,6 +349,18 @@ def test_changed_original_guard_is_inapplicable_not_void(revision):
     assert decision.disposition is RetryDisposition.INAPPLICABLE and decision.fresh_read
 
 
+def test_an_effect_the_workflow_no_longer_owes_is_inapplicable_even_when_the_guard_holds():
+    state = gated(snapshot())
+    known = facts(state)
+    owed = retry_spend_decision(state, grant(state, "grant-1", EVIDENCE), known, read(NOW), now=NOW, effect_owed=True)
+    assert isinstance(owed, BeginRetry)
+    declined = retry_spend_decision(state, grant(state, "grant-1", EVIDENCE), known, read(NOW), now=NOW,
+                                    effect_owed=False)
+    assert declined.disposition is RetryDisposition.INAPPLICABLE and declined.fresh_read
+    with pytest.raises(ValueError):
+        retry_spend_decision(state, grant(state, "grant-1", EVIDENCE), known, read(NOW), now=NOW, effect_owed=1)
+
+
 @pytest.mark.parametrize("changes", [
     {"observed_at": NOW.replace(tzinfo=None)}, {"target_revision": ""}, {"target_revision": "x" * 513},
     {"guard_holds": 1}, {"observed_at": None},

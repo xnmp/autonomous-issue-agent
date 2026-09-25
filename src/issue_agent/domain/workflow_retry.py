@@ -20,6 +20,7 @@ from .workflow import (
     WorkflowMutation, WorkflowRejected, WorkflowRejection, WorkflowSnapshot, WorkflowTransition,
     ActiveReconciliation, ClosedRetryAuthorization, RearmingGate, RetryDisposition,
 )
+from .review_workflow import PendingReviewRearm, ReviewWorkflowSnapshot
 from .workflow_reconciliation import ABSENCE_FRESHNESS_SECONDS
 from .workflow_identity import WorkflowBinding, WorkflowRevision, validate_workflow_identifier
 
@@ -33,6 +34,10 @@ MAX_GRANT_UNAVAILABLE_READS = 5
 MAX_GRANT_AGE_SECONDS = 86400
 
 RetryAuthorization = UnconsumedRetryAuthorization | ConsumedRetryAuthorization | ClosedRetryAuthorization
+# Both families share one grant contract: the same scope, evidence, ceiling,
+# disposition and one-write rules (ADR 0015 review slice, increment 5).
+RetrySnapshot = WorkflowSnapshot | ReviewWorkflowSnapshot
+_SNAPSHOTS = (WorkflowSnapshot, ReviewWorkflowSnapshot)
 
 
 def _authorization(value: RetryAuthorization) -> UnconsumedRetryAuthorization:
@@ -48,7 +53,7 @@ def _aware(value: object, name: str) -> None:
 class RetryAuthorizationFacts:
     """Harness-owned command facts read inside the deciding transaction.
 
-    Provenance: the fix owner's control store mints every field from its own
+    Provenance: the owning role's control store mints every field from its own
     rows (command outbox, workflow_evidence kind 'absence', re-arm linkage,
     workspace acknowledgement, paid-return provenance and prior grants). Wire
     input never supplies any of them. Acceptance, the operator view and the
@@ -111,7 +116,7 @@ def _reject(code: WorkflowRejection, reason: str) -> WorkflowRejected:
 
 
 def _scope_refusal(
-    snapshot: WorkflowSnapshot, command_id: CommandId, gate_id: str, facts: RetryAuthorizationFacts,
+    snapshot: RetrySnapshot, command_id: CommandId, gate_id: str, facts: RetryAuthorizationFacts,
 ) -> str | None:
     """The one scope contract shared by acceptance, the view and execution.
 
@@ -132,9 +137,10 @@ def _scope_refusal(
     if facts.command_binding != snapshot.binding:
         return "the command belongs to another workflow generation, epoch or episode"
     intent = snapshot.intent
-    required = intent.required_commands if isinstance(intent, PendingRearm) else ()
+    pending = isinstance(intent, (PendingRearm, PendingReviewRearm))
+    required = intent.required_commands if isinstance(intent, (PendingRearm, PendingReviewRearm)) else ()
     if isinstance(facts.association, RearmObligation):
-        if (not isinstance(intent, PendingRearm) or intent.request_id != facts.association.request_id
+        if (not pending or intent.request_id != facts.association.request_id
                 or command_id not in required or not facts.obligation_active):
             return "the re-arm request owning this obligation is no longer pending"
         if not facts.workspace_ready:
@@ -151,11 +157,11 @@ def _scope_refusal(
 
 
 def retry_authorization_refusal(
-    snapshot: WorkflowSnapshot, *, command_id: CommandId, gate_id: str, evidence_id: str,
+    snapshot: RetrySnapshot, *, command_id: CommandId, gate_id: str, evidence_id: str,
     facts: RetryAuthorizationFacts,
 ) -> WorkflowRejected | None:
     """Every acceptance precondition except revision/identity replay."""
-    if not isinstance(snapshot, WorkflowSnapshot) or not isinstance(facts, RetryAuthorizationFacts):
+    if not isinstance(snapshot, _SNAPSHOTS) or not isinstance(facts, RetryAuthorizationFacts):
         raise ValueError("retry authorization policy requires typed state and facts")
     if facts.command_id != command_id:
         raise ValueError("retry facts were read for another command")
@@ -196,7 +202,7 @@ def retry_authorization_refusal(
 
 
 def retry_authorization_available(
-    snapshot: WorkflowSnapshot, gate: OpenGate, facts: RetryAuthorizationFacts,
+    snapshot: RetrySnapshot, gate: OpenGate, facts: RetryAuthorizationFacts,
 ) -> bool:
     """The operator view offers exactly what acceptance would admit now."""
     if not isinstance(gate, OpenGate) or not isinstance(gate.cause, RetryAuthorizationRequired):
@@ -247,14 +253,19 @@ class DeclineRetry:
 
 
 def retry_spend_decision(
-    snapshot: WorkflowSnapshot, grant: UnconsumedRetryAuthorization, facts: RetryAuthorizationFacts,
-    read: RetryAbsenceRead, *, now: datetime,
+    snapshot: RetrySnapshot, grant: UnconsumedRetryAuthorization, facts: RetryAuthorizationFacts,
+    read: RetryAbsenceRead, *, now: datetime, effect_owed: bool = True,
 ) -> BeginRetry | DeclineRetry:
     """Decide, once, what an open grant buys after the executor proved absence.
 
-    Every non-begin outcome is terminal for the grant, so no refusal can loop.
+    `effect_owed` is the owning store's own fact, read in the spend's
+    transaction, that the workflow still owes this effect (a review family
+    submission whose review already landed is not). Every non-begin outcome is
+    terminal for the grant, so no refusal can loop.
     """
-    if not isinstance(snapshot, WorkflowSnapshot) or not isinstance(grant, UnconsumedRetryAuthorization) or not isinstance(
+    if not isinstance(effect_owed, bool):
+        raise ValueError("retry spend requires a typed owed-effect fact")
+    if not isinstance(snapshot, _SNAPSHOTS) or not isinstance(grant, UnconsumedRetryAuthorization) or not isinstance(
         facts, RetryAuthorizationFacts,
     ) or not isinstance(read, RetryAbsenceRead):
         raise ValueError("retry spend requires typed state, grant, facts and read")
@@ -280,6 +291,8 @@ def retry_spend_decision(
         return DeclineRetry(RetryDisposition.VOID, "a newer observation superseded the grant's absence evidence", True)
     if grant.binding != snapshot.binding:
         return DeclineRetry(RetryDisposition.VOID, "the grant belongs to another workflow generation, epoch or episode", True)
+    if not effect_owed:
+        return DeclineRetry(RetryDisposition.INAPPLICABLE, "the workflow no longer owes this effect", True)
     if not read.guard_holds:
         return DeclineRetry(
             RetryDisposition.INAPPLICABLE,
@@ -290,7 +303,7 @@ def retry_spend_decision(
 
 
 def authorize_absent_retry(
-    snapshot: WorkflowSnapshot, command: AuthorizeAbsentRetry, actor: OperatorActor,
+    snapshot: RetrySnapshot, command: AuthorizeAbsentRetry, actor: OperatorActor,
     facts: RetryAuthorizationFacts,
 ) -> WorkflowTransition:
     if not isinstance(command, AuthorizeAbsentRetry) or not isinstance(actor, OperatorActor):
@@ -305,8 +318,11 @@ def authorize_absent_retry(
         return refusal
     current = snapshot.revision
     after = replace(snapshot, revision=WorkflowRevision(current.fence, current.version + 1))
+    # A review transition carries its exact prior as the witness the commit
+    # adapter proves equal to the stored row; resolve keeps none.
     return WorkflowChanged(
         current, WorkflowMutation.AUTHORIZE_RETRY, after, AuthorizedOperatorCommand(actor, command),
+        prior=snapshot if isinstance(snapshot, ReviewWorkflowSnapshot) else None,
     )
 
 

@@ -55,7 +55,7 @@ from ..domain.ports import EventSink
 from .deployment_authority import DeploymentAuthority, deployment_role
 from .durable_effects import DurableEffectRunner, EffectOutcome
 from .journal import alert
-from ..domain.review_workflow import PartialReviews, mark_review_body
+from ..domain.review_workflow import PartialReviews, PullRequestState, PullRequestUnavailable, mark_review_body
 from .review_effects import (
     BoundReviewSubmissionOp, PullRequestProjectionOp, ReviewCheck, ReviewCommandCheck, ReviewDismissalOp,
     ReviewDismissals, ReviewFamilyOp, ReviewReadUnavailable, ReviewReads, bound_submission_op, check_bound_submission, check_review_op,
@@ -1593,16 +1593,25 @@ class GitHubEffectExecutor:
         a human's answer. Only a re-arm hold projection uses the semantic hold
         fence. Commands carrying only a raw revision are re-derived from fresh
         observations each tick, so their raw fence stays authoritative.
-        A review-family command is judged on its own accepted guard.
+        A review-family command is judged on its own accepted guard: a
+        dismissal on `dismissal_check`, a PR projection on its
+        `PullRequestHoldGuard`, and a bound submission on its reviewed head
+        of a still-open pull request (its marker's absence was just proven by
+        the caller's postcondition read; the store re-checks the binding).
         """
         op = review_family_op(command)
         if op is not None:
-            # Unreachable while review-family retry grants are refused
-            # (`_retry_supported`); kept so enabling them needs no new guard.
             check = self._check_review(op, command)
             if check.check is ReviewCheck.UNAVAILABLE:
                 raise UnknownEffectOutcome(f"{command.command_id}: decision facts are unavailable ({check.detail})")
             return check.check is ReviewCheck.APPLIES
+        submission = bound_submission_op(command)
+        if submission is not None:
+            assert command.workflow is not None
+            observed = observe_pull_request(self.gateway, command.workflow.fence.key, self.store.now(), reviews=False)
+            if isinstance(observed, PullRequestUnavailable):
+                raise UnknownEffectOutcome(f"{command.command_id}: decision facts are unavailable ({observed.reason})")
+            return observed.state is PullRequestState.OPEN and observed.head_sha == submission.head
         if command.kind in {CommandKind.RELABEL, CommandKind.CLOSE_ISSUE}:
             action = action_from_command(command)
             if isinstance(action, Relabel) and action.hold_guard is not None:

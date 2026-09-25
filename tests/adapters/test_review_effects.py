@@ -487,36 +487,53 @@ def _absent_after_expiry(rig, command):
     return state, gate
 
 
-def test_review_family_retry_is_refused_by_the_shared_validator_and_never_spent(rig, rearm):
-    command = by_kind(rearm, CommandKind.DISMISS_REVIEW)[0]
-    state, gate = _absent_after_expiry(rig, command)
-    with closing(rig.store._connect()) as db:
-        db.execute("BEGIN")
-        facts = load_retry_authorization_facts(rig.store, db, command.command_id, gate.cause.absence_evidence_id)
-    assert facts.execution_refusal is not None and "not yet supported" in facts.execution_refusal
-    assert facts.evidence is not None and facts.workspace_ready
-    # A grant that could only have been forged into storage is never offered
-    # a schedule bypass and is voided, not spent, at the executor's next read.
+def grant(rig, command, gate, authorization_id="grant-1"):
+    """Accept one operator grant exactly as the review control persists it."""
+    from issue_agent.adapters.workflow_commit import persist_retry_authorization
+    from issue_agent.domain.workflow import AuthorizeAbsentRetry
+    from issue_agent.domain.workflow_retry import authorize_absent_retry
+    state = rig.workflow()
     with rig.store.transaction() as db:
-        db.execute(
-            "INSERT INTO workflow_retry_authorizations (authorization_id, request_id, command_id, gate_id, "
-            "association_kind, binding_json, evidence_id, request_digest, actor_json, generation, accepted_at) "
-            "VALUES (?, ?, ?, ?, 'rearm', ?, ?, 'forged', '{}', ?, ?)",
-            ("grant-1", rearm.snapshot.intent.request_id, str(command.command_id), gate.gate_id,
-             encode_workflow(command.workflow), gate.cause.absence_evidence_id,
-             command.workflow.fence.generation, rig.clock[0].isoformat()),
-        )
-    assert command.command_id not in {
-        p.command.command_id for p in rig.store.runnable_commands(
-            repository="o/r", executor_identity=REVIEWER, diagnose=rig.logs.append)
-    }
+        facts = load_retry_authorization_facts(rig.store, db, command.command_id, gate.cause.absence_evidence_id)
+        request = AuthorizeAbsentRetry(authorization_id, state.revision, command.command_id, gate.gate_id,
+                                       gate.cause.absence_evidence_id)
+        change = authorize_absent_retry(state, request, ACTOR, facts)
+        assert isinstance(change, WorkflowChanged), change
+        persist_workflow_snapshot(db, change.snapshot)
+        persist_retry_authorization(db, rig.store, change, facts)
+    return facts
+
+
+def grant_row(rig):
+    with closing(rig.store._connect()) as db:
+        return db.execute("SELECT disposition, disposition_reason FROM workflow_retry_authorizations").fetchone()
+
+
+def test_a_review_family_grant_buys_exactly_one_guarded_dismissal(rig, rearm):
+    command = by_kind(rearm, CommandKind.DISMISS_REVIEW)[0]
+    _, gate = _absent_after_expiry(rig, command)
+    facts = grant(rig, command, gate)
+    assert facts.execution_refusal is None and facts.evidence is not None and facts.workspace_ready
+    assert "r0" not in [call[2] for call in rig.calls("dismiss_review")]
+    rig.drain()  # a fresh grant is due at once: guard re-checked, one write, verified
+    assert [call[2] for call in rig.calls("dismiss_review")].count("r0") == 1
+    assert rig.remote.review_state("r0") == "DISMISSED"
+    assert rig.receipt(command.command_id)[0] == "succeeded"
+    assert rig.gate(gate.gate_id) is None and grant_row(rig)[0] == "consumed"
     rig.advance(3600)
     rig.drain()
+    assert len([c for c in rig.calls("dismiss_review") if c[2] == "r0"]) == 1
+
+
+def test_a_review_family_grant_whose_guard_changed_ends_inapplicable_without_a_write(rig, rearm):
+    command = by_kind(rearm, CommandKind.DISMISS_REVIEW)[0]
+    _, gate = _absent_after_expiry(rig, command)
+    grant(rig, command, gate)
+    rig.remote.external_review_change("r0", state="APPROVED")  # the dismissal guard no longer applies
+    rig.drain()
     assert "r0" not in [call[2] for call in rig.calls("dismiss_review")]
-    assert rig.remote.review_state("r0") == "CHANGES_REQUESTED"
-    with closing(rig.store._connect()) as db:
-        row = db.execute("SELECT disposition, disposition_reason FROM workflow_retry_authorizations").fetchone()
-    assert row[0] == "void" and "not yet supported" in row[1]
+    disposition, reason = grant_row(rig)
+    assert disposition == "inapplicable" and "guard no longer holds" in reason
 
 
 # -- bound review submission ---------------------------------------------------------------------

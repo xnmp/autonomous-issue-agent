@@ -13,9 +13,11 @@ from .workflow import (
     AuthorizedOperatorCommand, CancelRearm, ContinueGrantedRearm, OperatorActor, RequestRearm,
     HeldProjection, RearmIntent, RetryAlreadyConsumed, RetryDeclined, RetryStale,
     RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead, WorkflowSnapshot,
+    WorkflowUnavailable,
 )
 from .workflow_retry import RetryAbsenceRead
-from .review_workflow import ReviewRearmPreflight, ReviewWorkflowRead
+from .review_rearm import PendingReviewRecovery, ReleaseProjection, ReviewControlRead
+from .review_workflow import ReviewWorkflowRead
 from .workflow_identity import (
     FamilyAuthority, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
 )
@@ -111,18 +113,22 @@ class WorkflowControl(Protocol):
 class ReviewWorkflowControl(Protocol):
     """PR-scoped review-rejection authority bound to the repository's review owner.
 
-    Declared ahead of its SQLite implementation (review slice increment 5).
     Reads distinguish absence, unavailability and a never-activated family
     (`WorkflowMigrationRequired(family=REVIEW_REJECTIONS)`). Acceptance takes
-    the deployment barriers, refreshes facts read-only and commits local intent
-    only; the preflight is harness-minted from a complete review read and is
-    never parsed from operator input. No method accepts an owner identity.
+    the deployment barriers, refreshes facts read-only through the review
+    gateway and commits local intent only; the preflight is minted by the
+    control from that read and is never a caller argument. No method accepts
+    an owner identity.
     """
 
     @property
     def writer(self) -> WorkflowWriter: ...
 
     def load_workflow(self, key: WorkflowKey) -> ReviewWorkflowRead: ...
+
+    def review_control_view(
+        self, key: WorkflowKey, *, request_id: str | None = None,
+    ) -> ReviewControlRead | WorkflowUnavailable: ...
 
     def commit_workflow(
         self,
@@ -132,14 +138,28 @@ class ReviewWorkflowControl(Protocol):
     ) -> WorkflowCommitted | WorkflowConflict: ...
 
     def request_rearm(
-        self, command: RequestRearm, actor: OperatorActor, preflight: ReviewRearmPreflight,
+        self, command: RequestRearm, actor: OperatorActor,
     ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected: ...
 
     def continue_rearm(
-        self, command: ContinueGrantedRearm, actor: OperatorActor, preflight: ReviewRearmPreflight,
+        self, command: ContinueGrantedRearm, actor: OperatorActor,
     ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected: ...
 
     def cancel_rearm(self, command: CancelRearm, actor: OperatorActor) -> WorkflowCommitted | WorkflowConflict: ...
+
+    def authorize_retry(
+        self, command: AuthorizeAbsentRetry, actor: OperatorActor,
+    ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected: ...
+
+    def pending_rearms(self, *, limit: int = 32) -> tuple[PendingReviewRecovery | UnavailableResolveRearm, ...]: ...
+
+    def reconcile_rearm(self, expected: WorkflowRevision) -> WorkflowCommitted | WorkflowConflict: ...
+
+    def release_projection(self, key: WorkflowKey) -> ReleaseProjection | None: ...
+
+    def reconcile_release(self, key: WorkflowKey) -> ReleaseProjection | None: ...
+
+    def reconcile_pending_rearms(self, *, limit: int = 32) -> int: ...
 
 
 class WorkflowRetryControl(Protocol):

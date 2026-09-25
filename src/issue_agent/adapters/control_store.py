@@ -49,8 +49,8 @@ from ..domain.workflow import (
     AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
-from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm
-from ..domain.review_workflow_policy import CeilingEscalation, ReviewSubmissionReceipt
+from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewWorkflowSnapshot
+from ..domain.review_workflow_policy import CeilingEscalation, ReviewSubmissionReceipt, bound_submission_owed
 from ..domain.workflow_retry import (
     MAX_AUTHORIZED_ATTEMPTS, MAX_RELEVANT_AUTHORIZATIONS, BeginRetry, DeclineRetry, grant_unavailable_void, RetryAbsenceRead, RetryAuthorization, RetryAuthorizationFacts,
     retry_spend_decision,
@@ -4964,7 +4964,7 @@ class SQLiteControlStore:
                         # A freshly accepted grant is due now, exactly once;
                         # later visits follow the bounded read schedule.
                         grant = self._executable_authorization(db, command.command_id, gate) if isinstance(
-                            reconciliation, ReconciliationOnly) and _retry_supported(command) else None
+                            reconciliation, ReconciliationOnly) else None
                         # Recorded in this transaction, so a grant bypasses the
                         # schedule once however its visit ends.
                         authorized_now = grant is not None and db.execute(
@@ -5114,6 +5114,15 @@ class SQLiteControlStore:
                 outcome = json.dumps({"command": str(command.command_id), "observation": "never_began_locally"}, sort_keys=True)
             elif receipt is not None and receipt["status"] == row["state"] and row["state"] in ("retryable_failure", "permanent_failure", "succeeded"):
                 outcome = json.dumps(dict(receipt), sort_keys=True)
+            elif row["state"] == "retryable_failure" and receipt is None and (archived := [
+                r["evidence_id"] for r in db.execute(
+                    "SELECT evidence_id FROM workflow_evidence WHERE command_id=? AND kind='prior_receipt' "
+                    "ORDER BY evidence_id", (str(command.command_id),))
+            ]):
+                # A trusted read proved the unknown attempt absent and archived
+                # its receipt (`retry_reconciled_command`); it never settled.
+                outcome = json.dumps({"command": str(command.command_id), "observation": "proven_absent_never_settled",
+                                      "prior_receipts": archived}, sort_keys=True)
             else:
                 raise WorkflowAuthorityError("superseded command lacks settled or uncertain outcome evidence")
             outcome_id = "command-outcome:" + hashlib.sha256(outcome.encode()).hexdigest()
@@ -5365,29 +5374,7 @@ class SQLiteControlStore:
         ceiling decision can tell it apart. None until the receipt succeeds.
         """
         with closing(self._connect()) as db:
-            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
-            if row is None:
-                raise KeyError(str(command_id))
-            receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command_id),)).fetchone()
-        command = _command_from_row(row)
-        binding = command.workflow
-        if (command.kind is not CommandKind.SUBMIT_REVIEW or binding is None
-                or binding.authority.family is not WorkflowFamily.REVIEW_REJECTIONS):
-            return None
-        if row["state"] != EffectStatus.SUCCEEDED.value or receipt is None or receipt["status"] != EffectStatus.SUCCEEDED.value:
-            return None
-        payload = command.payload
-        try:
-            head, cause = payload["head"], payload.get("escalate_cause")
-            if head != command.expected_revision:
-                raise ValueError("submitted head disagrees with the command revision")
-            submission = BoundReviewSubmission(command.command_id, binding)
-            receipt_id = f"effect-receipt:{receipt['receipt_digest']}"
-            if cause is not None:
-                return CeilingEscalation(submission, head, receipt_id, cause)
-            return ReviewSubmissionReceipt(submission, head, payload["patch_id"], receipt_id)
-        except (KeyError, TypeError, ValueError) as exc:
-            raise WorkflowAuthorityError(f"bound review submission evidence is malformed: {exc}") from exc
+            return load_bound_review_submission(db, command_id)
 
     @staticmethod
     def _prewrite_read(row: sqlite3.Row) -> ActiveReconciliation | None:
@@ -5796,13 +5783,10 @@ class SQLiteControlStore:
             if current is None:
                 raise WorkflowAuthorityError("authorized retry workflow is absent")
             facts = load_retry_authorization_facts(self, db, command.command_id, stored.evidence_id)
-            # Retry policy exists only for resolve (ADR 0015 review slice): a
-            # review-family grant ends void here and never buys a write.
-            decision = (
-                retry_spend_decision(current, stored, facts, read, now=self._now())
-                if isinstance(current, WorkflowSnapshot) and _retry_supported(command)
-                else DeclineRetry(RetryDisposition.VOID, _RETRY_UNSUPPORTED, True)
-            )
+            # One grant contract for both families (ADR 0015): the review
+            # executor's read re-evaluated the command's own accepted guard.
+            decision = retry_spend_decision(current, stored, facts, read, now=self._now(),
+                                            effect_owed=self._effect_owed(db, command, current))
             if isinstance(decision, DeclineRetry):
                 return RetryDeclined(self._decline_retry(db, row, command, current, stored, expected, read, decision))
             evidence = self._read_absence(command, authorization_id, read)
@@ -5827,6 +5811,33 @@ class SQLiteControlStore:
             self._mark_executing(db, command_id)
             self._attempt_uncertainty(db, command, expected, f"authorized retry attempt {attempt} began; outcome unverified")
             return RetryBegan(ConsumedRetryAuthorization(stored, attempt))
+
+    @staticmethod
+    def _effect_owed(db: sqlite3.Connection, command: LifecycleCommand, current: AnyWorkflowSnapshot) -> bool:
+        """Whether the workflow still owes a granted command's effect, read in the spend's transaction.
+
+        Only a bound review submission can stop being owed: a newer verdict
+        at the same head that landed (or was recorded) makes a re-write a
+        stale second verdict (ADR 0015).
+        """
+        submission = bound_submission_op(command)
+        if submission is None:
+            return True
+        binding = command.workflow
+        if binding is None or not isinstance(current, ReviewWorkflowSnapshot):
+            raise WorkflowAuthorityError("a bound review submission requires its review workflow")
+        settled_sibling = False
+        for sibling in db.execute(
+            "SELECT * FROM lifecycle_commands WHERE repository=? AND target=? AND kind=? AND command_id<>? "
+            "AND state='succeeded'",
+            (command.repository, command.target, CommandKind.SUBMIT_REVIEW.value, str(command.command_id)),
+        ).fetchall():
+            other = _command_from_row(sibling)
+            if other.workflow == binding and other.expected_revision == submission.head:
+                settled_sibling = True
+                break
+        return bound_submission_owed(current, binding, submission.head, submission.patch_id,
+                                     settled_sibling=settled_sibling)
 
     def _decline_retry(
         self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand, current: AnyWorkflowSnapshot,
@@ -6579,14 +6590,6 @@ def _retry_authorization_from_row(row: sqlite3.Row) -> RetryAuthorization:
         raise WorkflowAuthorityError("persisted retry authorization is malformed") from exc
 
 
-_RETRY_UNSUPPORTED = "absence-authorized retry is not yet supported for review-rejection commands"
-
-
-def _retry_supported(command: LifecycleCommand) -> bool:
-    """Only resolve has an AUTHORIZE_RETRY policy; review grants are never offered or spent."""
-    return command.workflow is not None and command.workflow.authority.family is WorkflowFamily.RESOLVE
-
-
 def load_retry_authorization_facts(
     store: SQLiteControlStore, db: sqlite3.Connection, command_id: CommandId, evidence_id: str,
 ) -> RetryAuthorizationFacts:
@@ -6644,8 +6647,6 @@ def load_retry_authorization_facts(
         # The check is read-only by contract; never let it leave writes behind.
         db.execute("ROLLBACK TO retry_execution_check")
         db.execute("RELEASE retry_execution_check")
-    if refusal is None and not _retry_supported(command):
-        refusal = _RETRY_UNSUPPORTED
     return RetryAuthorizationFacts(
         command.command_id, binding, SQLiteControlStore._command_reconciliation(row), evidence,
         RearmObligation(link["request_id"]) if link is not None else StandaloneCommand(), prior,
@@ -6655,6 +6656,43 @@ def load_retry_authorization_facts(
         last_attempt_at=datetime.fromisoformat(attempted) if attempted is not None else None,
         authorized_attempts=int(attempts), execution_refusal=refusal,
     )
+
+
+def load_bound_review_submission(
+    db: sqlite3.Connection, command_id: CommandId,
+) -> ReviewSubmissionReceipt | CeilingEscalation | None:
+    """`SQLiteControlStore.bound_review_submission` inside the caller's transaction.
+
+    The receipt identity is the GitHub review the executor matched by its
+    command marker (`remote_object_id`); the store already refuses one review
+    as the receipt of two submissions, so a baseline names its actual review.
+    """
+    row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+    if row is None:
+        raise KeyError(str(command_id))
+    receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command_id),)).fetchone()
+    command = _command_from_row(row)
+    binding = command.workflow
+    if (command.kind is not CommandKind.SUBMIT_REVIEW or binding is None
+            or binding.authority.family is not WorkflowFamily.REVIEW_REJECTIONS):
+        return None
+    if row["state"] != EffectStatus.SUCCEEDED.value or receipt is None or receipt["status"] != EffectStatus.SUCCEEDED.value:
+        return None
+    payload = command.payload
+    try:
+        head, cause = payload["head"], payload.get("escalate_cause")
+        if head != command.expected_revision:
+            raise ValueError("submitted head disagrees with the command revision")
+        review = receipt["remote_object_id"]
+        if not isinstance(review, str) or not review:
+            raise ValueError("the receipt does not name the review it matched")
+        submission = BoundReviewSubmission(command.command_id, binding)
+        receipt_id = f"github-review:{review}"
+        if cause is not None:
+            return CeilingEscalation(submission, head, receipt_id, cause)
+        return ReviewSubmissionReceipt(submission, head, payload["patch_id"], receipt_id)
+    except (KeyError, TypeError, ValueError) as exc:
+        raise WorkflowAuthorityError(f"bound review submission evidence is malformed: {exc}") from exc
 
 
 def _command_from_row(row: sqlite3.Row) -> LifecycleCommand:

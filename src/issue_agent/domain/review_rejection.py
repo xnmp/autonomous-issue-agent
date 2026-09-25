@@ -134,6 +134,31 @@ class ReviewRejectionCeiling:
         return CountingRule.of(self.review_bot, self.non_resetting_commits)
 
 
+@dataclass(frozen=True)
+class ReviewProjectionRefused:
+    """A ceiling release's pull request projection was refused by its hold guard.
+
+    The release advanced the generation and owes a fresh review, but the PR's
+    head or hold labels changed before the relabel, so it was never applied
+    (a verified refusal, not uncertainty). The gate holds review dispatch
+    visibly until a fresh observation shows the labels that command planned
+    (for example after an operator corrects them by hand on GitHub) or a
+    terminal pull request, so a PR can never sit labelled held beside a free
+    workflow. A later operator re-arm or release supersedes it: its own
+    projection replaces the refused one (ADR 0015).
+    """
+    command_id: str
+    generation: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "refused projection command")
+        # The refused release's own generation: its gate is reconciled by that
+        # command's planned labels whatever the current generation (ADR 0015).
+        validate_workflow_integer(self.generation, "refused projection generation")
+        validate_workflow_text(self.reason, "projection refusal", limit=MAX_DETAIL_CHARS)
+
+
 class PullRequestState(str, Enum):
     OPEN = "open"
     CLOSED = "closed"

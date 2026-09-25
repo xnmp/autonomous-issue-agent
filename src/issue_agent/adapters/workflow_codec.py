@@ -65,6 +65,7 @@ _VALUES = (
     rw.PendingReviewRearm, rw.CompletedReviewRearm, rw.SupersededReviewRearm, rw.CancelledReviewRearm,
     rw.ReviewWorkflowSnapshot, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
     rw.ObservedPullRequest, rw.PullRequestAbsent, rw.PullRequestUnavailable,
+    rw.ReviewProjectionRefused, rw.RecordedPullRequest,
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,

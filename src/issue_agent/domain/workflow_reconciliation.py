@@ -7,7 +7,7 @@ import hashlib
 from .contracts import CommandId
 from .workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, EvidenceUnavailable,
-    NoAuthorizedRemediation, OpenGate, ReconciliationOnly,
+    NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
     ReconciliationPolicy, RemediationAttempted, RemediationOperation,
     RemediationOutcome, RemoteOutcomeUncertain, RetiredSettledCommand,
     RetiredUncertainCommand, RetryAuthorizationRequired,
@@ -179,10 +179,25 @@ def unavailable_reconciliation(
     )
 
 
+_PREWRITE_GATE_PREFIX = "prewrite-evidence:"
+
+
 def prewrite_evidence_gate_id(command_id: CommandId) -> str:
     """The one visible hold a command's unavailable pre-write reads can open."""
     validate_workflow_identifier(command_id, "command")
-    return "prewrite-evidence:" + hashlib.sha256(str(command_id).encode()).hexdigest()
+    return _PREWRITE_GATE_PREFIX + hashlib.sha256(str(command_id).encode()).hexdigest()
+
+
+def is_prewrite_gate(gate: object) -> bool:
+    """Whether a gate is a pre-write evidence hold: its command has not written.
+
+    Such a hold lives only as long as its command can still begin. A
+    transition that makes the command unable to begin (a generation advance,
+    retirement) removes it with that transition (ADR 0012/0015).
+    """
+    opened = gate.gate if isinstance(gate, RearmingGate) else gate
+    return (isinstance(opened, OpenGate) and isinstance(opened.cause, EvidenceUnavailable)
+            and opened.gate_id.startswith(_PREWRITE_GATE_PREFIX))
 
 
 def unavailable_prewrite_read(

@@ -64,7 +64,8 @@ from .effects import command_for_action
 from .deployment_authority import DeploymentAuthority, deployment_role, deployment_effect_barrier
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_commit import (
-    insert_pending_rearm, intent_state, opened_gate, owns_command, record_commit, record_stop_evidence,
+    insert_pending_rearm, intent_state, opened_gate, owns_command, persist_retry_authorization, record_commit,
+    record_stop_evidence,
     replay_or_conflict, retire_rearm_obligation, transition_receipt, update_rearm_state,
 )
 from .workflow_rows import (
@@ -618,24 +619,7 @@ class SQLiteWorkflowControl:
     def _persist_retry_authorization(
         self, db: sqlite3.Connection, transition: WorkflowChanged, facts: RetryAuthorizationFacts,
     ) -> None:
-        audit = transition.audit
-        assert isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, AuthorizeAbsentRetry)
-        grant = minted_authorization(audit.command, facts)
-        association = grant.association
-        request_id = association.request_id if isinstance(association, RearmObligation) else None
-        db.execute(
-            "INSERT INTO workflow_retry_authorizations (authorization_id, request_id, command_id, gate_id, "
-            "association_kind, binding_json, evidence_id, request_digest, actor_json, generation, accepted_at) "
-            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (grant.authorization_id, request_id, str(grant.command_id), grant.gate_id,
-             "rearm" if request_id is not None else "standalone",
-             encode_workflow(grant.binding), grant.evidence_id,
-             hashlib.sha256(encode_workflow((audit.actor.subject, audit.command)).encode()).hexdigest(),
-             encode_workflow(audit), grant.binding.fence.generation, _stamp(self._control._now())),
-        )
-        self._control._transition(db, "workflow_retry_authorization", grant.authorization_id, "authorized", {
-            "command_id": str(grant.command_id), "gate_id": grant.gate_id, "evidence_id": grant.evidence_id,
-        })
+        persist_retry_authorization(db, self._control, transition, facts)
 
     def authorize_retry(
         self, command: AuthorizeAbsentRetry, actor: OperatorActor, *, binding: WorkflowBinding | None = None,

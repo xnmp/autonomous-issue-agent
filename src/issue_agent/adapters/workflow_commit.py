@@ -19,11 +19,13 @@ from ..domain.review_workflow import (
 )
 from ..domain.workflow import (
     AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
-    ContinueGrantedRearm, OpenGate, PendingRearm, RearmIntent, RearmingGate, RequestRearm, ResolveAttemptResult,
+    ContinueGrantedRearm, OpenGate, PendingRearm, RearmIntent, RearmObligation, RearmingGate, RequestRearm,
+    ResolveAttemptResult,
     SupersededRearm, WorkflowChanged, WorkflowCommitted, WorkflowConflict,
 )
 from ..domain.workflow_identity import WorkflowWriter
-from .control_store import SQLiteControlStore
+from ..domain.workflow_retry import RetryAuthorizationFacts, minted_authorization
+from .control_store import SQLiteControlStore, _stamp
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError
 
@@ -199,3 +201,28 @@ def owns_command(db: sqlite3.Connection, writer: WorkflowWriter, owner: str) -> 
             return False
         owner = row["successor_owner_id"]
     return False
+
+
+def persist_retry_authorization(
+    db: sqlite3.Connection, control: SQLiteControlStore, transition: WorkflowChanged,
+    facts: RetryAuthorizationFacts,
+) -> None:
+    """Persist one accepted operator retry grant (both families share the grant contract)."""
+    audit = transition.audit
+    assert isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, AuthorizeAbsentRetry)
+    grant = minted_authorization(audit.command, facts)
+    association = grant.association
+    request_id = association.request_id if isinstance(association, RearmObligation) else None
+    db.execute(
+        "INSERT INTO workflow_retry_authorizations (authorization_id, request_id, command_id, gate_id, "
+        "association_kind, binding_json, evidence_id, request_digest, actor_json, generation, accepted_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (grant.authorization_id, request_id, str(grant.command_id), grant.gate_id,
+         "rearm" if request_id is not None else "standalone",
+         encode_workflow(grant.binding), grant.evidence_id,
+         hashlib.sha256(encode_workflow((audit.actor.subject, audit.command)).encode()).hexdigest(),
+         encode_workflow(audit), grant.binding.fence.generation, _stamp(control._now())),
+    )
+    control._transition(db, "workflow_retry_authorization", grant.authorization_id, "authorized", {
+        "command_id": str(grant.command_id), "gate_id": grant.gate_id, "evidence_id": grant.evidence_id,
+    })

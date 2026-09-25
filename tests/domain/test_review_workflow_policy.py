@@ -21,6 +21,7 @@ from issue_agent.domain.review_workflow_policy import (
     dismissal_check, dismissal_command, initial_review_workflow, open_review_ceiling, pull_request_hold_guard,
     pull_request_hold_guard_applies, record_review, request_review_rearm, review_ceiling_cause,
     review_ceiling_gate_id, review_ceiling_rearm_refusal, review_dismissal_command_id, review_dispatch_decision,
+    SubmissionUnresolved, bound_submission_owed,
     review_owed, review_projection_command_id, review_rearm_projection, review_rearm_stop_reason,
     supersede_review_rearm, validate_review_transition,
 )
@@ -462,6 +463,50 @@ def test_dispatch_holds_before_owing_and_distinguishes_initial_from_re_review():
     assert review_dispatch_decision(rearmed, observe(), patch_id=PATCH) == ReviewOwed(ReviewKind.RE_REVIEW)
     assert isinstance(review_dispatch_decision(rearmed, observe(state=PullRequestState.CLOSED), patch_id=None),
                       ReviewNotOwed)
+
+
+def test_an_unresolved_submission_holds_dispatch_after_gates_and_before_everything_else():
+    unresolved = (CommandId("verdict-a"),)
+    assert review_dispatch_decision(fresh(), observe(), patch_id=PATCH,
+                                    unresolved_submissions=unresolved) == SubmissionUnresolved(unresolved)
+    # Neither a covered head nor a pending release projection hides the doubt.
+    assert review_dispatch_decision(with_baseline(), observe(), patch_id=PATCH, release_pending=CommandId("release"),
+                                    unresolved_submissions=unresolved) == SubmissionUnresolved(unresolved)
+    state = gated()
+    assert isinstance(review_dispatch_decision(state, observe(), patch_id=None, unresolved_submissions=unresolved),
+                      ReviewHeld)
+    assert review_dispatch_decision(fresh(), observe(), patch_id=PATCH, unresolved_submissions=()) == ReviewOwed(
+        ReviewKind.INITIAL)
+
+
+@pytest.mark.parametrize("ids", [(), ("",), ["verdict-a"], ("x" * 10_000,)])
+def test_an_unresolved_submission_hold_names_valid_commands(ids):
+    with pytest.raises(ValueError):
+        SubmissionUnresolved(ids)
+
+
+def test_a_bound_submission_is_owed_only_while_its_binding_and_head_still_need_it():
+    state = fresh()
+    assert bound_submission_owed(state, state.binding, HEAD, PATCH, settled_sibling=False)
+    # Another verdict for this binding and head already landed.
+    assert not bound_submission_owed(state, state.binding, HEAD, PATCH, settled_sibling=True)
+    # The reviewed baseline already covers this head.
+    covered = with_baseline()
+    assert not bound_submission_owed(covered, covered.binding, HEAD, PATCH, settled_sibling=False)
+    assert bound_submission_owed(covered, covered.binding, OTHER_HEAD, OTHER_PATCH, settled_sibling=False)
+    # A submission captured under an earlier generation is not the continuation's.
+    rearmed = complete(accepted().snapshot, dismissed(rejections(2), "r0", "r1")).snapshot
+    assert not bound_submission_owed(rearmed, state.binding, HEAD, PATCH, settled_sibling=False)
+    assert bound_submission_owed(rearmed, rearmed.binding, HEAD, PATCH, settled_sibling=False)
+
+
+@pytest.mark.parametrize("changes", [{"binding": None}, {"settled_sibling": 0}, {"head": ""}, {"patch": "C" * 64}])
+def test_bound_submission_applicability_refuses_malformed_facts(changes):
+    state = fresh()
+    args = {"binding": state.binding, "head": HEAD, "patch": PATCH, "settled_sibling": False} | changes
+    with pytest.raises(ValueError):
+        bound_submission_owed(state, args["binding"], args["head"], args["patch"],
+                              settled_sibling=args["settled_sibling"])
 
 
 @pytest.mark.parametrize("observation", [
@@ -931,7 +976,17 @@ def test_every_genuine_review_transition_validates():
                                                      accepted_preflight=request.audit.preflight))
     validate_review_transition(pending, stop(pending, reason=StopReason.TARGET_TERMINAL),
                                facts(observation=observe(state=PullRequestState.CLOSED)))
-    validate_review_transition(pending, stop(pending, reason=StopReason.REQUIRED_EFFECT_REJECTED), facts())
+    rejected = stop(pending, reason=StopReason.REQUIRED_EFFECT_REJECTED)
+    validate_review_transition(pending, rejected, facts(observation=observe(rejections(2)),
+                                                        accepted_preflight=request.audit.preflight))
+    # A refusal still cites a fresh complete read taken after acceptance.
+    for bad in (facts(), facts(observation=observe(rejections(2), partial=True),
+                               accepted_preflight=request.audit.preflight),
+                facts(observation=observe(rejections(2), at=NOW - timedelta(seconds=1)),
+                      accepted_preflight=request.audit.preflight),
+                facts(observation=observe(rejections(2)))):
+        with pytest.raises(ValueError):
+            validate_review_transition(pending, rejected, bad)
     stopped = moved.snapshot
     validate_review_transition(stopped, carry_on(stopped, dismissed(rejections(2), "r0")),
                                facts(observation=observe(dismissed(rejections(2), "r0"))))

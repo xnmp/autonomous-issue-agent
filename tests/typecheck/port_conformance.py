@@ -20,6 +20,7 @@ from issue_agent.adapters.process_supervisor import (
     ProcessSupervisor as DurableProcessSupervisor,
 )
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
+from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.adapters.store import Store
 from issue_agent.adapters.typed_journal import TypedJournal
 from issue_agent.adapters.worktree import Worktrees
@@ -31,6 +32,7 @@ from issue_agent.app.roles import (
     _LateReservationReconciler,
     _SweepReservationReconciler,
 )
+import issue_agent.domain.workflow_ports as workflow_ports
 from issue_agent.domain.ports import (
     ActionExecutor,
     CiPendingState,
@@ -264,3 +266,11 @@ def recovery_disposition(
 
 def recovery_release(release: ReleaseResult) -> RecoveryRelease:
     return release
+
+
+# Workflow authority ports live in domain/workflow_ports.py, outside the
+# domain/ports.py manifest above; the qualified name keeps them out of it.
+def review_workflow_control(
+    control: SQLiteReviewWorkflowControl,
+) -> workflow_ports.ReviewWorkflowControl:
+    return control

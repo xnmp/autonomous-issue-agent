@@ -15,8 +15,8 @@ from enum import Enum
 from .contracts import CommandId
 from .labels import Label
 from .review_rejection import (
-    MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, CountedReview, CountingRule, PullRequestState, ReviewRearmPreflight,
-    ReviewRejectionCeiling, validate_commit_sha, validate_counted, validate_labels,
+    MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, CountedReview, CountingRule, PullRequestState, ReviewProjectionRefused,
+    ReviewRearmPreflight, ReviewRejectionCeiling, validate_commit_sha, validate_counted, validate_labels,
 )
 from .workflow import (
     GUIDANCE_MAX_CHARS, MAX_DETAIL_CHARS, MAX_WORKFLOW_GATES,
@@ -25,6 +25,7 @@ from .workflow import (
     WorkflowSnapshot, WorkflowUnavailable,
     _command_ids, _count, _items, _text, _time,
 )
+from .workflow_reconciliation import is_prewrite_gate
 from .workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
 )
@@ -38,7 +39,8 @@ __all__ = [
     "ReviewRearmIntent", "ReviewWorkflowSnapshot", "AnyWorkflowSnapshot", "ReviewWorkflowRead",
     "SubmittedReviewState", "SubmittedReviewFact", "CompleteReviews", "PartialReviews", "ReviewRead",
     "PullRequestState", "ObservedPullRequest", "PullRequestAbsent", "PullRequestUnavailable",
-    "PullRequestObservation", "decisive_reviews", "validate_review_change",
+    "PullRequestObservation", "RecordedPullRequest", "ReviewProjectionRefused", "decisive_reviews",
+    "validate_review_change",
 ]
 
 
@@ -51,6 +53,20 @@ def _patch_id(value: object) -> None:
     # `review.patch_signature` is a SHA-256 hex digest of the normalized diff.
     if not isinstance(value, str) or len(value) != 64 or any(character not in "0123456789abcdef" for character in value):
         raise ValueError("reviewed patch identity must be a SHA-256 digest")
+
+
+
+def ends_with_advance(gate: object) -> bool:
+    """Holds a generation advance supersedes rather than keeps.
+
+    A pre-write evidence hold belongs to a command the advance fences (it can
+    never begin), and a refused release projection is replaced by the
+    advance's own projection. Keeping either would strand it; counting it as
+    an independent hold would plan a HOLD against it twice (ADR 0015).
+    """
+    opened = gate.gate if isinstance(gate, RearmingGate) else gate
+    return is_prewrite_gate(opened) or (
+        isinstance(opened, OpenGate) and isinstance(opened.cause, ReviewProjectionRefused))
 
 
 @dataclass(frozen=True)
@@ -588,6 +604,26 @@ class PullRequestUnavailable:
 PullRequestObservation = ObservedPullRequest | PullRequestAbsent | PullRequestUnavailable
 
 
+@dataclass(frozen=True)
+class RecordedPullRequest:
+    """A harness read of one pull request as durable `workflow_evidence`.
+
+    Provenance: minted only by the review owner's control store from its own
+    gateway read, together with the external holds it derived from that same
+    read, so a committed transition re-derives its facts from this row and
+    never from a proposal or operator input (ADR 0015).
+    """
+    observation: ObservedPullRequest
+    external_holds: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.observation, ObservedPullRequest):
+            raise ValueError("recorded evidence requires a present pull request observation")
+        _items(self.external_holds, "external holds", (str,), MAX_WORKFLOW_GATES)
+        for hold in self.external_holds:
+            _text(hold, "external hold", limit=MAX_DETAIL_CHARS)
+
+
 def _ids(reviews: tuple[CountedReview, ...]) -> frozenset[str]:
     return frozenset(review.review_id for review in reviews)
 
@@ -625,7 +661,8 @@ def _validate_release(prior: ReviewWorkflowSnapshot, after: ReviewWorkflowSnapsh
                      and g.cause.episode_id == prior.episode.episode_id)
     if not released:
         raise ValueError("a ceiling release requires an open rejection ceiling of this episode")
-    kept = tuple(g for g in prior.gates if g not in released)
+    # The advance also ends every pre-write hold: no older command can begin.
+    kept = tuple(g for g in prior.gates if g not in released and not ends_with_advance(g))
     if set(after.gates) != set(kept) or len(after.gates) != len(kept):
         raise ValueError("a ceiling release removes only the episode's rejection ceiling")
 
@@ -669,7 +706,7 @@ def validate_review_change(change: WorkflowChanged) -> None:
         # The operator's new decision supersedes any stopped one (every review
         # decision gate belongs to this PR's single episode); every other gate,
         # including retained uncertainty, stays exactly as it was.
-        retained = {g for g in prior.gates if g != gate and not (
+        retained = {g for g in prior.gates if g != gate and not ends_with_advance(g) and not (
             isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision))}
         if set(after.gates) != retained | {RearmingGate(gate, audit.command.request_id)} or len(after.gates) != len(retained) + 1:
             raise ValueError("a review rearm may absorb only stopped decision gates")
@@ -693,7 +730,8 @@ def validate_review_change(change: WorkflowChanged) -> None:
         rearming = next((g for g in after.gates if isinstance(g, RearmingGate) and g.gate.gate_id == intent.gate_id), None)
         if rearming is None or not isinstance(rearming.gate.cause, RearmNeedsDecision) or rearming.gate.cause.stopped_request_id != stopped.request_id:
             raise ValueError("a review continuation rearms the stopped request's decision gate")
-        expected_gates = tuple(RearmingGate(rearming.gate, intent.request_id) if g == rearming.gate else g for g in prior.gates)
+        expected_gates = tuple(RearmingGate(rearming.gate, intent.request_id) if g == rearming.gate else g
+                               for g in prior.gates if not ends_with_advance(g))
         if set(after.gates) != set(expected_gates) or len(after.gates) != len(expected_gates):
             raise ValueError("a review continuation rearms only the retained decision gate")
         if not set(intent.authorized) <= set(stopped.authorized):

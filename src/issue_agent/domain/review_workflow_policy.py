@@ -29,15 +29,19 @@ from .review_workflow import (
     ObservedPullRequest, PendingReviewRearm, PullRequestAbsent, PullRequestObservation, PullRequestState,
     PullRequestUnavailable, RequireFreshReview, ReviewedBaseline, ReviewEpisode, ReviewProjectionPlan, ReviewRearmPreflight,
     ReviewRejectionCeiling, ReviewWorkflowSnapshot, SubmittedReviewState, SupersededReviewRearm, decisive_reviews,
+    ends_with_advance,
 )
 from .workflow import (
-    MAX_WORKFLOW_GATES, AuthorizedOperatorCommand, CancelRearm, ClearGuidance, ContinueGrantedRearm,
+    MAX_WORKFLOW_GATES, AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, ClearGuidance, ContinueGrantedRearm,
     NoAuthorizedRemediation, ObservedTransition, OpenGate, OperatorActor, RearmingGate, RearmNeedsDecision,
     RemoteOutcomeUncertain, RequestRearm, RetryAuthorizationRequired, SetGuidance, StopReason, UnresolvedGate,
     WorkflowChanged, WorkflowMutation, WorkflowRejected, WorkflowRejection, WorkflowTransition, WorkflowUnchanged,
 )
+from .workflow_reconciliation import prewrite_evidence_gate_id
+from .workflow_retry import RetryAuthorizationFacts, authorize_absent_retry
 from .workflow_identity import (
-    MAX_DETAIL_CHARS, FamilyAuthority, PullRequestRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
+    MAX_DETAIL_CHARS, FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
+    WorkflowRevision,
     validate_workflow_identifier, validate_workflow_text,
 )
 
@@ -157,6 +161,16 @@ def review_release_command_id(key: WorkflowKey, generation: int) -> CommandId:
     if type(generation) is not int or generation < 1:
         raise ValueError("a ceiling release projection belongs to an advanced generation")
     return CommandId(_digest(key.repository, "PullRequestRef", key.target.number, generation, "release_ceiling"))
+
+
+def review_rearm_observation_gate_id(request_id: str) -> str:
+    """The one visible hold a pending review re-arm's unavailable reconciliation reads can open.
+
+    Keyed by request: it belongs to that intent's observation obligation, so
+    stopping the intent removes it with the stop (ADR 0012/0015).
+    """
+    validate_workflow_identifier(request_id, "request")
+    return "review-rearm-observation:" + _digest("review_rearm_observation", request_id)
 
 
 def review_dismissal_command_id(key: WorkflowKey, request_id: str, review_id: str) -> CommandId:
@@ -440,6 +454,9 @@ def _release(
 ) -> WorkflowChanged:
     revision = _next(snapshot, advance_generation=True)
     episode = replace(snapshot.episode, continuation=FreshReviewRequired(revision.fence.generation))
+    # The advance fences every command of the old generation: none can begin,
+    # so no pre-write evidence hold of one may outlive it.
+    kept = tuple(g for g in kept if not ends_with_advance(g))
     after = replace(snapshot, revision=revision, episode=episode, gates=kept)
     key = revision.fence.key
     plan = _plan(review_release_command_id(key, revision.fence.generation), bool(kept) or bool(external_holds),
@@ -504,6 +521,23 @@ def review_owed(snapshot: ReviewWorkflowSnapshot, head_sha: str, patch_id: str |
     return patch != continuation.patch_id
 
 
+def bound_submission_owed(
+    snapshot: ReviewWorkflowSnapshot, binding: WorkflowBinding, head_sha: str, patch_id: str | None,
+    *, settled_sibling: bool,
+) -> bool:
+    """Whether the workflow still owes the review a bound submission would post.
+
+    Spend-time applicability for a granted re-write (ADR 0015): the
+    submission's binding is still current, its head still needs a review, and
+    no other submission for this binding and head has already landed.
+    Otherwise a stale verdict would double-post.
+    """
+    snapshot = _review_snapshot(snapshot)
+    if not isinstance(binding, WorkflowBinding) or not isinstance(settled_sibling, bool):
+        raise ValueError("submission applicability requires a typed binding and sibling fact")
+    return not settled_sibling and snapshot.binding == binding and review_owed(snapshot, head_sha, patch_id)
+
+
 class ReviewKind(str, Enum):
     INITIAL = "initial"
     RE_REVIEW = "re_review"
@@ -524,18 +558,46 @@ class ReviewNotOwed:
     reason: str
 
 
-ReviewDispatch = ReviewHeld | ReviewOwed | ReviewNotOwed
+@dataclass(frozen=True)
+class ReleaseProjectionPending:
+    """A ceiling release's relabel is not yet verified: dispatch waits for it."""
+    command_id: CommandId
+
+
+@dataclass(frozen=True)
+class SubmissionUnresolved:
+    """A current-binding review submission's outcome is not yet known: dispatch waits.
+
+    Posting another verdict while one may already have landed double-posts at
+    one head (ADR 0015). Post-expiry uncertainty is also a visible gate.
+    """
+    command_ids: tuple[CommandId, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.command_ids, tuple) or not self.command_ids:
+            raise ValueError("an unresolved submission hold names its commands")
+        for command_id in self.command_ids:
+            validate_workflow_identifier(command_id, "unresolved review submission")
+
+
+ReviewDispatch = ReviewHeld | ReviewOwed | ReviewNotOwed | ReleaseProjectionPending | SubmissionUnresolved
 
 
 def review_dispatch_decision(
     snapshot: ReviewWorkflowSnapshot | None, pr: ObservedPullRequest, *, patch_id: str | None,
+    release_pending: CommandId | None = None, unresolved_submissions: tuple[CommandId, ...] = (),
 ) -> ReviewDispatch:
     """Held beats owed. `None` is a proven-absent workflow (initial review owed).
 
-    Caller contract, owed by increments 5-6 and not enforced here: after a
-    RELEASE_CEILING, dispatch stays held until the release projection command
-    is verified; and a refused or uncertain release projection must surface as
-    a visible gate, never a silent label mismatch.
+    `unresolved_submissions` is the store's harness-owned list of the current
+    binding's bound review submissions whose outcome is unknown or awaiting
+    re-execution: until each resolves, no further review is dispatched.
+
+    `release_pending` is the store's harness-owned fact that the current
+    generation's RELEASE_CEILING projection has no SUCCEEDED receipt: until it
+    is verified, dispatch is held. A refused or expired-uncertain release
+    projection is also a visible gate (`ReviewProjectionRefused`,
+    `RemoteOutcomeUncertain`), never a silent label mismatch.
     """
     if not isinstance(pr, ObservedPullRequest):
         raise ValueError("review dispatch requires a present pull request observation")
@@ -548,6 +610,11 @@ def review_dispatch_decision(
         raise ValueError("review dispatch observation belongs to another workflow")
     if snapshot.gates:
         return ReviewHeld(tuple(_open(g).gate_id for g in snapshot.gates))
+    if unresolved_submissions:
+        return SubmissionUnresolved(unresolved_submissions)
+    if release_pending is not None:
+        validate_workflow_identifier(release_pending, "release projection command")
+        return ReleaseProjectionPending(release_pending)
     if pr.state is not PullRequestState.OPEN:
         return ReviewNotOwed("the pull request is terminal")
     if not review_owed(snapshot, pr.head_sha, patch_id):
@@ -888,8 +955,9 @@ def request_review_rearm(
     by_id = {review.review_id: review for review in cause.counted}
     dismissals = tuple(by_id[review.review_id] for review in counted)
     revision = _next(snapshot, advance_generation=True)
+    # A generation advance fences every older command, so pre-write holds end.
     gates = tuple(RearmingGate(gate, command.request_id) if g == gate else g
-                  for g in snapshot.gates if not _is_decision(g))
+                  for g in snapshot.gates if not _is_decision(g) and not ends_with_advance(g))
     # The absorbed decision's retired obligations are covered by this request
     # exactly as a continuation covers its own.
     absorbed = tuple(c for g in snapshot.gates if isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision)
@@ -941,7 +1009,8 @@ def _retire_rearm(
                                        pending.projection)
         audit = ObservedTransition((evidence_id,))
     generation = snapshot.revision.fence.generation
-    gates = tuple(g for g in snapshot.gates if _open(g).gate_id != pending.gate_id)
+    gates = tuple(g for g in snapshot.gates
+                  if _open(g).gate_id != pending.gate_id and not _ends_with_stop(g, pending, retired))
     gates += (OpenGate(
         _identity(snapshot, "rearm-stopped", pending.request_id), generation,
         RearmNeedsDecision(pending.request_id, retired, reason),
@@ -959,6 +1028,25 @@ def _retire_rearm(
         return _reject(WorkflowRejection.OTHER_HOLD, "the workflow cannot hold the stopped re-arm's gates")
     after = replace(snapshot, revision=_next(snapshot), intent=intent, gates=gates)
     return WorkflowChanged(snapshot.revision, WorkflowMutation.STOP_REARM, after, audit, prior=snapshot)
+
+
+def _ends_with_stop(gate: UnresolvedGate, pending: PendingReviewRearm, retired: tuple[CommandId, ...]) -> bool:
+    """Holds that belong only to the stopped intent's never-to-execute obligations.
+
+    Its reconciliation-read hold and its retired commands' pre-write holds end
+    with it. A retired command whose current postcondition the harness already
+    proved absent (`RetryAuthorizationRequired`) retires that hold too: a
+    retired command can never execute, so the retry contract refuses any grant
+    for it and keeping the gate would leave no operator path (ADR 0015
+    retirement). Outcome uncertainty
+    (`RemoteOutcomeUncertain`) survives for read-only reconciliation.
+    """
+    opened = _open(gate)
+    if opened.gate_id == review_rearm_observation_gate_id(pending.request_id):
+        return True
+    if opened.gate_id in {prewrite_evidence_gate_id(command) for command in retired}:
+        return True
+    return isinstance(opened.cause, RetryAuthorizationRequired) and opened.cause.command_id in retired
 
 
 def cancel_review_rearm(
@@ -1007,6 +1095,33 @@ def review_rearm_stop_reason(
     return None
 
 
+def review_projection_obsolete(snapshot: ReviewWorkflowSnapshot, external_holds: tuple[str, ...] = ()) -> bool:
+    """Whether the pending re-arm's recorded relabel no longer matches the hold facts.
+
+    The projection was planned at acceptance from the gates and external
+    holds then present. If an independent hold has since resolved (for
+    example a direction-conflicting stopped relabel's uncertainty) or appeared,
+    completion could never accept the planned labels: that is a changed
+    decision, superseding the request so a continuation re-plans it (ADR 0015).
+    The intent's own obligations' holds (their uncertainty, pre-write reads
+    and its reconciliation reads) are not hold facts of the decision.
+    """
+    snapshot = _review_snapshot(snapshot)
+    pending = _pending(snapshot)
+    own = set(pending.required_commands)
+    own_gates = {review_rearm_observation_gate_id(pending.request_id)} | {prewrite_evidence_gate_id(c) for c in own}
+
+    def independent(gate: UnresolvedGate) -> bool:
+        opened = _open(gate)
+        if opened.gate_id == pending.gate_id or opened.gate_id in own_gates or _covered(gate, pending.replaces):
+            return False
+        cause = opened.cause
+        return not (isinstance(cause, (RemoteOutcomeUncertain, RetryAuthorizationRequired)) and cause.command_id in own)
+
+    held = bool(_holds(external_holds)) or any(independent(g) for g in snapshot.gates)
+    return held != (pending.projection.remove is None)
+
+
 def continue_review_rearm(
     snapshot: ReviewWorkflowSnapshot, command: ContinueGrantedRearm, actor: OperatorActor, pr: PullRequestObservation,
     *, now: datetime, active_reviews: tuple[WorkflowAttemptIdentity, ...], evidence_id: str, trigger_label: Label,
@@ -1043,7 +1158,8 @@ def continue_review_rearm(
     dismissals = tuple(by_id[review.review_id] for review in counted)
     revision = _next(snapshot, advance_generation=True)
     assert isinstance(gate.cause, RearmNeedsDecision)
-    gates = tuple(RearmingGate(gate, command.request_id) if g == gate else g for g in snapshot.gates)
+    gates = tuple(RearmingGate(gate, command.request_id) if g == gate else g
+                  for g in snapshot.gates if not ends_with_advance(g))
     replaces, projection = _replacement(
         snapshot, gates, gate.gate_id, gate.cause.obligations,
         review_projection_command_id(snapshot.revision.fence.key, command.request_id), external_holds, trigger_label)
@@ -1111,6 +1227,7 @@ class ReviewTransitionFacts:
     - `submission`: the SUBMIT_REVIEW command/receipt facts a recorded review requires.
     - `accepted_preflight`: the stopped intent's accepted preflight for
       decision-changed supersession.
+    - `retry`: the command's retry-grant facts for an operator retry grant.
     """
     now: datetime
     ceiling: int
@@ -1122,6 +1239,9 @@ class ReviewTransitionFacts:
     external_holds: tuple[str, ...] = ()
     escalation: CeilingEscalation | None = None
     submission: ReviewSubmissionReceipt | None = None
+    # The shared retry-grant facts (`load_retry_authorization_facts`) an
+    # AUTHORIZE_RETRY is re-derived from; minted by the store, never wire input.
+    retry: RetryAuthorizationFacts | None = None
 
 
 def _by_identity(commands: tuple[LifecycleCommand, ...]) -> list[LifecycleCommand]:
@@ -1135,13 +1255,20 @@ def _normalized(snapshot: ReviewWorkflowSnapshot) -> ReviewWorkflowSnapshot:
 def _supersession_evidence(
     before: ReviewWorkflowSnapshot, intent: SupersededReviewRearm, facts: ReviewTransitionFacts,
 ) -> None:
-    if intent.reason is StopReason.REQUIRED_EFFECT_REJECTED:
-        return  # The adapter verifies the refusal receipt named by the evidence.
     pr = facts.observation
     if not isinstance(pr, ObservedPullRequest):
         raise ValueError("absent or unavailable pull requests cannot justify supersession")
     if pr.key != before.revision.fence.key or not 0 <= (facts.now - pr.observed_at).total_seconds() <= OBSERVATION_MAX_AGE_SECONDS:
         raise ValueError("supersession observation is foreign or stale")
+    if intent.reason is StopReason.REQUIRED_EFFECT_REJECTED:
+        # The adapter verifies the refusal receipt; the stop still cites one
+        # fresh complete read taken after the re-arm was accepted.
+        accepted = facts.accepted_preflight
+        if not isinstance(pr.reviews, CompleteReviews):
+            raise ValueError("an effect-rejected supersession requires a complete review read")
+        if not isinstance(accepted, ReviewRearmPreflight) or pr.observed_at < accepted.observed_at:
+            raise ValueError("an effect-rejected supersession cites a read taken before the re-arm was accepted")
+        return
     if intent.reason is StopReason.TARGET_TERMINAL:
         if pr.state is PullRequestState.OPEN:
             raise ValueError("terminal supersession requires an observed terminal pull request")
@@ -1149,8 +1276,9 @@ def _supersession_evidence(
     accepted = facts.accepted_preflight
     if not isinstance(accepted, ReviewRearmPreflight) or accepted.pr_key != before.revision.fence.key:
         raise ValueError("decision supersession requires the accepted preflight")
-    if pr.head_sha == accepted.head_sha and set(_holds(facts.external_holds)) == set(accepted.external_holds):
-        raise ValueError("decision supersession requires a moved head or changed holds")
+    if (pr.head_sha == accepted.head_sha and set(_holds(facts.external_holds)) == set(accepted.external_holds)
+            and not review_projection_obsolete(before, facts.external_holds)):
+        raise ValueError("decision supersession requires a moved head, changed holds or an obsolete projection")
 
 
 def _observation(facts: ReviewTransitionFacts) -> PullRequestObservation:
@@ -1246,6 +1374,14 @@ def validate_review_transition(
             evidence_ids=audit.evidence_ids, now=facts.now, ceiling=facts.ceiling,
             trigger_label=facts.trigger_label, external_holds=facts.external_holds,
         )
+    elif mutation is WorkflowMutation.AUTHORIZE_RETRY and isinstance(audit, AuthorizedOperatorCommand) and isinstance(
+        audit.command, AuthorizeAbsentRetry
+    ):
+        # Mirrors resolve: a version bump only, admitted by the shared grant
+        # policy over the harness's own absence evidence and command facts.
+        if not isinstance(facts.retry, RetryAuthorizationFacts):
+            raise ValueError("a retry authorization requires the store's own retry facts")
+        expected = authorize_absent_retry(before, audit.command, audit.actor, facts.retry)
     else:
         raise ValueError("workflow mutation is not supported by review policy")
     if not isinstance(expected, WorkflowChanged):

@@ -484,7 +484,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
-`domain/deployment.py`
+`domain/review_rearm.py`, `domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration; the PR-owned review-rejection
 family has its own snapshot, continuation and handoff-free intents, sharing only
@@ -513,6 +513,9 @@ reconciliation-only command after harness-proven absence).
 `adapters/repository_guidance.py`, `adapters/resolve_activation.py`,
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
+`adapters/review_workflow_control.py` (the review owner's generation-fenced
+commit boundary: store-minted facts, barrier-ordered acceptance, bounded
+re-arm reconciliation and the ceiling-release projection fact),
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,

@@ -18,7 +18,7 @@ from .workflow_identity import (
     WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowTarget, target_family,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
 )
-from .review_rejection import ReviewRearmPreflight, ReviewRejectionCeiling
+from .review_rejection import ReviewProjectionRefused, ReviewRearmPreflight, ReviewRejectionCeiling
 from .world import Comment, IssueView
 from .labels import Label
 from .resolve_split import NeedsAdjudication, SplitContinuation, SplitImplement, split_sources
@@ -274,8 +274,10 @@ class RearmNeedsDecision:
             raise ValueError("rearm stop reason must be typed")
 
 
-GateCause = ResolveCeiling | ReviewRejectionCeiling | RemoteOutcomeUncertain | RetryAuthorizationRequired | EvidenceUnavailable | RearmNeedsDecision
-_CAUSES = (ResolveCeiling, ReviewRejectionCeiling, RemoteOutcomeUncertain, RetryAuthorizationRequired, EvidenceUnavailable, RearmNeedsDecision)
+GateCause = (ResolveCeiling | ReviewRejectionCeiling | RemoteOutcomeUncertain | RetryAuthorizationRequired
+             | EvidenceUnavailable | RearmNeedsDecision | ReviewProjectionRefused)
+_CAUSES = (ResolveCeiling, ReviewRejectionCeiling, RemoteOutcomeUncertain, RetryAuthorizationRequired, EvidenceUnavailable,
+           RearmNeedsDecision, ReviewProjectionRefused)
 
 
 class RemediationOperation(str, Enum):
@@ -631,7 +633,7 @@ class WorkflowSnapshot:
             raise ValueError("gate identities must be unique")
         if any(g.opened_generation > self.revision.fence.generation for g in opened):
             raise ValueError("a gate cannot originate in a future generation")
-        if any(isinstance(g.cause, ReviewRejectionCeiling) for g in opened):
+        if any(isinstance(g.cause, (ReviewRejectionCeiling, ReviewProjectionRefused)) for g in opened):
             raise ValueError("a resolve workflow cannot hold a review rejection cause")
         if self.intent is not None and not isinstance(
             self.intent, (PendingRearm, CompletedRearm, SupersededRearm, CancelledRearm)
