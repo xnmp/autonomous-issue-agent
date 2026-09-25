@@ -872,7 +872,10 @@ def test_v23_backfills_legacy_consumed_grants_as_terminal(control, absent, clock
     clock[0] += timedelta(seconds=5)
     assert executor(control, gateway).drain_pending_commands() == 1
     with control.transaction() as db:  # Isolated v22 fixture, never a supported rollback.
-        for statement in ("DROP TRIGGER workflow_retry_grant_insert", "DROP TRIGGER workflow_retry_grant_update",
+        for statement in ("DROP INDEX effect_receipts_remote_object",
+                          "ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json",
+                          "DELETE FROM schema_migrations WHERE version=24",
+                          "DROP TRIGGER workflow_retry_grant_insert", "DROP TRIGGER workflow_retry_grant_update",
                           "DROP INDEX workflow_retry_open_grant",
                           "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition",
                           "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposed_at",

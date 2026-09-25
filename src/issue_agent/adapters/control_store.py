@@ -49,13 +49,15 @@ from ..domain.workflow import (
     AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
+from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm
+from ..domain.review_workflow_policy import CeilingEscalation, ReviewSubmissionReceipt
 from ..domain.workflow_retry import (
     MAX_AUTHORIZED_ATTEMPTS, MAX_RELEVANT_AUTHORIZATIONS, BeginRetry, DeclineRetry, grant_unavailable_void, RetryAbsenceRead, RetryAuthorization, RetryAuthorizationFacts,
     retry_spend_decision,
 )
 from ..domain.workflow_reconciliation import (
     ABSENCE_FRESHNESS_SECONDS, ReconciliationProgress, absent_reconciliation, absent_reexecution, reconciliation_due,
-    unavailable_reconciliation, unknown_outcome_history,
+    prewrite_evidence_gate_id, unavailable_prewrite_read, unavailable_reconciliation, unknown_outcome_history,
 )
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
 from ..domain.outcome import AuthorFollowup, author_followup
@@ -84,10 +86,11 @@ from .deployment_authority import (
     deployment_effect_barrier, deployment_effect_authority,
     deployment_role,
 )
+from .review_effects import bound_submission_op, review_family_op
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, load_family_authority, load_resolve_authority, load_resolve_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import WorkflowAuthorityError, load_family_authority, load_resolve_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 23
+SCHEMA_VERSION = 24
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -366,10 +369,8 @@ LEGACY_V8_SCHEMA_DIGEST = (
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _RESOLVE_PAID_KINDS = frozenset(stage.value for stage in ResolveStage)
 # ADR 0015 review slice: the only effects a review-rejection re-arm or review
-# completion may own. The PR target is enforced separately. Executor-side
-# readers (command reconciliation gates, rearm projection readiness) still load
-# resolve rows only; increment 4 makes them family-aware before any review
-# command can execute.
+# completion may own. The PR target and each command's exact guard are
+# enforced separately at enqueue (review_family_op, bound_submission_op).
 _REVIEW_FAMILY_COMMAND_KINDS = frozenset({CommandKind.DISMISS_REVIEW, CommandKind.RELABEL, CommandKind.SUBMIT_REVIEW})
 AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
@@ -1344,6 +1345,16 @@ WHEN OLD.disposition IS NOT NULL
 BEGIN
     SELECT RAISE(ABORT, 'a retry grant is disposed exactly once and is otherwise immutable');
 END;
+"""),
+    # ADR 0015 review slice. `prewrite_read_json` is the bounded schedule of a
+    # pending command whose pre-write guard read was unavailable (ADR 0012
+    # ceiling); it is not outcome uncertainty and never enters the
+    # reconciliation JSON. The remote-object index serves the one-receipt-per-
+    # review check on bound review submissions.
+    SchemaMigration(24, """
+ALTER TABLE lifecycle_commands ADD COLUMN prewrite_read_json TEXT;
+CREATE INDEX effect_receipts_remote_object ON effect_receipts(remote_object_id)
+WHERE remote_object_id IS NOT NULL;
 """),
 )
 
@@ -4644,6 +4655,10 @@ class SQLiteControlStore:
                 # can never ride on review-family authority.
                 if command.kind not in _REVIEW_FAMILY_COMMAND_KINDS:
                     raise WorkflowAuthorityError(f"review rejection workflow cannot enqueue {command.kind.value} commands")
+                # A review relabel or dismissal without its decodable guard is
+                # unrepresentable in the outbox, not merely skipped by the executor.
+                review_family_op(command)
+                bound_submission_op(command)
                 require_review_binding(db, binding, allow_gated=True)
                 if command.target != f"pr:{binding.fence.key.target.number}":
                     raise WorkflowAuthorityError("review rejection command target disagrees with its pull request")
@@ -4879,8 +4894,8 @@ class SQLiteControlStore:
         binding = command.workflow
         if binding is None:
             raise WorkflowAuthorityError("command uncertainty has no captured workflow")
-        # Resolve-only until increment 4 (review commands cannot execute yet).
-        current = load_resolve_workflow_row(db, binding.fence.key)
+        # The binding's family selects the only rows that can hold its gate.
+        current = load_workflow_row(db, binding.fence.key)
         if current is None:
             raise WorkflowAuthorityError("command uncertainty workflow is absent")
         uncertainty = state.uncertainty if isinstance(state, RetiredUncertainCommand) else state
@@ -4949,7 +4964,7 @@ class SQLiteControlStore:
                         # A freshly accepted grant is due now, exactly once;
                         # later visits follow the bounded read schedule.
                         grant = self._executable_authorization(db, command.command_id, gate) if isinstance(
-                            reconciliation, ReconciliationOnly) else None
+                            reconciliation, ReconciliationOnly) and _retry_supported(command) else None
                         # Recorded in this transaction, so a grant bypasses the
                         # schedule once however its visit ends.
                         authorized_now = grant is not None and db.execute(
@@ -5053,7 +5068,7 @@ class SQLiteControlStore:
 
     def _retire_workflow_command(
         self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand,
-        current: WorkflowSnapshot, retirement_id: str, *, create_uncertainty: bool = False,
+        current: AnyWorkflowSnapshot, retirement_id: str, *, create_uncertainty: bool = False,
     ) -> CommandReconciliation:
         """One receipt/history boundary for rearm retirement and supersession."""
         binding = command.workflow
@@ -5119,8 +5134,7 @@ class SQLiteControlStore:
         self, db: sqlite3.Connection, binding: WorkflowBinding, gate_id: str, gate: OpenGate | None,
     ) -> None:
         scope = workflow_scope(binding.fence.key)
-        # Resolve-only until increment 4 (review commands cannot execute yet).
-        current = load_resolve_workflow_row(db, binding.fence.key)
+        current = load_workflow_row(db, binding.fence.key)
         if current is None:
             raise WorkflowAuthorityError("command reconciliation workflow is absent")
         existing = db.execute("SELECT * FROM workflow_gates WHERE gate_id=?", (gate_id,)).fetchone()
@@ -5145,7 +5159,7 @@ class SQLiteControlStore:
     def record_reconciliation_read(
         self, command_id: CommandId, expected: ReconciliationOnly | RetiredUncertainCommand,
         *, expected_attempts: int, read_started_at: datetime, executor_identity: str,
-        observed: bool | None, error: str = "",
+        observed: bool | None, error: str = "", remote_object_id: str | None = None,
     ) -> bool:
         """Persist a harness read, never permission to repeat a remote mutation.
 
@@ -5218,7 +5232,8 @@ class SQLiteControlStore:
             else:
                 if row["state"] not in ("executing", "unknown_outcome"):
                     raise WorkflowAuthorityError("verified success contradicts a settled command state")
-                receipt = EffectReceipt(command_id, executor_identity, now, now, EffectStatus.SUCCEEDED)
+                receipt = EffectReceipt(command_id, executor_identity, now, now, EffectStatus.SUCCEEDED,
+                                        remote_object_id=remote_object_id)
                 self._replace_effect_receipt(db, command)
                 db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (executor_identity, str(command_id)))
                 self._insert_effect(db, receipt, _receipt_digest(receipt))
@@ -5254,6 +5269,7 @@ class SQLiteControlStore:
         self, command_id: CommandId, expected: ActiveReconciliation | None,
         *, expected_attempts: int, read_started_at: datetime, executor_identity: str,
         observed: bool | None, error: str = "", reexecution_ceiling: bool = False,
+        remote_object_id: str | None = None,
     ) -> bool:
         """Persist one pre-expiry read of an unresolved workflow command (ADR 0015).
 
@@ -5300,7 +5316,8 @@ class SQLiteControlStore:
             db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (evidence_id, *workflow_scope(binding.fence.key), str(command_id), "observation", evidence_payload))
             if observed is True:
-                receipt = EffectReceipt(command_id, executor_identity, now, now, EffectStatus.SUCCEEDED)
+                receipt = EffectReceipt(command_id, executor_identity, now, now, EffectStatus.SUCCEEDED,
+                                        remote_object_id=remote_object_id)
                 self._replace_effect_receipt(db, command)
                 db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (executor_identity, str(command_id)))
                 self._insert_effect(db, receipt, _receipt_digest(receipt))
@@ -5338,6 +5355,104 @@ class SQLiteControlStore:
                    "WHERE authorization_id=? AND disposition IS NULL", (grant.authorization_id,))
         return int(db.execute("SELECT unavailable_reads FROM workflow_retry_authorizations WHERE authorization_id=?",
                               (grant.authorization_id,)).fetchone()[0])
+
+    def bound_review_submission(self, command_id: CommandId) -> ReviewSubmissionReceipt | CeilingEscalation | None:
+        """Harness-minted evidence of one verified, generation-bound SUBMIT_REVIEW.
+
+        Only this store's own command row and SUCCEEDED receipt can yield it,
+        never agent output: the reviewed head and patch identity come from the
+        command the executor submitted, and an escalation keeps its cause so a
+        ceiling decision can tell it apart. None until the receipt succeeds.
+        """
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+            if row is None:
+                raise KeyError(str(command_id))
+            receipt = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(command_id),)).fetchone()
+        command = _command_from_row(row)
+        binding = command.workflow
+        if (command.kind is not CommandKind.SUBMIT_REVIEW or binding is None
+                or binding.authority.family is not WorkflowFamily.REVIEW_REJECTIONS):
+            return None
+        if row["state"] != EffectStatus.SUCCEEDED.value or receipt is None or receipt["status"] != EffectStatus.SUCCEEDED.value:
+            return None
+        payload = command.payload
+        try:
+            head, cause = payload["head"], payload.get("escalate_cause")
+            if head != command.expected_revision:
+                raise ValueError("submitted head disagrees with the command revision")
+            submission = BoundReviewSubmission(command.command_id, binding)
+            receipt_id = f"effect-receipt:{receipt['receipt_digest']}"
+            if cause is not None:
+                return CeilingEscalation(submission, head, receipt_id, cause)
+            return ReviewSubmissionReceipt(submission, head, payload["patch_id"], receipt_id)
+        except (KeyError, TypeError, ValueError) as exc:
+            raise WorkflowAuthorityError(f"bound review submission evidence is malformed: {exc}") from exc
+
+    @staticmethod
+    def _prewrite_read(row: sqlite3.Row) -> ActiveReconciliation | None:
+        raw = row["prewrite_read_json"]
+        return decode_workflow(raw, ActiveReconciliation) if raw is not None else None
+
+    def prewrite_read(self, command_id: CommandId) -> ActiveReconciliation | None:
+        """The bounded schedule of a command whose pre-write guard read was unavailable."""
+        with closing(self._connect()) as db:
+            row = db.execute("SELECT prewrite_read_json FROM lifecycle_commands WHERE command_id=?",
+                             (str(command_id),)).fetchone()
+        if row is None:
+            raise KeyError(str(command_id))
+        return self._prewrite_read(row)
+
+    def record_prewrite_unavailable(
+        self, command_id: CommandId, expected: ActiveReconciliation | None, *,
+        expected_attempts: int, read_started_at: datetime, executor_identity: str, error: str,
+    ) -> bool:
+        """Persist one unavailable pre-write guard read of a bound command (ADR 0012).
+
+        The command has not written, so this is not outcome uncertainty: it
+        backs off on its own schedule, is journaled, and at the ceiling opens
+        a visible `EvidenceUnavailable` gate. Beginning the command (after a
+        complete read) ends the schedule and closes the gate. False means
+        another read or attempt already advanced the command.
+        """
+        if expected is not None and not isinstance(expected, ActiveReconciliation):
+            raise ValueError("a pre-write read requires its prior schedule")
+        if type(expected_attempts) is not int or expected_attempts < 0:
+            raise ValueError("a pre-write read requires the attempt count observed before it")
+        if not isinstance(read_started_at, datetime) or read_started_at.tzinfo is None or read_started_at.utcoffset() is None:
+            raise ValueError("a pre-write read requires the timezone-aware start of its read")
+        with self.transaction() as db:
+            self._assert_owner_active(db, executor_identity)
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+            if row is None or row["executor_identity"] != executor_identity:
+                raise WorkflowAuthorityError("pre-write read belongs to another executor")
+            command = _command_from_row(row)
+            binding = command.workflow
+            if binding is None:
+                raise WorkflowAuthorityError("a pre-write schedule requires workflow authority")
+            # A stale generation cannot begin; it must not open a hold either.
+            self._validate_workflow_command(db, command)
+            if (row["state"] not in ("pending", "retryable_failure") or self._prewrite_read(row) != expected
+                    or int(row["attempts"]) != expected_attempts):
+                return False
+            now = self._now()
+            if not 0 <= (now - read_started_at).total_seconds() <= ABSENCE_FRESHNESS_SECONDS:
+                raise ValueError("a pre-write read must be recorded fresh and cannot start in the future")
+            progress = unavailable_prewrite_read(binding, command_id, expected, now=now,
+                                                 error=error[:4096] or "pre-write guard read unavailable")
+            history = progress.state
+            assert isinstance(history, ActiveReconciliation)
+            db.execute("UPDATE lifecycle_commands SET prewrite_read_json=? WHERE command_id=?",
+                       (encode_workflow(history), str(command_id)))
+            if progress.gate is not None:
+                self._reconciliation_gate(db, binding, progress.gate.gate_id, progress.gate)
+            self._transition(db, "lifecycle_command", str(command_id),
+                             "prewrite_evidence_gated" if progress.gate is not None else "prewrite_evidence_deferred", {
+                                 "failed_reads": history.failed_reads,
+                                 "next_read_at": _stamp(history.next_read_at),
+                                 "error": error[:512],
+                             })
+            return True
 
     def latest_command(self, logical_key: str) -> PendingCommand | None:
         if not logical_key:
@@ -5380,12 +5495,22 @@ class SQLiteControlStore:
             self._mark_executing(db, command_id)
 
     def _mark_executing(self, db: sqlite3.Connection, command_id: CommandId) -> None:
-        """The one attempt increment shared by ordinary and authorized execution."""
+        """The one attempt increment shared by ordinary and authorized execution.
+
+        Beginning ends any pre-write evidence schedule (the executor only
+        begins after a complete guard read) and closes its visible hold.
+        """
+        row = db.execute("SELECT workflow_binding_json, prewrite_read_json FROM lifecycle_commands WHERE command_id=?",
+                         (str(command_id),)).fetchone()
+        now = _stamp(self._now())
         db.execute(
             "UPDATE lifecycle_commands SET state='executing', attempts=attempts+1, "
-            "updated_at=?, attempt_owner=executor_identity WHERE command_id=?",
-            (_stamp(self._now()), str(command_id)),
+            "updated_at=?, attempt_owner=executor_identity, prewrite_read_json=NULL WHERE command_id=?",
+            (now, str(command_id)),
         )
+        if row is not None and row["prewrite_read_json"] is not None and row["workflow_binding_json"] is not None:
+            binding = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
+            self._reconciliation_gate(db, binding, prewrite_evidence_gate_id(command_id), None)
         self._transition(
             db,
             "lifecycle_command",
@@ -5395,22 +5520,30 @@ class SQLiteControlStore:
 
     @staticmethod
     def _workspace_projection_ready(db: sqlite3.Connection, command: LifecycleCommand) -> bool:
+        """Whether a re-arm obligation may execute now; other commands always may.
+
+        Dispatches on the binding's family: resolve obligations also wait for
+        their verified workspace handoff; review obligations have none.
+        """
         association = db.execute(
             "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?",
             (str(command.command_id),),
         ).fetchone()
+        pending_type = (
+            PendingReviewRearm if command.workflow is not None
+            and command.workflow.authority.family is WorkflowFamily.REVIEW_REJECTIONS else PendingRearm
+        )
         if association is None:
             if command.workflow is not None:
-                # Resolve-only until increment 4 makes rearm projection family-aware.
-                current = load_resolve_workflow_row(db, command.workflow.fence.key)
-                if current is not None and isinstance(current.intent, PendingRearm) and command.command_id in current.intent.required_commands:
+                current = load_workflow_row(db, command.workflow.fence.key)
+                if current is not None and isinstance(current.intent, pending_type) and command.command_id in current.intent.required_commands:
                     raise WorkflowAuthorityError("rearm projection lacks its recorded operation association")
             return True
         if command.workflow is None:
             raise WorkflowAuthorityError("rearm projection lacks its workflow binding")
-        current = require_resolve_binding(db, command.workflow, allow_gated=True)
+        current = require_workflow_binding(db, command.workflow, allow_gated=True)
         intent = current.intent
-        if (association["disposition"] != "required" or not isinstance(intent, PendingRearm)
+        if (association["disposition"] != "required" or not isinstance(intent, pending_type)
                 or intent.request_id != association["request_id"]
                 or command.command_id not in intent.required_commands):
             raise WorkflowAuthorityError("rearm projection no longer belongs to a pending authorized intent")
@@ -5418,7 +5551,9 @@ class SQLiteControlStore:
         # with the replacement projection, so it waits for reconciliation.
         if any(isinstance((g.gate if isinstance(g, RearmingGate) else g).cause, RemoteOutcomeUncertain) for g in current.gates):
             return False
-        return load_workspace_ack(db, intent.handoff) is not None
+        if isinstance(intent, PendingRearm):
+            return load_workspace_ack(db, intent.handoff) is not None
+        return True
 
     @staticmethod
     def _return_projection_attempt(db: sqlite3.Connection, command: LifecycleCommand) -> WorkflowAttemptIdentity | None:
@@ -5657,12 +5792,16 @@ class SQLiteControlStore:
             self._require_reconciliation_gate(db, command, expected)
             if row["state"] not in ("executing", "unknown_outcome"):
                 raise WorkflowAuthorityError("reconciliation-only command lacks an unresolved outcome")
-            current = load_resolve_workflow_row(db, binding.fence.key)
+            current = load_workflow_row(db, binding.fence.key)
             if current is None:
                 raise WorkflowAuthorityError("authorized retry workflow is absent")
-            decision = retry_spend_decision(
-                current, stored, load_retry_authorization_facts(self, db, command.command_id, stored.evidence_id),
-                read, now=self._now(),
+            facts = load_retry_authorization_facts(self, db, command.command_id, stored.evidence_id)
+            # Retry policy exists only for resolve (ADR 0015 review slice): a
+            # review-family grant ends void here and never buys a write.
+            decision = (
+                retry_spend_decision(current, stored, facts, read, now=self._now())
+                if isinstance(current, WorkflowSnapshot) and _retry_supported(command)
+                else DeclineRetry(RetryDisposition.VOID, _RETRY_UNSUPPORTED, True)
             )
             if isinstance(decision, DeclineRetry):
                 return RetryDeclined(self._decline_retry(db, row, command, current, stored, expected, read, decision))
@@ -5690,7 +5829,7 @@ class SQLiteControlStore:
             return RetryBegan(ConsumedRetryAuthorization(stored, attempt))
 
     def _decline_retry(
-        self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand, current: WorkflowSnapshot,
+        self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand, current: AnyWorkflowSnapshot,
         stored: UnconsumedRetryAuthorization, expected: ReconciliationOnly, read: RetryAbsenceRead,
         decision: DeclineRetry,
     ) -> ClosedRetryAuthorization:
@@ -5764,10 +5903,12 @@ class SQLiteControlStore:
             return
         payload = _json(dict(receipt))
         evidence_id = hashlib.sha256(f"prior-receipt:{command.command_id}:{payload}".encode()).hexdigest()
+        # Scoped by the binding's own target: a pull request workflow's receipt
+        # is never filed under an issue of the same number.
         db.execute(
             "INSERT OR IGNORE INTO workflow_evidence(evidence_id, repository, target_kind, target_number, command_id, kind, payload_json) "
-            "VALUES (?, ?, 'issue', ?, ?, 'prior_receipt', ?)",
-            (evidence_id, command.repository, command.workflow.fence.key.target.number, str(command.command_id), payload),
+            "VALUES (?, ?, ?, ?, ?, 'prior_receipt', ?)",
+            (evidence_id, command.repository, *workflow_scope(command.workflow.fence.key)[1:], str(command.command_id), payload),
         )
 
     def _replace_effect_receipt(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
@@ -5932,6 +6073,19 @@ class SQLiteControlStore:
         # identity that actually began this attempt and may receipt its result.
         if command.workflow is not None and (not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]):
             raise ControlStoreError("workflow effect receipt does not match the captured attempt owner")
+        if command.kind is CommandKind.SUBMIT_REVIEW and receipt.remote_object_id is not None:
+            # Defence in depth behind the review marker: one GitHub review is
+            # the receipt of at most one submission, so two verdicts can never
+            # both be settled by the same review.
+            holder = db.execute(
+                "SELECT r.command_id FROM effect_receipts r JOIN lifecycle_commands c ON c.command_id=r.command_id "
+                "WHERE r.remote_object_id=? AND r.command_id<>? AND c.kind=? AND c.repository=? LIMIT 1",
+                (receipt.remote_object_id, str(receipt.command_id), CommandKind.SUBMIT_REVIEW.value, command.repository),
+            ).fetchone()
+            if holder is not None:
+                raise ControlStoreError(
+                    f"review {receipt.remote_object_id} is already the receipt of command {holder['command_id']}"
+                )
         db.execute(
             "INSERT INTO effect_receipts(command_id, executor_identity, "
             "started_at, completed_at, status, remote_object_id, "
@@ -6425,6 +6579,14 @@ def _retry_authorization_from_row(row: sqlite3.Row) -> RetryAuthorization:
         raise WorkflowAuthorityError("persisted retry authorization is malformed") from exc
 
 
+_RETRY_UNSUPPORTED = "absence-authorized retry is not yet supported for review-rejection commands"
+
+
+def _retry_supported(command: LifecycleCommand) -> bool:
+    """Only resolve has an AUTHORIZE_RETRY policy; review grants are never offered or spent."""
+    return command.workflow is not None and command.workflow.authority.family is WorkflowFamily.RESOLVE
+
+
 def load_retry_authorization_facts(
     store: SQLiteControlStore, db: sqlite3.Connection, command_id: CommandId, evidence_id: str,
 ) -> RetryAuthorizationFacts:
@@ -6450,11 +6612,14 @@ def load_retry_authorization_facts(
     link = db.execute(
         "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?", (str(command_id),),
     ).fetchone()
-    current = load_resolve_workflow_row(db, binding.fence.key)
+    current = load_workflow_row(db, binding.fence.key)
     intent = current.intent if current is not None else None
-    workspace_ready = (
-        link is not None and isinstance(intent, PendingRearm) and intent.request_id == link["request_id"]
+    # Review obligations carry no workspace handoff; their readiness is the
+    # pending intent alone.
+    workspace_ready = link is not None and (
+        isinstance(intent, PendingRearm) and intent.request_id == link["request_id"]
         and load_workspace_ack(db, intent.handoff) is not None
+        or isinstance(intent, PendingReviewRearm) and intent.request_id == link["request_id"]
     )
     prior = tuple(_retry_authorization_from_row(item) for item in db.execute(
         "SELECT * FROM workflow_retry_authorizations WHERE command_id=? "
@@ -6479,6 +6644,8 @@ def load_retry_authorization_facts(
         # The check is read-only by contract; never let it leave writes behind.
         db.execute("ROLLBACK TO retry_execution_check")
         db.execute("RELEASE retry_execution_check")
+    if refusal is None and not _retry_supported(command):
+        refusal = _RETRY_UNSUPPORTED
     return RetryAuthorizationFacts(
         command.command_id, binding, SQLiteControlStore._command_reconciliation(row), evidence,
         RearmObligation(link["request_id"]) if link is not None else StandaloneCommand(), prior,

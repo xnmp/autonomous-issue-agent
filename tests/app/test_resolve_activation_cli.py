@@ -145,6 +145,8 @@ def _downgrade_to_v21(store):
     # Isolated fixture of a deployment still at the previous schema.
     with store.transaction() as db:
         for statement in (
+            "DROP INDEX effect_receipts_remote_object",
+            "ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json",
             "DROP TRIGGER workflow_retry_grant_insert", "DROP TRIGGER workflow_retry_grant_update",
             "DROP INDEX workflow_retry_open_grant",
             "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition",

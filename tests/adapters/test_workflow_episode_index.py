@@ -28,6 +28,8 @@ def test_episode_index_uses_stable_wire_discriminator_and_ignores_generation():
 def _downgrade_fixture_to_v19(store):
     # Isolated historical fixture construction, never a supported rollback.
     with store.transaction() as db:
+        db.execute("DROP INDEX effect_receipts_remote_object")
+        db.execute("ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json")
         db.execute("DROP TRIGGER workflow_retry_grant_insert")
         db.execute("DROP TRIGGER workflow_retry_grant_update")
         db.execute("DROP INDEX workflow_retry_open_grant")

@@ -511,6 +511,8 @@ reconciliation-only command after harness-proven absence).
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
 `adapters/repository_guidance.py`, `adapters/resolve_activation.py`,
+`adapters/review_effects.py` (guarded review dismissal and PR projection
+commands executed by the review owner),
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,

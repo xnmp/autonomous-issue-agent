@@ -8,7 +8,7 @@ import sqlite3
 import sys
 from dataclasses import fields, is_dataclass, replace
 from enum import Enum
-from typing import Any, Callable, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, NoReturn, Protocol, runtime_checkable
 
 from ..domain.actions import (
     Action,
@@ -31,7 +31,7 @@ from ..domain.lifecycle import (
     completion_eligibility, hold_guard_applies,
 )
 from ..domain.repository import canonical_repository
-from ..domain.workflow_identity import WorkflowBinding
+from ..domain.workflow_identity import WorkflowBinding, WorkflowFamily
 from ..domain.workflow import (
     ActiveReconciliation, ReconciliationOnly, RetiredUncertainCommand,
     RetryBegan, RetryDeclined,
@@ -55,6 +55,12 @@ from ..domain.ports import EventSink
 from .deployment_authority import DeploymentAuthority, deployment_role
 from .durable_effects import DurableEffectRunner, EffectOutcome
 from .journal import alert
+from ..domain.review_workflow import PartialReviews, mark_review_body
+from .review_effects import (
+    BoundReviewSubmissionOp, PullRequestProjectionOp, ReviewCheck, ReviewCommandCheck, ReviewDismissalOp,
+    ReviewDismissals, ReviewFamilyOp, ReviewReadUnavailable, ReviewReads, bound_submission_op, check_bound_submission, check_review_op,
+    is_review_family, observe_pull_request, review_family_op,
+)
 from .workflow_codec import encode_workflow
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
@@ -85,6 +91,9 @@ _OWNED_COMMAND_KINDS = frozenset(
         CommandKind.SUBMIT_REVIEW,
     }
 )
+# ADR 0015: review dismissal executes only as the review daemon's owner, with
+# its gateway and credential; the fix executor never owns it.
+_REVIEW_ROLE_COMMAND_KINDS = frozenset({CommandKind.DISMISS_REVIEW})
 
 
 def _stderr_log(line: str) -> None:
@@ -332,6 +341,9 @@ class GitHubEffectExecutor:
         self.alert_cmd = alert_cmd
         self.log = log if log is not None else _stderr_log
         self._unowned_kinds_seen: set[CommandKind] = set()
+        self.owned_kinds = _OWNED_COMMAND_KINDS | (
+            _REVIEW_ROLE_COMMAND_KINDS if deployment_role(self.repository, identity) == "review" else frozenset()
+        )
         self.effects = DurableEffectRunner(
             store,
             DeploymentAuthority(
@@ -386,20 +398,120 @@ class GitHubEffectExecutor:
                 )
             return False
         started = self.store.now()
-        present, error = self._observe_postcondition(command)
+        present, error, remote_object_id = self._observe_postcondition_evidence(command)
         ceiling = present is False and state is not None and reexecution_exhausted(state, started)
         if ceiling:
             error = "repeated unknown outcomes reached the re-execution ceiling; absence needs an operator grant"
         elif present is False:
-            return self._execute(action_from_command(command), pending)
+            return self._resume_absent(pending)
         if self.store.record_scheduled_read(
             command.command_id, state, expected_attempts=pending.attempts, read_started_at=started,
             executor_identity=self.identity, observed=present, error=error, reexecution_ceiling=ceiling,
+            remote_object_id=remote_object_id,
         ):
             return True
         if raise_unresolved:
             raise UnknownEffectOutcome(f"{command.command_id}: remote outcome remains unknown ({error or 'unverified'})")
         return False
+
+    def _resume_absent(self, pending) -> bool:
+        """Proven absence re-enters the command's own execution path."""
+        command = pending.command
+        if command.kind is CommandKind.SUBMIT_REVIEW:
+            return self._run_submission(pending, raise_deferred=False)
+        op = review_family_op(command)
+        if op is not None:
+            return self._execute_review(op, pending)
+        return self._execute(action_from_command(command), pending)
+
+    def _check_review(self, op: ReviewFamilyOp, command: LifecycleCommand) -> ReviewCommandCheck:
+        """One fresh read of the pull request, classified against the op's accepted guard."""
+        assert command.workflow is not None
+        observation = observe_pull_request(
+            self.gateway, command.workflow.fence.key, self.store.now(),
+            reviews=isinstance(op, ReviewDismissalOp),
+        )
+        return check_review_op(op, observation)
+
+    def _write_review(self, op: ReviewFamilyOp) -> bool:
+        """The single remote write; False is GitHub's refusal of this identity's request."""
+        if isinstance(op, ReviewDismissalOp):
+            if not isinstance(self.gateway, ReviewDismissals):
+                raise UnknownEffectOutcome(f"pr:{op.pr}: the executor gateway cannot dismiss reviews")
+            return bool(self.gateway.dismiss_review(op.pr, op.review_id, op.message))
+        self.gateway.relabel("pr", op.pr, op.remove.value if op.remove is not None else None, op.add.value)
+        return True
+
+    def _execute_review(self, op: ReviewFamilyOp, pending) -> bool:
+        """Run one review-family obligation with its guard enforced before any write.
+
+        Mirrors `_execute` for a queued command: presence settles without a
+        write; a changed guard is a verified refusal (permanent, never a write);
+        an unavailable read leaves the command's state as it was. The write
+        runs as this executor's own identity; GitHub refusing it is a visible
+        permanent failure, never a reason to try another credential (ADR 0015).
+        """
+        command = pending.command
+        if self._retire_if_exhausted(pending):
+            return False
+        if pending.state == EffectStatus.PERMANENT_FAILURE.value:
+            return False
+        unresolved = pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}
+        due, schedule = (True, None) if unresolved else self._prewrite_schedule(pending)
+        if not due:
+            return False
+        started = self.store.now()
+        check = self._check_review(op, command)
+        if unresolved:
+            if check.check is ReviewCheck.PRESENT:
+                return self.effects.resolve_unknown(command, EffectOutcome(True, EffectStatus.SUCCEEDED))
+            if check.check is ReviewCheck.UNAVAILABLE:
+                raise UnknownEffectOutcome(f"{command.command_id}: remote outcome remains unknown ({check.detail})")
+            self.effects.retry_reconciled(command)
+        elif check.check is ReviewCheck.PRESENT:
+            return self.effects.execute(command, lambda: EffectOutcome(True, EffectStatus.SUCCEEDED))
+        elif check.check is ReviewCheck.UNAVAILABLE:
+            self._defer_prewrite(pending, schedule, started, check.detail)
+        if check.check is ReviewCheck.REFUSED:
+            reason = f"guard changed: {check.detail}"
+            self.effects.execute(command, lambda: EffectOutcome(False, EffectStatus.PERMANENT_FAILURE, error=reason))
+            self.log(f"lifecycle command {command.command_id} ({command.kind.value} on {command.target}) refused: {reason}")
+            return False
+
+        def write_and_verify() -> EffectOutcome[bool]:
+            accepted = self._write_review(op)
+            after = self._check_review(op, command)
+            if after.check is ReviewCheck.PRESENT:
+                return EffectOutcome(True, EffectStatus.SUCCEEDED)
+            if after.check is ReviewCheck.UNAVAILABLE:
+                raise UnknownEffectOutcome(f"{command.command_id}: remote postcondition is unavailable ({after.detail})")
+            if after.check is ReviewCheck.REFUSED:
+                return EffectOutcome(False, EffectStatus.PERMANENT_FAILURE, error=f"guard changed: {after.detail}")
+            if isinstance(op, PullRequestProjectionOp):
+                return EffectOutcome(False, EffectStatus.RETRYABLE_FAILURE,
+                                     error="GitHub did not confirm the requested remote state")
+            if not accepted:
+                return EffectOutcome(False, EffectStatus.PERMANENT_FAILURE, error=(
+                    "GitHub refused the dismissal for the review identity (missing permission or branch "
+                    "protection); credentials are never switched"
+                ))
+            raise UnknownEffectOutcome(f"{command.command_id}: accepted dismissal is not yet visible")
+
+        return bool(self.effects.execute(command, write_and_verify))
+
+    def _prewrite_schedule(self, pending) -> tuple[bool, ActiveReconciliation | None]:
+        """Whether a pending command's guard read is due now, and its pre-write schedule."""
+        schedule = self.store.prewrite_read(pending.command.command_id)
+        return schedule is None or reconciliation_due(schedule, self.store.now()), schedule
+
+    def _defer_prewrite(self, pending, schedule: ActiveReconciliation | None, started, detail: str) -> NoReturn:
+        """An unavailable pre-write guard read: bounded backoff, journaled, gated at the ceiling (ADR 0012)."""
+        command = pending.command
+        self.store.record_prewrite_unavailable(
+            command.command_id, schedule, expected_attempts=pending.attempts, read_started_at=started,
+            executor_identity=self.identity, error=detail,
+        )
+        raise UnknownEffectOutcome(f"{command.command_id}: pre-write observation unavailable ({detail})")
 
     def _execute(self, action: Action, pending):
         if pending is None and isinstance(action, CloseIssue) and self._reconcile(action) is True:
@@ -579,6 +691,109 @@ class GitHubEffectExecutor:
         pending = self.effects.enqueue(command)
         return self._run_review_command(pending)
 
+    def submit_bound_review(
+        self, pr: int, event: str, body: str, expected_head: str, *,
+        workflow: WorkflowBinding, reviewer: str, patch_id: str | None, escalate_cause: str | None = None,
+    ) -> bool:
+        """SUBMIT_REVIEW under an active review-rejection workflow (ADR 0015).
+
+        The command carries the captured binding, so the store fences it by
+        generation at enqueue and begin, and its payload records the reviewed
+        head, patch identity and any escalation cause: the SUCCEEDED receipt
+        of this exact command is the only evidence a later RECORD_REVIEW or
+        ceiling decision may use. `reviewer` is the review identity's login:
+        reconciliation recognizes this command's review by it, never by
+        content. Unbound submissions keep `submit_review`.
+        """
+        if not isinstance(workflow, WorkflowBinding) or workflow.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
+            raise ValueError("a bound review submission requires a review-rejection binding")
+        if workflow.fence.key.target.number != pr:
+            raise ValueError("a bound review submission belongs to its workflow's pull request")
+        if not expected_head:
+            raise UnknownEffectOutcome(f"pr:{pr}: review head is unavailable")
+        op = BoundReviewSubmissionOp(pr, event, body, expected_head, reviewer, patch_id, escalate_cause)
+        payload = op.payload()
+        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        digest = hashlib.sha256(f"submit-review:{encoded}:{encode_workflow(workflow)}".encode()).hexdigest()
+        command = LifecycleCommand(
+            CommandId(digest), f"github:{digest}", CommandKind.SUBMIT_REVIEW, f"pr:{pr}", expected_head, payload,
+            self.config_version, self.repository, self.identity, workflow=workflow,
+        )
+        pending = self.effects.enqueue(command)
+        if _unresolved_workflow_command(pending):
+            return self._reconcile_scheduled(pending, raise_unresolved=True)
+        return self._run_bound_review_command(op, pending, raise_deferred=True)
+
+    def _run_submission(self, pending, *, raise_deferred: bool) -> bool:
+        op = bound_submission_op(pending.command)
+        if op is None:
+            return self._run_review_command(pending)
+        return self._run_bound_review_command(op, pending, raise_deferred=raise_deferred)
+
+    def _check_bound_submission(self, op: BoundReviewSubmissionOp, command: LifecycleCommand) -> ReviewCommandCheck:
+        """One read of every review, matched to this command's own submission."""
+        if not isinstance(self.gateway, ReviewReads):
+            return ReviewCommandCheck(ReviewCheck.UNAVAILABLE, "the executor gateway cannot read pull request reviews")
+        try:
+            reviews = self.gateway.pull_request_reviews(op.pr)
+        except sqlite3.Error:
+            raise
+        except Exception as exc:  # noqa: BLE001 - a failed read is unavailable evidence, never absence
+            reviews = PartialReviews(f"{type(exc).__name__}: {exc}"[:512])
+        return check_bound_submission(op, reviews, command_id=str(command.command_id))
+
+    def _run_bound_review_command(self, op: BoundReviewSubmissionOp, pending, *, raise_deferred: bool) -> bool:
+        """Submit a bound review at most once per proven absence (ADR 0015).
+
+        Its body carries a final-line marker naming this command, and only a
+        review by the review identity with that marker is its own
+        (`check_bound_submission`); the receipt names that review. A read that cannot decide never buys a write.
+        """
+        command = pending.command
+        if pending.state == EffectStatus.SUCCEEDED.value:
+            # Reviews are never deleted, only dismissed: the receipt is final.
+            return True
+        if self._retire_if_exhausted(pending):
+            return False
+        if pending.state == EffectStatus.PERMANENT_FAILURE.value:
+            return False
+        due, schedule = True, None
+        if pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
+            check = self._check_bound_submission(op, command)
+            if check.check is ReviewCheck.PRESENT:
+                return self.effects.resolve_unknown(command, EffectOutcome(
+                    True, EffectStatus.SUCCEEDED, remote_object_id=check.remote_object_id))
+            if check.check is not ReviewCheck.APPLIES:
+                raise UnknownEffectOutcome(f"{command.command_id}: remote outcome remains unknown ({check.detail})")
+            self.effects.retry_reconciled(command)
+        else:
+            due, schedule = self._prewrite_schedule(pending)
+        if not due:
+            if raise_deferred:
+                raise UnknownEffectOutcome(f"{command.command_id}: pre-write read is deferred on its schedule")
+            return False
+        started = self.store.now()
+        try:
+            current = self._current_revision(command)
+        except sqlite3.Error:
+            raise
+        except Exception as exc:  # noqa: BLE001 - bounded pre-write evidence
+            self._defer_prewrite(pending, schedule, started, f"{type(exc).__name__}: {exc}"[:512])
+        if current != op.head:
+            return bool(self.effects.execute(command, lambda: EffectOutcome(
+                False, EffectStatus.PERMANENT_FAILURE, error="review head changed before submission")))
+
+        def submit_and_verify() -> EffectOutcome[bool]:
+            if not self.gateway.submit_review(op.pr, op.event, mark_review_body(op.body, command.command_id), op.head):
+                return EffectOutcome(False, EffectStatus.PERMANENT_FAILURE, error="GitHub rejected review submission")
+            after = self._check_bound_submission(op, command)
+            if after.check is ReviewCheck.PRESENT:
+                return EffectOutcome(True, EffectStatus.SUCCEEDED, remote_object_id=after.remote_object_id)
+            raise UnknownEffectOutcome(
+                f"{command.command_id}: submitted review is not verifiable ({after.detail or 'not yet visible'})")
+
+        return bool(self.effects.execute(command, submit_and_verify))
+
     def _run_review_command(self, pending) -> bool:
         command = pending.command
         payload = command.payload
@@ -610,16 +825,25 @@ class GitHubEffectExecutor:
                     EffectOutcome(True, EffectStatus.SUCCEEDED),
                 )
             self.effects.retry_reconciled(command)
-        elif isinstance(self.gateway, ReviewVerifier) and self.gateway.has_review(
-            pr, event, body, head
-        ):
-            # Deployment-scoped identities change the command digest. Reconcile
-            # a matching pre-cutover review before the new identity can submit
-            # the same GitHub review again.
-            return self.effects.execute(
-                command,
-                lambda: EffectOutcome(True, EffectStatus.SUCCEEDED),
-            )
+        elif isinstance(self.gateway, ReviewVerifier):
+            try:
+                present = self.gateway.has_review(pr, event, body, head)
+            except ReviewReadUnavailable as exc:
+                # Fail closed without a write, and say why: this is GitHub
+                # refusing the read, not an infra death. The command stays
+                # pending; the caller's unproductive-round bound escalates a
+                # refusal that persists.
+                self.log(f"lifecycle command {command.command_id} (submit_review on {command.target}) "
+                         f"not submitted: {exc}")
+                return False
+            if present:
+                # Deployment-scoped identities change the command digest. Reconcile
+                # a matching pre-cutover review before the new identity can submit
+                # the same GitHub review again.
+                return self.effects.execute(
+                    command,
+                    lambda: EffectOutcome(True, EffectStatus.SUCCEEDED),
+                )
         if not self._revision_matches(command):
             return self.effects.execute(
                 command,
@@ -671,7 +895,9 @@ class GitHubEffectExecutor:
             diagnose=self.log,
         ):
             command = pending.command
-            if command.kind not in _OWNED_COMMAND_KINDS:
+            if command.kind not in self.owned_kinds or (
+                command.kind in _REVIEW_ROLE_COMMAND_KINDS and not is_review_family(command)
+            ):
                 self._note_unowned_kind(command.kind)
                 continue
             try:
@@ -681,7 +907,9 @@ class GitHubEffectExecutor:
                 elif _unresolved_workflow_command(pending):
                     applied = self._reconcile_scheduled(pending, raise_unresolved=False)
                 elif command.kind is CommandKind.SUBMIT_REVIEW:
-                    applied = self._run_review_command(pending)
+                    applied = self._run_submission(pending, raise_deferred=False)
+                elif (op := review_family_op(command)) is not None:
+                    applied = self._execute_review(op, pending)
                 else:
                     applied = self.execute(action_from_command(command))
             except sqlite3.Error:
@@ -707,11 +935,34 @@ class GitHubEffectExecutor:
         return completed
 
     def _observe_postcondition(self, command: LifecycleCommand) -> tuple[bool | None, str]:
-        """One complete harness read; failure is unavailable, never absence."""
+        present, error, _remote_object_id = self._observe_postcondition_evidence(command)
+        return present, error
+
+    def _observe_postcondition_evidence(self, command: LifecycleCommand) -> tuple[bool | None, str, str | None]:
+        """One complete harness read; failure is unavailable, never absence.
+
+        The third value names the remote object that proves presence, when
+        the read can identify it (a bound review submission's review id).
+        """
         try:
+            op = review_family_op(command)
+            submission = bound_submission_op(command)
+            if submission is not None:
+                found = self._check_bound_submission(submission, command)
+                if found.check is ReviewCheck.UNAVAILABLE:
+                    return None, found.detail, None
+                present = found.check is ReviewCheck.PRESENT
+                return present, "", found.remote_object_id if present else None
             if command.kind is CommandKind.SUBMIT_REVIEW:
                 payload = command.payload
                 present = self.gateway.has_review(int(payload["pr"]), str(payload["event"]), str(payload["body"]), str(payload["head"])) if isinstance(self.gateway, ReviewVerifier) else None
+            elif op is not None:
+                # A refused guard is absence of this effect; every write path
+                # re-checks the guard first, so it never buys a write.
+                check = self._check_review(op, command)
+                if check.check is ReviewCheck.UNAVAILABLE:
+                    return None, check.detail, None
+                present = check.check is ReviewCheck.PRESENT
             else:
                 action = action_from_command(command)
                 if isinstance(action, Relabel) and _is_compound_relabel(action):
@@ -728,8 +979,8 @@ class GitHubEffectExecutor:
         except sqlite3.Error:
             raise
         except Exception as exc:  # noqa: BLE001 — bounded durable failed-read evidence
-            return None, f"{type(exc).__name__}: {exc}"
-        return present, ""
+            return None, f"{type(exc).__name__}: {exc}", None
+        return present, "", None
 
     def _current_revision(self, command: LifecycleCommand) -> str:
         number = int(command.target.split(":", 1)[1])
@@ -762,10 +1013,10 @@ class GitHubEffectExecutor:
             raise ValueError("uncertain command reconciliation requires a workflow-bound command")
         settled = False
 
-        def record(started, present: bool | None, error: str) -> bool:
+        def record(started, present: bool | None, error: str, remote_object_id: str | None = None) -> bool:
             return self.store.record_reconciliation_read(
                 command.command_id, state, expected_attempts=attempts, read_started_at=started,
-                executor_identity=self.identity, observed=present, error=error,
+                executor_identity=self.identity, observed=present, error=error, remote_object_id=remote_object_id,
             )
 
         def begin() -> bool:
@@ -773,9 +1024,9 @@ class GitHubEffectExecutor:
             grant = (self.store.retry_authorization(command.command_id)
                      if isinstance(state, ReconciliationOnly) else None)
             started = self.store.now()
-            present, error = self._observe_postcondition(command)
+            present, error, remote_object_id = self._observe_postcondition_evidence(command)
             if grant is None or present is not False:
-                settled = record(started, present, error)
+                settled = record(started, present, error, remote_object_id)
                 return False
             try:
                 guard_holds = self._decision_applies(command)
@@ -797,14 +1048,23 @@ class GitHubEffectExecutor:
             return isinstance(outcome, RetryBegan)
 
         def write() -> EffectOutcome[bool]:
-            if command.kind is CommandKind.SUBMIT_REVIEW:
+            op = review_family_op(command)
+            submission = bound_submission_op(command)
+            if submission is not None:
+                applied = bool(self.gateway.submit_review(
+                    submission.pr, submission.event, mark_review_body(submission.body, command.command_id),
+                    submission.head))
+            elif command.kind is CommandKind.SUBMIT_REVIEW:
                 payload = command.payload
                 applied = bool(self.gateway.submit_review(int(payload["pr"]), str(payload["event"]), str(payload["body"]), str(payload["head"])))
+            elif op is not None:
+                applied = self._write_review(op)
             else:
                 applied = bool(self._apply(action_from_command(command), command))
-            verified, error = self._observe_postcondition(command) if applied else (False, "")
+            verified, error, remote_object_id = (
+                self._observe_postcondition_evidence(command) if applied else (False, "", None))
             if verified is True:
-                return EffectOutcome(True, EffectStatus.SUCCEEDED)
+                return EffectOutcome(True, EffectStatus.SUCCEEDED, remote_object_id=remote_object_id)
             raise UnknownEffectOutcome(
                 f"{command.command_id}: authorized retry did not verify its postcondition"
                 + (f" ({error})" if error else "" if applied else " (write refused)")
@@ -1333,7 +1593,16 @@ class GitHubEffectExecutor:
         a human's answer. Only a re-arm hold projection uses the semantic hold
         fence. Commands carrying only a raw revision are re-derived from fresh
         observations each tick, so their raw fence stays authoritative.
+        A review-family command is judged on its own accepted guard.
         """
+        op = review_family_op(command)
+        if op is not None:
+            # Unreachable while review-family retry grants are refused
+            # (`_retry_supported`); kept so enabling them needs no new guard.
+            check = self._check_review(op, command)
+            if check.check is ReviewCheck.UNAVAILABLE:
+                raise UnknownEffectOutcome(f"{command.command_id}: decision facts are unavailable ({check.detail})")
+            return check.check is ReviewCheck.APPLIES
         if command.kind in {CommandKind.RELABEL, CommandKind.CLOSE_ISSUE}:
             action = action_from_command(command)
             if isinstance(action, Relabel) and action.hold_guard is not None:
@@ -1465,9 +1734,15 @@ def command_for_action(
 
 
 def action_from_command(command: LifecycleCommand) -> Action:
-    """Reconstruct the closed Action vocabulary for boot-time command draining."""
+    """Reconstruct the closed Action vocabulary for boot-time command draining.
+
+    Review-family commands never reconstruct: an Action cannot carry their
+    guard, so rebuilding one would be an unfenced write (ADR 0015).
+    """
 
     payload = command.payload
+    if is_review_family(command) or (command.kind is CommandKind.RELABEL and "pull_request_hold_guard" in payload):
+        raise ValueError("review-family commands execute only through their guarded review path")
     if command.kind is CommandKind.RELABEL:
         if {"pr", "head", "body"} <= payload.keys():
             return EscalateCiPending(
@@ -1610,9 +1885,10 @@ def _expected_revision(action: Action) -> str | None:
 def _unresolved_workflow_command(pending) -> bool:
     """A migrated-slice command whose outcome is not yet known (ADR 0015)."""
     command = pending.command
+    # A bound review submission (review family only) is bounded like any
+    # other workflow command; unbound submissions keep their legacy path.
     return (
         command.workflow is not None
-        and command.kind is not CommandKind.SUBMIT_REVIEW
         and pending.state in ("executing", EffectStatus.UNKNOWN_OUTCOME.value)
     )
 

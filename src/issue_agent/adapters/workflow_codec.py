@@ -85,6 +85,8 @@ _LEGACY_FIELDS = {
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
     "ResolveAttemptResult": {"split": None},
     "ReturnedResolve": {"split_input": None, "verdict": "", "rationale": "", "contract_revision": None},
+    # Review facts observed before command markers were parsed name no command.
+    "SubmittedReviewFact": {"review_command": None},
 }
 
 

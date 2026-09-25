@@ -3,29 +3,49 @@
 Each label addition/removal commits separately, matching GitHub's partial-write
 boundary. Fault hooks run outside transactions; they can emulate a lost reply
 or interleave a second client without making remote writes locally atomic.
+Pull request reviews are paginated like the REST list: a failing page makes
+the read partial, never a shorter complete list.
+
+`fault` raises (an infra failure or lost reply). `soft_failures` names
+operations that fail the way `GitHubGateway` does when GitHub answers with an
+error (403/404/422, which `gh` returns as empty output): reads raise or come
+back partial exactly as the real parser makes them, writes return False or
+are silently not applied. They must never read as "absent".
 """
 
 from collections.abc import Callable
 from dataclasses import asdict
+from datetime import datetime
 import json
 from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 
+from issue_agent.adapters.github import ReviewReadUnavailable, parse_pr, parse_review_pages
 from issue_agent.domain.labels import Label
+from issue_agent.domain.review_workflow import (
+    CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
+)
 from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review, WorldState
 
 
 class PersistentGitHub:
-    def __init__(self, path: Path, *, fault: Callable[[str], None] = lambda _: None):
+    def __init__(self, path: Path, *, fault: Callable[[str], None] = lambda _: None,
+                 clock: Callable[[], datetime] | None = None):
         self.path = path
         self.fault = fault
+        self.clock = clock
+        self.soft_failures: set[str] = set()
         with self._connect() as db:
             db.execute("CREATE TABLE IF NOT EXISTS issues (number INTEGER PRIMARY KEY, body TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS prs (number INTEGER PRIMARY KEY, body TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS calls (body TEXT NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS links (issue INTEGER PRIMARY KEY, pr INTEGER NOT NULL)")
             db.execute("CREATE TABLE IF NOT EXISTS clock (revision INTEGER NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS reviews (seq INTEGER PRIMARY KEY AUTOINCREMENT, pr INTEGER NOT NULL, "
+                       "review_id TEXT NOT NULL UNIQUE, author TEXT NOT NULL, state TEXT NOT NULL, commit_id TEXT, "
+                       "submitted_at TEXT, body TEXT NOT NULL DEFAULT '')")
+            db.execute("CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
             if db.execute("SELECT revision FROM clock").fetchone() is None:
                 db.execute("INSERT INTO clock VALUES (0)")
 
@@ -69,6 +89,8 @@ class PersistentGitHub:
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         self.fault("read")
+        if "get_pr" in self.soft_failures:
+            return parse_pr(None)  # type: ignore[arg-type]  # the real gateway's parse of an empty answer
         with self._connect() as db:
             body = json.loads(db.execute("SELECT body FROM prs WHERE number = ?", (number,)).fetchone()[0])
         body["labels"] = frozenset(Label(value) for value in body["labels"])
@@ -115,11 +137,15 @@ class PersistentGitHub:
 
     def relabel(self, kind: str, number: int, remove: str | None, add: str | None) -> None:
         if kind == "pr":
+            self.fault("relabel_pr_requested")
             self._call("relabel_pr", number, remove, add)
+            if "relabel_pr" in self.soft_failures:
+                return  # the real gateway ignores an empty (refused) answer
             with self._connect() as db:
                 body = json.loads(db.execute("SELECT body FROM prs WHERE number = ?", (number,)).fetchone()[0])
                 body["labels"] = sorted((set(body["labels"]) | ({add} if add else set())) - ({remove} if remove else set()))
                 db.execute("UPDATE prs SET body = ? WHERE number = ?", (json.dumps(body), number))
+            self.fault("relabel_pr_applied")
             return
         assert kind == "issue"
         # A request lost before GitHub applied it: the caller cannot tell it
@@ -192,3 +218,95 @@ class PersistentGitHub:
             body = json.loads(db.execute("SELECT body FROM prs WHERE number = ?", (number,)).fetchone()[0])
             body.update(fields)
             db.execute("UPDATE prs SET body = ? WHERE number = ?", (json.dumps(body), number))
+
+    # -- pull request reviews ----------------------------------------------------
+
+    def seed_review(
+        self, pr: int, review_id: str, *, author: str = "review-bot[bot]", state: str = "CHANGES_REQUESTED",
+        commit: str | None = None, submitted_at: str | None = "2026-09-25T11:00:00+00:00", body: str = "",
+    ) -> None:
+        """A review that exists on GitHub (seeded or submitted by a human): not a harness call."""
+        with self._connect() as db:
+            db.execute("INSERT INTO reviews(pr, review_id, author, state, commit_id, submitted_at, body) "
+                       "VALUES (?, ?, ?, ?, ?, ?, ?)", (pr, review_id, author, state, commit, submitted_at, body))
+
+    def external_review_change(self, review_id: str, *, state: str | None = None, delete: bool = False) -> None:
+        with self._connect() as db:
+            if delete:
+                db.execute("DELETE FROM reviews WHERE review_id = ?", (review_id,))
+            elif state is not None:
+                db.execute("UPDATE reviews SET state = ? WHERE review_id = ?", (state, review_id))
+
+    def review_state(self, review_id: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute("SELECT state FROM reviews WHERE review_id = ?", (review_id,)).fetchone()
+        return None if row is None else row[0]
+
+    def deny_dismissals(self) -> None:
+        """The review identity lacks permission (or branch protection forbids dismissal): GitHub answers 403."""
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES ('dismissals', 'denied')")
+
+    def _setting(self, name: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute("SELECT value FROM settings WHERE name = ?", (name,)).fetchone()
+        return None if row is None else row[0]
+
+    def pull_request_reviews(self, pr: int, *, page_size: int = 2) -> CompleteReviews | PartialReviews:
+        """The gateway contract: every page or a partial read; PENDING drafts are skipped."""
+        if "reviews" in self.soft_failures:
+            return parse_review_pages(None)
+        with self._connect() as db:
+            rows = db.execute("SELECT review_id, author, state, commit_id, submitted_at, body FROM reviews "
+                              "WHERE pr = ? ORDER BY seq", (pr,)).fetchall()
+        facts = []
+        for page, start in enumerate(range(0, max(len(rows), 1), page_size)):
+            try:
+                self.fault(f"reviews_page:{page}")
+            except Exception as exc:  # noqa: BLE001 - a failed page is a partial read
+                return PartialReviews(f"review page {page} failed: {exc}")
+            for review_id, author, state, commit, submitted, body in rows[start:start + page_size]:
+                if state == "PENDING":
+                    continue
+                facts.append(SubmittedReviewFact(review_id, author, SubmittedReviewState(state), commit,
+                                                 datetime.fromisoformat(submitted), body_review_command(body)))
+        return CompleteReviews(tuple(facts))
+
+    def dismiss_review(self, pr: int, review_id: str, message: str) -> bool:
+        # A request lost before GitHub applied it is indistinguishable from a lost reply.
+        self.fault("dismiss_requested")
+        self._call("dismiss_review", pr, review_id, message)
+        if self._setting("dismissals") == "denied" or "dismiss_review" in self.soft_failures:
+            return False
+        with self._connect() as db:
+            row = db.execute("SELECT state FROM reviews WHERE pr = ? AND review_id = ?", (pr, review_id)).fetchone()
+            if row is None or row[0] != "CHANGES_REQUESTED":
+                return False
+            db.execute("UPDATE reviews SET state = 'DISMISSED' WHERE review_id = ?", (review_id,))
+        self.fault("dismiss_applied")
+        return True
+
+    def submit_review(self, pr: int, event: str, body: str, head: str) -> bool:
+        state = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "COMMENT": "COMMENTED"}[event]
+        # A request lost before GitHub applied it is indistinguishable from a lost reply.
+        self.fault("review_requested")
+        self._call("submit_review", pr, event, head)
+        if "submit_review" in self.soft_failures:
+            return False
+        submitted = self.clock().isoformat() if self.clock is not None else "2026-09-25T12:00:00+00:00"
+        with self._connect() as db:
+            count = db.execute("SELECT count(*) FROM reviews").fetchone()[0]
+            db.execute("INSERT INTO reviews(pr, review_id, author, state, commit_id, submitted_at, body) "
+                       "VALUES (?, ?, 'review-bot[bot]', ?, ?, ?, ?)",
+                       (pr, f"submitted-{count}", state, head, submitted, body))
+        self.fault("review_submitted")
+        return True
+
+    def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
+        state = {"APPROVE": "APPROVED", "REQUEST_CHANGES": "CHANGES_REQUESTED", "COMMENT": "COMMENTED"}[event]
+        self.fault("read")
+        if "has_review" in self.soft_failures:
+            raise ReviewReadUnavailable(f"review read refused: pull request {pr} reviews were not answered completely")
+        with self._connect() as db:
+            return db.execute("SELECT 1 FROM reviews WHERE pr = ? AND state = ? AND body = ? AND commit_id = ?",
+                              (pr, state, body, head)).fetchone() is not None

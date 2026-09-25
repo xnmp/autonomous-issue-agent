@@ -279,3 +279,15 @@ def test_a_held_projection_plan_survives_restart():
     state = replace(pending(), intent=replace(pending_intent(), projection=projection(held=True)))
     recovered = roundtrip(state, ReviewWorkflowSnapshot)
     assert isinstance(recovered.intent, PendingReviewRearm) and recovered.intent.projection.remove is None
+
+
+def test_a_review_fact_encoded_before_command_markers_decodes_without_one():
+    from datetime import datetime, timezone
+    from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
+    from issue_agent.domain.review_workflow import SubmittedReviewFact, SubmittedReviewState
+    fact = SubmittedReviewFact("1", "review-bot[bot]", SubmittedReviewState.DISMISSED, "a" * 40,
+                               datetime(2026, 9, 25, tzinfo=timezone.utc), "c" * 64)
+    assert decode_workflow(encode_workflow(fact), SubmittedReviewFact) == fact
+    legacy = json.loads(encode_workflow(fact))
+    del legacy["value"]["fields"]["review_command"]
+    assert decode_workflow(json.dumps(legacy), SubmittedReviewFact) == replace(fact, review_command=None)

@@ -29,6 +29,11 @@ from datetime import datetime, timezone
 from urllib.parse import quote
 
 from ..domain.labels import Label
+from ..domain.review_rejection import MAX_OBSERVED_REVIEWS, is_commit_sha
+from ..domain.review_workflow import (
+    CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
+)
+from .review_effects import ReviewReadUnavailable
 from ..domain.world import (
     Check,
     ClosingRef,
@@ -805,6 +810,64 @@ def parse_world(issues: list[dict], prs: list[dict], now: str = "") -> WorldStat
 
 
 # ── write command builders ──────────────────────────────────────────────────
+_REVIEW_STATES = {state.value: state for state in SubmittedReviewState}
+
+
+def parse_review_pages(pages: object) -> CompleteReviews | PartialReviews:
+    """One `--paginate --slurp` reviews answer as a complete read, or why it is not one.
+
+    Every page must be a list of well-formed reviews; anything else is partial,
+    never a truncated "complete" (ADR 0015: a partial read can neither
+    establish nor disprove a rejection cause). A PENDING review is an unsent
+    draft, not a submission, so it is skipped rather than failing the read: a
+    crashed bot draft would otherwise make every read partial forever.
+    """
+    if not isinstance(pages, list) or any(not isinstance(page, list) for page in pages):
+        return PartialReviews("review pages were unreadable or incomplete")
+    facts: list[SubmittedReviewFact] = []
+    for row in (item for page in pages for item in page):
+        if not isinstance(row, dict):
+            return PartialReviews("a review entry was malformed")
+        state = str(row.get("state") or "").upper()
+        if state == "PENDING":
+            continue
+        if state not in _REVIEW_STATES:
+            return PartialReviews(f"review has an unrecognized state {state[:64]!r}")
+        review_id, user = row.get("id"), row.get("user")
+        commit = row.get("commit_id") or ""
+        submitted = row.get("submitted_at")
+        if type(review_id) is not int or review_id <= 0 or not isinstance(submitted, str) or (
+            commit and not is_commit_sha(commit)
+        ):
+            return PartialReviews("a review entry lacked its identity, commit or submission time")
+        try:
+            submitted_at = datetime.fromisoformat(submitted.replace("Z", "+00:00"))
+            # A deleted account is GitHub's "ghost"; the review still counts as authored.
+            author = str(user.get("login") or "ghost") if isinstance(user, dict) else "ghost"
+            facts.append(SubmittedReviewFact(str(review_id), author, _REVIEW_STATES[state],
+                                             commit or None, submitted_at, body_review_command(row.get("body"))))
+        except ValueError:
+            return PartialReviews("a review entry was malformed")
+        if len(facts) > MAX_OBSERVED_REVIEWS:
+            return PartialReviews(f"more than {MAX_OBSERVED_REVIEWS} reviews exceed one bounded observation")
+    try:
+        # GitHub lists reviews chronologically; a stable sort only repairs
+        # equal-time or page-boundary ordering, never the identity set.
+        return CompleteReviews(tuple(sorted(facts, key=lambda fact: fact.submitted_at)))
+    except ValueError:
+        return PartialReviews("review pages repeated a review identity")
+
+
+def build_dismiss_review_args(repo: str, pr: int, review_id: str, message: str) -> list[str]:
+    if type(pr) is not int or pr <= 0 or not review_id.isdigit():
+        raise ValueError("a dismissal requires a positive pull request and a numeric review id")
+    return [
+        "api", "--method", "PUT",
+        f"repos/{repo}/pulls/{pr}/reviews/{quote(review_id, safe='')}/dismissals",
+        "-f", f"message={message}", "-f", "event=DISMISS",
+    ]
+
+
 def build_submit_review_args(
     repo: str,
     pr: int,
@@ -2135,6 +2198,12 @@ class GitHubGateway:
         )
 
     def has_review(self, pr: int, event: str, body: str, head: str) -> bool:
+        """Whether a matching review exists; a read that did not answer raises.
+
+        Only a complete, list-shaped answer can say "absent": a refused read
+        (403/404, which `_gh` returns as "") or a malformed one used to answer
+        False, which reconciliation took as proof and re-submitted the review.
+        """
         state = {
             "APPROVE": "APPROVED",
             "REQUEST_CHANGES": "CHANGES_REQUESTED",
@@ -2148,13 +2217,9 @@ class GitHubGateway:
                 "--slurp",
             ]
         )
-        if not isinstance(data, list):
-            return False
-        reviews = [
-            item
-            for page in data
-            for item in (page if isinstance(page, list) else [page])
-        ]
+        if not isinstance(data, list) or any(not isinstance(page, list) for page in data):
+            raise ReviewReadUnavailable(f"review read refused: pull request {pr} reviews were not answered completely")
+        reviews = [item for page in data for item in page]
         return any(
             isinstance(item, dict)
             and str(item.get("state") or "").upper() == state
@@ -2162,6 +2227,34 @@ class GitHubGateway:
             and item.get("commit_id") == head
             for item in reviews
         )
+
+    def pull_request_reviews(self, pr: int) -> CompleteReviews | PartialReviews:
+        """Every submitted review of `pr` across all pages, or a partial read.
+
+        Any failed page, infra or not, is partial: "no reviews" and "could not
+        read every review" must never be the same answer.
+        """
+        try:
+            pages = self._gh_json([
+                "api", "--paginate", "--slurp",
+                f"repos/{self.repo}/pulls/{pr}/reviews?per_page=100",
+            ])
+        except GhUnavailable as exc:
+            return PartialReviews(f"review read failed: {exc.headline}")
+        except ValueError:
+            return PartialReviews("review pages were not valid JSON")
+        return parse_review_pages(pages)
+
+    def dismiss_review(self, pr: int, review_id: str, message: str) -> bool:
+        """Dismiss one review as this gateway's identity; never another credential.
+
+        True means GitHub accepted the request. False is GitHub's answer
+        refusing it (403 permission, 422 protection or state, 404): a verified
+        refusal the executor reports, never a reason to retry as someone else.
+        Infra failures raise `GhUnavailable`, an unknown outcome.
+        """
+        out = self._gh(build_dismiss_review_args(self.repo, pr, review_id, message))
+        return bool(out.strip())
 
     def is_expected_head_merged(
         self, pr: int, expected_head: str

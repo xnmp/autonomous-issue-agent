@@ -161,6 +161,8 @@ def test_quiescence_ignores_unrelated_and_terminal_publication_history_in_bounde
 
 def _downgrade_to_v20(control):
     with control.transaction() as db:
+        db.execute("DROP INDEX effect_receipts_remote_object")
+        db.execute("ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json")
         db.execute("DROP TRIGGER workflow_retry_grant_insert")
         db.execute("DROP TRIGGER workflow_retry_grant_update")
         db.execute("DROP INDEX workflow_retry_open_grant")

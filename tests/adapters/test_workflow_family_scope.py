@@ -295,14 +295,58 @@ def raw_command(kind, binding, name, payload=None):
                             repository="o/r", executor_identity=REVIEWER, workflow=binding)
 
 
+HEAD = "a" * 40
+
+
+def guarded_relabel(binding, name="relabel", *, owner=REVIEWER, number=9, **changes):
+    """A PR projection shaped as the review policy mints it, guard included."""
+    payload = {
+        "target": Target.PR.value, "number": number, "remove": Label.NEEDS_HUMAN_REVIEW.value,
+        "add": Label.AI_REVIEW.value, "expected_revision": HEAD, "harness_signal": False, "removes": [],
+        "completion_guard": None, "pull_request_hold_guard": {"head_sha": HEAD, "labels": ["needs-human-review"]},
+    }
+    payload.update(changes)
+    return LifecycleCommand(CommandId(name), f"idem:{name}", CommandKind.RELABEL, f"pr:{number}", HEAD, payload,
+                            repository="o/r", executor_identity=owner, workflow=binding)
+
+
+def bound_submission(binding, name="submission", **changes):
+    """A bound SUBMIT_REVIEW verdict shaped as `submit_bound_review` enqueues it."""
+    payload = {"pr": 9, "event": "REQUEST_CHANGES", "body": "fix", "head": HEAD, "author": "review-bot[bot]",
+               "patch_id": "f" * 64, "escalate_cause": None, **changes}
+    return LifecycleCommand(CommandId(name), f"idem:{name}", CommandKind.SUBMIT_REVIEW, "pr:9", HEAD, payload,
+                            repository="o/r", executor_identity=REVIEWER, workflow=binding)
+
+
+def test_a_bound_submission_without_its_verdict_or_escalation_shape_is_unrepresentable(store):
+    install_workflow(store, resolve_snapshot())
+    install_review(store, held())
+    for index, changes in enumerate((
+        {"escalate_cause": "ceiling"}, {"event": "COMMENT"}, {"patch_id": None}, {"author": ""}, {"head": "short"},
+        {"pr": 10}, {"extra": True},
+    )):
+        with pytest.raises(ControlStoreError):
+            store.enqueue_command(bound_submission(held().binding, f"malformed-{index}", **changes))
+    assert store.pending_commands() == ()
+
+
+def guarded_dismissal(binding, name="dismissal", **changes):
+    payload = {"pr": 9, "review_id": "r0", "message": "re-armed",
+               "guard": {"review_id": "r0", "author": "review-bot[bot]", "head_sha": HEAD, "state": "CHANGES_REQUESTED"}}
+    payload.update(changes)
+    return LifecycleCommand(CommandId(name), f"idem:{name}", CommandKind.DISMISS_REVIEW, "pr:9", HEAD, payload,
+                            repository="o/r", executor_identity=REVIEWER, workflow=binding)
+
+
 _REVIEW_KINDS = (CommandKind.DISMISS_REVIEW, CommandKind.RELABEL, CommandKind.SUBMIT_REVIEW)
 
 
 def test_review_family_enqueues_only_dismissal_relabel_and_review_submission(store):
     install_workflow(store, resolve_snapshot())
     install_review(store, held())
-    for kind in _REVIEW_KINDS:
-        store.enqueue_command(raw_command(kind, held().binding, f"allowed-{kind.value}"))
+    store.enqueue_command(guarded_dismissal(held().binding, "allowed-dismiss_review"))
+    store.enqueue_command(guarded_relabel(held().binding, "allowed-relabel"))
+    store.enqueue_command(bound_submission(held().binding, "allowed-submit_review"))
     for kind in (k for k in CommandKind if k not in _REVIEW_KINDS):
         with pytest.raises(ControlStoreError, match=f"cannot enqueue {kind.value} commands"):
             store.enqueue_command(raw_command(kind, held().binding, f"refused-{kind.value}"))
@@ -322,14 +366,14 @@ def test_review_family_cannot_publish_branches_even_without_a_captured_run(store
 def test_review_commands_require_the_review_owner_and_this_pull_request(store):
     install_workflow(store, resolve_snapshot())
     install_review(store, held())
-    accepted = review_command(held().binding)
+    accepted = guarded_relabel(held().binding)
     store.enqueue_command(accepted)
     assert [p.command.workflow for p in store.pending_commands()] == [held().binding]
     refused = [
-        review_command(held().binding, owner=FIX),
-        review_command(held().binding, number=10),
+        guarded_relabel(held().binding, "fix-owned", owner=FIX),
+        guarded_relabel(held().binding, "other-pr", number=10),
         review_command(held().binding, number=7, target=Target.ISSUE),
-        review_command(replace(held().binding, episode_id="other")),
+        guarded_relabel(replace(held().binding, episode_id="other"), "other-episode"),
         review_command(resolve_snapshot().binding, number=1, target=Target.ISSUE),
     ]
     for command in refused:
@@ -341,7 +385,45 @@ def test_review_commands_require_the_review_owner_and_this_pull_request(store):
 def test_review_commands_without_review_activation_are_refused(store):
     install_workflow(store, resolve_snapshot())
     with pytest.raises(ControlStoreError, match="migration is required"):
-        store.enqueue_command(review_command(held().binding))
+        store.enqueue_command(guarded_relabel(held().binding))
+
+
+@pytest.mark.parametrize("command", [
+    lambda b: review_command(b),  # an Action-shaped relabel carries no hold guard
+    lambda b: raw_command(CommandKind.RELABEL, b, "bare-relabel"),
+    lambda b: raw_command(CommandKind.DISMISS_REVIEW, b, "bare-dismissal"),
+    lambda b: guarded_relabel(b, removes=["ai-blocked"]),
+    lambda b: guarded_relabel(b, harness_signal=True),
+    lambda b: guarded_relabel(b, expected_revision="b" * 40),
+    lambda b: guarded_relabel(b, pull_request_hold_guard={"head_sha": HEAD}),
+    lambda b: guarded_relabel(b, pull_request_hold_guard={"head_sha": HEAD, "labels": ["p1"]}),
+    lambda b: guarded_dismissal(b, review_id="r1"),
+    lambda b: guarded_dismissal(b, guard={"review_id": "r0", "author": "review-bot[bot]", "head_sha": HEAD,
+                                          "state": "APPROVED"}),
+    lambda b: guarded_dismissal(b, message=""),
+    lambda b: guarded_dismissal(b, pr=10),
+    lambda b: replace(guarded_dismissal(b), expected_revision="b" * 40),
+], ids=["action-relabel", "bare-relabel", "bare-dismissal", "extra-removals", "harness-signal", "revision",
+        "guard-without-labels", "ordering-label-guard", "guard-for-another-review", "guard-state", "empty-message",
+        "other-pr", "dismissal-revision"])
+def test_review_commands_without_their_exact_guard_are_unrepresentable(store, command):
+    install_workflow(store, resolve_snapshot())
+    install_review(store, held())
+    with pytest.raises(ControlStoreError):
+        store.enqueue_command(command(held().binding))
+    assert store.pending_commands() == ()
+
+
+def test_an_accepted_review_relabel_is_selectable_only_by_the_review_executor(store):
+    # The increment 1-2 probe: review obligations were never runnable because
+    # the drain read their workflow as resolve authority.
+    install_workflow(store, resolve_snapshot())
+    install_review(store, held())
+    store.enqueue_command(guarded_relabel(held().binding))
+    diagnostics = []
+    selected = store.runnable_commands(repository="o/r", executor_identity=REVIEWER, diagnose=diagnostics.append)
+    assert [p.command.command_id for p in selected] == [CommandId("relabel")] and diagnostics == []
+    assert store.runnable_commands(repository="o/r", executor_identity=FIX, diagnose=diagnostics.append) == ()
 
 
 def test_resolve_commands_keep_the_fix_owner_rule(store):

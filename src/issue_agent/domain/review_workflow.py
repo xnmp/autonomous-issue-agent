@@ -419,14 +419,67 @@ class SubmittedReviewState(str, Enum):
     DISMISSED = "DISMISSED"
 
 
+# Idempotency marker of a bound review submission, shaped like the harness's
+# handover markers. It is the final line of the body the executor submits and
+# names the SUBMIT_REVIEW command that wrote it. Anyone who can comment can
+# type it, so it identifies a review only together with the review identity's
+# authorship (ADR 0015 provenance).
+REVIEW_COMMAND_MARKER_PREFIX = "<!-- issue-agent-review-command id="
+_MARKER_SUFFIX = " -->"
+_MARKER_LINE_START = "<!-- issue-agent-review-command"
+# Only a body's tail can hold its final line; a huge body is never scanned whole.
+_MARKER_TAIL_CHARS = 2048
+
+
+def _marker_command(value: str) -> bool:
+    return 0 < len(value) <= 512 and not any(c.isspace() or c in "<>" for c in value)
+
+
+def review_command_marker(command_id: str) -> str:
+    if not isinstance(command_id, str) or not _marker_command(command_id):
+        raise ValueError("a review command marker names one bounded command identity")
+    return f"{REVIEW_COMMAND_MARKER_PREFIX}{command_id}{_MARKER_SUFFIX}"
+
+
+def mark_review_body(body: str, command_id: str) -> str:
+    """`body` with this command's marker as its final line.
+
+    Marker-shaped lines already in the (agent-written) body are removed, so
+    review text can never pre-claim or shadow a command.
+    """
+    if not isinstance(body, str):
+        raise ValueError("review body must be text")
+    marker = review_command_marker(command_id)
+    kept = "\n".join(line for line in body.splitlines() if not line.strip().startswith(_MARKER_LINE_START)).rstrip()
+    return f"{kept}\n\n{marker}" if kept else marker
+
+
+def body_review_command(body: object) -> str | None:
+    """The command named by a review body's final-line marker; None for any other body."""
+    if not isinstance(body, str):
+        return None
+    tail = body[-_MARKER_TAIL_CHARS:].rstrip()
+    last = tail.rsplit("\n", 1)[-1].strip()
+    if not (last.startswith(REVIEW_COMMAND_MARKER_PREFIX) and last.endswith(_MARKER_SUFFIX)):
+        return None
+    command = last[len(REVIEW_COMMAND_MARKER_PREFIX):-len(_MARKER_SUFFIX)]
+    return command if _marker_command(command) else None
+
+
 @dataclass(frozen=True)
 class SubmittedReviewFact:
-    """One submitted review from a complete read; `commit_id` None is an unresolved commit."""
+    """One submitted review from a complete read; `commit_id` None is an unresolved commit.
+
+    `review_command` is the command named by the body's final-line marker
+    (`body_review_command`): an untrusted claim written by whoever authored
+    the review, meaningful only for a review by the review identity.
+    """
     review_id: str
     author: str
     state: SubmittedReviewState
     commit_id: str | None
     submitted_at: datetime
+    review_command: str | None = None
 
     def __post_init__(self) -> None:
         _text(self.review_id, "review")
@@ -436,6 +489,10 @@ class SubmittedReviewFact:
         if self.commit_id is not None:
             validate_commit_sha(self.commit_id, "review commit")
         _time(self.submitted_at, "review submission time")
+        if self.review_command is not None and (
+            not isinstance(self.review_command, str) or not _marker_command(self.review_command)
+        ):
+            raise ValueError("review command marker must name one bounded command identity")
 
 
 @dataclass(frozen=True)
