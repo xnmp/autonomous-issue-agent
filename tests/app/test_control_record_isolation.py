@@ -11,7 +11,7 @@ from issue_agent.domain.fix import FixConfig, decide_fix
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review import ReviewConfig, decide_review
 from issue_agent.domain.world import IssueView, PRView, WorldState
-from issue_agent.domain.workflow import WorkflowAbsent, WorkflowSnapshot, WorkflowUnavailable
+from issue_agent.domain.workflow import WorkflowAbsent, WorkflowMigrationRequired, WorkflowSnapshot, WorkflowUnavailable
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 import pytest
@@ -92,8 +92,8 @@ def test_missing_activation_is_a_hold_not_a_fresh_allowance(tmp_path):
     _, workflows = workflow_control(tmp_path, numbers=())
     world = WorldState(issues=(IssueView(1, labels=frozenset({Label.AI_READY}), updated_at="r"),))
     state = _fix_state(Store(str(tmp_path)), world, workflow_control=workflows)
-    assert isinstance(state.resolve_workflows[1], WorkflowUnavailable)
-    assert "migration" in state.resolve_workflows[1].reason
+    assert isinstance(state.resolve_workflows[1], WorkflowMigrationRequired)
+    assert state.resolve_workflows[1].reason == "resolve_migration_required"
     assert not decide_fix(world, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
 
 

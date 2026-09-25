@@ -256,7 +256,6 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     s.set_ci_retries(5, 3)
     s.set_review_retry(5, "2026-01-01T00:00:00Z", 2)
     s.set_rebase_retries(5, 1)
-    s.set_resolve_retries(5, 4)
     s.set_infra_deaths(5, 5)
 
     assert s.clear_retries(5) == 3  # reports what it actually retired
@@ -264,7 +263,6 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     assert s.get_ci_retries(5) == 0
     assert s.get_review_retry(5) == ("", 0)
     assert s.get_rebase_retries(5) == 0
-    assert s.get_resolve_retries(5) == 4
     assert s.get_infra_deaths(5) == 5
 
 
@@ -430,7 +428,6 @@ def test_clear_issue_removes_all():
     s, _ = _store()
     s.save_session(5, "x")
     s.set_ci_retries(5, 2)
-    s.set_resolve_retries(5, 2)
     s.set_rebase_retries(5, 1)
     s.set_resumed_at(5, "t")
     s.set_phase(5, "authored")
@@ -438,7 +435,6 @@ def test_clear_issue_removes_all():
     s.clear_issue(5)
     assert not s.has_session(5)
     assert s.get_ci_retries(5) == 0
-    assert s.get_resolve_retries(5) == 0  # resolve breaker resets with the issue
     assert s.get_rebase_retries(5) == 0
     assert s.get_phase(5) == ""           # phase cleared on teardown
     assert s.get_infra_deaths(5) == 0     # review M4/D8: infra-deaths clears too
@@ -465,11 +461,27 @@ def test_clear_issue_does_not_touch_pr_automerge_marker():
     assert s.automerge_enabled(100) is True
 
 
-def test_resolve_retries_roundtrip():
-    s, _ = _store()
-    assert s.get_resolve_retries(5) == 0
-    s.set_resolve_retries(5, 2)
-    assert s.get_resolve_retries(5) == 2
+def test_cleaners_retain_retired_resolve_files_as_import_evidence():
+    # ADR 0015: resolve episodes live in SQLite. Stopped legacy files are the
+    # offline importer's evidence, so no cleaner or unblock may delete them.
+    s, root = _store()
+    retries = os.path.join(root, "issue-5.resolve-retries")
+    last_error = os.path.join(root, "issue-5.last-error")
+    for path, content in ((retries, "3"), (last_error, "tests failed")):
+        with open(path, "w", encoding="utf-8") as stream:
+            stream.write(content)
+    s.clear_retries(5)
+    s.cleanup_pr(100, 5, merged=False)
+    s.cleanup_pr(100, 5, merged=True)
+    s.clear_issue(5)
+    with open(retries, encoding="utf-8") as stream:
+        assert stream.read() == "3"
+    with open(last_error, encoding="utf-8") as stream:
+        assert stream.read() == "tests failed"
+    assert not any(hasattr(s, name) for name in (
+        "get_resolve_retries", "set_resolve_retries", "reset_resolve_episode",
+        "get_last_resolve_error", "set_last_resolve_error",
+    ))
 
 
 def test_clear_pr_review():
@@ -513,24 +525,21 @@ def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
 def test_cleanup_pr_merged_clears_full_issue_state_and_automerge_marker():
     s, _ = _store()
     s.save_session(9, "sess-1")
-    s.set_resolve_retries(9, 3)
     s.bump_infra_deaths(9)
     s.mark_automerge(100)
     s.cleanup_pr(100, 9, merged=True)
     assert s.get_session(9) == ""
-    assert s.get_resolve_retries(9) == 0
     assert s.get_infra_deaths(9) == 0
     assert s.automerge_enabled(100) is False
 
 
-def test_cleanup_pr_closed_unmerged_keeps_resolve_retries_and_infra_deaths():
+def test_cleanup_pr_closed_unmerged_keeps_infra_deaths():
     # review M4/D8 + handover §5.7: fewer retries after a human closed the PR
     # is deliberate — only the resume-blocking markers clear.
     s, _ = _store()
     s.save_session(9, "sess-1")
     s.set_phase(9, "authoring")
     s.set_resumed_at(9, "t1")
-    s.set_resolve_retries(9, 3)
     s.bump_infra_deaths(9)
     s.mark_automerge(100)
     s.cleanup_pr(100, 9, merged=False)
@@ -538,7 +547,6 @@ def test_cleanup_pr_closed_unmerged_keeps_resolve_retries_and_infra_deaths():
     assert s.get_phase(9) == ""
     assert s.get_resumed_at(9) == ""
     # anti-vacuity twin: prove these are KEPT, not "everything got cleared"
-    assert s.get_resolve_retries(9) == 3
     assert s.get_infra_deaths(9) == 1
     # closed-unmerged is silent on PR-side state (spec covers issue state only)
     assert s.automerge_enabled(100) is True

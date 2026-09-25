@@ -78,7 +78,7 @@ from .deployment_authority import (
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, load_resolve_authority, load_workflow_row, load_workspace_ack, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1249,6 +1249,36 @@ CREATE INDEX runs_workflow_scope ON runs(workflow_episode_key);
 CREATE INDEX lifecycle_publication_runs ON lifecycle_commands(CAST(json_extract(payload_json,'$.run_id') AS TEXT))
 WHERE kind IN ('publish_branch','open_pull_request','update_pull_request_body')
 AND state NOT IN ('succeeded','permanent_failure');
+"""),
+    # ADR 0015 family activation evidence: one immutable decision per imported
+    # target, bound to its epoch and installed workflow, plus one row per
+    # activation recording its ceiling and confirmed plan digest, so even a
+    # row-less activation (nothing to import) can be recognised exactly.
+    SchemaMigration(22, """
+CREATE TABLE workflow_activation_imports (
+    repository TEXT NOT NULL,
+    family TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    target_kind TEXT NOT NULL CHECK (target_kind IN ('issue', 'pr')),
+    target_number INTEGER NOT NULL CHECK (target_number > 0),
+    source_digest TEXT NOT NULL,
+    decision_json TEXT NOT NULL,
+    PRIMARY KEY (repository, family, target_kind, target_number),
+    FOREIGN KEY (repository, family)
+        REFERENCES workflow_authority_epochs (repository, family),
+    FOREIGN KEY (repository, target_kind, target_number)
+        REFERENCES workflows (repository, target_kind, target_number)
+);
+CREATE TABLE workflow_activation_evidence (
+    repository TEXT NOT NULL,
+    family TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    ceiling INTEGER NOT NULL CHECK (ceiling >= 0),
+    plan_digest TEXT NOT NULL CHECK (length(plan_digest) = 64),
+    PRIMARY KEY (repository, family, epoch),
+    FOREIGN KEY (repository, family)
+        REFERENCES workflow_authority_epochs (repository, family)
+);
 """),
 )
 

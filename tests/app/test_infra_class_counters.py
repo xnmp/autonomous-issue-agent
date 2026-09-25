@@ -350,9 +350,6 @@ def test_unreadable_legacy_counters_do_not_erase_sql_failure_evidence():
     """Unavailable legacy CI evidence is optional; resolve authority is not."""
 
     class BrokenStore(FakeStore):
-        def get_resolve_retries(self, issue):
-            raise OSError("state dir is gone")
-
         def get_ci_retries(self, issue):
             raise OSError("state dir is gone")
 

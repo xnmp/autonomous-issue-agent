@@ -51,9 +51,13 @@ from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 # tuple (`issue-N.automerge`), which nothing ever wrote (mark_automerge/
 # automerge_enabled always used pr_path), so clear_issue's removal was a no-op
 # and the real pr-N.automerge marker was cleared by NEITHER cleaner.
+#
+# The retired resolve files (`resolve-retries`, `last-error`) have no accessor
+# and no cleaner: resolve episodes live in SQLite (ADR 0015), and any stopped
+# file is retained as import evidence read only by adapters/resolve_activation.
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "ci-history",
-    "resolve-retries", "last-error", "machine-block", "budget-block",
+    "machine-block", "budget-block",
     "self-clears", "self-clear-ceiling",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
@@ -67,8 +71,8 @@ _PR_SUFFIXES = (
 )
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
-# resume-blocking markers are cleared — resolve-retries and infra-deaths are
-# DELIBERATELY kept (fewer retries after a human closed the PR). This is a
+# resume-blocking markers are cleared — infra-deaths (and the SQL resolve
+# episode) are DELIBERATELY kept (fewer retries after a human closed the PR). This is a
 # strict subset of _ISSUE_SUFFIXES, not a third partition member, so it does
 # not participate in the "exactly one cleaner" coverage test above.
 #
@@ -80,8 +84,8 @@ _PR_SUFFIXES = (
 _RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at", "ci-history")
 
 # Operator unblock (`clear_retries`): the per-attempt ceilings only. Also a
-# strict subset of _ISSUE_SUFFIXES — resolve-retries and infra-deaths are
-# deliberately absent, see clear_retries.
+# strict subset of _ISSUE_SUFFIXES — infra-deaths is deliberately absent, see
+# clear_retries.
 _RETRY_SUFFIXES = ("ci-retries", "review-retries", "rebase-retries")
 
 
@@ -134,7 +138,7 @@ class Store:
     def _read(self, path: str) -> str:
         advisory = path.rsplit(".", 1)[-1] in {
             "ci-history", "operator-guidance", "jira", "jira-phase",
-            "predicted-paths", "last-error", "stall-sig",
+            "predicted-paths", "stall-sig",
         }
         if not advisory:
             raw = self._read_control(path)
@@ -360,39 +364,6 @@ class Store:
             json.dumps(ci_history_payload(history)),
         )
         return history
-
-    def get_resolve_retries(self, issue: int) -> int:
-        return self._read_int(self.issue_path(issue, "resolve-retries"))
-
-    def set_resolve_retries(self, issue: int, retries: int) -> None:
-        self._write(self.issue_path(issue, "resolve-retries"), str(retries))
-
-    def reset_resolve_episode(self, issue: int) -> None:
-        """Operator re-arm (#98): close the resolve episode so the breaker
-        grants a fresh, still-bounded budget of attempts. Reachable ONLY from
-        the dashboard unblock — an authenticated harness mint that resets this
-        BEFORE restoring ai-ready — never from label observation: a mutable
-        GitHub label is not operator provenance (ADR 0012; agent children can
-        write labels, and inferring a grant from one would let any label-writer
-        convert relabels into unbounded paid budgets). Removal form, not "0":
-        absent already reads as 0 and a removal cannot leave a torn file
-        behind (see clear_infra_deaths)."""
-        self._remove(self.issue_path(issue, "resolve-retries"))
-
-    # #188: the last terminal error of a failed resolve-family leg, kept so the
-    # circuit-breaker escalation can quote WHY instead of only "failed N×" —
-    # the operator read that as "failed without a reason" and had to grep
-    # journals for a config fix the harness had already diagnosed verbatim.
-    # One bounded line: the comment is operator-facing, not a log dump.
-    _LAST_ERROR_MAX = 400
-
-    def get_last_resolve_error(self, issue: int) -> str:
-        return self._read(self.issue_path(issue, "last-error"))
-
-    def set_last_resolve_error(self, issue: int, summary: str) -> None:
-        line = " ".join((summary or "").split())[: self._LAST_ERROR_MAX]
-        if line:
-            self._write(self.issue_path(issue, "last-error"), line)
 
     def get_machine_block(self, issue: int) -> MachineBlock | None:
         path = self.issue_path(issue, "machine-block")

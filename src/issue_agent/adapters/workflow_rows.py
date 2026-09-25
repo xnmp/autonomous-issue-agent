@@ -1,5 +1,6 @@
 """Transaction-local workflow reads shared by admission and progression; ADR 0015."""
 
+import hashlib
 import sqlite3
 import json
 
@@ -13,7 +14,7 @@ from ..domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence,
     WorkflowKey, WorkflowRevision,
 )
-from .workflow_codec import WorkflowEncodingError, decode_workflow
+from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 
 
 class WorkflowAuthorityError(ValueError):
@@ -149,3 +150,33 @@ def require_workflow_binding(
     if snapshot.gates and not allow_gated:
         raise WorkflowAuthorityError("workflow has unresolved gates")
     return snapshot
+
+
+def persist_workflow_snapshot(db: sqlite3.Connection, after: WorkflowSnapshot) -> None:
+    """Write an existing workflow row and its unresolved gate index."""
+    scope = workflow_scope(after.revision.fence.key)
+    changed = db.execute(
+        "UPDATE workflows SET generation=?, version=?, episode_json=? "
+        "WHERE repository=? AND target_kind=? AND target_number=?",
+        (after.revision.fence.generation, after.revision.version,
+         encode_workflow((after.authority, after.episode)), *scope),
+    ).rowcount
+    if changed != 1:
+        raise WorkflowAuthorityError("persisted workflow row is absent")
+    # Closed causes remain forensic history, never a runtime file fallback.
+    db.execute(
+        "UPDATE workflow_gates SET state='closed' WHERE repository=? AND target_kind=? AND target_number=?",
+        scope,
+    )
+    for gate in after.gates:
+        opened = gate.gate if isinstance(gate, RearmingGate) else gate
+        cause_key = hashlib.sha256(encode_workflow(opened.cause).encode()).hexdigest()
+        existing = db.execute("SELECT repository, target_kind, target_number FROM workflow_gates WHERE gate_id=?", (opened.gate_id,)).fetchone()
+        if existing is not None and tuple(existing) != scope:
+            raise WorkflowAuthorityError("gate identity belongs to another workflow")
+        db.execute(
+            "INSERT INTO workflow_gates VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(gate_id) DO UPDATE SET state=excluded.state, payload_json=excluded.payload_json",
+            (opened.gate_id, *scope, opened.opened_generation, cause_key,
+             "rearming" if isinstance(gate, RearmingGate) else "open", encode_workflow(gate)),
+        )

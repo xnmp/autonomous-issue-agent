@@ -268,6 +268,36 @@ activated resolve authority, including missing targets. It also refuses absent,
 unwitnessed, corrupt or outdated databases; operators must use the explicit
 offline migration/activation procedure when that slice is accepted.
 
+### Resolve family activation (offline, operator-only)
+
+A deployment's resolve family stays **inactive** until an operator activates it;
+inactive resolve work is held as `resolve_migration_required` and is never read
+from the legacy `issue-N.resolve-retries`/`last-error` files, which remain on
+disk only as import evidence. Activation is explicit and offline:
+
+```bash
+issue-agent resolve-activation inventory            # read-only: in-flight work, legacy records, blockers
+issue-agent resolve-activation shadow               # read-only: per-issue legacy vs new-authority comparison + plan digest
+issue-agent resolve-activation rehearse --copy-to /tmp/empty-dir   # full activation on an isolated copy
+issue-agent resolve-activation activate --confirm-plan-digest <digest from shadow>
+```
+
+Stop all roles first: `activate` refuses while any watcher process or fresh or
+unreadable heartbeat exists for any deployment of the same repository, while
+the control store records in-flight runs, leases, claims, non-terminal
+commands or active reservations for it, and when any legacy record is
+unreadable, malformed or duplicated across state roots. Add
+`--legacy-state-dir` (repeatable, absolute) for older or custom state roots.
+The confirmed digest covers the epoch, ceiling, sources, inventory and every
+import decision; any change since the reviewed `shadow` refuses. Activation
+commits the epoch, imported episodes, ceiling holds for exhausted issues,
+per-issue decisions and a `workflow_activation` event in one transaction.
+Re-running with the same digest reports `already_active_with_this_plan`;
+activation is never repeated or reversed. Rollback after activation means
+running compatible code against the retained SQLite authority (or keeping work
+paused) — never re-enabling the legacy files. Older binaries fail closed on the
+schema. Live activation remains paused under the architecture plan.
+
 ## Testing
 
 ```bash

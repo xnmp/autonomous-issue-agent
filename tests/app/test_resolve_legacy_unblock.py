@@ -19,8 +19,8 @@ def _files(dirs):
 @pytest.mark.parametrize("state", ["active_target", "active_family", "missing_epoch", "wrong_path", "missing_database"])
 def test_refusal_preserves_counters_guidance_and_remote_holds(monkeypatch, tmp_path, state):
     backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
-    Store(str(dirs["fix"])).set_resolve_retries(7, 4)
-    Store(str(dirs["fix"])).set_last_resolve_error(7, "preserve failure")
+    (dirs["fix"] / "issue-7.resolve-retries").write_text("4")
+    (dirs["fix"] / "issue-7.last-error").write_text("preserve failure")
     Store(str(dirs["review"])).set_operator_guidance(12, "preserve scope")
     control = SQLiteControlStore(backend.control_db_path)
     if state in {"active_target", "active_family", "missing_epoch"}:
@@ -76,7 +76,7 @@ def test_configuration_change_cannot_redirect_unblock_files_or_effects(monkeypat
     for scope in (dirs, other_dirs):
         for directory in scope.values():
             directory.mkdir(parents=True, exist_ok=True)
-        Store(str(scope["fix"])).set_resolve_retries(7, 4)
+        (scope["fix"] / "issue-7.resolve-retries").write_text("4")
         Store(str(scope["review"])).set_last_sha(12, "preserve-head")
         Store(str(scope["review"])).set_operator_guidance(12, "old scope")
     untouched = _files(other_dirs)
@@ -95,7 +95,8 @@ def test_configuration_change_cannot_redirect_unblock_files_or_effects(monkeypat
 
     assert _files(other_dirs) == untouched
     assert all(paths == tuple(str(path) for path in dirs.values()) for paths in captured_dirs)
-    assert not (dirs["fix"] / "issue-7.resolve-retries").exists()
+    # Retired resolve files are import evidence, never reset by an unblock.
+    assert (dirs["fix"] / "issue-7.resolve-retries").read_text() == "4"
     assert (dirs["review"] / "pr-12.last-sha").read_text() == ""
     assert Store(str(dirs["review"])).get_operator_guidance(12) == "new scope"
     assert (dirs["fix"] / "events-v2.jsonl").exists()
@@ -115,7 +116,7 @@ def test_overlay_cannot_hide_active_snapshot_family_authority(monkeypatch, tmp_p
     backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
     install_workflow(SQLiteControlStore(backend.control_db_path), resolve_snapshot(7))
     monkeypatch.setattr(backend, "overlay_field", lambda *_: "future/repo")
-    Store(str(dirs["fix"])).set_resolve_retries(7, 4)
+    (dirs["fix"] / "issue-7.resolve-retries").write_text("4")
     before = _files(dirs)
 
     ok, detail = backend.unblock("demo", 7)
@@ -127,7 +128,7 @@ def test_overlay_cannot_hide_active_snapshot_family_authority(monkeypatch, tmp_p
 def test_missing_active_snapshot_never_falls_back_to_overlay_or_creates_authority(monkeypatch, tmp_path):
     backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
     (tmp_path / "config" / ".active.demo.env").unlink()
-    Store(str(dirs["fix"])).set_resolve_retries(7, 4)
+    (dirs["fix"] / "issue-7.resolve-retries").write_text("4")
     before = _files(dirs)
 
     ok, detail = backend.unblock("demo", 7)

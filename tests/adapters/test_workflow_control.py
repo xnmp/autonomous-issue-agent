@@ -32,6 +32,7 @@ from issue_agent.domain.workflow import (
     OperatorActor, PendingRearm, RemoteOutcomeUncertain, RequestRearm,
     ResolveAttemptResult, ResolveEpisode, ResolveRearmPreflight, ResolveResultKind, RetiredSettledCommand,
     RetiredUncertainCommand, SetGuidance, StopReason, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
+    WorkflowMigrationRequired,
     WorkflowConflict, WorkflowSnapshot,
 )
 from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowRevision, WorkflowWriter
@@ -815,8 +816,7 @@ def test_sessionless_author_needs_normal_completed_settlement(control, corruptio
 
 def test_read_requires_activation_and_distinguishes_verified_absence(control):
     key = resolve_snapshot().revision.fence.key
-    with pytest.raises(WorkflowAuthorityError, match="migration"):
-        adapter(control).load_workflow(key)
+    assert adapter(control).load_workflow(key) == WorkflowMigrationRequired(key)
     install_workflow(control, resolve_snapshot())
     assert isinstance(adapter(control).load_workflow(WorkflowKey("o/r", IssueRef(999))), WorkflowAbsent)
     with pytest.raises(WorkflowAuthorityError, match="scope"):

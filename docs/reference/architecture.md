@@ -482,10 +482,12 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
-`domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/deployment.py`
+`domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
+`domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration; workspace handoffs are explicit
-preparation obligations, not AUTHOR evidence or independent execution authority).
+preparation obligations, not AUTHOR evidence or independent execution authority;
+family activation plans legacy imports offline and refuses rather than defaulting).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/agent_publish.py`,
@@ -501,7 +503,7 @@ preparation obligations, not AUTHOR evidence or independent execution authority)
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
-`adapters/repository_guidance.py`,
+`adapters/repository_guidance.py`, `adapters/resolve_activation.py`,
 `adapters/runtime_plan.py`, `adapters/single_instance.py`,
 `adapters/spend_recovery.py`, `adapters/store.py`,
 `adapters/supervised_exec.py`, `adapters/systemd_notify.py`,
@@ -518,7 +520,7 @@ adapters live under `adapters/dashweb/`.
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
-`app/resolve_control.py`,
+`app/resolve_control.py`, `app/resolve_activation.py`,
 `app/service_doctor.py`, `app/webhook.py`,
 `app/world_probe.py`, and `app/world_reporter.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid

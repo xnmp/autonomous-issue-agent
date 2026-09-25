@@ -675,7 +675,22 @@ class WorkflowUnavailable:
         _text(self.reason, "unavailability reason", limit=MAX_DETAIL_CHARS)
 
 
-WorkflowRead = WorkflowSnapshot | WorkflowAbsent | WorkflowUnavailable
+@dataclass(frozen=True)
+class WorkflowMigrationRequired:
+    """The repository's resolve family has no activation; never file fallback."""
+
+    key: WorkflowKey
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, WorkflowKey):
+            raise ValueError("migration-required state requires a queried workflow identity")
+
+    @property
+    def reason(self) -> str:
+        return "resolve_migration_required"
+
+
+WorkflowRead = WorkflowSnapshot | WorkflowAbsent | WorkflowMigrationRequired | WorkflowUnavailable
 
 
 @dataclass(frozen=True)

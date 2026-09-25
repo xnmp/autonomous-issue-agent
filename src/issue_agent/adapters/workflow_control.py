@@ -41,7 +41,7 @@ from ..domain.workflow import (
     PendingRearm, RearmingGate, RearmIntent, RemoteOutcomeUncertain,
     RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind, ResolveStage,
     StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
-    WorkflowConflict, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
+    WorkflowConflict, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
     WorkflowUnchanged, WorkflowRejected,
 )
 from ..domain.workflow_identity import (
@@ -64,7 +64,7 @@ from .deployment_authority import DeploymentAuthority, deployment_role, deployme
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
     WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict, load_workflow_row,
-    load_resolve_authority, load_workspace_ack, workflow_scope,
+    load_resolve_authority, load_workspace_ack, persist_workflow_snapshot, workflow_scope,
 )
 
 
@@ -153,6 +153,8 @@ class SQLiteWorkflowControl:
         try:
             with closing(self._control._connect()) as db:
                 db.execute("BEGIN")
+                if load_resolve_authority(db, key.repository) is None:
+                    return WorkflowMigrationRequired(key)
                 snapshot = load_workflow_row(db, key)
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
@@ -1598,30 +1600,8 @@ class SQLiteWorkflowControl:
         return False
 
     def _persist_snapshot(self, db: sqlite3.Connection, after: WorkflowSnapshot) -> None:
-        scope = workflow_scope(after.revision.fence.key)
-        db.execute(
-            "UPDATE workflows SET generation=?, version=?, episode_json=? "
-            "WHERE repository=? AND target_kind=? AND target_number=?",
-            (after.revision.fence.generation, after.revision.version,
-             encode_workflow((after.authority, after.episode)), *scope),
-        )
-        # Closed causes remain forensic history, never a runtime file fallback.
-        db.execute(
-            "UPDATE workflow_gates SET state='closed' WHERE repository=? AND target_kind=? AND target_number=?",
-            scope,
-        )
-        for gate in after.gates:
-            opened = _opened(gate)
-            cause_key = hashlib.sha256(encode_workflow(opened.cause).encode()).hexdigest()
-            existing = db.execute("SELECT repository, target_kind, target_number FROM workflow_gates WHERE gate_id=?", (opened.gate_id,)).fetchone()
-            if existing is not None and tuple(existing) != scope:
-                raise WorkflowAuthorityError("gate identity belongs to another workflow")
-            db.execute(
-                "INSERT INTO workflow_gates VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
-                "ON CONFLICT(gate_id) DO UPDATE SET state=excluded.state, payload_json=excluded.payload_json",
-                (opened.gate_id, *scope, opened.opened_generation, cause_key,
-                 "rearming" if isinstance(gate, RearmingGate) else "open", encode_workflow(gate)),
-            )
+        persist_workflow_snapshot(db, after)
+
     def _persist(
         self, db: sqlite3.Connection, prior: WorkflowSnapshot,
         proposal: WorkflowChanged, encoded: str,

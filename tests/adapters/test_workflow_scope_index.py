@@ -161,9 +161,11 @@ def test_quiescence_ignores_unrelated_and_terminal_publication_history_in_bounde
 
 def _downgrade_to_v20(control):
     with control.transaction() as db:
+        db.execute("DROP TABLE workflow_activation_evidence")
+        db.execute("DROP TABLE workflow_activation_imports")
         db.execute("DROP INDEX runs_workflow_scope")
         db.execute("DROP INDEX lifecycle_publication_runs")
-        db.execute("DELETE FROM schema_migrations WHERE version=21")
+        db.execute("DELETE FROM schema_migrations WHERE version>=21")
 
 
 def test_v21_upgrade_preserves_old_target_evidence_and_is_idempotent(control):

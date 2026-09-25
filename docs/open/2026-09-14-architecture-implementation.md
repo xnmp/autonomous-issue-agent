@@ -2,9 +2,26 @@
 
 **Resumed by the user on 2026-09-25** ("resume implementing the plan and don't
 stop until it's complete"). The [paused handover](2026-09-25-architecture-resume-handover.md)
-is historical input. The operator UI checkpoint below is accepted; offline
-activation/import is the current increment. Live operation, family activation on
+is historical input. The operator UI checkpoint below is accepted, as is the
+offline activation/import checkpoint that follows it. Current work: the
+absence-authorized retry control and full composed resolve acceptance. Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
+
+Offline activation checkpoint (2026-09-25): `issue-agent resolve-activation
+{inventory,shadow,rehearse,activate}` (see HARNESS.md). Pure planning and shadow
+comparison through the real ceiling policy; strict legacy parsing where corrupt,
+unmapped, unreadable or cross-root duplicate records block rather than default;
+quiescence over canonicalised runs/leases/claims/commands/reservations plus
+process and fail-closed heartbeat checks for every same-repository deployment;
+a whole-plan confirmation digest; one transaction under the three deployment
+barriers writes epoch, imported episodes, ceiling gates, decisions, schema-v22
+activation evidence and the journal event. Rehearsal operates only on an
+isolated copy (destination may not overlap any original). Legacy resolve Store
+accessors and the unblock's resolve reset are deleted; inactive scopes return a
+typed `WorkflowMigrationRequired`. Two independent adversarial review rounds;
+all substantiated findings fixed with regression tests. `make test`: 1,672
+domain, 1,781 adapter, 2,598 app, hooks, contracts and both Pyrefly passes.
+No real deployment was activated.
 
 Operator UI checkpoint (2026-09-25): the issue page owns one keyed resolve
 controller; the board's "Review holds" opens it rather than mutating from a row.

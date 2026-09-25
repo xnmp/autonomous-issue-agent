@@ -73,7 +73,9 @@ from ..domain.fix import (
 from ..domain.review import REVIEW_APPROVED
 from ..domain.labels import Label
 from ..domain.ci import parse_timestamp
-from ..domain.workflow import ObservedIssue, WorkflowAbsent, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable
+from ..domain.workflow import (
+    ObservedIssue, WorkflowAbsent, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
+)
 from ..domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
 from ..domain.workflow_ports import WorkflowControl
 from ..domain.lifecycle import pr_lifecycle, retry_breaker
@@ -2787,6 +2789,12 @@ def build_fix_daemon(
         )
         for target, reason in state.control_errors.items():
             _log("fix")(f"workflow {target} held: {reason}")
+        migration_required = sorted(
+            target for target, workflow in state.resolve_workflows.items()
+            if isinstance(workflow, WorkflowMigrationRequired)
+        )
+        if migration_required:
+            _log("fix")(f"resolve workflows held ({len(migration_required)}): resolve_migration_required")
         for target, workflow in state.resolve_workflows.items():
             if isinstance(workflow, WorkflowUnavailable):
                 _log("fix")(f"resolve workflow {target} held: {workflow.reason}")
