@@ -15,7 +15,7 @@ from enum import Enum
 from .contracts import CommandId
 from .labels import Label
 from .review_rejection import (
-    MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, CountedReview, PullRequestState, ReviewRearmPreflight,
+    MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, CountedReview, CountingRule, PullRequestState, ReviewRearmPreflight,
     ReviewRejectionCeiling, validate_commit_sha, validate_counted, validate_labels,
 )
 from .workflow import (
@@ -30,9 +30,10 @@ from .workflow_identity import (
 )
 
 __all__ = [
-    "MAX_COUNTED_REVIEWS", "MAX_OBSERVED_REVIEWS", "CountedReview", "ReviewRearmPreflight", "ReviewRejectionCeiling",
+    "MAX_COUNTED_REVIEWS", "MAX_OBSERVED_REVIEWS", "CountedReview", "CountingRule", "ReviewRearmPreflight", "ReviewRejectionCeiling",
     "FreshReviewRequired", "BoundReviewSubmission", "ImportedBaseline", "ReviewedBaseline", "ReviewContinuation",
     "ReviewEpisode", "DismissCountedReview", "RequireFreshReview", "EnsureReviewProjection", "ReviewRearmOperation",
+    "ReviewProjectionPlan",
     "PendingReviewRearm", "CompletedReviewRearm", "SupersededReviewRearm", "CancelledReviewRearm",
     "ReviewRearmIntent", "ReviewWorkflowSnapshot", "AnyWorkflowSnapshot", "ReviewWorkflowRead",
     "SubmittedReviewState", "SubmittedReviewFact", "CompleteReviews", "PartialReviews", "ReviewRead",
@@ -148,6 +149,33 @@ class EnsureReviewProjection:
 
 
 ReviewRearmOperation = DismissCountedReview | RequireFreshReview | EnsureReviewProjection
+
+
+@dataclass(frozen=True)
+class ReviewProjectionPlan:
+    """The relabel a review re-arm planned: release (remove the attention hold,
+    add the trigger) or hold (keep and ensure the attention hold, add nothing).
+
+    Recorded so a replacement can tell whether an uncertain earlier relabel
+    would land the same outcome; only then does it cover that uncertainty.
+    """
+    command_id: CommandId
+    remove: Label | None
+    add: Label
+
+    def __post_init__(self) -> None:
+        _text(self.command_id, "projection command")
+        if not isinstance(self.add, Label) or (self.remove is not None and not isinstance(self.remove, Label)):
+            raise ValueError("review projection labels must be typed")
+        if self.remove is None:
+            if self.add is not Label.NEEDS_HUMAN_REVIEW:
+                raise ValueError("a held review projection only ensures the attention hold")
+        elif self.remove is not Label.NEEDS_HUMAN_REVIEW or self.add is Label.NEEDS_HUMAN_REVIEW:
+            raise ValueError("a released review projection removes the attention hold and adds a trigger")
+
+    @property
+    def labels(self) -> tuple[Label | None, Label]:
+        return (self.remove, self.add)
 _OPERATIONS = (DismissCountedReview, RequireFreshReview, EnsureReviewProjection)
 
 
@@ -155,7 +183,13 @@ _OPERATIONS = (DismissCountedReview, RequireFreshReview, EnsureReviewProjection)
 class PendingReviewRearm:
     """`authorized` is the exact counted set the operator accepted; dismissal
     obligations may name only those reviews, and a stopped intent keeps them so
-    continuation never recovers authority from audit or actor JSON."""
+    continuation never recovers authority from audit or actor JSON. `rule` is
+    the counting rule that selected them; later recounts use only it.
+    `replaces` names the stopped decision's retired obligations this intent
+    takes over: uncertainty over them lands the same outcome, so it is not an
+    independent hold (ADR 0015). Dismissals are idempotent and always covered;
+    the stopped relabel is covered only when its `projection` labels equal
+    this intent's."""
     request_id: str
     gate_id: str
     from_generation: int
@@ -163,6 +197,9 @@ class PendingReviewRearm:
     operations: tuple[ReviewRearmOperation, ...]
     required_commands: tuple[CommandId, ...]
     authorized: tuple[CountedReview, ...]
+    rule: CountingRule
+    projection: ReviewProjectionPlan
+    replaces: tuple[CommandId, ...] = ()
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
@@ -189,6 +226,12 @@ class PendingReviewRearm:
         _command_ids(self.required_commands, "required commands")
         if not self.required_commands:
             raise ValueError("pending rearm requires durable command obligations")
+        _rule(self.rule)
+        if not isinstance(self.projection, ReviewProjectionPlan) or self.projection.command_id not in self.required_commands:
+            raise ValueError("a review rearm plans the projection among its obligations")
+        _command_ids(self.replaces, "replaced obligations")
+        if set(self.replaces) & set(self.required_commands):
+            raise ValueError("a review rearm cannot replace its own obligations")
 
     @property
     def pr(self) -> PullRequestRef:
@@ -197,6 +240,16 @@ class PendingReviewRearm:
     @property
     def dismissals(self) -> tuple[CountedReview, ...]:
         return tuple(item.review for item in self.operations if isinstance(item, DismissCountedReview))
+
+
+def _projection(value: object) -> None:
+    if not isinstance(value, ReviewProjectionPlan):
+        raise ValueError("a stopped review rearm keeps its planned projection")
+
+
+def _rule(value: object) -> None:
+    if not isinstance(value, CountingRule):
+        raise ValueError("review rearm requires its captured counting rule")
 
 
 def _disposition(verified: tuple[CommandId, ...], retired: tuple[CommandId, ...]) -> None:
@@ -230,12 +283,16 @@ class SupersededReviewRearm:
     verified_commands: tuple[CommandId, ...]
     retired_obligations: tuple[CommandId, ...]
     authorized: tuple[CountedReview, ...]
+    rule: CountingRule
+    projection: ReviewProjectionPlan
 
     def __post_init__(self) -> None:
+        _projection(self.projection)
         _text(self.request_id, "request")
         _text(self.gate_id, "gate")
         _text(self.evidence_id, "supersession evidence")
         validate_counted(self.authorized, "authorized reviews")
+        _rule(self.rule)
         _count(self.to_generation, "rearm generation", minimum=1)
         if not isinstance(self.reason, StopReason) or self.reason is StopReason.OPERATOR_CANCELLED:
             raise ValueError("supersession requires an observed stop reason")
@@ -252,12 +309,16 @@ class CancelledReviewRearm:
     verified_commands: tuple[CommandId, ...]
     retired_obligations: tuple[CommandId, ...]
     authorized: tuple[CountedReview, ...]
+    rule: CountingRule
+    projection: ReviewProjectionPlan
 
     def __post_init__(self) -> None:
+        _projection(self.projection)
         _text(self.request_id, "request")
         _text(self.gate_id, "gate")
         _text(self.cancellation_id, "cancellation")
         validate_counted(self.authorized, "authorized reviews")
+        _rule(self.rule)
         _text(self.reason, "cancellation reason", limit=MAX_DETAIL_CHARS)
         _count(self.to_generation, "rearm generation", minimum=1)
         _disposition(self.verified_commands, self.retired_obligations)
@@ -323,10 +384,22 @@ class ReviewWorkflowSnapshot:
             if isinstance(cause, ReviewRejectionCeiling):
                 if not set(self.intent.authorized) <= set(cause.counted):
                     raise ValueError("a review rearm may authorize only the gate's counted reviews")
+                if self.intent.rule != cause.rule:
+                    raise ValueError("a review rearm counts under its gate's captured rule")
             elif not isinstance(cause, RearmNeedsDecision) or cause.stopped_request_id == self.intent.request_id:
                 raise ValueError("a review rearm requires a rejection ceiling or an earlier stopped decision")
+            elif not set(self.intent.replaces) <= set(cause.obligations):
+                raise ValueError("a review continuation replaces only its stopped decision's obligations")
         elif rearming:
             raise ValueError("rearming gate requires a pending owning intent")
+        # A stopped review re-arm is visible as exactly one open decision gate,
+        # and no decision gate outlives the stop it records: otherwise a stop
+        # could leave no operator path, or a stale decision could hold forever.
+        decisions = tuple(g.cause.stopped_request_id for g in self.gates
+                          if isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision))
+        stopped = self.intent if isinstance(self.intent, (SupersededReviewRearm, CancelledReviewRearm)) else None
+        if decisions != ((stopped.request_id,) if stopped is not None else ()):
+            raise ValueError("an open review decision gate exists exactly for the current stopped re-arm")
         if self.intent is not None and self.intent.to_generation > generation:
             raise ValueError("intent cannot belong to a future generation")
 
@@ -462,6 +535,44 @@ def _ids(reviews: tuple[CountedReview, ...]) -> frozenset[str]:
     return frozenset(review.review_id for review in reviews)
 
 
+def _validate_coverage(
+    prior: ReviewWorkflowSnapshot, intent: PendingReviewRearm, obligations: tuple[CommandId, ...],
+) -> None:
+    """The replacement covers every retired dismissal, and the stopped relabel only in its own direction.
+
+    An uncertain relabel that would land the opposite outcome is an
+    unresolved conflicting effect: it stays an independent hold (ADR 0015).
+    """
+    stopped = prior.intent
+    relabel = stopped.projection.command_id if isinstance(stopped, (SupersededReviewRearm, CancelledReviewRearm)) else None
+    required = tuple(c for c in obligations if c != relabel)
+    if intent.replaces not in (required, obligations):
+        raise ValueError("a review rearm replaces exactly the retired dismissals, and the relabel only when agreed")
+    if relabel in intent.replaces:
+        assert isinstance(stopped, (SupersededReviewRearm, CancelledReviewRearm))
+        if stopped.projection.labels != intent.projection.labels:
+            raise ValueError("a review rearm covers the stopped relabel only in the same direction")
+
+
+def _validate_release(prior: ReviewWorkflowSnapshot, after: ReviewWorkflowSnapshot) -> None:
+    """A release removes this episode's disproven ceiling and owes a fresh review.
+
+    The head the ceiling held must not stay covered by an older baseline, or
+    the PR would be neither held nor reviewed (the keifu #173 dead-state class).
+    """
+    if after.episode.continuation != FreshReviewRequired(after.revision.fence.generation):
+        raise ValueError("a released ceiling owes a fresh review from its new generation")
+    if after.episode.guidance != prior.episode.guidance or after.intent != prior.intent:
+        raise ValueError("a ceiling release changes only the ceiling gate and the continuation")
+    released = tuple(g for g in prior.gates if isinstance(g, OpenGate) and isinstance(g.cause, ReviewRejectionCeiling)
+                     and g.cause.episode_id == prior.episode.episode_id)
+    if not released:
+        raise ValueError("a ceiling release requires an open rejection ceiling of this episode")
+    kept = tuple(g for g in prior.gates if g not in released)
+    if set(after.gates) != set(kept) or len(after.gates) != len(kept):
+        raise ValueError("a ceiling release removes only the episode's rejection ceiling")
+
+
 def validate_review_change(change: WorkflowChanged) -> None:
     """Review-family provenance that a single snapshot cannot express (ADR 0015).
 
@@ -481,8 +592,10 @@ def validate_review_change(change: WorkflowChanged) -> None:
     if mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM):
         if after.episode.continuation != FreshReviewRequired(after.revision.fence.generation):
             raise ValueError("an accepted review rearm owes a fresh review from its new generation")
+    elif mutation is WorkflowMutation.RELEASE_CEILING:
+        _validate_release(prior, after)
     elif mutation is not WorkflowMutation.RECORD_REVIEW and after.episode.continuation != prior.episode.continuation:
-        raise ValueError("only a recorded review or an accepted rearm may change the review continuation")
+        raise ValueError("only a recorded review, an accepted rearm or a ceiling release may change the review continuation")
     if mutation not in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM):
         return
     audit, intent = change.audit, after.intent
@@ -496,8 +609,20 @@ def validate_review_change(change: WorkflowChanged) -> None:
         if not any(isinstance(g, RearmingGate) and g.gate == gate for g in after.gates):
             raise ValueError("the rearming gate must retain the exact accepted ceiling cause")
         cause = gate.cause
+        # The operator's new decision supersedes any stopped one (every review
+        # decision gate belongs to this PR's single episode); every other gate,
+        # including retained uncertainty, stays exactly as it was.
+        retained = {g for g in prior.gates if g != gate and not (
+            isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision))}
+        if set(after.gates) != retained | {RearmingGate(gate, audit.command.request_id)} or len(after.gates) != len(retained) + 1:
+            raise ValueError("a review rearm may absorb only stopped decision gates")
+        absorbed = tuple(c for g in prior.gates if isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision)
+                         for c in g.cause.obligations)
+        _validate_coverage(prior, intent, absorbed)
         if intent.authorized != cause.counted:
             raise ValueError("a review rearm authorizes exactly the gate's observed counted set")
+        if intent.rule != cause.rule:
+            raise ValueError("a review rearm counts under its gate's captured rule")
         if preflight.head_sha != cause.head_sha:
             raise ValueError("the pull request head moved since the rejection ceiling opened")
         if not _ids(preflight.counted) <= _ids(cause.counted):
@@ -511,11 +636,18 @@ def validate_review_change(change: WorkflowChanged) -> None:
         rearming = next((g for g in after.gates if isinstance(g, RearmingGate) and g.gate.gate_id == intent.gate_id), None)
         if rearming is None or not isinstance(rearming.gate.cause, RearmNeedsDecision) or rearming.gate.cause.stopped_request_id != stopped.request_id:
             raise ValueError("a review continuation rearms the stopped request's decision gate")
+        expected_gates = tuple(RearmingGate(rearming.gate, intent.request_id) if g == rearming.gate else g for g in prior.gates)
+        if set(after.gates) != set(expected_gates) or len(after.gates) != len(expected_gates):
+            raise ValueError("a review continuation rearms only the retained decision gate")
         if not set(intent.authorized) <= set(stopped.authorized):
             raise ValueError("a review continuation cannot widen the stopped authorization")
+        if intent.rule != stopped.rule:
+            raise ValueError("a review continuation counts under the stopped intent's rule")
         if not _ids(preflight.counted) <= _ids(stopped.authorized):
             raise ValueError("the preflight counts reviews outside the stopped authorization")
         if not dismissed <= _ids(preflight.counted):
             raise ValueError("continued dismissals must be freshly counted reviews")
+        assert isinstance(rearming.gate.cause, RearmNeedsDecision)
+        _validate_coverage(prior, intent, rearming.gate.cause.obligations)
     else:
         raise ValueError("accepted review rearm requires a request or continuation")

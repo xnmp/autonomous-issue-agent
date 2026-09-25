@@ -13,6 +13,7 @@ request whose observed set exceeds the authorization bound.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
 
 from .labels import Label
@@ -72,6 +73,40 @@ class CountedReview:
         return cls(review_id, None if commit_id == "" else commit_id)
 
 
+def _non_resetting(value: object) -> None:
+    if not isinstance(value, tuple) or len(value) > MAX_NON_RESETTING_COMMITS:
+        raise ValueError("non-resetting commits must be a bounded tuple")
+    for commit in value:
+        validate_commit_sha(commit, "non-resetting commit")
+    if len(set(value)) != len(value):
+        raise ValueError("non-resetting commits must be unique")
+
+
+@dataclass(frozen=True)
+class CountingRule:
+    """Which reviews count toward the ceiling: the trusted bot identity and the
+    approvals proven unmergeable (no reset). Captured when a gate opens and
+    carried by the re-arm intents, so continuation, completion and ceiling
+    reconciliation recount under the rule that decided the gate, never under
+    whatever configuration is current. Commits are canonical (sorted, unique).
+    """
+    review_bot: str
+    non_resetting_commits: tuple[str, ...] = ()
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.review_bot, "review bot")
+        _non_resetting(self.non_resetting_commits)
+        if list(self.non_resetting_commits) != sorted(self.non_resetting_commits):
+            raise ValueError("counting rule commits must be canonically sorted")
+
+    @classmethod
+    def of(cls, review_bot: str, non_resetting_commits: object = ()) -> "CountingRule":
+        """Canonicalize a configured tuple or frozenset of commits."""
+        if not isinstance(non_resetting_commits, (tuple, frozenset)) or len(non_resetting_commits) > MAX_NON_RESETTING_COMMITS:
+            raise ValueError("non-resetting commits must be a bounded tuple or frozenset")
+        return cls(review_bot, tuple(sorted(set(non_resetting_commits))))
+
+
 @dataclass(frozen=True)
 class ReviewRejectionCeiling:
     """The observed counted set when the gate opened, bounded by one complete read."""
@@ -91,12 +126,12 @@ class ReviewRejectionCeiling:
         # The escalation is posted after ceiling-1 counted rejections.
         if len(self.counted) < self.ceiling - 1:
             raise ValueError("a review rejection ceiling cause requires exhaustion")
-        if not isinstance(self.non_resetting_commits, tuple) or len(self.non_resetting_commits) > MAX_NON_RESETTING_COMMITS:
-            raise ValueError("non-resetting commits must be a bounded tuple")
-        for commit in self.non_resetting_commits:
-            validate_commit_sha(commit, "non-resetting commit")
-        if len(set(self.non_resetting_commits)) != len(self.non_resetting_commits):
-            raise ValueError("non-resetting commits must be unique")
+        _non_resetting(self.non_resetting_commits)
+
+    @property
+    def rule(self) -> CountingRule:
+        """The counting rule this cause was decided under."""
+        return CountingRule.of(self.review_bot, self.non_resetting_commits)
 
 
 class PullRequestState(str, Enum):
@@ -116,7 +151,11 @@ class ReviewRearmPreflight:
 
     `complete_reviews_evidence_id` names that durable observation; a partial
     read has no constructor that yields this value. `counted` is the fresh
-    observed counted set, so it is bounded as an observation.
+    observed counted set, so it is bounded as an observation. Policy validation
+    re-derives this value from the observation and requires equality; the
+    committing adapter (increment 5) must additionally bind
+    `complete_reviews_evidence_id` to a durable read taken at `observed_at`
+    and fresh under the acceptance barrier, since policy cannot see storage.
     """
     pr_key: WorkflowKey
     head_sha: str
@@ -124,6 +163,7 @@ class ReviewRearmPreflight:
     counted: tuple[CountedReview, ...]
     state: PullRequestState
     labels: frozenset[Label]
+    observed_at: datetime
     external_holds: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -135,6 +175,8 @@ class ReviewRearmPreflight:
         if not isinstance(self.state, PullRequestState):
             raise ValueError("preflight pull request state must be typed")
         validate_labels(self.labels, "preflight labels")
+        if not isinstance(self.observed_at, datetime) or self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
+            raise ValueError("preflight observation time must be timezone-aware")
         if not isinstance(self.external_holds, tuple) or len(self.external_holds) > MAX_WORKFLOW_GATES:
             raise ValueError("external holds must be a bounded tuple")
         for hold in self.external_holds:

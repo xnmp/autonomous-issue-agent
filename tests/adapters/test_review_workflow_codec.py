@@ -12,13 +12,13 @@ from issue_agent.adapters.workflow_codec import (
 from issue_agent.domain.contracts import CommandId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_workflow import (
-    MAX_COUNTED_REVIEWS, BoundReviewSubmission, CompleteReviews, CountedReview, FreshReviewRequired,
+    MAX_COUNTED_REVIEWS, BoundReviewSubmission, CompleteReviews, CountedReview, CountingRule, FreshReviewRequired,
     ImportedBaseline, ObservedPullRequest, PartialReviews, PendingReviewRearm, PullRequestAbsent, PullRequestState,
     PullRequestUnavailable, ReviewEpisode, ReviewRearmPreflight, ReviewRejectionCeiling, ReviewWorkflowSnapshot,
     ReviewedBaseline, SubmittedReviewFact, SubmittedReviewState,
 )
 from issue_agent.domain.workflow import (
-    AuthorizedOperatorCommand, ContinueGrantedRearm, NoAuthorizedRemediation, OpenGate, RearmNeedsDecision,
+    AuthorizedOperatorCommand, ContinueGrantedRearm, NoAuthorizedRemediation, OpenGate, RearmNeedsDecision, RearmingGate,
     RemoteOutcomeUncertain, ResolveCeiling, StopReason, WorkflowSnapshot,
 )
 from issue_agent.domain.workflow_identity import (
@@ -75,6 +75,7 @@ def test_operator_audit_observations_and_reads_roundtrip():
     roundtrip(PullRequestAbsent(PR_KEY, NOW), PullRequestAbsent)
     roundtrip(PullRequestUnavailable(PR_KEY, NOW, "rate limited"), PullRequestUnavailable)
     roundtrip(ceiling_cause(), ReviewRejectionCeiling)
+    roundtrip(CountingRule("review-bot[bot]", (HEAD, "f" * 40)), CountingRule)
     roundtrip(replace(observed(), reviews=PartialReviews("page 2 failed")), ObservedPullRequest)
     unresolved = ReviewRejectionCeiling(EPISODE, HEAD, "bot", (CountedReview("r1", None), CountedReview("r2", HEAD)), 3, ())
     assert roundtrip(unresolved, ReviewRejectionCeiling).counted[0].commit_id is None
@@ -258,3 +259,23 @@ def test_completed_review_rearm_carries_no_authorization():
     intent = completed().intent
     with pytest.raises(WorkflowEncodingError, match="wrong fields"):
         decode_workflow(mutate(intent, ("fields", "authorized"), []), type(intent))
+
+
+def test_replaced_obligations_of_a_continuation_survive_restart():
+    stopped = cancelled()
+    [decision] = stopped.gates
+    assert isinstance(decision.cause, RearmNeedsDecision)
+    intent = replace(pending_intent("request:2", from_generation=1), gate_id=decision.gate_id,
+                     replaces=decision.cause.obligations)
+    state = ReviewWorkflowSnapshot(revision(2, 3), REVIEW, ReviewEpisode(EPISODE, "", FreshReviewRequired(2)),
+                                   (RearmingGate(decision, "request:2"),), intent)
+    recovered = roundtrip(state, ReviewWorkflowSnapshot)
+    assert isinstance(recovered.intent, PendingReviewRearm)
+    assert recovered.intent.replaces == decision.cause.obligations
+
+
+def test_a_held_projection_plan_survives_restart():
+    from tests.fakes.review_workflow import projection
+    state = replace(pending(), intent=replace(pending_intent(), projection=projection(held=True)))
+    recovered = roundtrip(state, ReviewWorkflowSnapshot)
+    assert isinstance(recovered.intent, PendingReviewRearm) and recovered.intent.projection.remove is None

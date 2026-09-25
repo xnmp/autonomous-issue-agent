@@ -1104,6 +1104,10 @@ class WorkflowMutation(str, Enum):
     STOP_REARM = "stop_rearm"
     AUTHORIZE_RETRY = "authorize_retry"
     RECORD_REVIEW = "record_review"
+    # Review-only: a fresh complete read disproved the rejection ceiling. It
+    # advances the generation so no in-flight older review can re-cover the
+    # head the ceiling held (ADR 0015).
+    RELEASE_CEILING = "release_ceiling"
 
 
 @dataclass(frozen=True)
@@ -1171,9 +1175,11 @@ class WorkflowChanged:
         before, after = self.expected, self.snapshot.revision
         if before.fence.key != after.fence.key or after.version != before.version + 1:
             raise ValueError("a transition advances one version of the same workflow")
-        advances = self.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM)
+        advances = self.mutation in (
+            WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM, WorkflowMutation.RELEASE_CEILING,
+        )
         if after.fence.generation != before.fence.generation + int(advances):
-            raise ValueError("only accepted rearm intents advance generation")
+            raise ValueError("only accepted rearm intents and ceiling releases advance generation")
         if not isinstance(self.audit, (AuthorizedOperatorCommand, ResolveAttemptResult, ObservedTransition)):
             raise ValueError("transition requires typed audit provenance")
         operator_variants = {
@@ -1200,6 +1206,11 @@ class WorkflowChanged:
                 raise ValueError("recorded review must establish a bound baseline of the current generation")
             if not isinstance(self.audit, ObservedTransition) or str(continuation.source.command_id) not in self.audit.evidence_ids:
                 raise ValueError("recorded review requires its bound submission evidence")
+        elif self.mutation is WorkflowMutation.RELEASE_CEILING:
+            if not review:
+                raise ValueError("ceiling release belongs to the review rejection family")
+            if not isinstance(self.audit, ObservedTransition):
+                raise ValueError("ceiling release requires observed evidence")
         elif self.mutation is WorkflowMutation.STOP_REARM:
             terminal = (SupersededReviewRearm, CancelledReviewRearm) if review else (SupersededRearm, CancelledRearm)
             if not isinstance(self.snapshot.intent, terminal):
@@ -1211,7 +1222,7 @@ class WorkflowChanged:
                 raise ValueError("superseded rearm requires observed evidence")
         elif not isinstance(self.audit, ObservedTransition):
             raise ValueError("observed transition requires observed audit provenance")
-        if advances:
+        if advances and self.mutation is not WorkflowMutation.RELEASE_CEILING:
             intent = self.snapshot.intent
             pending = PendingReviewRearm if review else PendingRearm
             if not isinstance(intent, pending) or not isinstance(self.audit, AuthorizedOperatorCommand) or not isinstance(self.audit.command, (RequestRearm, ContinueGrantedRearm)) or intent.request_id != self.audit.command.request_id:
@@ -1252,6 +1263,9 @@ class WorkflowRejection(str, Enum):
     INVALID_SCOPE = "invalid_scope"
     MISSING_AUTHORIZATION = "missing_authorization"
     AUTHORIZATION_OUTSTANDING = "authorization_outstanding"
+    # An observed counted set larger than one re-arm's dismissal bound: the gate
+    # stays visible and the operator is told why it cannot be re-armed as is.
+    AUTHORIZATION_BOUND_EXCEEDED = "authorization_bound_exceeded"
 
 
 @dataclass(frozen=True)

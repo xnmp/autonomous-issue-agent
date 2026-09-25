@@ -11,7 +11,8 @@ from issue_agent.domain.review_workflow import (
     MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, BoundReviewSubmission, CancelledReviewRearm, CompleteReviews,
     CompletedReviewRearm, CountedReview, DismissCountedReview, EnsureReviewProjection, FreshReviewRequired,
     ImportedBaseline, ObservedPullRequest, PartialReviews, PendingReviewRearm, PullRequestAbsent, PullRequestState,
-    PullRequestUnavailable, RequireFreshReview, ReviewEpisode, ReviewRearmPreflight, ReviewRejectionCeiling,
+    PullRequestUnavailable, RequireFreshReview, ReviewEpisode, ReviewProjectionPlan, ReviewRearmPreflight,
+    ReviewRejectionCeiling,
     ReviewWorkflowSnapshot, ReviewedBaseline, SubmittedReviewFact, SubmittedReviewState, SupersededReviewRearm,
     decisive_reviews,
 )
@@ -28,10 +29,12 @@ from issue_agent.domain.workflow_identity import (
     WorkflowRevision, target_family,
 )
 from tests.fakes.review_workflow import (
-    ACTOR, EPISODE, GATE, HEAD, ISSUE_KEY, NOW, OTHER_HEAD, PATCH, PR, PR_KEY, RESOLVE, REVIEW,
+    ACTOR, EPISODE, GATE, HEAD, ISSUE_KEY, NOW, OTHER_HEAD, PATCH, PR, PR_KEY, RESOLVE, REVIEW, RULE,
     cancelled, ceiling_cause, ceiling_gate, completed, counted, held, operations, pending, pending_intent,
-    preflight, request, revision, superseded,
+    preflight, projection, request, revision, superseded,
 )
+
+PROJ = projection()
 
 BAD_IDENTIFIERS = [None, 1, "", " ", "a" * 513, "line\nbreak", "nul\x00"]
 BAD_SHAS = ["", "a" * 39, "a" * 41, "a" * 63, "a" * 65, "A" * 40, "g" * 40, " " + "a" * 39, 40]
@@ -167,7 +170,9 @@ def test_review_snapshot_rejects_a_resolve_ceiling_cause():
 def test_both_families_accept_shared_causes(cause):
     gate = OpenGate("gate:shared", 0, cause, NoAuthorizedRemediation("reconcile only"))
     assert replace(resolve_snapshot(), gates=(gate,)).gates == (gate,)
-    assert replace(held(), gates=(gate,)).gates == (gate,)
+    # A review decision gate exists only beside its stopped re-arm.
+    review = cancelled("request:0") if isinstance(cause, RearmNeedsDecision) else held()
+    assert replace(review, gates=(gate,)).gates == (gate,)
 
 
 # -- continuation -------------------------------------------------------------
@@ -255,7 +260,7 @@ def test_counted_review_bound_leaves_room_for_the_projection_command():
 
 def test_a_maximal_ceiling_produces_a_representable_pending_intent():
     reviews = counted(MAX_COUNTED_REVIEWS)
-    cause = ReviewRejectionCeiling(EPISODE, HEAD, "bot", reviews, MAX_COUNTED_REVIEWS + 1, ())
+    cause = ReviewRejectionCeiling(EPISODE, HEAD, RULE.review_bot, reviews, MAX_COUNTED_REVIEWS + 1, ())
     commands = tuple(CommandId(f"dismiss-{index}") for index in range(MAX_COUNTED_REVIEWS)) + (CommandId("projection"),)
     intent = pending_intent(ops=operations(dismissals=reviews), commands=commands, authorized=reviews)
     assert len(intent.required_commands) == MAX_REARM_COMMANDS and intent.dismissals == reviews
@@ -270,7 +275,7 @@ def test_a_maximal_ceiling_produces_a_representable_pending_intent():
 
 def test_observed_ceiling_may_exceed_the_authorization_bound_but_cannot_be_authorized():
     observed = counted(MAX_COUNTED_REVIEWS + 1)
-    cause = ReviewRejectionCeiling(EPISODE, HEAD, "bot", observed, 3, ())
+    cause = ReviewRejectionCeiling(EPISODE, HEAD, RULE.review_bot, observed, 3, ())
     assert len(cause.counted) == MAX_COUNTED_REVIEWS + 1
     assert len(ReviewRejectionCeiling(EPISODE, HEAD, "bot", counted(MAX_OBSERVED_REVIEWS), 3, ()).counted) == MAX_OBSERVED_REVIEWS
     with pytest.raises(ValueError):
@@ -298,8 +303,8 @@ def test_pending_review_rearm_cannot_exceed_the_counted_review_bound():
 @pytest.mark.parametrize("value", [counted(1) * 2, list(counted()), ("review-0",), counted(MAX_COUNTED_REVIEWS + 1)])
 def test_authorized_set_is_unique_bounded_and_typed_in_every_carrying_intent(value):
     for build in (lambda: pending_intent(ops=operations(dismissals=()), authorized=value),
-                  lambda: SupersededReviewRearm("r", GATE, 1, StopReason.TARGET_TERMINAL, "e", (), (), value),
-                  lambda: CancelledReviewRearm("r", GATE, 1, "cancel", "why", (), (), value)):
+                  lambda: SupersededReviewRearm("r", GATE, 1, StopReason.TARGET_TERMINAL, "e", (), (), value, RULE, PROJ),
+                  lambda: CancelledReviewRearm("r", GATE, 1, "cancel", "why", (), (), value, RULE, PROJ)):
         with pytest.raises(ValueError):
             build()
 
@@ -326,22 +331,23 @@ def test_pending_review_rearm_requires_bounded_unique_durable_commands(commands)
 @pytest.mark.parametrize("from_generation, to_generation", [(0, 0), (0, 2), (1, 1), (-1, 0)])
 def test_review_rearm_advances_generation_exactly_once(from_generation, to_generation):
     with pytest.raises(ValueError):
-        PendingReviewRearm("request", GATE, from_generation, to_generation, operations(), (CommandId("c"),), counted())
+        PendingReviewRearm("request", GATE, from_generation, to_generation, operations(), (CommandId("c"),), counted(), RULE,
+                           ReviewProjectionPlan(CommandId("c"), None, Label.NEEDS_HUMAN_REVIEW))
 
 
 def test_terminal_review_intents_keep_verified_and_retired_obligations_disjoint():
     with pytest.raises(ValueError, match="observed stop reason"):
-        SupersededReviewRearm("r", GATE, 1, StopReason.OPERATOR_CANCELLED, "e", (), (), ())
+        SupersededReviewRearm("r", GATE, 1, StopReason.OPERATOR_CANCELLED, "e", (), (), (), RULE, PROJ)
     with pytest.raises(ValueError, match="observed stop reason"):
-        SupersededReviewRearm("r", GATE, 1, "decision_changed", "e", (), (), ())  # type: ignore[arg-type]
+        SupersededReviewRearm("r", GATE, 1, "decision_changed", "e", (), (), (), RULE, PROJ)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="also be retired"):
-        SupersededReviewRearm("r", GATE, 1, StopReason.TARGET_TERMINAL, "e", (CommandId("c"),), (CommandId("c"),), ())
+        SupersededReviewRearm("r", GATE, 1, StopReason.TARGET_TERMINAL, "e", (CommandId("c"),), (CommandId("c"),), (), RULE, PROJ)
     with pytest.raises(ValueError, match="also be retired"):
-        CancelledReviewRearm("r", GATE, 1, "cancel", "why", (CommandId("c"),), (CommandId("c"),), ())
+        CancelledReviewRearm("r", GATE, 1, "cancel", "why", (CommandId("c"),), (CommandId("c"),), (), RULE, PROJ)
     with pytest.raises(ValueError):
-        CancelledReviewRearm("r", GATE, 1, "cancel", "", (), (), ())
+        CancelledReviewRearm("r", GATE, 1, "cancel", "", (), (), (), RULE, PROJ)
     with pytest.raises(ValueError):
-        CancelledReviewRearm("r", GATE, 1, "cancel", "x" * (MAX_DETAIL_CHARS + 1), (), (), ())
+        CancelledReviewRearm("r", GATE, 1, "cancel", "x" * (MAX_DETAIL_CHARS + 1), (), (), (), RULE, PROJ)
     with pytest.raises(ValueError):
         CompletedReviewRearm("r", GATE, 0, ())
     assert CompletedReviewRearm("r", GATE, 1, ()).verified_commands == ()
@@ -740,13 +746,16 @@ def decision_gate(stopped="request:1"):
                     NoAuthorizedRemediation("decide the stopped rearm"))
 
 
-def continued(*, stopped=None, gate=None, allowed=None, pf=None, dismissals=None, stopped_id="request:1"):
-    prior = replace(stopped or cancelled(), gates=(gate or decision_gate(),))
+def continued(*, stopped=None, gate=None, allowed=None, pf=None, dismissals=None, stopped_id="request:1",
+              prior_gates=None):
+    gate = gate or decision_gate()
+    prior = replace(stopped or cancelled(), gates=(gate,) if prior_gates is None else prior_gates)
     reviews = counted(1) if dismissals is None else dismissals
     intent = PendingReviewRearm("request:2", "gate:decision", 1, 2, operations(dismissals=reviews),
-                                (CommandId("request:2:projection"),), counted() if allowed is None else allowed)
+                                (CommandId("request:2:projection"),), counted() if allowed is None else allowed, RULE,
+                                projection("request:2"), gate.cause.obligations)
     after = ReviewWorkflowSnapshot(revision(2, 3), REVIEW, ReviewEpisode(EPISODE, "", FreshReviewRequired(2)),
-                                   (RearmingGate(gate or decision_gate(), "request:2"),), intent)
+                                   (RearmingGate(gate, "request:2"),), intent)
     command = ContinueGrantedRearm("request:2", prior.revision, stopped_id)
     return WorkflowChanged(prior.revision, WorkflowMutation.CONTINUE_REARM, after,
                            authorized(command, pf or preflight(reviews=counted(1))), prior=prior)
@@ -763,13 +772,38 @@ def test_review_continuation_may_narrow_the_stopped_authorization():
     ({"allowed": counted() + (HUMAN,)}, "cannot widen"),
     ({"pf": preflight(reviews=counted(1) + (HUMAN,))}, "outside the stopped authorization"),
     ({"pf": preflight(reviews=()), "dismissals": counted(1)}, "freshly counted"),
-    ({"stopped_id": "request:0", "gate": decision_gate("request:0")}, "current stopped review intent"),
-    ({"gate": decision_gate("request:0")}, "stopped request's decision gate"),
-    ({"stopped": completed()}, "current stopped review intent"),
+    ({"stopped_id": "request:0"}, "current stopped review intent"),
+    ({"stopped": completed(), "prior_gates": ()}, "current stopped review intent"),
+    ({"gate": decision_gate("request:0"), "prior_gates": (decision_gate(),)}, "stopped request's decision gate"),
 ])
 def test_review_continuation_stays_inside_the_stopped_authorization_chain(changes, match):
     with pytest.raises(ValueError, match=match):
         continued(**changes)
+
+
+def test_a_stopped_review_rearm_is_visible_as_exactly_its_own_decision_gate():
+    stopped = cancelled()
+    with pytest.raises(ValueError, match="exactly for the current stopped re-arm"):
+        replace(stopped, gates=())
+    with pytest.raises(ValueError, match="exactly for the current stopped re-arm"):
+        replace(stopped, gates=(decision_gate("request:0"),))
+    with pytest.raises(ValueError, match="exactly for the current stopped re-arm"):
+        replace(stopped, gates=stopped.gates + (replace(decision_gate(), gate_id="gate:decision-2"),))
+    for other in (held(generation=1), completed(), pending()):
+        with pytest.raises(ValueError, match="exactly for the current stopped re-arm"):
+            replace(other, gates=other.gates + (decision_gate(),))
+
+
+def test_a_review_continuation_replaces_exactly_its_stopped_decisions_obligations():
+    change = continued()
+    intent = change.snapshot.intent
+    assert isinstance(intent, PendingReviewRearm) and intent.replaces == decision_gate().cause.obligations
+    with pytest.raises(ValueError, match="replaces only its stopped decision"):
+        replace(change.snapshot, intent=replace(intent, replaces=(CommandId("request:9:projection"),)))
+    with pytest.raises(ValueError, match="exactly the retired dismissals"):
+        replace(change, snapshot=replace(change.snapshot, intent=replace(intent, replaces=())))
+    with pytest.raises(ValueError, match="cannot replace its own obligations"):
+        replace(intent, replaces=intent.required_commands)
 
 
 def test_pending_review_rearm_requires_a_ceiling_or_an_earlier_stopped_decision():
@@ -803,7 +837,7 @@ def test_only_a_recorded_review_or_accepted_rearm_changes_the_continuation(mutat
         # Control: an observed transition preserving the continuation is fine.
         assert WorkflowChanged(prior.revision, mutation, after, ObservedTransition(("x",)), prior=prior).prior == prior
         return
-    with pytest.raises(ValueError, match="only a recorded review or an accepted rearm"):
+    with pytest.raises(ValueError, match="only a recorded review, an accepted rearm or a ceiling release"):
         WorkflowChanged(prior.revision, mutation, after, audit, prior=prior)
 
 
@@ -811,3 +845,22 @@ def test_imported_baseline_survives_only_by_preservation():
     prior = ReviewWorkflowSnapshot(revision(0, 0), REVIEW, ReviewEpisode(EPISODE, "", IMPORTED))
     after = replace(prior, revision=revision(0, 1), gates=(ceiling_gate(),))
     assert WorkflowChanged(prior.revision, WorkflowMutation.OPEN_GATE, after, ObservedTransition(("x",)), prior=prior)
+
+
+@pytest.mark.parametrize("remove, add", [
+    (None, Label.AI_PR_OPEN), (Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW),
+    (Label.NEEDS_HUMAN_REVIEW, Label.NEEDS_HUMAN_REVIEW), ("needs-human-review", Label.AI_PR_OPEN), (None, None),
+])
+def test_a_review_projection_plan_is_either_a_release_or_a_hold(remove, add):
+    with pytest.raises(ValueError):
+        ReviewProjectionPlan(CommandId("c"), remove, add)
+
+
+def test_a_pending_review_rearm_plans_its_projection_among_its_obligations():
+    with pytest.raises(ValueError, match="projection among its obligations"):
+        replace(pending_intent(), projection=replace(PROJ, command_id=CommandId("elsewhere")))
+    for build in (cancelled, superseded):
+        intent = build().intent
+        assert isinstance(intent, (CancelledReviewRearm, SupersededReviewRearm))
+        with pytest.raises(ValueError, match="planned projection"):
+            replace(intent, projection=None)

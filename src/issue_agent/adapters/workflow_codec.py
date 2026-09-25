@@ -59,9 +59,9 @@ _VALUES = (
     w.RetiredUncertainCommand, w.RetiredSettledCommand, w.ResolveAttemptResult,
     w.AuthorizedOperatorCommand, w.ObservedTransition,
     # Review-rejection family (ADR 0015 review slice).
-    rw.CountedReview, rw.ReviewRejectionCeiling, rw.ReviewRearmPreflight,
+    rw.CountedReview, rw.CountingRule, rw.ReviewRejectionCeiling, rw.ReviewRearmPreflight,
     rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ImportedBaseline, rw.ReviewedBaseline,
-    rw.ReviewEpisode, rw.DismissCountedReview, rw.RequireFreshReview, rw.EnsureReviewProjection,
+    rw.ReviewEpisode, rw.DismissCountedReview, rw.RequireFreshReview, rw.EnsureReviewProjection, rw.ReviewProjectionPlan,
     rw.PendingReviewRearm, rw.CompletedReviewRearm, rw.SupersededReviewRearm, rw.CancelledReviewRearm,
     rw.ReviewWorkflowSnapshot, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
     rw.ObservedPullRequest, rw.PullRequestAbsent, rw.PullRequestUnavailable,

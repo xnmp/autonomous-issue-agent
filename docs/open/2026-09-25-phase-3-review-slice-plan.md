@@ -94,3 +94,19 @@ and can be revisited before live activation, which remains separately paused.
    panel mounts on linked PRs in the issue page. Closed PRs' legacy files are
    recorded as evidence and not imported.
 10. No v23 index unless query-plan tests show the quiescence probe needs one.
+11. Authorization bound (deliberate deviation from ADR wording "bounded by the
+    configured ceiling"): the operator authorizes exactly the observed counted set
+    captured in the gate's cause, which can exceed the ceiling when the bot keeps
+    rejecting after escalation. The bound is `MAX_COUNTED_REVIEWS` (63, one intent's
+    command budget); `REVIEW_MAX_REJECTIONS` is validated ≤ 63 at config load. The
+    ADR's intent holds: only counted bot reviews, never human or later reviews, and
+    no unbounded fan-out. A larger counted set gets a typed visible refusal, and a
+    ceiling whose cause is later disproven is closed by ceiling reconciliation.
+12. Releasing a disproven rejection ceiling (e.g. a human dismissed the counted
+    reviews on GitHub, or the ceiling was lowered/disabled) is a distinct observed
+    transition, `RELEASE_CEILING`, that advances the generation, marks a fresh
+    review owed and projects the PR back to the trigger label (unless other holds
+    remain). Advancing the generation fences any in-flight review submission of the
+    old generation, so a stale baseline can never leave a released PR unreviewed
+    (the keifu #173 dead-state class). This is the only observed transition that
+    advances a generation; operator re-arms remain the only commanded ones.
