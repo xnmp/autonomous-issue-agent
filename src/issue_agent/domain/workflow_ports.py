@@ -9,10 +9,12 @@ from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetInt
 from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
 from .resolve_rearm import PendingResolveRearm, ResolveControlRead, UnavailableResolveRearm
 from .workflow import (
+    AuthorizeAbsentRetry, ReconciliationOnly, UnconsumedRetryAuthorization, WorkflowRejected,
     AuthorizedOperatorCommand, CancelRearm, OperatorActor,
-    CommandAbsenceEvidence, CommandRetryApplicability, HeldProjection, RearmIntent, RetryAlreadyConsumed,
+    HeldProjection, RearmIntent, RetryAlreadyConsumed, RetryDeclined, RetryStale,
     RetryBegan, ObservedIssue, NoLinkedPr, LinkedPrPresent, ResolveAttemptResult, WorkflowChanged, WorkflowCommitted, WorkflowConflict, WorkflowRead, WorkflowSnapshot,
 )
+from .workflow_retry import RetryAbsenceRead
 from .workflow_identity import (
     FamilyAuthority, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
 )
@@ -89,6 +91,8 @@ class WorkflowControl(Protocol):
 
     def cancel_rearm(self, command: CancelRearm, actor: OperatorActor, *, binding: WorkflowBinding | None = None) -> WorkflowCommitted | WorkflowConflict: ...
 
+    def authorize_retry(self, command: AuthorizeAbsentRetry, actor: OperatorActor, *, binding: WorkflowBinding | None = None) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected: ...
+
     def finalize_return(
         self, returned: ReturnedResolve, issue: ObservedIssue,
         linkage: NoLinkedPr | LinkedPrPresent,
@@ -104,14 +108,25 @@ class WorkflowControl(Protocol):
 
 
 class WorkflowRetryControl(Protocol):
-    @property
-    def writer(self) -> WorkflowWriter: ...
+    """Effect-store seam spending one operator grant (ADR 0015).
+
+    `expected` is the command's reconciliation state and `expected_attempts`
+    its attempt count, both observed before the executor's read: a read taken
+    before another attempt began can never spend or settle after it. The
+    grant's binding pins generation, epoch and episode. A decision leaves the
+    grant terminal; a stale or unavailable read leaves it open.
+    """
+
+    def retry_authorization(self, command_id: CommandId) -> UnconsumedRetryAuthorization | None: ...
 
     def begin_authorized_retry(
         self,
         command_id: CommandId,
         authorization_id: str,
-        expected: WorkflowRevision,
-        evidence: CommandAbsenceEvidence,
-        applicability: CommandRetryApplicability,
-    ) -> RetryBegan | RetryAlreadyConsumed: ...
+        *,
+        expected: ReconciliationOnly,
+        expected_attempts: int,
+        read: RetryAbsenceRead,
+        executor_identity: str,
+    ) -> RetryBegan | RetryAlreadyConsumed | RetryDeclined | RetryStale: ...
+

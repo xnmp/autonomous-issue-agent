@@ -341,7 +341,9 @@ leave a retry token consumed while a command still appears safe to re-execute.
 After consumption, crash/unknown outcome returns to read-only reconciliation.
 Original unresolved age and expiry stay recorded; every subsequent write needs
 a new explicit authorization and fresh absence proof. A persisted unconsumed
-authorization can resume after restart. This is a one-write grant, not an
+authorization can resume after restart at the next scheduled read, and
+survives bounded transient read failures; see ADR 0015's fault rows for the
+implemented dispositions and ceilings. This is a one-write grant, not an
 unbounded retry-window reset.
 
 Terminal `SupersededRearm`/`CancelledRearm` records free the pending slot while

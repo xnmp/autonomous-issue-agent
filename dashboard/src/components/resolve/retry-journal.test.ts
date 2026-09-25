@@ -13,12 +13,21 @@ afterEach(() => {
 // hands to retainRequest/acknowledgeRequest, so key order matches what
 // decode() (which also parses) produces — retryRequest's callers never hand
 // it a hand-rolled object.
-const command: ResolveCommand = parseResolveCommand({
+const command = parseResolveCommand({
   operation: "request_rearm",
   expected: { ...binding },
   request_id: "request-1",
   gate_id: "gate-77",
   guidance: { kind: "keep" },
+}) as Extract<ResolveCommand, { operation: "request_rearm" }>;
+
+const authorization: ResolveCommand = parseResolveCommand({
+  operation: "authorize_retry",
+  expected: { ...binding },
+  authorization_id: "grant-1",
+  gate_id: "uncertain-77",
+  command_id: "command-77",
+  evidence_id: "absence-77",
 });
 
 const otherIssueCommand: ResolveCommand = parseResolveCommand({
@@ -196,5 +205,24 @@ describe("acknowledgeRequest", () => {
     expect(() => acknowledgeRequest(stubborn, "demo", command)).toThrow(
       "The browser could not clear the acknowledged request.",
     );
+  });
+});
+
+describe("authorize_retry records", () => {
+  it("round-trips the exact grant so a lost reply can only retry the same authorization ID", () => {
+    retainRequest(sessionStorage, "demo", authorization);
+    const recovered = recoverRequest(sessionStorage, "demo", 77);
+    expect(recovered).toMatchObject({ kind: "uncertain", command: authorization });
+    const second: ResolveCommand = { ...authorization, authorization_id: "grant-2" } as ResolveCommand;
+    expect(() => retainRequest(sessionStorage, "demo", second)).toThrow("Another saved request needs a response");
+    acknowledgeRequest(sessionStorage, "demo", authorization);
+    expect(recoverRequest(sessionStorage, "demo", 77)).toEqual({ kind: "idle" });
+  });
+
+  it("blocks, rather than re-minting, a saved grant that lost its harness evidence reference", () => {
+    const { evidence_id: _dropped, ...partial } = authorization as Extract<ResolveCommand, { operation: "authorize_retry" }>;
+    sessionStorage.setItem(retryKey("demo", 77), JSON.stringify({ version: 1, command: partial }));
+    expect(recoverRequest(sessionStorage, "demo", 77)).toMatchObject({ kind: "blocked" });
+    expect(sessionStorage.getItem(retryKey("demo", 77))).not.toBeNull();
   });
 });

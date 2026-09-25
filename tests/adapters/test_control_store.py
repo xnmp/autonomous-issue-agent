@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 23))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 24))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -119,6 +119,16 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     # This constructs test fixtures, not a production downgrade: migrations
     # which rewrite rows need their historical inputs seeded by the caller.
     removals = {
+        23: (
+            "DROP TRIGGER workflow_retry_grant_insert", "DROP TRIGGER workflow_retry_grant_update",
+            "DROP INDEX workflow_retry_open_grant",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposed_at",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition_reason",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN accepted_at",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN first_visit_at",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN unavailable_reads",
+        ),
         22: ("DROP TABLE workflow_activation_evidence", "DROP TABLE workflow_activation_imports"),
         21: ("DROP INDEX runs_workflow_scope", "DROP INDEX lifecycle_publication_runs"),
         20: (

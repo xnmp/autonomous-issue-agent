@@ -1,8 +1,8 @@
 import { describe, expect, it } from "vitest";
 
 import type { ResolveCommand } from "../../api/types";
-import { commandIdentity, operationLocksActions, prepareResolveCommand, sameBinding, type ResolveOperation } from "./model";
-import { availableControl, binding, ceilingGate, rearm } from "./test-fixtures";
+import { commandIdentity, commandRequestId, operationLocksActions, prepareResolveCommand, sameBinding, type ResolveOperation } from "./model";
+import { availableControl, binding, ceilingGate, rearm, retryGate } from "./test-fixtures";
 
 describe("prepareResolveCommand", () => {
   it("builds a request_rearm command scoped to the inspected gate and control's expected binding", () => {
@@ -157,5 +157,39 @@ describe("sameBinding", () => {
   ] as const)("is false when a binding field differs: %j", (change) => {
     const other: ResolveCommand["expected"] = { ...binding, ...change };
     expect(sameBinding(binding, other)).toBe(false);
+  });
+});
+
+describe("authorize_retry", () => {
+  it("names the gate's own command and harness evidence and uses the minted ID as its identity", () => {
+    const control = availableControl({ gates: [ceilingGate({ available_commands: [] }), retryGate()] });
+    const command = prepareResolveCommand(control, { operation: "authorize_retry", gateId: "uncertain-77" }, "grant-1");
+    expect(command).toEqual({
+      operation: "authorize_retry",
+      expected: binding,
+      authorization_id: "grant-1",
+      gate_id: "uncertain-77",
+      command_id: "command-77",
+      evidence_id: "absence-77",
+    });
+    expect(commandIdentity(command)).toBe("grant-1");
+    expect(commandRequestId(command)).toBeNull();
+  });
+
+  it("refuses when the gate no longer offers it or no longer awaits authorization", () => {
+    const withdrawn = availableControl({ gates: [retryGate({ available_commands: [] })] });
+    expect(() => prepareResolveCommand(withdrawn, { operation: "authorize_retry", gateId: "uncertain-77" }, "grant-1"))
+      .toThrow("This action is no longer available. Refresh the control status.");
+    const uncertain = availableControl({ gates: [retryGate({
+      cause: { kind: "remote_uncertain", command_id: "command-77", unresolved_since: "2026-09-14T00:00:00Z", failed_reads: 3, last_error: "lost" },
+    })] });
+    expect(() => prepareResolveCommand(uncertain, { operation: "authorize_retry", gateId: "uncertain-77" }, "grant-1"))
+      .toThrow("This action is no longer available. Refresh the control status.");
+  });
+
+  it("refuses an authorization ID the server contract would reject", () => {
+    const control = availableControl({ gates: [retryGate()] });
+    expect(() => prepareResolveCommand(control, { operation: "authorize_retry", gateId: "uncertain-77" }, "")).toThrow();
+    expect(() => prepareResolveCommand(control, { operation: "authorize_retry", gateId: "uncertain-77" }, "x".repeat(513))).toThrow();
   });
 });

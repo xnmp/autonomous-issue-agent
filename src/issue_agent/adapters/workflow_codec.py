@@ -54,13 +54,13 @@ _VALUES = (
     w.PendingRearm, w.CompletedRearm, w.SupersededRearm, w.CancelledRearm,
     w.WorkflowSnapshot, w.CommandAbsenceEvidence, w.CommandRetryApplicability,
     w.StandaloneCommand, w.RearmObligation, w.UnconsumedRetryAuthorization,
-    w.ConsumedRetryAuthorization, w.ActiveReconciliation, w.ReconciliationOnly,
+    w.ConsumedRetryAuthorization, w.ClosedRetryAuthorization, w.ActiveReconciliation, w.ReconciliationOnly,
     w.RetiredUncertainCommand, w.RetiredSettledCommand, w.ResolveAttemptResult,
     w.AuthorizedOperatorCommand, w.ObservedTransition,
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,
-    Label, identity.WorkflowFamily, w.StopReason, w.RemediationOperation,
+    Label, identity.WorkflowFamily, w.StopReason, w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
 )
 _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}

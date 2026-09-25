@@ -13,6 +13,7 @@
 .resolve-gates { list-style: none; margin: 0; padding: 0; }
 .resolve-gates > li { border-top: 1px solid var(--border); padding: var(--space-5) 0; }
 .resolve-gate-heading > .resolve-state { display: block; margin: 0 0 var(--space-4); }
+.resolve-pending { font-size: var(--text-sm); color: var(--ink-muted); margin: 0 0 var(--space-4); }
 .resolve-control summary { cursor: pointer; color: var(--ink-muted); padding: var(--space-4) 0; overflow-wrap: anywhere; }
 .resolve-control summary:hover { color: var(--ink); }
 .resolve-control details[open] > summary { color: var(--ink); margin-bottom: var(--space-4); }

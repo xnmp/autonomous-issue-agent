@@ -42,7 +42,7 @@ function CommandDetails({ command }: { command: ResolveCommand }) {
   const scope = command.expected;
   return <>
     <dl className="resolve-facts">
-      <dt>{command.operation === "cancel_rearm" ? "Cancellation ID" : "Request ID"}</dt><dd className="mono">{commandIdentity(command)}</dd>
+      <dt>{command.operation === "cancel_rearm" ? "Cancellation ID" : command.operation === "authorize_retry" ? "Authorization ID" : "Request ID"}</dt><dd className="mono">{commandIdentity(command)}</dd>
       <dt>Repository / issue</dt><dd className="mono">{scope.repository} #{scope.issue}</dd>
       <dt>Family / epoch</dt><dd className="mono">{scope.family} / {scope.epoch}</dd>
       <dt>Generation / version</dt><dd className="mono">{scope.generation} / {scope.version}</dd>
@@ -51,6 +51,7 @@ function CommandDetails({ command }: { command: ResolveCommand }) {
     {command.operation === "request_rearm" && <p>Guidance: {command.guidance.kind === "keep" ? "Keep existing guidance" : command.guidance.kind === "clear" ? "Clear existing guidance" : <span className="resolve-prose">{command.guidance.text}</span>}</p>}
     {command.operation === "continue_rearm" && <p>Continue <span className="mono">{command.stopped_request_id}</span>. No new allowance.</p>}
     {command.operation === "cancel_rearm" && <><p>Cancel request <span className="mono">{command.request_id}</span>.</p><p className="resolve-prose">{command.reason}</p></>}
+    {command.operation === "authorize_retry" && <><p>Authorize one execution of command <span className="mono">{command.command_id}</span>. No allowance is renewed.</p><p>Absence evidence (the harness’s own read): <span className="mono">{command.evidence_id}</span></p></>}
   </>;
 }
 
@@ -99,6 +100,7 @@ export function ResolveControlView(props: ResolveControlViewProps) {
       {control?.status === "available" && <>
         {control.gates.length > 0 && <ul className="resolve-gates">{control.gates.map((gate) => <li key={gate.gate_id}>
           <div className="resolve-gate-heading"><GateCause cause={gate.cause} /><span className="resolve-state">{gate.state}</span></div>
+          {gate.pending_retry && <p className="resolve-pending" role="status">One retry authorized, waiting for the executor. <span className="mono">{gate.pending_retry.authorization_id}</span></p>}
           <details><summary>Hold evidence</summary><p className="mono">{gate.gate_id}</p><p>Opened in generation {gate.opened_generation}.</p>
             {gate.remediation.kind === "attempted" ? <><p>{gate.remediation.operation}: {gate.remediation.outcome}</p><ul>{gate.remediation.evidence_ids.map((evidence) => <li className="mono" key={evidence}>{evidence}</li>)}</ul></> : <p>No remediation recorded.</p>}
           </details>

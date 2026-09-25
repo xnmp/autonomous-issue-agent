@@ -292,11 +292,46 @@ authority, then consumes the authorization atomically with `begin_command` for
 one attempt of the existing command ID. Replayed authorization IDs cannot buy
 another execution. If a crash or unknown result follows consumption, return to
 reconciliation-only, retaining the original expiry; a later proven absence
-requires a fresh explicit one-attempt authorization. A crash before consumption
-leaves the persisted authorization available after restart. If the effect is
-already present, reconcile success without consuming a write. Changed guards
+requires a fresh explicit one-attempt authorization. If the effect is already
+present, reconcile success without consuming a write. Changed guards
 retire/supersede the obligation as described below instead of replacing its
 expected revision. Ordinary `ReconcileGate` remains read-only.
+
+Authorized attempts are human-gated and bounded: each grant buys at most one
+attempt, and one command can be granted at most three attempts over its life
+(journaled when reached). Acceptance, the operator view and the executor's
+spend decision share one validator, so a grant is offered only when the
+executor could begin it (scope, generation, holds, pending obligation and
+workspace, and the store's execution authority). Every grant ends in exactly
+one terminal disposition — consumed, not needed, inapplicable or void — and a
+deterministic gate identity can never rematch a terminal grant.
+
+Fault rows (implemented 2026-09-25):
+
+- Pre-consumption restart: the persisted grant stays open and is spent at the
+  next scheduled read. A grant bypasses the read schedule at most once, recorded
+  durably when the executor selects it.
+- Transient read or spend fault before consumption: the grant stays open, the
+  gate keeps its absence evidence, and reads back off normally; after five such
+  reads or one day the grant is voided (journaled). A definite decline (scope
+  changed, stale read) voids it at once and records the fresh absence.
+- Changed original guard: the grant is inapplicable. A standalone command
+  retires; a re-arm obligation becomes a verified refusal that supersedes its
+  intent (`REQUIRED_EFFECT_REJECTED`) at the next re-arm reconciliation, and
+  it can never be granted again.
+- Consumption rewrites the command's gate to `RemoteOutcomeUncertain` and its
+  schedule, and every read compares the attempt count it began with, so no read
+  taken before an attempt can settle or back absence after it. An unknown
+  settlement rewrites the gate again; a new grant needs absence observed after
+  the last authorized attempt. Reads are stamped at their start.
+- Mid-write reads: an attempt holds its command's exclusive span from the spend
+  decision to its receipt; another drain skips the command until the holder
+  exits, and the kernel releases the span when the holder dies.
+- Operator acceptance takes the deployment barriers that exclude the fix
+  owner's shared effect authority, so a read never straddles acceptance; a read
+  that began before acceptance never judges the grant.
+- Retirement, cancellation or supersession of the command voids its open grant
+  in the same transaction.
 
 ### Superseded and cancelled intent
 

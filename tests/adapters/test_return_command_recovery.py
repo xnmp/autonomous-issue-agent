@@ -129,7 +129,8 @@ def test_ambiguous_superseded_return_is_read_only_even_with_changed_guard(contro
     assert command.command_id in {item.command.command_id for item in selected}
     state = control.command_reconciliation(command.command_id)
     assert isinstance(state, RetiredUncertainCommand)
-    assert executor(control, gateway, logs)._reconcile_read_only(command, state) is present
+    attempts = next(item.attempts for item in selected if item.command.command_id == command.command_id)
+    assert executor(control, gateway, logs)._reconcile_uncertain(command, state, attempts) is present
     assert isinstance(control.command_reconciliation(command.command_id), RetiredSettledCommand)
     assert gateway.calls == [] and logs == []
     current = adapter(control).load_workflow(snapshot.binding.fence.key)
@@ -178,7 +179,8 @@ def test_unavailable_retired_read_preserves_uncertainty_and_backs_off(control):
     control.runnable_commands(repository="o/r", executor_identity=WRITER.owner_id, diagnose=lambda _: None)
     state = control.command_reconciliation(command.command_id)
     assert isinstance(state, RetiredUncertainCommand)
-    assert not control.record_reconciliation_read(command.command_id, state, executor_identity=WRITER.owner_id,
+    assert not control.record_reconciliation_read(command.command_id, state, expected_attempts=1,
+                                                 read_started_at=control.now(), executor_identity=WRITER.owner_id,
                                                  observed=None, error="remote unavailable")
     after = control.command_reconciliation(command.command_id)
     assert isinstance(after, RetiredUncertainCommand)

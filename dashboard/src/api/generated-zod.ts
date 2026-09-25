@@ -315,6 +315,10 @@ const RearmNeedsDecision = z.object({
   reason: z.string(),
   stopped_request_id: z.string(),
 });
+const PendingRetry = z.object({
+  authorization_id: z.string(),
+  command_id: z.string(),
+});
 const NoRemediation = z.object({
   kind: z.literal("none_authorized"),
   reason: z.string(),
@@ -327,7 +331,12 @@ const AttemptedRemediation = z.object({
 });
 const Gate = z.object({
   available_commands: z.array(
-    z.enum(["request_rearm", "continue_rearm", "cancel_rearm"])
+    z.enum([
+      "request_rearm",
+      "continue_rearm",
+      "cancel_rearm",
+      "authorize_retry",
+    ])
   ),
   cause: z.discriminatedUnion("kind", [
     ResolveCeiling,
@@ -338,6 +347,7 @@ const Gate = z.object({
   ]),
   gate_id: z.string(),
   opened_generation: z.number().int(),
+  pending_retry: z.union([PendingRetry, z.null()]),
   remediation: z.discriminatedUnion("kind", [
     NoRemediation,
     AttemptedRemediation,
@@ -407,8 +417,21 @@ const CancelRearm = z.object({
   reason: z.string().min(1).max(16384),
   request_id: z.string().min(1).max(512),
 });
+const AuthorizeRetry = z.object({
+  authorization_id: z.string().min(1).max(512),
+  command_id: z.string().min(1).max(512),
+  evidence_id: z.string().min(1).max(512),
+  expected: ResolveExpected,
+  gate_id: z.string().min(1).max(512),
+  operation: z.literal("authorize_retry"),
+});
 const api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body =
-  z.discriminatedUnion("operation", [RequestRearm, ContinueRearm, CancelRearm]);
+  z.discriminatedUnion("operation", [
+    RequestRearm,
+    ContinueRearm,
+    CancelRearm,
+    AuthorizeRetry,
+  ]);
 const CommandResult = z.object({
   control: z.discriminatedUnion("status", [
     AvailableControl,
@@ -620,6 +643,7 @@ export const schemas = {
   RetryAuthorizationRequired,
   EvidenceUnavailable,
   RearmNeedsDecision,
+  PendingRetry,
   NoRemediation,
   AttemptedRemediation,
   Gate,
@@ -634,6 +658,7 @@ export const schemas = {
   RequestRearm,
   ContinueRearm,
   CancelRearm,
+  AuthorizeRetry,
   api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body,
   CommandResult,
   StepEventsPayload,

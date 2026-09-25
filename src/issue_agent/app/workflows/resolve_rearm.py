@@ -12,7 +12,7 @@ from issue_agent.domain.refs import slugify
 from issue_agent.domain.resolve_rearm import UnavailableResolveRearm
 from issue_agent.domain.resolve_workspace import EpisodeWorkspacePrepared
 from issue_agent.domain.workflow import (
-    CancelRearm, ContinueGrantedRearm, LinkedPrPresent, NoLinkedPr, ObservedIssue,
+    AuthorizeAbsentRetry, CancelRearm, ContinueGrantedRearm, LinkedPrPresent, NoLinkedPr, ObservedIssue,
     OperatorActor, PendingRearm, RequestRearm, WorkflowCommitted, WorkflowConflict,
     WorkflowRejected, WorkflowRejection, WorkflowSnapshot, WorkflowUnchanged,
 )
@@ -47,10 +47,10 @@ class ResolveRearmWorkflow:
         return issue, linkage, self.external_holds(issue)
 
     def submit(
-        self, command: RequestRearm | ContinueGrantedRearm | CancelRearm,
+        self, command: RequestRearm | ContinueGrantedRearm | CancelRearm | AuthorizeAbsentRetry,
         actor: OperatorActor, *, binding: WorkflowBinding | None = None,
     ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected:
-        if not isinstance(command, (RequestRearm, ContinueGrantedRearm, CancelRearm)) or not isinstance(actor, OperatorActor):
+        if not isinstance(command, (RequestRearm, ContinueGrantedRearm, CancelRearm, AuthorizeAbsentRetry)) or not isinstance(actor, OperatorActor):
             return WorkflowRejected(WorkflowRejection.INVALID_SCOPE, "re-arm requires a typed command and authenticated operator")
         if binding is not None and (not isinstance(binding, WorkflowBinding) or binding.fence != command.expected.fence):
             return WorkflowRejected(WorkflowRejection.INVALID_SCOPE, "re-arm binding disagrees with its expected revision")
@@ -59,6 +59,10 @@ class ResolveRearmWorkflow:
             if isinstance(command, CancelRearm):
                 # Cancellation owns its barrier so canonical replay precedes CAS.
                 return self.control.cancel_rearm(command, actor, binding=binding)
+            if isinstance(command, AuthorizeAbsentRetry):
+                # Evidence is the harness's own durable read; no remote I/O
+                # here, and the grant executes only through the fix drain.
+                return self.control.authorize_retry(command, actor, binding=binding)
             accepted = self.control.accepted_rearm(key, command.request_id)
             if accepted is not None:
                 current = self.control.load_workflow(key)

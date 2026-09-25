@@ -122,7 +122,28 @@ class CancelRearm(ClosedContract):
         return w.CancelRearm(self.cancellation_id, self.expected.revision(), self.request_id, self.reason)
 
 
-ResolveCommand = Annotated[RequestRearm | ContinueRearm | CancelRearm, Field(discriminator="operation")]
+class AuthorizeRetry(ClosedContract):
+    """One execution of an existing command; the evidence is the harness's own read."""
+    operation: Literal["authorize_retry"]
+    expected: ResolveExpected
+    authorization_id: Identifier
+    gate_id: Identifier
+    command_id: Identifier
+    evidence_id: Identifier
+
+    def command(self) -> w.AuthorizeAbsentRetry:
+        return w.AuthorizeAbsentRetry(
+            self.authorization_id, self.expected.revision(), w.CommandId(self.command_id),
+            self.gate_id, self.evidence_id,
+        )
+
+
+ResolveCommand = Annotated[RequestRearm | ContinueRearm | CancelRearm | AuthorizeRetry, Field(discriminator="operation")]
+
+
+def requested_rearm(body: RequestRearm | ContinueRearm | CancelRearm | AuthorizeRetry) -> str | None:
+    """The re-arm history a command result should display, if it names one."""
+    return None if isinstance(body, AuthorizeRetry) else body.request_id
 
 
 class ResolveCeiling(ClosedContract):
@@ -180,13 +201,20 @@ class AttemptedRemediation(ClosedContract):
 Remediation = Annotated[NoRemediation | AttemptedRemediation, Field(discriminator="kind")]
 
 
+class PendingRetry(ClosedContract):
+    """One authorized retry accepted and awaiting the executor's decision."""
+    authorization_id: str
+    command_id: str
+
+
 class Gate(ClosedContract):
     gate_id: str
     state: Literal["open", "rearming"]
     opened_generation: int
     cause: GateCause
     remediation: Remediation
-    available_commands: list[Literal["request_rearm", "continue_rearm", "cancel_rearm"]]
+    available_commands: list[Literal["request_rearm", "continue_rearm", "cancel_rearm", "authorize_retry"]]
+    pending_retry: PendingRetry | None
 
 
 class Rearm(ClosedContract):

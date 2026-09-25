@@ -23,7 +23,7 @@ from .resolve_workspace import (
     ResolveWorkspaceObserved,
 )
 from .workflow import (
-    AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
+    AuthoredResolve, AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, EnsureLifecycleProjection, EvidenceUnavailable, FreshResolve, IssueObservation,
     LinkedPrObservation, LinkedPrPresent, NoAuthorizedRemediation, NoLinkedPr, ObservedIssue,
     ObservedTransition, OpenGate, OperatorActor, PendingRearm, RearmingGate,
@@ -33,6 +33,7 @@ from .workflow import (
     UnresolvedGate, WorkflowChanged, WorkflowMutation, WorkflowRejected, adjudication_allowed,
     WorkflowRejection, WorkflowSnapshot, WorkflowTransition, WorkflowUnchanged,
 )
+from .workflow_retry import RetryAuthorizationFacts, authorize_absent_retry
 from .workflow_identity import (
     FamilyAuthority, WorkflowBinding, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier,
 )
@@ -804,6 +805,7 @@ def validate_resolve_transition(
     observations: tuple[ResolveRearmPreflight | ObservedIssue | LinkedPrPresent, ...] = (),
     accepted_preflight: ResolveRearmPreflight | ResolveRearmAcceptance | None = None,
     admission: ResolveAdmission | None = None,
+    retry_facts: RetryAuthorizationFacts | None = None,
 ) -> None:
     """Recompute authoritative deltas; a well-formed snapshot is not permission.
 
@@ -880,6 +882,10 @@ def validate_resolve_transition(
             expected = supersede_resolve_rearm(prior, intent.reason, intent.evidence_id, verified_commands=intent.verified_commands, uncertainty=uncertainty)
         else:
             raise ValueError("workflow stop does not carry its authorized disposition")
+    elif proposal.mutation is WorkflowMutation.AUTHORIZE_RETRY and isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, AuthorizeAbsentRetry):
+        if not isinstance(retry_facts, RetryAuthorizationFacts):
+            raise ValueError("retry authorization requires its harness-owned command facts")
+        expected = authorize_absent_retry(prior, audit.command, audit.actor, retry_facts)
     elif proposal.mutation is WorkflowMutation.RECONCILE_REARM and isinstance(audit, ObservedTransition):
         pending, completed = prior.intent, proposal.snapshot.intent
         if not isinstance(pending, PendingRearm) or not isinstance(completed, CompletedRearm) or set(completed.verified_commands) != set(pending.required_commands):

@@ -7,7 +7,7 @@ import hashlib
 import os
 import stat
 from collections.abc import Iterator
-from contextlib import AbstractContextManager, contextmanager
+from contextlib import AbstractContextManager, ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -24,6 +24,8 @@ class OwnerRegistry(Protocol):
 class EffectAuthority(Protocol):
     def effect(self) -> AbstractContextManager[None]: ...
 
+    def command(self, command_id: str) -> AbstractContextManager[bool]: ...
+
 
 @dataclass(frozen=True)
 class UnfencedEffectAuthority:
@@ -32,6 +34,10 @@ class UnfencedEffectAuthority:
     @contextmanager
     def effect(self) -> Iterator[None]:
         yield
+
+    @contextmanager
+    def command(self, command_id: str) -> Iterator[bool]:
+        yield True
 
 
 def deployment_role(repository: str, owner_id: str) -> str:
@@ -150,3 +156,25 @@ class DeploymentAuthority:
         ):
             self.registry.assert_owner_active(self.owner_id)
             yield
+
+    @contextmanager
+    def command(self, command_id: str) -> Iterator[bool]:
+        """Exclusive, non-blocking claim on one uncertain command's remote span.
+
+        An authorized attempt holds it from its spend decision through its
+        receipt; a reader that cannot take it skips the command. The kernel
+        releases it when the holder dies, so only a live attempt excludes
+        reads (ADR 0015 mid-write reads).
+        """
+        if not command_id:
+            raise ValueError("command span requires a command identity")
+        with ExitStack() as held:
+            try:
+                held.enter_context(_deployment_effect_lock(
+                    self.registry.path, self.repository, f"{self.role}\0command\0{command_id}",
+                    exclusive=True, blocking=False,
+                ))
+            except BlockingIOError:
+                yield False
+                return
+            yield True

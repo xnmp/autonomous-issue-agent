@@ -18,7 +18,7 @@ from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
 from ..domain.contracts import CommandId
 from ..domain.outcome import budget_exhausted, infra_class_failure
 from ..domain.resolve_rearm import (
-    AbsentResolveControl, InactiveResolveControl, ResolveControlRead, ResolveControlView,
+    AbsentResolveControl, InactiveResolveControl, PendingRetry, ResolveControlRead, ResolveControlView,
     PendingResolveRearm, RearmObservation, UnavailableResolveRearm,
     decide_rearm_reconciliation, defer_rearm_observation,
     schedule_rearm_observation, update_rearm_observation,
@@ -36,13 +36,13 @@ from ..domain.resolve_workspace import (
     ObservedResolveBase, PriorResolveAdmission, ResolveWorkspaceObserved,
 )
 from ..domain.workflow import (
-    ActiveReconciliation, AuthoredResolve, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
+    ActiveReconciliation, ReconciliationOnly, RetiredSettledCommand, RetiredUncertainCommand, AuthoredResolve, AuthorizeAbsentRetry, RearmObligation, RetryAuthorizationRequired, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, HeldProjection, LinkedPrPresent, NoLinkedPr, ObservedIssue, ObservedTransition, OpenGate, OperatorActor,
     PendingRearm, RearmingGate, RearmIntent, RemoteOutcomeUncertain,
     RequestRearm, ResolveAdmission, ResolveAttemptResult, ResolveRearmAcceptance, ResolveRearmPreflight, ResolveResultKind, ResolveStage,
     StopReason, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowCommitted,
     WorkflowConflict, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
-    WorkflowUnchanged, WorkflowRejected,
+    WorkflowUnchanged, WorkflowRejected, WorkflowRejection,
 )
 from ..domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
@@ -53,9 +53,10 @@ from ..domain.workflow_policy import (
     cancel_resolve_rearm, reauthor_baseline, record_resolve_attempt, resolve_return_actions, return_gate_id,
     update_return_observation, validate_resolve_transition, split_return_continuation,
 )
+from ..domain.workflow_retry import RetryAuthorizationFacts, authorize_absent_retry, minted_authorization, retry_authorization_available
 from .control_store import (
-    AccountingDisposition, SettlementRequest, SettlementResult, SQLiteControlStore,
-    _command_from_row, admitted_adjudications, latest_work_admission,
+    load_retry_authorization_facts, AccountingDisposition, ControlStoreError, SettlementRequest, SettlementResult, SQLiteControlStore,
+    _command_from_row, _stamp, admitted_adjudications, latest_work_admission,
     proven_unlaunched_run, require_workspace_predecessor, reset_predecessor_admission,
     target_has_work_admissions, workflow_run_scope_bounds,
 )
@@ -122,6 +123,8 @@ def _dedupe_key(proposal: WorkflowChanged) -> tuple[str, str]:
             return "workflow-request", command.request_id
         if isinstance(command, CancelRearm):
             return "workflow-cancellation", command.cancellation_id
+        if isinstance(command, AuthorizeAbsentRetry):
+            return "workflow-retry-authorization", command.authorization_id
     return "workflow-transition", hashlib.sha256(encode_workflow(proposal.expected).encode()).hexdigest()
 
 
@@ -178,7 +181,8 @@ class SQLiteWorkflowControl:
                 selected_id = request_id or (snapshot.intent.request_id if snapshot.intent is not None else None)
                 requested = self._lookup_rearm(db, key, selected_id) if selected_id is not None else None
                 observation = self._rearm_observation(db, snapshot) if isinstance(snapshot.intent, PendingRearm) else None
-                return ResolveControlView(snapshot, selected_id, requested, observation)
+                return ResolveControlView(snapshot, selected_id, requested, observation,
+                                          self._retry_authorizable(db, snapshot), self._retry_pending(db, snapshot))
         except (sqlite3.Error, ValueError, TypeError) as exc:
             reason = (str(exc) or type(exc).__name__).replace("\x00", "")[:16384]
             return WorkflowUnavailable(key, reason)
@@ -440,15 +444,26 @@ class SQLiteWorkflowControl:
                 raise WorkflowAuthorityError("pending re-arm command belongs to another authority")
             receipt_status = row["receipt_status"]
             reconciliation = self._control._command_reconciliation(row)
-            if reconciliation is not None and not isinstance(reconciliation, ActiveReconciliation):
-                raise WorkflowAuthorityError("pending re-arm command has incompatible read history")
+            if isinstance(reconciliation, (RetiredUncertainCommand, RetiredSettledCommand)):
+                raise WorkflowAuthorityError("a pending re-arm obligation cannot already be retired")
+            if isinstance(reconciliation, ReconciliationOnly):
+                # Expired uncertainty keeps its own visible gate, so it is not
+                # re-reported; a grant judged inapplicable is a verified
+                # refusal of the obligation (ADR 0015 changed guards).
+                if row["state"] not in ("executing", "unknown_outcome"):
+                    raise WorkflowAuthorityError("reconciliation-only obligation lacks an unresolved outcome")
+                self._control._require_reconciliation_gate(db, command, reconciliation)
+                if self._control._retry_judged_inapplicable(db, command.command_id):
+                    rejected.append(command.command_id)
+                continue
             if receipt_status is None:
                 if row["state"] not in ("pending", "executing"):
                     raise WorkflowAuthorityError("settled re-arm command lacks its exact receipt")
-                if isinstance(reconciliation, ActiveReconciliation):
+                history = self._control._unresolved_history(row)
+                if history is not None:
                     uncertainty.append(RemoteOutcomeUncertain(
-                        command.command_id, reconciliation.unresolved_since,
-                        reconciliation.failed_reads, "command outcome remains unresolved",
+                        command.command_id, history.unresolved_since,
+                        history.failed_reads, "command outcome remains unresolved",
                     ))
                 continue
             try:
@@ -469,9 +484,8 @@ class SQLiteWorkflowControl:
             elif status is EffectStatus.PERMANENT_FAILURE:
                 rejected.append(command.command_id)
             elif status is EffectStatus.UNKNOWN_OUTCOME:
-                history = reconciliation or ActiveReconciliation(
-                    completed, max(completed, self._control._now()), 0,
-                )
+                history = self._control._unresolved_history(row)
+                assert history is not None
                 uncertainty.append(RemoteOutcomeUncertain(
                     command.command_id, history.unresolved_since, history.failed_reads,
                     row["receipt_error"] or "command outcome remains unresolved",
@@ -619,6 +633,114 @@ class SQLiteWorkflowControl:
                 return self._commit_workflow(
                     db, prior.revision, (prior.authority,), proposal,
                 )
+
+    def _retry_facts(self, db: sqlite3.Connection, command: AuthorizeAbsentRetry) -> RetryAuthorizationFacts:
+        facts = load_retry_authorization_facts(self._control, db, command.command_id, command.evidence_id)
+        row = db.execute("SELECT executor_identity FROM lifecycle_commands WHERE command_id=?", (str(command.command_id),)).fetchone()
+        if facts.command_binding.fence.key != command.expected.fence.key or not self._owns_command(db, row["executor_identity"]):
+            raise WorkflowAuthorityError("retry authorization names a command outside this fix owner's workflow")
+        return facts
+
+    def _retry_authorizable(self, db: sqlite3.Connection, snapshot: WorkflowSnapshot) -> frozenset[str]:
+        available: set[str] = set()
+        for gate in snapshot.gates:
+            if not isinstance(gate, OpenGate) or not isinstance(gate.cause, RetryAuthorizationRequired):
+                continue
+            try:
+                facts = load_retry_authorization_facts(self._control, db, gate.cause.command_id, gate.cause.absence_evidence_id)
+                row = db.execute("SELECT executor_identity FROM lifecycle_commands WHERE command_id=?", (str(gate.cause.command_id),)).fetchone()
+                owned = facts.command_binding.fence.key == snapshot.revision.fence.key and self._owns_command(db, row["executor_identity"])
+            except (WorkflowAuthorityError, ControlStoreError, ValueError, TypeError):
+                continue  # Unreadable authority is never offered as an action.
+            if owned and retry_authorization_available(snapshot, gate, facts):
+                available.add(gate.gate_id)
+        return frozenset(available)
+
+    @staticmethod
+    def _retry_pending(db: sqlite3.Connection, snapshot: WorkflowSnapshot) -> tuple[PendingRetry, ...]:
+        gates = {(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in snapshot.gates}
+        pending = []
+        for row in db.execute(
+            "SELECT g.authorization_id, g.gate_id, g.command_id FROM workflow_retry_authorizations g "
+            "JOIN workflow_gates w USING(gate_id) WHERE g.disposition IS NULL "
+            "AND w.repository=? AND w.target_kind=? AND w.target_number=? ORDER BY g.gate_id",
+            workflow_scope(snapshot.revision.fence.key),
+        ):
+            if row["gate_id"] in gates:
+                pending.append(PendingRetry(row["gate_id"], row["authorization_id"], row["command_id"]))
+        return tuple(pending)
+
+    def _persist_retry_authorization(
+        self, db: sqlite3.Connection, transition: WorkflowChanged, facts: RetryAuthorizationFacts,
+    ) -> None:
+        audit = transition.audit
+        assert isinstance(audit, AuthorizedOperatorCommand) and isinstance(audit.command, AuthorizeAbsentRetry)
+        grant = minted_authorization(audit.command, facts)
+        association = grant.association
+        request_id = association.request_id if isinstance(association, RearmObligation) else None
+        db.execute(
+            "INSERT INTO workflow_retry_authorizations (authorization_id, request_id, command_id, gate_id, "
+            "association_kind, binding_json, evidence_id, request_digest, actor_json, generation, accepted_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (grant.authorization_id, request_id, str(grant.command_id), grant.gate_id,
+             "rearm" if request_id is not None else "standalone",
+             encode_workflow(grant.binding), grant.evidence_id,
+             hashlib.sha256(encode_workflow((audit.actor.subject, audit.command)).encode()).hexdigest(),
+             encode_workflow(audit), grant.binding.fence.generation, _stamp(self._control._now())),
+        )
+        self._control._transition(db, "workflow_retry_authorization", grant.authorization_id, "authorized", {
+            "command_id": str(grant.command_id), "gate_id": grant.gate_id, "evidence_id": grant.evidence_id,
+        })
+
+    def authorize_retry(
+        self, command: AuthorizeAbsentRetry, actor: OperatorActor, *, binding: WorkflowBinding | None = None,
+    ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected:
+        """Persist one operator grant under every resolve deployment barrier."""
+        if not isinstance(command, AuthorizeAbsentRetry) or not isinstance(actor, OperatorActor):
+            raise ValueError("retry authorization requires typed command and actor")
+        if binding is not None and (not isinstance(binding, WorkflowBinding) or binding.fence != command.expected.fence):
+            raise WorkflowAuthorityError("retry binding disagrees with its expected revision")
+        self._scope(command.expected.fence.key)
+        with self._rearm_barriers():
+            with self._control.transaction() as db:
+                self._control._assert_owner_active(db, self.writer.owner_id)
+                prior = load_workflow_row(db, command.expected.fence.key)
+                if prior is None:
+                    raise WorkflowAuthorityError("retry authorization requires workflow authority")
+                stored = db.execute(
+                    "SELECT binding_json, actor_json FROM workflow_retry_authorizations WHERE authorization_id=?",
+                    (command.authorization_id,),
+                ).fetchone()
+                if stored is not None:
+                    try:
+                        accepted = decode_workflow(stored["actor_json"], AuthorizedOperatorCommand)
+                        granted = decode_workflow(stored["binding_json"], WorkflowBinding)
+                    except (ValueError, TypeError) as exc:
+                        raise WorkflowAuthorityError("invalid accepted retry authorization audit") from exc
+                    if accepted.command == command and accepted.actor.subject == actor.subject and (
+                        binding is None or binding == granted
+                    ):
+                        return WorkflowCommitted(prior, idempotent=True)
+                    return WorkflowConflict(prior.revision, "authorization identity was reused with different content or operator")
+                if prior.revision != command.expected:
+                    return WorkflowConflict(prior.revision, "workflow changed before retry authorization")
+                if binding is not None and prior.binding != binding:
+                    return WorkflowConflict(prior.revision, "retry authorization family epoch or episode changed")
+                gate = next((g for g in prior.gates if isinstance(g, OpenGate) and g.gate_id == command.gate_id), None)
+                if gate is None or not isinstance(gate.cause, RetryAuthorizationRequired) or (
+                    gate.cause.command_id, gate.cause.absence_evidence_id,
+                ) != (command.command_id, command.evidence_id):
+                    # Unknown commands and fabricated evidence stop here, before
+                    # any command row is consulted.
+                    return WorkflowRejected(WorkflowRejection.INVALID_SCOPE,
+                                            "the named gate does not await this command's retry authorization")
+                proposal = authorize_absent_retry(prior, command, actor, self._retry_facts(db, command))
+                if isinstance(proposal, WorkflowRejected):
+                    if proposal.code in (WorkflowRejection.STALE_REVISION, WorkflowRejection.AUTHORIZATION_OUTSTANDING):
+                        return WorkflowConflict(prior.revision, proposal.reason)
+                    return proposal
+                assert isinstance(proposal, WorkflowChanged)
+                return self._commit_workflow(db, prior.revision, (prior.authority,), proposal)
 
     def held_projection(self, key: WorkflowKey) -> HeldProjection:
         state = self.load_workflow(key)
@@ -1431,8 +1553,11 @@ class SQLiteWorkflowControl:
             if row is None:
                 raise WorkflowAuthorityError("pending intent lacks its accepted audit")
             accepted_preflight = decode_workflow(row["actor_json"], AuthorizedOperatorCommand).preflight
-        validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight, admission=admission)
+        retry_facts = self._retry_facts(db, transition.audit.command) if isinstance(transition.audit, AuthorizedOperatorCommand) and isinstance(transition.audit.command, AuthorizeAbsentRetry) else None
+        validate_resolve_transition(prior, transition, ceiling=self._resolve_ceiling, now=self._control._now(), observations=observations, accepted_preflight=accepted_preflight, admission=admission, retry_facts=retry_facts)
         self._persist(db, prior, transition, encoded)
+        if retry_facts is not None:
+            self._persist_retry_authorization(db, transition, retry_facts)
         db.execute(
             "INSERT INTO dedupe_keys(namespace, scope, key, claimed_at, payload_json) VALUES (?, ?, ?, ?, ?)",
             (namespace, self.writer.repository, dedupe, self._control._now().isoformat(), encoded),
@@ -1515,6 +1640,8 @@ class SQLiteWorkflowControl:
                 ).fetchone()
                 if row is not None and self._owns_command(db, row["executor_identity"]):
                     rejected = True
+                elif command_id in self._rearm_command_facts(db, prior)[1]:
+                    rejected = True  # A grant judged the obligation inapplicable.
             if not rejected:
                 raise WorkflowAuthorityError("effect-rejected supersession requires an exact required command rejection")
         for command in proposal.commands:

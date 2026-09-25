@@ -244,12 +244,54 @@ the current intent and holds. `workflow_held` describes SQLite holds, not remote
 readiness; submission checks external facts again. Inspection never creates or
 migrates a database, performs Git recovery, or drains commands.
 
-Commands are `request_rearm`, `continue_rearm`, and `cancel_rearm`. Copy the exact
-`expected` identity from GET (repository, issue, family, epoch, generation,
-version, episode). Use stable request/cancellation IDs. Request includes gate ID
-and tagged guidance (`keep`, `clear`, or `set` with text); Continue names the
-stopped request; Cancel names the pending request and reason. Actor identity is
-minted by the server for its local OS account, never accepted from the body.
+Commands are `request_rearm`, `continue_rearm`, `cancel_rearm`, and
+`authorize_retry`. Copy the exact `expected` identity from GET (repository,
+issue, family, epoch, generation, version, episode). Use stable
+request/cancellation/authorization IDs. Request includes gate ID and tagged
+guidance (`keep`, `clear`, or `set` with text); Continue names the stopped
+request; Cancel names the pending request and reason. Actor identity is minted
+by the server for its local OS account, never accepted from the body.
+
+`authorize_retry` is offered only on a `retry_authorization_required` gate: a
+command whose remote outcome expired into reconciliation-only mode and whose
+current postcondition the harness's own read later proved absent. The body
+names `authorization_id`, `gate_id`, `command_id` and `evidence_id` exactly as
+GET reports them; the API never accepts proof. It permits **one** execution of
+the existing command under its current generation and episode. It does not
+renew allowance, create a re-arm, advance generation, reset expiry, or erase
+unresolved history. It is offered and accepted only when the executor could
+begin it now — the same validator decides both: a re-arm obligation needs its
+original request still pending and its workspace handoff verified; a
+returned-result completion needs no other gate holding the workflow; the
+store's own execution-authority check must pass; retired commands are never
+authorizable. The absence must postdate the command's uncertainty and its last
+authorized attempt. Authorized attempts are bounded: one per grant and three
+per command over its life (the last one is journaled as `ceiling_reached`). A
+second grant while one is open, or a reused ID with different content,
+conflicts (409); an evidence ID that already backed a grant, a command whose
+original decision was judged inapplicable, or a command at its ceiling is
+rejected (422). While a grant is open the gate reports it under
+`pending_retry` ("one retry authorized, waiting for the executor").
+
+Every grant ends in one journaled terminal disposition (`consumed`,
+`not_needed`, `inapplicable` or `void`, entity `workflow_retry_authorization`).
+The fix daemon visits a new grant once immediately; later visits follow the
+read schedule. It re-reads the postcondition (stamped at read start): present
+settles success (`not_needed`); unavailable keeps the grant open under the
+normal backoff (`deferred`) and voids it after five unavailable reads or one
+day; a restart before consumption keeps it open for the next scheduled read.
+Absent re-checks the original decision's guards: a changed guard is
+`inapplicable` (a standalone command retires; a re-arm obligation becomes a
+verified refusal that supersedes its request at the next re-arm reconciliation,
+after which `continue_rearm` is available, and it can never be granted again). A
+scope change since acceptance (other hold, generation, cancelled or retired
+obligation, stale read) is `void` and records the fresh absence. Otherwise the
+grant is consumed with the attempt in one transaction and the gate reports the
+attempt as `remote_uncertain`; while the attempt's process is alive no other
+drain reads that command. Success closes the gate; a crash or unverified write
+keeps reconciliation-only with the original history, and a later verified
+absence needs a new grant. Cancelling or superseding a re-arm voids any open
+grant on its retired obligations.
 
 Accepted (202) means durable intent, not completed recovery. Canonical replay
 returns 200, stale identity/content conflicts 409, invalid requests 422, and

@@ -14,6 +14,10 @@ from .workflow import (
 from .workflow_identity import WorkflowBinding, validate_workflow_identifier
 
 
+# A harness absence read older than this cannot back a gate or an attempt.
+ABSENCE_FRESHNESS_SECONDS = 300
+
+
 @dataclass(frozen=True)
 class ReconciliationProgress:
     state: CommandReconciliation
@@ -44,7 +48,7 @@ def absent_reconciliation(
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("reconciliation clock must be timezone-aware")
     uncertainty = prior.uncertainty if isinstance(prior, RetiredUncertainCommand) else prior
-    if not 0 <= (now - evidence.observed_at).total_seconds() <= 300:
+    if not 0 <= (now - evidence.observed_at).total_seconds() <= ABSENCE_FRESHNESS_SECONDS:
         raise ValueError("absence evidence must be fresh and not from the future")
     if evidence.observed_at < uncertainty.history.unresolved_since:
         raise ValueError("absence evidence predates the command's uncertainty")

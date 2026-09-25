@@ -926,6 +926,46 @@ class RetryAlreadyConsumed:
             raise ValueError("retry replay requires prior consumption")
 
 
+class RetryDisposition(str, Enum):
+    """How an operator grant ended without buying an attempt."""
+    NOT_NEEDED = "not_needed"
+    INAPPLICABLE = "inapplicable"
+    VOID = "void"
+
+
+@dataclass(frozen=True)
+class ClosedRetryAuthorization:
+    """A terminal grant that bought no attempt; it can never match again.
+
+    Every grant ends at the executor's first spend decision (consumed or one of
+    these), so a deterministic gate identity cannot revive an old grant.
+    """
+    authorization: UnconsumedRetryAuthorization
+    disposition: RetryDisposition
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authorization, UnconsumedRetryAuthorization):
+            raise ValueError("a closed grant requires a validated authorization")
+        if not isinstance(self.disposition, RetryDisposition):
+            raise ValueError("a closed grant requires a typed disposition")
+        _text(self.reason, "grant disposition reason", limit=MAX_DETAIL_CHARS)
+
+
+@dataclass(frozen=True)
+class RetryDeclined:
+    closed: ClosedRetryAuthorization
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.closed, ClosedRetryAuthorization):
+            raise ValueError("a declined retry requires its terminal grant")
+
+
+@dataclass(frozen=True)
+class RetryStale:
+    """The command's reconciliation moved after the executor's read; nothing was spent."""
+
+
 @dataclass(frozen=True)
 class ReconciliationPolicy:
     initial_delay_seconds: int = 30
@@ -1155,6 +1195,7 @@ class WorkflowRejection(str, Enum):
     OTHER_HOLD = "other_hold"
     INVALID_SCOPE = "invalid_scope"
     MISSING_AUTHORIZATION = "missing_authorization"
+    AUTHORIZATION_OUTSTANDING = "authorization_outstanding"
 
 
 @dataclass(frozen=True)

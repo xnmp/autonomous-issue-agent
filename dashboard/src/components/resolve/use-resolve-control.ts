@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { api, RejectedRequest } from "../../api/client";
 import { usePolled } from "../../api/hooks";
 import type { ResolveCommand, ResolveControl } from "../../api/types";
-import { operationLocksActions, prepareResolveCommand, requestIdProblem, sameBinding, type ResolveDraft, type ResolveOperation } from "./model";
+import { commandRequestId, operationLocksActions, prepareResolveCommand, requestIdProblem, sameBinding, type ResolveDraft, type ResolveOperation } from "./model";
 import { acknowledgeRequest, recoverRequest, retainRequest } from "./retry-journal";
 
 function restore(deployment: string, issue: number): ResolveOperation {
@@ -29,7 +29,7 @@ export function useResolveControl(deployment: string, issue: number) {
   const active = useRef(true);
   const inFlight = useRef<Promise<void> | null>(null);
   useEffect(() => { active.current = true; return () => { active.current = false; }; }, []);
-  const requestId = "command" in operation && operation.kind !== "review" ? operation.command.request_id : selectedId;
+  const requestId = ("command" in operation && operation.kind !== "review" ? commandRequestId(operation.command) : null) ?? selectedId;
   const read = usePolled(
     JSON.stringify(["resolve-control", deployment, issue, requestId, readVersion]),
     (signal) => api.resolveControl(deployment, issue, requestId || undefined, signal),

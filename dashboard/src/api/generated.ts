@@ -347,6 +347,26 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * AuthorizeRetry
+         * @description One execution of an existing command; the evidence is the harness's own read.
+         */
+        AuthorizeRetry: {
+            /** Authorization Id */
+            authorization_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Evidence Id */
+            evidence_id: string;
+            expected: components["schemas"]["ResolveExpected"];
+            /** Gate Id */
+            gate_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "authorize_retry";
+        };
         /** AvailableControl */
         AvailableControl: {
             current_intent: components["schemas"]["Rearm"] | null;
@@ -562,13 +582,14 @@ export interface components {
         /** Gate */
         Gate: {
             /** Available Commands */
-            available_commands: ("request_rearm" | "continue_rearm" | "cancel_rearm")[];
+            available_commands: ("request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry")[];
             /** Cause */
             cause: components["schemas"]["ResolveCeiling"] | components["schemas"]["RemoteUncertain"] | components["schemas"]["RetryAuthorizationRequired"] | components["schemas"]["EvidenceUnavailable"] | components["schemas"]["RearmNeedsDecision"];
             /** Gate Id */
             gate_id: string;
             /** Opened Generation */
             opened_generation: number;
+            pending_retry: components["schemas"]["PendingRetry"] | null;
             /** Remediation */
             remediation: components["schemas"]["NoRemediation"] | components["schemas"]["AttemptedRemediation"];
             /**
@@ -1072,6 +1093,16 @@ export interface components {
             url: string | null;
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * PendingRetry
+         * @description One authorized retry accepted and awaiting the executor's decision.
+         */
+        PendingRetry: {
+            /** Authorization Id */
+            authorization_id: string;
+            /** Command Id */
+            command_id: string;
         };
         /** PullRequestLink */
         PullRequestLink: {
@@ -1679,7 +1710,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["RequestRearm"] | components["schemas"]["ContinueRearm"] | components["schemas"]["CancelRearm"];
+                "application/json": components["schemas"]["RequestRearm"] | components["schemas"]["ContinueRearm"] | components["schemas"]["CancelRearm"] | components["schemas"]["AuthorizeRetry"];
             };
         };
         responses: {

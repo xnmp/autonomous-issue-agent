@@ -481,13 +481,15 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
-`domain/workflow_reconciliation.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
+`domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
 `domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration; workspace handoffs are explicit
 preparation obligations, not AUTHOR evidence or independent execution authority;
-family activation plans legacy imports offline and refuses rather than defaulting).
+family activation plans legacy imports offline and refuses rather than defaulting;
+an operator retry authorization buys exactly one execution of an existing
+reconciliation-only command after harness-proven absence).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/agent_publish.py`,

@@ -16,6 +16,7 @@ import {
   jsonResponse,
   OUTCOME_STATUS,
   rearm,
+  retryGate,
   unavailableControl,
 } from "./test-fixtures";
 
@@ -845,5 +846,118 @@ describe("in-flight reads and replies", () => {
     await act(async () => { reply.release(jsonResponse(commandResult("accepted", availableControl({ current_intent: rearm() })), OUTCOME_STATUS.accepted)); });
     await screen.findByRole("heading", { name: "Command recorded" });
     expect(input).toHaveFocus();
+  });
+});
+
+describe("authorize one retry", () => {
+  it("explains the one-write grant, sends the gate's own evidence under a minted authorization ID, and retries it byte-identically", async () => {
+    const user = userEvent.setup();
+    const r = router("demo", 77);
+    const held = availableControl({ gates: [retryGate()], failures: 0 });
+    r.queueControl(held);
+    render(<ResolveControls deployment="demo" issue={77} heldForHuman={false} onChanged={vi.fn()} />);
+    expect(await screen.findByText("Retry authorization required")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Authorize one retry" }));
+    const form = screen.getByRole("group", { name: "Authorize one retry" });
+    expect(within(form).getByText(/exactly one more execution of existing command/)).toBeInTheDocument();
+    expect(within(form).getByText(/does not renew the resolve allowance/)).toBeInTheDocument();
+    expect(within(form).getByText(/harness’s own current read/)).toBeInTheDocument();
+    await user.click(within(form).getByRole("button", { name: "Review command" }));
+    await screen.findByRole("heading", { name: "Review resolve command" });
+    expect(screen.getByText("Authorization ID")).toBeInTheDocument();
+    expect(r.commandCalls).toHaveLength(0);
+
+    let attempts = 0;
+    r.setCommand(() => {
+      attempts += 1;
+      if (attempts === 1) throw new TypeError("network lost");
+      return jsonResponse(commandResult("replayed", availableControl({ gates: [retryGate({ available_commands: [] })] })), OUTCOME_STATUS.replayed);
+    });
+    await user.click(screen.getByRole("button", { name: "Confirm command" }));
+    await screen.findByRole("heading", { name: "Command outcome not confirmed" });
+    const saved = JSON.parse(sessionStorage.getItem(retryKey("demo", 77))!);
+    expect(saved.command.operation).toBe("authorize_retry");
+    await user.click(screen.getByRole("button", { name: "Retry same command" }));
+    await screen.findByRole("heading", { name: "Command recorded" });
+
+    expect(r.commandCalls).toHaveLength(2);
+    expect(r.commandCalls[1]).toEqual(r.commandCalls[0]);
+    const sent = r.commandCalls[0] as Record<string, unknown>;
+    expect(sent).toEqual({
+      operation: "authorize_retry", expected: binding, authorization_id: sent.authorization_id,
+      gate_id: "uncertain-77", command_id: "command-77", evidence_id: "absence-77",
+    });
+    expect(typeof sent.authorization_id).toBe("string");
+    expect(sessionStorage.getItem(retryKey("demo", 77))).toBeNull();
+    // A grant never selects a re-arm history read.
+    const reads = r.fetchMock.mock.calls.map(([input]) => String(input)).filter((url) => url.includes("resolve-control") && !url.endsWith("/commands"));
+    expect(reads.every((url) => !url.includes("request_id="))).toBe(true);
+  });
+
+  it("shows an open grant as pending rather than an action-less gate", async () => {
+    const r = router("demo", 77);
+    r.queueControl(availableControl({ gates: [retryGate({
+      available_commands: [], pending_retry: { authorization_id: "grant-9", command_id: "command-77" },
+    })] }));
+    render(<ResolveControls deployment="demo" issue={77} heldForHuman={false} onChanged={vi.fn()} />);
+    const status = await screen.findByText(/One retry authorized, waiting for the executor/);
+    expect(within(status).getByText("grant-9")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Authorize one retry" })).not.toBeInTheDocument();
+  });
+
+  it("keeps the selected re-arm history while an authorization is sent and after it is recorded", async () => {
+    const user = userEvent.setup();
+    const r = router("demo", 77);
+    const requested = rearm({ request_id: "history-1", state: "completed" });
+    r.queueControl(availableControl({ gates: [retryGate()] }));
+    render(<ResolveControls deployment="demo" issue={77} heldForHuman={false} onChanged={vi.fn()} />);
+    await screen.findByRole("heading", { name: /Resolve control/ });
+    r.queueControl(availableControl({ gates: [retryGate()], requested_id: requested.request_id, requested_intent: requested }));
+    await user.type(screen.getByLabelText("Look up request ID"), "history-1");
+    await user.click(screen.getByRole("button", { name: "Look up request" }));
+    await screen.findByRole("heading", { name: /^Requested historical re-arm/ });
+
+    await user.click(screen.getByRole("button", { name: "Authorize one retry" }));
+    await user.click(screen.getByRole("button", { name: "Review command" }));
+    await screen.findByRole("heading", { name: "Review resolve command" });
+    const granted = availableControl({
+      gates: [retryGate({ available_commands: [], pending_retry: { authorization_id: "grant-1", command_id: "command-77" } })],
+      requested_id: requested.request_id, requested_intent: requested,
+    });
+    r.setCommand(() => jsonResponse(commandResult("accepted", granted), OUTCOME_STATUS.accepted));
+    r.queueControl(granted);
+    const before = r.fetchMock.mock.calls.length;
+    await user.click(screen.getByRole("button", { name: "Confirm command" }));
+    await screen.findByRole("heading", { name: "Command recorded" });
+
+    const reads = r.fetchMock.mock.calls.slice(before).map(([input]) => String(input))
+      .filter((url) => url.includes("resolve-control") && !url.endsWith("/commands"));
+    expect(reads.length).toBeGreaterThan(0);
+    expect(reads.every((url) => url.includes("request_id=history-1"))).toBe(true);
+    expect(screen.getByRole("region", { name: "Requested historical re-arm" })).toBeInTheDocument();
+  });
+
+  it("does not offer authorization when the server withholds it, even on a retry gate", async () => {
+    const r = router("demo", 77);
+    r.queueControl(availableControl({ gates: [retryGate({ available_commands: [] })] }));
+    render(<ResolveControls deployment="demo" issue={77} heldForHuman={false} onChanged={vi.fn()} />);
+    expect(await screen.findByText("Retry authorization required")).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Authorize one retry" })).not.toBeInTheDocument();
+  });
+
+  it("reports a conflict for a second grant without claiming acceptance", async () => {
+    const user = userEvent.setup();
+    const r = router("demo", 77);
+    r.queueControl(availableControl({ gates: [retryGate()] }));
+    render(<ResolveControls deployment="demo" issue={77} heldForHuman={false} onChanged={vi.fn()} />);
+    await user.click(await screen.findByRole("button", { name: "Authorize one retry" }));
+    await user.click(screen.getByRole("button", { name: "Review command" }));
+    await screen.findByRole("heading", { name: "Review resolve command" });
+    r.setCommand(() => jsonResponse(commandResult("conflict", availableControl({ gates: [retryGate({ available_commands: [] })] }),
+      "this command already has an unconsumed retry authorization"), OUTCOME_STATUS.conflict));
+    await user.click(screen.getByRole("button", { name: "Confirm command" }));
+    await screen.findByRole("heading", { name: "Command not accepted" });
+    expect(screen.getByText(/already has an unconsumed retry authorization/)).toBeInTheDocument();
+    expect(sessionStorage.getItem(retryKey("demo", 77))).toBeNull();
   });
 });

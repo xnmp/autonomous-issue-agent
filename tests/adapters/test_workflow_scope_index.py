@@ -161,6 +161,15 @@ def test_quiescence_ignores_unrelated_and_terminal_publication_history_in_bounde
 
 def _downgrade_to_v20(control):
     with control.transaction() as db:
+        db.execute("DROP TRIGGER workflow_retry_grant_insert")
+        db.execute("DROP TRIGGER workflow_retry_grant_update")
+        db.execute("DROP INDEX workflow_retry_open_grant")
+        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition")
+        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN disposed_at")
+        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition_reason")
+        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN accepted_at")
+        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN first_visit_at")
+        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN unavailable_reads")
         db.execute("DROP TABLE workflow_activation_evidence")
         db.execute("DROP TABLE workflow_activation_imports")
         db.execute("DROP INDEX runs_workflow_scope")

@@ -144,9 +144,20 @@ def test_blocked_sources_refuse_activation_without_writing(deployment, capsys):
 def _downgrade_to_v21(store):
     # Isolated fixture of a deployment still at the previous schema.
     with store.transaction() as db:
+        for statement in (
+            "DROP TRIGGER workflow_retry_grant_insert", "DROP TRIGGER workflow_retry_grant_update",
+            "DROP INDEX workflow_retry_open_grant",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposed_at",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition_reason",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN accepted_at",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN first_visit_at",
+            "ALTER TABLE workflow_retry_authorizations DROP COLUMN unavailable_reads",
+        ):
+            db.execute(statement)
         db.execute("DROP TABLE workflow_activation_evidence")
         db.execute("DROP TABLE workflow_activation_imports")
-        db.execute("DELETE FROM schema_migrations WHERE version=22")
+        db.execute("DELETE FROM schema_migrations WHERE version>=22")
     gc.collect()
     with closing(sqlite3.connect(store.path)) as db:
         db.execute("PRAGMA wal_checkpoint(TRUNCATE)")

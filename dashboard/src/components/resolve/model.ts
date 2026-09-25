@@ -4,7 +4,8 @@ import type { AvailableResolveControl, ResolveCommand, ResolveCommandResult, Res
 export type ResolveDraft =
   | { operation: "request_rearm"; gateId: string; guidance: ResolveGuidance }
   | { operation: "continue_rearm"; gateId: string; stoppedRequestId: string }
-  | { operation: "cancel_rearm"; gateId: string; requestId: string; reason: string };
+  | { operation: "cancel_rearm"; gateId: string; requestId: string; reason: string }
+  | { operation: "authorize_retry"; gateId: string };
 
 export type ResolveOperation =
   | { kind: "idle" }
@@ -27,6 +28,15 @@ export function prepareResolveCommand(control: AvailableResolveControl, draft: R
     if (draft.guidance.kind === "set" && !draft.guidance.text.trim()) throw new Error("Enter guidance or choose Keep or Clear.");
     return parseResolveCommand({ operation: draft.operation, expected, request_id: id, gate_id: draft.gateId, guidance: draft.guidance });
   }
+  if (draft.operation === "authorize_retry") {
+    // The evidence is the harness's own read as reported by the gate; the
+    // operator only authorizes, never supplies proof.
+    if (gate.cause.kind !== "retry_authorization_required") throw new Error("This action is no longer available. Refresh the control status.");
+    return parseResolveCommand({
+      operation: draft.operation, expected, authorization_id: id, gate_id: draft.gateId,
+      command_id: gate.cause.command_id, evidence_id: gate.cause.absence_evidence_id,
+    });
+  }
   const intent = control.current_intent;
   if (!intent || intent.gate_id !== draft.gateId) throw new Error("The recovery request changed. Refresh the control status.");
   if (draft.operation === "continue_rearm") {
@@ -39,7 +49,17 @@ export function prepareResolveCommand(control: AvailableResolveControl, draft: R
 }
 
 export function commandIdentity(command: ResolveCommand): string {
-  return command.operation === "cancel_rearm" ? command.cancellation_id : command.request_id;
+  switch (command.operation) {
+    case "cancel_rearm": return command.cancellation_id;
+    case "authorize_retry": return command.authorization_id;
+    default: return command.request_id;
+  }
+}
+
+/** The re-arm history a command's status read should select, if it names one. */
+/** The re-arm history a command displays; null when it names none (keep the selection). */
+export function commandRequestId(command: ResolveCommand): string | null {
+  return command.operation === "authorize_retry" ? null : command.request_id;
 }
 
 export function operationLocksActions(operation: ResolveOperation): boolean {

@@ -95,22 +95,47 @@ class DurableEffectRunner:
 
         with self.authority.effect():
             self.control.begin_command(command.command_id)
-            started = self.now()
-            try:
-                outcome = operation()
-                receipt = self._outcome_receipt(command, started, outcome)
-            except BaseException as exc:
-                self._commit_receipt(
-                    self._receipt(
-                        command,
-                        started,
-                        EffectStatus.UNKNOWN_OUTCOME,
-                        error=f"{type(exc).__name__}: {exc}",
-                    )
+            return self._perform(command, operation)
+
+    def execute_reconciled(
+        self,
+        command: LifecycleCommand,
+        begin: Callable[[], bool],
+        operation: Callable[[], EffectOutcome[T]],
+    ) -> T | None:
+        """One exclusive span for an uncertain command's reads, spend and write.
+
+        `begin` reads and records (or commits a grant's consumption); False
+        means no write is owed. While a live attempt holds the command's span
+        another drain neither reads nor spends it, and gets None.
+        """
+
+        with self.authority.effect(), self.authority.command(str(command.command_id)) as held:
+            if not held or not begin():
+                return None
+            return self._perform(command, operation)
+
+    def _perform(
+        self,
+        command: LifecycleCommand,
+        operation: Callable[[], EffectOutcome[T]],
+    ) -> T:
+        started = self.now()
+        try:
+            outcome = operation()
+            receipt = self._outcome_receipt(command, started, outcome)
+        except BaseException as exc:
+            self._commit_receipt(
+                self._receipt(
+                    command,
+                    started,
+                    EffectStatus.UNKNOWN_OUTCOME,
+                    error=f"{type(exc).__name__}: {exc}",
                 )
-                raise
-            self._commit_receipt(receipt)
-            return outcome.value
+            )
+            raise
+        self._commit_receipt(receipt)
+        return outcome.value
 
     async def execute_async(
         self,

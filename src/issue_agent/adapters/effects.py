@@ -32,7 +32,11 @@ from ..domain.lifecycle import (
 )
 from ..domain.repository import canonical_repository
 from ..domain.workflow_identity import WorkflowBinding
-from ..domain.workflow import ReconciliationOnly, RetiredUncertainCommand
+from ..domain.workflow import (
+    ReconciliationOnly, RetiredUncertainCommand,
+    RetryBegan, RetryDeclined,
+)
+from ..domain.workflow_retry import RetryAbsenceRead
 from ..domain.contracts import (
     CommandId,
     CommandKind,
@@ -626,7 +630,7 @@ class GitHubEffectExecutor:
             try:
                 reconciliation = self.store.command_reconciliation(command.command_id)
                 if isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
-                    applied = self._reconcile_read_only(command, reconciliation)
+                    applied = self._reconcile_uncertain(command, reconciliation, pending.attempts)
                 elif command.kind is CommandKind.SUBMIT_REVIEW:
                     applied = self._run_review_command(pending)
                 else:
@@ -653,38 +657,112 @@ class GitHubEffectExecutor:
                 completed += 1
         return completed
 
-    def _reconcile_read_only(
-        self, command: LifecycleCommand,
-        state: ReconciliationOnly | RetiredUncertainCommand,
-    ) -> bool:
-        def observe() -> bool:
-            error = ""
-            try:
-                if command.kind is CommandKind.SUBMIT_REVIEW:
-                    payload = command.payload
-                    present = self.gateway.has_review(int(payload["pr"]), str(payload["event"]), str(payload["body"]), str(payload["head"])) if isinstance(self.gateway, ReviewVerifier) else None
+    def _observe_postcondition(self, command: LifecycleCommand) -> tuple[bool | None, str]:
+        """One complete harness read; failure is unavailable, never absence."""
+        try:
+            if command.kind is CommandKind.SUBMIT_REVIEW:
+                payload = command.payload
+                present = self.gateway.has_review(int(payload["pr"]), str(payload["event"]), str(payload["body"]), str(payload["head"])) if isinstance(self.gateway, ReviewVerifier) else None
+            else:
+                action = action_from_command(command)
+                if isinstance(action, Relabel) and _is_compound_relabel(action):
+                    # Current postcondition evidence does not authorize a
+                    # mutation. A changed guard cannot hide retired debt.
+                    issue = self.gateway.get_issue(action.number)
+                    present = (
+                        all(label in issue.labels for label in action.added_labels)
+                        and all(label not in issue.labels for label in action.removed_labels)
+                        and (not action.comment or any(item.body == action.comment for item in issue.comments))
+                    )
                 else:
-                    action = action_from_command(command)
-                    if isinstance(action, Relabel) and _is_compound_relabel(action):
-                        # Current postcondition evidence does not authorize a
-                        # mutation. A changed guard cannot hide retired debt.
-                        issue = self.gateway.get_issue(action.number)
-                        present = (
-                            all(label in issue.labels for label in action.added_labels)
-                            and all(label not in issue.labels for label in action.removed_labels)
-                            and (not action.comment or any(item.body == action.comment for item in issue.comments))
-                        )
-                    else:
-                        present = self._reconcile(action, command)
+                    present = self._reconcile(action, command)
+        except sqlite3.Error:
+            raise
+        except Exception as exc:  # noqa: BLE001 — bounded durable failed-read evidence
+            return None, f"{type(exc).__name__}: {exc}"
+        return present, ""
+
+    def _current_revision(self, command: LifecycleCommand) -> str:
+        number = int(command.target.split(":", 1)[1])
+        current = (
+            self.gateway.get_pr(number, mergeability=False, checks=False).head_ref_oid
+            if command.target.startswith("pr:") else self.gateway.get_issue(number).updated_at
+        )
+        if not current:
+            raise UnknownEffectOutcome(f"{command.command_id}: current revision is unavailable")
+        return str(current)
+
+    def _reconcile_uncertain(
+        self, command: LifecycleCommand,
+        state: ReconciliationOnly | RetiredUncertainCommand, attempts: int,
+    ) -> bool:
+        """Read an uncertain command, spending an operator grant if one is open.
+
+        Everything runs inside the command's exclusive span (a live attempt
+        excludes it) and the shared effect authority, which operator grant
+        acceptance excludes, so whether a grant exists is decided atomically
+        with the read. Reads are stamped at their start.
+
+        With a grant (ADR 0015): present settles without spending it;
+        unavailable keeps it open under backoff up to its ceiling; absent
+        re-evaluates the original decision's guards (never adopting a newer
+        revision) and the store makes the grant's single spend decision. The
+        write's only receipts are verified success or unknown outcome.
+        """
+        if command.workflow is None:
+            raise ValueError("uncertain command reconciliation requires a workflow-bound command")
+        settled = False
+
+        def record(started, present: bool | None, error: str) -> bool:
+            return self.store.record_reconciliation_read(
+                command.command_id, state, expected_attempts=attempts, read_started_at=started,
+                executor_identity=self.identity, observed=present, error=error,
+            )
+
+        def begin() -> bool:
+            nonlocal settled
+            grant = (self.store.retry_authorization(command.command_id)
+                     if isinstance(state, ReconciliationOnly) else None)
+            started = self.store.now()
+            present, error = self._observe_postcondition(command)
+            if grant is None or present is not False:
+                settled = record(started, present, error)
+                return False
+            try:
+                guard_holds = self._revision_matches(command)
+                revision = self._current_revision(command)
+                outcome = self.store.begin_authorized_retry(
+                    command.command_id, grant.authorization_id, expected=state, expected_attempts=attempts,
+                    read=RetryAbsenceRead(started, revision, guard_holds),
+                    executor_identity=self.identity,
+                )
             except sqlite3.Error:
                 raise
-            except Exception as exc:  # noqa: BLE001 — bounded durable failed-read evidence
-                present, error = None, f"{type(exc).__name__}: {exc}"
-            return self.store.record_reconciliation_read(
-                command.command_id, state, executor_identity=self.identity,
-                observed=present, error=error,
+            except Exception as exc:  # noqa: BLE001 — a transient fault counts toward the grant's ceiling
+                self.log(f"lifecycle command {command.command_id} retry spend unavailable: {type(exc).__name__}: {exc}")
+                record(started, None, f"retry spend unavailable: {type(exc).__name__}: {exc}")
+                return False
+            if isinstance(outcome, RetryDeclined):
+                self.log(f"lifecycle command {command.command_id} retry grant {grant.authorization_id} "
+                         f"{outcome.closed.disposition.value}: {outcome.closed.reason}")
+            return isinstance(outcome, RetryBegan)
+
+        def write() -> EffectOutcome[bool]:
+            if command.kind is CommandKind.SUBMIT_REVIEW:
+                payload = command.payload
+                applied = bool(self.gateway.submit_review(int(payload["pr"]), str(payload["event"]), str(payload["body"]), str(payload["head"])))
+            else:
+                applied = bool(self._apply(action_from_command(command), command))
+            verified, error = self._observe_postcondition(command) if applied else (False, "")
+            if verified is True:
+                return EffectOutcome(True, EffectStatus.SUCCEEDED)
+            raise UnknownEffectOutcome(
+                f"{command.command_id}: authorized retry did not verify its postcondition"
+                + (f" ({error})" if error else "" if applied else " (write refused)")
             )
-        return self.effects.authorized(observe)
+
+        written = self.effects.execute_reconciled(command, begin, write)
+        return settled or bool(written)
 
     def _note_unowned_kind(self, kind: CommandKind) -> None:
         """Report a queued kind belonging to another executor once per process.

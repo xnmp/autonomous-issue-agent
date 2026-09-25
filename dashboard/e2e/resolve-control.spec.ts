@@ -232,4 +232,37 @@ test.describe("resolve operator controls", () => {
       await page.screenshot({ path: test.info().outputPath(`uncertain-${width}.png`), fullPage: true });
     }
   });
+
+  test("authorize one retry on a verified-absence gate: explains the one-write grant and records it once", async ({ page }) => {
+    const issue = 71;
+    await gotoIssue(page, issue);
+    await expect(page.getByText("Retry authorization required")).toBeVisible();
+    await page.getByRole("button", { name: "Authorize one retry" }).click();
+    const form = page.getByRole("group", { name: "Authorize one retry" });
+    await expect(form).toContainText("exactly one more execution of existing command");
+    await expect(form).toContainText("does not renew the resolve allowance");
+    await expect(form).toContainText("harness’s own current read");
+    await form.getByRole("button", { name: "Review command" }).click();
+    await expect(page.getByRole("heading", { name: "Review resolve command" })).toBeVisible();
+    const authorizationId = await page.locator('.resolve-operation dt:has-text("Authorization ID") + dd').textContent();
+    expect(authorizationId).toBeTruthy();
+    await expect(page.locator(".resolve-operation")).toContainText(`absence-${issue}`);
+
+    const posted = page.waitForRequest(`**/api/repos/self/issues/${issue}/resolve-control/commands`);
+    await page.getByRole("button", { name: "Confirm command" }).click();
+    const body = (await posted).postDataJSON();
+    expect(body).toMatchObject({
+      operation: "authorize_retry", authorization_id: authorizationId,
+      gate_id: `uncertain-${issue}`, command_id: `command-${issue}`, evidence_id: `absence-${issue}`,
+    });
+    await expect(page.getByRole("heading", { name: "Command recorded" })).toBeVisible();
+    await page.getByRole("button", { name: "Close result" }).click();
+    // The grant is recorded once: the gate stays visible but offers no second grant.
+    await expect(page.getByText("Retry authorization required")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Authorize one retry" })).toHaveCount(0);
+    // ...and reports the open grant as pending on the executor.
+    const pending = page.getByText(/One retry authorized, waiting for the executor/);
+    await expect(pending).toBeVisible();
+    await expect(pending).toContainText(authorizationId!);
+  });
 });

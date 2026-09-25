@@ -3,7 +3,7 @@
 import os
 
 from ...domain import workflow as w
-from ...domain.resolve_rearm import AbsentResolveControl, InactiveResolveControl, ResolveControlView
+from ...domain.resolve_rearm import AbsentResolveControl, InactiveResolveControl, PendingRetry, ResolveControlView
 from ...domain.workflow_identity import IssueRef, WorkflowKey
 from ..workflows.resolve_rearm import ResolveRearmWorkflow
 from . import resolve_contracts as wire
@@ -49,7 +49,8 @@ def _cause(cause: w.GateCause) -> wire.GateCause:
                                    obligations=list(cause.obligations), reason=cause.reason.value)
 
 
-def _gate(gate: w.UnresolvedGate, snapshot: w.WorkflowSnapshot) -> wire.Gate:
+def _gate(gate: w.UnresolvedGate, snapshot: w.WorkflowSnapshot, retry_authorizable: frozenset[str] = frozenset(),
+          retry_pending: tuple[PendingRetry, ...] = ()) -> wire.Gate:
     opened = gate.gate if isinstance(gate, w.RearmingGate) else gate
     remediation = opened.remediation
     remedy = (wire.NoRemediation(kind="none_authorized", reason=remediation.reason)
@@ -64,9 +65,14 @@ def _gate(gate: w.UnresolvedGate, snapshot: w.WorkflowSnapshot) -> wire.Gate:
         commands = ["continue_rearm"]
     elif isinstance(opened.cause, w.ResolveCeiling) and not isinstance(intent, w.PendingRearm):
         commands = ["request_rearm"]
+    elif isinstance(opened.cause, w.RetryAuthorizationRequired) and opened.gate_id in retry_authorizable:
+        commands = ["authorize_retry"]
+    pending = next((item for item in retry_pending if item.gate_id == opened.gate_id), None)
     return wire.Gate(gate_id=opened.gate_id, state="rearming" if isinstance(gate, w.RearmingGate) else "open",
                      opened_generation=opened.opened_generation, cause=_cause(opened.cause),
-                     remediation=remedy, available_commands=commands)
+                     remediation=remedy, available_commands=commands,
+                     pending_retry=None if pending is None else wire.PendingRetry(
+                         authorization_id=pending.authorization_id, command_id=pending.command_id))
 
 
 def read_control(workflow: ResolveRearmWorkflow, number: int, request_id: str | None = None) -> wire.ResolveControl:
@@ -86,7 +92,7 @@ def read_control(workflow: ResolveRearmWorkflow, number: int, request_id: str | 
         expected=wire.ResolveExpected(repository=key.repository, issue=number, family="resolve", epoch=state.authority.epoch,
                                       generation=state.revision.fence.generation, version=state.revision.version,
                                       episode_id=state.episode.episode_id),
-        workflow_held=bool(state.gates), gates=[_gate(gate, state) for gate in state.gates],
+        workflow_held=bool(state.gates), gates=[_gate(gate, state, result.retry_authorizable, result.retry_pending) for gate in state.gates],
         guidance=state.episode.guidance, failures=state.episode.failures,
         current_intent=_rearm(state.intent), requested_id=result.requested_id, requested_intent=_rearm(result.requested),
         observation=(wire.Observation(unresolved_since=observation.history.unresolved_since.isoformat(),
@@ -106,7 +112,7 @@ def submit_control(workflow: ResolveRearmWorkflow, number: int, body: wire.Resol
     # or User-Agent claim. The server's loopback/Origin/CSRF boundary is required.
     actor = w.OperatorActor(f"local-user:{os.getuid()}", "dashboard")
     result = workflow.submit(command, actor, binding=body.expected.binding())
-    control = read_control(workflow, number, body.request_id)
+    control = read_control(workflow, number, wire.requested_rearm(body))
     if isinstance(result, w.WorkflowCommitted):
         return wire.CommandResult(outcome="replayed" if result.idempotent else "accepted", reason="", control=control)
     if isinstance(result, w.WorkflowConflict):

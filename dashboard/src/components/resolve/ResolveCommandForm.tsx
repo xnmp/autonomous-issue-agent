@@ -25,11 +25,12 @@ export function ResolveCommandForm({ control, gate, disabled, onPrepare }: {
   const intent = control.current_intent;
   const allowed = gate.available_commands.filter((operation) => {
     if (operation === "request_rearm") return intent?.state !== "pending";
+    if (operation === "authorize_retry") return gate.cause.kind === "retry_authorization_required";
     if (!intent || intent.gate_id !== gate.gate_id) return false;
     return operation === "cancel_rearm" ? intent.state === "pending" : ["cancelled", "superseded"].includes(intent.state);
   });
   if (allowed.length === 0) return null;
-  const labels = { request_rearm: "Request re-arm", continue_rearm: "Continue existing re-arm", cancel_rearm: "Cancel pending re-arm" };
+  const labels = { request_rearm: "Request re-arm", continue_rearm: "Continue existing re-arm", cancel_rearm: "Cancel pending re-arm", authorize_retry: "Authorize one retry" };
   const selected = mode && allowed.includes(mode) ? mode : null;
   const submit = () => {
     if (disabled || !selected) return;
@@ -38,6 +39,8 @@ export function ResolveCommandForm({ control, gate, disabled, onPrepare }: {
       onPrepare({ operation: selected, gateId: gate.gate_id, guidance: guidance === "set" ? { kind: "set", text } : { kind: guidance } });
     } else if (selected === "continue_rearm" && intent) {
       onPrepare({ operation: selected, gateId: gate.gate_id, stoppedRequestId: intent.request_id });
+    } else if (selected === "authorize_retry") {
+      onPrepare({ operation: selected, gateId: gate.gate_id });
     } else if (selected === "cancel_rearm" && intent) {
       if (!reason.trim()) { setError("Enter a reason for cancellation."); return; }
       onPrepare({ operation: selected, gateId: gate.gate_id, requestId: intent.request_id, reason });
@@ -72,6 +75,18 @@ export function ResolveCommandForm({ control, gate, disabled, onPrepare }: {
           Continue stopped request <span className="mono">{intent?.request_id}</span> using its existing episode and workspace handoff.
           This does not renew the allowance again.
         </p>}
+        {selected === "authorize_retry" && gate.cause.kind === "retry_authorization_required" && <>
+          <p>
+            Permit exactly one more execution of existing command <span className="mono">{gate.cause.command_id}</span> under
+            its current generation and episode. This does not renew the resolve allowance, create a re-arm, or reset its
+            unresolved history.
+          </p>
+          <p>
+            The evidence is the harness’s own current read proving the command’s effect absent
+            (<span className="mono">{gate.cause.absence_evidence_id}</span>). The daemon reads again before writing; if the
+            effect has appeared meanwhile, nothing is written. A lost or unverified attempt needs a new authorization.
+          </p>
+        </>}
         {selected === "cancel_rearm" && <>
           <p>Stop request <span className="mono">{intent?.request_id}</span>. Cancellation does not undo workspace preparation or remote effects, erase receipts, or refund allowance.</p>
           <label htmlFor={`${id}-reason`}>Reason for cancellation</label>
@@ -81,7 +96,7 @@ export function ResolveCommandForm({ control, gate, disabled, onPrepare }: {
         </>}
         {error && <p id={`${id}-error`} role="alert" className="resolve-error">{error}</p>}
         <div className="resolve-actions">
-          <button autoFocus={selected === "continue_rearm"} className="btn btn-primary" type="submit">Review command</button>
+          <button autoFocus={selected === "continue_rearm" || selected === "authorize_retry"} className="btn btn-primary" type="submit">Review command</button>
           <button className="btn btn-ghost" type="button" onClick={() => {
             restoreFocus.current = true; setMode(null); setError(null);
           }}>Close form</button>

@@ -17,8 +17,22 @@ export function ceilingGate(overrides: Partial<ResolveGate> = {}): ResolveGate {
     state: "open",
     opened_generation: 4,
     available_commands: ["request_rearm"],
+    pending_retry: null,
     cause: { kind: "resolve_ceiling", episode_id: "episode-77", failures: 3, ceiling: 3, last_failure: "tests still red" },
     remediation: { kind: "none_authorized", reason: "operator decision required" },
+    ...overrides,
+  };
+}
+
+export function retryGate(overrides: Partial<ResolveGate> = {}): ResolveGate {
+  return {
+    gate_id: "uncertain-77",
+    state: "open",
+    opened_generation: 4,
+    available_commands: ["authorize_retry"],
+    pending_retry: null,
+    cause: { kind: "retry_authorization_required", command_id: "command-77", absence_evidence_id: "absence-77" },
+    remediation: { kind: "attempted", operation: "reconcile_remote", evidence_ids: ["absence-77"], outcome: "verified_absent" },
     ...overrides,
   };
 }

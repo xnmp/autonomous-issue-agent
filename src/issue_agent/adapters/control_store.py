@@ -39,15 +39,21 @@ from ..domain.contracts import (
     TokenUsage,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import WorkflowBinding, WorkflowKey, WorkflowRevision, validate_workflow_integer
+from ..domain.workflow_identity import WorkflowBinding, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
 from ..domain.workflow import (
-    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation,
-    NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
+    ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, CommandRetryApplicability,
+    ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryAlreadyConsumed,
+    RetryBegan, RetryDeclined, RetryDisposition, RetryStale, StandaloneCommand,
+    UnconsumedRetryAuthorization, NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
     RemoteOutcomeUncertain, RetiredSettledCommand, RetiredUncertainCommand, RetryAuthorizationRequired,
     AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
-from ..domain.workflow_reconciliation import ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
+from ..domain.workflow_retry import (
+    MAX_AUTHORIZED_ATTEMPTS, MAX_RELEVANT_AUTHORIZATIONS, BeginRetry, DeclineRetry, grant_unavailable_void, RetryAbsenceRead, RetryAuthorization, RetryAuthorizationFacts,
+    retry_spend_decision,
+)
+from ..domain.workflow_reconciliation import ABSENCE_FRESHNESS_SECONDS, ReconciliationProgress, absent_reconciliation, reconciliation_due, unavailable_reconciliation
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
 from ..domain.outcome import AuthorFollowup, author_followup
 from ..domain.resolve_split import MAX_SPLIT_TRAIL, AdjudicationInput, ContractResetCompleted, ReauthorInput, ReauthorResetIntent, SplitContext, SplitImplement, SplitInput, split_context, validate_contract_rounds
@@ -78,7 +84,7 @@ from .deployment_authority import (
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, load_resolve_authority, load_workflow_row, load_workspace_ack, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 22
+SCHEMA_VERSION = 23
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1280,6 +1286,56 @@ CREATE TABLE workflow_activation_evidence (
         REFERENCES workflow_authority_epochs (repository, family)
 );
 """),
+    # ADR 0015 retry grants (review 2026-09-25). Every grant ends terminal;
+    # an open grant is the only row that can match; at most one exists per
+    # command; a disposition never changes. An open grant may only record its
+    # single schedule bypass and count unavailable reads toward its ceiling.
+    # Legacy consumed rows take their command's last update as the attempt
+    # time, which only ever demands a later absence observation.
+    SchemaMigration(23, """
+ALTER TABLE workflow_retry_authorizations ADD COLUMN disposition TEXT
+    CHECK (disposition IN ('consumed', 'not_needed', 'inapplicable', 'void'));
+ALTER TABLE workflow_retry_authorizations ADD COLUMN disposed_at TEXT;
+ALTER TABLE workflow_retry_authorizations ADD COLUMN disposition_reason TEXT;
+ALTER TABLE workflow_retry_authorizations ADD COLUMN accepted_at TEXT;
+ALTER TABLE workflow_retry_authorizations ADD COLUMN first_visit_at TEXT;
+ALTER TABLE workflow_retry_authorizations ADD COLUMN unavailable_reads INTEGER NOT NULL DEFAULT 0
+    CHECK (unavailable_reads >= 0);
+UPDATE workflow_retry_authorizations
+SET disposition='consumed', disposition_reason='authorized attempt began',
+    disposed_at=(SELECT updated_at FROM lifecycle_commands c
+                 WHERE c.command_id=workflow_retry_authorizations.command_id)
+WHERE consumed_attempt IS NOT NULL;
+UPDATE workflow_retry_authorizations
+SET accepted_at=(SELECT updated_at FROM lifecycle_commands c
+                 WHERE c.command_id=workflow_retry_authorizations.command_id);
+CREATE UNIQUE INDEX workflow_retry_open_grant ON workflow_retry_authorizations(command_id)
+WHERE disposition IS NULL;
+CREATE TRIGGER workflow_retry_grant_insert BEFORE INSERT ON workflow_retry_authorizations
+WHEN NEW.disposition IS NOT NULL OR NEW.consumed_attempt IS NOT NULL OR NEW.disposed_at IS NOT NULL
+    OR NEW.disposition_reason IS NOT NULL OR NEW.first_visit_at IS NOT NULL
+    OR NEW.unavailable_reads != 0 OR NEW.accepted_at IS NULL
+BEGIN
+    SELECT RAISE(ABORT, 'a retry grant is created open');
+END;
+CREATE TRIGGER workflow_retry_grant_update BEFORE UPDATE ON workflow_retry_authorizations
+WHEN OLD.disposition IS NOT NULL
+    OR NEW.authorization_id IS NOT OLD.authorization_id OR NEW.request_id IS NOT OLD.request_id
+    OR NEW.command_id IS NOT OLD.command_id OR NEW.gate_id IS NOT OLD.gate_id
+    OR NEW.association_kind IS NOT OLD.association_kind OR NEW.binding_json IS NOT OLD.binding_json
+    OR NEW.evidence_id IS NOT OLD.evidence_id OR NEW.request_digest IS NOT OLD.request_digest
+    OR NEW.actor_json IS NOT OLD.actor_json OR NEW.generation IS NOT OLD.generation
+    OR NEW.accepted_at IS NOT OLD.accepted_at
+    OR (OLD.first_visit_at IS NOT NULL AND NEW.first_visit_at IS NOT OLD.first_visit_at)
+    OR NEW.unavailable_reads NOT IN (OLD.unavailable_reads, OLD.unavailable_reads + 1)
+    OR (NEW.disposition IS NULL AND (NEW.disposed_at IS NOT NULL OR NEW.disposition_reason IS NOT NULL
+        OR NEW.consumed_attempt IS NOT NULL))
+    OR (NEW.disposition IS NOT NULL AND (NEW.disposed_at IS NULL OR NEW.disposition_reason IS NULL
+        OR (NEW.disposition = 'consumed') != (NEW.consumed_attempt IS NOT NULL)))
+BEGIN
+    SELECT RAISE(ABORT, 'a retry grant is disposed exactly once and is otherwise immutable');
+END;
+"""),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -2101,6 +2157,10 @@ class SQLiteControlStore:
                 ),
             )
             return (prior_rows, moved_outbox)
+
+    def now(self) -> datetime:
+        """This store's authority clock; executors stamp their reads with it."""
+        return self._now()
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -4843,8 +4903,20 @@ class SQLiteControlStore:
                     reconciliation = self._command_reconciliation(row)
                     if isinstance(reconciliation, (RetiredSettledCommand, RetiredUncertainCommand)):
                         self._require_retirement_evidence(db, command, reconciliation)
+                    authorized_now = False
                     if isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
-                        self._require_reconciliation_gate(db, command, reconciliation)
+                        gate = self._require_reconciliation_gate(db, command, reconciliation)
+                        # A freshly accepted grant is due now, exactly once;
+                        # later visits follow the bounded read schedule.
+                        grant = self._executable_authorization(db, command.command_id, gate) if isinstance(
+                            reconciliation, ReconciliationOnly) else None
+                        # Recorded in this transaction, so a grant bypasses the
+                        # schedule once however its visit ends.
+                        authorized_now = grant is not None and db.execute(
+                            "UPDATE workflow_retry_authorizations SET first_visit_at=? "
+                            "WHERE authorization_id=? AND disposition IS NULL AND first_visit_at IS NULL",
+                            (_stamp(self._now()), grant.authorization_id),
+                        ).rowcount == 1
                     if reconciliation is None or isinstance(reconciliation, ActiveReconciliation):
                         if not self._workspace_projection_ready(db, command):
                             continue
@@ -4857,7 +4929,7 @@ class SQLiteControlStore:
                             reconciliation = self._retire_return_projection(db, row, command, current)
                         if current.binding == attempt.binding and current.gates and not isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
                             continue
-                    if reconciliation is not None and not reconciliation_due(reconciliation, self._now()):
+                    if reconciliation is not None and not authorized_now and not reconciliation_due(reconciliation, self._now()):
                         continue
                     selected.append(PendingCommand(command, row["state"], row["attempts"], int(row["refusals"])))
                 except (ValueError, TypeError, KeyError, ControlStoreError) as exc:
@@ -4883,6 +4955,35 @@ class SQLiteControlStore:
                    (retirement_id, *scope, str(command.command_id), evidence))
         return self._retire_workflow_command(db, row, command, current, retirement_id, create_uncertainty=True)
 
+    @classmethod
+    def _unresolved_history(cls, row: sqlite3.Row) -> ActiveReconciliation | None:
+        """The one durable source of a command's unresolved read history.
+
+        Persisted history wins; otherwise an executing or unknown command has
+        been unresolved since the store stamped its current state. That
+        fallback relies on no write touching `updated_at` between the
+        uncertain receipt and the first persisted history; anything that
+        would must persist history first.
+        """
+        state = cls._command_reconciliation(row)
+        if isinstance(state, ActiveReconciliation):
+            return state
+        if isinstance(state, ReconciliationOnly):
+            return state.history
+        if isinstance(state, RetiredUncertainCommand):
+            return state.uncertainty.history
+        if row["state"] not in ("executing", "unknown_outcome"):
+            return None
+        since = datetime.fromisoformat(row["updated_at"])
+        return ActiveReconciliation(since, since, 0)
+
+    @staticmethod
+    def _retry_judged_inapplicable(db: sqlite3.Connection, command_id: CommandId) -> bool:
+        return db.execute(
+            "SELECT 1 FROM workflow_retry_authorizations WHERE command_id=? AND disposition='inapplicable'",
+            (str(command_id),),
+        ).fetchone() is not None
+
     def _retire_workflow_command(
         self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand,
         current: WorkflowSnapshot, retirement_id: str, *, create_uncertainty: bool = False,
@@ -4904,7 +5005,9 @@ class SQLiteControlStore:
             if gate is None and not create_uncertainty:
                 raise WorkflowAuthorityError("retiring an uncertain command requires its visible uncertainty gate")
             if history is None:
-                since = datetime.fromisoformat(row["updated_at"])
+                unresolved = self._unresolved_history(row)
+                assert unresolved is not None
+                since = unresolved.unresolved_since
                 if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) and gate.cause.unresolved_since != since:
                     raise WorkflowAuthorityError("command uncertainty must retain its recorded start")
                 history = ActiveReconciliation(since, max(since, self._now()), gate.cause.failed_reads if gate is not None and isinstance(gate.cause, RemoteOutcomeUncertain) else 0)
@@ -4937,6 +5040,11 @@ class SQLiteControlStore:
             state = RetiredSettledCommand(retirement_id, outcome_id)
         db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
                    (encode_workflow(state), str(command.command_id)))
+        grant = self._open_authorization(db, command.command_id)
+        if grant is not None:
+            # A retired command can never execute, so its grant ends with it.
+            self._dispose_grant(db, grant, RetryDisposition.VOID.value, "the command was retired before the grant was spent",
+                                details={"evidence_id": retirement_id})
         self._transition(db, "lifecycle_command", str(command.command_id), "superseded", {"evidence_id": retirement_id})
         return state
 
@@ -4968,11 +5076,24 @@ class SQLiteControlStore:
 
     def record_reconciliation_read(
         self, command_id: CommandId, expected: ReconciliationOnly | RetiredUncertainCommand,
-        *, executor_identity: str, observed: bool | None, error: str = "",
+        *, expected_attempts: int, read_started_at: datetime, executor_identity: str,
+        observed: bool | None, error: str = "",
     ) -> bool:
-        """Persist a harness read, never permission to repeat a remote mutation."""
+        """Persist a harness read, never permission to repeat a remote mutation.
+
+        `expected` and `expected_attempts` were observed before the read: a
+        read that began before another attempt cannot settle after it. The
+        read is stamped at its start (store clock), the conservative bound.
+        An open retry grant accepted before the read began ends when the
+        postcondition is present, and otherwise survives unavailable reads
+        under the normal backoff up to its bounded ceiling (ADR 0015).
+        """
         if observed is not None and not isinstance(observed, bool):
             raise ValueError("postcondition observation must be a boolean or unavailable")
+        if type(expected_attempts) is not int or expected_attempts < 0:
+            raise ValueError("reconciliation requires the attempt count observed before the read")
+        if not isinstance(read_started_at, datetime) or read_started_at.tzinfo is None or read_started_at.utcoffset() is None:
+            raise ValueError("reconciliation requires the timezone-aware start of its read")
         with self.transaction() as db:
             self._assert_owner_active(db, executor_identity)
             row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
@@ -4984,27 +5105,48 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
             self._return_projection_attempt(db, command)
             state = self._command_reconciliation(row)
-            if state != expected:
-                return False  # Another verified read already advanced this history.
+            if state != expected or int(row["attempts"]) != expected_attempts:
+                return False  # Another read or attempt already advanced this history.
             self._require_reconciliation_gate(db, command, state)
             if isinstance(state, RetiredUncertainCommand):
                 self._require_retirement_evidence(db, command, state)
             uncertainty = state.uncertainty if isinstance(state, RetiredUncertainCommand) else state
             assert isinstance(uncertainty, ReconciliationOnly)
             now = self._now()
-            evidence_payload = json.dumps({"command": str(command_id), "observed_at": _stamp(now),
+            if not 0 <= (now - read_started_at).total_seconds() <= ABSENCE_FRESHNESS_SECONDS:
+                raise ValueError("a reconciliation read must be recorded fresh and cannot start in the future")
+            grant = self._open_authorization(db, command_id)
+            accepted_at = self._grant_accepted_at(db, grant) if grant is not None else None
+            # A grant accepted after this read began is not judged by it.
+            judged = grant if grant is not None and accepted_at is not None and accepted_at <= read_started_at else None
+            evidence_payload = json.dumps({"command": str(command_id), "observed_at": _stamp(read_started_at),
                                            "postcondition_present": observed, "error": error[:4096],
                                            "prior": encode_workflow(state)}, sort_keys=True)
             evidence_id = "command-read:" + hashlib.sha256(evidence_payload.encode()).hexdigest()
             scope = workflow_scope(binding.fence.key)
             progress: ReconciliationProgress | None = None
+            keep_gate = False
             if observed is False:
-                evidence = CommandAbsenceEvidence(evidence_id, command_id, binding, now, "current-postcondition:" + hashlib.sha256(evidence_payload.encode()).hexdigest())
+                evidence = CommandAbsenceEvidence(evidence_id, command_id, binding, read_started_at, "current-postcondition:" + hashlib.sha256(evidence_payload.encode()).hexdigest())
                 progress = absent_reconciliation(binding, command_id, state, evidence, now=now)
                 kind, payload = "absence", encode_workflow(evidence)
             elif observed is None:
                 progress = unavailable_reconciliation(binding, command_id, state, now=now, evidence_id=evidence_id, error=error[:4096] or "postcondition verification unavailable")
                 kind, payload = "observation", evidence_payload
+                if judged is not None:
+                    reads = self._count_grant_unavailable(db, judged)
+                    void = grant_unavailable_void(reads, accepted_at, now) if accepted_at is not None else None
+                    if void is not None:
+                        self._dispose_grant(db, judged, RetryDisposition.VOID.value, void, details={"evidence_id": evidence_id})
+                    else:
+                        # The grant stays spendable: its absence evidence keeps
+                        # the gate while the read schedule backs off.
+                        keep_gate = True
+                        self._transition(db, "workflow_retry_authorization", judged.authorization_id, "deferred", {
+                            "command_id": str(command_id), "unavailable_reads": reads,
+                            "next_read_at": _stamp(progress.state.history.next_read_at) if isinstance(progress.state, ReconciliationOnly) else None,
+                        })
+                    judged = None
             else:
                 if row["state"] not in ("executing", "unknown_outcome"):
                     raise WorkflowAuthorityError("verified success contradicts a settled command state")
@@ -5020,15 +5162,38 @@ class SQLiteControlStore:
                 db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
                            (encode_workflow(resolved) if resolved is not None else None, str(command_id)))
                 self._reconciliation_gate(db, binding, uncertainty.gate_id, None)
+                # Settled: no grant, early or late, can match this command again.
+                judged = grant
             db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
                        (evidence_id, *scope, str(command_id), kind, payload))
             if observed is not True:
                 assert progress is not None
                 db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
                            (encode_workflow(progress.state), str(command_id)))
-                self._reconciliation_gate(db, binding, uncertainty.gate_id, progress.gate)
+                if not keep_gate:
+                    self._reconciliation_gate(db, binding, uncertainty.gate_id, progress.gate)
+            if judged is not None:
+                self._dispose_grant(
+                    db, judged, "not_needed" if observed is True else "void",
+                    "the postcondition is already present" if observed is True else
+                    "a newer absence observation superseded the grant before it was spent",
+                    details={"evidence_id": evidence_id},
+                )
             self._transition(db, "lifecycle_command", str(command_id), "reconciled_read_only", {"evidence_id": evidence_id})
             return observed is True
+
+    @staticmethod
+    def _grant_accepted_at(db: sqlite3.Connection, grant: UnconsumedRetryAuthorization) -> datetime | None:
+        value = db.execute("SELECT accepted_at FROM workflow_retry_authorizations WHERE authorization_id=?",
+                           (grant.authorization_id,)).fetchone()[0]
+        return datetime.fromisoformat(value) if value is not None else None
+
+    @staticmethod
+    def _count_grant_unavailable(db: sqlite3.Connection, grant: UnconsumedRetryAuthorization) -> int:
+        db.execute("UPDATE workflow_retry_authorizations SET unavailable_reads=unavailable_reads+1 "
+                   "WHERE authorization_id=? AND disposition IS NULL", (grant.authorization_id,))
+        return int(db.execute("SELECT unavailable_reads FROM workflow_retry_authorizations WHERE authorization_id=?",
+                              (grant.authorization_id,)).fetchone()[0])
 
     def latest_command(self, logical_key: str) -> PendingCommand | None:
         if not logical_key:
@@ -5068,17 +5233,21 @@ class SQLiteControlStore:
                 )
             if row["state"] == "retryable_failure":
                 self._replace_effect_receipt(db, command)
-            db.execute(
-                "UPDATE lifecycle_commands SET state='executing', attempts=attempts+1, "
-                "updated_at=?, attempt_owner=executor_identity WHERE command_id=?",
-                (_stamp(self._now()), str(command_id)),
-            )
-            self._transition(
-                db,
-                "lifecycle_command",
-                str(command_id),
-                "executing",
-            )
+            self._mark_executing(db, command_id)
+
+    def _mark_executing(self, db: sqlite3.Connection, command_id: CommandId) -> None:
+        """The one attempt increment shared by ordinary and authorized execution."""
+        db.execute(
+            "UPDATE lifecycle_commands SET state='executing', attempts=attempts+1, "
+            "updated_at=?, attempt_owner=executor_identity WHERE command_id=?",
+            (_stamp(self._now()), str(command_id)),
+        )
+        self._transition(
+            db,
+            "lifecycle_command",
+            str(command_id),
+            "executing",
+        )
 
     @staticmethod
     def _workspace_projection_ready(db: sqlite3.Connection, command: LifecycleCommand) -> bool:
@@ -5102,7 +5271,8 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError("rearm projection no longer belongs to a pending authorized intent")
         return load_workspace_ack(db, intent.handoff) is not None
 
-    def _return_projection_attempt(self, db: sqlite3.Connection, command: LifecycleCommand) -> WorkflowAttemptIdentity | None:
+    @staticmethod
+    def _return_projection_attempt(db: sqlite3.Connection, command: LifecycleCommand) -> WorkflowAttemptIdentity | None:
         if not command.idempotency_key.startswith("resolve-return:"):
             return None
         source = db.execute(
@@ -5172,6 +5342,260 @@ class SQLiteControlStore:
                 decode_workflow(raw, ActiveReconciliation)
             except ValueError as exc:
                 raise ControlStoreError("workflow command is reconciliation-only or retired; execution is not authorized") from exc
+
+    @staticmethod
+    def _retry_authorization_row(db: sqlite3.Connection, authorization_id: str) -> RetryAuthorization | None:
+        row = db.execute(
+            "SELECT * FROM workflow_retry_authorizations WHERE authorization_id=?", (authorization_id,),
+        ).fetchone()
+        return None if row is None else _retry_authorization_from_row(row)
+
+    @staticmethod
+    def _open_authorization(db: sqlite3.Connection, command_id: CommandId) -> UnconsumedRetryAuthorization | None:
+        # A unique partial index admits at most one open grant per command.
+        row = db.execute(
+            "SELECT * FROM workflow_retry_authorizations WHERE command_id=? AND disposition IS NULL",
+            (str(command_id),),
+        ).fetchone()
+        if row is None:
+            return None
+        grant = _retry_authorization_from_row(row)
+        assert isinstance(grant, UnconsumedRetryAuthorization)
+        return grant
+
+    def _executable_authorization(
+        self, db: sqlite3.Connection, command_id: CommandId, gate: OpenGate,
+    ) -> UnconsumedRetryAuthorization | None:
+        """An open grant still naming the gate's current absence observation."""
+        if not isinstance(gate.cause, RetryAuthorizationRequired) or gate.cause.command_id != command_id:
+            return None
+        grant = self._open_authorization(db, command_id)
+        if grant is None or (grant.gate_id, grant.evidence_id) != (gate.gate_id, gate.cause.absence_evidence_id):
+            return None
+        return grant
+
+    def retry_authorization(self, command_id: CommandId) -> UnconsumedRetryAuthorization | None:
+        """The open grant awaiting the executor's one spend decision (read-only).
+
+        It is returned even when newer evidence moved the gate on, so the
+        executor's next read ends it rather than leaving it matchable forever.
+        """
+        with closing(self._connect()) as db:
+            db.execute("BEGIN")
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+            if row is None:
+                raise KeyError(str(command_id))
+            state = self._command_reconciliation(row)
+            if not isinstance(state, ReconciliationOnly):
+                return None
+            self._require_reconciliation_gate(db, _command_from_row(row), state)
+            return self._open_authorization(db, command_id)
+
+    def _retry_grant(
+        self, db: sqlite3.Connection, row: sqlite3.Row | None, authorization_id: str, executor_identity: str,
+    ) -> RetryAuthorization:
+        self._assert_owner_active(db, executor_identity)
+        if row is None or row["executor_identity"] != executor_identity:
+            raise WorkflowAuthorityError("authorized retry belongs to another executor")
+        stored = self._retry_authorization_row(db, authorization_id)
+        if stored is None or _authorization(stored).command_id != row["command_id"]:
+            raise WorkflowAuthorityError("authorized retry lacks its persisted operator grant")
+        return stored
+
+    def _dispose_grant(
+        self, db: sqlite3.Connection, grant: UnconsumedRetryAuthorization, disposition: str, reason: str,
+        *, attempt: int | None = None, details: dict[str, object] | None = None,
+    ) -> None:
+        """Every grant ends here exactly once; the schema refuses a second disposal."""
+        if db.execute(
+            "UPDATE workflow_retry_authorizations SET disposition=?, disposition_reason=?, disposed_at=?, "
+            "consumed_attempt=? WHERE authorization_id=? AND disposition IS NULL",
+            (disposition, reason[:4096], _stamp(self._now()), attempt, grant.authorization_id),
+        ).rowcount != 1:
+            raise WorkflowAuthorityError("retry grant was disposed concurrently")
+        self._transition(db, "workflow_retry_authorization", grant.authorization_id, disposition, {
+            "command_id": str(grant.command_id), "reason": reason[:4096], **(details or {}),
+        })
+
+    @staticmethod
+    def _read_absence(command: LifecycleCommand, authorization_id: str, read: RetryAbsenceRead) -> CommandAbsenceEvidence:
+        """Evidence names the executor's actual read: its time and observed facts."""
+        assert command.workflow is not None
+        facts = json.dumps({
+            "command": str(command.command_id), "authorization_id": authorization_id,
+            "observed_at": _stamp(read.observed_at), "postcondition_present": False,
+            "target_revision": read.target_revision, "guard_holds": read.guard_holds,
+        }, sort_keys=True)
+        digest = hashlib.sha256(facts.encode()).hexdigest()
+        return CommandAbsenceEvidence(
+            "retry-absence:" + digest, command.command_id, command.workflow, read.observed_at,
+            "current-postcondition:" + digest,
+        )
+
+    def _insert_retry_evidence(
+        self, db: sqlite3.Connection, command: LifecycleCommand, kind: str, evidence_id: str, payload: str,
+    ) -> None:
+        assert command.workflow is not None
+        db.execute("INSERT OR IGNORE INTO workflow_evidence VALUES (?, ?, ?, ?, ?, ?, ?)",
+                   (evidence_id, *workflow_scope(command.workflow.fence.key), str(command.command_id), kind, payload))
+        stored = db.execute("SELECT kind,payload_json FROM workflow_evidence WHERE evidence_id=?", (evidence_id,)).fetchone()
+        if stored is None or (stored["kind"], stored["payload_json"]) != (kind, payload):
+            raise WorkflowAuthorityError("retry evidence identity contains different facts")
+
+    def _attempt_uncertainty(
+        self, db: sqlite3.Connection, command: LifecycleCommand, state: ReconciliationOnly, detail: str,
+    ) -> None:
+        """Report an authorized attempt's unverified outcome on its retained gate.
+
+        Unresolved history is kept; the rewritten state makes every read taken
+        before this point fail its compare-and-set, and the gate stops showing
+        the absence the attempt already spent.
+        """
+        binding = command.workflow
+        assert binding is not None
+        history = state.history
+        rotated = ReconciliationOnly(replace(history, next_read_at=max(
+            self._now() + timedelta(seconds=ReconciliationPolicy().initial_delay_seconds), history.unresolved_since,
+        )), state.gate_id)
+        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                   (encode_workflow(rotated), str(command.command_id)))
+        self._reconciliation_gate(db, binding, state.gate_id, OpenGate(
+            state.gate_id, binding.fence.generation,
+            RemoteOutcomeUncertain(command.command_id, history.unresolved_since, history.failed_reads, detail),
+            NoAuthorizedRemediation("read-only outcome reconciliation required"),
+        ))
+
+    def begin_authorized_retry(
+        self, command_id: CommandId, authorization_id: str, *,
+        expected: ReconciliationOnly, expected_attempts: int, read: RetryAbsenceRead, executor_identity: str,
+    ) -> RetryBegan | RetryAlreadyConsumed | RetryDeclined | RetryStale:
+        """Make the grant's one spend decision atomically (ADR 0015).
+
+        The caller holds the shared deployment effect authority and has just
+        read current absence and re-evaluated the original decision. The pure
+        spend decision either consumes the grant with the attempt increment and
+        receipt archival, or ends it inapplicable/void with persisted evidence;
+        no refusal is left to repeat. A crash before this commits leaves the
+        grant open; a crash after it leaves read-only reconciliation.
+        """
+        if not isinstance(expected, ReconciliationOnly) or not isinstance(read, RetryAbsenceRead):
+            raise ValueError("authorized retry requires the command's reconciliation-only state and its read")
+        if type(expected_attempts) is not int or expected_attempts < 0:
+            raise ValueError("authorized retry requires the observed attempt count")
+        validate_workflow_identifier(authorization_id, "retry authorization")
+        with self.transaction() as db:
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+            stored = self._retry_grant(db, row, authorization_id, executor_identity)
+            if isinstance(stored, ConsumedRetryAuthorization):
+                return RetryAlreadyConsumed(stored)
+            if isinstance(stored, ClosedRetryAuthorization):
+                return RetryDeclined(stored)
+            if self._command_reconciliation(row) != expected or int(row["attempts"]) != expected_attempts:
+                return RetryStale()
+            command = _command_from_row(row)
+            binding = command.workflow
+            if binding is None:
+                raise WorkflowAuthorityError("authorized retry requires captured workflow authority")
+            self._require_reconciliation_gate(db, command, expected)
+            if row["state"] not in ("executing", "unknown_outcome"):
+                raise WorkflowAuthorityError("reconciliation-only command lacks an unresolved outcome")
+            current = load_workflow_row(db, binding.fence.key)
+            if current is None:
+                raise WorkflowAuthorityError("authorized retry workflow is absent")
+            decision = retry_spend_decision(
+                current, stored, load_retry_authorization_facts(self, db, command.command_id, stored.evidence_id),
+                read, now=self._now(),
+            )
+            if isinstance(decision, DeclineRetry):
+                return RetryDeclined(self._decline_retry(db, row, command, current, stored, expected, read, decision))
+            evidence = self._read_absence(command, authorization_id, read)
+            applicability = CommandRetryApplicability(
+                evidence.evidence_id.replace("retry-absence:", "retry-applicability:", 1), command.command_id,
+                current.binding, read.observed_at, str(row["payload_digest"]),
+            )
+            self._insert_retry_evidence(db, command, "absence", evidence.evidence_id, encode_workflow(evidence))
+            self._insert_retry_evidence(db, command, "retry_applicability", applicability.evidence_id, encode_workflow(applicability))
+            attempt = expected_attempts + 1
+            self._dispose_grant(db, stored, "consumed", "authorized attempt began", attempt=attempt, details={
+                "attempt": attempt, "absence_evidence_id": evidence.evidence_id,
+                "applicability_evidence_id": applicability.evidence_id,
+            })
+            spent = int(db.execute("SELECT count(*) FROM workflow_retry_authorizations "
+                                   "WHERE command_id=? AND disposition='consumed'", (str(command_id),)).fetchone()[0])
+            if spent >= MAX_AUTHORIZED_ATTEMPTS:
+                self._transition(db, "workflow_retry_authorization", authorization_id, "ceiling_reached", {
+                    "command_id": str(command_id), "authorized_attempts": spent, "ceiling": MAX_AUTHORIZED_ATTEMPTS,
+                })
+            self._replace_effect_receipt(db, command)
+            self._mark_executing(db, command_id)
+            self._attempt_uncertainty(db, command, expected, f"authorized retry attempt {attempt} began; outcome unverified")
+            return RetryBegan(ConsumedRetryAuthorization(stored, attempt))
+
+    def _decline_retry(
+        self, db: sqlite3.Connection, row: sqlite3.Row, command: LifecycleCommand, current: WorkflowSnapshot,
+        stored: UnconsumedRetryAuthorization, expected: ReconciliationOnly, read: RetryAbsenceRead,
+        decision: DeclineRetry,
+    ) -> ClosedRetryAuthorization:
+        """End the grant unspent and persist what the read proved.
+
+        A fresh absence rotates the gate evidence and advances the bounded read
+        schedule. An inapplicable standalone command retires; an inapplicable
+        re-arm obligation keeps its restriction and can never be granted again.
+        """
+        binding = command.workflow
+        assert binding is not None
+        payload = json.dumps({"command": str(command.command_id), "authorization_id": stored.authorization_id,
+                              "disposition": decision.disposition.value, "reason": decision.reason[:4096],
+                              "observed_at": _stamp(read.observed_at), "target_revision": read.target_revision},
+                             sort_keys=True)
+        refusal_id = "retry-declined:" + hashlib.sha256(payload.encode()).hexdigest()
+        self._insert_retry_evidence(db, command, "retry_applicability", refusal_id, payload)
+        self._dispose_grant(db, stored, decision.disposition.value, decision.reason, details={
+            "evidence_id": refusal_id,
+            "association": "rearm" if isinstance(stored.association, RearmObligation) else "standalone",
+        })
+        state: CommandReconciliation = expected
+        if decision.disposition is RetryDisposition.INAPPLICABLE and isinstance(stored.association, StandaloneCommand):
+            state = self._retire_workflow_command(db, row, command, current, refusal_id)
+            if not isinstance(state, RetiredUncertainCommand):
+                raise WorkflowAuthorityError("inapplicable retry must retire an unresolved command")
+        if decision.fresh_read:
+            assert isinstance(state, (ReconciliationOnly, RetiredUncertainCommand))
+            evidence = self._read_absence(command, stored.authorization_id, read)
+            self._insert_retry_evidence(db, command, "absence", evidence.evidence_id, encode_workflow(evidence))
+            progress = absent_reconciliation(binding, command.command_id, state, evidence, now=self._now())
+            db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                       (encode_workflow(progress.state), str(command.command_id)))
+            self._reconciliation_gate(db, binding, expected.gate_id, progress.gate)
+        return ClosedRetryAuthorization(stored, decision.disposition, decision.reason[:4096])
+
+    def _settle_authorized_retry(self, db: sqlite3.Connection, receipt: EffectReceipt) -> None:
+        row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(receipt.command_id),)).fetchone()
+        state = self._command_reconciliation(row)
+        if not isinstance(state, ReconciliationOnly):
+            return
+        grant = db.execute(
+            "SELECT authorization_id FROM workflow_retry_authorizations "
+            "WHERE command_id=? AND disposition='consumed' AND consumed_attempt=?",
+            (str(receipt.command_id), int(row["attempts"])),
+        ).fetchone()
+        if grant is None:
+            return
+        command = _command_from_row(row)
+        assert command.workflow is not None
+        if receipt.status is EffectStatus.SUCCEEDED:
+            db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=NULL WHERE command_id=?",
+                       (str(receipt.command_id),))
+            self._reconciliation_gate(db, command.workflow, state.gate_id, None)
+        elif receipt.status is EffectStatus.UNKNOWN_OUTCOME:
+            # Original expiry history is retained; any absence read during the
+            # write is superseded, so a later write needs a new proof and grant.
+            self._attempt_uncertainty(db, command, state, f"authorized retry attempt {int(row['attempts'])} outcome unknown")
+        else:
+            raise ControlStoreError("an authorized retry settles only as verified success or unknown outcome")
+        self._transition(db, "workflow_retry_authorization", grant["authorization_id"],
+                         "succeeded" if receipt.status is EffectStatus.SUCCEEDED else "unresolved",
+                         {"command_id": str(receipt.command_id), "attempt": int(row["attempts"])})
 
     @staticmethod
     def _archive_workflow_receipt(db: sqlite3.Connection, command: LifecycleCommand) -> None:
@@ -5334,6 +5758,7 @@ class SQLiteControlStore:
             if row is not None:
                 return row["receipt_digest"] == digest
             self._insert_effect(db, receipt, digest)
+            self._settle_authorized_retry(db, receipt)
             return True
 
     def _insert_effect(
@@ -5816,6 +6241,94 @@ class SQLiteControlStore:
         db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         return db
+
+
+def _authorization(value: RetryAuthorization) -> UnconsumedRetryAuthorization:
+    return value if isinstance(value, UnconsumedRetryAuthorization) else value.authorization
+
+
+def _retry_authorization_from_row(row: sqlite3.Row) -> RetryAuthorization:
+    try:
+        association = (StandaloneCommand() if row["association_kind"] == "standalone"
+                       else RearmObligation(row["request_id"]))
+        grant = UnconsumedRetryAuthorization(
+            row["authorization_id"], CommandId(row["command_id"]), row["gate_id"], row["evidence_id"],
+            decode_workflow(row["binding_json"], WorkflowBinding), association,
+        )
+        disposition = row["disposition"]
+        if disposition is None:
+            return grant
+        if disposition == "consumed":
+            return ConsumedRetryAuthorization(grant, int(row["consumed_attempt"]))
+        return ClosedRetryAuthorization(grant, RetryDisposition(disposition), row["disposition_reason"])
+    except (ValueError, TypeError) as exc:
+        raise WorkflowAuthorityError("persisted retry authorization is malformed") from exc
+
+
+def load_retry_authorization_facts(
+    store: SQLiteControlStore, db: sqlite3.Connection, command_id: CommandId, evidence_id: str,
+) -> RetryAuthorizationFacts:
+    """Mint harness-owned acceptance and spend facts inside the caller's transaction.
+
+    The same facts back acceptance, the operator view and the spend decision,
+    including the store's own execution-authority check, so nothing is offered
+    that the executor would have to discard.
+    """
+    row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
+    if row is None:
+        raise WorkflowAuthorityError("retry authorization names an unknown command")
+    command = _command_from_row(row)
+    binding = command.workflow
+    if binding is None:
+        raise WorkflowAuthorityError("retry authorization requires a workflow-bound command")
+    evidence: CommandAbsenceEvidence | None = None
+    stored = db.execute("SELECT * FROM workflow_evidence WHERE evidence_id=?", (evidence_id,)).fetchone()
+    if (stored is not None and stored["kind"] == "absence" and stored["command_id"] == str(command_id)
+            and (stored["repository"], stored["target_kind"], stored["target_number"]) == workflow_scope(binding.fence.key)):
+        candidate = decode_workflow(stored["payload_json"], CommandAbsenceEvidence)
+        evidence = candidate if candidate.command_id == command.command_id else None
+    link = db.execute(
+        "SELECT request_id,disposition FROM workflow_rearm_commands WHERE command_id=?", (str(command_id),),
+    ).fetchone()
+    current = load_workflow_row(db, binding.fence.key)
+    intent = current.intent if current is not None else None
+    workspace_ready = (
+        link is not None and isinstance(intent, PendingRearm) and intent.request_id == link["request_id"]
+        and load_workspace_ack(db, intent.handoff) is not None
+    )
+    prior = tuple(_retry_authorization_from_row(item) for item in db.execute(
+        "SELECT * FROM workflow_retry_authorizations WHERE command_id=? "
+        "AND (disposition IS NULL OR disposition='inapplicable' OR evidence_id=?) "
+        "ORDER BY authorization_id LIMIT ?",
+        (str(command_id), evidence_id, MAX_RELEVANT_AUTHORIZATIONS),
+    ))
+    attempted, attempts = db.execute(
+        "SELECT max(disposed_at), count(*) FROM workflow_retry_authorizations "
+        "WHERE command_id=? AND disposition='consumed'",
+        (str(command_id),),
+    ).fetchone()
+    refusal: str | None = None
+    db.execute("SAVEPOINT retry_execution_check")
+    try:
+        store._validate_workflow_command(db, command)
+    except CorruptControlStore:
+        raise
+    except (ControlStoreError, ValueError) as exc:
+        refusal = str(exc)[:4096] or type(exc).__name__
+    finally:
+        # The check is read-only by contract; never let it leave writes behind.
+        db.execute("ROLLBACK TO retry_execution_check")
+        db.execute("RELEASE retry_execution_check")
+    return RetryAuthorizationFacts(
+        command.command_id, binding, SQLiteControlStore._command_reconciliation(row), evidence,
+        RearmObligation(link["request_id"]) if link is not None else StandaloneCommand(), prior,
+        decision_revision=command.expected_revision,
+        returns_resolve_result=SQLiteControlStore._return_projection_attempt(db, command) is not None,
+        obligation_active=link is not None and link["disposition"] == "required",
+        workspace_ready=workspace_ready,
+        last_attempt_at=datetime.fromisoformat(attempted) if attempted is not None else None,
+        authorized_attempts=int(attempts), execution_refusal=refusal,
+    )
 
 
 def _command_from_row(row: sqlite3.Row) -> LifecycleCommand:

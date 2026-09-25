@@ -81,17 +81,47 @@ class AbsentResolveControl:
 
 
 @dataclass(frozen=True)
+class PendingRetry:
+    """An accepted one-attempt grant the executor has not yet decided."""
+    gate_id: str
+    authorization_id: str
+    command_id: str
+
+    def __post_init__(self) -> None:
+        for name in ("gate_id", "authorization_id", "command_id"):
+            validate_workflow_identifier(getattr(self, name), name)
+
+
+@dataclass(frozen=True)
 class ResolveControlView:
     snapshot: WorkflowSnapshot
     requested_id: str | None
     requested: RearmIntent | None
     observation: RearmObservation | None
+    # Gate IDs whose one-attempt retry authorization the pure policy admits now.
+    retry_authorizable: frozenset[str] = frozenset()
+    # Open grants awaiting the executor, at most one per gate.
+    retry_pending: tuple[PendingRetry, ...] = ()
 
     def __post_init__(self) -> None:
-        from .workflow import CancelledRearm, CompletedRearm, SupersededRearm
+        from .workflow import CancelledRearm, CompletedRearm, OpenGate, RetryAuthorizationRequired, SupersededRearm
 
         if not isinstance(self.snapshot, WorkflowSnapshot):
             raise ValueError("resolve control view requires current workflow authority")
+        if not isinstance(self.retry_authorizable, frozenset) or not self.retry_authorizable <= {
+            gate.gate_id for gate in self.snapshot.gates
+            if isinstance(gate, OpenGate) and isinstance(gate.cause, RetryAuthorizationRequired)
+        }:
+            raise ValueError("retry authorization availability must name open retry gates")
+        if not isinstance(self.retry_pending, tuple) or any(
+            not isinstance(item, PendingRetry) for item in self.retry_pending
+        ):
+            raise ValueError("pending retries must be typed")
+        pending_gates = [item.gate_id for item in self.retry_pending]
+        if len(set(pending_gates)) != len(pending_gates) or not set(pending_gates) <= {
+            (gate.gate if not isinstance(gate, OpenGate) else gate).gate_id for gate in self.snapshot.gates
+        } or set(pending_gates) & self.retry_authorizable:
+            raise ValueError("a pending retry names one visible gate that is not also offered")
         if self.requested_id is not None:
             validate_workflow_identifier(self.requested_id, "requested rearm")
         if self.requested is not None and (

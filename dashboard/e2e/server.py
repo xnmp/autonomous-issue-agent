@@ -19,6 +19,9 @@ RESOLVE_REPO = "openai/autonomous-issue-agent"
 # parallel Playwright tests stay isolated just by using distinct issue numbers.
 INACTIVE_ISSUE = 61
 UNAVAILABLE_ISSUE = 62
+# An expired command whose harness read proved current absence: its gate
+# offers exactly one retry authorization until one is recorded.
+RETRY_ISSUE = 71
 
 
 @dataclass
@@ -37,6 +40,8 @@ class _ResolveState:
     # historical-lookup index (GET ?request_id=...) and the source continue_rearm
     # reads from (it flips the STOPPED record's state; it never mints a new one).
     rearms: dict = field(default_factory=dict)
+    # The authorization_id recorded for the retry gate, if any (RETRY_ISSUE).
+    retry_authorization: str | None = None
     # Command identity (request_id, or cancellation_id for cancel_rearm) ->
     # (dumped request body, prior CommandResult) for exact-retry replay.
     processed: dict = field(default_factory=dict)
@@ -88,14 +93,32 @@ class ResolveFixture:
             gate_id=state.gate_id, state=gate_state, opened_generation=state.generation,
             cause=cause,
             remediation=rc.NoRemediation(kind="none_authorized", reason="Awaiting an operator decision."),
-            available_commands=available,
+            available_commands=available, pending_retry=None,
+        )
+
+    def _retry_gate(self, state: _ResolveState) -> rc.Gate:
+        return rc.Gate(
+            gate_id=f"uncertain-{state.number}", state="open", opened_generation=state.generation,
+            cause=rc.RetryAuthorizationRequired(
+                kind="retry_authorization_required", command_id=f"command-{state.number}",
+                absence_evidence_id=f"absence-{state.number}",
+            ),
+            remediation=rc.AttemptedRemediation(
+                kind="attempted", operation="reconcile_remote",
+                evidence_ids=[f"absence-{state.number}"], outcome="verified_absent",
+            ),
+            available_commands=[] if state.retry_authorization else ["authorize_retry"],
+            pending_retry=rc.PendingRetry(
+                authorization_id=state.retry_authorization, command_id=f"command-{state.number}",
+            ) if state.retry_authorization else None,
         )
 
     def _control(self, state: _ResolveState, request_id: str | None) -> rc.AvailableControl:
         requested_intent = state.rearms.get(request_id) if request_id else None
+        gates = [self._retry_gate(state)] if state.number == RETRY_ISSUE else [self._gate(state)]
         return rc.AvailableControl(
             status="available", expected=self._expected(state), workflow_held=True,
-            gates=[self._gate(state)], guidance=state.guidance, failures=state.failures,
+            gates=gates, guidance=state.guidance, failures=state.failures,
             current_intent=state.current_intent, requested_id=request_id,
             requested_intent=requested_intent, observation=None,
         )
@@ -124,7 +147,8 @@ class ResolveFixture:
                 control=rc.UnavailableControl(status="unavailable", reason="resolve control unavailable (fixture)"))
 
         state = self._state(number)
-        identity = body.cancellation_id if body.operation == "cancel_rearm" else body.request_id
+        identity = (body.cancellation_id if body.operation == "cancel_rearm"
+                    else body.authorization_id if body.operation == "authorize_retry" else body.request_id)
         dumped = body.model_dump(mode="json")
 
         prior = state.processed.get(identity)
@@ -141,6 +165,27 @@ class ResolveFixture:
             return rc.CommandResult(outcome="conflict",
                 reason="Resolve status changed since this command was prepared.",
                 control=self._control(state, None))
+
+        if body.operation == "authorize_retry":
+            gate = self._retry_gate(state) if state.number == RETRY_ISSUE else None
+            if gate is None or "authorize_retry" not in gate.available_commands:
+                outcome = "conflict" if state.retry_authorization else "rejected"
+                return rc.CommandResult(outcome=outcome, reason="No retry authorization is available for this gate.",
+                    control=self._control(state, None))
+            cause = gate.cause
+            assert isinstance(cause, rc.RetryAuthorizationRequired)
+            if (body.gate_id, body.command_id, body.evidence_id) != (gate.gate_id, cause.command_id, cause.absence_evidence_id):
+                return rc.CommandResult(outcome="rejected", reason="The gate does not await this retry.",
+                    control=self._control(state, None))
+            # One execution of the existing command; generation, episode and
+            # allowance are unchanged.
+            state.retry_authorization = body.authorization_id
+            state.version += 1
+            result = rc.CommandResult(outcome="accepted",
+                reason="One retry authorized; the daemon executes it after a fresh read.",
+                control=self._control(state, None))
+            state.processed[identity] = (dumped, result)
+            return result
 
         intent = state.current_intent
         if body.operation == "request_rearm":
