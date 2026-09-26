@@ -233,7 +233,7 @@ def reservation(name, binding, owner, kind="REVIEW"):
     return ReservationRequest(
         ReservationId("reservation:" + name), RunId(name),
         json.dumps({"repository": "o/r", "role": owner.split(":")[1], "kind": kind, "leg_id": "leg:" + name,
-                    "runtime": "codex", "pr": 9}),
+                    "runtime": "codex", "pr": 9, "number": 9}),
         BudgetScope("o/r", "daily", "USD", "2026-09-25", NOW, NOW + timedelta(days=1), ZoneInfo("UTC")),
         PriceQuote("model", "card", "1", NOW, Money("USD", 1)), Money("USD", 100), "config", "o/r",
         kind=kind, owner_id=owner, workflow=binding,
@@ -253,7 +253,12 @@ def test_review_admission_requires_the_review_owner_and_records_no_resolve_recei
     state = ReviewWorkflowSnapshot(held().revision, REVIEW, ReviewEpisode("review-episode"))
     install_review(store, state)
     assert_refused(store, reservation("fix-owned", state.binding, FIX), "review owner")
-    assert_refused(store, reservation("review-owned", state.binding, REVIEWER), "no admission receipt")
+    # Increment 6: a current, ungated review binding admits its paid review, but
+    # never through the resolve admission receipt (that is resolve-only).
+    admitted = store.reserve(reservation("review-owned", state.binding, REVIEWER))
+    assert admitted.disposition is AccountingDisposition.AVAILABLE, admitted.detail
+    with closing(store._connect()) as db:
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='workflow-admission'").fetchone()[0] == 0
     stale = replace(state.binding, episode_id="other-episode")
     assert_refused(store, reservation("stale", stale, REVIEWER), "stale")
     assert_refused(store, reservation("resolve-by-reviewer", resolve_snapshot().binding, REVIEWER, "RESOLVE"), "fix owner")
@@ -313,7 +318,7 @@ def guarded_relabel(binding, name="relabel", *, owner=REVIEWER, number=9, **chan
 def bound_submission(binding, name="submission", **changes):
     """A bound SUBMIT_REVIEW verdict shaped as `submit_bound_review` enqueues it."""
     payload = {"pr": 9, "event": "REQUEST_CHANGES", "body": "fix", "head": HEAD, "author": "review-bot[bot]",
-               "patch_id": "f" * 64, "escalate_cause": None, **changes}
+               "patch_id": "f" * 64, "escalate_cause": None, "non_resetting_commits": [], **changes}
     return LifecycleCommand(CommandId(name), f"idem:{name}", CommandKind.SUBMIT_REVIEW, "pr:9", HEAD, payload,
                             repository="o/r", executor_identity=REVIEWER, workflow=binding)
 
@@ -323,7 +328,9 @@ def test_a_bound_submission_without_its_verdict_or_escalation_shape_is_unreprese
     install_review(store, held())
     for index, changes in enumerate((
         {"escalate_cause": "ceiling"}, {"event": "COMMENT"}, {"patch_id": None}, {"author": ""}, {"head": "short"},
-        {"pr": 10}, {"extra": True},
+        {"pr": 10}, {"extra": True}, {"non_resetting_commits": ["a" * 40]},
+        {"event": "COMMENT", "escalate_cause": "ceiling", "non_resetting_commits": ["b" * 40, "a" * 40]},
+        {"event": "COMMENT", "escalate_cause": "ceiling", "non_resetting_commits": "a" * 40},
     )):
         with pytest.raises(ControlStoreError):
             store.enqueue_command(bound_submission(held().binding, f"malformed-{index}", **changes))
@@ -433,3 +440,50 @@ def test_resolve_commands_keep_the_fix_owner_rule(store):
     store.enqueue_command(command)
     with pytest.raises(ControlStoreError, match="fix owner"):
         store.enqueue_command(review_command(resolve_snapshot().binding, owner=REVIEWER, number=1, target=Target.ISSUE))
+
+
+# -- increment 6: one admission path and read-only guidance once review is active ------------------
+
+def test_an_unbound_paid_review_is_admitted_only_while_the_review_family_is_inactive(store):
+    inactive = store.reserve(reservation("legacy", None, REVIEWER))
+    assert inactive.disposition is AccountingDisposition.AVAILABLE, inactive.detail
+    install_review(store, ReviewWorkflowSnapshot(held().revision, REVIEW, ReviewEpisode("review-episode")))
+    assert_refused(store, reservation("unbound", None, REVIEWER), "captured workflow binding")
+    assert_refused(store, reservation("unbound-re", None, REVIEWER, "RE_REVIEW"), "captured workflow binding")
+
+
+def test_a_bound_paid_review_must_name_its_own_pull_request(store):
+    state = ReviewWorkflowSnapshot(held().revision, REVIEW, ReviewEpisode("review-episode"))
+    install_review(store, state)
+    request = reservation("elsewhere", state.binding, REVIEWER)
+    request = replace(request, dispatch_id=request.dispatch_id.replace('"number": 9', '"number": 10'))
+    assert_refused(store, request, "disagrees with its workflow")
+
+
+def test_a_gated_review_workflow_admits_no_paid_review(store):
+    install_review(store, held())
+    result = store.reserve(reservation("gated", held().binding, REVIEWER))
+    assert result.disposition is AccountingDisposition.UNAVAILABLE
+
+
+def test_review_guidance_and_activation_reads_distinguish_inactive_absent_and_committed(store):
+    from issue_agent.adapters.review_workflow_control import read_review_guidance, review_family_activated
+
+    assert review_family_activated(store, "o/r") is False
+    assert read_review_guidance(store, "o/r", 9) is None  # the legacy record still owns it
+    install_review(store, ReviewWorkflowSnapshot(held().revision, REVIEW, ReviewEpisode("review-episode", "Scope: parser")))
+    assert review_family_activated(store, "o/r") is True
+    assert read_review_guidance(store, "o/r", 9) == "Scope: parser"
+    assert read_review_guidance(store, "o/r", 10) == ""  # activated but never observed
+
+
+def test_an_unreadable_authority_raises_rather_than_reading_as_inactive(store):
+    from issue_agent.adapters.review_workflow_control import read_review_guidance, review_family_activated
+
+    install_review(store, ReviewWorkflowSnapshot(held().revision, REVIEW, ReviewEpisode("review-episode", "x")))
+    with store.transaction() as db:
+        db.execute("UPDATE workflows SET episode_json='{' WHERE target_kind='pr'")
+    with pytest.raises(WorkflowAuthorityError):
+        read_review_guidance(store, "o/r", 9)
+    with pytest.raises(ValueError):
+        review_family_activated(object(), "o/r")  # type: ignore[arg-type]

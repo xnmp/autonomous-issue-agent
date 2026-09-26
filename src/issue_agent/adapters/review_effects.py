@@ -21,7 +21,7 @@ from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.eligibility import ORDERING_LABELS
 from ..domain.identity import login_eq
 from ..domain.labels import Label
-from ..domain.review_rejection import is_commit_sha
+from ..domain.review_rejection import CountingRule, is_commit_sha
 from ..domain.review_workflow import (
     CompleteReviews, ObservedPullRequest, PartialReviews, PullRequestState, PullRequestUnavailable,
     SubmittedReviewState,
@@ -102,10 +102,15 @@ _ESCALATION_CAUSES = frozenset({"verdict", "ceiling"})
 class BoundReviewSubmissionOp:
     """A generation-bound SUBMIT_REVIEW: a verdict on a patch, or an escalation.
 
-    Verdicts (APPROVE / REQUEST_CHANGES) carry their reviewed patch identity
-    and no cause; escalations ("verdict" or "ceiling") are COMMENT reviews.
-    Any other pairing is unrepresentable. `author` is the review identity's
-    login, the only author whose review can be this command's.
+    Verdicts (APPROVE / REQUEST_CHANGES) carry no cause; escalations
+    ("verdict" or "ceiling") are COMMENT reviews. Every submission records
+    the patch identity it reviewed. A ceiling escalation also records the
+    approvals its prior rejections were counted past without a reset
+    (`non_resetting_commits`), so settlement judges the gate by exactly the
+    rule the verdict used; no other submission's effect depends on counting,
+    so none carries one. Any other pairing is unrepresentable. `author` is the
+    review identity's login, the only author whose review can be this
+    command's.
     """
     pr: int
     event: str
@@ -114,6 +119,7 @@ class BoundReviewSubmissionOp:
     author: str
     patch_id: str | None
     escalate_cause: str | None
+    non_resetting_commits: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if type(self.pr) is not int or self.pr <= 0:
@@ -128,22 +134,28 @@ class BoundReviewSubmissionOp:
         if self.escalate_cause is None:
             if self.event not in _VERDICT_EVENTS:
                 raise ValueError("a verdict review is APPROVE or REQUEST_CHANGES")
-            if self.patch_id is None:
-                raise ValueError("a verdict review records its reviewed patch identity")
         elif self.escalate_cause in _ESCALATION_CAUSES:
             if self.event != "COMMENT":
                 raise ValueError("an escalation is submitted as a COMMENT review")
         else:
             raise ValueError("review escalation cause is not recognized")
-        if self.patch_id is not None and (
-            not isinstance(self.patch_id, str) or len(self.patch_id) != 64
-            or any(c not in "0123456789abcdef" for c in self.patch_id)
+        if not isinstance(self.patch_id, str) or len(self.patch_id) != 64 or any(
+            c not in "0123456789abcdef" for c in self.patch_id
         ):
-            raise ValueError("reviewed patch identity must be a SHA-256 digest")
+            raise ValueError("a bound review records its reviewed patch identity as a SHA-256 digest")
+        # Canonical (sorted, unique, bounded) so one decision is one command identity.
+        CountingRule(self.author, self.non_resetting_commits)
+        if self.non_resetting_commits and self.escalate_cause != "ceiling":
+            raise ValueError("only a ceiling escalation records the counting rule its verdict used")
+
+    @property
+    def rule(self) -> CountingRule:
+        return CountingRule(self.author, self.non_resetting_commits)
 
     def payload(self) -> dict[str, object]:
         return {"pr": self.pr, "event": self.event, "body": self.body, "head": self.head, "author": self.author,
-                "patch_id": self.patch_id, "escalate_cause": self.escalate_cause}
+                "patch_id": self.patch_id, "escalate_cause": self.escalate_cause,
+                "non_resetting_commits": list(self.non_resetting_commits)}
 
 
 def bound_submission_op(command: LifecycleCommand) -> BoundReviewSubmissionOp | None:
@@ -157,12 +169,15 @@ def bound_submission_op(command: LifecycleCommand) -> BoundReviewSubmissionOp | 
         return None
     binding = command.workflow
     assert binding is not None
-    raw = _mapping(command.payload, {"pr", "event", "body", "head", "author", "patch_id", "escalate_cause"},
-                   "bound review submission payload")
+    raw = _mapping(command.payload, {"pr", "event", "body", "head", "author", "patch_id", "escalate_cause",
+                                     "non_resetting_commits"}, "bound review submission payload")
+    commits = raw["non_resetting_commits"]
+    if not isinstance(commits, list) or any(not isinstance(commit, str) for commit in commits):
+        raise ValueError("malformed bound review counting rule")
     op = BoundReviewSubmissionOp(
         raw["pr"], _text(raw["event"], "review event"), _text(raw["body"], "review body"),  # type: ignore[arg-type]
         _text(raw["head"], "reviewed head"), _text(raw["author"], "review identity"),
-        raw["patch_id"], raw["escalate_cause"],  # type: ignore[arg-type]
+        raw["patch_id"], raw["escalate_cause"], tuple(commits),  # type: ignore[arg-type]
     )
     if op.pr != binding.fence.key.target.number or command.target != f"pr:{op.pr}":
         raise ValueError("bound review submission disagrees with its pull request workflow")
@@ -271,25 +286,43 @@ def review_family_op(command: LifecycleCommand) -> ReviewFamilyOp | None:
 _PR_STATES = {state.value.upper(): state for state in PullRequestState}
 
 
+def pull_request_observation(
+    key: WorkflowKey, view: object, observed_at: datetime, reviews: CompleteReviews | PartialReviews,
+) -> ObservedPullRequest | PullRequestUnavailable:
+    """A typed observation of one already-read pull request view; a degenerate view is unavailable."""
+    head, state = getattr(view, "head_ref_oid", ""), _PR_STATES.get(str(getattr(view, "state", "")).upper())
+    if not is_commit_sha(head) or state is None:
+        return PullRequestUnavailable(key, observed_at, "pull request head or state is unavailable")
+    return ObservedPullRequest(key, head, state, frozenset(getattr(view, "labels", frozenset())), reviews, observed_at)
+
+
 def observe_pull_request(
     gateway: object, key: WorkflowKey, observed_at: datetime, *, reviews: bool,
 ) -> ObservedPullRequest | PullRequestUnavailable:
     """One fresh read; any failure is unavailable, never absence (a bare 404 proves nothing)."""
+    return read_pull_request(gateway, key, observed_at, reviews=reviews)[0]
+
+
+def read_pull_request(
+    gateway: object, key: WorkflowKey, observed_at: datetime, *, reviews: bool,
+) -> tuple[ObservedPullRequest | PullRequestUnavailable, object | None]:
+    """`observe_pull_request` plus the pull request view that one read returned (None when unread)."""
     number = key.target.number
+    view = None
     try:
         if not isinstance(gateway, ReviewReads):
-            return PullRequestUnavailable(key, observed_at, "the executor gateway cannot read pull request reviews")
+            return PullRequestUnavailable(key, observed_at, "the executor gateway cannot read pull request reviews"), None
         view = gateway.get_pr(number, mergeability=False, checks=False)
-        head, state = getattr(view, "head_ref_oid", ""), _PR_STATES.get(str(getattr(view, "state", "")).upper())
-        if not is_commit_sha(head) or state is None:
-            return PullRequestUnavailable(key, observed_at, "pull request head or state is unavailable")
+        observed = pull_request_observation(key, view, observed_at, PartialReviews("reviews not yet read"))
+        if isinstance(observed, PullRequestUnavailable):
+            return observed, view
         read = gateway.pull_request_reviews(number) if reviews else PartialReviews(
             "reviews are not read for a label projection")
-        return ObservedPullRequest(key, head, state, frozenset(getattr(view, "labels", frozenset())), read, observed_at)
+        return pull_request_observation(key, view, observed_at, read), view
     except sqlite3.Error:
         raise
     except Exception as exc:  # noqa: BLE001 - a failed read is unavailable evidence
-        return PullRequestUnavailable(key, observed_at, f"{type(exc).__name__}: {exc}"[:512])
+        return PullRequestUnavailable(key, observed_at, f"{type(exc).__name__}: {exc}"[:512]), view
 
 
 def _refusal_reason(guard: ReviewDismissalGuard, pr: ObservedPullRequest, reviews: CompleteReviews) -> str:

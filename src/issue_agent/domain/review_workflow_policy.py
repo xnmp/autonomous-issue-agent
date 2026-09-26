@@ -12,15 +12,15 @@ here perform no I/O.
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
 
 from .actions import Target
 from .contracts import CommandId, CommandKind, LifecycleCommand, WorkflowAttemptIdentity
-from .eligibility import ORDERING_LABELS
 from .identity import login_eq
-from .labels import Label
+from .labels import LIFECYCLE_LABELS, Label
 from .review import EscalationCause
 from .review_rejection import validate_commit_sha
 from .review_workflow import (
@@ -163,6 +163,92 @@ def review_release_command_id(key: WorkflowKey, generation: int) -> CommandId:
     return CommandId(_digest(key.repository, "PullRequestRef", key.target.number, generation, "release_ceiling"))
 
 
+# Idempotency-key prefixes of the attention-hold projections the workflow owns
+# outside a re-arm: an escalation's (and its bounded re-plans), and a restored
+# ceiling hold. Each key names the escalation it makes visible after the
+# prefix: a verdict escalation's submission, or a ceiling's gate.
+ESCALATION_PROJECTION_PREFIX = "workflow:escalation:"
+HOLD_RESTORE_PREFIX = "workflow:hold:"
+_KEY_SEPARATOR = "#"
+
+# A verdict escalation's projection refused by a real hold-fact change is
+# re-planned from a fresh read at most this many times before the refusal is
+# surfaced as a visible gate (ADR 0012: every retry loop carries a ceiling).
+MAX_ESCALATION_REPLANS = 2
+# The harness re-projects an open ceiling's missing hold at most this many
+# times per gate; past it the label war is surfaced once as contested.
+MAX_HOLD_RESTORES = 3
+
+
+def _key_identity(value: str, name: str) -> str:
+    validate_workflow_identifier(value, name)
+    if _KEY_SEPARATOR in value:
+        raise ValueError(f"{name} cannot contain {_KEY_SEPARATOR!r}")
+    return value
+
+
+def review_escalation_command_id(key: WorkflowKey, submission: CommandId, attempt: int = 0) -> CommandId:
+    """One attention-hold projection per settled escalation receipt, and per bounded re-plan of it."""
+    key = _pr_key(key)
+    validate_workflow_identifier(submission, "escalation submission")
+    if type(attempt) is not int or not 0 <= attempt <= MAX_ESCALATION_REPLANS:
+        raise ValueError("escalation projection attempt is outside its re-plan bound")
+    parts = (key.repository, "PullRequestRef", key.target.number, submission, "escalation")
+    return CommandId(_digest(*parts, attempt) if attempt else _digest(*parts))
+
+
+def escalation_projection_key(escalation: str, attempt: int = 0) -> str:
+    """The idempotency key of an escalation's hold projection; `escalation` names the escalation."""
+    if type(attempt) is not int or not 0 <= attempt <= MAX_ESCALATION_REPLANS:
+        raise ValueError("escalation projection attempt is outside its re-plan bound")
+    return (ESCALATION_PROJECTION_PREFIX + _key_identity(escalation, "escalation")
+            + (f"{_KEY_SEPARATOR}{attempt}" if attempt else ""))
+
+
+def review_hold_restore_command_id(key: WorkflowKey, gate_id: str, evidence_id: str) -> CommandId:
+    """One restoring projection per (open gate, fresh read that found the hold missing)."""
+    key = _pr_key(key)
+    validate_workflow_identifier(gate_id, "held gate")
+    validate_workflow_identifier(evidence_id, "hold observation")
+    return CommandId(_digest(key.repository, "PullRequestRef", key.target.number, gate_id, evidence_id, "hold"))
+
+
+def _is_review_relabel(command: object) -> bool:
+    return (isinstance(command, LifecycleCommand) and command.kind is CommandKind.RELABEL
+            and command.workflow is not None
+            and command.workflow.authority.family is WorkflowFamily.REVIEW_REJECTIONS)
+
+
+def is_review_escalation_projection(command: object) -> bool:
+    """Whether a durable command is the attention-hold projection of a settled escalation."""
+    return (isinstance(command, LifecycleCommand) and _is_review_relabel(command)
+            and command.idempotency_key.startswith(ESCALATION_PROJECTION_PREFIX))
+
+
+def escalation_projection_identity(command: object) -> str | None:
+    """The escalation an escalation projection (or a bounded re-plan of it) belongs to."""
+    if not is_review_escalation_projection(command):
+        return None
+    assert isinstance(command, LifecycleCommand)
+    return command.idempotency_key[len(ESCALATION_PROJECTION_PREFIX):].split(_KEY_SEPARATOR, 1)[0]
+
+
+def escalation_signal_identity(command: object) -> str | None:
+    """The escalation a succeeded attention-hold projection makes visible, else None.
+
+    The operator is signalled once per identity: a verdict escalation's
+    submission, or a ceiling gate whether its hold landed through the
+    escalation's projection or through a restoration after that was refused.
+    """
+    if not _is_review_relabel(command):
+        return None
+    assert isinstance(command, LifecycleCommand)
+    for prefix in (ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX):
+        if command.idempotency_key.startswith(prefix):
+            return command.idempotency_key[len(prefix):].split(_KEY_SEPARATOR, 1)[0] or None
+    return None
+
+
 def review_rearm_observation_gate_id(request_id: str) -> str:
     """The one visible hold a pending review re-arm's unavailable reconciliation reads can open.
 
@@ -209,11 +295,14 @@ class ReviewSubmissionReceipt:
 
     Minted by the harness from its own command and effect receipt, never from
     agent output; the only input that may establish a reviewed baseline.
+    `escalated` marks the reviewer's ESCALATE verdict: the head is reviewed
+    and the attention hold is projected with the baseline, in one commit.
     """
     submission: BoundReviewSubmission
     head_sha: str
     patch_id: str
     receipt_id: str
+    escalated: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.submission, BoundReviewSubmission):
@@ -221,15 +310,23 @@ class ReviewSubmissionReceipt:
         validate_commit_sha(self.head_sha, "reviewed head")
         _patch_digest(self.patch_id, "reviewed patch identity")
         validate_workflow_identifier(self.receipt_id, "review receipt")
+        if not isinstance(self.escalated, bool):
+            raise ValueError("review receipt escalation must be a boolean")
 
 
 @dataclass(frozen=True)
 class CeilingEscalation:
-    """The SUBMIT_REVIEW receipt of an `EscalatedSubmission`; only cause "ceiling" opens a gate."""
+    """The SUBMIT_REVIEW receipt of an `EscalatedSubmission`; only cause "ceiling" opens a gate.
+
+    `rule` is the counting rule the escalating verdict counted its prior
+    rejections under (recorded in the submission payload), so the gate is
+    judged by exactly the rule that decided it, never by current configuration.
+    """
     submission: BoundReviewSubmission
     head_sha: str
     receipt_id: str
     escalate_cause: EscalationCause
+    rule: CountingRule
 
     def __post_init__(self) -> None:
         if not isinstance(self.submission, BoundReviewSubmission):
@@ -238,6 +335,8 @@ class CeilingEscalation:
         validate_workflow_identifier(self.receipt_id, "escalation receipt")
         if self.escalate_cause not in ("verdict", "ceiling"):
             raise ValueError("escalation requires a recognized cause")
+        if not isinstance(self.rule, CountingRule):
+            raise ValueError("escalation requires the counting rule its verdict used")
 
 
 def _evidence(required: tuple[str, ...], extra: object) -> tuple[str, ...]:
@@ -353,16 +452,26 @@ def _gate_change(snapshot: ReviewWorkflowSnapshot, gates: tuple[UnresolvedGate, 
 
 def open_review_ceiling(
     snapshot: ReviewWorkflowSnapshot, pr: PullRequestObservation, *, now: datetime, rule: CountingRule,
-    ceiling: int, escalation: CeilingEscalation, evidence_ids: tuple[str, ...] = (),
+    ceiling: int, escalation: CeilingEscalation, trigger_label: Label, executor_identity: str,
+    evidence_ids: tuple[str, ...] = (),
 ) -> WorkflowTransition:
     """Open a NEW ceiling gate, proven by the harness's own ceiling escalation.
 
-    `rule` is the configured counting rule, captured into the cause. An
-    existing same-episode ceiling is refreshed only by `reconcile_review_ceiling`.
+    The gate is judged under the counting rule the escalating verdict used
+    (`escalation.rule`, captured into the cause); `rule` is the configured
+    one, whose review identity it must share. The gate and its
+    `needs-human-review` projection commit together, so the visible hold can
+    neither precede nor outlive the settled receipt that proves it. A fresh
+    read that disproves the ceiling (a human dismissed a counted review, or
+    the head moved) refuses: no gate and no hold, and the head the escalation
+    named is not a reviewed baseline, so the workflow owes exactly the one
+    review a release would owe. An existing same-episode ceiling is refreshed
+    only by `reconcile_review_ceiling`.
     """
     snapshot = _review_snapshot(snapshot)
-    if not isinstance(escalation, CeilingEscalation):
-        raise ValueError("a new review ceiling requires its escalation receipt")
+    if not isinstance(escalation, CeilingEscalation) or not isinstance(rule, CountingRule):
+        raise ValueError("a new review ceiling requires its escalation receipt and the configured rule")
+    trigger = _trigger(trigger_label)
     failure = _observed(snapshot, pr, now, complete=True)
     if failure is not None:
         return failure
@@ -373,7 +482,9 @@ def open_review_ceiling(
         return _reject(WorkflowRejection.INVALID_SCOPE, "only a ceiling escalation opens a rejection ceiling")
     if escalation.submission.binding != snapshot.binding or escalation.head_sha != pr.head_sha:
         return _reject(WorkflowRejection.INVALID_SCOPE, "the escalation belongs to another generation, episode or head")
-    cause = review_ceiling_cause(pr, episode_id=snapshot.episode.episode_id, rule=rule, ceiling=ceiling)
+    if not login_eq(escalation.rule.review_bot, rule.review_bot):
+        return _reject(WorkflowRejection.INVALID_SCOPE, "the escalation counted another review identity's rejections")
+    cause = review_ceiling_cause(pr, episode_id=snapshot.episode.episode_id, rule=escalation.rule, ceiling=ceiling)
     if cause is None:
         return _reject(WorkflowRejection.NOT_EXHAUSTED, "fresh complete reviews do not reach the rejection ceiling")
     existing = _episode_ceilings(snapshot)
@@ -381,9 +492,16 @@ def open_review_ceiling(
         return WorkflowUnchanged(snapshot)
     if existing:
         return _reject(WorkflowRejection.INVALID_SCOPE, "an existing ceiling is refreshed by reconciliation")
+    gate = _ceiling_gate_for(snapshot, cause)
+    gates = snapshot.gates + (gate,)
+    if len(gates) > MAX_WORKFLOW_GATES:
+        return _reject(WorkflowRejection.OTHER_HOLD, "the workflow cannot hold another gate")
+    after = replace(snapshot, revision=_next(snapshot), gates=gates)
+    projection = _escalation_projection(after, pr, escalation.submission.command_id, escalation=gate.gate_id,
+                                        trigger_label=trigger, executor_identity=executor_identity)
     required = (str(escalation.submission.command_id), escalation.receipt_id)
-    return _gate_change(snapshot, snapshot.gates + (_ceiling_gate_for(snapshot, cause),),
-                        _evidence(required, evidence_ids))
+    return WorkflowChanged(snapshot.revision, WorkflowMutation.OPEN_GATE, after,
+                           ObservedTransition(_evidence(required, evidence_ids)), (projection,), prior=snapshot)
 
 
 def _captured_rule(snapshot: ReviewWorkflowSnapshot, existing: tuple[OpenGate, ...]) -> CountingRule | None:
@@ -469,15 +587,9 @@ def _release(
 
 # -- review completion and dispatch ---------------------------------------------
 
-def record_review(snapshot: ReviewWorkflowSnapshot, receipt: ReviewSubmissionReceipt) -> WorkflowTransition:
-    """A verified SUBMIT_REVIEW of the current generation becomes the reviewed baseline.
-
-    A submission bound to an older generation or another episode cannot
-    repopulate the baseline (ADR 0015); gates and guidance are untouched.
-    """
-    snapshot = _review_snapshot(snapshot)
-    if not isinstance(receipt, ReviewSubmissionReceipt):
-        raise ValueError("recorded review requires its harness-owned submission receipt")
+def _baseline_change(
+    snapshot: ReviewWorkflowSnapshot, receipt: ReviewSubmissionReceipt,
+) -> WorkflowRejected | WorkflowUnchanged | ReviewWorkflowSnapshot:
     submission = receipt.submission
     if submission.binding != snapshot.binding:
         return _reject(WorkflowRejection.INVALID_SCOPE,
@@ -487,10 +599,63 @@ def record_review(snapshot: ReviewWorkflowSnapshot, receipt: ReviewSubmissionRec
     baseline = ReviewedBaseline(receipt.head_sha, receipt.patch_id, snapshot.revision.fence.generation, submission)
     if snapshot.episode.continuation == baseline:
         return WorkflowUnchanged(snapshot)
-    after = replace(snapshot, revision=_next(snapshot), episode=replace(snapshot.episode, continuation=baseline))
+    return replace(snapshot, revision=_next(snapshot), episode=replace(snapshot.episode, continuation=baseline))
+
+
+def record_review(snapshot: ReviewWorkflowSnapshot, receipt: ReviewSubmissionReceipt) -> WorkflowTransition:
+    """A verified SUBMIT_REVIEW verdict of the current generation becomes the reviewed baseline.
+
+    A submission bound to an older generation or another episode cannot
+    repopulate the baseline (ADR 0015); gates and guidance are untouched. An
+    escalated verdict records only with its hold (`record_escalated_review`).
+    """
+    snapshot = _review_snapshot(snapshot)
+    if not isinstance(receipt, ReviewSubmissionReceipt):
+        raise ValueError("recorded review requires its harness-owned submission receipt")
+    if receipt.escalated:
+        return _reject(WorkflowRejection.INVALID_SCOPE, "an escalated verdict records together with its attention hold")
+    after = _baseline_change(snapshot, receipt)
+    if not isinstance(after, ReviewWorkflowSnapshot):
+        return after
+    submission = receipt.submission
     return WorkflowChanged(snapshot.revision, WorkflowMutation.RECORD_REVIEW, after,
                            ObservedTransition(_evidence((str(submission.command_id), receipt.receipt_id), ())),
                            prior=snapshot)
+
+
+def record_escalated_review(
+    snapshot: ReviewWorkflowSnapshot, receipt: ReviewSubmissionReceipt, pr: PullRequestObservation, *,
+    now: datetime, trigger_label: Label, executor_identity: str, evidence_ids: tuple[str, ...] = (),
+) -> WorkflowTransition:
+    """The reviewer's ESCALATE verdict: its head is reviewed and the attention hold is projected.
+
+    Both commit in one transition, decided by the settled receipt and a fresh
+    read (never by the dispatch that posted it), so a crash or lost reply
+    between the receipt and the relabel neither re-buys the head nor leaves
+    the PR under its trigger with no hold. The hold itself is an external
+    one the review projection never removes (slice plan decision 3). A head
+    that moved since the escalation supersedes it: the new head is owed a
+    review and nothing is held.
+    """
+    snapshot = _review_snapshot(snapshot)
+    if not isinstance(receipt, ReviewSubmissionReceipt) or not receipt.escalated:
+        raise ValueError("an escalated review records from its escalated verdict receipt")
+    trigger = _trigger(trigger_label)
+    failure = _observed(snapshot, pr, now, complete=False)
+    if failure is not None:
+        return failure
+    assert isinstance(pr, ObservedPullRequest)
+    if pr.head_sha != receipt.head_sha:
+        return _reject(WorkflowRejection.INVALID_SCOPE, "the escalated head was superseded; the new head is owed a review")
+    after = _baseline_change(snapshot, receipt)
+    if not isinstance(after, ReviewWorkflowSnapshot):
+        return after
+    submission = receipt.submission
+    projection = _escalation_projection(after, pr, submission.command_id, escalation=str(submission.command_id),
+                                        trigger_label=trigger, executor_identity=executor_identity)
+    required = (str(submission.command_id), receipt.receipt_id)
+    return WorkflowChanged(snapshot.revision, WorkflowMutation.RECORD_REVIEW, after,
+                           ObservedTransition(_evidence(required, evidence_ids)), (projection,), prior=snapshot)
 
 
 def _patch(value: object) -> str | None:
@@ -625,13 +790,27 @@ def review_dispatch_decision(
 
 # -- commands -------------------------------------------------------------------
 
+# The labels that hold, release or terminate review work on a pull request:
+# the review triggers, the human opt-out, the attention and trusted holds, and
+# the lifecycle positions. Advisory markers (recurrence, maybe-resolved),
+# priority and steward triage labels are observations, not decision facts, so
+# a projection is never refused because one of them changed (ADR 0015).
+PULL_REQUEST_HOLD_FACT_LABELS: frozenset[Label] = LIFECYCLE_LABELS | frozenset({
+    Label.AI_REVIEW, Label.NO_AI_REVIEW, Label.NEEDS_BUDGET_REVIEW,
+})
+
+
+def hold_fact_labels(labels: frozenset[Label]) -> frozenset[Label]:
+    return frozenset(labels) & PULL_REQUEST_HOLD_FACT_LABELS
+
+
 @dataclass(frozen=True)
 class PullRequestHoldGuard:
     """ADR 0015 semantic fence for a PR hold projection, mirroring `IssueHoldGuard`.
 
     The open state (implied: a guard is minted only from an open PR), the head,
-    and every hold/lifecycle label. Comments, title and body are not hold facts.
-    Priority labels only order queued work and are excluded.
+    and the `PULL_REQUEST_HOLD_FACT_LABELS` present. Comments, title, body and
+    advisory or priority labels are not hold facts.
     """
     head_sha: str
     labels: frozenset[Label]
@@ -640,14 +819,14 @@ class PullRequestHoldGuard:
         validate_commit_sha(self.head_sha, "hold guard head")
         if not isinstance(self.labels, frozenset) or any(not isinstance(label, Label) for label in self.labels):
             raise ValueError("hold guard labels must be a frozenset of labels")
-        if self.labels & ORDERING_LABELS:
-            raise ValueError("hold guard labels exclude ordering-only labels")
+        if not self.labels <= PULL_REQUEST_HOLD_FACT_LABELS:
+            raise ValueError("hold guard labels are hold facts only")
 
 
 def pull_request_hold_guard(pr: ObservedPullRequest) -> PullRequestHoldGuard:
     if not isinstance(pr, ObservedPullRequest) or pr.state is not PullRequestState.OPEN:
         raise ValueError("a hold projection guard requires an open observed pull request")
-    return PullRequestHoldGuard(pr.head_sha, frozenset(pr.labels) - ORDERING_LABELS)
+    return PullRequestHoldGuard(pr.head_sha, hold_fact_labels(pr.labels))
 
 
 def pull_request_hold_guard_applies(
@@ -663,7 +842,7 @@ def pull_request_hold_guard_applies(
         raise ValueError("hold guard evaluation requires a typed guard and observation")
     if pr.state is not PullRequestState.OPEN or pr.head_sha != guard.head_sha:
         return False
-    current = frozenset(pr.labels) - ORDERING_LABELS
+    current = hold_fact_labels(pr.labels)
     return not (current - guard.labels - set(added) or guard.labels - current - set(removed))
 
 
@@ -743,18 +922,194 @@ def _relabel(
     labels: frozenset[Label], *, executor_identity: str,
 ) -> LifecycleCommand:
     """Release the attention hold and add the trigger, or keep (and ensure) the hold, as planned."""
-    guard = PullRequestHoldGuard(head_sha, frozenset(labels) - ORDERING_LABELS)
+    return _guarded_relabel(snapshot, plan.command_id, plan.remove, plan.add, idempotency_key, head_sha, labels,
+                            executor_identity=executor_identity)
+
+
+def _guarded_relabel(
+    snapshot: ReviewWorkflowSnapshot, command_id: CommandId, remove: Label | None, add: Label, idempotency_key: str,
+    head_sha: str, labels: frozenset[Label], *, executor_identity: str,
+) -> LifecycleCommand:
+    """One workflow-owned pull request relabel fenced by its `PullRequestHoldGuard`."""
+    guard = PullRequestHoldGuard(head_sha, hold_fact_labels(labels))
     key = snapshot.revision.fence.key
     payload = {
         "target": Target.PR.value, "number": key.target.number,
-        "remove": plan.remove.value if plan.remove else None, "add": plan.add.value,
+        "remove": remove.value if remove else None, "add": add.value,
         "expected_revision": head_sha, "harness_signal": False, "removes": [], "completion_guard": None,
         "pull_request_hold_guard": {"head_sha": guard.head_sha, "labels": sorted(label.value for label in guard.labels)},
     }
     return LifecycleCommand(
-        plan.command_id, idempotency_key, CommandKind.RELABEL, f"pr:{key.target.number}", head_sha, payload,
+        command_id, idempotency_key, CommandKind.RELABEL, f"pr:{key.target.number}", head_sha, payload,
         repository=key.repository, executor_identity=executor_identity, workflow=snapshot.binding,
     )
+
+
+def _escalation_projection(
+    after: ReviewWorkflowSnapshot, pr: ObservedPullRequest, submission: CommandId, *, escalation: str,
+    trigger_label: Label, executor_identity: str, attempt: int = 0,
+) -> LifecycleCommand:
+    """Swap the trigger for the attention hold, fenced by this read's hold facts."""
+    key = after.revision.fence.key
+    return _guarded_relabel(after, review_escalation_command_id(key, submission, attempt), _trigger(trigger_label),
+                            Label.NEEDS_HUMAN_REVIEW, escalation_projection_key(escalation, attempt), pr.head_sha,
+                            pr.labels, executor_identity=executor_identity)
+
+
+@dataclass(frozen=True)
+class EscalationHoldPresent:
+    """The fresh read already shows the escalation's hold: the refusal needs nothing more."""
+
+
+@dataclass(frozen=True)
+class EscalationMoot:
+    """The escalation no longer applies (terminal, a new head, a new baseline): nothing to hold."""
+    reason: str
+
+
+@dataclass(frozen=True)
+class EscalationReprojected:
+    command: LifecycleCommand
+
+
+@dataclass(frozen=True)
+class EscalationProjectionExhausted:
+    """The re-plan bound is spent: the refusal becomes a visible gate, never a silent stop."""
+    replans: int
+
+
+EscalationReplan = EscalationHoldPresent | EscalationMoot | EscalationReprojected | EscalationProjectionExhausted
+
+
+def replan_escalation_hold(
+    snapshot: ReviewWorkflowSnapshot, pr: ObservedPullRequest, receipt: ReviewSubmissionReceipt, *, replans: int,
+    trigger_label: Label, executor_identity: str,
+) -> EscalationReplan:
+    """What a verdict escalation whose hold projection was refused becomes on a fresh read.
+
+    The projection is refused only when a hold fact changed before it ran
+    (the semantic guard ignores advisory labels). The escalation still
+    applies while the pull request is open at the escalated head and the
+    workflow's baseline is still that escalated verdict: its hold is then
+    re-planned from this read, so a human's hold label (`no-ai-review`,
+    `ai-parked`) is kept beside it; the projection only adds
+    `needs-human-review` and removes the trigger. A close, a new head (owed
+    its own review) or a replaced baseline makes it moot. Re-plans are
+    bounded; at the bound the refusal is surfaced, never dropped.
+    """
+    snapshot = _review_snapshot(snapshot)
+    trigger = _trigger(trigger_label)
+    if not isinstance(receipt, ReviewSubmissionReceipt) or not receipt.escalated:
+        raise ValueError("an escalation hold is re-planned from its escalated verdict receipt")
+    if not isinstance(pr, ObservedPullRequest) or pr.key != snapshot.revision.fence.key:
+        raise ValueError("an escalation hold is re-planned from its own pull request observation")
+    if type(replans) is not int or replans < 0:
+        raise ValueError("escalation re-plans are a non-negative count")
+    continuation = snapshot.episode.continuation
+    if pr.state is not PullRequestState.OPEN:
+        return EscalationMoot("the pull request is terminal")
+    if pr.head_sha != receipt.head_sha:
+        return EscalationMoot("the head moved; the new head is owed its own review")
+    if (not isinstance(continuation, ReviewedBaseline) or continuation.source != receipt.submission
+            or continuation.head_sha != receipt.head_sha
+            or continuation.reviewed_generation != snapshot.revision.fence.generation):
+        return EscalationMoot("the workflow no longer records this escalated verdict")
+    if isinstance(snapshot.intent, PendingReviewRearm):
+        return EscalationMoot("a pending re-arm owns the labels")
+    if escalation_hold_visible(pr, trigger):
+        return EscalationHoldPresent()
+    if replans >= MAX_ESCALATION_REPLANS:
+        return EscalationProjectionExhausted(replans)
+    submission = receipt.submission.command_id
+    return EscalationReprojected(_escalation_projection(
+        snapshot, pr, submission, escalation=str(submission), trigger_label=trigger,
+        executor_identity=executor_identity, attempt=replans + 1,
+    ))
+
+
+@dataclass(frozen=True)
+class RestoreHold:
+    gate_id: str
+    command: LifecycleCommand
+
+
+@dataclass(frozen=True)
+class HoldContested:
+    """The gate's restorations are spent: surfaced once; the gate still holds every review."""
+    gate_id: str
+    restores: int
+
+
+def restorable_ceiling_gate_ids(snapshot: ReviewWorkflowSnapshot) -> frozenset[str]:
+    """The open ceilings whose visible hold restoration may track; any other count is stale."""
+    return frozenset(g.gate_id for g in _episode_ceilings(_review_snapshot(snapshot)))
+
+
+def escalation_hold_visible(pr: ObservedPullRequest, trigger_label: Label) -> bool:
+    """An escalation's attention hold as GitHub shows it: `needs-human-review` and no review trigger."""
+    if not isinstance(pr, ObservedPullRequest):
+        raise ValueError("an escalation hold is read from a present pull request observation")
+    return Label.NEEDS_HUMAN_REVIEW in pr.labels and _trigger(trigger_label) not in pr.labels
+
+
+def verified_ceiling_holds(
+    snapshot: ReviewWorkflowSnapshot, pr: ObservedPullRequest, *, trigger_label: Label,
+) -> frozenset[str]:
+    """The open ceilings of this episode whose hold this read shows on GitHub, whoever applied it.
+
+    Each one's operator signal is owed from this read: a person may have
+    applied the hold before the escalation's projection or restoration ran,
+    and then no succeeded receipt of the harness carries that signal.
+    """
+    snapshot = _review_snapshot(snapshot)
+    if not isinstance(pr, ObservedPullRequest) or pr.key != snapshot.revision.fence.key:
+        raise ValueError("a ceiling hold is verified from its own pull request observation")
+    if pr.state is not PullRequestState.OPEN or not escalation_hold_visible(pr, trigger_label):
+        return frozenset()
+    return restorable_ceiling_gate_ids(snapshot)
+
+
+def ceiling_hold_restoration(
+    snapshot: ReviewWorkflowSnapshot, pr: ObservedPullRequest, evidence_id: str, *,
+    restores: Mapping[str, int], trigger_label: Label, executor_identity: str,
+) -> RestoreHold | HoldContested | None:
+    """Restore an open ceiling gate's missing visible hold, a bounded number of times per gate.
+
+    An open (not re-arming) rejection ceiling of this episode holds every
+    review dispatch; `needs-human-review` is its only visible sign. A human
+    removing that label, or swapping it back for the trigger, without
+    dismissing the counted reviews or re-arming leaves the gate open, so the
+    hold is re-projected rather than left silent (keifu #173). Releasing it is
+    a dismissal on GitHub (RELEASE_CEILING) or an operator re-arm, never a
+    label edit. A pending re-arm owns the labels until it completes or stops.
+    `restores` counts this gate's earlier restorations: past
+    `MAX_HOLD_RESTORES` an actor keeps removing the hold, and fighting it is
+    a loop, so the war is surfaced as contested instead. None: nothing to do.
+    """
+    snapshot = _review_snapshot(snapshot)
+    trigger = _trigger(trigger_label)
+    if not isinstance(pr, ObservedPullRequest) or pr.key != snapshot.revision.fence.key:
+        raise ValueError("hold restoration requires its own pull request observation")
+    if pr.state is not PullRequestState.OPEN or isinstance(snapshot.intent, PendingReviewRearm):
+        return None
+    ceilings = _episode_ceilings(snapshot)
+    if not ceilings:
+        return None
+    if escalation_hold_visible(pr, trigger):
+        return None
+    gate_id = ceilings[-1].gate_id
+    count = restores.get(gate_id, 0)
+    if type(count) is not int or count < 0:
+        raise ValueError("hold restorations are a non-negative count")
+    if count >= MAX_HOLD_RESTORES:
+        return HoldContested(gate_id, count)
+    key = snapshot.revision.fence.key
+    return RestoreHold(gate_id, _guarded_relabel(
+        snapshot, review_hold_restore_command_id(key, gate_id, evidence_id),
+        trigger if trigger in pr.labels else None, Label.NEEDS_HUMAN_REVIEW,
+        HOLD_RESTORE_PREFIX + _key_identity(gate_id, "held gate") + _KEY_SEPARATOR + evidence_id,
+        pr.head_sha, pr.labels, executor_identity=executor_identity,
+    ))
 
 
 def review_rearm_projection(
@@ -1095,6 +1450,22 @@ def review_rearm_stop_reason(
     return None
 
 
+def ceiling_reached_again(pending: PendingReviewRearm, pr: ObservedPullRequest, ceiling: int) -> bool:
+    """Whether reviews counted outside the authorization alone reach the ceiling.
+
+    Only a complete review read decides. Such a re-rejection can never be
+    completed by the authorized dismissals, so it stops the re-arm visibly
+    rather than waiting as an undecidable read (ADR 0015, newly true cause).
+    """
+    if not isinstance(pending, PendingReviewRearm) or not isinstance(pr, ObservedPullRequest):
+        raise ValueError("re-rejection requires the pending intent and a present observation")
+    if not isinstance(pr.reviews, CompleteReviews):
+        return False
+    authorized = _ids(pending.authorized)
+    fresh = tuple(r for r in counted_rejections(pr.reviews, pending.rule) if r.review_id not in authorized)
+    return not _ceiling_cleared(fresh, _ceiling_value(ceiling))
+
+
 def review_projection_obsolete(snapshot: ReviewWorkflowSnapshot, external_holds: tuple[str, ...] = ()) -> bool:
     """Whether the pending re-arm's recorded relabel no longer matches the hold facts.
 
@@ -1273,6 +1644,14 @@ def _supersession_evidence(
         if pr.state is PullRequestState.OPEN:
             raise ValueError("terminal supersession requires an observed terminal pull request")
         return
+    if intent.reason is StopReason.CEILING_REACHED_AGAIN:
+        accepted = facts.accepted_preflight
+        pending = before.intent
+        if not isinstance(accepted, ReviewRearmPreflight) or pr.observed_at < accepted.observed_at:
+            raise ValueError("a re-rejection stop cites a read taken after the re-arm was accepted")
+        if not isinstance(pending, PendingReviewRearm) or not ceiling_reached_again(pending, pr, facts.ceiling):
+            raise ValueError("a re-rejection stop requires unauthorized counted reviews at the ceiling")
+        return
     accepted = facts.accepted_preflight
     if not isinstance(accepted, ReviewRearmPreflight) or accepted.pr_key != before.revision.fence.key:
         raise ValueError("decision supersession requires the accepted preflight")
@@ -1322,6 +1701,8 @@ def validate_review_transition(
                 raise ValueError("a new review ceiling requires the configured counting rule")
             expected = open_review_ceiling(before, _observation(facts), now=facts.now, rule=facts.rule,
                                            ceiling=facts.ceiling, escalation=facts.escalation,
+                                           trigger_label=facts.trigger_label,
+                                           executor_identity=facts.executor_identity,
                                            evidence_ids=audit.evidence_ids)
         else:
             expected = _reconciled(before, facts, audit)
@@ -1330,7 +1711,13 @@ def validate_review_transition(
     elif mutation is WorkflowMutation.RECORD_REVIEW and isinstance(audit, ObservedTransition):
         if facts.submission is None:
             raise ValueError("a recorded review requires its harness-owned submission receipt")
-        expected = record_review(before, facts.submission)
+        if facts.submission.escalated:
+            expected = record_escalated_review(
+                before, facts.submission, _observation(facts), now=facts.now, trigger_label=facts.trigger_label,
+                executor_identity=facts.executor_identity, evidence_ids=audit.evidence_ids,
+            )
+        else:
+            expected = record_review(before, facts.submission)
     elif mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM) and isinstance(
         audit, AuthorizedOperatorCommand
     ) and isinstance(audit.preflight, ReviewRearmPreflight):

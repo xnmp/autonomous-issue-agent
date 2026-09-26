@@ -259,6 +259,9 @@ class StopReason(str, Enum):
     DECISION_CHANGED = "decision_changed"
     REQUIRED_EFFECT_REJECTED = "required_effect_rejected"
     OPERATOR_CANCELLED = "operator_cancelled"
+    # Review slice: reviews counted outside the authorization reached the
+    # rejection ceiling again before the re-arm completed.
+    CEILING_REACHED_AGAIN = "ceiling_reached_again"
 
 
 @dataclass(frozen=True)

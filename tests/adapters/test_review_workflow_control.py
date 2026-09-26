@@ -14,7 +14,9 @@ import json
 import pytest
 
 import issue_agent.adapters.review_workflow_control as review_control_module
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import (
+    ESCALATION_SIGNAL_OWED_NAMESPACE, ControlStoreError, RetiredOwnerError, SQLiteControlStore, owe_escalation_signal,
+)
 from issue_agent.adapters.deployment_authority import deployment_effect_authority
 from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.review_workflow_control import (
@@ -29,7 +31,7 @@ from issue_agent.domain.review_rearm import (
     AbsentReviewControl, InactiveReviewControl, PendingReviewRecovery, ReleaseStatus, ReviewControlView,
 )
 from issue_agent.domain.review_workflow import (
-    CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, RecordedPullRequest,
+    PullRequestUnavailable, CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, RecordedPullRequest,
     ReviewedBaseline, ReviewProjectionRefused, ReviewRejectionCeiling, ReviewWorkflowSnapshot, SupersededReviewRearm,
 )
 from issue_agent.domain.review_workflow_policy import (
@@ -39,12 +41,13 @@ from issue_agent.domain.review_workflow_policy import (
 )
 from issue_agent.domain.workflow import (
     AuthorizeAbsentRetry, CancelRearm, ContinueGrantedRearm, EvidenceUnavailable, KeepGuidance, OpenGate,
+    ReconciliationPolicy,
     OperatorActor, RearmNeedsDecision, RearmingGate, ReconciliationOnly, RemoteOutcomeUncertain, RequestRearm,
     RetiredUncertainCommand,
     RetiredSettledCommand, RetryAuthorizationRequired, StopReason, WorkflowAbsent, WorkflowCommitted,
     WorkflowConflict, WorkflowMigrationRequired, WorkflowMutation, WorkflowRejected, WorkflowRejection,
 )
-from issue_agent.domain.workflow_identity import FamilyAuthority, WorkflowFamily, WorkflowWriter
+from issue_agent.domain.workflow_identity import FamilyAuthority, PullRequestRef, WorkflowFamily, WorkflowKey, WorkflowWriter
 from issue_agent.domain.workflow_reconciliation import prewrite_evidence_gate_id
 from issue_agent.domain.review_rejection import CountingRule
 from issue_agent.domain.world import PRView
@@ -104,7 +107,7 @@ class Rig:
         return self.control()
 
     def control(self, *, gateway=None, ceiling=3, **kwargs):
-        kwargs.setdefault("external_holds", lambda _pr: tuple(self.holds))
+        kwargs.setdefault("external_holds", lambda _pr, _view: tuple(self.holds))
         return SQLiteReviewWorkflowControl(self.store, WRITER, gateway=gateway or self.remote, ceiling=ceiling,
                                            trigger_label=TRIGGER, rule=CountingRule(BOT), **kwargs)
 
@@ -141,7 +144,7 @@ class Rig:
         rows = self.query("SELECT status, error FROM effect_receipts WHERE command_id=?", str(command_id))
         return None if not rows else tuple(rows[0])
 
-    def submit(self, event="COMMENT", *, cause="ceiling", patch=None, body="escalating"):
+    def submit(self, event="COMMENT", *, cause="ceiling", patch=PATCH, body="escalating"):
         before = {row[0] for row in self.query("SELECT command_id FROM lifecycle_commands WHERE kind='submit_review'")}
         assert self.executor().submit_bound_review(PR, event, body, HEAD, workflow=self.workflow().binding,
                                                    reviewer=BOT, patch_id=patch, escalate_cause=cause)
@@ -336,13 +339,15 @@ def test_a_forged_prior_cannot_keep_or_drop_the_stored_baseline(rig):
     observation, evidence_id = fresh_observation(rig)
     forged = replace(stored, episode=replace(stored.episode, continuation=FreshReviewRequired(0)))
     proposal = open_review_ceiling(forged, observation, now=rig.clock[0], rule=CountingRule(BOT), ceiling=3,
-                                   escalation=escalation, evidence_ids=(evidence_id,))
+                                   escalation=escalation, trigger_label=TRIGGER, executor_identity=REVIEWER,
+                                   evidence_ids=(evidence_id,))
     assert proposal.mutation is WorkflowMutation.OPEN_GATE and proposal.expected == stored.revision
     with pytest.raises(WorkflowAuthorityError, match="stored workflow snapshot"):
         commit(rig, proposal)
     assert rig.workflow() == stored
     honest = open_review_ceiling(stored, observation, now=rig.clock[0], rule=CountingRule(BOT), ceiling=3,
-                                 escalation=escalation, evidence_ids=(evidence_id,))
+                                 escalation=escalation, trigger_label=TRIGGER, executor_identity=REVIEWER,
+                                   evidence_ids=(evidence_id,))
     kept = commit(rig, honest).snapshot
     assert kept.episode == stored.episode and rig.ceiling_gate(kept)
 
@@ -352,10 +357,11 @@ def test_a_ceiling_proposal_without_a_harness_escalation_is_refused(rig):
     stored = rig.control().ensure_observed_workflow(PR_KEY).snapshot
     verdict = rig.store.bound_review_submission(rig.verdict())
     from issue_agent.domain.review_workflow_policy import CeilingEscalation
-    forged = CeilingEscalation(verdict.submission, HEAD, verdict.receipt_id, "ceiling")
+    forged = CeilingEscalation(verdict.submission, HEAD, verdict.receipt_id, "ceiling", CountingRule(BOT))
     observation, evidence_id = fresh_observation(rig)
     proposal = open_review_ceiling(stored, observation, now=rig.clock[0], rule=CountingRule(BOT), ceiling=3,
-                                   escalation=forged, evidence_ids=(evidence_id,))
+                                   escalation=forged, trigger_label=TRIGGER, executor_identity=REVIEWER,
+                                   evidence_ids=(evidence_id,))
     with pytest.raises(WorkflowAuthorityError, match="escalation"):
         commit(rig, proposal)
     assert rig.workflow().gates == ()
@@ -367,7 +373,8 @@ def test_a_proposal_naming_absent_or_foreign_observation_evidence_is_refused(rig
     escalation = rig.store.bound_review_submission(rig.submit())
     observation, _ = fresh_observation(rig)
     proposal = open_review_ceiling(stored, observation, now=rig.clock[0], rule=CountingRule(BOT), ceiling=3,
-                                   escalation=escalation, evidence_ids=("pr-observation:invented",))
+                                   escalation=escalation, trigger_label=TRIGGER, executor_identity=REVIEWER,
+                                   evidence_ids=("pr-observation:invented",))
     with pytest.raises(WorkflowAuthorityError, match="durable harness"):
         commit(rig, proposal)
 
@@ -380,7 +387,7 @@ def test_a_stale_observation_cannot_decide_a_ceiling(rig):
     rig.advance(301)
     proposal = open_review_ceiling(stored, observation, now=rig.clock[0] - timedelta(seconds=301),
                                    rule=CountingRule(BOT), ceiling=3, escalation=escalation,
-                                   evidence_ids=(evidence_id,))
+                                   trigger_label=TRIGGER, executor_identity=REVIEWER, evidence_ids=(evidence_id,))
     with pytest.raises(WorkflowAuthorityError, match="refused"):
         commit(rig, proposal)
 
@@ -569,6 +576,25 @@ def test_an_active_review_run_blocks_acceptance(rig):
     assert rig.workflow() == state
 
 
+@pytest.mark.parametrize("number, state, blocks", [
+    (PR, "running", True),
+    (PR, "completed", False),
+    (PR + 1, "running", False),
+], ids=["live-for-this-pr", "finished", "another-pr"])
+def test_an_unbound_review_run_admitted_before_activation_blocks_acceptance_until_it_ends(rig, number, state, blocks):
+    """Admission refuses unbound review legs once active, so only a pre-activation run can match (ADR 0015)."""
+    gated = rig.gated()
+    rig.store.start_run(RunId("legacy-review"), json.dumps({
+        "repository": "o/r", "role": "review", "pr": number, "number": number, "kind": "REVIEW"}),
+        "REVIEW", REVIEWER, "config", state=state)
+    _, result = rig.request()
+    if blocks:
+        assert isinstance(result, WorkflowRejected) and result.code is WorkflowRejection.OTHER_HOLD
+        assert rig.workflow() == gated
+    else:
+        assert isinstance(result, WorkflowCommitted), result
+
+
 def test_a_crash_inside_the_acceptance_commit_leaves_nothing_and_a_restart_accepts(rig, monkeypatch):
     state = rig.gated()
 
@@ -751,31 +777,27 @@ def test_an_unavailable_read_backs_off_journals_and_gates_at_the_ceiling(rig):
     assert state.intent.request_id == finished.snapshot.intent.request_id
 
 
-def test_an_undecidable_completion_is_bounded_then_visible_not_silent(rig):
-    """A complete read that refuses completion (the ceiling is reached again) backs off to a visible hold."""
-    rig.pending()
+def test_a_rejection_during_a_pending_rearm_stops_it_visibly_and_regates(rig):
+    """Re-rejection to the ceiling while the re-arm is pending is an explicit stop, then a new ceiling gate.
+
+    Carried from increment 5: completion must not silently back off into a
+    generic observation hold when the reviewer has re-rejected to the ceiling.
+    """
+    state = rig.pending()
     rig.drain()
     for index in range(3):  # the bot requests changes three more times
         later_review(rig, f"n{index}")
-    first = rig.reconcile().snapshot
-    assert isinstance(first.intent, PendingReviewRearm)
-    observation = rig.control().review_control_view(PR_KEY).observation
-    assert "completion refused" in observation.last_error and observation.history.failed_reads == 1
-    gate_id = review_rearm_observation_gate_id("request:1")
-    control = rig.control()
-    for _ in range(40):
-        rig.advance(3600)
-        for due in control.pending_rearms():
-            control.reconcile_rearm(due.snapshot.revision)
-        if rig.gate(gate_id) is not None:
-            break
-    gate = rig.gate(gate_id)
-    assert isinstance(gate.cause, EvidenceUnavailable) and "ceiling" in gate.cause.last_error
-    # The operator's path out is visible and works: cancellation clears the hold.
-    cancelled = rig.control().cancel_rearm(
-        CancelRearm("cancel:1", rig.workflow().revision, "request:1", "rejected again"), ACTOR)
-    assert isinstance(cancelled.snapshot.intent, CancelledReviewRearm)
-    assert rig.gate(gate_id) is None
+    stopped = rig.reconcile().snapshot
+    assert isinstance(stopped.intent, SupersededReviewRearm)
+    assert stopped.intent.reason is StopReason.CEILING_REACHED_AGAIN
+    assert stopped.intent.request_id == "request:1"
+    assert rig.gate(review_rearm_observation_gate_id("request:1")) is None
+    regated = rig.control().reconcile_ceiling(PR_KEY)
+    assert isinstance(regated, WorkflowCommitted)
+    ceilings = [g for g in rig.workflow().gates if isinstance(g, OpenGate)
+                and isinstance(g.cause, ReviewRejectionCeiling)]
+    assert len(ceilings) == 1 and ceilings[0].gate_id != state.intent.gate_id
+    assert isinstance(rig.control().dispatch_decision(pr_now(rig), patch_id=PATCH), ReviewHeld)
 
 
 # -- retirement closes every hold without an operator path ---------------------------------
@@ -986,8 +1008,13 @@ def test_a_grant_for_a_verdict_superseded_by_a_landed_one_never_posts_a_second(r
     assert rig.gate(gate.gate_id) is None  # the grant's decline cleared the hold: no dead state
     assert rig.query("SELECT disposition FROM workflow_retry_authorizations WHERE authorization_id='grant:1'"
                      )[0][0] == "inapplicable"
-    # The retired verdict no longer holds dispatch; only the recorded baseline decides what is owed.
-    assert not isinstance(rig.control().dispatch_decision(pr_now(rig), patch_id=PATCH), (SubmissionUnresolved, ReviewHeld))
+    # The retired verdict no longer holds dispatch; only the landed B decides what is owed,
+    # and until B is applied to the workflow it is the one hold (never the retired A).
+    decision = rig.control().dispatch_decision(pr_now(rig), patch_id=PATCH)
+    if recorded:
+        assert not isinstance(decision, (SubmissionUnresolved, ReviewHeld))
+    else:
+        assert decision == SubmissionUnresolved((second,))
 
 
 def test_a_granted_verdict_at_a_new_head_is_still_owed_after_an_earlier_head_was_reviewed(tmp_path):
@@ -1029,7 +1056,8 @@ def test_dispatch_waits_while_a_bound_submission_is_unresolved(rig):
     rig.advance(3600)
     rig.drain()
     assert rig.state(first) == "succeeded" and len(submit_calls(rig)) == 1
-    assert isinstance(rig.control().dispatch_decision(pr_now(rig), patch_id=PATCH), ReviewOwed)
+    # Landed but not yet applied: a second paid review would double-cover the head.
+    assert rig.control().dispatch_decision(pr_now(rig), patch_id=PATCH) == SubmissionUnresolved((first,))
     rig.control().record_review(first)
     assert isinstance(rig.control().dispatch_decision(pr_now(rig), patch_id=PATCH), ReviewNotOwed)
 
@@ -1182,7 +1210,8 @@ def test_an_uncertain_release_surfaces_remote_outcome_uncertainty(rig):
     released(rig)
     rig.points.add("relabel_pr_requested")
     rig.drain()
-    (release,) = rig.commands(CommandKind.RELABEL)[-1:]
+    (release,) = [CommandId(row[0]) for row in rig.query(
+        "SELECT command_id FROM lifecycle_commands WHERE idempotency_key LIKE 'workflow:release:%'")]
     assert rig.state(release) == "unknown_outcome"
     rig.points.add("read")
     for _ in range(12):
@@ -1341,11 +1370,13 @@ def test_an_exact_proposal_replay_is_idempotent_and_identity_reuse_conflicts(rig
     escalation = rig.store.bound_review_submission(rig.submit())
     observation, evidence_id = fresh_observation(rig)
     proposal = open_review_ceiling(stored, observation, now=rig.clock[0], rule=CountingRule(BOT), ceiling=3,
-                                   escalation=escalation, evidence_ids=(evidence_id,))
+                                   escalation=escalation, trigger_label=TRIGGER, executor_identity=REVIEWER,
+                                   evidence_ids=(evidence_id,))
     assert not commit(rig, proposal).idempotent
     assert commit(rig, proposal).idempotent
     other = open_review_ceiling(stored, observation, now=rig.clock[0], rule=CountingRule(BOT), ceiling=2,
-                                escalation=escalation, evidence_ids=(evidence_id,))
+                                escalation=escalation, trigger_label=TRIGGER, executor_identity=REVIEWER,
+                                   evidence_ids=(evidence_id,))
     assert isinstance(commit(rig, other), WorkflowConflict)
 
 
@@ -1619,7 +1650,7 @@ def seed_pending_pr(rig, number, prefix):
     state = control.ensure_observed_workflow(key).snapshot
     before = {row[0] for row in rig.query("SELECT command_id FROM lifecycle_commands WHERE kind='submit_review'")}
     assert rig.executor().submit_bound_review(number, "COMMENT", "escalating", HEAD, workflow=state.binding,
-                                              reviewer=BOT, patch_id=None, escalate_cause="ceiling")
+                                              reviewer=BOT, patch_id=PATCH, escalate_cause="ceiling")
     (escalation,) = {row[0] for row in rig.query(
         "SELECT command_id FROM lifecycle_commands WHERE kind='submit_review'")} - before
     gated_state = control.open_ceiling(CommandId(escalation)).snapshot
@@ -1753,3 +1784,167 @@ def test_a_submission_receipt_without_its_matched_review_is_malformed(rig):
         db.execute("UPDATE effect_receipts SET remote_object_id=NULL WHERE command_id=?", (str(verdict),))
     with pytest.raises(WorkflowAuthorityError, match="malformed"):
         rig.control().record_review(verdict)
+
+
+# -- escalation operator signals and first-observation backoff (increment 6 pass 3) ----------------
+
+SUCCESSOR = "o/r:review:successor"
+
+
+def escalation_signals(rig) -> int:
+    return rig.query("SELECT COUNT(*) FROM event_outbox WHERE event_json LIKE '%lifecycle.escalation.raised%'")[0][0]
+
+
+def settled_escalation(rig) -> CommandId:
+    """A ceiling escalation whose hold projection settled SUCCEEDED, then a crash before any signal claim."""
+    rig.gated()
+    return settle_projection(rig)
+
+
+def settle_projection(rig) -> CommandId:
+    (projection,) = [CommandId(row[0]) for row in rig.query(
+        "SELECT command_id FROM lifecycle_commands WHERE idempotency_key LIKE 'workflow:escalation:%'")]
+    rig.store.begin_command(projection)
+    rig.store.record_effect(EffectReceipt(projection, REVIEWER, rig.clock[0], rig.clock[0], EffectStatus.SUCCEEDED))
+    assert rig.state(projection) == "succeeded"
+    return projection
+
+
+def owe(rig, escalation, *, executor=REVIEWER, pr=PR, reason="hold_verified"):
+    with rig.store.transaction() as db:
+        owe_escalation_signal(db, executor_identity=executor, escalation=escalation, pr=pr, reason=reason,
+                              at=rig.clock[0])
+
+
+@pytest.mark.parametrize("retirements", [1, 2])
+def test_a_retired_owners_unclaimed_escalation_signals_are_sent_once_by_its_successor(rig, retirements):
+    settled_escalation(rig)
+    owe(rig, "verdict-escalation", pr=11, reason="projection_exhausted")
+    owners = [REVIEWER, *(f"{SUCCESSOR}-{n}" for n in range(retirements))]
+    for prior, successor in zip(owners, owners[1:]):
+        rig.store.adopt_legacy_owner("o/r", "review", successor, prior_owner_ids=(prior,))
+    with pytest.raises(RetiredOwnerError):
+        rig.store.claim_escalation_signals("o/r", REVIEWER)
+    assert sorted(rig.store.claim_escalation_signals("o/r", owners[-1])) == [PR, 11]
+    assert rig.store.claim_escalation_signals("o/r", owners[-1]) == ()
+    assert escalation_signals(rig) == 2
+
+
+@pytest.mark.parametrize("foreign", ["o/r:review:elsewhere", "o/r:fix:test"])
+def test_another_executors_owed_signals_neither_reach_nor_starve_this_executor(rig, foreign):
+    for index in range(40):
+        owe(rig, f"a-foreign-{index:02}", executor=foreign, pr=100 + index)
+    for index in range(3):
+        owe(rig, f"b-own-{index}", pr=200 + index)
+    assert sorted(rig.store.claim_escalation_signals("o/r", REVIEWER)) == [200, 201, 202]
+    assert rig.store.claim_escalation_signals("o/r", REVIEWER) == ()
+    assert escalation_signals(rig) == 3
+
+
+def test_more_owed_signals_than_one_claim_holds_are_all_sent_in_bounded_batches(rig):
+    for index in range(40):
+        owe(rig, f"escalation-{index:02}", pr=100 + index)
+    first = rig.store.claim_escalation_signals("o/r", REVIEWER)
+    second = rig.store.claim_escalation_signals("o/r", REVIEWER)
+    assert (len(first), len(second)) == (32, 8) and sorted(first + second) == list(range(100, 140))
+    assert rig.store.claim_escalation_signals("o/r", REVIEWER) == () and escalation_signals(rig) == 40
+
+
+def test_one_escalation_signals_once_across_its_projection_and_every_owed_record(rig):
+    settled_escalation(rig)
+    gate_id = rig.ceiling_gate().gate_id
+    owe(rig, gate_id, reason="hold_verified")
+    assert rig.store.claim_escalation_signals("o/r", REVIEWER) == (PR,)
+    owe(rig, gate_id, reason="hold_contested")  # a later terminal of the same escalation
+    assert rig.store.claim_escalation_signals("o/r", REVIEWER) == () and escalation_signals(rig) == 1
+
+
+def malformed_signal(rig, payload, key="corrupt"):
+    with rig.store.transaction() as db:
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                   (ESCALATION_SIGNAL_OWED_NAMESPACE, REVIEWER, key, rig.clock[0].isoformat(), payload))
+
+
+MALFORMED_SIGNALS = [
+    "not json", "null", "[]", '"text"', "{}", '{"pr": 9}', '{"pr": "9", "reason": "hold_verified"}',
+    '{"pr": 0, "reason": "hold_verified"}', '{"pr": true, "reason": "hold_verified"}',
+    '{"pr": 9, "reason": "guessed"}', '{"pr": 9, "reason": []}',
+]
+
+
+@pytest.mark.parametrize("payload", MALFORMED_SIGNALS)
+def test_a_malformed_owed_signal_is_quarantined_once_and_never_blocks_the_well_formed(rig, payload):
+    rig.gated()
+    gate_id = rig.ceiling_gate().gate_id
+    malformed_signal(rig, payload)
+    malformed_signal(rig, payload, key=gate_id)  # corrupt, under a real escalation's identity
+    owe(rig, "verdict-escalation", pr=11)
+    assert rig.store.claim_escalation_signals("o/r", REVIEWER) == (11,)
+    quarantined = rig.journal("escalation_signal_malformed")
+    assert {json.loads(row[0])["data"]["entity_id"] for row in quarantined} == {"corrupt", gate_id}
+    # Quarantine is per record: that escalation's own settled hold is still signalled, and nothing is re-read.
+    settle_projection(rig)
+    assert rig.store.claim_escalation_signals("o/r", REVIEWER) == (PR,)
+    assert rig.store.claim_escalation_signals("o/r", REVIEWER) == ()
+    assert len(rig.journal("escalation_signal_malformed")) == 2 and escalation_signals(rig) == 2
+
+
+def test_a_drain_past_a_malformed_owed_signal_completes_and_still_signals(rig):
+    rig.gated()
+    malformed_signal(rig, "not json")
+    rig.drain()
+    rig.drain()
+    assert escalation_signals(rig) == 1 and len(rig.journal("escalation_signal_malformed")) == 1
+
+
+@pytest.mark.parametrize("fields", [
+    {"pr": 0}, {"pr": True}, {"pr": "9"}, {"reason": "guessed"}, {"escalation": ""}, {"executor_identity": ""},
+])
+def test_an_owed_signal_names_its_escalation_pull_request_and_reason(rig, fields):
+    arguments = {"executor_identity": REVIEWER, "escalation": "e", "pr": PR, "reason": "hold_verified", **fields}
+    with rig.store.transaction() as db, pytest.raises(ValueError):
+        owe_escalation_signal(db, at=rig.clock[0], **arguments)
+
+
+@pytest.mark.parametrize("limit", [0, 129, True, "8"])
+def test_a_signal_claim_is_bounded(rig, limit):
+    with pytest.raises(ValueError):
+        rig.store.claim_escalation_signals("o/r", REVIEWER, limit=limit)
+
+
+def test_a_first_read_failure_backs_off_each_pull_request_to_its_exact_boundary(rig):
+    policy, control, other = ReconciliationPolicy(), rig.control(), WorkflowKey("o/r", PullRequestRef(PR + 1))
+    assert control.first_observation_due(PR_KEY)
+    rig.points.add("read")
+    delays = []
+    for _ in range(12):
+        failed_at = rig.clock[0]
+        assert isinstance(control.ensure_observed_workflow(PR_KEY), PullRequestUnavailable)
+        assert not control.first_observation_due(PR_KEY) and control.first_observation_due(other)
+        delay = 1
+        while not control.first_observation_due(PR_KEY):
+            rig.clock[0] = failed_at + timedelta(seconds=delay)
+            delay += 1
+        delays.append(delay - 1)
+    # Doubling from the initial delay, never past the maximum; due exactly at the boundary, not a second early.
+    assert delays[:3] == [policy.initial_delay_seconds * 2 ** n for n in range(3)]
+    assert max(delays) == delays[-1] == policy.maximum_delay_seconds
+    rig.points.discard("read")
+    rig.activate()
+    assert isinstance(control.ensure_observed_workflow(PR_KEY), WorkflowCommitted)
+    assert control.first_observation_due(PR_KEY)  # a successful read ends the schedule
+
+
+@pytest.mark.parametrize("payload", [
+    "not json", "{}", '{"since": "x", "next": "y", "reads": 1, "surfaced": false}',
+    '{"since": "2026-09-25T12:00:00", "next": "2026-09-25T12:00:30", "reads": 1, "surfaced": false}',
+    '{"since": "2026-09-25T12:00:00+00:00", "next": "2026-09-25T12:00:30+00:00", "reads": "1", "surfaced": false}',
+    '{"since": "2026-09-25T12:00:00+00:00", "next": "2026-09-25T12:00:30+00:00", "reads": 1, "surfaced": "no"}',
+    '{"since": "2026-09-25T12:00:30+00:00", "next": "2026-09-25T12:00:00+00:00", "reads": 1, "surfaced": false}',
+])
+def test_a_malformed_first_observation_schedule_is_never_read_as_due(rig, payload):
+    with rig.store.transaction() as db:
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                   ("review-first-observation", "o/r", f"pr:{PR}", rig.clock[0].isoformat(), payload))
+    with pytest.raises(WorkflowAuthorityError, match="malformed"):
+        rig.control().first_observation_due(PR_KEY)

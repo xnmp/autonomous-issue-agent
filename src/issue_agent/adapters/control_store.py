@@ -50,7 +50,10 @@ from ..domain.workflow import (
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewWorkflowSnapshot
-from ..domain.review_workflow_policy import CeilingEscalation, ReviewSubmissionReceipt, bound_submission_owed
+from ..domain.review_workflow_policy import (
+    ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX, CeilingEscalation, ReviewSubmissionReceipt,
+    bound_submission_owed, escalation_signal_identity,
+)
 from ..domain.workflow_retry import (
     MAX_AUTHORIZED_ATTEMPTS, MAX_RELEVANT_AUTHORIZATIONS, BeginRetry, DeclineRetry, grant_unavailable_void, RetryAbsenceRead, RetryAuthorization, RetryAuthorizationFacts,
     retry_spend_decision,
@@ -69,6 +72,7 @@ from ..domain.events import (
     BudgetVarianceDetected,
     ControlTransitionCommitted,
     Correlation,
+    EscalationRaised,
     EventEnvelope,
     EventPayload,
     JsonValue,
@@ -368,6 +372,8 @@ LEGACY_V8_SCHEMA_DIGEST = (
 )
 DEFAULT_BUSY_TIMEOUT_MS = 5_000
 _RESOLVE_PAID_KINDS = frozenset(stage.value for stage in ResolveStage)
+# Paid review legs are admitted under the dispatched agent kind's name.
+_REVIEW_PAID_KINDS = frozenset({"REVIEW", "RE_REVIEW"})
 # ADR 0015 review slice: the only effects a review-rejection re-arm or review
 # completion may own. The PR target and each command's exact guard are
 # enforced separately at enqueue (review_family_op, bound_submission_op).
@@ -375,8 +381,55 @@ _REVIEW_FAMILY_COMMAND_KINDS = frozenset({CommandKind.DISMISS_REVIEW, CommandKin
 AUTHORITY_WITNESS_FORMAT = "issue-agent-control-authority-v1"
 
 
+# One operator signal per review escalation (increment 6 N2): claimed by
+# escalation identity, and each succeeded hold projection is examined once.
+ESCALATION_SIGNAL_NAMESPACE = "review-escalation-signal"
+ESCALATION_SIGNAL_COMMAND_NAMESPACE = "review-escalation-signal-command"
+# An escalation whose signal is owed although no succeeded receipt of its own
+# will carry it: its hold was found already on GitHub, its re-plans were
+# exhausted, or its restoration was contested (written by the review workflow
+# control). Scoped by the owing executor identity, so the executor's owner
+# lineage filters the rows in SQL before any claim limit applies.
+ESCALATION_SIGNAL_OWED_NAMESPACE = "review-escalation-signal-owed"
+ESCALATION_SIGNAL_REASONS = frozenset({"hold_verified", "projection_exhausted", "hold_contested"})
+# A malformed owed record is quarantined once, per row (same scope and key),
+# and journalled: at-most-once paging never wedges every drain on one corrupt
+# row, and a well-formed signal of the same escalation is still sent.
+ESCALATION_SIGNAL_QUARANTINE_NAMESPACE = "review-escalation-signal-quarantined"
+
+
+def owe_escalation_signal(
+    db: sqlite3.Connection, *, executor_identity: str, escalation: str, pr: int, reason: str, at: datetime,
+) -> None:
+    """Record, once, that this escalation's operator signal is owed; the executor's claim sends it."""
+    if reason not in ESCALATION_SIGNAL_REASONS:
+        raise ValueError(f"unknown escalation signal reason: {reason!r}")
+    if type(pr) is not int or pr < 1:
+        raise ValueError("an escalation signal names a pull request number")
+    if not executor_identity or not escalation:
+        raise ValueError("an escalation signal names its executor and its escalation")
+    db.execute(
+        "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+        (ESCALATION_SIGNAL_OWED_NAMESPACE, executor_identity, escalation, at.isoformat(),
+         json.dumps({"pr": pr, "reason": reason}, sort_keys=True)),
+    )
+
 class ControlStoreError(RuntimeError):
     pass
+
+
+def _owed_escalation_signal(raw: str) -> tuple[int, str] | str:
+    """An owed signal's (pull request, reason), or why the record is malformed."""
+    try:
+        payload = json.loads(raw)
+        number, reason = payload["pr"], payload["reason"]
+    except (ValueError, TypeError, KeyError) as exc:
+        return f"unparseable owed signal: {type(exc).__name__}: {str(exc)[:200]}"
+    if type(number) is not int or number < 1:
+        return "owed signal names no pull request number"
+    if not isinstance(reason, str) or reason not in ESCALATION_SIGNAL_REASONS:
+        return "owed signal names an unknown reason"
+    return number, reason
 
 
 class IncompatibleSchema(ControlStoreError):
@@ -3869,32 +3922,41 @@ class SQLiteControlStore:
     @staticmethod
     def _validate_workflow_reservation(db: sqlite3.Connection, request: ReservationRequest, *, workspace_verified: EpisodeWorkspacePrepared | None = None) -> WorkflowSnapshot | None:
         binding = request.workflow
-        activation = db.execute(
-            "SELECT 1 FROM workflow_authority_epochs WHERE repository=? AND family='resolve'",
-            (request.workload_repository,),
-        ).fetchone()
-        if binding is None and activation is None:
+        families = {
+            row["family"] for row in db.execute(
+                "SELECT family FROM workflow_authority_epochs WHERE repository=?", (request.workload_repository,),
+            ).fetchall()
+        }
+        if binding is None and not families & {WorkflowFamily.RESOLVE.value, WorkflowFamily.REVIEW_REJECTIONS.value}:
             return
         try:
             role = deployment_role(request.workload_repository, request.owner_id)
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
         if binding is None:
-            affected = role == "fix" and request.kind in _RESOLVE_PAID_KINDS
-            if affected:
+            if role == "fix" and request.kind in _RESOLVE_PAID_KINDS and WorkflowFamily.RESOLVE.value in families:
                 raise WorkflowAuthorityError("activated resolve admission requires a captured workflow binding")
+            # Once review rejection is active every paid review is bound, so
+            # no unbound review run can overlap a re-arm (ADR 0015 quiescence).
+            if (role == "review" and request.kind in _REVIEW_PAID_KINDS
+                    and WorkflowFamily.REVIEW_REJECTIONS.value in families):
+                raise WorkflowAuthorityError("activated review admission requires a captured workflow binding")
             return
         if binding.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
-            if role != "review":
-                raise WorkflowAuthorityError("review rejection admission requires the repository's review owner")
+            if role != "review" or request.kind not in _REVIEW_PAID_KINDS:
+                raise WorkflowAuthorityError("review rejection admission requires the review owner's review leg")
             try:
                 require_review_binding(db, binding)
+                dispatch = json.loads(request.dispatch_id)
             except (ValueError, TypeError) as exc:
                 raise WorkflowAuthorityError(str(exc)) from exc
-            # No review admission receipt exists before the review runtime
-            # switch (ADR 0015 review slice, increment 6); refuse rather than
-            # record a resolve receipt against a pull request.
-            raise WorkflowAuthorityError("review rejection paid admission has no admission receipt yet")
+            if (not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository
+                    or type(dispatch.get("number")) is not int or dispatch["number"] != binding.fence.key.target.number):
+                raise WorkflowAuthorityError("paid review identity disagrees with its workflow")
+            # The run row records the captured binding (and so its generation);
+            # this transaction proved it current and ungated. Review has no
+            # ordered continuation to receipt, unlike resolve.
+            return None
         if role != "fix":
             raise WorkflowAuthorityError("resolve admission requires the repository's fix owner")
         try:
@@ -3979,7 +4041,11 @@ class SQLiteControlStore:
         ).fetchone()
         if run is None:
             return False
-        if request.workflow is not None:
+        if request.workflow is not None and request.workflow.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
+            if (run["workflow_episode_key"] != workflow_episode_key(request.workflow)
+                    or run["workflow_binding_json"] != encode_workflow(request.workflow)):
+                return False
+        elif request.workflow is not None:
             if run["workflow_episode_key"] != workflow_episode_key(request.workflow):
                 return False
             receipt = db.execute(
@@ -4644,6 +4710,13 @@ class SQLiteControlStore:
             ).fetchone() is not None:
                 if deployment_role(command.repository, command.executor_identity) == "fix":
                     raise ControlStoreError("activated issue command requires captured workflow authority")
+            if command.kind is CommandKind.SUBMIT_REVIEW and load_family_authority(
+                db, WorkflowFamily.REVIEW_REJECTIONS, command.repository,
+            ) is not None:
+                # ADR 0015: an activated review family has one submission path. An
+                # unbound verdict would neither fence by generation nor settle a
+                # baseline, so it could double-post beside a bound one.
+                raise ControlStoreError("activated review submission requires captured workflow authority")
             return
         self._assert_owner_active(db, command.executor_identity)
         try:
@@ -4932,6 +5005,124 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("retired command lacks scoped retirement/outcome evidence")
             if not isinstance(json.loads(row["payload_json"]), dict):
                 raise WorkflowAuthorityError("retired command evidence is malformed")
+
+    def claim_escalation_signals(
+        self, repository: str, executor_identity: str, *, limit: int = 32,
+    ) -> tuple[int, ...]:
+        """Claim each review escalation's one operator signal; the pull requests to alert on.
+
+        An escalation is signalled once its attention hold is verified on
+        GitHub, whichever path settled that projection SUCCEEDED: the direct
+        write, a scheduled or reconciliation read after a lost reply, or a
+        restart's recovery. An escalation whose signal is owed without such
+        a receipt (its hold found already present, its re-plans exhausted,
+        its restoration contested) is signalled too. One signal per
+        escalation identity (a verdict's submission, a ceiling's gate), so a
+        restored or re-planned hold never re-pages. Rows written by a
+        retired predecessor of this executor are this executor's to send;
+        every other executor's rows are filtered before the limit, so they
+        never starve these. A malformed owed record is quarantined and
+        journalled once (`escalation_signal_malformed`), never re-read, and
+        never blocks the well-formed rows. The journal event commits with the
+        claim; the caller's alert after commit is best-effort, as every alert.
+        """
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("escalation signal claim limit must be between 1 and 128")
+        repository = canonical_repository(repository)
+        claimed: list[int] = []
+        with self.transaction() as db:
+            self._assert_owner_active(db, executor_identity)
+            lineage = self._owner_lineage(db, repository, executor_identity)
+            owners = ",".join("?" for _ in lineage)
+            rows = db.execute(
+                f"SELECT * FROM lifecycle_commands c WHERE c.repository=? AND c.executor_identity IN ({owners}) "
+                "AND c.kind=? AND c.state=? AND (c.idempotency_key LIKE ? OR c.idempotency_key LIKE ?) "
+                "AND NOT EXISTS (SELECT 1 FROM dedupe_keys d WHERE d.namespace=? AND d.scope=c.repository "
+                "AND d.key=c.command_id) ORDER BY c.created_at LIMIT ?",
+                (repository, *lineage, CommandKind.RELABEL.value, EffectStatus.SUCCEEDED.value,
+                 ESCALATION_PROJECTION_PREFIX + "%", HOLD_RESTORE_PREFIX + "%", ESCALATION_SIGNAL_COMMAND_NAMESPACE,
+                 limit),
+            ).fetchall()
+            for row in rows:
+                command = _command_from_row(row)
+                self._claim_key(db, ESCALATION_SIGNAL_COMMAND_NAMESPACE, repository, str(command.command_id), {})
+                identity = escalation_signal_identity(command)
+                kind, _, number = command.target.partition(":")
+                if identity is not None and kind == "pr" and number.isdigit():
+                    if self._claim_key(db, ESCALATION_SIGNAL_NAMESPACE, repository, identity, {"pr": int(number)}):
+                        claimed.append(int(number))
+            for row in db.execute(
+                f"SELECT e.scope, e.key, e.payload_json FROM dedupe_keys e WHERE e.namespace=? "
+                f"AND e.scope IN ({owners}) "
+                "AND NOT EXISTS (SELECT 1 FROM dedupe_keys d WHERE d.namespace=? AND d.scope=? AND d.key=e.key) "
+                "AND NOT EXISTS (SELECT 1 FROM dedupe_keys q WHERE q.namespace=? AND q.scope=e.scope AND q.key=e.key) "
+                "ORDER BY e.claimed_at, e.key LIMIT ?",
+                (ESCALATION_SIGNAL_OWED_NAMESPACE, *lineage, ESCALATION_SIGNAL_NAMESPACE, repository,
+                 ESCALATION_SIGNAL_QUARANTINE_NAMESPACE, limit),
+            ).fetchall():
+                parsed = _owed_escalation_signal(row["payload_json"])
+                if isinstance(parsed, str):
+                    self._claim_key(db, ESCALATION_SIGNAL_QUARANTINE_NAMESPACE, row["scope"], row["key"],
+                                    {"error": parsed})
+                    self._transition(db, "review_escalation_signal", row["key"], "escalation_signal_malformed",
+                                     {"owner": row["scope"], "error": parsed})
+                    continue
+                number, reason = parsed
+                if self._claim_key(db, ESCALATION_SIGNAL_NAMESPACE, repository, row["key"],
+                                   {"pr": number, "reason": reason}):
+                    claimed.append(number)
+            for number in claimed:
+                self._event(db, EscalationRaised("pr", number), correlation=Correlation(pr=number))
+        return tuple(claimed)
+
+    @staticmethod
+    def _owner_lineage(db: sqlite3.Connection, repository: str, owner_id: str) -> tuple[str, ...]:
+        """This owner and every retired owner of its repository and role that it (transitively) succeeded.
+
+        The reverse of `owns_command`'s walk: a terminal receipt keeps the
+        executor that settled it, so a predecessor's unclaimed rows belong
+        to its successor. Bounded like that walk.
+        """
+        role = deployment_role(repository, owner_id)
+        lineage, frontier = [owner_id], [owner_id]
+        for _ in range(64):
+            if not frontier:
+                break
+            marks = ",".join("?" for _ in frontier)
+            found = [row["owner_id"] for row in db.execute(
+                f"SELECT owner_id, repository, role FROM retired_owners WHERE successor_owner_id IN ({marks}) "
+                "ORDER BY owner_id", frontier,
+            ) if canonical_repository(row["repository"]) == repository and row["role"] == role
+                and row["owner_id"] not in lineage]
+            lineage.extend(found)
+            frontier = found
+        return tuple(lineage)
+
+    def _claim_key(self, db: sqlite3.Connection, namespace: str, scope: str, key: str, payload: dict) -> bool:
+        return db.execute(
+            "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+            (namespace, scope, key, self._now().isoformat(), json.dumps(payload, sort_keys=True)),
+        ).rowcount == 1
+
+    def unsettled_sibling_dismissals(self, command: LifecycleCommand) -> int:
+        """How many dismissals its re-arm still requires that have not succeeded.
+
+        A review re-arm's trigger projection waits on them: restoring the
+        trigger while a counted review may still stand would drop the visible
+        needs-human-review hold of a re-arm that can still stop (ADR 0015).
+        Retired obligations never hold it; a projection outside a re-arm
+        (a ceiling release) has no siblings.
+        """
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT COUNT(*) FROM workflow_rearm_commands projection "
+                "JOIN workflow_rearm_commands sibling ON sibling.request_id=projection.request_id "
+                "JOIN lifecycle_commands dismissal ON dismissal.command_id=sibling.command_id "
+                "WHERE projection.command_id=? AND sibling.disposition='required' AND dismissal.kind=? "
+                "AND dismissal.state != ?",
+                (str(command.command_id), CommandKind.DISMISS_REVIEW.value, EffectStatus.SUCCEEDED.value),
+            ).fetchone()
+        return int(row[0])
 
     def runnable_commands(
         self, *, repository: str, executor_identity: str,
@@ -6678,19 +6869,21 @@ def load_bound_review_submission(
         return None
     if row["state"] != EffectStatus.SUCCEEDED.value or receipt is None or receipt["status"] != EffectStatus.SUCCEEDED.value:
         return None
-    payload = command.payload
     try:
-        head, cause = payload["head"], payload.get("escalate_cause")
-        if head != command.expected_revision:
-            raise ValueError("submitted head disagrees with the command revision")
+        op = bound_submission_op(command)
+        assert op is not None
         review = receipt["remote_object_id"]
         if not isinstance(review, str) or not review:
             raise ValueError("the receipt does not name the review it matched")
         submission = BoundReviewSubmission(command.command_id, binding)
         receipt_id = f"github-review:{review}"
-        if cause is not None:
-            return CeilingEscalation(submission, head, receipt_id, cause)
-        return ReviewSubmissionReceipt(submission, head, payload["patch_id"], receipt_id)
+        assert op.patch_id is not None
+        if op.escalate_cause == "ceiling":
+            return CeilingEscalation(submission, op.head, receipt_id, "ceiling", op.rule)
+        # A verdict ESCALATE is the reviewer's verdict on its head: a baseline
+        # that also carries the attention hold (`record_escalated_review`).
+        return ReviewSubmissionReceipt(submission, op.head, op.patch_id, receipt_id,
+                                       escalated=op.escalate_cause == "verdict")
     except (KeyError, TypeError, ValueError) as exc:
         raise WorkflowAuthorityError(f"bound review submission evidence is malformed: {exc}") from exc
 

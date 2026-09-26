@@ -54,6 +54,9 @@ from ..adapters.spend_recovery import CodexSpendReconciler, spend_evidence_dir
 from ..adapters.wake import WakeSignal, wake_path
 from ..adapters.worktree import ReviewCheckouts, Worktrees
 from ..adapters.workflow_control import SQLiteWorkflowControl
+from ..adapters.review_effects import ReviewReads
+from ..adapters.review_workflow_control import review_family_activated
+from ..adapters.workflow_rows import WorkflowAuthorityError
 _PR_COMMITS_FETCH_CEILING = 100  # gh pr view --json commits silent cap
 
 from ..domain.fix import (
@@ -93,10 +96,12 @@ from ..domain.gate import looks_like_test, modified_existing_tests_from_diff
 from ..domain.identity import login_eq
 from ..domain.review import (
     DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
+    BoundReviewState,
     FixHold,
     IdentityMode,
     ReviewConfig,
     ReviewState,
+    decide_bound_review,
     decide_review,
     fix_hold_ceiling_seconds,
     hold_review_dispatch,
@@ -174,6 +179,10 @@ from .dispatch import AgentDispatcher, DispatchConfig
 from .infra_breaker import InfraBreaker
 from ..domain.infra_breaker import BreakerPolicy
 from .execute import Executor
+from .review_runtime import (
+    ActiveReviewRuntime, compose_review_control, review_external_holds,
+    review_guidance_reader, unproductive_round_keys, unproductive_rounds_reader,
+)
 from .workflows.resolve_rearm import ResolveRearmWorkflow
 from .loop import Daemon
 from .mcp import mcp_servers_from_file
@@ -2627,7 +2636,7 @@ def compose_fix_daemon(
         harness_root=cfg.runtime_paths.harness_root,
         log=log,
         fix_bot=fix_runtime.bot,
-        # Scope notes keep one owner; repairs and review read the same record.
+        # Scope notes keep one owner; bound to the review authority below.
         operator_guidance=Store(cfg.review_state_dir).get_operator_guidance,
         fixer_runtime=cfg.fixer_runtime,
         escalate_on_evidence=cfg.escalate_on_evidence,
@@ -2644,6 +2653,11 @@ def compose_fix_daemon(
     prepare_cwd = runtime_binding.prepare_cwd
 
     control = _control_store(cfg, cfg.state_dir, journal)
+    # The review role owns PR guidance: its committed episode once the review
+    # family is active (an unreadable read defers the repair), else the file.
+    dcfg = replace(dcfg, operator_guidance=review_guidance_reader(
+        control, cfg.repo, Store(cfg.review_state_dir).get_operator_guidance,
+    ))
     owner_id = _owner_identity(cfg, "fix")
     effect_executor = _effects(
         gateway,
@@ -2977,18 +2991,25 @@ def _review_state(
     errors: dict[int, str] = {}
     sessions = frozenset(p.number for p in world.prs if _control_value(errors, p.number, store.get_pr_session, ""))
     last = {p.number: _control_value(errors, p.number, store.get_last_sha, "") for p in world.prs}
-    deaths = process_deaths or {}
-    unproductive = {
-        p.number: sum(
-            _control_value(errors, k, store.get_infra_deaths, 0, error_key=p.number) + deaths.get(k, 0)
-            for k in {breaker_key(p), -p.number}
-        )
-        for p in world.prs
-    }
+    unproductive = _review_unproductive_rounds(store, world, process_deaths, errors)
     return ReviewState(
         sessions=sessions, last_sha=last, unproductive_rounds=unproductive,
         control_errors=errors,
     )
+
+
+def _review_unproductive_rounds(
+    store: Store, world, process_deaths: Mapping[int, int] | None, errors: dict[int, str],
+) -> dict[int, int]:
+    """The unproductive-round counter per PR over `unproductive_round_keys` (shared with the hold source)."""
+    deaths = process_deaths or {}
+    return {
+        p.number: sum(
+            _control_value(errors, k, store.get_infra_deaths, 0, error_key=p.number) + deaths.get(k, 0)
+            for k in unproductive_round_keys(p)
+        )
+        for p in world.prs
+    }
 
 
 def _fix_holds(control, repository: str, world, now: datetime) -> dict[int, FixHold]:
@@ -3122,9 +3143,37 @@ def _fix_hold_reporter(journal: EventSink | None, repo: str, log, control=None):
     return report
 
 
+@dataclass(frozen=True)
+class ReviewDaemonComposition:
+    """The review role's composed authorities (see `FixDaemonComposition`).
+
+    `runtime` is None only when the gateway cannot read pull request reviews;
+    an activated review family then holds every paid review rather than
+    falling back to the legacy path.
+    """
+
+    daemon: Daemon
+    control: SQLiteControlStore
+    journal: TypedJournal
+    executor: Executor
+    effects: EffectRecovery
+    dispatcher: AgentDispatcher
+    runtime: ActiveReviewRuntime | None
+    recovery: _RecoveryHooks
+    owner_id: str
+
+
 def build_review_daemon(
     cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRuntime
 ) -> Daemon:
+    return compose_review_daemon(cfg, gateway, store, runner).daemon
+
+
+def compose_review_daemon(
+    cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRuntime,
+    *, log: Callable[[str], None] | None = None,
+) -> ReviewDaemonComposition:
+    say: Callable[[str], None] = log or _log("review")
     repo_cfg = cfg.repository
     review_runtime = cfg.review_runtime
     journal = _typed_journal(_journal(store), cfg, "review", store.state_dir)
@@ -3165,7 +3214,7 @@ def build_review_daemon(
         reviewer_runtime=review_runtime.runtime,
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,
-        log=_log("review"),
+        log=say,
         # `rcfg.max_unproductive_rounds` is the ceiling the review decide side
         # reads off this counter — same value, same getattr fallback, so a
         # deterministic death saturates to exactly what escalates (#13).
@@ -3213,11 +3262,11 @@ def build_review_daemon(
         retry_ceiling=cfg.effect_retry_ceiling,
         journal=journal,
         alert_cmd=cfg.alert_cmd,
-        log=_log("review"),
+        log=say,
     )
     executor = Executor(
         gateway,
-        log=_log("review"),
+        log=say,
         journal=journal,
         alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
@@ -3228,6 +3277,12 @@ def build_review_daemon(
         role="review",
         owner_id=owner_id,
     )
+    runtime = _active_review_runtime(
+        cfg, rcfg, control, gateway, store, effect_executor.actions, owner_id, say,
+    )
+    if runtime is not None:
+        executor.bind_workflow_reconciliation(runtime.reconcile)
+        effect_executor = replace(effect_executor, reconcile_workflow=runtime.reconcile)
     review_reconciler = _LateReservationReconciler()
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, None,
@@ -3251,6 +3306,7 @@ def build_review_daemon(
         journal=journal,
         dedupe=control,
         dispatch_claim_target=reservations.issue_for,
+        review_authority=runtime,
     )
     dispatch_runtime = CancellableAsyncDispatch(
         dispatcher.dispatch,
@@ -3259,16 +3315,42 @@ def build_review_daemon(
     executor.bind_dispatch(dispatch_runtime)
 
     report_fix_holds = _fix_hold_reporter(
-        journal, cfg.repo, _log("review"), control
+        journal, cfg.repo, say, control
     )
 
-    def decide(world):
-        state = _review_state(
-            store, world, control.abandoned_dispatch_counts(owner_id)
+    def decide_actions(world) -> list:
+        try:
+            active = review_family_activated(control, cfg.repo)
+        except WorkflowAuthorityError as exc:
+            # Unknown activation: neither path may buy a review this tick.
+            say(f"review dispatch held: {exc}")
+            return []
+        if not active:
+            state = _review_state(
+                store, world, control.abandoned_dispatch_counts(owner_id)
+            )
+            for target, reason in state.control_errors.items():
+                say(f"PR #{target} held: {reason}")
+            return decide_review(world, rcfg, state)
+        if runtime is None:
+            say("review dispatch held: the review family is active but this "
+                "gateway cannot read pull request reviews")
+            return []
+        plan = runtime.plan(world, rcfg)
+        errors: dict[int, str] = dict(plan.errors)
+        unproductive = _review_unproductive_rounds(
+            store, world, control.abandoned_dispatch_counts(owner_id), errors
         )
-        for target, reason in state.control_errors.items():
-            _log("review")(f"PR #{target} held: {reason}")
-        actions = decide_review(world, rcfg, state)
+        for target, reason in errors.items():
+            say(f"PR #{target} held: {reason}")
+        for target, reason in plan.held.items():
+            say(f"PR #{target} review held by its workflow: {reason}")
+        return decide_bound_review(world, rcfg, BoundReviewState(
+            owed=plan.owed, unproductive_rounds=unproductive, control_errors=errors,
+        ))
+
+    def decide(world):
+        actions = decide_actions(world)
         plan = hold_review_dispatch(
             actions,
             _fix_holds(control, cfg.repo, world, datetime.now(timezone.utc)),
@@ -3293,7 +3375,7 @@ def build_review_daemon(
             ):
                 continue
             rejected_prs.add(action.number)
-            _log("review")(
+            say(
                 f"dispatch {action.kind.name} PR #{action.number}: "
                 f"deferred — target {issue} is already reserved (another PR "
                 "on the same issue here, or another deployment's claim)"
@@ -3314,7 +3396,7 @@ def build_review_daemon(
             )
         ]
 
-    _log("review")(review_capability_line(
+    say(review_capability_line(
         can_approve=rcfg.identity_mode == IdentityMode.THREE,
         adopt_unlabeled=rcfg.adopt_unlabeled,
     ))
@@ -3328,11 +3410,11 @@ def build_review_daemon(
         reconciler=review_reconciler,
     )
 
-    return Daemon("review", _reported_world(
+    daemon = Daemon("review", _reported_world(
                       gateway.build_review_world, control, cfg, "review",
-                      _log("review")
+                      say
                   ), decide, executor,
-                  cfg.tick_interval_seconds, _log("review"), journal=journal,
+                  cfg.tick_interval_seconds, say, journal=journal,
                   tick_gate=_control_spend_gate(cfg, control),
                   wake_check=_wake_check(cfg, store),
                   dispatch_capacity=1,
@@ -3373,6 +3455,35 @@ def build_review_daemon(
                       state_dir=cfg.review_state_dir,
                       role="review",
                   ))
+    return ReviewDaemonComposition(
+        daemon, control, journal, executor, effect_executor, dispatcher, runtime,
+        recovery, owner_id,
+    )
+
+
+def _active_review_runtime(
+    cfg: HarnessConfig, rcfg: ReviewConfig, control: SQLiteControlStore, gateway,
+    store: Store, effects: GitHubEffectExecutor, owner_id: str, log,
+) -> ActiveReviewRuntime | None:
+    """The review family's runtime, or None when the gateway cannot read reviews."""
+    if not isinstance(gateway, ReviewReads):
+        return None
+    trailers = getattr(gateway, "pr_commit_messages", None)
+    workflow = compose_review_control(
+        control, gateway, repository=cfg.repo, owner_id=owner_id,
+        ceiling=cfg.review_runtime.max_rejections, trigger_label=rcfg.trigger_label,
+        review_bot=rcfg.review_bot,
+        external_holds=review_external_holds(
+            unproductive_rounds_reader(
+                store, lambda: control.abandoned_dispatch_counts(owner_id)
+            ),
+            rcfg.max_unproductive_rounds,
+        ),
+        trailers=trailers if callable(trailers) else None,
+    )
+    return ActiveReviewRuntime(
+        workflow, effects, gateway, review_bot=rcfg.review_bot, log=log,
+    )
 
 
 _CODEOWNERS_PATHS = ("CODEOWNERS", ".github/CODEOWNERS", "docs/CODEOWNERS")

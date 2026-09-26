@@ -25,6 +25,7 @@ from .workflow import (
     WorkflowSnapshot, WorkflowUnavailable,
     _command_ids, _count, _items, _text, _time,
 )
+from .review_evidence import is_review_evidence_gate
 from .workflow_reconciliation import is_prewrite_gate
 from .workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
@@ -61,11 +62,14 @@ def ends_with_advance(gate: object) -> bool:
 
     A pre-write evidence hold belongs to a command the advance fences (it can
     never begin), and a refused release projection is replaced by the
-    advance's own projection. Keeping either would strand it; counting it as
-    an independent hold would plan a HOLD against it twice (ADR 0015).
+    advance's own projection. An unreadable-evidence hold belongs to the old
+    generation's review dispatch: the fresh review the advance owes re-reads
+    that evidence under the original contract. Keeping any of them would
+    strand it; counting it as an independent hold would plan a HOLD against
+    it twice (ADR 0015).
     """
     opened = gate.gate if isinstance(gate, RearmingGate) else gate
-    return is_prewrite_gate(opened) or (
+    return is_prewrite_gate(opened) or is_review_evidence_gate(opened) or (
         isinstance(opened, OpenGate) and isinstance(opened.cause, ReviewProjectionRefused))
 
 

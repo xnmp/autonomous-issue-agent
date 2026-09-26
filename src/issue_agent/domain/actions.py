@@ -21,7 +21,7 @@ from typing import Union
 
 from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from .labels import Label
-from .workflow_identity import IssueRef, WorkflowBinding
+from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding
 
 
 class Target(Enum):
@@ -264,6 +264,10 @@ class RunAgent:
             self.workflow.fence.key.target != IssueRef(self.number)
         ):
             raise ValueError("resolve dispatch must retain its workflow issue identity")
+        if self.kind in (AgentKind.REVIEW, AgentKind.RE_REVIEW) and (
+            self.workflow.fence.key.target != PullRequestRef(self.number)
+        ):
+            raise ValueError("review dispatch must retain its workflow pull request identity")
 
 
 @dataclass(frozen=True)

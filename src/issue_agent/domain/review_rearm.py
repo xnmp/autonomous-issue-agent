@@ -19,7 +19,7 @@ from .review_workflow import (
     ReviewRearmPreflight, ReviewWorkflowSnapshot, SupersededReviewRearm,
 )
 from .review_workflow_policy import (
-    OBSERVATION_MAX_AGE_SECONDS, complete_review_rearm, review_projection_obsolete, review_rearm_observation_gate_id,
+    OBSERVATION_MAX_AGE_SECONDS, ceiling_reached_again, complete_review_rearm, review_projection_obsolete, review_rearm_observation_gate_id,
     review_rearm_stop_reason, supersede_review_rearm,
 )
 from .labels import Label
@@ -120,6 +120,8 @@ def decide_review_rearm_reconciliation(
     reason = review_rearm_stop_reason(accepted, pr, external_holds=external_holds)
     if reason is None and review_projection_obsolete(snapshot, external_holds):
         reason = StopReason.DECISION_CHANGED
+    if reason is None and pr.observed_at >= accepted.observed_at and ceiling_reached_again(pending, pr, ceiling):
+        reason = StopReason.CEILING_REACHED_AGAIN
     if reason is None and rejected_commands:
         if not isinstance(pr.reviews, CompleteReviews) or pr.observed_at < accepted.observed_at:
             # A refusal is cited only with a fresh complete read after acceptance;

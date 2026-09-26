@@ -442,7 +442,37 @@ class GitHubEffectExecutor:
         self.gateway.relabel("pr", op.pr, op.remove.value if op.remove is not None else None, op.add.value)
         return True
 
+    def _projection_waits(self, op: ReviewFamilyOp, command: LifecycleCommand, check: ReviewCommandCheck) -> bool:
+        """Whether a re-arm's trigger write must wait for its dismissals.
+
+        Only the write waits: a verified refusal or an already-present label
+        settles as before. A refused or undecided dismissal can still stop the
+        re-arm, and until it settles needs-human-review stays the visible hold.
+        """
+        return (isinstance(op, PullRequestProjectionOp) and check.check is ReviewCheck.APPLIES
+                and self.store.unsettled_sibling_dismissals(command) > 0)
+
     def _execute_review(self, op: ReviewFamilyOp, pending) -> bool:
+        return self._execute_review_guarded(op, pending)
+
+    def _signal_escalations(self) -> None:
+        """The operator signal of each settled review escalation, once, on whichever path settled it.
+
+        Mirrors `Executor._escalated`: an active review family moves a PR to
+        needs-human-review through a workflow-owned projection, never through
+        the action funnel. Its receipt can settle SUCCEEDED on the direct
+        write, on a scheduled or reconciliation read after a lost reply, or in
+        a restart's recovery, so the signal is claimed from the durable
+        receipts after each drain instead of on one of those paths. The
+        journal event commits with the claim (the control store's outbox,
+        always bound in a composed daemon); the alert follows it.
+        """
+        if not _REVIEW_ROLE_COMMAND_KINDS <= self.owned_kinds:
+            return
+        for number in self.store.claim_escalation_signals(self.repository, self.identity):
+            alert(self.alert_cmd, json.dumps({"event": "escalation", "target": "pr", "number": number}, sort_keys=True))
+
+    def _execute_review_guarded(self, op: ReviewFamilyOp, pending) -> bool:
         """Run one review-family obligation with its guard enforced before any write.
 
         Mirrors `_execute` for a queued command: presence settles without a
@@ -467,6 +497,8 @@ class GitHubEffectExecutor:
                 return self.effects.resolve_unknown(command, EffectOutcome(True, EffectStatus.SUCCEEDED))
             if check.check is ReviewCheck.UNAVAILABLE:
                 raise UnknownEffectOutcome(f"{command.command_id}: remote outcome remains unknown ({check.detail})")
+            if self._projection_waits(op, command, check):
+                return False
             self.effects.retry_reconciled(command)
         elif check.check is ReviewCheck.PRESENT:
             return self.effects.execute(command, lambda: EffectOutcome(True, EffectStatus.SUCCEEDED))
@@ -476,6 +508,8 @@ class GitHubEffectExecutor:
             reason = f"guard changed: {check.detail}"
             self.effects.execute(command, lambda: EffectOutcome(False, EffectStatus.PERMANENT_FAILURE, error=reason))
             self.log(f"lifecycle command {command.command_id} ({command.kind.value} on {command.target}) refused: {reason}")
+            return False
+        if not unresolved and self._projection_waits(op, command, check):
             return False
 
         def write_and_verify() -> EffectOutcome[bool]:
@@ -694,6 +728,7 @@ class GitHubEffectExecutor:
     def submit_bound_review(
         self, pr: int, event: str, body: str, expected_head: str, *,
         workflow: WorkflowBinding, reviewer: str, patch_id: str | None, escalate_cause: str | None = None,
+        non_resetting_commits: tuple[str, ...] = (),
     ) -> bool:
         """SUBMIT_REVIEW under an active review-rejection workflow (ADR 0015).
 
@@ -707,16 +742,13 @@ class GitHubEffectExecutor:
         """
         if not isinstance(workflow, WorkflowBinding) or workflow.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
             raise ValueError("a bound review submission requires a review-rejection binding")
-        if workflow.fence.key.target.number != pr:
-            raise ValueError("a bound review submission belongs to its workflow's pull request")
         if not expected_head:
             raise UnknownEffectOutcome(f"pr:{pr}: review head is unavailable")
-        op = BoundReviewSubmissionOp(pr, event, body, expected_head, reviewer, patch_id, escalate_cause)
-        payload = op.payload()
-        encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        digest = hashlib.sha256(f"submit-review:{encoded}:{encode_workflow(workflow)}".encode()).hexdigest()
+        op = BoundReviewSubmissionOp(pr, event, body, expected_head, reviewer, patch_id, escalate_cause,
+                                     non_resetting_commits)
+        digest = bound_review_command_id(op, workflow)
         command = LifecycleCommand(
-            CommandId(digest), f"github:{digest}", CommandKind.SUBMIT_REVIEW, f"pr:{pr}", expected_head, payload,
+            digest, f"github:{digest}", CommandKind.SUBMIT_REVIEW, f"pr:{pr}", expected_head, op.payload(),
             self.config_version, self.repository, self.identity, workflow=workflow,
         )
         pending = self.effects.enqueue(command)
@@ -889,11 +921,16 @@ class GitHubEffectExecutor:
         """Resume durable commands after restart without blindly repeating ambiguity."""
 
         completed = 0
-        for pending in self.store.runnable_commands(
+        runnable = list(self.store.runnable_commands(
             repository=self.repository,
             executor_identity=self.identity,
             diagnose=self.log,
-        ):
+        ))
+        # Review-family projections run last in a pass, so a re-arm whose
+        # dismissals all land in this pass also restores its trigger in it.
+        runnable.sort(key=lambda pending: (
+            pending.command.kind is CommandKind.RELABEL and is_review_family(pending.command)))
+        for pending in runnable:
             command = pending.command
             if command.kind not in self.owned_kinds or (
                 command.kind in _REVIEW_ROLE_COMMAND_KINDS and not is_review_family(command)
@@ -932,6 +969,7 @@ class GitHubEffectExecutor:
                 continue
             if applied:
                 completed += 1
+        self._signal_escalations()
         return completed
 
     def _observe_postcondition(self, command: LifecycleCommand) -> tuple[bool | None, str]:
@@ -1889,6 +1927,23 @@ def _expected_revision(action: Action) -> str | None:
         )
         else None
     )
+
+
+def bound_review_command_id(op: BoundReviewSubmissionOp, workflow: WorkflowBinding) -> CommandId:
+    """The stable identity of one bound SUBMIT_REVIEW (verdict or escalation).
+
+    Derived only from the reviewed payload and the captured binding, so the
+    submitting workflow can name the receipt it will record without a second
+    source of truth, and a replay of the same decision is the same command.
+    """
+    if not isinstance(op, BoundReviewSubmissionOp):
+        raise ValueError("a bound review command identity requires its typed submission")
+    if not isinstance(workflow, WorkflowBinding) or workflow.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
+        raise ValueError("a bound review submission requires a review-rejection binding")
+    if workflow.fence.key.target.number != op.pr:
+        raise ValueError("a bound review submission belongs to its workflow's pull request")
+    encoded = json.dumps(op.payload(), sort_keys=True, separators=(",", ":"))
+    return CommandId(hashlib.sha256(f"submit-review:{encoded}:{encode_workflow(workflow)}".encode()).hexdigest())
 
 
 def _unresolved_workflow_command(pending) -> bool:

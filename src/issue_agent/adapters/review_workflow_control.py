@@ -30,17 +30,24 @@ from ..domain.review_rearm import (
     ReviewControlRead, ReviewControlView, decide_review_rearm_reconciliation,
     update_review_rearm_observation,
 )
-from ..domain.review_rejection import CountingRule, ReviewProjectionRefused
+from ..domain.review_evidence import (
+    EvidenceSchedule, ReviewEvidenceKind, evidence_due, evidence_gate_id, review_evidence_gate_kind,
+    unavailable_evidence, unavailable_first_observation,
+)
+from ..domain.review_rejection import CountingRule, ReviewProjectionRefused, ReviewRejectionCeiling
 from ..domain.review_workflow import (
     CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, ObservedPullRequest, PendingReviewRearm,
     PullRequestState, PullRequestUnavailable, RecordedPullRequest, ReviewRearmIntent, ReviewRearmPreflight,
     ReviewWorkflowRead, ReviewWorkflowSnapshot, SupersededReviewRearm,
 )
 from ..domain.review_workflow_policy import (
-    OBSERVATION_MAX_AGE_SECONDS, CeilingEscalation, ReviewDispatch, ReviewSubmissionReceipt, ReviewTransitionFacts,
-    cancel_review_rearm, continue_review_rearm, initial_review_workflow, open_review_ceiling, reconcile_review_ceiling,
-    record_review, request_review_rearm, review_dispatch_decision, review_release_command_id,
-    validate_review_transition,
+    ESCALATION_PROJECTION_PREFIX, OBSERVATION_MAX_AGE_SECONDS, CeilingEscalation, EscalationHoldPresent,
+    EscalationMoot, EscalationProjectionExhausted, EscalationReprojected, HoldContested, RestoreHold, ReviewDispatch,
+    ReviewSubmissionReceipt, ReviewTransitionFacts, cancel_review_rearm, ceiling_hold_restoration,
+    continue_review_rearm, escalation_projection_identity, initial_review_workflow, is_review_escalation_projection,
+    open_review_ceiling, reconcile_review_ceiling, record_escalated_review, record_review, replan_escalation_hold,
+    request_review_rearm, restorable_ceiling_gate_ids, review_dispatch_decision, review_release_command_id,
+    validate_review_transition, verified_ceiling_holds,
 )
 from ..domain.workflow import (
     ActiveReconciliation, AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, ContinueGrantedRearm,
@@ -57,10 +64,13 @@ from ..domain.workflow_identity import (
 from ..domain.workflow_retry import RetryAuthorizationFacts, authorize_absent_retry, retry_authorization_available
 from .control_store import (
     ControlStoreError, SQLiteControlStore, _command_from_row, load_bound_review_submission,
-    load_retry_authorization_facts,
+    load_retry_authorization_facts, owe_escalation_signal,
 )
 from .deployment_authority import deployment_effect_barrier, deployment_role
-from .review_effects import PullRequestProjectionOp, ReviewCheck, ReviewReads, check_review_op, observe_pull_request, review_family_op
+from .review_effects import (
+    PullRequestProjectionOp, ReviewCheck, ReviewReads, check_review_op, observe_pull_request, read_pull_request,
+    review_family_op,
+)
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_commit import (
     insert_pending_rearm, intent_state, owns_command, persist_retry_authorization, record_commit,
@@ -77,6 +87,20 @@ BARRIER_ROLES = ("fix", "review", "steward")
 _OBSERVATION_NAMESPACE = "workflow-rearm-observation"
 _RECORDED_REVIEW_NAMESPACE = "review-recorded-submission"
 _RELEASE_RESOLVED_NAMESPACE = "review-release-resolved"
+_SETTLED_SUBMISSION_NAMESPACE = "review-submission-settled"
+_HOLD_OBSERVATION_NAMESPACE = "review-hold-observation"
+_FIRST_OBSERVATION_NAMESPACE = "review-first-observation"
+# Per open ceiling gate: how often the harness restored its hold, and whether
+# the restorations were spent against an actor removing it (contested).
+_HOLD_RESTORES_NAMESPACE = "review-hold-restores"
+# A refused escalation projection is resolved exactly once: verified present,
+# moot, re-planned, or exhausted into a visible gate (whose operator signal the
+# executor's claim sends from its owed record).
+_ESCALATION_RESOLVED_NAMESPACE = "review-escalation-resolved"
+_EVIDENCE_NAMESPACES = {
+    ReviewEvidenceKind.EXEMPTION_TRAILERS: "review-exemption-evidence",
+    ReviewEvidenceKind.REVIEW_HISTORY: "review-history-evidence",
+}
 _REVIEW_INTENTS = PendingReviewRearm | CompletedReviewRearm | SupersededReviewRearm | CancelledReviewRearm
 _BARRIER_ORDERED = frozenset({
     WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM, WorkflowMutation.RELEASE_CEILING,
@@ -84,12 +108,54 @@ _BARRIER_ORDERED = frozenset({
 })
 
 
-def _no_external_holds(_: ObservedPullRequest) -> tuple[str, ...]:
+def _no_external_holds(_observed: ObservedPullRequest, _view: object) -> tuple[str, ...]:
     return ()
 
 
 def _reason(exc: BaseException) -> str:
     return (str(exc).replace("\x00", "") or type(exc).__name__)[:16384]
+
+
+def review_family_activated(control: SQLiteControlStore, repository: str) -> bool:
+    """Whether a repository's review family is activated; read-only, never initializes it.
+
+    Raises `WorkflowAuthorityError` when the authority is unreadable, so a
+    caller holds rather than silently taking the legacy path.
+    """
+    if not isinstance(control, SQLiteControlStore):
+        raise ValueError("review family activation is read from the control store")
+    try:
+        with closing(control._connect()) as db:
+            db.execute("BEGIN")
+            return load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, repository) is not None
+    except (sqlite3.Error, ControlStoreError, ValueError) as exc:
+        raise WorkflowAuthorityError(f"review family activation is unreadable: {_reason(exc)[:512]}") from exc
+
+
+def read_review_guidance(control: SQLiteControlStore, repository: str, pr: int) -> str | None:
+    """A pull request's committed review-episode guidance, read-only for any role.
+
+    None means the review family is not activated for the repository, so the
+    legacy per-PR record still owns guidance; an activated but unobserved
+    workflow has no guidance (""). An unreadable authority raises
+    `WorkflowAuthorityError`: a caller defers rather than guessing (ADR 0015).
+    """
+    if not isinstance(control, SQLiteControlStore):
+        raise ValueError("review guidance is read from the control store")
+    key = WorkflowKey(repository, PullRequestRef(pr))
+    try:
+        with closing(control._connect()) as db:
+            db.execute("BEGIN")
+            read = load_workflow_read(db, key)
+    except (sqlite3.Error, ControlStoreError, ValueError) as exc:
+        raise WorkflowAuthorityError(f"review guidance is unavailable: {_reason(exc)[:512]}") from exc
+    if isinstance(read, WorkflowMigrationRequired):
+        return None
+    if isinstance(read, ReviewWorkflowSnapshot):
+        return read.episode.guidance
+    if isinstance(read, WorkflowAbsent):
+        return ""
+    raise WorkflowAuthorityError("review guidance belongs to another workflow family")
 
 
 def release_refused_gate_id(command_id: CommandId) -> str:
@@ -103,8 +169,9 @@ class SQLiteReviewWorkflowControl:
     def __init__(
         self, control: SQLiteControlStore, writer: WorkflowWriter, *, gateway: object, ceiling: int,
         trigger_label: Label, rule: CountingRule,
-        external_holds: Callable[[ObservedPullRequest], tuple[str, ...]] = _no_external_holds,
+        external_holds: Callable[[ObservedPullRequest, object], tuple[str, ...]] = _no_external_holds,
         policy: ReconciliationPolicy = ReconciliationPolicy(),
+        trailers: Callable[[int], object] | None = None,
     ) -> None:
         if not isinstance(control, SQLiteControlStore) or not isinstance(writer, WorkflowWriter):
             raise ValueError("review workflow control requires the existing store and a typed writer")
@@ -118,6 +185,8 @@ class SQLiteReviewWorkflowControl:
             raise ValueError("review trigger must be a label other than the attention hold")
         if not isinstance(rule, CountingRule) or not isinstance(policy, ReconciliationPolicy) or not callable(external_holds):
             raise ValueError("review workflow control requires a counting rule, hold source and read policy")
+        if trailers is not None and not callable(trailers):
+            raise ValueError("the exemption evidence reader must be callable")
         self._control = control
         self._writer = writer
         self._gateway = gateway
@@ -126,6 +195,9 @@ class SQLiteReviewWorkflowControl:
         self._rule = rule
         self._external_holds = external_holds
         self._policy = policy
+        # The read-only commit-trailer read behind exemption declarations
+        # (ADR 0014); None leaves evidence holds to the dispatching review.
+        self._trailers = trailers
 
     @property
     def writer(self) -> WorkflowWriter:
@@ -156,13 +228,17 @@ class SQLiteReviewWorkflowControl:
             yield
 
     def _observe(self, key: WorkflowKey) -> RecordedPullRequest | PullRequestUnavailable:
-        """One fresh read-only observation, stamped at its start on the store clock."""
+        """One fresh read-only observation, stamped at its start on the store clock.
+
+        The hold source sees the same read's pull request view, so a hold
+        keyed by the PR's linked issue is derived from this read, not a second.
+        """
         started = self._now()
-        observed = observe_pull_request(self._gateway, key, started, reviews=True)
+        observed, view = read_pull_request(self._gateway, key, started, reviews=True)
         if isinstance(observed, PullRequestUnavailable):
             return observed
         try:
-            return RecordedPullRequest(observed, tuple(self._external_holds(observed)))
+            return RecordedPullRequest(observed, tuple(self._external_holds(observed, view)))
         except sqlite3.Error:
             raise
         except Exception as exc:  # noqa: BLE001 - an unreadable hold source is unavailable evidence
@@ -364,17 +440,26 @@ class SQLiteReviewWorkflowControl:
 
         Unknown, executing (a crashed attempt) or proven absent and awaiting
         re-execution, before or after expiry; a retired command has its own
-        gate. Harness-owned: the dispatch hold's only input.
+        gate. A succeeded submission not yet applied to the workflow (its
+        baseline or ceiling unrecorded) also holds: dispatching then would buy
+        a second review of the head the landed verdict already covers.
+        Harness-owned: the dispatch hold's only input.
         """
         key = binding.fence.key
         unresolved: list[CommandId] = []
         for row in db.execute(
             "SELECT * FROM lifecycle_commands WHERE repository=? AND target=? AND kind=? "
-            "AND state IN ('executing','unknown_outcome','retryable_failure') ORDER BY created_at, command_id",
+            "AND state IN ('executing','unknown_outcome','retryable_failure','succeeded') "
+            "ORDER BY created_at, command_id",
             (key.repository, f"pr:{key.target.number}", CommandKind.SUBMIT_REVIEW.value),
         ).fetchall():
             command = _command_from_row(row)
-            if command.workflow == binding and not isinstance(
+            if command.workflow != binding:
+                continue
+            if row["state"] == EffectStatus.SUCCEEDED.value:
+                if not self._submission_settled(db, str(command.command_id)):
+                    unresolved.append(command.command_id)
+            elif not isinstance(
                 self._control._command_reconciliation(row), (RetiredSettledCommand, RetiredUncertainCommand)
             ):
                 unresolved.append(command.command_id)
@@ -408,12 +493,20 @@ class SQLiteReviewWorkflowControl:
     # -- discovery -----------------------------------------------------------------------------
 
     def ensure_observed_workflow(self, key: WorkflowKey) -> WorkflowCommitted | PullRequestUnavailable:
-        """Create the initial workflow of a present pull request; never initializes a family."""
+        """Create the initial workflow of a present pull request; never initializes a family.
+
+        An unavailable first read backs off on its own schedule
+        (`first_observation_due`), journalled when it starts and once at its
+        ceiling; a later read that succeeds ends it.
+        """
         self._scope(key)
         recorded = self._observe(key)
         if isinstance(recorded, PullRequestUnavailable):
+            self._first_observation_failed(key, recorded.reason or "pull request read unavailable")
             return recorded
         with self._control.transaction() as db:
+            db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                       (_FIRST_OBSERVATION_NAMESPACE, self._writer.repository, f"pr:{key.target.number}"))
             self._control._assert_owner_active(db, self._writer.owner_id)
             authority = load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, key.repository)
             if authority is None:
@@ -428,6 +521,54 @@ class SQLiteReviewWorkflowControl:
             self._control._transition(db, "workflow", encode_workflow(key), "discovered",
                                       {"generation": 0, "version": 0, "epoch": authority.epoch})
             return WorkflowCommitted(snapshot)
+
+    def _first_observation(
+        self, db: sqlite3.Connection, key: WorkflowKey,
+    ) -> tuple[ActiveReconciliation, bool] | None:
+        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                         (_FIRST_OBSERVATION_NAMESPACE, self._writer.repository, f"pr:{key.target.number}")).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = json.loads(row["payload_json"])
+            surfaced, reads = raw["surfaced"], raw["reads"]
+            if not isinstance(surfaced, bool) or type(reads) is not int:
+                raise ValueError("untyped surfaced flag or read count")
+            return ActiveReconciliation(datetime.fromisoformat(raw["since"]), datetime.fromisoformat(raw["next"]),
+                                        reads), surfaced
+        except (ValueError, TypeError, KeyError) as exc:
+            raise WorkflowAuthorityError("first observation schedule is malformed") from exc
+
+    def first_observation_due(self, key: WorkflowKey) -> bool:
+        """Whether a never-observed pull request's first read may be attempted now."""
+        self._scope(key)
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            prior = self._first_observation(db, key)
+        return prior is None or prior[0].next_read_at <= self._now()
+
+    def _first_observation_failed(self, key: WorkflowKey, error: str) -> None:
+        with self._control.transaction() as db:
+            prior = self._first_observation(db, key)
+            surfaced = prior is not None and prior[1]
+            progress = unavailable_first_observation(prior[0] if prior else None, surfaced=surfaced, now=self._now(),
+                                                     policy=self._policy)
+            history = progress.history
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(namespace,scope,key) DO UPDATE SET payload_json=excluded.payload_json",
+                (_FIRST_OBSERVATION_NAMESPACE, self._writer.repository, f"pr:{key.target.number}",
+                 self._now().isoformat(), json.dumps({"since": history.unresolved_since.isoformat(),
+                                                      "next": history.next_read_at.isoformat(),
+                                                      "reads": history.failed_reads,
+                                                      "surfaced": surfaced or progress.surface})),
+            )
+            if prior is None or progress.surface:
+                self._control._transition(db, "workflow", encode_workflow(key),
+                                          "first_observation_ceiling" if progress.surface
+                                          else "first_observation_unavailable",
+                                          {"failed_reads": history.failed_reads, "error": error[:512],
+                                           "next_read_at": history.next_read_at.isoformat()})
 
     # -- the one commit boundary ------------------------------------------------------------------
 
@@ -868,7 +1009,8 @@ class SQLiteReviewWorkflowControl:
                 return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, recorded.reason)
             proposal = open_review_ceiling(
                 prior, recorded.observation, now=self._now(), rule=self._rule, ceiling=self._ceiling,
-                escalation=bound, evidence_ids=(self._evidence_id(recorded),),
+                escalation=bound, trigger_label=self._trigger, executor_identity=self._writer.owner_id,
+                evidence_ids=(self._evidence_id(recorded),),
             )
             return self._apply(db, prior, key, recorded, proposal)
 
@@ -878,22 +1020,226 @@ class SQLiteReviewWorkflowControl:
         A release advances the generation, which fences every older command,
         so it is ordered with executing effects like an operator re-arm.
         """
+        return self._reconcile_ceiling(key)[0]
+
+    def _reconcile_ceiling(
+        self, key: WorkflowKey,
+    ) -> tuple[WorkflowCommitted | WorkflowConflict | WorkflowRejected, bool]:
+        """`reconcile_ceiling`, and whether the same read re-projected an open ceiling's missing hold."""
         self._scope(key)
         with self._barriers():
             recorded = self._observe(key)
             with self._control.transaction() as db:
                 prior = self._load(db, key)
                 if isinstance(recorded, PullRequestUnavailable):
-                    return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, recorded.reason)
+                    return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, recorded.reason), False
                 proposal = reconcile_review_ceiling(
                     prior, recorded.observation, now=self._now(), ceiling=self._ceiling,
                     evidence_ids=(self._evidence_id(recorded),), trigger_label=self._trigger,
                     executor_identity=self._writer.owner_id, external_holds=recorded.external_holds,
                 )
-                return self._apply(db, prior, key, recorded, proposal)
+                result = self._apply(db, prior, key, recorded, proposal)
+                if not isinstance(result, WorkflowCommitted):
+                    return result, False
+                return result, self._restore_ceiling_hold(db, key, recorded)
+
+    def _restore_ceiling_hold(self, db: sqlite3.Connection, key: WorkflowKey, recorded: RecordedPullRequest) -> bool:
+        """Re-project an open ceiling's missing `needs-human-review` from this read (keifu #173 class).
+
+        One workflow-owned, hold-guarded relabel per read that found the hold
+        missing, journalled, at most `MAX_HOLD_RESTORES` per gate; past that
+        the contest is journalled once and the gate alone keeps holding
+        reviews. Never while another review-family relabel of this pull
+        request is still unsettled (the escalation's own projection, a
+        re-arm's), which already decides these labels. A restoration is the
+        harness's own write, so it never resets the hold's read backoff.
+        """
+        state = self._load(db, key)
+        for gate_id in verified_ceiling_holds(state, recorded.observation, trigger_label=self._trigger):
+            # The hold is on GitHub whoever applied it; its signal is owed once.
+            self._owe_signal(db, key, gate_id, "hold_verified")
+        restores = self._clear_stale_restores(db, key, state)
+        evidence_id = self._evidence_id(recorded)
+        decision = ceiling_hold_restoration(
+            state, recorded.observation, evidence_id, restores={g: n for g, (n, _) in restores.items()},
+            trigger_label=self._trigger, executor_identity=self._writer.owner_id,
+        )
+        if decision is None or self._unsettled_projection(db, key) or self._unresolved_escalation(db, key):
+            return False
+        if isinstance(decision, HoldContested):
+            if not restores.get(decision.gate_id, (0, False))[1]:
+                self._owe_signal(db, key, decision.gate_id, "hold_contested")
+                self._write_restores(db, key, decision.gate_id, decision.restores, contested=True)
+                self._control._transition(db, "workflow_hold", f"pr:{key.target.number}", "hold_contested", {
+                    "gate_id": decision.gate_id, "restores": decision.restores,
+                    "generation": state.revision.fence.generation,
+                    "labels": sorted(label.value for label in recorded.observation.labels),
+                })
+            return False
+        assert isinstance(decision, RestoreHold)
+        count = restores.get(decision.gate_id, (0, False))[0] + 1
+        self._insert_evidence(db, key, recorded)
+        self._control._enqueue_command(db, decision.command)
+        self._write_restores(db, key, decision.gate_id, count, contested=False)
+        self._control._transition(db, "workflow_hold", f"pr:{key.target.number}", "hold_reprojected", {
+            "command_id": str(decision.command.command_id), "generation": state.revision.fence.generation,
+            "gate_id": decision.gate_id, "restores": count,
+            "labels": sorted(label.value for label in recorded.observation.labels), "evidence_id": evidence_id,
+        })
+        return True
+
+    def _restore_rows(self, db: sqlite3.Connection, key: WorkflowKey) -> dict[str, tuple[int, bool]]:
+        rows: dict[str, tuple[int, bool]] = {}
+        for row in db.execute("SELECT key, payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key LIKE ?",
+                              (_HOLD_RESTORES_NAMESPACE, self._writer.repository, f"pr:{key.target.number}:%")):
+            try:
+                payload = json.loads(row["payload_json"])
+                restores, contested = int(payload["restores"]), payload["contested"]
+                if restores < 0 or not isinstance(contested, bool):
+                    raise ValueError("negative or untyped restoration count")
+            except (ValueError, TypeError, KeyError) as exc:
+                raise WorkflowAuthorityError("hold restoration count is malformed") from exc
+            rows[row["key"].split(":", 2)[2]] = (restores, contested)
+        return rows
+
+    def _clear_stale_restores(
+        self, db: sqlite3.Connection, key: WorkflowKey, state: ReviewWorkflowSnapshot,
+    ) -> dict[str, tuple[int, bool]]:
+        """Drop counts of gates that changed or released; a cleared contest is journalled."""
+        rows = self._restore_rows(db, key)
+        live = restorable_ceiling_gate_ids(state)
+        for gate_id, (_, contested) in list(rows.items()):
+            if gate_id in live:
+                continue
+            db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                       (_HOLD_RESTORES_NAMESPACE, self._writer.repository, f"pr:{key.target.number}:{gate_id}"))
+            del rows[gate_id]
+            if contested:
+                self._control._transition(db, "workflow_hold", f"pr:{key.target.number}", "hold_contest_cleared",
+                                          {"gate_id": gate_id, "generation": state.revision.fence.generation})
+        return rows
+
+    def _write_restores(self, db: sqlite3.Connection, key: WorkflowKey, gate_id: str, restores: int, *,
+                        contested: bool) -> None:
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(namespace,scope,key) DO UPDATE SET payload_json=excluded.payload_json",
+            (_HOLD_RESTORES_NAMESPACE, self._writer.repository, f"pr:{key.target.number}:{gate_id}",
+             self._now().isoformat(), json.dumps({"restores": restores, "contested": contested})),
+        )
+
+    # -- refused escalation projections (increment 6 re-review N1) --------------------------------
+
+    def _refused_escalations(self, db: sqlite3.Connection, key: WorkflowKey) -> list[sqlite3.Row]:
+        return db.execute(
+            "SELECT * FROM lifecycle_commands c WHERE c.repository=? AND c.target=? AND c.kind=? AND c.state=? "
+            "AND c.idempotency_key LIKE ? AND NOT EXISTS (SELECT 1 FROM dedupe_keys d WHERE d.namespace=? "
+            "AND d.scope=c.repository AND d.key=c.command_id) ORDER BY c.created_at",
+            (key.repository, f"pr:{key.target.number}", CommandKind.RELABEL.value,
+             EffectStatus.PERMANENT_FAILURE.value, ESCALATION_PROJECTION_PREFIX + "%",
+             _ESCALATION_RESOLVED_NAMESPACE),
+        ).fetchall()
+
+    def _unresolved_escalation(self, db: sqlite3.Connection, key: WorkflowKey) -> bool:
+        return bool(self._refused_escalations(db, key))
+
+    def _replan_escalations(self, key: WorkflowKey) -> str:
+        """Resolve every refused escalation projection of this pull request from one fresh read.
+
+        A ceiling's refused projection is the open gate's restoration's to
+        repair (it is the same hold). A verdict's is re-planned while the
+        escalation still applies, bounded, and surfaced as a visible
+        `ReviewProjectionRefused` gate plus its operator signal when the
+        bound is spent. Returns an unavailable read's error, else "".
+        """
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            if not self._refused_escalations(db, key):
+                return ""
+        recorded = self._observe(key)
+        if isinstance(recorded, PullRequestUnavailable):
+            return recorded.reason or "pull request read unavailable"
+        with self._control.transaction() as db:
+            for row in self._refused_escalations(db, key):
+                self._replan_escalation(db, key, _command_from_row(row), recorded)
+        return ""
+
+    def _replan_escalation(self, db: sqlite3.Connection, key: WorkflowKey, command, recorded: RecordedPullRequest) -> None:
+        identity = escalation_projection_identity(command)
+        if identity is None or not owns_command(db, self._writer, command.executor_identity):
+            raise WorkflowAuthorityError("a refused escalation projection belongs to another executor")
+        state = self._load(db, key)
+        subject = f"pr:{key.target.number}"
+        # A ceiling's projection names its gate, not a submission.
+        submitted = db.execute("SELECT 1 FROM lifecycle_commands WHERE command_id=?", (identity,)).fetchone()
+        receipt = load_bound_review_submission(db, CommandId(identity)) if submitted is not None else None
+        error = db.execute("SELECT error FROM effect_receipts WHERE command_id=?", (str(command.command_id),)).fetchone()
+        refusal = (error["error"] if error is not None and error["error"] else "escalation projection refused")[:512]
+
+        def resolve(outcome: str, detail: dict) -> None:
+            db.execute("INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       (_ESCALATION_RESOLVED_NAMESPACE, self._writer.repository, str(command.command_id),
+                        self._now().isoformat(), json.dumps({"outcome": outcome, **detail})))
+            self._control._transition(db, "workflow_escalation", subject, f"escalation_{outcome}", {
+                "command_id": str(command.command_id), "escalation": identity, "refusal": refusal, **detail})
+
+        if not isinstance(receipt, ReviewSubmissionReceipt) or not receipt.escalated:
+            resolve("owned_by_ceiling", {})  # restored by the open ceiling's hold restoration
+            return
+        replans = db.execute("SELECT COUNT(*) FROM lifecycle_commands WHERE repository=? AND idempotency_key LIKE ?",
+                             (key.repository, ESCALATION_PROJECTION_PREFIX + identity + "%")).fetchone()[0] - 1
+        decision = replan_escalation_hold(state, recorded.observation, receipt, replans=replans,
+                                          trigger_label=self._trigger, executor_identity=self._writer.owner_id)
+        if isinstance(decision, EscalationHoldPresent):
+            # Someone else applied the hold: no receipt of ours will carry the signal.
+            self._owe_signal(db, key, identity, "hold_verified")
+            resolve("hold_verified", {})
+        elif isinstance(decision, EscalationMoot):
+            resolve("moot", {"reason": decision.reason})
+        elif isinstance(decision, EscalationReprojected):
+            evidence_id = self._insert_evidence(db, key, recorded)
+            self._control._enqueue_command(db, decision.command)
+            resolve("reprojected", {"replacement": str(decision.command.command_id), "attempt": replans + 1,
+                                    "evidence_id": evidence_id})
+        else:
+            assert isinstance(decision, EscalationProjectionExhausted)
+            gate_id = self._open_refused_gate(db, state, command, refusal, (
+                "apply needs-human-review (and remove the trigger) by hand; the next harness read verifies "
+                "the labels and releases this hold"))
+            self._owe_signal(db, key, identity, "projection_exhausted")
+            resolve("projection_exhausted", {"gate_id": gate_id, "replans": decision.replans})
+
+    def _owe_signal(self, db: sqlite3.Connection, key: WorkflowKey, escalation: str, reason: str) -> None:
+        owe_escalation_signal(db, executor_identity=self._writer.owner_id, escalation=escalation,
+                              pr=key.target.number, reason=reason, at=self._now())
+
+    def _open_refused_gate(self, db: sqlite3.Connection, state: ReviewWorkflowSnapshot, command, reason: str,
+                           remediation: str) -> str:
+        binding = command.workflow
+        gate_id = release_refused_gate_id(command.command_id)
+        self._control._reconciliation_gate(db, binding, gate_id, OpenGate(
+            gate_id, state.revision.fence.generation,
+            ReviewProjectionRefused(str(command.command_id), binding.fence.generation, reason[:16384]),
+            NoAuthorizedRemediation(remediation),
+        ))
+        return gate_id
+
+    def _unsettled_projection(self, db: sqlite3.Connection, key: WorkflowKey) -> bool:
+        for row in db.execute(
+            "SELECT * FROM lifecycle_commands WHERE repository=? AND target=? AND kind=? "
+            "AND workflow_binding_json IS NOT NULL AND state NOT IN ('succeeded','permanent_failure')",
+            (key.repository, f"pr:{key.target.number}", CommandKind.RELABEL.value),
+        ):
+            if not isinstance(self._control._command_reconciliation(row), RetiredSettledCommand):
+                return True
+        return False
 
     def record_review(self, submission: CommandId) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected:
-        """Record a verified current-generation verdict as the reviewed baseline, at most once per receipt."""
+        """Record a verified current-generation verdict as the reviewed baseline, at most once per receipt.
+
+        An escalated verdict also needs a fresh read: its baseline commits
+        together with the attention-hold projection that read guards.
+        """
         with self._control.transaction() as db:
             bound = load_bound_review_submission(db, submission)
             if bound is None:
@@ -905,12 +1251,25 @@ class SQLiteReviewWorkflowControl:
             prior = self._load(db, key)
             if self._submission_recorded(db, str(submission)):
                 return WorkflowCommitted(prior, idempotent=True)
-            proposal = record_review(prior, bound)
-            if isinstance(proposal, WorkflowRejected):
-                return proposal
-            if isinstance(proposal, WorkflowUnchanged):
+            if not bound.escalated:
+                proposal = record_review(prior, bound)
+                if isinstance(proposal, WorkflowRejected):
+                    return proposal
+                if isinstance(proposal, WorkflowUnchanged):
+                    return WorkflowCommitted(prior, idempotent=True)
+                return self._commit(db, prior.revision, (prior.authority,), proposal)
+        recorded = self._observe(key)
+        with self._control.transaction() as db:
+            prior = self._load(db, key)
+            if self._submission_recorded(db, str(submission)):
                 return WorkflowCommitted(prior, idempotent=True)
-            return self._commit(db, prior.revision, (prior.authority,), proposal)
+            if isinstance(recorded, PullRequestUnavailable):
+                return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, recorded.reason)
+            escalated = record_escalated_review(
+                prior, bound, recorded.observation, now=self._now(), trigger_label=self._trigger,
+                executor_identity=self._writer.owner_id, evidence_ids=(self._evidence_id(recorded),),
+            )
+            return self._apply(db, prior, key, recorded, escalated)
 
     def _apply(
         self, db: sqlite3.Connection, prior: ReviewWorkflowSnapshot, key: WorkflowKey, recorded: RecordedPullRequest,
@@ -955,12 +1314,26 @@ class SQLiteReviewWorkflowControl:
         return WorkflowCommitted(current, idempotent=True)
 
     def _active_review_runs(self, db: sqlite3.Connection, key: WorkflowKey) -> bool:
+        """Bound runs of any generation, and unbound review legs admitted before activation.
+
+        Once the family is active, admission refuses every unbound review leg,
+        so the unbound half can only find runs admitted before the switch
+        (ADR 0015: indexed bound queries cannot prove legacy quiescence).
+        """
         lower, upper = workflow_run_scope_bounds(key)
-        return db.execute(
+        live = "(r.state IN ('reserved','starting','running') OR l.run_id IS NOT NULL OR b.state='active')"
+        bound = db.execute(
             "SELECT 1 FROM runs r LEFT JOIN leases l USING(run_id) LEFT JOIN budget_reservations b USING(run_id) "
-            "WHERE r.workflow_episode_key>=? AND r.workflow_episode_key<? "
-            "AND (r.state IN ('reserved','starting','running') OR l.run_id IS NOT NULL OR b.state='active') LIMIT 1",
+            f"WHERE r.workflow_episode_key>=? AND r.workflow_episode_key<? AND {live} LIMIT 1",
             (lower, upper),
+        ).fetchone() is not None
+        return bound or db.execute(
+            "SELECT 1 FROM runs r LEFT JOIN leases l USING(run_id) LEFT JOIN budget_reservations b USING(run_id) "
+            "WHERE r.workflow_episode_key IS NULL AND r.kind IN ('REVIEW','RE_REVIEW') "
+            "AND json_valid(r.dispatch_id) AND json_extract(r.dispatch_id,'$.role')='review' "
+            "AND json_extract(r.dispatch_id,'$.repository')=? AND json_extract(r.dispatch_id,'$.number')=? "
+            f"AND {live} LIMIT 1",
+            (key.repository, key.target.number),
         ).fetchone() is not None
 
     def request_rearm(
@@ -1312,7 +1685,9 @@ class SQLiteReviewWorkflowControl:
         if isinstance(recorded, RecordedPullRequest) and isinstance(recorded.observation.reviews, CompleteReviews):
             pr = recorded.observation
             planned = op.add in pr.labels and (op.remove is None or op.remove not in pr.labels)
-            if planned or pr.state is not PullRequestState.OPEN:
+            # An escalation holds one head: a new head is owed its own review.
+            superseded = is_review_escalation_projection(command) and pr.head_sha != op.guard.head_sha
+            if planned or superseded or pr.state is not PullRequestState.OPEN:
                 evidence_id = self._insert_evidence(db, key, recorded)
                 db.execute("INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
                            "VALUES (?,?,?,?,?)", (_RELEASE_RESOLVED_NAMESPACE, self._writer.repository, command_id,
@@ -1321,7 +1696,7 @@ class SQLiteReviewWorkflowControl:
                     self._control._reconciliation_gate(db, binding, gate_id, None)
                 self._control._transition(db, "workflow_release", command_id, "verified_by_observation", {
                     "evidence_id": evidence_id, "terminal": pr.state is not PullRequestState.OPEN,
-                    "generation": binding.fence.generation,
+                    "superseded": superseded, "generation": binding.fence.generation,
                 })
                 return
         if gate is None:
@@ -1329,12 +1704,391 @@ class SQLiteReviewWorkflowControl:
             reason = (error["error"] if error is not None and error["error"] else "release projection refused")
             planned = (f"remove {op.remove.value!r} and add {op.add.value!r}" if op.remove is not None
                        else f"add {op.add.value!r}")
-            self._control._reconciliation_gate(db, binding, gate_id, OpenGate(
-                gate_id, state.revision.fence.generation,
-                ReviewProjectionRefused(command_id, binding.fence.generation, reason[:16384]),
-                NoAuthorizedRemediation(
-                    f"correct the pull request labels by hand ({planned}); the next harness read verifies "
-                    "them and releases this hold"),
-            ))
+            self._open_refused_gate(db, state, command, reason, (
+                f"correct the pull request labels by hand ({planned}); the next harness read verifies "
+                "them and releases this hold"))
             self._control._transition(db, "workflow_release", command_id, "refusal_gated",
                                       {"gate_id": gate_id, "generation": binding.fence.generation})
+
+    # -- runtime: activation, settled submissions, holds and exemption evidence ----------------
+
+    def family_active(self) -> bool:
+        """Whether this repository's review family is activated; never initializes it."""
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            return load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, self._writer.repository) is not None
+
+    def _submission_settled(self, db: sqlite3.Connection, command_id: str) -> bool:
+        return db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace IN (?, ?) AND scope=? AND key=?",
+            (_SETTLED_SUBMISSION_NAMESPACE, _RECORDED_REVIEW_NAMESPACE, self._writer.repository, command_id),
+        ).fetchone() is not None
+
+    def settle_submission(
+        self, submission: CommandId,
+    ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected | None:
+        """Apply one settled bound review submission to its workflow exactly once.
+
+        The durable consequence of every submission is decided here, from its
+        SUCCEEDED receipt, never by the dispatch that posted it: a verdict
+        becomes the reviewed baseline (RECORD_REVIEW); an ESCALATE verdict
+        becomes the baseline plus the needs-human-review projection; a ceiling
+        escalation opens its gate plus that projection. Each commits in one
+        transaction, and the projection is a workflow-owned, hold-guarded
+        command the executor drains. Both the submitting review and the
+        reconciliation pass call this, so a crash or a lost reply anywhere
+        between the write and the relabel neither loses the hold nor re-buys
+        the review. A fresh read that refuses the escalation (the head moved,
+        or a human dismissed a counted review) settles with no hold at all.
+        An unavailable read is retried on the bounded review-history
+        schedule, which gates visibly at its ceiling. Returns None when
+        nothing is (yet) settled to apply.
+        """
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            if self._submission_settled(db, str(submission)):
+                return None
+            row = db.execute("SELECT executor_identity FROM lifecycle_commands WHERE command_id=?",
+                             (str(submission),)).fetchone()
+            if row is None or not owns_command(db, self._writer, row["executor_identity"]):
+                return None
+            bound = load_bound_review_submission(db, submission)
+        if bound is None:
+            return None
+        key = self._scope(bound.submission.binding.fence.key)
+        result: WorkflowCommitted | WorkflowConflict | WorkflowRejected
+        if isinstance(bound, ReviewSubmissionReceipt):
+            result = self.record_review(submission)
+        else:
+            result = self.open_ceiling(submission)
+        if isinstance(result, WorkflowRejected) and result.code is WorkflowRejection.OBSERVATION_UNAVAILABLE:
+            self.record_evidence(key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
+                                 error=result.reason or "pull request read unavailable")
+            return result  # retried by a later reconciliation pass on its schedule
+        if isinstance(result, WorkflowConflict):
+            return result  # retried by the next reconciliation pass
+        if self._reads_review_history(bound):
+            self.record_evidence(key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY, error=None)
+        outcome = ("applied" if isinstance(result, WorkflowCommitted) and not result.idempotent
+                   else "unchanged" if isinstance(result, WorkflowCommitted)
+                   else f"refused: {result.code.value}")
+        with self._control.transaction() as db:
+            db.execute("INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       (_SETTLED_SUBMISSION_NAMESPACE, self._writer.repository, str(submission),
+                        self._now().isoformat(), json.dumps({"outcome": outcome})))
+            self._control._transition(db, "review_submission", str(submission), "settled", {
+                "outcome": outcome, "reason": result.reason[:512] if isinstance(result, WorkflowRejected) else "",
+                "escalation": ("ceiling" if isinstance(bound, CeilingEscalation)
+                               else "verdict" if bound.escalated else ""),
+            })
+        return result
+
+    @staticmethod
+    def _reads_review_history(bound: ReviewSubmissionReceipt | CeilingEscalation) -> bool:
+        return isinstance(bound, CeilingEscalation) or bound.escalated
+
+    def reconcile_submissions(self, *, limit: int = 32) -> int:
+        """Settle bound review submissions whose receipt landed without being applied.
+
+        Covers a crash after the receipt and a submission the drain settled
+        after an unknown outcome. A settlement that needs a fresh read waits
+        for that pull request's review-history schedule, so an unreadable
+        pull request costs a bounded number of reads. Returns how many were
+        applied.
+        """
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("submission reconciliation limit must be between 1 and 128")
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            rows = db.execute(
+                "SELECT c.command_id FROM lifecycle_commands c WHERE c.repository=? AND c.kind=? AND c.state=? "
+                "AND c.workflow_binding_json IS NOT NULL AND NOT EXISTS (SELECT 1 FROM dedupe_keys d "
+                "WHERE d.namespace IN (?, ?) AND d.scope=c.repository AND d.key=c.command_id) "
+                "ORDER BY c.created_at, c.command_id LIMIT ?",
+                (self._writer.repository, CommandKind.SUBMIT_REVIEW.value, EffectStatus.SUCCEEDED.value,
+                 _SETTLED_SUBMISSION_NAMESPACE, _RECORDED_REVIEW_NAMESPACE, limit),
+            ).fetchall()
+        applied = 0
+        for row in rows:
+            try:
+                with closing(self._control._connect()) as db:
+                    db.execute("BEGIN")
+                    bound = load_bound_review_submission(db, CommandId(row["command_id"]))
+                if bound is not None and self._reads_review_history(bound) and not self.evidence_due(
+                    bound.submission.binding.fence.key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
+                ):
+                    continue
+                result = self.settle_submission(CommandId(row["command_id"]))
+            except (WorkflowAuthorityError, ControlStoreError, KeyError) as exc:
+                with self._control.transaction() as db:
+                    self._control._transition(db, "review_submission", row["command_id"], "settle_unavailable",
+                                              {"reason": _reason(exc)[:512]})
+                continue
+            applied += isinstance(result, WorkflowCommitted) and not result.idempotent
+        return applied
+
+    # Holds whose fresh-read reconciliation this pass drives (ADR 0015 review slice).
+    def _hold_candidates(self, db: sqlite3.Connection) -> tuple[int, ...]:
+        numbers = {row[0] for row in db.execute(
+            "SELECT DISTINCT target_number FROM workflow_gates WHERE repository=? AND target_kind='pr' "
+            "AND state IN ('open','rearming')", (self._writer.repository,),
+        )}
+        for row in db.execute(
+            "SELECT c.command_id, w.target_number, w.generation FROM lifecycle_commands c JOIN workflows w "
+            "ON w.repository=c.repository AND w.target_kind='pr' AND c.target='pr:'||w.target_number "
+            "WHERE c.repository=? AND c.kind=? AND c.state=? AND c.idempotency_key LIKE 'workflow:release:%' "
+            "AND NOT EXISTS (SELECT 1 FROM dedupe_keys d WHERE d.namespace=? AND d.scope=c.repository "
+            "AND d.key=c.command_id)",
+            (self._writer.repository, CommandKind.RELABEL.value, EffectStatus.PERMANENT_FAILURE.value,
+             _RELEASE_RESOLVED_NAMESPACE),
+        ):
+            key = WorkflowKey(self._writer.repository, PullRequestRef(row["target_number"]))
+            if row["generation"] >= 1 and str(review_release_command_id(key, row["generation"])) == row["command_id"]:
+                numbers.add(row["target_number"])
+        for row in db.execute(
+            "SELECT DISTINCT c.target FROM lifecycle_commands c WHERE c.repository=? AND c.kind=? AND c.state=? "
+            "AND c.idempotency_key LIKE ? AND NOT EXISTS (SELECT 1 FROM dedupe_keys d WHERE d.namespace=? "
+            "AND d.scope=c.repository AND d.key=c.command_id)",
+            (self._writer.repository, CommandKind.RELABEL.value, EffectStatus.PERMANENT_FAILURE.value,
+             ESCALATION_PROJECTION_PREFIX + "%", _ESCALATION_RESOLVED_NAMESPACE),
+        ):
+            kind, _, number = row["target"].partition(":")
+            if kind == "pr" and number.isdigit():
+                numbers.add(int(number))
+        return tuple(sorted(numbers))
+
+    def _hold_schedule(self, db: sqlite3.Connection, number: int) -> tuple[datetime, int] | None:
+        row = db.execute(
+            f"SELECT claimed_at, payload_json FROM dedupe_keys WHERE namespace='{_HOLD_OBSERVATION_NAMESPACE}' "
+            "AND scope=? AND key=?", (self._writer.repository, f"pr:{number}"),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            payload = json.loads(row["payload_json"])
+            return datetime.fromisoformat(row["claimed_at"]), int(payload["failed_reads"])
+        except (ValueError, TypeError, KeyError):
+            return None  # an unreadable schedule is due, never a silent skip
+
+    def _write_hold_schedule(self, number: int, failed_reads: int, delay: float, error: str) -> None:
+        now = self._now()
+        with self._control.transaction() as db:
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,"
+                "payload_json=excluded.payload_json",
+                (_HOLD_OBSERVATION_NAMESPACE, self._writer.repository, f"pr:{number}",
+                 (now + timedelta(seconds=delay)).isoformat(),
+                 json.dumps({"failed_reads": failed_reads, "error": error[:512]})),
+            )
+            if error:
+                self._control._transition(db, "workflow_hold", f"pr:{number}", "observation_deferred", {
+                    "failed_reads": failed_reads, "error": error[:512], "delay_seconds": delay,
+                })
+
+    def reconcile_holds(self, *, limit: int = 16) -> int:
+        """Drive every due review hold from one fresh read: ceilings, refused releases, evidence.
+
+        A ceiling whose cause is now false is released (RELEASE_CEILING) and
+        one still true is refreshed; a refused release projection becomes a
+        visible gate until a read verifies it; an exemption-evidence hold is
+        re-read on its own schedule. Bounded by `limit` per pass and by a
+        per-pull-request schedule that backs off on unavailable reads, so a
+        held or terminal pull request never becomes a tight polling loop.
+        Must run outside every effect runner's shared authority: ceiling
+        reconciliation takes the exclusive deployment barriers.
+        """
+        if type(limit) is not int or not 1 <= limit <= 128:
+            raise ValueError("hold reconciliation limit must be between 1 and 128")
+        now = self._now()
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            due = [number for number in self._hold_candidates(db)
+                   if (schedule := self._hold_schedule(db, number)) is None or schedule[0] <= now][:limit]
+            prior = {number: self._hold_schedule(db, number) for number in due}
+        progressed = 0
+        for number in due:
+            key = WorkflowKey(self._writer.repository, PullRequestRef(number))
+            reads = (prior[number] or (now, 0))[1]
+            try:
+                changed, error, terminal = self._reconcile_hold(key)
+            except (WorkflowAuthorityError, ControlStoreError, ValueError) as exc:
+                changed, error, terminal = False, _reason(exc), False
+            progressed += changed
+            if changed:
+                # Progress may enable the next step (a released ceiling's
+                # projection, a refreshed gate): look again soon.
+                self._write_hold_schedule(number, 0, self._policy.initial_delay_seconds, "")
+                continue
+            # An unavailable or an unchanged read backs off, so a hold that
+            # sits for days costs a bounded number of complete reads.
+            reads = min(reads + 1, 2**31)
+            delay = (self._policy.maximum_delay_seconds if terminal else
+                     min(self._policy.maximum_delay_seconds,
+                         self._policy.initial_delay_seconds * 2 ** min(reads - 1, 17)))
+            self._write_hold_schedule(number, reads, delay, error)
+        return progressed
+
+    def _reconcile_hold(self, key: WorkflowKey) -> tuple[bool, str, bool]:
+        """(changed, unavailable-read error or "", pull request terminal) for one held pull request."""
+        state = self.load_workflow(key)
+        if not isinstance(state, ReviewWorkflowSnapshot):
+            return False, (state.reason if isinstance(state, WorkflowUnavailable) else ""), False
+        changed = False
+        self.reconcile_release(key)
+        after = self.load_workflow(key)
+        changed |= after != state
+        if not isinstance(after, ReviewWorkflowSnapshot):
+            return changed, "", False
+        error = self._replan_escalations(key)
+        if error:
+            return changed, error, False
+        stopped = isinstance(after.intent, (SupersededReviewRearm, CancelledReviewRearm))
+        ceilings = any(isinstance(g, OpenGate) and isinstance(g.cause, ReviewRejectionCeiling) for g in after.gates)
+        terminal = False
+        if not isinstance(after.intent, PendingReviewRearm) and (ceilings or stopped):
+            # A restoration is the harness's own write: it never resets the backoff.
+            result, _restored = self._reconcile_ceiling(key)
+            if isinstance(result, WorkflowRejected):
+                if result.code is WorkflowRejection.OBSERVATION_UNAVAILABLE:
+                    return changed, result.reason or "pull request read unavailable", False
+                terminal = "terminal" in result.reason or "verified absent" in result.reason
+            elif isinstance(result, WorkflowCommitted):
+                changed |= not result.idempotent
+        current = self.load_workflow(key)
+        if isinstance(current, ReviewWorkflowSnapshot):
+            for kind in dict.fromkeys(k for g in current.gates if (k := review_evidence_gate_kind(g)) is not None):
+                evidence_changed, error = self._reread_evidence(current, kind)
+                changed |= evidence_changed
+                if error:
+                    return changed, error, False
+        return changed, "", terminal
+
+    # -- unreadable evidence (the ADR 0012/0015 UNVERIFIABLE loops) ------------------------------
+
+    def _evidence_schedule(
+        self, db: sqlite3.Connection, key: WorkflowKey, kind: ReviewEvidenceKind,
+    ) -> EvidenceSchedule | None:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (_EVIDENCE_NAMESPACES[kind], self._writer.repository, f"pr:{key.target.number}"),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            raw = json.loads(row["payload_json"])
+            return EvidenceSchedule(raw["head"], ActiveReconciliation(
+                datetime.fromisoformat(raw["since"]), datetime.fromisoformat(raw["next"]), int(raw["reads"])),
+                raw["error"])
+        except (ValueError, TypeError, KeyError) as exc:
+            raise WorkflowAuthorityError(f"{kind.value} schedule is malformed") from exc
+
+    def evidence_due(self, key: WorkflowKey, head_sha: str, kind: ReviewEvidenceKind) -> bool:
+        """Whether this head's evidence of this kind may be read now (its backoff has elapsed)."""
+        self._scope(key)
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            schedule = self._evidence_schedule(db, key, kind)
+        return evidence_due(schedule, head_sha, now=self._now())
+
+    def exemption_evidence_due(self, key: WorkflowKey, head_sha: str) -> bool:
+        return self.evidence_due(key, head_sha, ReviewEvidenceKind.EXEMPTION_TRAILERS)
+
+    def record_evidence(self, key: WorkflowKey, head_sha: str, kind: ReviewEvidenceKind, *, error: str | None) -> None:
+        """Persist one read of the current generation's evidence of `kind` at `head_sha`.
+
+        An unavailable read backs off and, at the policy ceiling, opens (or
+        refreshes) the visible `EvidenceUnavailable` hold. An available read
+        ends the schedule and closes that kind's hold; it grants, counts and
+        approves nothing.
+        """
+        self._scope(key)
+        namespace, scope = _EVIDENCE_NAMESPACES[kind], f"pr:{key.target.number}"
+        with self._control.transaction() as db:
+            state = self._load(db, key)
+            prior = self._evidence_schedule(db, key, kind)
+            now = self._now()
+            gate_id = evidence_gate_id(kind, key.target.number, head_sha)
+            held = [(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in state.gates
+                    if review_evidence_gate_kind(g) is kind]
+            if error is None:
+                if prior is None and not held:
+                    return
+                db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                           (namespace, self._writer.repository, scope))
+                for stale_id in held:
+                    self._control._reconciliation_gate(db, state.binding, stale_id, None)
+                self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_available",
+                                          {"head": head_sha, "closed_gates": len(held)})
+                return
+            progress = unavailable_evidence(kind, state.binding, head_sha, prior, now=now, error=error,
+                                            policy=self._policy)
+            schedule = progress.schedule
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,"
+                "payload_json=excluded.payload_json",
+                (namespace, self._writer.repository, scope, schedule.history.next_read_at.isoformat(), json.dumps({
+                    "head": schedule.head_sha, "since": schedule.history.unresolved_since.isoformat(),
+                    "next": schedule.history.next_read_at.isoformat(), "reads": schedule.history.failed_reads,
+                    "error": schedule.last_error})),
+            )
+            # Another head's hold is a different, now obsolete, question.
+            for stale_id in held:
+                if stale_id != gate_id:
+                    self._control._reconciliation_gate(db, state.binding, stale_id, None)
+            if progress.gate is not None:
+                self._control._reconciliation_gate(db, state.binding, gate_id, progress.gate)
+            self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_unavailable", {
+                "head": head_sha, "failed_reads": schedule.history.failed_reads,
+                "next_read_at": schedule.history.next_read_at.isoformat(), "gated": progress.gate is not None,
+                "error": schedule.last_error[:512],
+            })
+
+    def record_exemption_evidence(self, key: WorkflowKey, head_sha: str, *, error: str | None) -> None:
+        self.record_evidence(key, head_sha, ReviewEvidenceKind.EXEMPTION_TRAILERS, error=error)
+
+    def _reread_evidence(self, state: ReviewWorkflowSnapshot, kind: ReviewEvidenceKind) -> tuple[bool, str]:
+        """The scheduled read that alone may release an unreadable-evidence hold."""
+        key = state.revision.fence.key
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            schedule = self._evidence_schedule(db, key, kind)
+        if schedule is not None and not evidence_due(schedule, schedule.head_sha, now=self._now()):
+            return False, ""
+        history = kind is ReviewEvidenceKind.REVIEW_HISTORY
+        observed = observe_pull_request(self._gateway, key, self._now(), reviews=history)
+        if isinstance(observed, PullRequestUnavailable):
+            if history and schedule is not None:
+                # The evidence schedule is this hold's backoff; its failure is journalled there.
+                self.record_evidence(key, schedule.head_sha, kind, error=observed.reason or "pull request unavailable")
+                return False, ""
+            return False, observed.reason or "pull request read unavailable"
+        held = {(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in state.gates
+                if review_evidence_gate_kind(g) is kind}
+        if observed.state is not PullRequestState.OPEN or evidence_gate_id(kind, key.target.number,
+                                                                           observed.head_sha) not in held:
+            # A new head (or a terminal pull request) is a different question:
+            # the next dispatch or settlement reads its evidence afresh.
+            self.record_evidence(key, observed.head_sha, kind, error=None)
+            return True, ""
+        if history:
+            reviews = observed.reviews
+            complete = isinstance(reviews, CompleteReviews)
+            self.record_evidence(key, observed.head_sha, kind, error=(
+                None if complete else getattr(reviews, "reason", "") or "review history incomplete"))
+            return complete, ""
+        if self._trailers is None:
+            return False, ""
+        try:
+            self._trailers(key.target.number)
+        except sqlite3.Error:
+            raise
+        except Exception as exc:  # noqa: BLE001 - an unreadable trailer read is unavailable evidence
+            self.record_evidence(key, observed.head_sha, kind, error=_reason(exc)[:512] or "trailers unreadable")
+            return True, ""
+        self.record_evidence(key, observed.head_sha, kind, error=None)
+        return True, ""

@@ -2867,3 +2867,68 @@ def test_old_generation_result_is_audited_without_current_episode_or_remote_muta
         retired = decode_workflow(raw, RetiredResolveReturn)
         assert retired.superseded_by == _resolve_snapshot(store).binding
         assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='workflow-result'").fetchone()[0] == 0
+
+
+# ── PR guidance from the active review workflow (ADR 0015, increment 6) ─────
+
+def _review_guidance_control(tmp_path, guidance):
+    from issue_agent.domain.review_workflow import ReviewEpisode, ReviewWorkflowSnapshot
+    from tests.fakes.review_workflow import REVIEW, held, PR_KEY
+
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    state = ReviewWorkflowSnapshot(held().revision, REVIEW, ReviewEpisode("review-episode", guidance))
+    install_workflow(control, state)
+    return control, PR_KEY.target.number
+
+
+@pytest.mark.parametrize("handler", ["address_review", "fix_ci", "rebase"])
+def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_side_effects(handler):
+    p = PRView(100, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),),
+               checks=(Check("ci", "fail"),))
+    gw = FakeGateway(prs={100: p})
+    store = RetryRecordingStore()
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
+    ensured: list[int] = []
+
+    class RecordingWorktrees(FakeWorktrees):
+        def ensure(self, issue, branch):
+            ensured.append(issue)
+            return super().ensure(issue, branch)
+
+    worktrees = RecordingWorktrees()
+
+    def unreadable(_pr):
+        raise WorkflowAuthorityError("review guidance is unavailable: disk I/O error")
+
+    workflow = _workflow(gw, store, runner, wt=worktrees, operator_guidance=unreadable)
+    with pytest.raises(WorkflowAuthorityError):
+        asyncio.run(getattr(workflow, handler)(100))
+    assert runner.tasks == [] and store.get_review_retry(5) == ("", 0)
+    assert store.resumes.get(5, 0) == 0 and store.ci_retries == {} and store.rebase_retries == {}
+    assert ensured == []  # not even a worktree is prepared for a deferred repair
+
+
+def test_the_repair_reads_the_committed_review_episode_guidance(tmp_path):
+    from issue_agent.app.review_runtime import review_guidance_reader
+
+    control, pr = _review_guidance_control(tmp_path, "Scope: the parser only")
+    legacy_reads: list[int] = []
+    reader = review_guidance_reader(control, "o/r", lambda n: legacy_reads.append(n) or "legacy note")
+    assert reader(pr) == "Scope: the parser only" and legacy_reads == []
+    assert reader(pr + 1) == ""  # active but never observed: no legacy fallback
+    p = PRView(pr, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
+    asyncio.run(_workflow(FakeGateway(prs={pr: p}), FakeStore(), runner, operator_guidance=reader).address_review(pr))
+    assert "Scope: the parser only" in runner.tasks[0].intent.prompt
+
+
+def test_an_inactive_review_family_keeps_the_legacy_guidance_record(tmp_path):
+    from issue_agent.app.review_runtime import review_guidance_reader
+
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    reader = review_guidance_reader(control, "o/r", lambda n: f"legacy {n}")
+    assert reader(9) == "legacy 9"

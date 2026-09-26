@@ -553,21 +553,43 @@ def test_a_bound_submission_carries_its_binding_and_mints_receipt_evidence(rig, 
 
 def test_a_ceiling_escalation_submission_is_identifiable(rig, rearm):
     binding = rearm.snapshot.binding
-    rig.executor().submit_bound_review(PR, "COMMENT", "escalating", HEAD, workflow=binding, reviewer=BOT, patch_id=None,
-                                       escalate_cause="ceiling")
+    counted_past = ("a" * 40,)
+    rig.executor().submit_bound_review(PR, "COMMENT", "escalating", HEAD, workflow=binding, reviewer=BOT,
+                                       patch_id=PATCH, escalate_cause="ceiling", non_resetting_commits=counted_past)
     with closing(rig.store._connect()) as db:
         command_id = db.execute("SELECT command_id FROM lifecycle_commands WHERE kind='submit_review'").fetchone()[0]
     evidence = rig.store.bound_review_submission(CommandId(command_id))
     assert isinstance(evidence, CeilingEscalation) and evidence.escalate_cause == "ceiling"
+    # Settlement judges the gate under exactly the rule the verdict counted with.
+    assert evidence.rule.review_bot == BOT and evidence.rule.non_resetting_commits == counted_past
 
 
-def test_an_unbound_submission_is_unchanged_and_mints_no_evidence(rig, rearm):
+def test_a_verdict_escalation_settles_as_an_escalated_baseline_receipt(rig, rearm):
+    from issue_agent.domain.review_workflow_policy import ReviewSubmissionReceipt
+    rig.executor().submit_bound_review(PR, "COMMENT", "escalating", HEAD, workflow=rearm.snapshot.binding,
+                                       reviewer=BOT, patch_id=PATCH, escalate_cause="verdict")
+    with closing(rig.store._connect()) as db:
+        command_id = db.execute("SELECT command_id FROM lifecycle_commands WHERE kind='submit_review'").fetchone()[0]
+    evidence = rig.store.bound_review_submission(CommandId(command_id))
+    assert isinstance(evidence, ReviewSubmissionReceipt) and evidence.escalated and evidence.patch_id == PATCH
+
+
+def test_an_unbound_submission_is_unchanged_and_mints_no_evidence_while_inactive(rig):
     assert rig.executor().submit_review(PR, "APPROVE", "lgtm", HEAD)
     with closing(rig.store._connect()) as db:
         row = db.execute("SELECT command_id, workflow_binding_json, payload_json FROM lifecycle_commands "
                          "WHERE kind='submit_review'").fetchone()
     assert row[1] is None and json.loads(row[2]) == {"pr": PR, "event": "APPROVE", "body": "lgtm", "head": HEAD}
     assert rig.store.bound_review_submission(CommandId(row[0])) is None
+
+
+def test_an_active_review_family_refuses_every_unbound_submission_before_any_write(rig, rearm):
+    """One submission path once active: an unbound verdict could double-post beside a bound one."""
+    with pytest.raises(ControlStoreError, match="captured workflow authority"):
+        rig.executor().submit_review(PR, "APPROVE", "lgtm", HEAD)
+    assert rig.calls("submit_review") == []
+    with closing(rig.store._connect()) as db:
+        assert db.execute("SELECT COUNT(*) FROM lifecycle_commands WHERE kind='submit_review'").fetchone()[0] == 0
 
 
 def test_a_stale_generation_submission_is_refused_before_any_write(rig, rearm):
@@ -886,6 +908,8 @@ def test_an_unreadable_head_defers_a_bound_submission_to_a_visible_evidence_gate
     ("APPROVE", "ceiling", None),           # an escalation is a COMMENT
     ("REQUEST_CHANGES", "verdict", PATCH),
     ("COMMENT", "panic", None),
+    ("COMMENT", "verdict", None),           # every bound submission records its reviewed patch
+    ("COMMENT", "ceiling", None),
     ("DISMISS", None, PATCH),
     ("approve", None, PATCH),
 ])
@@ -897,7 +921,7 @@ def test_event_and_escalation_cause_must_pair(rig, rearm, event, cause, patch):
 
 
 @pytest.mark.parametrize("event, cause, patch", [
-    ("APPROVE", None, PATCH), ("REQUEST_CHANGES", None, PATCH), ("COMMENT", "verdict", None), ("COMMENT", "ceiling", PATCH),
+    ("APPROVE", None, PATCH), ("REQUEST_CHANGES", None, PATCH), ("COMMENT", "verdict", PATCH), ("COMMENT", "ceiling", PATCH),
 ])
 def test_valid_pairings_submit(rig, rearm, event, cause, patch):
     assert rig.executor().submit_bound_review(PR, event, "x", HEAD, workflow=rearm.snapshot.binding, reviewer=BOT,
@@ -1056,3 +1080,41 @@ def test_a_marker_survives_line_ending_and_trailing_whitespace_normalization():
 def test_a_marker_names_one_bounded_command(command_id):
     with pytest.raises(ValueError):
         review_command_marker(command_id)
+
+
+# -- the trigger returns only after the counted reviews are dismissed (increment 6) ---------------
+
+def test_a_refused_dismissal_keeps_the_trigger_projection_unwritten(rig, rearm):
+    rig.remote.deny_dismissals()
+    for _ in range(3):
+        rig.drain()
+        rig.advance(3600)
+    assert rig.calls("relabel_pr") == []
+    assert rig.state(projection(rearm).command_id) == "pending"
+    assert Label.NEEDS_HUMAN_REVIEW in rig.remote.get_pr(PR).labels
+
+
+def test_an_undecided_dismissal_holds_the_projection_until_it_is_proven(tmp_path):
+    lost = {"dismiss_applied"}
+
+    def fault(point):
+        if point in lost:
+            lost.discard(point)
+            raise TimeoutError(point)
+    rig = Rig(tmp_path, fault=fault)
+    change = accepted_rearm()
+    commit_rearm(rig.store, change)
+    rig.drain()
+    assert rig.calls("relabel_pr") == []  # the first dismissal's reply was lost
+    rig.advance(60)
+    rig.drain()
+    assert rig.receipt(projection(change).command_id) == ("succeeded", None)
+    assert len(rig.calls("dismiss_review")) == 2 and len(rig.calls("relabel_pr")) == 1
+
+
+def test_a_projection_refusal_or_present_label_settles_without_waiting_for_dismissals(rig, rearm):
+    rig.remote.deny_dismissals()
+    rig.remote.external_pr_change(PR, head_ref_oid=OTHER_HEAD)
+    rig.drain()
+    status, error = rig.receipt(projection(rearm).command_id)
+    assert status == "permanent_failure" and "head moved" in error

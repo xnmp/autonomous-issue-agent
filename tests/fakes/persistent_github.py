@@ -26,7 +26,7 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.review_workflow import (
     CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
 )
-from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review, WorldState
+from issue_agent.domain.world import Check, Comment, IssueView, PRView, PullRequestDiff, Review, WorldState
 
 
 class PersistentGitHub:
@@ -46,6 +46,8 @@ class PersistentGitHub:
                        "review_id TEXT NOT NULL UNIQUE, author TEXT NOT NULL, state TEXT NOT NULL, commit_id TEXT, "
                        "submitted_at TEXT, body TEXT NOT NULL DEFAULT '')")
             db.execute("CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS diffs (head TEXT PRIMARY KEY, text TEXT NOT NULL)")
+            db.execute("CREATE TABLE IF NOT EXISTS commit_messages (pr INTEGER PRIMARY KEY, body TEXT NOT NULL)")
             if db.execute("SELECT revision FROM clock").fetchone() is None:
                 db.execute("INSERT INTO clock VALUES (0)")
 
@@ -89,6 +91,8 @@ class PersistentGitHub:
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         self.fault("read")
+        if not checks:
+            self.fault("observation_read")  # a harness workflow read, never the world observation
         if "get_pr" in self.soft_failures:
             return parse_pr(None)  # type: ignore[arg-type]  # the real gateway's parse of an empty answer
         with self._connect() as db:
@@ -97,6 +101,14 @@ class PersistentGitHub:
         body["changed_files"] = frozenset(body["changed_files"])
         for key, constructor in (("comments", Comment), ("reviews", Review), ("checks", Check)):
             body[key] = tuple(constructor(**entry) for entry in body[key])
+        # Reviews live in the reviews table once any exist for this PR, so a
+        # submitted or dismissed review is what the next read reports.
+        with self._connect() as db:
+            rows = db.execute("SELECT author, state, commit_id, submitted_at, body FROM reviews "
+                              "WHERE pr = ? AND state != 'PENDING' ORDER BY seq", (number,)).fetchall()
+        if rows:
+            body["reviews"] = tuple(Review(state, author, submitted or "", text, commit or "")
+                                    for author, state, commit, submitted, text in rows)
         return PRView(**body)
 
     def build_world(self) -> WorldState:
@@ -104,6 +116,38 @@ class PersistentGitHub:
             numbers = [row[0] for row in db.execute("SELECT number FROM issues ORDER BY number")]
             prs = [row[0] for row in db.execute("SELECT number FROM prs ORDER BY number")]
         return WorldState(issues=tuple(self.get_issue(number) for number in numbers), prs=tuple(self.get_pr(number) for number in prs))
+
+    def build_review_world(self) -> WorldState:
+        with self._connect() as db:
+            prs = [row[0] for row in db.execute("SELECT number FROM prs ORDER BY number")]
+        return WorldState(prs=tuple(self.get_pr(number, mergeability=False) for number in prs))
+
+    def set_diff(self, head: str, text: str) -> None:
+        """The compare diff GitHub serves for any base...head (not a harness call)."""
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO diffs VALUES (?, ?)", (head, text))
+
+    def pr_diff(self, pr: int, base_oid: str, head_oid: str) -> PullRequestDiff:
+        self.fault("diff")
+        if "pr_diff" in self.soft_failures:
+            raise RuntimeError("immutable pull-request diff is unavailable")
+        with self._connect() as db:
+            row = db.execute("SELECT text FROM diffs WHERE head = ?", (head_oid,)).fetchone()
+        if row is None:
+            raise RuntimeError("immutable pull-request diff is unavailable")
+        return PullRequestDiff(base_oid, head_oid, row[0])
+
+    def set_commit_messages(self, pr: int, *messages: str) -> None:
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO commit_messages VALUES (?, ?)", (pr, json.dumps(messages)))
+
+    def pr_commit_messages(self, pr: int) -> tuple[str, ...]:
+        self.fault("commit_messages")
+        if "pr_commit_messages" in self.soft_failures:
+            raise RuntimeError("commit messages were not answered")
+        with self._connect() as db:
+            row = db.execute("SELECT body FROM commit_messages WHERE pr = ?", (pr,)).fetchone()
+        return () if row is None else tuple(json.loads(row[0]))
 
     def recently_merged_issues(self, author: str, limit: int = 30):
         return tuple(
@@ -160,6 +204,13 @@ class PersistentGitHub:
         self.fault("relabel_applied")
 
     def comment(self, kind: str, number: int, body: str) -> None:
+        if kind == "pr":
+            self._call("comment_pr", number, body)
+            self.external_pr_change(number, comments=[
+                *json.loads(self._pr_body(number))["comments"],
+                {"author": "review-bot[bot]", "body": body, "created_at": "2026-09-25T12:00:00Z"},
+            ])
+            return
         assert kind == "issue"
         self._call("comment", number, body)
         self._update(number, lambda issue: issue["comments"].append({
@@ -168,8 +219,14 @@ class PersistentGitHub:
         self.fault("comment_applied")
 
     def has_comment(self, kind: str, number: int, body: str) -> bool:
+        if kind == "pr":
+            return any(comment.body == body for comment in self.get_pr(number).comments)
         assert kind == "issue"
         return any(comment.body == body for comment in self.get_issue(number).comments)
+
+    def _pr_body(self, number: int) -> str:
+        with self._connect() as db:
+            return db.execute("SELECT body FROM prs WHERE number = ?", (number,)).fetchone()[0]
 
     def close_issue(self, number: int, reason: str, comment: str) -> None:
         self._call("close", number, reason)

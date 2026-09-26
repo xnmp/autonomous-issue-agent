@@ -77,16 +77,17 @@ def fresh():
     return initial_review_workflow(PR_KEY, REVIEW)
 
 
-def escalation(state, head=HEAD, cause="ceiling"):
+def escalation(state, head=HEAD, cause="ceiling", *, counted=RULE):
     return CeilingEscalation(BoundReviewSubmission(CommandId("escalate:1"), state.binding), head, "receipt:escalate",
-                             cause)
+                             cause, counted)
 
 
 def open_new(state, observation, *, ceiling=3, rule=RULE, proof=None, evidence_ids=()):
     return open_review_ceiling(state, observation, now=NOW, rule=rule, ceiling=ceiling,
                                escalation=proof or escalation(state, observation.head_sha
-                                                              if isinstance(observation, ObservedPullRequest) else HEAD),
-                               evidence_ids=evidence_ids)
+                                                              if isinstance(observation, ObservedPullRequest) else HEAD,
+                                                              counted=rule),
+                               trigger_label=TRIGGER, executor_identity=EXECUTOR, evidence_ids=evidence_ids)
 
 
 def opened(state=None, reviews=None, *, ceiling=3, count=2, **kwargs):
@@ -321,7 +322,12 @@ def test_initial_workflow_refuses_foreign_targets_and_families(key, authority):
 def test_opening_records_the_observed_counted_set_and_head():
     result = opened()
     assert result.mutation is WorkflowMutation.OPEN_GATE and result.prior == fresh()
-    assert result.audit == ObservedTransition(("escalate:1", "receipt:escalate")) and result.commands == ()
+    assert result.audit == ObservedTransition(("escalate:1", "receipt:escalate"))
+    # The visible hold commits with the gate: one guarded trigger -> needs-human-review swap.
+    (projection,) = result.commands
+    assert projection.kind is CommandKind.RELABEL and projection.workflow == result.snapshot.binding
+    assert (projection.payload["remove"], projection.payload["add"]) == (TRIGGER.value, Label.NEEDS_HUMAN_REVIEW.value)
+    assert projection.payload["pull_request_hold_guard"] == {"head_sha": HEAD, "labels": [Label.NEEDS_HUMAN_REVIEW.value]}
     gate = ceiling_gate_of(result.snapshot)
     assert gate.cause.counted == (CountedReview("r0", HEAD), CountedReview("r1", HEAD))
     assert gate.cause.episode_id == fresh().episode.episode_id and gate.cause.head_sha == HEAD
@@ -376,11 +382,12 @@ def test_opening_refuses_untyped_inputs():
         open_new(resolve_snapshot(), observe(), proof=escalation(fresh()))
     with pytest.raises(ValueError):
         open_review_ceiling(fresh(), observe(rejections(2)), now=NOW.replace(tzinfo=None), rule=RULE, ceiling=3,
-                            escalation=escalation(fresh()))
+                            escalation=escalation(fresh()), trigger_label=TRIGGER, executor_identity=EXECUTOR)
     with pytest.raises(ValueError):
         open_new(fresh(), None, proof=escalation(fresh()))
     with pytest.raises(ValueError):
-        open_review_ceiling(fresh(), observe(rejections(2)), now=NOW, rule=RULE, ceiling=3, escalation=None)
+        open_review_ceiling(fresh(), observe(rejections(2)), now=NOW, rule=RULE, ceiling=3, escalation=None,
+                            trigger_label=TRIGGER, executor_identity=EXECUTOR)
     with pytest.raises(ValueError):
         open_new(fresh(), observe(rejections(2)), evidence_ids=["e"])
 
@@ -706,6 +713,20 @@ def test_hold_guard_ignores_harmless_activity_and_its_own_partial_effect():
         PullRequestHoldGuard(HEAD, frozenset({Label.P1}))
     with pytest.raises(ValueError):
         pull_request_hold_guard_applies(guard, PullRequestAbsent(PR_KEY, NOW))
+
+
+@pytest.mark.parametrize("label, refuses", [
+    (Label.RECURRENCE, False), (Label.MAYBE_RESOLVED, False), (Label.AI_TRIAGE, False), (Label.P1, False),
+    (Label.NO_AI_REVIEW, True), (Label.AI_PARKED, True), (Label.AI_BLOCKED, True), (Label.NEEDS_BUDGET_REVIEW, True),
+    (Label.AI_REVIEW, True), (Label.AI_DONE, True),
+])
+def test_hold_guard_is_refused_only_by_a_hold_fact_never_by_an_advisory_label(label, refuses):
+    guard = pull_request_hold_guard(observe(labels=(TRIGGER, Label.RECURRENCE)))
+    assert guard.labels == frozenset({TRIGGER})  # the advisory label is not a guarded fact
+    later = observe(labels=(TRIGGER, label))
+    assert pull_request_hold_guard_applies(guard, later) is not refuses
+    with pytest.raises(ValueError):
+        PullRequestHoldGuard(HEAD, frozenset({Label.RECURRENCE}))
 
 
 def test_dismissal_commands_are_deterministic_and_fenced_by_binding_and_review():
@@ -1477,7 +1498,7 @@ def test_a_new_gate_requires_the_harness_ceiling_escalation():
     rejected(open_new(rearmed, observe(rejections(3, prefix="n")), proof=escalation(base)),
              WorkflowRejection.INVALID_SCOPE)
     with pytest.raises(ValueError):
-        CeilingEscalation(submission(base), HEAD, "receipt", "bored")
+        CeilingEscalation(submission(base), HEAD, "receipt", "bored", RULE)
 
 
 def test_the_operator_preflight_is_rederived_from_the_fresh_observation():
@@ -1621,3 +1642,256 @@ def test_a_request_absorbing_a_conflicting_relabel_is_held():
     intent = pending_of(request.snapshot)
     assert relabel not in intent.replaces and intent.projection.remove is None
     assert_completion_held(request.snapshot, relabel, HOLD)
+
+
+# -- re-rejection to the ceiling during a pending re-arm (increment 6) ----------------------------
+
+def test_a_pending_rearm_is_reached_again_only_by_fresh_complete_counted_rejections():
+    from issue_agent.domain.review_workflow_policy import ceiling_reached_again
+
+    state = accepted().snapshot
+    pending = state.intent
+    authorized = rejections(2)
+    # The authorized set itself never re-reaches the ceiling, dismissed or not.
+    assert not ceiling_reached_again(pending, observe(authorized), 3)
+    assert not ceiling_reached_again(pending, observe(dismissed(authorized, "r0", "r1")), 3)
+    fresh_two = authorized + rejections(2, prefix="n", start=10)
+    assert ceiling_reached_again(pending, observe(fresh_two), 3)
+    # Another author's rejection is not the bot's; a partial read decides nothing.
+    other = authorized + rejections(2, prefix="h", start=10, author="octocat")
+    assert not ceiling_reached_again(pending, observe(other), 3)
+    assert not ceiling_reached_again(pending, observe(partial=True), 3)
+    # A disabled ceiling never stops a re-arm.
+    assert not ceiling_reached_again(pending, observe(fresh_two), 0)
+
+
+# -- increment 6 review: the hold follows the settled escalation (F1-F3) ------------------------
+
+def escalated_receipt(state, head=HEAD, patch=PATCH):
+    return ReviewSubmissionReceipt(submission(state, "escalate:verdict"), head, patch, "receipt:verdict", escalated=True)
+
+
+def record_escalated(state, observation, receipt_value=None):
+    from issue_agent.domain.review_workflow_policy import record_escalated_review
+    return record_escalated_review(state, receipt_value or escalated_receipt(state), observation, now=NOW,
+                                   trigger_label=TRIGGER, executor_identity=EXECUTOR, evidence_ids=("obs:1",))
+
+
+def test_an_escalated_verdict_records_its_head_and_its_hold_in_one_transition():
+    state = fresh()
+    result = changed(record_escalated(state, observe(labels=(TRIGGER,))))
+    assert result.mutation is WorkflowMutation.RECORD_REVIEW
+    baseline = result.snapshot.episode.continuation
+    assert isinstance(baseline, ReviewedBaseline) and (baseline.head_sha, baseline.patch_id) == (HEAD, PATCH)
+    (projection,) = result.commands
+    assert (projection.payload["remove"], projection.payload["add"]) == (TRIGGER.value, Label.NEEDS_HUMAN_REVIEW.value)
+    assert projection.payload["pull_request_hold_guard"]["labels"] == [TRIGGER.value]
+    # The recorded head is never owed again; a new head is.
+    assert not review_owed(result.snapshot, HEAD, None) and review_owed(result.snapshot, OTHER_HEAD, None)
+    validate_review_transition(state, result, facts(observation=observe(labels=(TRIGGER,)),
+                                                    submission=escalated_receipt(state)))
+
+
+def test_an_escalated_verdict_on_a_superseded_head_holds_nothing_and_owes_the_new_head():
+    state = fresh()
+    rejected(record_escalated(state, observe(head=OTHER_HEAD, labels=(TRIGGER,))), WorkflowRejection.INVALID_SCOPE)
+    rejected(record_escalated(state, observe(labels=(TRIGGER,), state=PullRequestState.CLOSED)),
+             WorkflowRejection.INVALID_SCOPE)
+    rejected(record_escalated(state, PullRequestUnavailable(PR_KEY, NOW, "down")),
+             WorkflowRejection.OBSERVATION_UNAVAILABLE)
+    # Without its hold an escalated verdict is never a plain baseline.
+    rejected(record_review(state, escalated_receipt(state)), WorkflowRejection.INVALID_SCOPE)
+
+
+def test_a_forged_escalated_record_is_refused_by_rederivation():
+    state = fresh()
+    genuine = changed(record_escalated(state, observe(labels=(TRIGGER,))))
+    evidence = facts(observation=observe(labels=(TRIGGER,)), submission=escalated_receipt(state))
+    refused(state, lambda: replace(genuine, commands=()), evidence)
+    other = replace(genuine.commands[0], payload={**genuine.commands[0].payload, "remove": None})
+    refused(state, lambda: replace(genuine, commands=(other,)), evidence)
+    with pytest.raises(ValueError):
+        validate_review_transition(state, genuine, facts(submission=escalated_receipt(state)))
+
+
+def test_the_ceiling_is_judged_by_the_rule_the_escalating_verdict_counted_under():
+    unmergeable = CountingRule(BOT, (OTHER_HEAD,))
+    reviews = (fact("r0", at=0), fact("approve", APPROVED, commit=OTHER_HEAD, at=1), fact("r1", at=2))
+    configured = RULE  # no non-resetting commits: the approval would reset the count
+    counted = changed(open_new(fresh(), observe(reviews), rule=configured,
+                               proof=escalation(fresh(), counted=unmergeable)))
+    assert ceiling_gate_of(counted.snapshot).cause.non_resetting_commits == (OTHER_HEAD,)
+    # The same read under a rule that resets on the approval disproves it (no re-buy loop:
+    # the settlement and the verdict can no longer disagree about the count).
+    rejected(open_new(fresh(), observe(reviews), rule=configured, proof=escalation(fresh(), counted=configured)),
+             WorkflowRejection.NOT_EXHAUSTED)
+    rejected(open_new(fresh(), observe(reviews), rule=configured,
+                      proof=escalation(fresh(), counted=CountingRule("someone-else[bot]", (OTHER_HEAD,)))),
+             WorkflowRejection.INVALID_SCOPE)
+
+
+def test_a_ceiling_disproven_before_settlement_holds_nothing():
+    # A human dismissed a counted review between the verdict and its settlement.
+    rejected(open_new(fresh(), observe(dismissed(rejections(2), "r0"))), WorkflowRejection.NOT_EXHAUSTED)
+    rejected(open_new(fresh(), observe(rejections(2), head=OTHER_HEAD), proof=escalation(fresh())),
+             WorkflowRejection.INVALID_SCOPE)
+
+
+def restoration(snapshot, *, restores=None, evidence="obs:1", **kwargs):
+    from issue_agent.domain.review_workflow_policy import ceiling_hold_restoration
+    return ceiling_hold_restoration(snapshot, observe(**kwargs), evidence, restores=restores or {},
+                                    trigger_label=TRIGGER, executor_identity=EXECUTOR)
+
+
+@pytest.mark.parametrize("labels, restores", [
+    ((Label.NEEDS_HUMAN_REVIEW,), None),
+    ((), (None, Label.NEEDS_HUMAN_REVIEW.value)),
+    ((TRIGGER,), (TRIGGER.value, Label.NEEDS_HUMAN_REVIEW.value)),
+    ((TRIGGER, Label.NEEDS_HUMAN_REVIEW), (TRIGGER.value, Label.NEEDS_HUMAN_REVIEW.value)),
+])
+def test_an_open_ceiling_restores_its_missing_hold(labels, restores):
+    from issue_agent.domain.review_workflow_policy import RestoreHold, escalation_signal_identity
+    state = gated()
+    decision = restoration(state, labels=labels)
+    if restores is None:
+        assert decision is None
+        return
+    assert isinstance(decision, RestoreHold) and decision.gate_id == ceiling_gate_of(state).gate_id
+    command = decision.command
+    assert (command.payload["remove"], command.payload["add"]) == restores
+    assert command.workflow == state.binding and command.executor_identity == EXECUTOR
+    # A restored hold makes the same escalation visible as the gate's own projection would.
+    assert escalation_signal_identity(command) == decision.gate_id
+    again = restoration(state, labels=labels, evidence="obs:2")
+    assert again.command.command_id != command.command_id  # one per read that found it missing
+
+
+def test_hold_restoration_is_bounded_per_gate_then_contested():
+    from issue_agent.domain.review_workflow_policy import MAX_HOLD_RESTORES, HoldContested, RestoreHold
+    state = gated()
+    gate_id = ceiling_gate_of(state).gate_id
+    assert isinstance(restoration(state, labels=(TRIGGER,), restores={gate_id: MAX_HOLD_RESTORES - 1}), RestoreHold)
+    assert restoration(state, labels=(TRIGGER,), restores={gate_id: MAX_HOLD_RESTORES}) == HoldContested(
+        gate_id, MAX_HOLD_RESTORES)
+    assert restoration(state, labels=(TRIGGER,), restores={gate_id: 10**9}) == HoldContested(gate_id, 10**9)
+    # A count kept for another (changed or released) gate never spends this one's bound.
+    assert isinstance(restoration(state, labels=(TRIGGER,), restores={"review-ceiling:old": 99}), RestoreHold)
+    with pytest.raises(ValueError):
+        restoration(state, labels=(TRIGGER,), restores={gate_id: -1})
+
+
+def test_hold_restoration_never_acts_without_an_open_ceiling_or_during_a_rearm():
+    assert restoration(fresh(), labels=()) is None
+    assert restoration(accepted().snapshot, labels=(TRIGGER,)) is None
+    assert restoration(gated(), labels=(), state=PullRequestState.CLOSED) is None
+    with pytest.raises(ValueError):
+        restoration(gated(), labels=(), key=ISSUE_KEY)
+
+
+@pytest.mark.parametrize("labels, verified", [
+    ((Label.NEEDS_HUMAN_REVIEW,), True),
+    ((Label.NEEDS_HUMAN_REVIEW, Label.NO_AI_REVIEW), True),  # whoever applied it, beside a human's opt-out
+    ((Label.NEEDS_HUMAN_REVIEW, TRIGGER), False),  # the trigger still asks for a review: not a hold
+    ((TRIGGER,), False),
+    ((), False),
+])
+def test_a_ceiling_hold_is_verified_by_the_visible_labels_whoever_applied_them(labels, verified):
+    from issue_agent.domain.review_workflow_policy import verified_ceiling_holds
+    state = gated()
+    held = verified_ceiling_holds(state, observe(labels=labels), trigger_label=TRIGGER)
+    assert held == (frozenset({ceiling_gate_of(state).gate_id}) if verified else frozenset())
+
+
+def test_a_ceiling_hold_is_never_verified_without_an_open_ceiling_an_open_pull_request_or_during_a_rearm():
+    from issue_agent.domain.review_workflow_policy import verified_ceiling_holds
+    held = (Label.NEEDS_HUMAN_REVIEW,)
+    assert verified_ceiling_holds(fresh(), observe(labels=held), trigger_label=TRIGGER) == frozenset()
+    assert verified_ceiling_holds(accepted().snapshot, observe(labels=held), trigger_label=TRIGGER) == frozenset()
+    closed = observe(labels=held, state=PullRequestState.CLOSED)
+    assert verified_ceiling_holds(gated(), closed, trigger_label=TRIGGER) == frozenset()
+    with pytest.raises(ValueError):
+        verified_ceiling_holds(gated(), observe(labels=held, key=ISSUE_KEY), trigger_label=TRIGGER)
+    with pytest.raises(ValueError):
+        verified_ceiling_holds(gated(), None, trigger_label=TRIGGER)  # type: ignore[arg-type]
+
+
+# -- increment 6 re-review: a refused verdict-escalation projection (N1) ------------------------
+
+def escalated_state():
+    state = fresh()
+    return changed(record_escalated(state, observe(labels=(TRIGGER,)))).snapshot, escalated_receipt(state)
+
+
+def replan(snapshot, receipt, *, replans=0, **kwargs):
+    from issue_agent.domain.review_workflow_policy import replan_escalation_hold
+    return replan_escalation_hold(snapshot, observe(**kwargs), receipt, replans=replans, trigger_label=TRIGGER,
+                                  executor_identity=EXECUTOR)
+
+
+@pytest.mark.parametrize("labels", [(TRIGGER, Label.NO_AI_REVIEW), (TRIGGER, Label.AI_PARKED), ()])
+def test_a_refused_verdict_escalation_is_re_planned_from_the_fresh_hold_facts(labels):
+    from issue_agent.domain.review_workflow_policy import (
+        EscalationReprojected, escalation_projection_identity, pull_request_hold_guard_applies,
+    )
+    snapshot, receipt = escalated_state()
+    decision = replan(snapshot, receipt, labels=labels)
+    assert isinstance(decision, EscalationReprojected)
+    command = decision.command
+    # A human's hold label is kept: the projection only adds the hold and removes the trigger.
+    assert command.payload["add"] == Label.NEEDS_HUMAN_REVIEW.value
+    assert command.payload["remove"] == TRIGGER.value
+    assert set(command.payload["pull_request_hold_guard"]["labels"]) == {label.value for label in labels}
+    assert escalation_projection_identity(command) == str(receipt.submission.command_id)
+    original = changed(record_escalated(fresh(), observe(labels=(TRIGGER,)))).commands[0]
+    assert command.command_id != original.command_id
+    assert escalation_projection_identity(original) == escalation_projection_identity(command)
+    guard = PullRequestHoldGuard(HEAD, frozenset(labels))
+    assert pull_request_hold_guard_applies(guard, observe(labels=labels))
+
+
+def test_a_refused_verdict_escalation_is_moot_once_it_no_longer_applies():
+    from issue_agent.domain.review_workflow_policy import EscalationHoldPresent, EscalationMoot
+    snapshot, receipt = escalated_state()
+    assert isinstance(replan(snapshot, receipt, labels=(TRIGGER,), state=PullRequestState.CLOSED), EscalationMoot)
+    assert "new head" in replan(snapshot, receipt, labels=(TRIGGER,), head=OTHER_HEAD).reason
+    rebaselined = replace(snapshot, episode=replace(snapshot.episode, continuation=FreshReviewRequired(0)))
+    assert isinstance(replan(rebaselined, receipt, labels=(TRIGGER,)), EscalationMoot)
+    assert replan(snapshot, receipt, labels=(Label.NEEDS_HUMAN_REVIEW,)) == EscalationHoldPresent()
+    assert replan(snapshot, receipt, labels=(Label.NEEDS_HUMAN_REVIEW, Label.NO_AI_REVIEW)) == EscalationHoldPresent()
+
+
+def test_verdict_escalation_re_plans_are_bounded_then_surfaced():
+    from issue_agent.domain.review_workflow_policy import (
+        MAX_ESCALATION_REPLANS, EscalationProjectionExhausted, EscalationReprojected,
+    )
+    snapshot, receipt = escalated_state()
+    attempts = [replan(snapshot, receipt, replans=n, labels=(TRIGGER,)) for n in range(MAX_ESCALATION_REPLANS)]
+    assert all(isinstance(a, EscalationReprojected) for a in attempts)
+    assert len({a.command.command_id for a in attempts}) == MAX_ESCALATION_REPLANS
+    assert replan(snapshot, receipt, replans=MAX_ESCALATION_REPLANS, labels=(TRIGGER,)) == (
+        EscalationProjectionExhausted(MAX_ESCALATION_REPLANS))
+    assert isinstance(replan(snapshot, receipt, replans=10**9, labels=(TRIGGER,)), EscalationProjectionExhausted)
+    with pytest.raises(ValueError):
+        replan(snapshot, receipt, replans=-1, labels=(TRIGGER,))
+    with pytest.raises(ValueError):
+        replan(snapshot, replace(receipt, escalated=False), labels=(TRIGGER,))
+
+
+def test_escalation_signal_identity_names_the_escalation_never_the_attempt():
+    from issue_agent.domain.review_workflow_policy import (
+        escalation_projection_key, escalation_signal_identity, review_escalation_command_id,
+    )
+    assert escalation_projection_key("abc") == "workflow:escalation:abc"
+    assert escalation_projection_key("abc", 2) == "workflow:escalation:abc#2"
+    for bad in ("", "a#b", "x" * 600):
+        with pytest.raises(ValueError):
+            escalation_projection_key(bad)
+    with pytest.raises(ValueError):
+        escalation_projection_key("abc", 99)
+    first = review_escalation_command_id(PR_KEY, CommandId("s:1"))
+    assert first == review_escalation_command_id(PR_KEY, CommandId("s:1"), 0)
+    assert first != review_escalation_command_id(PR_KEY, CommandId("s:1"), 1)
+    ceiling = changed(open_new(fresh(), observe(rejections(2), labels=(TRIGGER,)))).commands[0]
+    assert escalation_signal_identity(ceiling) == ceiling_gate_of(changed(
+        open_new(fresh(), observe(rejections(2), labels=(TRIGGER,)))).snapshot).gate_id
+    assert escalation_signal_identity(accepted().commands[0]) is None

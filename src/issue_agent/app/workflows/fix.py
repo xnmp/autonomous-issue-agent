@@ -1649,6 +1649,9 @@ class FixWorkflow:
         p, issue = dispatch
         if issue is None:
             return
+        # Read before any repair side effect: an unavailable active-review read
+        # raises a workflow hold and defers the whole repair (ADR 0015).
+        guidance = self._pr_guidance(p.number)
         reply_comment = fix_domain.last_human_reply(p, self.cfg.fix_bot)
         if reply_comment is None or not reply_comment.body.strip():
             if reply_comment is not None:
@@ -1683,7 +1686,8 @@ class FixWorkflow:
                 fix_cfg, fork=fork,
             )
         result = await self._run_pr_logged(
-            "pr-resume", issue, task, p, kind="PR_RESUME", reply=reply_comment.body
+            "pr-resume", issue, task, p, kind="PR_RESUME", reply=reply_comment.body,
+            guidance=guidance,
         )
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
@@ -1721,6 +1725,9 @@ class FixWorkflow:
         p, issue = dispatch
         if issue is None:
             return
+        # Read before any repair side effect: an unavailable active-review read
+        # raises a workflow hold and defers the whole repair (ADR 0015).
+        guidance = self._pr_guidance(p.number)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         review_body = self.latest_review_body(p)
         # The file:line asks reviewers actually make live in the INLINE comments,
@@ -1742,7 +1749,7 @@ class FixWorkflow:
             fork=fork,
         )
         result = await self._run_pr_logged(
-            "address-review", issue, task, p, kind="ADDRESS_REVIEW"
+            "address-review", issue, task, p, kind="ADDRESS_REVIEW", guidance=guidance,
         )
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
@@ -1772,12 +1779,21 @@ class FixWorkflow:
             base = n if at == review_at else 0
             self.store.set_review_retry(issue, review_at, base + 1)
 
-    async def _run_pr_logged(self, label, issue, task, p: PRView, *, kind, reply=None):
-        guidance = self.cfg.operator_guidance or self.store.get_operator_guidance
+    def _pr_guidance(self, pr: int) -> str:
+        """The operator's scope note for a PR repair, from its one owner.
+
+        The review role owns it: its committed review episode when the review
+        family is active (a read failure raises `WorkflowAuthorityError`, a
+        hold), else the legacy per-PR record.
+        """
+        read = self.cfg.operator_guidance or self.store.get_operator_guidance
+        return read(pr)
+
+    async def _run_pr_logged(self, label, issue, task, p: PRView, *, kind, guidance: str, reply=None):
         current = task_builders.with_pr_repair_context(
             task, p,
             rerun_head=self.store.get_ci_rerun_head(p.number),
-            operator_guidance=guidance(p.number),
+            operator_guidance=guidance,
             discussion=as_untrusted(format_pr_discussion(p.comments)),
             human_reply=as_untrusted(reply) if reply is not None else None,
         )
@@ -1822,12 +1838,15 @@ class FixWorkflow:
         p, issue = dispatch
         if issue is None:
             return
+        # Read before any repair side effect: an unavailable active-review read
+        # raises a workflow hold and defers the whole repair (ADR 0015).
+        guidance = self._pr_guidance(p.number)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         attempt = make_attempt(
             p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]
         )
         task = self._ci_task(p, issue, cwd)
-        result = await self._run_pr_logged("fix-ci", issue, task, p, kind="FIX_CI")
+        result = await self._run_pr_logged("fix-ci", issue, task, p, kind="FIX_CI", guidance=guidance)
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
@@ -1873,12 +1892,15 @@ class FixWorkflow:
         p, issue = dispatch
         if issue is None:
             return
+        # Read before any repair side effect: an unavailable active-review read
+        # raises a workflow hold and defers the whole repair (ADR 0015).
+        guidance = self._pr_guidance(p.number)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         task = task_builders.build_rebase_task(
             pr, self.cfg.base_branch, cwd, self.store.get_session(issue),
             self._repair_fix_cfg(issue, "rebase")
         )
-        result = await self._run_pr_logged("rebase", issue, task, p, kind="REBASE")
+        result = await self._run_pr_logged("rebase", issue, task, p, kind="REBASE", guidance=guidance)
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )

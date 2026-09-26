@@ -46,7 +46,7 @@ from ..domain.resolve_split import ContractRevision, ContractResetResult
 from .planners.tasks import FixTaskConfig, GroomTaskConfig, JiraTaskConfig, ReviewTaskConfig, TriageTaskConfig
 from .workflows.fix import FixWorkflow, FixWorkflowConfig
 from .workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
-from .workflows.review import ReviewWorkflow, ReviewWorkflowConfig
+from .workflows.review import ReviewAuthority, ReviewWorkflow, ReviewWorkflowConfig
 from .workflows.steward import StewardWorkflow, StewardWorkflowConfig
 from .workflows.base import run_leg
 
@@ -234,6 +234,7 @@ class AgentDispatcher:
         dedupe: ControlStore | None = None,
         dispatch_claim_target: Callable[[RunAgent], int | None] | None = None,
         workflow_control: WorkflowControl | None = None,
+        review_authority: ReviewAuthority | None = None,
     ):
         self.cfg = cfg
         self.gw = gateway
@@ -264,6 +265,7 @@ class AgentDispatcher:
             replace(cfg.review_workflow_config(), journal=journal),
             gateway, store, runner, executor,
             self._run_logged,
+            authority=review_authority,
         )
         self.steward_workflow = StewardWorkflow(
             # The journal reaches the dispatcher as a constructor argument, not
@@ -410,7 +412,7 @@ class AgentDispatcher:
         }.get(action.kind)
         if handler is None:
             return
-        if action.kind in {AgentKind.RESOLVE, AgentKind.RESUME}:
+        if action.kind in {AgentKind.RESOLVE, AgentKind.RESUME, AgentKind.REVIEW, AgentKind.RE_REVIEW}:
             handler = partial(handler, binding=action.workflow)
         issue, resolved, claim_target = self._spend_target(action)
         if action.kind in {

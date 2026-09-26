@@ -25,6 +25,7 @@ from .lifecycle import (
     retry_breaker,
 )
 from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
+from .workflow_identity import WorkflowBinding
 
 # Ceiling on UNPRODUCTIVE review rounds per PR (see ReviewConfig). Deliberately
 # the same order of magnitude as the fixer's MAX_INFRA_DEATHS: high enough that
@@ -625,6 +626,69 @@ def decide_review(
             )
             actions.append(claim)
             actions.append(RunAgent(AgentKind.REVIEW, pr.number, claim))
+    return actions
+
+
+@dataclass(frozen=True)
+class BoundReviewState:
+    """Per-PR dispatch facts for a repository whose review family is ACTIVE.
+
+    `owed` maps a PR to the review kind its workflow owes and the binding the
+    paid leg must carry; a PR absent from it is held or not owed (the
+    workflow authority decided, ADR 0015). `unproductive_rounds` and
+    `control_errors` keep their `ReviewState` meaning: the unproductive-round
+    counter is not migrated in this slice.
+    """
+
+    owed: Mapping[int, tuple[AgentKind, WorkflowBinding]] = field(default_factory=dict)
+    unproductive_rounds: dict[int, int] = field(default_factory=dict)
+    control_errors: Mapping[int, str] = field(default_factory=dict)
+
+
+def decide_bound_review(
+    world: WorldState, cfg: ReviewConfig, state: BoundReviewState
+) -> list[Action]:
+    """`decide_review` for an active review family: the workflow decides dispatch.
+
+    Held beats owed, so only PRs in `state.owed` can dispatch, each carrying
+    its captured binding. The legacy `sessions`/`last_sha` predicates and the
+    abandoned-at-ceiling re-escalation are not consulted: the ceiling gate is
+    the hold, released only by a re-arm or ceiling reconciliation, so there is
+    no dead state to re-escalate. The unproductive-round breaker and rogue-PR
+    adoption behave as in `decide_review`.
+    """
+    if cfg.identity_mode == IdentityMode.SOLO:
+        return []
+    actions: list[Action] = []
+
+    def eligible(pr: PRView) -> bool:
+        return pr.number not in state.control_errors and isinstance(
+            pr_eligibility(pr, LifecycleOperation.REVIEW), AllowedEligibility)
+
+    for pr in world.prs_with(cfg.trigger_label):
+        owed = state.owed.get(pr.number)
+        if owed is None or not eligible(pr):
+            continue
+        if retry_breaker(state.unproductive_rounds.get(pr.number, 0), cfg.max_unproductive_rounds).tripped:
+            if not pr.has(Label.NEEDS_HUMAN_REVIEW):
+                actions.extend(pr_escalation(
+                    pr.number,
+                    unproductive_escalation_reason(cfg.max_unproductive_rounds),
+                    from_label=cfg.trigger_label,
+                ).actions())
+            continue
+        kind, binding = owed
+        actions.append(RunAgent(kind, pr.number, workflow=binding))
+    for pr in world.prs:
+        owed = state.owed.get(pr.number)
+        if owed is None or not eligible(pr) or not should_adopt(pr, cfg):
+            continue
+        if retry_breaker(state.unproductive_rounds.get(pr.number, 0), cfg.max_unproductive_rounds).tripped:
+            continue
+        claim = Relabel(Target.PR, pr.number, None, cfg.trigger_label, pr.head_ref_oid)
+        kind, binding = owed
+        actions.append(claim)
+        actions.append(RunAgent(kind, pr.number, claim, workflow=binding))
     return actions
 
 
