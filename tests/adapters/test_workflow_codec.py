@@ -257,6 +257,39 @@ def activated_review_execution(state, *, imported=False):
                                     checkpoint, execution, 6)
 
 
+def test_generation_boundary_codec_retains_exact_transition_and_rejects_missing_fields():
+    from issue_agent.domain.review_execution import (
+        ReviewExecutionGenerationBoundary, carry_review_execution_generation,
+    )
+    from issue_agent.domain.workflow import WorkflowMutation
+    from issue_agent.domain.workflow_identity import WorkflowFence
+
+    _, proposal = review_v24_proposal()
+    prior = proposal.snapshot
+    active = activated_review_execution(prior)
+    before = active.state
+    next_binding = replace(
+        before.binding,
+        rejection=replace(before.binding.rejection,
+                          fence=WorkflowFence(prior.revision.fence.key,
+                                              prior.revision.fence.generation + 1)),
+    )
+    after = carry_review_execution_generation(before, next_binding, active.last_sequence)
+    boundary = ReviewExecutionGenerationBoundary(
+        before, after, active.last_sequence, (), "boundary:codec", prior.revision,
+        WorkflowRevision(next_binding.rejection.fence, prior.revision.version + 1),
+        WorkflowMutation.REQUEST_REARM,
+    )
+
+    raw = encode_workflow(boundary)
+
+    assert decode_workflow(raw, ReviewExecutionGenerationBoundary) == boundary
+    malformed = json.loads(raw)
+    del malformed["value"]["fields"]["from_revision"]
+    with pytest.raises(WorkflowEncodingError, match="wrong fields"):
+        decode_workflow(json.dumps(malformed), ReviewExecutionGenerationBoundary)
+
+
 def test_current_review_snapshot_has_a_distinct_tag_and_required_inactive_component():
     from issue_agent.domain.review_execution import ExecutionNotActivated
     from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot

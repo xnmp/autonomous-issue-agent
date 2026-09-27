@@ -91,7 +91,7 @@ _VALUES = (
     rx.ReviewAdmissionRefused, rx.ReviewReservationReleased, rx.ReviewUnlaunchedRound,
     rx.ReviewPreparationFailure, rx.ReviewPreparationDeferred,
     rx.ReviewRoundCancelled, rx.ReviewRoundOutcome, rx.ReviewExecutionPolicy,
-    rx.ReviewExecutionState, rx.ReviewExecutionCheckpoint,
+    rx.ReviewExecutionState, rx.ReviewExecutionCheckpoint, rx.ReviewExecutionGenerationBoundary,
     rx.ReviewExecutionOrigin, rx.ExecutionNotActivated, rx.ActivatedReviewExecution,
     rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,
     rr.ReviewChildPending, rr.ReviewChildRefused, rr.ReviewChildReleased,
@@ -110,7 +110,8 @@ _VALUES = (
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,
-    Label, identity.WorkflowFamily, w.StopReason, w.WorkflowRejection, w.RetryDisposition, w.RemediationOperation,
+    Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
+    w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
     rw.SubmittedReviewState, rw.PullRequestState, rp.ReviewKind, rd.DecisionRead, rd.WithheldReason,
     RuntimeName, ReviewMode, rx.ReviewChildKind, rx.ReviewPreparationKind,

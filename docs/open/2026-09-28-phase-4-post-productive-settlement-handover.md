@@ -47,17 +47,42 @@ accepted strict xfails remained expected. Log:
 No execution-family activation, live migration, target mutation, service
 restart, paid harness run or push occurred.
 
+## Checkpoint 27 — pure generation boundary
+
+The [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md)
+records a reproduced public-control failure: rejection rearm advances the
+workflow generation but retains the active execution binding. The same
+construction applies to rearm continuation and ceiling release. Rebinding
+alone would lose already counted outcomes on replay or admit late old outcomes.
+The domain now has a typed generation boundary, carry operation and ordered
+replay that separates a generation advance from a contiguous checkpoint. The
+closed codec preserves its exact revisions and mutation. Sol review found no
+remaining medium or high defect in this model scope. Full `make test` passed:
+3,128 domain, 2,827 adapter and 2,866 app tests, plus hooks, governor,
+gate parity, four import contracts and both Pyrefly checks. Ten accepted
+strict xfails remained expected. Log:
+`/tmp/phase4-generation-boundary-final-gate.log` (ephemeral).
+
+The adapter does not yet mint or verify boundary receipts or wire the active
+aggregate's three generation-advancing transitions. The public-control
+regression remains uncommitted until that complete change is implemented.
+No live execution-family activation, migration, service restart, target
+mutation, paid run or push occurred.
+
 ## Next implementation boundaries
 
-1. Design source-backed checkpoint compaction with an activation/import anchor,
+1. Implement the [generation-boundary design](2026-09-28-phase-4-generation-boundary.md)
+   before rejection rearm or ceiling release can operate on active execution.
+   The public control path currently raises on its old execution binding.
+2. Design source-backed checkpoint compaction with an activation/import anchor,
    an archived-source audit contract and bounded canonical reads. The current
    4,096-round suffix limit remains an activation gate.
-2. Add source-specific bounded rereads for `REVISION_DIFF` and `CONTAINMENT`
+3. Add source-specific bounded rereads for `REVISION_DIFF` and `CONTAINMENT`
    preparation outcomes after their adapter sources are minted.
-3. Wire real round identity through production review dispatch, child
+4. Wire real round identity through production review dispatch, child
    reservations and verdict registration. Resolve SDK exception transport
    classification and run composed recovery tests.
-4. Complete offline migration, shadow, rehearsal and execution-family
+5. Complete offline migration, shadow, rehearsal and execution-family
    activation. Phases 5–6 follow; live phase-5 windows require explicit user
    authorization.
 

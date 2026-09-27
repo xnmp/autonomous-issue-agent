@@ -10,6 +10,7 @@ from datetime import datetime
 from enum import Enum
 
 from .agent_task import RuntimeCapabilities, RuntimeName
+from .workflow import WorkflowMutation
 from .workflow_identity import (
     PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowRevision,
     validate_workflow_identifier as identifier,
@@ -630,6 +631,67 @@ def same_execution_episode(current: ReviewExecutionBinding, observed: ReviewExec
     )
 
 
+def carry_review_execution_generation(
+    state: ReviewExecutionState, binding: ReviewExecutionBinding, through_sequence: int,
+) -> ReviewExecutionState:
+    """Preserve execution allowance when rejection recovery owes a fresh review."""
+    if not isinstance(state, ReviewExecutionState) or not isinstance(binding, ReviewExecutionBinding):
+        raise ValueError("generation carry requires validated execution state and binding")
+    integer(through_sequence, "generation boundary sequence")
+    if (not same_execution_episode(state.binding, binding)
+            or binding.rejection.fence.generation != state.binding.rejection.fence.generation + 1
+            or through_sequence < max(state.session_sequence, state.display_sequence,
+                                      state.productive_sequence)):
+        raise ValueError("generation carry requires the next rejection generation and allocated sequence")
+    return replace(
+        state, binding=binding, session=NoReviewSession(), session_sequence=through_sequence,
+    )
+
+
+@dataclass(frozen=True)
+class ReviewExecutionGenerationBoundary:
+    """Frozen projection at a generation advance, distinct from finalized prefix."""
+
+    before: ReviewExecutionState
+    after: ReviewExecutionState
+    through_sequence: int
+    applied_sequences: tuple[int, ...]
+    receipt_id: str
+    from_revision: WorkflowRevision
+    to_revision: WorkflowRevision
+    mutation: WorkflowMutation
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.before, ReviewExecutionState) or not isinstance(self.after, ReviewExecutionState):
+            raise ValueError("generation boundary requires validated states")
+        integer(self.through_sequence, "generation boundary sequence")
+        identifier(self.receipt_id, "generation boundary receipt")
+        if (not isinstance(self.from_revision, WorkflowRevision)
+                or not isinstance(self.to_revision, WorkflowRevision)
+                or self.from_revision.fence != self.before.binding.rejection.fence
+                or self.to_revision.fence != self.after.binding.rejection.fence
+                or self.to_revision.version != self.from_revision.version + 1
+                or not isinstance(self.mutation, WorkflowMutation)
+                or self.mutation not in (
+                    WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM,
+                    WorkflowMutation.RELEASE_CEILING,
+                )):
+            raise ValueError("generation boundary requires its exact advancing transition")
+        if self.after != carry_review_execution_generation(
+            self.before, self.after.binding, self.through_sequence,
+        ):
+            raise ValueError("generation boundary must carry the prior allowance and clear its session")
+        if (not isinstance(self.applied_sequences, tuple)
+                or len(self.applied_sequences) > MAX_EXECUTION_SUFFIX):
+            raise ValueError("generation boundary requires bounded applied round identities")
+        previous = 0
+        for sequence in self.applied_sequences:
+            integer(sequence, "generation boundary applied sequence", minimum=1)
+            if sequence <= previous or sequence > self.through_sequence:
+                raise ValueError("generation boundary applied sequences must be ordered and allocated")
+            previous = sequence
+
+
 def _apply(
     state: ReviewExecutionState, outcome: ReviewRoundOutcome, policy: ReviewExecutionPolicy,
 ) -> ReviewExecutionState:
@@ -701,3 +763,65 @@ def project_review_execution(
         if sequence == prefix.through_sequence + 1:
             prefix = ReviewExecutionCheckpoint(sequence, state, checkpoint.policy)
     return ReviewExecutionProjection(state, prefix, max(ordered, default=checkpoint.through_sequence))
+
+
+def replay_review_execution_generations(
+    checkpoint: ReviewExecutionCheckpoint,
+    outcomes: tuple[ReviewRoundOutcome, ...],
+    boundaries: tuple[ReviewExecutionGenerationBoundary, ...],
+) -> ReviewExecutionState:
+    """Replay captured pre-advance outcomes; late older outcomes remain audit."""
+    if not isinstance(checkpoint, ReviewExecutionCheckpoint):
+        raise ValueError("generation replay requires a checkpoint")
+    if not isinstance(outcomes, tuple) or len(outcomes) > MAX_EXECUTION_SUFFIX:
+        raise ValueError("generation replay requires a bounded outcome tuple")
+    if not isinstance(boundaries, tuple) or len(boundaries) > MAX_EXECUTION_SUFFIX:
+        raise ValueError("generation replay requires bounded boundaries")
+    if not boundaries:
+        return project_review_execution(checkpoint, outcomes).state
+    ordered: dict[int, ReviewRoundOutcome] = {}
+    identities: dict[str, ReviewRoundIdentity] = {}
+    for outcome in outcomes:
+        if not isinstance(outcome, ReviewRoundOutcome):
+            raise ValueError("generation replay contains an invalid outcome")
+        identity = outcome.round
+        if (identity.sequence <= checkpoint.through_sequence
+                or not same_execution_episode(checkpoint.state.binding, identity.binding)):
+            raise ValueError("generation outcome belongs to a compacted or foreign execution")
+        if identity.sequence in ordered and ordered[identity.sequence] != outcome:
+            raise ValueError("conflicting outcomes for one review round sequence")
+        if identity.round_id in identities and identities[identity.round_id] != identity:
+            raise ValueError("one review round cannot have multiple identities")
+        ordered[identity.sequence] = outcome
+        identities[identity.round_id] = identity
+    state, cutoff = checkpoint.state, checkpoint.through_sequence
+    by_sequence = sorted(ordered.items())
+    cursor = 0
+    previous_revision: WorkflowRevision | None = None
+    for index, boundary in enumerate(boundaries):
+        if (not isinstance(boundary, ReviewExecutionGenerationBoundary)
+                or boundary.before.binding != state.binding
+                or boundary.through_sequence < cutoff
+                or (previous_revision is not None
+                    and boundary.from_revision.version < previous_revision.version)):
+            raise ValueError("generation boundaries must advance one execution history")
+        while cursor < len(by_sequence) and by_sequence[cursor][0] <= boundary.through_sequence:
+            if by_sequence[cursor][1].round.binding != state.binding:
+                raise ValueError("round allocation disagrees with its generation boundary")
+            cursor += 1
+        for sequence in boundary.applied_sequences:
+            if index == 0 and sequence <= checkpoint.through_sequence:
+                continue
+            outcome = ordered.get(sequence)
+            if (sequence <= cutoff or outcome is None
+                    or outcome.round.binding != state.binding):
+                raise ValueError("generation boundary lacks an applicable finalized outcome")
+            state = _apply(state, outcome, checkpoint.policy)
+        if state != boundary.before:
+            raise ValueError("generation boundary disagrees with its prior outcome projection")
+        state, cutoff, previous_revision = boundary.after, boundary.through_sequence, boundary.to_revision
+    for sequence, outcome in by_sequence[cursor:]:
+        if outcome.round.binding != state.binding:
+            raise ValueError("generation replay contains an outcome beyond its binding boundary")
+        state = _apply(state, outcome, checkpoint.policy)
+    return state

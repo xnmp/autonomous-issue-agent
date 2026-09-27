@@ -13,12 +13,15 @@ from issue_agent.domain.review_execution import (
     PaidReviewProgress, PreserveDisplayedRound, PreserveReviewSession, ReplaceReviewSession,
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
-    ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
+    ReviewExecutionGenerationBoundary, ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
+    ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
-    SetDisplayedRound, compatible_review_session, project_review_execution,
+    SetDisplayedRound, carry_review_execution_generation, compatible_review_session,
+    project_review_execution, replay_review_execution_generations,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
+from issue_agent.domain.workflow import WorkflowMutation
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
 )
@@ -71,6 +74,16 @@ def checkpoint(*, captured=None, through=0, policy=ReviewExecutionPolicy(), **st
     return ReviewExecutionCheckpoint(through, ReviewExecutionState(captured or binding(), **state), policy)
 
 
+def generation_boundary(before, after, through, applied, receipt):
+    version = before.binding.rejection.fence.generation + 4
+    return ReviewExecutionGenerationBoundary(
+        before, after, through, applied, receipt,
+        WorkflowRevision(before.binding.rejection.fence, version),
+        WorkflowRevision(after.binding.rejection.fence, version + 1),
+        WorkflowMutation.REQUEST_REARM,
+    )
+
+
 def test_child_refusal_requires_actual_cap_exhaustion_and_bound_revision():
     child = launched(round_id(1)).child
     now = datetime.now(timezone.utc)
@@ -109,6 +122,103 @@ def test_out_of_order_delivery_and_incremental_compaction_preserve_the_same_outc
         assert committed.through_sequence == 5 and committed.state == expected
         assert pending == {}
     assert initial.state.failures == 3 and initial.through_sequence == 0
+
+
+def test_generation_boundary_carries_prior_failures_and_ignores_late_old_rounds():
+    initial = checkpoint(failures=2, pin_deferrals=1)
+    prior = project_review_execution(initial, (failed(1),)).state
+    carried = carry_review_execution_generation(prior, binding(1), 2)
+    boundary = generation_boundary(prior, carried, 2, (1,), "boundary:1")
+
+    observed = replay_review_execution_generations(
+        initial, (failed(3, captured=binding(1)), failed(2), failed(1)), (boundary,),
+    )
+
+    assert observed.binding == binding(1)
+    assert (observed.failures, observed.pin_deferrals) == (4, 1)
+    assert observed.session_sequence == 2
+
+
+def test_generation_replay_from_verified_prefix_inside_a_boundary_matches_full_history():
+    initial = checkpoint(failures=2)
+    first = failed(1)
+    before = project_review_execution(initial, (first,)).state
+    after = carry_review_execution_generation(before, binding(1), 2)
+    boundary = generation_boundary(before, after, 2, (1,), "boundary:1")
+    late = failed(2)
+    next_round = failed(3, captured=binding(1))
+    full = replay_review_execution_generations(initial, (first, late, next_round), (boundary,))
+    compacted = project_review_execution(initial, (first,)).checkpoint
+
+    assert replay_review_execution_generations(compacted, (late, next_round), (boundary,)) == full
+
+
+def test_repeated_generation_boundaries_preserve_only_pre_advance_effects():
+    initial = checkpoint(failures=1)
+    first_before = project_review_execution(initial, (failed(1),)).state
+    first_after = carry_review_execution_generation(first_before, binding(1), 2)
+    first = generation_boundary(first_before, first_after, 2, (1,), "boundary:1")
+    second_before = project_review_execution(
+        ReviewExecutionCheckpoint(2, first_after), (failed(3, captured=binding(1)),),
+    ).state
+    second_after = carry_review_execution_generation(second_before, binding(2), 3)
+    second = generation_boundary(second_before, second_after, 3, (3,), "boundary:2")
+
+    observed = replay_review_execution_generations(
+        initial, (failed(2), failed(1), failed(3, captured=binding(1)),
+                  copied(4, captured=binding(2))), (first, second),
+    )
+
+    assert observed.binding == binding(2)
+    assert observed.failures == 0 and observed.productive_sequence == 4
+    backwards = replace(
+        second, from_revision=WorkflowRevision(binding(1).rejection.fence, 1),
+        to_revision=WorkflowRevision(binding(2).rejection.fence, 2),
+    )
+    with pytest.raises(ValueError, match="advance one execution history"):
+        replay_review_execution_generations(
+            initial, (failed(1), failed(3, captured=binding(1))), (first, backwards),
+        )
+
+
+def test_generation_boundary_clears_verified_reviewer_session_for_fresh_review():
+    initial = checkpoint()
+    prior = project_review_execution(initial, (productive(1, handle="session:1", display=7),)).state
+
+    carried = carry_review_execution_generation(prior, binding(1), 1)
+
+    assert isinstance(carried.session, NoReviewSession)
+    assert carried.session_sequence == 1
+    assert carried.displayed_round == 7 and carried.display_sequence == 1
+    assert carried.productive_sequence == 1
+    assert replay_review_execution_generations(
+        initial, (productive(1, handle="session:1", display=7),),
+        (generation_boundary(prior, carried, 1, (1,), "boundary:1"),),
+    ) == carried
+
+
+def test_generation_boundary_refuses_missing_source_and_changed_carry():
+    initial = checkpoint()
+    before = project_review_execution(initial, (failed(1),)).state
+    after = carry_review_execution_generation(before, binding(1), 1)
+    boundary = generation_boundary(before, after, 1, (1,), "boundary:1")
+
+    with pytest.raises(ValueError, match="finalized outcome"):
+        replay_review_execution_generations(initial, (), (boundary,))
+    with pytest.raises(ValueError, match="prior outcome projection"):
+        replay_review_execution_generations(initial, (copied(1),), (boundary,))
+    with pytest.raises(ValueError, match="round allocation"):
+        replay_review_execution_generations(initial, (failed(1, captured=binding(1)),), (boundary,))
+    with pytest.raises(ValueError, match="carry the prior allowance"):
+        replace(boundary, after=replace(after, failures=0))
+    with pytest.raises(ValueError, match="ordered and allocated"):
+        replace(boundary, applied_sequences=(1, 1))
+    with pytest.raises(ValueError, match="next rejection generation"):
+        carry_review_execution_generation(before, binding(2), 1)
+    with pytest.raises(ValueError, match="exact advancing transition"):
+        replace(boundary, to_revision=WorkflowRevision(binding(1).rejection.fence, 100))
+    with pytest.raises(ValueError, match="exact advancing transition"):
+        replace(boundary, mutation="request_rearm")
 
 
 def test_a_gap_is_not_compacted_and_filling_it_does_not_charge_later_rounds_twice():

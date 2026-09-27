@@ -8,6 +8,8 @@ The [post-stage handover](2026-09-27-phase-4-post-stage-handover.md)
 records the next transaction boundary and standing restrictions.
 The latest [post-productive-settlement handover](2026-09-28-phase-4-post-productive-settlement-handover.md)
 records the current boundary and remaining work.
+The [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md)
+records a reproduced active-execution rearm blocker and its reviewed design.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
 and [execution provenance map](2026-09-27-phase-4-execution-provenance.md).
@@ -749,3 +751,32 @@ Full `make test` passed: 3,123 domain, 2,826 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten accepted strict xfails remained expected. Log:
 `/tmp/review-productive-final-gate.log` (ephemeral).
+
+## Checkpoint 27 — generation boundary model and codec (offline)
+
+An active execution component cannot currently cross a rejection rearm or
+ceiling release: all three advancing transitions retain its old binding, and
+the public SQLite-control path raises during snapshot construction. A
+temporary regression reproduced it. The [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md)
+explains why rebinding alone would lose finalized failures on replay or apply
+late old-generation outcomes. No adapter path was changed in this checkpoint.
+
+`domain/review_execution.py` now has a validated immutable generation
+boundary, a pure carry that preserves allowance and clears the reviewer
+session, and replay that applies only outcomes captured before each advance.
+The closed workflow codec round-trips the boundary's exact revisions and
+mutation and refuses missing fields.
+It keeps a boundary distinct from the contiguous finalized checkpoint,
+supports a verified checkpoint inside a boundary, and rejects foreign
+allocation bindings and revision order. Tests cover old late outcomes,
+multiple advances, session clearing, malformed boundary facts, and
+full-versus-compacted replay. Independent Sol review found and verified fixes
+for compacted replay, allocation binding validation, revision provenance and
+an initially quadratic interval scan. Its final pass found no medium/high
+defect in the pure model. Adapter minting, completeness of the captured source
+set, exact transition receipts, canonical loading and generation-aware
+compaction remain pending. The 4,096-round suffix limit remains an activation
+gate; no live authority was activated. Full `make test` passed: 3,128 domain,
+2,827 adapter and 2,866 app tests, plus hooks, governor, gate parity, four
+import contracts and both Pyrefly checks. Ten accepted strict xfails remained
+expected. Log: `/tmp/phase4-generation-boundary-final-gate.log` (ephemeral).
