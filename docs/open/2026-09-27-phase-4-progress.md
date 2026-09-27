@@ -195,9 +195,38 @@ tests, plus hooks, governor, gate parity, four import contracts and both
 Pyrefly passes. Ten strict xfails remained expected. Local log:
 `/tmp/phase4-launch-final-full.log` (ephemeral).
 
+## Checkpoint 8 — raw review return and accounting capture (accepted)
+
+`domain/review_return.py` defines a bounded, unclassified child result. A
+review attachment now flows through journal and accounting context into paid
+admission. Admission checks the planned runtime before the child runs.
+`AccountingRuntime` retains the raw result with either the actual settled
+charge or an active reservation whose accounting remains uncertain. The
+review settlement transaction commits charge and immutable
+`review-execution-return` receipt together; exact replay is inert and changed
+output or money conflicts. A reconciler that settles first can still accept
+the exact raw return against its stored charge. An accounting calculation
+failure retains raw output and the reservation instead of dropping both.
+
+Return capture validates exact child admission, historical stage/preflight
+runtime and launch receipt independently, including after parent release,
+generation change or lease cleanup. Raw output does not classify review
+success, failure, session reuse or outer-round outcome. The remaining
+no-launch branch needs its own positive preflight-stop proof before it can
+authorize `ReviewChildSettledWithoutLaunch`.
+
+Independent adversarial review reproduced and verified fixes for
+reconciler-first output loss, corrupt-runtime replay, runtime drift at
+admission, missing launch after cleanup, invalid accounting calculation and
+contradictory live lease/launch evidence. Behavioral regressions cover each.
+Final `make test` passed with 3,093 domain, 2,641 adapter and 2,863 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+passes. Ten strict xfails remained expected. Local log:
+`/tmp/phase4-return-full.log` (ephemeral). No live activation occurred.
+
 ## Required subsequent work
 
-- Returned evidence, then sealed outer outcomes and
+- No-launch preflight-stop and pre-reservation refusal receipts, then sealed outer outcomes and
   evidence-based finalization after parent/claim abandonment. Distinguish
   released-before-launch and settled-without-launch evidence; preserve actual
   accounting and bound unpaid preparation faults through evidence holds.

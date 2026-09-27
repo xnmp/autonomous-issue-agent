@@ -106,13 +106,17 @@ must match round, child and execution capture, not merely its rejection binding.
 Pre-reservation refusal needs its own durable idempotent receipt, without
 fabricating an admitted run.
 
-**Returned evidence.** `AccountingRuntime.run` already builds `ReturnedResolve`;
-`_settle_result` delegates to `SQLiteWorkflowControl.settle_return`, which calls
-`control._settle` and captures the return in one transaction. Add a typed review
-child return and corresponding review-control settlement path at this seam.
-Preserve resolve's behavior. Reuse existing run, lease, reservation-recovery and
-provider receipts to prove launch/refusal/death and parent abandonment.
-Terminal children alone do not authorize sealing an open outer round.
+**Returned evidence.** `AccountingRuntime.run` builds `ReturnedResolve` and now
+also captures bounded raw `ReturnedReviewChild` for explicitly attached paid
+review children. `settle_review_return` joins admission, preflight runtime and
+launch history, then records the raw return with the actual charge in one
+transaction. Retained spend also keeps the raw return; reconciler-first charge
+settlement accepts it later without rewriting money. These receipts remain
+unclassified. A separate positive preflight-stop receipt must distinguish
+settled-without-launch from missing launch evidence. Reuse existing run, lease,
+reservation-recovery and provider receipts to prove launch/refusal/death and
+parent abandonment. Terminal children alone do not authorize sealing an open
+outer round.
 
 **Productive settlement.** Apply execution reset, applicable continuation
 updates and the outer productive disposition in the same transaction as the

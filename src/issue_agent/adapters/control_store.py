@@ -52,6 +52,7 @@ from ..domain.workflow import (
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildIdentity, ReviewChildLaunchRegistration
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
+from ..domain.review_return import ReturnedReviewChild
 from ..domain.review_rounds import ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
@@ -3076,18 +3077,44 @@ class SQLiteControlStore:
         self,
         run_id: RunId,
         reason: str,
+        *,
+        returned_review: ReturnedReviewChild | None = None,
     ) -> bool:
-        """Persist a completed run whose spend remains indeterminate."""
+        """Retain uncertain spend, or capture its return after reconciliation wins."""
 
         if not reason:
             raise ValueError("reservation retention reason is required")
+        if returned_review is not None and (
+            not isinstance(returned_review, ReturnedReviewChild)
+            or returned_review.run_id != str(run_id)
+        ):
+            raise ValueError("retained review return requires its exact run")
         with self.transaction() as db:
             row = db.execute(
                 "SELECT b.state, r.dispatch_id FROM budget_reservations b "
                 "JOIN runs r ON r.run_id=b.run_id WHERE b.run_id=?",
                 (str(run_id),),
             ).fetchone()
-            if row is None or row["state"] != "active":
+            review_return = (
+                self._review_return_authority(db, returned_review)
+                if returned_review is not None else None
+            )
+            if row is None:
+                if returned_review is not None:
+                    raise ControlStoreError("review return lacks its paid reservation")
+                return False
+            if row["state"] == "settled" and review_return is not None:
+                charge = db.execute(
+                    "SELECT 1 FROM charges WHERE run_id=?", (str(run_id),),
+                ).fetchone()
+                if charge is None:
+                    raise ControlStoreError("settled review return lacks its actual charge")
+                if not review_return[1]:
+                    self._insert_review_return(db, review_return[0], returned_review)
+                return False
+            if row["state"] != "active":
+                if returned_review is not None:
+                    raise ControlStoreError("review return has no retainable or settled reservation")
                 return False
             now = _stamp(self._now())
             db.execute(
@@ -3105,6 +3132,8 @@ class SQLiteControlStore:
                 (now, str(run_id)),
             )
             db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
+            if review_return is not None and not review_return[1]:
+                self._insert_review_return(db, review_return[0], returned_review)
             self._event(
                 db,
                 ReservationRetained(str(run_id), reason),
@@ -4451,6 +4480,7 @@ class SQLiteControlStore:
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
         if (dispatch.get("repository") != repository or dispatch.get("role") != "review"
+                or dispatch.get("runtime") != plan.runtime.value
                 or type(dispatch.get("number")) is not int
                 or dispatch.get("number") != child.round.binding.rejection.fence.key.target.number
                 or type(dispatch.get("claim_target")) is not int
@@ -4734,6 +4764,112 @@ class SQLiteControlStore:
     def settle(self, request: SettlementRequest) -> SettlementResult:
         with self.transaction() as db:
             return self._settle(db, request)
+
+    def settle_review_return(
+        self, request: SettlementRequest, returned: ReturnedReviewChild,
+    ) -> SettlementResult:
+        """Commit review output with its exact settled charge, or neither."""
+        if not isinstance(returned, ReturnedReviewChild) or str(request.run_id) != returned.run_id:
+            raise ValueError("review settlement requires the returned child's run")
+        with self.transaction() as db:
+            self._assert_owner_active(db, returned.owner_id)
+            repository, prior = self._review_return_authority(db, returned)
+            settled = self._settle(db, request)
+            if settled.disposition is AccountingDisposition.AVAILABLE:
+                charge = db.execute(
+                    "SELECT provider_receipt_id FROM charges WHERE run_id=?", (returned.run_id,),
+                ).fetchone()
+                if charge is None:
+                    raise ControlStoreError("review return settlement lacks its actual charge")
+                if not prior:
+                    self._insert_review_return(db, repository, returned)
+            return settled
+
+    def returned_review_child(
+        self, repository: str, run_id: RunId,
+    ) -> ReturnedReviewChild | None:
+        repository = canonical_repository(repository)
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
+                "AND scope=? AND key=?", (repository, str(run_id)),
+            ).fetchone()
+            if row is None:
+                return None
+            returned = decode_workflow(row["payload_json"], ReturnedReviewChild)
+            if returned.run_id != str(run_id) or self._review_return_authority(db, returned) != (repository, True):
+                raise ControlStoreError("review return lookup disagrees with its admitted run")
+            return returned
+
+    def _review_return_authority(
+        self, db: sqlite3.Connection, returned: ReturnedReviewChild,
+    ) -> tuple[str, bool]:
+        row = db.execute(
+            "SELECT r.*,b.workload_repository,l.run_id AS leased, "
+            "l.dispatch_id AS lease_dispatch_id,l.owner_id AS lease_owner_id, "
+            "l.pid AS lease_pid,l.pgid AS lease_pgid, "
+            "l.process_start_ticks AS lease_start_ticks, "
+            "l.started_at AS lease_started_at FROM runs r "
+            "JOIN budget_reservations b ON b.run_id=r.run_id "
+            "LEFT JOIN leases l ON l.run_id=r.run_id WHERE r.run_id=?",
+            (returned.run_id,),
+        ).fetchone()
+        if row is None or row["review_round_id"] is None:
+            raise ControlStoreError("review return lacks its attached paid run")
+        repository = row["workload_repository"]
+        admission = self._load_review_launch_admission(
+            db, RunId(returned.run_id), repository, row,
+        )
+        if (returned.child != admission.child or returned.owner_id != admission.owner_id
+                or returned.run_id != admission.run_id):
+            raise ControlStoreError("review return disagrees with its exact child admission")
+        recorded = load_review_preflight_record(
+            db, repository, returned.owner_id, returned.child.round.round_id,
+        )
+        if recorded is None or returned.child not in recorded[2].children or recorded[2].runtime != returned.runtime:
+            raise ControlStoreError("review return disagrees with its planned runtime or child")
+        launch = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-launch' "
+            "AND scope=? AND key=?", (repository, returned.run_id),
+        ).fetchone()
+        if launch is None:
+            if row["leased"] is not None or row["state"] == "running" or row["started_at"] is not None:
+                raise ControlStoreError("review return lost its registered launch receipt")
+        else:
+            registered = decode_workflow(launch["payload_json"], ReviewChildLaunchRegistration)
+            if (registered.admission != admission or registered.dispatch_id != row["dispatch_id"]
+                    or registered.receipt_id != f"review-execution-launch:{returned.run_id}"
+                    or row["started_at"] is None
+                    or registered.registered_at != _parse_stamp(row["started_at"])):
+                raise ControlStoreError("review return launch receipt disagrees with its admission")
+            if row["leased"] is not None and (
+                row["lease_dispatch_id"] != registered.dispatch_id
+                or row["lease_owner_id"] != admission.owner_id
+                or row["lease_pid"] != registered.pid
+                or row["lease_pgid"] != registered.pgid
+                or row["lease_start_ticks"] != registered.process_start_ticks
+                or _parse_stamp(row["lease_started_at"]) != registered.registered_at
+            ):
+                raise ControlStoreError("review return launch receipt disagrees with its live lease")
+        prior = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
+            "AND scope=? AND key=?", (repository, returned.run_id),
+        ).fetchone()
+        if prior is not None:
+            if decode_workflow(prior["payload_json"], ReturnedReviewChild) != returned:
+                raise ControlStoreError("review return conflicts with its immutable receipt")
+            return repository, True
+        return repository, False
+
+    @staticmethod
+    def _insert_review_return(
+        db: sqlite3.Connection, repository: str, returned: ReturnedReviewChild,
+    ) -> None:
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-execution-return',?,?,?,?)",
+            (repository, returned.run_id, _stamp(returned.returned_at), encode_workflow(returned)),
+        )
 
     def _settle(self, db: sqlite3.Connection, request: SettlementRequest) -> SettlementResult:
         reservation = db.execute(

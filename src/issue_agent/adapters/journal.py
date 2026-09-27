@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 from .runtime_plan import ContextualRuntime, RunIdentityRuntime, RuntimePlan
 from ..domain.contracts import Money
 from ..domain.workflow_identity import WorkflowBinding
+from ..domain.review_execution import ReviewChildIdentity
 from ..domain.dashboard import ISSUE_NUMBERED
 from ..domain.events import (
     ActionApplied,
@@ -437,6 +438,7 @@ class RunContext:
     claim_target: int | None = None
     dispatch_id: str = ""
     workflow: WorkflowBinding | None = None
+    review_child: ReviewChildIdentity | None = None
 
 
 def _run_correlation(
@@ -553,6 +555,7 @@ class JournalingRuntime:
         claim_target: int | None = None,
         *,
         workflow: WorkflowBinding | None = None,
+        review_child: ReviewChildIdentity | None = None,
     ) -> None:
         """Called by the dispatcher immediately before it hands off to a handler.
         Mutable state on purpose: journaling and paid admission consume the
@@ -570,6 +573,7 @@ class JournalingRuntime:
             claim_target=claim_target,
             dispatch_id=uuid.uuid4().hex[:12],
             workflow=workflow,
+            review_child=review_child,
         ))
         if isinstance(self.inner, ContextualRuntime):
             self.inner.set_context(
@@ -579,6 +583,7 @@ class JournalingRuntime:
                 issue,
                 claim_target=claim_target,
                 workflow=workflow,
+                **({"review_child": review_child} if review_child is not None else {}),
             )
 
     @contextlib.contextmanager
@@ -605,6 +610,7 @@ class JournalingRuntime:
                 previous.issue,
                 claim_target=previous.claim_target,
                 workflow=previous.workflow,
+                **({"review_child": previous.review_child} if previous.review_child is not None else {}),
             )
         try:
             yield
@@ -617,6 +623,7 @@ class JournalingRuntime:
                     previous.issue,
                     claim_target=previous.claim_target,
                     workflow=previous.workflow,
+                    **({"review_child": previous.review_child} if previous.review_child is not None else {}),
                 )
             self._context.reset(token)
 

@@ -14,6 +14,7 @@ import json
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
+from decimal import InvalidOperation
 from zoneinfo import ZoneInfo
 
 from .runtime_plan import AgentRuntime, RuntimePlan
@@ -50,7 +51,9 @@ from ..domain.resolve_split import (
 from .worktree import WorktreeUnavailable, capture_contract_revision
 from .workflow_control import SQLiteWorkflowControl
 from .workflow_codec import WorkflowEncodingError, encode_workflow
-from ..domain.agent_task import run_input_fingerprint
+from ..domain.agent_task import RuntimeName, run_input_fingerprint
+from ..domain.review_execution import ReviewChildIdentity
+from ..domain.review_return import ReturnedReviewChild, review_returned_envelope
 from .control_store import (
     AccountingDisposition,
     BudgetLimit,
@@ -140,11 +143,11 @@ class AccountingRuntime(AgentRuntime):
     max_contract_rounds: int | None = None
     admit: Callable[[ReservationRequest], ReservationResult] | None = None
     _context: contextvars.ContextVar[
-        tuple[int | None, str, int, int | None, WorkflowBinding | None]
+        tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None]
     ] = field(
         default_factory=lambda: contextvars.ContextVar(
             f"accounting_context_{uuid.uuid4().hex}",
-            default=(None, "", 0, None, None),
+            default=(None, "", 0, None, None, None),
         ),
         init=False,
         repr=False,
@@ -168,10 +171,21 @@ class AccountingRuntime(AgentRuntime):
         claim_target: int | None = None,
         *,
         workflow: WorkflowBinding | None = None,
+        review_child: ReviewChildIdentity | None = None,
     ) -> None:
         if workflow is not None and not isinstance(workflow, WorkflowBinding):
             raise ValueError("accounting context requires a validated workflow binding")
-        self._context.set((issue, kind, number, claim_target, workflow))
+        if review_child is not None and (
+            not isinstance(review_child, ReviewChildIdentity)
+            or role != "review"
+            or self.role != "review"
+            or kind not in {"REVIEW", "RE_REVIEW"}
+            or workflow != review_child.round.binding.rejection
+        ):
+            raise ValueError("accounting review child requires its bound review context")
+        if review_child is not None:
+            RuntimeName(self.runtime_name)
+        self._context.set((issue, kind, number, claim_target, workflow, review_child))
 
     @property
     def workflow_binding(self) -> WorkflowBinding | None:
@@ -273,7 +287,9 @@ class AccountingRuntime(AgentRuntime):
 
     async def run(self, task: RuntimePlan) -> AgentResult:
         now = datetime.now(timezone.utc)
-        issue, kind, number, claim_target, workflow = self._context.get()
+        issue, kind, number, claim_target, workflow, review_child = self._context.get()
+        if review_child is not None and task.resolve_inputs is not None:
+            return _return_refused("review child cannot carry resolve inputs")
         if workflow is not None and kind in ("AUTHOR", "IMPLEMENT", "ADJUDICATE") and task.resolve_inputs is None:
             return _return_refused("split completion requires durable stage inputs")
         if task.resolve_inputs is not None:
@@ -411,6 +427,7 @@ class AccountingRuntime(AgentRuntime):
             self.owner_id or f"{self.repository}:{self.role}",
             workflow=workflow,
             adjudication_ceiling=self.max_contract_rounds if workflow is not None and kind == "ADJUDICATE" else None,
+            review_child=review_child,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:
@@ -580,15 +597,42 @@ class AccountingRuntime(AgentRuntime):
                 split_input=task.split_input, verdict=verdict, rationale=rationale,
                 contract_revision=revision,
             )
+        review_return = None
+        if review_child is not None:
+            try:
+                review_return = ReturnedReviewChild(
+                    review_child, str(run_id), request.owner_id, RuntimeName(self.runtime_name),
+                    review_returned_envelope(result), datetime.now(timezone.utc),
+                )
+                encode_workflow(review_return)
+            except (ValueError, WorkflowEncodingError) as exc:
+                self.store.record_reservation_retained(
+                    run_id, "review returned output cannot be durably captured",
+                )
+                raise RuntimeError("review returned output cannot be durably captured") from exc
         return self._settle_result(
-            run_id, task.model or result.model or reserved_model, result, returned=returned,
+            run_id, task.model or result.model or reserved_model, result,
+            returned=returned, returned_review=review_return,
         )
 
     def _settle_result(
-        self, run_id: RunId, model: str | None, result: AgentResult, *, returned: ReturnedResolve | None = None,
+        self, run_id: RunId, model: str | None, result: AgentResult, *,
+        returned: ReturnedResolve | None = None,
+        returned_review: ReturnedReviewChild | None = None,
     ) -> AgentResult:
-        usage = _token_usage(result.usage, self.runtime_name)
-        provider_amount = Money.from_major("USD", result.cost_usd)
+        def retain_invalid_accounting() -> None:
+            if returned_review is not None:
+                self.store.record_reservation_retained(
+                    run_id, "review accounting calculation unavailable",
+                    returned_review=returned_review,
+                )
+
+        try:
+            usage = _token_usage(result.usage, self.runtime_name)
+            provider_amount = Money.from_major("USD", result.cost_usd)
+        except (ValueError, TypeError, OverflowError, InvalidOperation):
+            retain_invalid_accounting()
+            raise
         codex_source = (
             str(result.usage.get("source") or "")
             if isinstance(result.usage, dict)
@@ -619,9 +663,13 @@ class AccountingRuntime(AgentRuntime):
             # The stream accumulator can over-count repeated cache counters, but
             # it is observed adapter telemetry and therefore a conservative
             # fail-closed fallback while a monetary cap is armed.
-            stream_usage = _token_usage(
-                result.stream_usage, self.runtime_name
-            )
+            try:
+                stream_usage = _token_usage(
+                    result.stream_usage, self.runtime_name
+                )
+            except (ValueError, TypeError, OverflowError, InvalidOperation):
+                retain_invalid_accounting()
+                raise
             if stream_usage is not None and stream_usage.total_tokens > 0:
                 usage = stream_usage
                 used_stream_fallback = True
@@ -641,7 +689,8 @@ class AccountingRuntime(AgentRuntime):
             # evidence; every other runtime stays visibly fail-closed instead
             # of silently admitting unlimited zero-dollar work.
             self.store.record_reservation_retained(
-                run_id, "trusted usage and provider charge unavailable"
+                run_id, "trusted usage and provider charge unavailable",
+                returned_review=returned_review,
             )
             return result
         if (
@@ -654,7 +703,8 @@ class AccountingRuntime(AgentRuntime):
             # Observed work with no usable pricing authority cannot safely
             # become a zero-dollar charge. Keep the maximum reservation.
             self.store.record_reservation_retained(
-                run_id, "pricing authority unavailable"
+                run_id, "pricing authority unavailable",
+                returned_review=returned_review,
             )
             return result
         priced_by_rate_card = (
@@ -668,12 +718,17 @@ class AccountingRuntime(AgentRuntime):
         )
         if priced_by_rate_card:
             if not model:
+                retain_invalid_accounting()
                 raise RuntimeError("configured-rate settlement needs a model")
-            amount = price(
-                usage,
-                self.rate_table.rates_for(model),
-                self.rate_table.currency,
-            )
+            try:
+                amount = price(
+                    usage,
+                    self.rate_table.rates_for(model),
+                    self.rate_table.currency,
+                )
+            except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
+                retain_invalid_accounting()
+                raise
             basis = (
                 PricingBasis.CONFIGURED_RATE_CARD
                 if self.runtime_name == "codex"
@@ -700,7 +755,8 @@ class AccountingRuntime(AgentRuntime):
                 if provider_amount.micros <= 0
                 else PricingBasis.PROVIDER_REPORTED
             )
-        request = SettlementRequest(
+        try:
+            request = SettlementRequest(
                 run_id,
                 amount,
                 basis,
@@ -723,8 +779,13 @@ class AccountingRuntime(AgentRuntime):
                 )
                 and self.rate_table is not None
                 else None,
-        )
-        if returned is None:
+            )
+        except (ValueError, TypeError, OverflowError):
+            retain_invalid_accounting()
+            raise
+        if returned_review is not None:
+            settlement = self.store.settle_review_return(request, returned_review)
+        elif returned is None:
             settlement = self.store.settle(request)
         else:
             writer = WorkflowWriter(self.repository, self.role, self.owner_id or f"{self.repository}:{self.role}")

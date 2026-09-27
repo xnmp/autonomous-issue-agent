@@ -487,6 +487,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_execution.py` (phase-4 pure ordered execution projection; runtime cutover pending),
 `domain/review_rounds.py` (pure outer-round plans, verified evidence and finalization),
 `domain/review_preflight.py` (pure round selection and current paid-work eligibility under captured execution authority),
+`domain/review_return.py` (bounded, unclassified review child result evidence),
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
 `domain/review_rearm.py`, `domain/review_control.py`, `domain/review_dispatch_record.py`,
 `domain/review_evidence.py`, `domain/deployment.py`

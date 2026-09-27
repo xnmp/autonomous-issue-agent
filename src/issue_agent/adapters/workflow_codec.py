@@ -18,6 +18,7 @@ from ..domain import review_workflow_policy as rp
 from ..domain import review_execution as rx
 from ..domain import review_rounds as rr
 from ..domain import review_preflight as preflight
+from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
 from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
@@ -79,6 +80,7 @@ _VALUES = (
     rd.DecisionBasis, rd.DepartedReadFailure, rd.RecordedReviewDecision,
     rx.ReviewExecutionBinding, rx.ReviewRoundIdentity, rx.ReviewChildIdentity,
     rx.ReviewChildAdmission, rx.ReviewChildLaunchRegistration,
+    review_return.ReviewReturnedEnvelope, review_return.ReturnedReviewChild,
     rx.LaunchedReviewChild, rx.ImportedReviewSession, rx.NoReviewSession,
     rx.ReusableReviewSession, rx.PreserveReviewSession, rx.ReplaceReviewSession,
     rx.ClearReviewSession, rx.PreserveDisplayedRound, rx.SetDisplayedRound,

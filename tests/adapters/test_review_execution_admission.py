@@ -23,7 +23,8 @@ def request(child, *, index=1, cap=100):
     return replace(_request(index, maximum=60, cap=cap), kind="REVIEW", owner_id=OWNER,
                    workflow=child.round.binding.rejection, review_child=child,
                    dispatch_id=json.dumps({"repository": "o/r", "role": "review", "kind": "REVIEW",
-                                           "number": 9, "claim_target": -9, "leg_id": f"leg:{index}"}))
+                                           "runtime": "claude", "number": 9, "claim_target": -9,
+                                           "leg_id": f"leg:{index}"}))
 
 
 @pytest.fixture
@@ -71,6 +72,22 @@ def test_exact_admission_replay_after_parent_release_is_inert(planned):
     replay = store.reserve(accepted)
     assert replay.admitted and replay.committed.micros == 60
     assert dump(store) == before
+
+
+@pytest.mark.parametrize("runtime", [None, "codex"])
+def test_paid_child_requires_its_explicit_planned_runtime(planned, runtime):
+    store, _, _, child = planned
+    proposed = request(child)
+    dispatch = json.loads(proposed.dispatch_id)
+    if runtime is None:
+        dispatch.pop("runtime")
+    else:
+        dispatch["runtime"] = runtime
+    proposed = replace(proposed, dispatch_id=json.dumps(dispatch))
+    before = dump(store)
+    assert not store.reserve(proposed).admitted
+    assert receipt(store) is None and dump(store) == before
+    assert_unpaid(store)
 
 
 @pytest.mark.parametrize("change", ["child", "round", "absent_child"])
