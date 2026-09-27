@@ -56,10 +56,22 @@ no blocker. Full `make test` passed: 3,122 domain, 2,790 adapter and 2,866
 app tests, plus hooks, governor, parity, four import contracts and both
 Pyrefly checks. Log: `/tmp/phase4-codex-child-retry-full.log` (ephemeral).
 
+The next offline checkpoint adds a completed-planning nonproductive writer
+and extends the bounded composed round sweep to sealed completed rounds.
+Canonical suffix reload now verifies their source receipts. Full `make test`
+passed: 3,122 domain, 2,795 adapter and 2,866 app tests, plus hooks,
+governor, parity, architecture and Pyrefly. Log:
+`/tmp/phase4-completed-rounds-full.log` (ephemeral). Independent Sol review
+found and verified fixes for the missing composed caller and synthetic
+fixture incompatibility. A sealed parent that disappears before
+child admission still lacks terminal non-admission proof, so its round stays
+open with a bounded evidence wait. Restore composed ordered/compacted suffix
+coverage alongside the productive and checkpoint writers.
+
 1. Add the bounded preparation-failure schedule and hold in the same
    transaction as `DeferredReviewPreparation` outcomes. Reuse existing
    rejection-family gate/hold machinery where applicable; do not invent a
-   second queue. Add source-backed completed-planning finalization.
+   second queue. Complete post-seal parent abandonment proof.
 2. Settle confirmed paid/copied submissions jointly with the existing
    `record_review` rejection baseline or `open_ceiling` transaction before
    their later marker. Capture its canonical round outcome and execution reset
@@ -69,8 +81,8 @@ Pyrefly checks. Log: `/tmp/phase4-codex-child-retry-full.log` (ephemeral).
    keeps outcomes in the suffix so every read verifies source receipts; the
    4,096-round suffix limit is still an activation gate.
 4. Wire real round identity through review dispatch, child reservations and
-   verdict registration. Resolve transport-death classification and Codex's
-   multiple supervised attempts. Complete offline migration, shadow,
+   verdict registration. Resolve SDK exception transport death classification.
+   Complete offline migration, shadow,
    rehearsal and activation, then phases 5–6. Live phase-5 windows require
    explicit user authorization.
 

@@ -49,7 +49,7 @@ from .workflow_rows import (
 )
 
 
-MAX_ABANDONMENT_SWEEP = 64
+MAX_REVIEW_ROUND_SWEEP = 64
 MAX_ABANDONMENT_WAIT_OBSERVATIONS = 8
 MAX_ABANDONMENT_BLOCK_REASONS = 8
 _START_CURSOR = (0, 0, "", 0)
@@ -58,7 +58,7 @@ _BLOCK_NAMESPACE = "review-round-recovery-block"
 
 
 @dataclass(frozen=True)
-class ReviewAbandonmentSweep:
+class ReviewRoundSweep:
     sealed: tuple[str, ...]
     finalized: tuple[str, ...]
     blocked: tuple[tuple[str, str], ...]
@@ -78,10 +78,10 @@ class SQLiteReviewExecutionControl:
         self._control = control
         self._writer = writer
         self._gateway = gateway
-        self._abandonment_cursor = _START_CURSOR
+        self._round_cursor = _START_CURSOR
 
-    def recover_abandoned_rounds(self) -> ReviewAbandonmentSweep:
-        """Fence and finalize one indexed page of abandoned outer rounds."""
+    def reconcile_review_rounds(self) -> ReviewRoundSweep:
+        """Fence abandoned planning and finalize one indexed page of terminal rounds."""
         with self._control.transaction() as db:
             rows = db.execute(
                 "SELECT rr.round_id,rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence,"
@@ -92,9 +92,9 @@ class SQLiteReviewExecutionControl:
                 "WHERE rr.repository=? AND rr.outcome_json IS NULL "
                 "AND (rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence)>(?,?,?,?) "
                 "ORDER BY rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence LIMIT ?",
-                (self._writer.repository, *self._abandonment_cursor, MAX_ABANDONMENT_SWEEP + 1),
+                (self._writer.repository, *self._round_cursor, MAX_REVIEW_ROUND_SWEEP + 1),
             ).fetchall()
-        page = rows[:MAX_ABANDONMENT_SWEEP]
+        page = rows[:MAX_REVIEW_ROUND_SWEEP]
         sealed: list[str] = []
         finalized: list[str] = []
         blocked: list[tuple[str, str]] = []
@@ -109,16 +109,19 @@ class SQLiteReviewExecutionControl:
             if open_planning and row["live_claim"] is not None:
                 continue
             try:
-                if not open_planning:
-                    planning = decode_workflow(
+                planning = (
+                    ReviewPlanningOpen() if open_planning else decode_workflow(
                         row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
                     )
-                    if not isinstance(planning, ReviewParentAbandoned):
-                        continue
+                )
                 if open_planning:
                     self.seal_abandoned_planning(round_id)
                     sealed.append(round_id)
-                result = self.finalize_abandoned_round(round_id)
+                result = (
+                    self.finalize_completed_round(round_id)
+                    if isinstance(planning, ReviewPlanningSealed)
+                    else self.finalize_abandoned_round(round_id)
+                )
                 if isinstance(result, FinalizedReviewRound):
                     finalized.append(round_id)
                 elif self._recovery_wait_at_ceiling(round_id):
@@ -126,13 +129,13 @@ class SQLiteReviewExecutionControl:
             except (ValueError, ControlStoreError) as exc:
                 blocked.append((round_id, str(exc)))
                 self._record_recovery_block(round_id, str(exc))
-        self._abandonment_cursor = (
+        self._round_cursor = (
             (page[-1]["target_number"], page[-1]["execution_epoch"],
              page[-1]["execution_episode"], page[-1]["sequence"])
-            if len(rows) > MAX_ABANDONMENT_SWEEP else _START_CURSOR
+            if len(rows) > MAX_REVIEW_ROUND_SWEEP else _START_CURSOR
         )
-        return ReviewAbandonmentSweep(tuple(sealed), tuple(finalized), tuple(blocked),
-                                      len(rows) > MAX_ABANDONMENT_SWEEP)
+        return ReviewRoundSweep(tuple(sealed), tuple(finalized), tuple(blocked),
+                                len(rows) > MAX_REVIEW_ROUND_SWEEP)
 
     def _recovery_wait_at_ceiling(self, round_id: str) -> bool:
         with self._control.transaction() as db:
@@ -242,7 +245,7 @@ class SQLiteReviewExecutionControl:
             return self._read_round_facts(db, round_id)
 
     def _read_round_facts(self, db: sqlite3.Connection, round_id: str) -> ReviewRoundFacts:
-        stored = self._abandonment_round(db, round_id)
+        stored = self._round_record(db, round_id)
         if stored is None:
             raise WorkflowAuthorityError("review round lacks its preflight")
         parent_owner, selection, plan, row = stored
@@ -260,10 +263,22 @@ class SQLiteReviewExecutionControl:
         self, round_id: str,
     ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound:
         """Settle a nonproductive abandoned round and its execution projection atomically."""
+        return self._finalize_nonproductive_round(round_id, ReviewParentAbandoned)
+
+    def finalize_completed_round(
+        self, round_id: str,
+    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound:
+        """Settle a sealed, nonproductive round from its durable sources."""
+        return self._finalize_nonproductive_round(round_id, ReviewPlanningSealed)
+
+    def _finalize_nonproductive_round(
+        self, round_id: str,
+        planning_type: type[ReviewParentAbandoned] | type[ReviewPlanningSealed],
+    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound:
         validate_workflow_identifier(round_id, "review round")
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self._writer.owner_id)
-            stored = self._abandonment_round(db, round_id)
+            stored = self._round_record(db, round_id)
             if stored is None:
                 raise WorkflowAuthorityError("review round lacks its preflight")
             _, _, plan, row = stored
@@ -273,13 +288,13 @@ class SQLiteReviewExecutionControl:
             facts = self._read_round_facts(db, round_id)
             result = finalize_review_round(facts)
             if isinstance(result, ReviewRoundAwaitingEvidence):
-                if isinstance(facts.planning, ReviewParentAbandoned):
+                if isinstance(facts.planning, (ReviewParentAbandoned, ReviewPlanningSealed)):
                     self._record_recovery_wait(db, facts, result)
                 return result
-            if not isinstance(facts.planning, ReviewParentAbandoned):
-                raise WorkflowAuthorityError("completed planning requires its own outcome settlement path")
+            if not isinstance(facts.planning, planning_type):
+                raise WorkflowAuthorityError("review round planning has a different settlement path")
             if not isinstance(result, FinalizedReviewRound):
-                raise WorkflowAuthorityError("abandoned preparation requires its bounded schedule")
+                raise WorkflowAuthorityError("review preparation requires its bounded schedule")
             if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
                 raise WorkflowAuthorityError("productive review requires joint rejection settlement")
             receipt = db.execute(
@@ -334,7 +349,7 @@ class SQLiteReviewExecutionControl:
     ) -> tuple[ReviewPreflightSelection, ReviewRoundPlan, ReviewRoundPlan, sqlite3.Row] | None:
         return load_review_preflight_record(db, self._writer.repository, self._writer.owner_id, request_id)
 
-    def _abandonment_round(
+    def _round_record(
         self, db: sqlite3.Connection, round_id: str,
     ) -> tuple[str, ReviewPreflightSelection, ReviewRoundPlan, sqlite3.Row] | None:
         receipt = db.execute(
@@ -345,13 +360,13 @@ class SQLiteReviewExecutionControl:
             return None
         captured = decode_workflow(receipt["payload_json"], tuple)
         if len(captured) != 3 or not isinstance(captured[1], str) or not captured[1]:
-            raise WorkflowAuthorityError("review abandonment preflight has no captured owner")
+            raise WorkflowAuthorityError("review round preflight has no captured owner")
         owner_id = captured[1]
         if owner_id not in self._control._owner_lineage(db, self._writer.repository, self._writer.owner_id):
-            raise WorkflowAuthorityError("review abandonment owner is outside this deployment lineage")
+            raise WorkflowAuthorityError("review round owner is outside this deployment lineage")
         stored = load_review_preflight_record(db, self._writer.repository, owner_id, round_id)
         if stored is None:
-            raise WorkflowAuthorityError("review abandonment lost its preflight")
+            raise WorkflowAuthorityError("review round lost its preflight")
         selection, _, plan, row = stored
         return owner_id, selection, plan, row
 
@@ -811,7 +826,7 @@ class SQLiteReviewExecutionControl:
         validate_workflow_identifier(round_id, "review round")
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self._writer.owner_id)
-            stored = self._abandonment_round(db, round_id)
+            stored = self._round_record(db, round_id)
             if stored is None:
                 raise WorkflowAuthorityError("review abandonment lacks its preflight")
             parent_owner, selection, plan, row = stored

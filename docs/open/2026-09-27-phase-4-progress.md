@@ -619,11 +619,43 @@ app tests, plus hooks, governor, parity, four import contracts and both
 Pyrefly checks. Log: `/tmp/phase4-codex-child-retry-full.log` (ephemeral).
 No live activation or paid run occurred.
 
+## Checkpoint 23 — source-backed completed planning outcomes (offline)
+
+Sealed completed-planning rounds now have a nonproductive finalization entry
+point. It reconstructs the exact parent seal, child launch and accounting,
+and submission effect receipts in one SQLite transaction, then writes the
+closure facts, immutable outcome receipt and ordered execution projection
+together. Canonical suffix reads reconstruct completed-round sources before
+accepting stored outcomes. The composed bounded round sweep now revisits
+sealed completed planning and finalizes it after terminal child evidence;
+pending evidence remains open with a bounded observation journal. Productive
+submissions and preparation failures still require their separate joint
+settlement paths.
+Behavioral tests cover refusal, settled paid failure, pending child, confirmed
+copy refusal by this writer, replay and source corruption. Earlier synthetic
+history fixtures now test the pure projection contract; real writer tests
+exercise canonical source-backed reload. No live activation, paid run,
+migration or push occurred.
+
+A sealed parent that disappears before admitting a planned child still lacks
+terminal non-admission proof. Reconciliation keeps its round open and surfaces
+a bounded evidence wait. A post-seal abandonment fence must establish that
+proof before activation. Ordered and compacted synthetic suffix tests now
+exercise the pure projection contract; composed canonical coverage belongs
+with the productive and checkpoint writers.
+Independent Sol review identified the missing composed caller and synthetic
+fixture incompatibility; both were corrected. Its final pass found the
+post-seal liveness gap above. Full `make test` passed: 3,122 domain, 2,795
+adapter and 2,866 app tests, plus hooks, governor, parity, four import
+contracts and both Pyrefly checks. Log:
+`/tmp/phase4-completed-rounds-full.log` (ephemeral).
+
 ## Required subsequent work
 
-- Finalize completed-planning rounds and source-backed abandoned rounds with
-  preparation failures. Preserve actual accounting and bind preparation faults
-  to bounded evidence holds before committing their outer outcomes.
+- Finalize completed and abandoned rounds with preparation failures. Preserve
+  actual accounting and bind preparation faults to bounded evidence holds
+  before committing their outer outcomes. Capture post-seal parent
+  abandonment so unadmitted children can terminalize safely.
 - Pass an execution round through the production review workflow so copied
   and paid verdicts use atomic registration; terminalize fenced abandoned
   rounds from complete evidence before execution activation.

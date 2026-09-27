@@ -123,7 +123,7 @@ def test_unresolved_submission_records_bounded_wait_and_later_settles(rig):
     control.seal_abandoned_planning(plan.round.round_id)
     for _ in range(7):
         assert isinstance(control.finalize_abandoned_round(plan.round.round_id), ReviewRoundAwaitingEvidence)
-    sweep = control.recover_abandoned_rounds()
+    sweep = control.reconcile_review_rounds()
     assert sweep.finalized == ()
     assert sweep.blocked == ((plan.round.round_id,
                               "round evidence remains pending after bounded recovery observations"),)
@@ -133,12 +133,12 @@ def test_unresolved_submission_records_bounded_wait_and_later_settles(rig):
         ).fetchone()[0]
         assert decode_workflow(payload, tuple)[3] == 8
     before = dump(store)
-    assert control.recover_abandoned_rounds().blocked == sweep.blocked
+    assert control.reconcile_review_rounds().blocked == sweep.blocked
     assert dump(store) == before
     store.begin_command(command.command_id)
     store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
                                       EffectStatus.PERMANENT_FAILURE, error="head changed"))
-    assert control.recover_abandoned_rounds().finalized == (plan.round.round_id,)
+    assert control.reconcile_review_rounds().finalized == (plan.round.round_id,)
     assert current(store, selection).execution.state.failures == 3
 
 
@@ -152,9 +152,9 @@ def test_command_attempt_progress_resets_recovery_wait_ceiling(rig):
     control.seal_abandoned_planning(plan.round.round_id)
     for _ in range(8):
         control.finalize_abandoned_round(plan.round.round_id)
-    assert control.recover_abandoned_rounds().blocked
+    assert control.reconcile_review_rounds().blocked
     store.begin_command(command.command_id)
-    assert control.recover_abandoned_rounds().blocked == ()
+    assert control.reconcile_review_rounds().blocked == ()
     with store.transaction() as db:
         payload = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-recovery-wait'",
@@ -173,7 +173,7 @@ def test_live_leased_child_does_not_consume_recovery_wait_ceiling(rig):
     control.seal_abandoned_planning(plan.round.round_id)
     for _ in range(9):
         assert isinstance(control.finalize_abandoned_round(plan.round.round_id), ReviewRoundAwaitingEvidence)
-    assert control.recover_abandoned_rounds().blocked == ()
+    assert control.reconcile_review_rounds().blocked == ()
     with store.transaction() as db:
         payload = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-recovery-wait'",

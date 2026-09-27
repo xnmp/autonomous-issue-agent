@@ -171,22 +171,16 @@ def insert_checkpoint_receipt(db, checkpoint, *, receipt="checkpoint:1", scope="
     )
 
 
-def test_one_stored_ordinary_failure_restores_one_outer_debit_and_exact_rejection_baseline(active):
-    store, snapshot = active
-    facts, outcome = round_facts(snapshot, 1)
-    with store.transaction() as db:
-        insert_round(db, facts, outcome)
-        expected = set_projection(db, snapshot, (outcome,), 1)
-        before = tuple(db.iterdump())
-        restored = load_review_workflow_row(db, snapshot.revision.fence.key)
-        assert restored == expected
-        assert restored.execution.state.failures == 4
-        assert restored.episode == snapshot.episode
-        assert tuple(db.iterdump()) == before
+def test_ordinary_failure_projection_preserves_rejection_baseline(active):
+    _, snapshot = active
+    _, outcome = round_facts(snapshot, 1)
+    projected = execution.project_review_execution(snapshot.execution.checkpoint, (outcome,))
+    assert projected.state.failures == 4
+    assert projected.state.binding == snapshot.execution.binding
 
 
-def test_stored_budget_exhaustion_restores_visible_non_striking_outcome(active):
-    store, snapshot = active
+def test_budget_exhaustion_projection_is_non_striking(active):
+    _, snapshot = active
     original, _ = round_facts(snapshot, 1)
     failed = original.children[0]
     assert isinstance(failed, rounds.ReviewChildReturned)
@@ -195,14 +189,8 @@ def test_stored_budget_exhaustion_restores_visible_non_striking_outcome(active):
     result = rounds.finalize_review_round(facts)
     assert isinstance(result, rounds.FinalizedReviewRound)
     assert result.outcome.disposition == execution.ReviewBudgetExhausted((exhausted.launched,), facts.closure_receipt)
-    with store.transaction() as db:
-        insert_round(db, facts, result.outcome)
-        expected = set_projection(db, snapshot, (result.outcome,), 1)
-        before = tuple(db.iterdump())
-        restored = load_review_workflow_row(db, snapshot.revision.fence.key)
-        assert restored == expected
-        assert restored.execution.state.failures == snapshot.execution.state.failures
-        assert tuple(db.iterdump()) == before
+    projected = execution.project_review_execution(snapshot.execution.checkpoint, (result.outcome,))
+    assert projected.state.failures == snapshot.execution.state.failures
 
 
 @pytest.mark.parametrize("corruption", ["missing", "changed_plan", "changed_seal_id", "orphan_open",
@@ -268,26 +256,16 @@ def test_execution_authority_requires_the_complete_accepted_stage_set(active, co
         assert tuple(db.iterdump()) == before
 
 
-def test_out_of_order_round_settlement_preserves_later_failure_across_earlier_copied_progress(active):
-    store, snapshot = active
-    early, progress = round_facts(snapshot, 1, copied=True)
-    later, failed = round_facts(snapshot, 2)
-    with store.transaction() as db:
-        insert_round(db, early)
-        insert_round(db, later, failed)
-        set_projection(db, snapshot, (failed,), 2)
-        assert load_review_workflow_row(db, snapshot.revision.fence.key).execution.state.failures == 4
-        db.execute("UPDATE review_execution_rounds SET planning_json=?,closure_json=?,outcome_json=? WHERE round_id=?",
-                   (encode_workflow(early.planning), encode_workflow(early), encode_workflow(progress), early.plan.round.round_id))
-        insert_seal_receipt(db, early)
-        set_projection(db, snapshot, (failed, progress), 2)
-        before = tuple(db.iterdump())
-        restored = load_review_workflow_row(db, snapshot.revision.fence.key)
-        assert restored.execution.state.failures == 1
-        assert restored.execution.state.pin_deferrals == 0
-        assert restored.execution.checkpoint.through_sequence == 0
-        assert restored.episode == snapshot.episode
-        assert tuple(db.iterdump()) == before
+def test_out_of_order_projection_preserves_later_failure_across_earlier_copied_progress(active):
+    _, snapshot = active
+    _, progress = round_facts(snapshot, 1, copied=True)
+    _, failed = round_facts(snapshot, 2)
+    pending_earlier = execution.project_review_execution(snapshot.execution.checkpoint, (failed,))
+    assert pending_earlier.state.failures == 4
+    projected = execution.project_review_execution(snapshot.execution.checkpoint, (failed, progress))
+    assert projected.state.failures == 1
+    assert projected.state.pin_deferrals == 0
+    assert projected.checkpoint.through_sequence == 2
 
 
 @pytest.mark.parametrize("corruption", ["missing_round", "missing_closure", "missing_outcome", "altered_outcome",
@@ -372,8 +350,7 @@ def test_compacted_checkpoint_cannot_claim_an_unsettled_open_round(active):
         assert tuple(db.iterdump()) == before
 
 
-@pytest.mark.parametrize("suffix,expected_failures", [(None, 4), ("failure", 5), ("copied", 0)])
-def test_verified_compacted_prefix_loads_and_later_suffix_projects_once(active, suffix, expected_failures):
+def test_verified_compacted_prefix_loads_without_replaying_it(active):
     store, snapshot = active
     first, failure = round_facts(snapshot, 1)
     checkpoint = execution.project_review_execution(snapshot.execution.checkpoint, (failure,)).checkpoint
@@ -383,19 +360,25 @@ def test_verified_compacted_prefix_loads_and_later_suffix_projects_once(active, 
         insert_checkpoint_receipt(db, checkpoint)
         compacted = replace(snapshot, execution=replace(snapshot.execution, checkpoint=checkpoint, state=checkpoint.state,
                                                        last_sequence=1, checkpoint_receipt="checkpoint:1"))
-        if suffix is None:
-            expected = set_projection(db, compacted, (), 1)
-        else:
-            later, outcome = round_facts(snapshot, 2, copied=suffix == "copied")
-            insert_round(db, later, outcome)
-            expected = set_projection(db, compacted, (outcome,), 2)
+        expected = set_projection(db, compacted, (), 1)
         before = tuple(db.iterdump())
         recovered = load_review_workflow_row(db, snapshot.revision.fence.key)
         assert recovered == expected
-        assert recovered.execution.state.failures == expected_failures
+        assert recovered.execution.state.failures == 4
         assert recovered.execution.checkpoint.policy.free_pin_deferrals == 1
         assert load_review_workflow_row(db, snapshot.revision.fence.key) == recovered
         assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("copied,expected_failures", [(False, 5), (True, 0)])
+def test_compacted_projection_applies_later_suffix_once(active, copied, expected_failures):
+    _, snapshot = active
+    _, failure = round_facts(snapshot, 1)
+    checkpoint = execution.project_review_execution(snapshot.execution.checkpoint, (failure,)).checkpoint
+    _, outcome = round_facts(snapshot, 2, copied=copied)
+    projected = execution.project_review_execution(checkpoint, (outcome,))
+    assert projected.state.failures == expected_failures
+    assert projected.checkpoint.policy.free_pin_deferrals == 1
 
 
 @pytest.mark.parametrize("corruption", ["missing_reference", "missing_receipt", "foreign_scope", "different_state", "different_policy"])

@@ -541,13 +541,13 @@ def _check_execution_projection(
         ).fetchone() is not None:
             raise WorkflowAuthorityError("review planning has a contradictory abandonment fence")
         preflight = None
-        if isinstance(planning, ReviewParentAbandoned):
+        if isinstance(planning, ReviewParentAbandoned) or row["outcome_json"] is not None:
             preflight_row = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-preflight' "
                 "AND scope=? AND key=?", (scope[0], identity.round_id),
             ).fetchone()
             if preflight_row is None:
-                raise WorkflowAuthorityError("abandoned review round lacks its exact preflight")
+                raise WorkflowAuthorityError("finalized review round lacks its exact preflight")
             preflight = decode_workflow(preflight_row["payload_json"], tuple)
             if (len(preflight) != 3 or not isinstance(preflight[0], ReviewPreflightSelection)
                     or not isinstance(preflight[1], str) or not preflight[1]
@@ -555,11 +555,12 @@ def _check_execution_projection(
                     or preflight[0].request_id != identity.round_id
                     or preflight[0].claim_occurrence_id != row["claim_occurrence_id"]
                     or replace(preflight[2], stages=plan.stages, submissions=plan.submissions) != plan):
-                raise WorkflowAuthorityError("abandoned review round preflight disagrees with its plan")
-            verified_review_parent_abandonment(
-                db, scope[0], preflight[1], row["claim_occurrence_id"],
-                preflight[0].claim_target, plan, planning,
-            )
+                raise WorkflowAuthorityError("finalized review round preflight disagrees with its plan")
+            if isinstance(planning, ReviewParentAbandoned):
+                verified_review_parent_abandonment(
+                    db, scope[0], preflight[1], row["claim_occurrence_id"],
+                    preflight[0].claim_target, plan, planning,
+                )
         expected_sequence += 1
         if row["outcome_json"] is None:
             if row["closure_json"] is not None:
@@ -574,8 +575,8 @@ def _check_execution_projection(
         outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
         if facts.plan != plan or facts.planning != planning or outcome != result.outcome:
             raise WorkflowAuthorityError("review round outcome disagrees with verified closure facts")
-        if isinstance(planning, ReviewParentAbandoned):
-            # This source-backed path is shared with the abandonment writer.
+        if isinstance(planning, (ReviewParentAbandoned, ReviewPlanningSealed)):
+            # Both nonproductive writers commit the same source-backed receipt.
             from .review_round_sources import read_review_round_sources
 
             assert preflight is not None
@@ -589,7 +590,7 @@ def _check_execution_projection(
             if source != facts or receipt is None or decode_workflow(
                 receipt["payload_json"], tuple,
             ) != (facts, outcome):
-                raise WorkflowAuthorityError("abandoned review outcome disagrees with durable source receipt")
+                raise WorkflowAuthorityError("review outcome disagrees with durable source receipt")
         outcomes.append(outcome)
     if expected_sequence != execution.last_sequence + 1:
         raise WorkflowAuthorityError("review execution round suffix has a gap")

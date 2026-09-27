@@ -70,4 +70,4 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
     assert abandoned.abandonment_receipt.endswith(":released")
     assert row["closure_json"] is not None and row["outcome_json"] is not None
     assert any("fenced 1 abandoned parent round" in line for line in composed.log)
-    assert any("finalized 1 abandoned parent round" in line for line in composed.log)
+    assert any("finalized 1 parent round" in line for line in composed.log)
