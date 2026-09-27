@@ -321,11 +321,15 @@ def test_release_projection_and_view_invariants():
     with pytest.raises(ValueError):
         ReleaseProjection(CommandId("release:1"), "verified")
     state, _ = pending()
+    trigger = Label.AI_PR_OPEN
     with pytest.raises(ValueError):
-        ReviewControlView(state, "request:1", state.intent, None)  # pending control carries its schedule
-    ReviewControlView(state, "request:1", state.intent, seed(state))
+        ReviewControlView(state, "request:1", state.intent, None,  # pending control carries its schedule
+                          trigger_label=trigger)
+    ReviewControlView(state, "request:1", state.intent, seed(state), trigger_label=trigger)
     with pytest.raises(ValueError):
-        ReviewControlView(gated(), None, None, seed(state))
+        ReviewControlView(gated(), None, None, seed(state), trigger_label=trigger)
+    with pytest.raises(ValueError):
+        ReviewControlView(state, "request:1", state.intent, seed(state), trigger_label=Label.NEEDS_HUMAN_REVIEW)
     assert HEAD and isinstance(state.intent, PendingReviewRearm) and RemoteOutcomeUncertain
 
 

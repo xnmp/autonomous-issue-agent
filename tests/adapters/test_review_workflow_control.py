@@ -31,7 +31,8 @@ from issue_agent.domain.review_rearm import (
     AbsentReviewControl, InactiveReviewControl, PendingReviewRecovery, ReleaseStatus, ReviewControlView,
 )
 from issue_agent.domain.review_workflow import (
-    PullRequestUnavailable, CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, RecordedPullRequest,
+    PullRequestUnavailable, CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, PullRequestState,
+    RecordedPullRequest,
     ReviewedBaseline, ReviewProjectionRefused, ReviewRejectionCeiling, ReviewWorkflowSnapshot, SupersededReviewRearm,
 )
 from issue_agent.domain.review_workflow_policy import (
@@ -1948,3 +1949,336 @@ def test_a_malformed_first_observation_schedule_is_never_read_as_due(rig, payloa
                    ("review-first-observation", "o/r", f"pr:{PR}", rig.clock[0].isoformat(), payload))
     with pytest.raises(WorkflowAuthorityError, match="malformed"):
         rig.control().first_observation_due(PR_KEY)
+
+
+# -- the operator view's harness-owned facts (increment 7) -------------------------------------------
+
+def test_an_inactive_review_family_beside_an_active_resolve_family_reads_migration_required(rig):
+    from issue_agent.domain.review_rearm import MigrationRequiredReviewControl
+
+    with rig.store.transaction() as db:
+        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r', ?, 1, 'test-source', 'test-inventory', ?)",
+                   (WorkflowFamily.RESOLVE.value, NOW.isoformat()))
+    before = rig.query("SELECT COUNT(*) FROM workflows")
+    assert rig.control().review_control_view(PR_KEY) == MigrationRequiredReviewControl(
+        PR_KEY, (WorkflowFamily.RESOLVE,))
+    assert rig.query("SELECT COUNT(*) FROM workflows") == before
+
+
+def test_the_view_stays_readable_after_a_stop_records_its_retirement_evidence(rig):
+    state = rig.pending()
+    rig.advance(60)
+    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", state.revision, "request:1", "stop"), ACTOR)
+    assert isinstance(cancelled, WorkflowCommitted)
+    view = rig.control().review_control_view(PR_KEY)
+    assert isinstance(view, ReviewControlView), view
+    assert view.decision is None  # no review plan has recorded a decision; the view never derives one
+
+
+def test_pending_command_progress_follows_the_stores_receipts(rig):
+    from issue_agent.domain.review_rearm import RearmCommandStatus
+
+    state = rig.pending()
+    view = rig.control().review_control_view(PR_KEY)
+    assert [p.command_id for p in view.command_progress] == list(state.intent.required_commands)
+    assert {p.status for p in view.command_progress} == {RearmCommandStatus.PENDING}
+    rig.drain()
+    drained = rig.control().review_control_view(PR_KEY)
+    assert isinstance(drained.snapshot.intent, PendingReviewRearm)
+    assert {p.status for p in drained.command_progress} == {RearmCommandStatus.VERIFIED}
+    rig.reconcile()
+    assert rig.control().review_control_view(PR_KEY).command_progress == ()
+
+
+def test_an_accepted_grant_is_shown_waiting_and_is_never_offered_again(rig):
+    from issue_agent.domain.resolve_rearm import PendingRetry
+
+    rig.pending()
+    dismissal = rig.commands(CommandKind.DISMISS_REVIEW)[0]
+    gate = expire_absent(rig, dismissal)
+    state = rig.workflow()
+    command = AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id)
+    assert isinstance(rig.control().authorize_retry(command, ACTOR), WorkflowCommitted)
+    view = rig.control().review_control_view(PR_KEY)
+    assert view.retry_pending == (PendingRetry(gate.gate_id, "grant:1", str(dismissal)),)
+    assert view.retry_authorizable == frozenset()
+    assert [refusal.gate_id for refusal in view.retry_refusals] == [gate.gate_id]
+    progress = {p.command_id: p.status.value for p in view.command_progress}
+    assert progress[dismissal] == "held"
+
+
+def test_a_malformed_restoration_row_reads_unreadable_on_its_own_gate_not_a_guess(rig):
+    from issue_agent.domain.review_rearm import UnreadableHoldRestoration
+
+    rig.gated()
+    gate = rig.ceiling_gate()
+    with rig.store.transaction() as db:
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                   ("review-hold-restores", "o/r", f"pr:{PR}:{gate.gate_id}", NOW.isoformat(), '{"restores": -1}'))
+    view = rig.control().review_control_view(PR_KEY)
+    assert isinstance(view, ReviewControlView), view
+    (restoration,) = view.hold_restorations
+    assert isinstance(restoration, UnreadableHoldRestoration) and restoration.gate_id == gate.gate_id
+    assert view.gate_facts_unavailable == () and view.snapshot.gates == (gate,)
+
+
+# -- the review daemon's recorded decision (ADR 0015 operator surface) -----------------------------------
+
+def _basis(state=PullRequestState.OPEN, labels=frozenset({Label.NEEDS_HUMAN_REVIEW}), holds=()):
+    from issue_agent.domain.review_dispatch_record import DecisionBasis
+
+    return DecisionBasis(HEAD, state, labels, holds)
+
+
+def _listed():
+    from issue_agent.domain.review_dispatch_record import DecisionRead
+
+    return DecisionRead.REVIEW_READ
+
+
+def _departed():
+    from issue_agent.domain.review_dispatch_record import DecisionRead
+
+    return DecisionRead.DEPARTED_READ
+
+
+def _decision_rows(rig):
+    return rig.query("SELECT key, claimed_at, payload_json FROM dedupe_keys WHERE namespace='review-dispatch-decision'")
+
+
+def test_a_decision_is_recorded_only_for_an_observed_workflow_and_rewritten_only_on_change_or_due(rig):
+    from issue_agent.domain.review_dispatch_record import DECISION_CONFIRM_SECONDS, ReviewNotAdmitted
+    from issue_agent.domain.review_workflow_policy import ReviewKind
+
+    rig.activate()
+    held_out = ReviewNotAdmitted(("needs-human-review",))
+    assert rig.control().record_dispatch_decision(PR_KEY, held_out, _basis(), _listed()) is False
+    assert _decision_rows(rig) == []
+    rig.control().ensure_observed_workflow(PR_KEY)
+    assert rig.control().record_dispatch_decision(PR_KEY, held_out, _basis(), _listed()) is True
+    first = rig.control().recorded_decision(PR_KEY)
+    assert first.decision == held_out and first.decided_at == first.as_of == NOW
+    rig.advance(DECISION_CONFIRM_SECONDS - 1)
+    assert rig.control().record_dispatch_decision(PR_KEY, held_out, _basis(), _listed()) is False
+    assert rig.control().recorded_decision(PR_KEY) == first
+    rig.advance(1)
+    assert rig.control().record_dispatch_decision(PR_KEY, held_out, _basis(), _listed()) is True
+    confirmed = rig.control().recorded_decision(PR_KEY)
+    assert confirmed.decided_at == NOW and confirmed.as_of == rig.clock[0]
+    owed = ReviewOwed(ReviewKind.INITIAL)
+    assert rig.control().record_dispatch_decision(PR_KEY, owed, _basis(labels=frozenset({TRIGGER})), _listed()) is True
+    changed = rig.control().recorded_decision(PR_KEY)
+    assert changed.decision == owed and changed.decided_at == rig.clock[0]
+    (row,) = _decision_rows(rig)
+    assert row[0] == f"pr:{PR}"
+
+
+def test_the_view_renders_the_recorded_decision_and_a_malformed_one_reads_unreadable_not_unavailable(rig):
+    from issue_agent.domain.review_dispatch_record import ReviewTerminal
+    from issue_agent.domain.review_rearm import UnreadableReviewDecision
+
+    rig.gated()
+    closed = _basis(state=PullRequestState.CLOSED)
+    rig.control().record_dispatch_decision(PR_KEY, ReviewTerminal(PullRequestState.CLOSED), closed, _listed())
+    view = rig.control().review_control_view(PR_KEY)
+    assert view.decision.decision == ReviewTerminal(PullRequestState.CLOSED) and view.decision.basis == closed
+    with rig.store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json='{\"format\":1,\"value\":7}' "
+                   "WHERE namespace='review-dispatch-decision'")
+    degraded = rig.control().review_control_view(PR_KEY)
+    assert isinstance(degraded, ReviewControlView) and isinstance(degraded.decision, UnreadableReviewDecision)
+    assert degraded.snapshot.gates == view.snapshot.gates
+    rig.control().record_dispatch_decision(PR_KEY, ReviewTerminal(PullRequestState.CLOSED), closed, _listed())
+    assert rig.control().review_control_view(PR_KEY).decision.decision == ReviewTerminal(PullRequestState.CLOSED)
+
+
+def test_a_retired_owner_records_no_decision(rig):
+    from issue_agent.domain.review_dispatch_record import ReviewNotAdmitted
+
+    rig.gated()
+    with rig.store.transaction() as db:
+        db.execute("INSERT INTO retired_owners VALUES (?, ?, 'o/r', 'review', ?)",
+                   (REVIEWER, "o/r:review:new", NOW.isoformat()))
+    with pytest.raises(RetiredOwnerError):
+        rig.control().record_dispatch_decision(PR_KEY, ReviewNotAdmitted(("needs-human-review",)), _basis(), _listed())
+    assert _decision_rows(rig) == []
+
+
+def test_departed_pull_requests_are_due_by_their_record_most_overdue_first_and_bounded(rig):
+    from issue_agent.domain.review_dispatch_record import (
+        DEPARTED_CONFIRM_SECONDS, ReviewNotAdmitted, ReviewTerminal,
+    )
+
+    rig.activate()
+    numbers = (PR, 11, 12, 13)
+    for number in numbers[1:]:
+        rig.remote.seed_pr(PRView(number, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
+    for number in numbers:
+        rig.control().ensure_observed_workflow(WorkflowKey("o/r", PullRequestRef(number)))
+    assert rig.control().departed_pull_requests(frozenset(), limit=64) == (PR, 11, 12, 13)  # all unrecorded
+    assert rig.control().departed_pull_requests(frozenset({PR, 12}), limit=1) == (11,)
+    key = lambda number: WorkflowKey("o/r", PullRequestRef(number))  # noqa: E731
+    rig.control().record_dispatch_decision(key(11), ReviewNotAdmitted(("needs-human-review",)), _basis(), _departed())
+    rig.control().record_dispatch_decision(key(12), ReviewTerminal(PullRequestState.MERGED),
+                                           _basis(state=PullRequestState.MERGED), _departed())
+    # Decided in the review read: stale as soon as it is missing from it, so due at once.
+    rig.control().record_dispatch_decision(key(13), ReviewNotAdmitted(("needs-human-review",)), _basis(), _listed())
+    assert rig.control().departed_pull_requests(frozenset(), limit=64) == (PR, 13)
+    rig.advance(DEPARTED_CONFIRM_SECONDS)
+    assert rig.control().departed_pull_requests(frozenset(), limit=64) == (PR, 13, 11)
+    rig.advance(10**8)
+    assert 12 not in rig.control().departed_pull_requests(frozenset(), limit=64)  # merged: never again
+    with pytest.raises(ValueError):
+        rig.control().departed_pull_requests(frozenset(), limit=0)
+
+
+def test_a_closed_departure_is_re_read_on_the_short_cadence_while_its_workflow_holds_gates(rig):
+    from issue_agent.domain.review_dispatch_record import (
+        CLOSED_RECONFIRM_SECONDS, DEPARTED_CONFIRM_SECONDS, ReviewTerminal,
+    )
+
+    rig.gated()
+    closed = _basis(state=PullRequestState.CLOSED)
+    rig.control().record_dispatch_decision(PR_KEY, ReviewTerminal(PullRequestState.CLOSED), closed, _departed())
+    assert rig.control().departed_pull_requests(frozenset(), limit=64) == ()
+    rig.advance(DEPARTED_CONFIRM_SECONDS)
+    assert rig.control().departed_pull_requests(frozenset(), limit=64) == (PR,)  # a reopen must find its lever
+    ungated_key = WorkflowKey("o/r", PullRequestRef(11))
+    rig.remote.seed_pr(PRView(11, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
+    rig.control().ensure_observed_workflow(ungated_key)
+    rig.control().record_dispatch_decision(ungated_key, ReviewTerminal(PullRequestState.CLOSED), closed, _departed())
+    rig.advance(DEPARTED_CONFIRM_SECONDS)
+    assert 11 not in rig.control().departed_pull_requests(frozenset(), limit=64)
+    rig.advance(CLOSED_RECONFIRM_SECONDS - DEPARTED_CONFIRM_SECONDS)
+    assert 11 in rig.control().departed_pull_requests(frozenset(), limit=64)
+
+
+def test_failed_departed_reads_are_journalled_at_the_first_failure_and_at_the_backoff_ceiling(rig):
+    from issue_agent.domain.review_dispatch_record import departed_backoff_seconds
+
+    rig.gated()
+    control = rig.control()
+    for attempt in range(1, 9):
+        assert control.record_departed_read_failure(PR_KEY, "Not Found") is True
+        record = control.recorded_decision(PR_KEY)
+        assert record.failed_reads == attempt and record.basis is None and record.decided_at == NOW
+        # Not due again until its backoff has passed, then due exactly then.
+        wait = departed_backoff_seconds(attempt)
+        rig.advance(wait - 1)
+        assert control.departed_pull_requests(frozenset(), limit=64) == ()
+        rig.advance(1)
+        assert control.departed_pull_requests(frozenset(), limit=64) == (PR,)
+    events = [row[0] for row in rig.journal("review_departed_read")]
+    assert len(events) == 2
+    assert '"read_failed"' in events[0] and '"failed_reads":1' in events[0].replace(" ", "")
+    assert '"read_backoff_ceiling"' in events[1] and '"failed_reads":6' in events[1].replace(" ", "")
+
+
+def test_decisions_are_recorded_in_one_write_and_an_unrecordable_entry_never_drops_the_others(rig):
+    from issue_agent.domain.review_dispatch_record import DecisionUpdate, DepartedReadFailed, ReviewTerminal
+    from issue_agent.domain.review_workflow_policy import ReviewKind, ReviewOwed
+
+    rig.gated()
+    other = WorkflowKey("o/r", PullRequestRef(11))
+    rig.remote.seed_pr(PRView(11, head_ref_oid=HEAD, labels=frozenset({TRIGGER})))
+    rig.control().ensure_observed_workflow(other)
+    unobserved = WorkflowKey("o/r", PullRequestRef(12))
+    # A terminal decision from an open read is contradictory: that entry alone cannot be recorded.
+    contradictory = DecisionUpdate(other, ReviewTerminal(PullRequestState.CLOSED), _basis(), _departed())
+    before = rig.query("SELECT COUNT(*) FROM event_outbox")[0][0]
+    result = rig.control().record_dispatch_decisions((
+        DecisionUpdate(PR_KEY, ReviewOwed(ReviewKind.RE_REVIEW), _basis(), _listed()),
+        contradictory,
+        DepartedReadFailed(unobserved, "no workflow, so no view to show it"),
+    ))
+    assert result.written == 1 and len(result.skipped) == 1 and result.skipped[0].startswith("#11: ")
+    assert rig.control().recorded_decision(PR_KEY).decision == ReviewOwed(ReviewKind.RE_REVIEW)
+    assert rig.control().recorded_decision(other) is None and rig.control().recorded_decision(unobserved) is None
+    assert rig.query("SELECT COUNT(*) FROM event_outbox")[0][0] == before  # no journal for plain decisions
+    # An unchanged decision within its confirmation bound opens no write transaction at all.
+    control = rig.control()
+    writes = []
+    real = control._control.transaction
+    control._control.transaction = lambda: (writes.append(1), real())[1]
+    unchanged = control.record_dispatch_decisions((DecisionUpdate(PR_KEY, ReviewOwed(ReviewKind.RE_REVIEW), _basis(),
+                                                                  _listed()),))
+    assert unchanged.written == 0 and writes == []
+
+
+def test_a_failed_read_of_a_closed_departure_keeps_it_shown_closed(rig):
+    from issue_agent.domain.review_dispatch_record import DEPARTED_CONFIRM_SECONDS, ReviewTerminal
+
+    rig.gated()
+    closed = _basis(state=PullRequestState.CLOSED)
+    control = rig.control()
+    control.record_dispatch_decision(PR_KEY, ReviewTerminal(PullRequestState.CLOSED), closed, _departed())
+    rig.advance(DEPARTED_CONFIRM_SECONDS)
+    assert control.record_departed_read_failure(PR_KEY, "502 Bad Gateway") is True
+    record = control.recorded_decision(PR_KEY)
+    assert record.decision == ReviewTerminal(PullRequestState.CLOSED) and record.basis == closed
+    assert record.as_of == NOW and record.read_failure.reason == "502 Bad Gateway"
+    events = [row[0] for row in rig.journal("review_departed_read")]
+    assert len(events) == 1 and '"read_failed"' in events[0]
+
+
+def test_active_workflow_families_are_read_exactly_as_the_legacy_unblock_refuses(rig):
+    assert rig.store.active_workflow_families("o/r") == ()
+    rig.activate()
+    assert rig.store.active_workflow_families("o/r") == (WorkflowFamily.REVIEW_REJECTIONS,)
+    with pytest.raises(WorkflowAuthorityError):
+        with rig.store.legacy_resolve_authority("o/r"):
+            pass
+
+
+# -- one inconsistent fact degrades only its own gate (finding 6) ------------------------------------------
+
+def test_duplicate_open_grants_on_one_gate_degrade_that_gate_and_leave_the_view_readable(rig):
+    rig.pending()
+    first, second = rig.commands(CommandKind.DISMISS_REVIEW)[:2]
+    gate = expire_absent(rig, first)
+    state = rig.workflow()
+    command = AuthorizeAbsentRetry("grant:1", state.revision, first, gate.gate_id, gate.cause.absence_evidence_id)
+    assert isinstance(rig.control().authorize_retry(command, ACTOR), WorkflowCommitted)
+    with rig.store.transaction() as db:
+        db.execute("DROP TRIGGER IF EXISTS workflow_retry_grant_insert")
+        row = dict(db.execute("SELECT * FROM workflow_retry_authorizations WHERE authorization_id='grant:1'").fetchone())
+        row.update(authorization_id="grant:2", command_id=str(second))
+        db.execute(f"INSERT INTO workflow_retry_authorizations({','.join(row)}) VALUES ({','.join('?' * len(row))})",
+                   tuple(row.values()))
+    view = rig.control().review_control_view(PR_KEY)
+    assert isinstance(view, ReviewControlView), view
+    assert [item.gate_id for item in view.gate_facts_unavailable] == [gate.gate_id]
+    assert "2 open retry grants" in view.gate_facts_unavailable[0].reason
+    assert view.retry_pending == () and gate.gate_id not in view.retry_authorizable
+    assert rig.workflow().gates == view.snapshot.gates  # nothing written; the daemon's authority is unchanged
+
+
+def test_a_gate_whose_read_history_lags_its_command_degrades_alone(rig):
+    import re
+
+    from issue_agent.domain.review_rearm import RearmCommandStatus
+
+    rig.pending()
+    dismissal, other = rig.commands(CommandKind.DISMISS_REVIEW)[:2]
+    rig.store.begin_command(dismissal)
+    rig.store.record_effect(EffectReceipt(dismissal, REVIEWER, rig.clock[0], rig.clock[0],
+                                          EffectStatus.UNKNOWN_OUTCOME, error="response lost"))
+    rig.points.add("reviews_page:0")
+    for _ in range(12):
+        rig.advance(1800)
+        rig.drain()
+        if isinstance(rig.store.command_reconciliation(dismissal), ReconciliationOnly):
+            break
+    gate_id = rig.store.command_reconciliation(dismissal).gate_id
+    with rig.store.transaction() as db:
+        raw = db.execute("SELECT workflow_reconciliation_json FROM lifecycle_commands WHERE command_id=?",
+                         (str(dismissal),)).fetchone()[0]
+        lagging = re.sub(r'"failed_reads":(\d+)', lambda m: f'"failed_reads":{int(m.group(1)) + 1}', raw, count=1)
+        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                   (lagging, str(dismissal)))
+    view = rig.control().review_control_view(PR_KEY)
+    assert isinstance(view, ReviewControlView), view
+    assert [item.gate_id for item in view.gate_facts_unavailable] == [gate_id]
+    progress = {item.command_id: item.status for item in view.command_progress}
+    assert progress[dismissal] is RearmCommandStatus.UNAVAILABLE
+    assert progress[other] is not RearmCommandStatus.UNAVAILABLE

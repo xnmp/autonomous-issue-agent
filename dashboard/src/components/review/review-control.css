@@ -1,0 +1,16 @@
+.review-counted { margin: var(--space-4) 0; padding-left: var(--space-6); max-height: 24rem; overflow-y: auto; }
+.review-counted li, .review-obligations li { overflow-wrap: anywhere; margin-bottom: var(--space-2); }
+.review-obligations { list-style: none; margin: var(--space-4) 0; padding: 0; display: grid; gap: var(--space-4); }
+.review-command-status { font-size: var(--text-sm); color: var(--ink-muted); margin-left: var(--space-2); }
+.review-command-verified { color: var(--ok-br); }
+.review-command-refused, .review-command-held { color: var(--fail-br); }
+.review-command-uncertain { color: var(--running-br); }
+.review-command-id { font-size: var(--text-sm); color: var(--ink-muted); }
+.review-refused { display: grid; gap: var(--space-2); min-width: 0; flex: 1 1 100%; }
+.review-refused > .btn { justify-self: start; }
+.review-control p.review-refusal { margin: 0; color: var(--ink-muted); font-size: var(--text-sm); }
+.review-contested { border-left: 3px solid var(--fail-br); padding-left: var(--space-4); }
+.review-control p.review-no-lever { color: var(--ink-muted); font-size: var(--text-sm); }
+@media (max-width: 480px) {
+  .review-refused > .btn { justify-self: stretch; }
+}

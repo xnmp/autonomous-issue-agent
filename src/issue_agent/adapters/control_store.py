@@ -92,7 +92,7 @@ from .deployment_authority import (
 )
 from .review_effects import bound_submission_op, review_family_op
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, load_family_authority, load_resolve_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import WorkflowAuthorityError, active_families, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 24
 
@@ -1608,14 +1608,24 @@ class SQLiteControlStore:
                 barriers.enter_context(deployment_effect_barrier(self.path, repository, role))
             with closing(self._connect()) as db:
                 db.execute("BEGIN")
-                if load_resolve_authority(db, repository) is not None:
+                active = active_families(db, repository)
+                if WorkflowFamily.RESOLVE in active:
                     raise WorkflowAuthorityError("legacy unblock is retired for active resolve control; use a typed re-arm command")
                 # Family-scoped reads no longer count PR rows as resolve
                 # authority; the legacy unblock still never crosses them
                 # (ADR 0015: never two authorities, no fallback).
-                if load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, repository) is not None:
+                if active:
                     raise WorkflowAuthorityError("legacy unblock is retired for active review rejection control; use a typed re-arm command")
             yield
+
+    def active_workflow_families(self, repository: str) -> tuple[WorkflowFamily, ...]:
+        """The families activated for a repository, read-only: exactly what `legacy_resolve_authority` refuses on."""
+        from ..domain.workflow_identity import canonical_workflow_repository
+
+        self.require_initialized()
+        with closing(self._connect()) as db:
+            db.execute("BEGIN")
+            return active_families(db, canonical_workflow_repository(repository))
 
     def _database_exists(self, *, allow_empty: bool = False) -> bool:
         try:

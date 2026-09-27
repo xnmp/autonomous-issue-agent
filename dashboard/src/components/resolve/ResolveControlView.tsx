@@ -97,6 +97,10 @@ export function ResolveControlView(props: ResolveControlViewProps) {
         </p>}
       </div>
       {control?.status === "inactive" && props.legacyAllowed && !locked && <button className="btn" type="button" onClick={props.onLegacy}>Review legacy unblock</button>}
+      {control?.status === "inactive" && props.legacyRefusal && <div className="resolve-legacy-refused">
+        <button className="btn" type="button" disabled aria-describedby={`${id}-legacy-refused`}>Review legacy unblock</button>
+        <p id={`${id}-legacy-refused`} className="resolve-status-note">{props.legacyRefusal}</p>
+      </div>}
       {control?.status === "available" && <>
         {control.gates.length > 0 && <ul className="resolve-gates">{control.gates.map((gate) => <li key={gate.gate_id}>
           <div className="resolve-gate-heading"><GateCause cause={gate.cause} /><span className="resolve-state">{gate.state}</span></div>

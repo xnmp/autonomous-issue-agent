@@ -18,17 +18,24 @@ import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager
-from datetime import datetime, timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 
 from ..domain.contracts import CommandId, CommandKind, EffectStatus
 from ..domain.labels import Label
 from ..domain.resolve_rearm import (
-    RearmObservation, UnavailableResolveRearm, defer_rearm_observation, schedule_rearm_observation,
+    PendingRetry, RearmObservation, UnavailableResolveRearm, defer_rearm_observation, schedule_rearm_observation,
+)
+from ..domain.review_dispatch_record import (
+    DecisionBasis, DecisionEntry, DecisionRead, DecisionUpdate, DepartedReadFailed, RecordedDispatch,
+    RecordedReviewDecision, departed_backoff_at_ceiling, departed_backoff_seconds, departed_read_after,
+    departed_read_due, next_decision_record,
 )
 from ..domain.review_rearm import (
-    AbsentReviewControl, InactiveReviewControl, PendingReviewRecovery, ReleaseProjection, ReleaseStatus,
-    ReviewControlRead, ReviewControlView, decide_review_rearm_reconciliation,
-    update_review_rearm_observation,
+    AbsentReviewControl, GateFactsUnavailable, HoldRestoration, InactiveReviewControl, MigrationRequiredReviewControl,
+    PendingReviewRecovery, RearmCommandProgress, RearmCommandStatus, ReleaseProjection, ReleaseStatus, RetryRefusal,
+    ReviewControlRead, ReviewControlView, UnreadableHoldRestoration, UnreadableReviewDecision,
+    decide_review_rearm_reconciliation, update_review_rearm_observation,
 )
 from ..domain.review_evidence import (
     EvidenceSchedule, ReviewEvidenceKind, evidence_due, evidence_gate_id, review_evidence_gate_kind,
@@ -61,7 +68,7 @@ from ..domain.workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowWriter,
     validate_workflow_identifier,
 )
-from ..domain.workflow_retry import RetryAuthorizationFacts, authorize_absent_retry, retry_authorization_available
+from ..domain.workflow_retry import RetryAuthorizationFacts, authorize_absent_retry, retry_authorization_refusal
 from .control_store import (
     ControlStoreError, SQLiteControlStore, _command_from_row, load_bound_review_submission,
     load_retry_authorization_facts, owe_escalation_signal,
@@ -78,7 +85,7 @@ from .workflow_commit import (
     same_receipt, transition_dedupe_key, transition_receipt, update_rearm_state,
 )
 from .workflow_rows import (
-    WorkflowAuthorityError, load_family_authority, load_review_workflow_row, load_workflow_read,
+    WorkflowAuthorityError, active_families, load_family_authority, load_review_workflow_row, load_workflow_read,
     persist_workflow_snapshot, workflow_run_scope_bounds, workflow_scope,
 )
 
@@ -90,6 +97,8 @@ _RELEASE_RESOLVED_NAMESPACE = "review-release-resolved"
 _SETTLED_SUBMISSION_NAMESPACE = "review-submission-settled"
 _HOLD_OBSERVATION_NAMESPACE = "review-hold-observation"
 _FIRST_OBSERVATION_NAMESPACE = "review-first-observation"
+# Content-addressed harness pull request reads (`RecordedPullRequest`).
+_PR_OBSERVATION_PREFIX = "pr-observation:"
 # Per open ceiling gate: how often the harness restored its hold, and whether
 # the restorations were spent against an actor removing it (contested).
 _HOLD_RESTORES_NAMESPACE = "review-hold-restores"
@@ -97,6 +106,12 @@ _HOLD_RESTORES_NAMESPACE = "review-hold-restores"
 # moot, re-planned, or exhausted into a visible gate (whose operator signal the
 # executor's claim sends from its owed record).
 _ESCALATION_RESOLVED_NAMESPACE = "review-escalation-resolved"
+# Per pull request, upserted: the review daemon's latest dispatch decision
+# (`RecordedReviewDecision`). Written only by the review plan through
+# `record_dispatch_decision`; `claimed_at` is from when a pull request missing
+# from the daemon's review read is due its own read (`departed_read_after`).
+_DECISION_NAMESPACE = "review-dispatch-decision"
+_NEVER_DUE = "9999-12-31T23:59:59.999999+00:00"
 _EVIDENCE_NAMESPACES = {
     ReviewEvidenceKind.EXEMPTION_TRAILERS: "review-exemption-evidence",
     ReviewEvidenceKind.REVIEW_HISTORY: "review-history-evidence",
@@ -114,6 +129,11 @@ def _no_external_holds(_observed: ObservedPullRequest, _view: object) -> tuple[s
 
 def _reason(exc: BaseException) -> str:
     return (str(exc).replace("\x00", "") or type(exc).__name__)[:16384]
+
+
+def _due_stamp(value: datetime | None) -> str:
+    """A sortable UTC stamp: every writer uses this one format, so SQL can compare stamps as text."""
+    return _NEVER_DUE if value is None else value.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f+00:00")
 
 
 def review_family_activated(control: SQLiteControlStore, repository: str) -> bool:
@@ -161,6 +181,13 @@ def read_review_guidance(control: SQLiteControlStore, repository: str, pr: int) 
 def release_refused_gate_id(command_id: CommandId) -> str:
     validate_workflow_identifier(command_id, "release projection command")
     return "review-projection-refused:" + hashlib.sha256(str(command_id).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class DecisionsRecorded:
+    """How many decision rows one recording wrote, and each entry it could not record, with why."""
+    written: int
+    skipped: tuple[str, ...]
 
 
 class SQLiteReviewWorkflowControl:
@@ -244,9 +271,16 @@ class SQLiteReviewWorkflowControl:
         except Exception as exc:  # noqa: BLE001 - an unreadable hold source is unavailable evidence
             return PullRequestUnavailable(key, started, f"external holds unavailable: {_reason(exc)[:480]}")
 
+    def external_holds(self, observed: ObservedPullRequest, view: object) -> tuple[str, ...]:
+        """The trusted holds a re-arm keeps, from one read's observation and pull request view; raises if unreadable."""
+        if not isinstance(observed, ObservedPullRequest):
+            raise ValueError("external holds are read from a present pull request observation")
+        self._scope(observed.key)
+        return tuple(self._external_holds(observed, view))
+
     @staticmethod
     def _evidence_id(recorded: RecordedPullRequest) -> str:
-        return "pr-observation:" + hashlib.sha256(encode_workflow(recorded).encode()).hexdigest()
+        return _PR_OBSERVATION_PREFIX + hashlib.sha256(encode_workflow(recorded).encode()).hexdigest()
 
     def _insert_evidence(self, db: sqlite3.Connection, key: WorkflowKey, recorded: RecordedPullRequest) -> str:
         if recorded.observation.key != key:
@@ -468,7 +502,13 @@ class SQLiteReviewWorkflowControl:
     def review_control_view(
         self, key: WorkflowKey, *, request_id: str | None = None,
     ) -> ReviewControlRead | WorkflowUnavailable:
-        """One read snapshot; inspection never schedules recovery or initializes state."""
+        """One read snapshot; inspection never schedules recovery or initializes state.
+
+        The workflow row and family authority are required. Auxiliary facts
+        degrade where they belong: a malformed recorded decision reads as
+        unreadable, and inconsistent grant, receipt or restoration rows mark
+        only their own gate, so one bad row never hides every other gate.
+        """
         self._scope(key)
         if request_id is not None:
             validate_workflow_identifier(request_id, "requested re-arm")
@@ -478,17 +518,279 @@ class SQLiteReviewWorkflowControl:
                 self._control._assert_owner_active(db, self._writer.owner_id)
                 authority = load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, key.repository)
                 if authority is None:
-                    return InactiveReviewControl(key)
+                    # The legacy unblock refuses a repository once any family is
+                    # active, so an inactive review family then has no lever.
+                    others = active_families(db, key.repository)
+                    return MigrationRequiredReviewControl(key, others) if others else InactiveReviewControl(key)
                 state = load_review_workflow_row(db, key)
                 if state is None:
                     return AbsentReviewControl(key, authority)
                 selected = request_id or (state.intent.request_id if state.intent is not None else None)
                 requested = self._lookup_rearm(db, key, selected) if selected is not None else None
                 observation = self._rearm_observation(db, state) if isinstance(state.intent, PendingReviewRearm) else None
-                return ReviewControlView(state, selected, requested, observation,
-                                         self._release_projection(db, state), self._retry_authorizable(db, state))
+                pending, unavailable = self._retry_pending(db, state)
+                progress, unreadable = self._command_progress(db, state)
+                unavailable.update((gate_id, reason) for gate_id, reason in unreadable.items() if gate_id not in unavailable)
+                authorizable, refusals = self._retry_offers(db, state, frozenset(unavailable))
+                live = restorable_ceiling_gate_ids(state)
+                try:
+                    decision: RecordedReviewDecision | UnreadableReviewDecision | None = self._decision(db, key)
+                except WorkflowAuthorityError as exc:
+                    decision = UnreadableReviewDecision(_reason(exc)[:512])
+                return ReviewControlView(
+                    state, selected, requested, observation, self._release_projection(db, state), authorizable,
+                    refusals, pending, decision, self._hold_restorations(db, key, live),
+                    self._active_review_runs(db, key), progress,
+                    tuple(GateFactsUnavailable(gate_id, reason[:512]) for gate_id, reason in sorted(unavailable.items())),
+                    trigger_label=self._trigger,
+                )
         except (sqlite3.Error, ValueError, TypeError) as exc:
             return WorkflowUnavailable(key, _reason(exc))
+
+    def _hold_restorations(
+        self, db: sqlite3.Connection, key: WorkflowKey, live: frozenset[str],
+    ) -> tuple[HoldRestoration | UnreadableHoldRestoration, ...]:
+        """Each open ceiling's restoration record; a malformed one reads unreadable on its own gate."""
+        found: dict[str, HoldRestoration | UnreadableHoldRestoration] = {}
+        for row in self._restore_records(db, key):
+            gate_id = row["key"].split(":", 2)[2]
+            if gate_id not in live:
+                continue
+            try:
+                found[gate_id] = HoldRestoration(gate_id, *self._restore_count(row["payload_json"]))
+            except (WorkflowAuthorityError, ValueError) as exc:
+                found[gate_id] = UnreadableHoldRestoration(gate_id, _reason(exc)[:512])
+        return tuple(found[gate_id] for gate_id in sorted(found))
+
+    def _command_progress(
+        self, db: sqlite3.Connection, state: ReviewWorkflowSnapshot,
+    ) -> tuple[tuple[RearmCommandProgress, ...], dict[str, str]]:
+        """Each pending obligation's status from the store's own receipts and gates (never a remote read).
+
+        Returns the gates whose command facts disagree too: an inconsistent
+        obligation reads `unavailable` and marks the gate that covers it.
+        """
+        intent = state.intent
+        if not isinstance(intent, PendingReviewRearm):
+            return (), {}
+        opened = [g.gate if isinstance(g, RearmingGate) else g for g in state.gates]
+        gated = {cause.command_id: gate.gate_id for gate in opened
+                 if isinstance(cause := gate.cause, (RemoteOutcomeUncertain, RetryAuthorizationRequired))}
+        facts: dict[CommandId, str] = {}
+        broken: dict[str, str] = {}
+        try:
+            rows = self._rearm_command_rows(db, intent)
+        except WorkflowAuthorityError as exc:
+            rows, reason = [], _reason(exc)
+            facts = {command_id: "unavailable" for command_id in intent.required_commands}
+            broken = {gated[command_id]: reason for command_id in intent.required_commands if command_id in gated}
+        gates = {gate.gate_id: gate for gate in opened}
+        for row in rows:
+            command_id = CommandId(row["command_id"])
+            try:
+                outcome, uncertain = self._rearm_command_fact(db, state, gates, row, None)
+            except (WorkflowAuthorityError, ControlStoreError, ValueError, TypeError) as exc:
+                facts[command_id] = "unavailable"
+                if command_id in gated:
+                    broken.setdefault(gated[command_id], f"command {command_id} facts disagree: {_reason(exc)[:256]}")
+                continue
+            facts[command_id] = "uncertain" if outcome == "pending" and uncertain is not None else outcome
+        return tuple(RearmCommandProgress(command_id, (
+            RearmCommandStatus.UNAVAILABLE if facts.get(command_id) == "unavailable"
+            or gated.get(command_id) in broken else
+            RearmCommandStatus.VERIFIED if facts.get(command_id) == "verified" else
+            RearmCommandStatus.REFUSED if facts.get(command_id) == "rejected" else
+            RearmCommandStatus.HELD if command_id in gated else
+            RearmCommandStatus.UNCERTAIN if facts.get(command_id) == "uncertain" else
+            RearmCommandStatus.PENDING)) for command_id in intent.required_commands), broken
+
+    @staticmethod
+    def _retry_pending(
+        db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot,
+    ) -> tuple[tuple[PendingRetry, ...], dict[str, str]]:
+        """Open grants awaiting the executor, one per retry gate; a gate whose grants disagree is unavailable."""
+        commands = {g.gate_id: g.cause.command_id for g in snapshot.gates
+                    if isinstance(g, OpenGate) and isinstance(g.cause, RetryAuthorizationRequired)}
+        visible = {(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in snapshot.gates}
+        grants: dict[str, list[sqlite3.Row]] = {}
+        for row in db.execute(
+            "SELECT g.authorization_id, g.gate_id, g.command_id FROM workflow_retry_authorizations g "
+            "JOIN workflow_gates w USING(gate_id) WHERE g.disposition IS NULL "
+            "AND w.repository=? AND w.target_kind=? AND w.target_number=? ORDER BY g.gate_id, g.authorization_id",
+            workflow_scope(snapshot.revision.fence.key),
+        ):
+            if row["gate_id"] in visible:
+                grants.setdefault(row["gate_id"], []).append(row)
+        pending: list[PendingRetry] = []
+        unavailable: dict[str, str] = {}
+        for gate_id, rows in grants.items():
+            if len(rows) > 1:
+                unavailable[gate_id] = f"{len(rows)} open retry grants name this gate; at most one may"
+            elif gate_id not in commands or str(commands[gate_id]) != rows[0]["command_id"]:
+                unavailable[gate_id] = "an open retry grant names a command this gate does not hold"
+            else:
+                pending.append(PendingRetry(gate_id, rows[0]["authorization_id"], rows[0]["command_id"]))
+        return tuple(pending), unavailable
+
+    # -- the review daemon's recorded dispatch decision -------------------------------------------
+
+    def _decision(self, db: sqlite3.Connection, key: WorkflowKey) -> RecordedReviewDecision | None:
+        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                         (_DECISION_NAMESPACE, key.repository, f"pr:{key.target.number}")).fetchone()
+        if row is None:
+            return None
+        try:
+            record = decode_workflow(row["payload_json"], RecordedReviewDecision)
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError(f"recorded review decision is malformed: {_reason(exc)[:256]}") from exc
+        if record.key != key:
+            raise WorkflowAuthorityError("recorded review decision belongs to another pull request")
+        return record
+
+    def record_dispatch_decision(
+        self, key: WorkflowKey, decision: RecordedDispatch, basis: DecisionBasis | None, read: DecisionRead,
+    ) -> bool:
+        """Record one decision (`record_dispatch_decisions`); True when a row was written."""
+        return self.record_dispatch_decisions((DecisionUpdate(key, decision, basis, read),)).written == 1
+
+    def record_departed_read_failure(self, key: WorkflowKey, reason: str) -> bool:
+        """Record one more failed departed read (`record_dispatch_decisions`); True when written."""
+        return self.record_dispatch_decisions((DepartedReadFailed(key, reason),)).written == 1
+
+    def record_dispatch_decisions(self, entries: tuple[DecisionEntry, ...]) -> DecisionsRecorded:
+        """Record the review plan's decisions in at most one write transaction.
+
+        Harness-owned: only the review daemon's plan calls this, as the active
+        review owner, from its own reads. A changed decision is written at
+        once and an unchanged one refreshes its as-of time on a bounded
+        cadence (`record_review_decision`). A failed departed read backs the
+        next one off exponentially, journalled at the first failure and when
+        the backoff tops out (ADR 0012). A pull request with no workflow has
+        no view to show it, so nothing is recorded; a malformed prior record is
+        replaced. An entry that cannot be recorded is skipped and reported,
+        never a reason to drop the others.
+        """
+        if not isinstance(entries, tuple) or any(not isinstance(e, (DecisionUpdate, DepartedReadFailed))
+                                                 for e in entries):
+            raise ValueError("decision entries must be a tuple of typed entries")
+        for entry in entries:
+            self._scope(entry.key)
+        now = self._now()
+        pending: list[DecisionEntry] = []
+        skipped: list[str] = []
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            for entry in entries:
+                record, _, error = self._decision_change(db, entry, now)
+                if error:
+                    skipped.append(f"#{entry.key.target.number}: {error}"[:512])
+                elif record is not None:
+                    pending.append(entry)
+        if not pending:
+            return DecisionsRecorded(0, tuple(skipped))
+        written = 0
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            for entry in pending:
+                record, workflow, error = self._decision_change(db, entry, now)
+                if error:
+                    skipped.append(f"#{entry.key.target.number}: {error}"[:512])
+                if record is None or workflow is None:
+                    continue
+                key = entry.key
+                # Written with the gates as they stand: a gate opening on a departed,
+                # closed pull request (practically never) waits at most the closed cadence.
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+                    "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,"
+                    "payload_json=excluded.payload_json",
+                    (_DECISION_NAMESPACE, key.repository, f"pr:{key.target.number}",
+                     _due_stamp(departed_read_after(record, holds_gates=bool(workflow.gates))),
+                     encode_workflow(record)),
+                )
+                written += 1
+                failure = record.read_failure
+                if isinstance(entry, DepartedReadFailed) and failure is not None and (
+                    failure.failed_reads == 1 or departed_backoff_at_ceiling(failure.failed_reads)
+                ):
+                    self._control._transition(
+                        db, "review_departed_read", f"pr:{key.target.number}",
+                        "read_failed" if failure.failed_reads == 1 else "read_backoff_ceiling", {
+                            "failed_reads": failure.failed_reads, "since": failure.first_failed_at.isoformat(),
+                            "next_read_seconds": departed_backoff_seconds(failure.failed_reads),
+                            "reason": failure.reason[:512],
+                        })
+        return DecisionsRecorded(written, tuple(skipped))
+
+    def journal_decision_record_failure(self, detail: str, suppressed: int) -> None:
+        """Journal that the plan's decisions could not be recorded; the caller bounds how often (ADR 0012)."""
+        if type(suppressed) is not int or suppressed < 0:
+            raise ValueError("suppressed failures are a non-negative count")
+        with self._control.transaction() as db:
+            self._control._transition(db, "review_dispatch_record", self._writer.repository, "record_failed",
+                                      {"detail": str(detail)[:512], "suppressed": suppressed})
+
+    def _decision_change(
+        self, db: sqlite3.Connection, entry: DecisionEntry, now: datetime,
+    ) -> tuple[RecordedReviewDecision | None, ReviewWorkflowSnapshot | None, str]:
+        """The record one entry would write, its workflow, and why it cannot be recorded (empty when it can)."""
+        try:
+            workflow = load_review_workflow_row(db, entry.key)
+            if workflow is None:
+                return None, None, ""
+            return next_decision_record(self._decision_or_none(db, entry.key), entry, now), workflow, ""
+        except (WorkflowAuthorityError, ValueError, TypeError) as exc:
+            return None, None, _reason(exc)
+
+    def _decision_or_none(self, db: sqlite3.Connection, key: WorkflowKey) -> RecordedReviewDecision | None:
+        """A malformed prior record is replaced by the next decision, never a reason to record nothing."""
+        try:
+            return self._decision(db, key)
+        except WorkflowAuthorityError:
+            return None
+
+    def recorded_decision(self, key: WorkflowKey) -> RecordedReviewDecision | None:
+        """The review daemon's latest recorded decision for this pull request; raises when it is malformed."""
+        self._scope(key)
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            return self._decision(db, key)
+
+    def departed_pull_requests(self, present: frozenset[int], *, limit: int) -> tuple[int, ...]:
+        """Observed pull requests missing from the daemon's review read whose own read is due, most overdue first.
+
+        `present` is every pull request number the daemon's read returned (any
+        state). The stored due stamp prefilters; the decoded record decides.
+        """
+        if type(limit) is not int or not 1 <= limit <= 64:
+            raise ValueError("departed pull request reads per pass must be between 1 and 64")
+        now = self._now()
+        due: list[int] = []
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            rows = db.execute(
+                "SELECT w.target_number AS number FROM workflows w LEFT JOIN dedupe_keys d ON d.namespace=? "
+                "AND d.scope=w.repository AND d.key='pr:'||w.target_number WHERE w.repository=? "
+                "AND w.target_kind='pr' AND (d.key IS NULL OR d.claimed_at <= ?) "
+                "ORDER BY d.key IS NOT NULL, d.claimed_at, w.target_number",
+                (_DECISION_NAMESPACE, self._writer.repository, _due_stamp(now)),
+            )
+            for row in rows:
+                number = row["number"]
+                if number in present:
+                    continue
+                key = WorkflowKey(self._writer.repository, PullRequestRef(number))
+                record = self._decision_or_none(db, key)
+                try:
+                    workflow = load_review_workflow_row(db, key)
+                    holds_gates = workflow is None or bool(workflow.gates)
+                except WorkflowAuthorityError:
+                    holds_gates = True  # unreadable: read sooner, never later
+                if departed_read_due(record, now, holds_gates=holds_gates):
+                    due.append(number)
+                    if len(due) == limit:
+                        break
+        return tuple(due)
 
     # -- discovery -----------------------------------------------------------------------------
 
@@ -723,11 +1025,18 @@ class SQLiteReviewWorkflowControl:
             raise WorkflowAuthorityError("retry authorization names a command outside this review owner's workflow")
         return facts
 
-    def _retry_authorizable(self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot) -> frozenset[str]:
-        """Retry gates offered exactly when acceptance would admit a grant now."""
+    def _retry_offers(
+        self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot, unavailable: frozenset[str] = frozenset(),
+    ) -> tuple[frozenset[str], tuple[RetryRefusal, ...]]:
+        """Retry gates offered exactly when acceptance would admit a grant now, and why each other one is not.
+
+        A gate in `unavailable` has inconsistent facts; it is neither offered nor explained here.
+        """
         available: set[str] = set()
+        refusals: list[RetryRefusal] = []
         for gate in snapshot.gates:
-            if not isinstance(gate, OpenGate) or not isinstance(gate.cause, RetryAuthorizationRequired):
+            if (not isinstance(gate, OpenGate) or not isinstance(gate.cause, RetryAuthorizationRequired)
+                    or gate.gate_id in unavailable):
                 continue
             try:
                 facts = load_retry_authorization_facts(self._control, db, gate.cause.command_id,
@@ -736,11 +1045,22 @@ class SQLiteReviewWorkflowControl:
                                  (str(gate.cause.command_id),)).fetchone()
                 owned = facts.command_binding.fence.key == snapshot.revision.fence.key and owns_command(
                     db, self._writer, row["executor_identity"])
-            except (WorkflowAuthorityError, ControlStoreError, ValueError, TypeError):
-                continue  # Unreadable authority is never offered as an action.
-            if owned and retry_authorization_available(snapshot, gate, facts):
+            except (WorkflowAuthorityError, ControlStoreError, ValueError, TypeError) as exc:
+                # Unreadable authority is never offered as an action.
+                refusals.append(RetryRefusal(gate.gate_id, f"retry authority is unreadable: {_reason(exc)[:512]}"))
+                continue
+            if not owned:
+                refusals.append(RetryRefusal(gate.gate_id, "the command belongs to another executor or workflow"))
+                continue
+            refusal = retry_authorization_refusal(
+                snapshot, command_id=gate.cause.command_id, gate_id=gate.gate_id,
+                evidence_id=gate.cause.absence_evidence_id, facts=facts,
+            )
+            if refusal is None:
                 available.add(gate.gate_id)
-        return frozenset(available)
+            else:
+                refusals.append(RetryRefusal(gate.gate_id, refusal.reason))
+        return frozenset(available), tuple(refusals)
 
     def _validate_receipts(
         self, db: sqlite3.Connection, prior: ReviewWorkflowSnapshot, transition: WorkflowChanged,
@@ -784,6 +1104,28 @@ class SQLiteReviewWorkflowControl:
         intent = state.intent
         if not isinstance(intent, PendingReviewRearm):
             raise WorkflowAuthorityError("re-arm command facts require a pending intent")
+        rows = self._rearm_command_rows(db, intent)
+        gates = {(g.gate if isinstance(g, RearmingGate) else g).gate_id: (g.gate if isinstance(g, RearmingGate) else g)
+                 for g in state.gates}
+        verified: list[CommandId] = []
+        rejected: list[CommandId] = []
+        uncertainty: list[RemoteOutcomeUncertain] = []
+        for row in rows:
+            outcome, uncertain = self._rearm_command_fact(db, state, gates, row, pr)
+            command_id = CommandId(row["command_id"])
+            if outcome == "verified":
+                verified.append(command_id)
+            elif outcome == "rejected":
+                rejected.append(command_id)
+            if uncertain is not None:
+                uncertainty.append(uncertain)
+        order = {command: index for index, command in enumerate(intent.required_commands)}
+        return (tuple(sorted(verified, key=order.__getitem__)), tuple(sorted(rejected, key=order.__getitem__)),
+                tuple(sorted(uncertainty, key=lambda item: order[item.command_id])))
+
+    @staticmethod
+    def _rearm_command_rows(db: sqlite3.Connection, intent: PendingReviewRearm) -> list[sqlite3.Row]:
+        """The pending intent's associated commands with receipts; exactly its required obligations."""
         rows = db.execute(
             "SELECT association.disposition,command.*,receipt.executor_identity AS receipt_executor,"
             "receipt.started_at AS receipt_started,receipt.completed_at AS receipt_completed,"
@@ -795,63 +1137,63 @@ class SQLiteReviewWorkflowControl:
         required = set(intent.required_commands)
         if {CommandId(row["command_id"]) for row in rows} != required or len(rows) != len(required):
             raise WorkflowAuthorityError("pending review re-arm commands disagree with required obligations")
-        gates = {(g.gate if isinstance(g, RearmingGate) else g).gate_id: (g.gate if isinstance(g, RearmingGate) else g)
-                 for g in state.gates}
-        verified: list[CommandId] = []
-        rejected: list[CommandId] = []
-        uncertainty: list[RemoteOutcomeUncertain] = []
-        for row in rows:
-            command = _command_from_row(row)
-            if (row["disposition"] != "required" or command.workflow != state.binding
-                    or not owns_command(db, self._writer, command.executor_identity)):
-                raise WorkflowAuthorityError("pending review re-arm command belongs to another authority")
-            reconciliation = self._control._command_reconciliation(row)
-            if isinstance(reconciliation, (RetiredUncertainCommand, RetiredSettledCommand)):
-                raise WorkflowAuthorityError("a pending re-arm obligation cannot already be retired")
-            if isinstance(reconciliation, ReconciliationOnly):
-                if row["state"] not in ("executing", "unknown_outcome"):
-                    raise WorkflowAuthorityError("reconciliation-only obligation lacks an unresolved outcome")
-                self._control._require_reconciliation_gate(db, command, reconciliation)
-                gate = gates.get(reconciliation.gate_id)
-                if pr is not None and gate is not None and isinstance(gate.cause, RetryAuthorizationRequired):
-                    op = review_family_op(command)
-                    if op is not None and check_review_op(op, pr).check is ReviewCheck.REFUSED:
-                        rejected.append(command.command_id)
-                continue
-            status = row["receipt_status"]
-            if status is None:
-                if row["state"] not in ("pending", "executing"):
-                    raise WorkflowAuthorityError("settled re-arm command lacks its exact receipt")
-                history = self._control._unresolved_history(row)
-                if history is not None:
-                    uncertainty.append(RemoteOutcomeUncertain(
-                        command.command_id, history.unresolved_since, history.failed_reads,
-                        "command outcome remains unresolved"))
-                continue
-            try:
-                settled = EffectStatus(status)
-                started = datetime.fromisoformat(row["receipt_started"])
-                completed = datetime.fromisoformat(row["receipt_completed"])
-            except (ValueError, TypeError) as exc:
-                raise WorkflowAuthorityError("re-arm command has malformed receipt evidence") from exc
-            if (row["state"] != settled.value or not row["attempt_owner"]
-                    or row["receipt_executor"] != row["attempt_owner"] or completed < started):
-                raise WorkflowAuthorityError("re-arm command receipt disagrees with its execution")
-            if settled is EffectStatus.SUCCEEDED:
-                verified.append(command.command_id)
-            elif settled is EffectStatus.PERMANENT_FAILURE:
-                rejected.append(command.command_id)
-            elif settled is EffectStatus.UNKNOWN_OUTCOME:
-                history = self._control._unresolved_history(row)
-                assert history is not None
-                uncertainty.append(RemoteOutcomeUncertain(
-                    command.command_id, history.unresolved_since, history.failed_reads,
-                    row["receipt_error"] or "command outcome remains unresolved"))
-            elif reconciliation is not None:
-                raise WorkflowAuthorityError("settled command retained incompatible uncertainty")
-        order = {command: index for index, command in enumerate(intent.required_commands)}
-        return (tuple(sorted(verified, key=order.__getitem__)), tuple(sorted(rejected, key=order.__getitem__)),
-                tuple(sorted(uncertainty, key=lambda item: order[item.command_id])))
+        return rows
+
+    def _rearm_command_fact(
+        self, db: sqlite3.Connection, state: ReviewWorkflowSnapshot, gates: dict[str, OpenGate], row: sqlite3.Row,
+        pr: ObservedPullRequest | None,
+    ) -> tuple[str, RemoteOutcomeUncertain | None]:
+        """One required obligation: ("verified" | "rejected" | "pending", its unresolved outcome if any).
+
+        Raises `WorkflowAuthorityError` when the store's rows about it disagree.
+        """
+        command = _command_from_row(row)
+        if (row["disposition"] != "required" or command.workflow != state.binding
+                or not owns_command(db, self._writer, command.executor_identity)):
+            raise WorkflowAuthorityError("pending review re-arm command belongs to another authority")
+        reconciliation = self._control._command_reconciliation(row)
+        if isinstance(reconciliation, (RetiredUncertainCommand, RetiredSettledCommand)):
+            raise WorkflowAuthorityError("a pending re-arm obligation cannot already be retired")
+        if isinstance(reconciliation, ReconciliationOnly):
+            if row["state"] not in ("executing", "unknown_outcome"):
+                raise WorkflowAuthorityError("reconciliation-only obligation lacks an unresolved outcome")
+            self._control._require_reconciliation_gate(db, command, reconciliation)
+            gate = gates.get(reconciliation.gate_id)
+            if pr is not None and gate is not None and isinstance(gate.cause, RetryAuthorizationRequired):
+                op = review_family_op(command)
+                if op is not None and check_review_op(op, pr).check is ReviewCheck.REFUSED:
+                    return "rejected", None
+            return "pending", None
+        status = row["receipt_status"]
+        if status is None:
+            if row["state"] not in ("pending", "executing"):
+                raise WorkflowAuthorityError("settled re-arm command lacks its exact receipt")
+            history = self._control._unresolved_history(row)
+            return "pending", (None if history is None else RemoteOutcomeUncertain(
+                command.command_id, history.unresolved_since, history.failed_reads,
+                "command outcome remains unresolved"))
+        try:
+            settled = EffectStatus(status)
+            started = datetime.fromisoformat(row["receipt_started"])
+            completed = datetime.fromisoformat(row["receipt_completed"])
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError("re-arm command has malformed receipt evidence") from exc
+        if (row["state"] != settled.value or not row["attempt_owner"]
+                or row["receipt_executor"] != row["attempt_owner"] or completed < started):
+            raise WorkflowAuthorityError("re-arm command receipt disagrees with its execution")
+        if settled is EffectStatus.SUCCEEDED:
+            return "verified", None
+        if settled is EffectStatus.PERMANENT_FAILURE:
+            return "rejected", None
+        if settled is EffectStatus.UNKNOWN_OUTCOME:
+            history = self._control._unresolved_history(row)
+            assert history is not None
+            return "pending", RemoteOutcomeUncertain(
+                command.command_id, history.unresolved_since, history.failed_reads,
+                row["receipt_error"] or "command outcome remains unresolved")
+        if reconciliation is not None:
+            raise WorkflowAuthorityError("settled command retained incompatible uncertainty")
+        return "pending", None
 
     def _persist(
         self, db: sqlite3.Connection, prior: ReviewWorkflowSnapshot, transition: WorkflowChanged, encoded: str,
@@ -1088,19 +1430,24 @@ class SQLiteReviewWorkflowControl:
         })
         return True
 
+    def _restore_records(self, db: sqlite3.Connection, key: WorkflowKey) -> list[sqlite3.Row]:
+        return db.execute("SELECT key, payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key LIKE ?",
+                          (_HOLD_RESTORES_NAMESPACE, self._writer.repository, f"pr:{key.target.number}:%")).fetchall()
+
+    @staticmethod
+    def _restore_count(payload_json: str) -> tuple[int, bool]:
+        try:
+            payload = json.loads(payload_json)
+            restores, contested = int(payload["restores"]), payload["contested"]
+            if restores < 0 or not isinstance(contested, bool):
+                raise ValueError("negative or untyped restoration count")
+        except (ValueError, TypeError, KeyError) as exc:
+            raise WorkflowAuthorityError("hold restoration count is malformed") from exc
+        return restores, contested
+
     def _restore_rows(self, db: sqlite3.Connection, key: WorkflowKey) -> dict[str, tuple[int, bool]]:
-        rows: dict[str, tuple[int, bool]] = {}
-        for row in db.execute("SELECT key, payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key LIKE ?",
-                              (_HOLD_RESTORES_NAMESPACE, self._writer.repository, f"pr:{key.target.number}:%")):
-            try:
-                payload = json.loads(row["payload_json"])
-                restores, contested = int(payload["restores"]), payload["contested"]
-                if restores < 0 or not isinstance(contested, bool):
-                    raise ValueError("negative or untyped restoration count")
-            except (ValueError, TypeError, KeyError) as exc:
-                raise WorkflowAuthorityError("hold restoration count is malformed") from exc
-            rows[row["key"].split(":", 2)[2]] = (restores, contested)
-        return rows
+        return {row["key"].split(":", 2)[2]: self._restore_count(row["payload_json"])
+                for row in self._restore_records(db, key)}
 
     def _clear_stale_restores(
         self, db: sqlite3.Connection, key: WorkflowKey, state: ReviewWorkflowSnapshot,
@@ -1436,6 +1783,11 @@ class SQLiteReviewWorkflowControl:
             raise ValueError("retry authorization requires a typed command and authenticated actor")
         key = self._scope(command.expected.fence.key)
         with self._barriers():
+            # A grant on a closed pull request would be spent on a certain
+            # refusal. Only a read that finds it terminal refuses here; an
+            # unavailable read leaves the decision to the executor's own guard.
+            observed, _ = read_pull_request(self._gateway, key, self._now(), reviews=False)
+            terminal = isinstance(observed, ObservedPullRequest) and observed.state is not PullRequestState.OPEN
             with self._control.transaction() as db:
                 prior = self._load(db, key)
                 stored = db.execute(
@@ -1453,6 +1805,8 @@ class SQLiteReviewWorkflowControl:
                                             "authorization identity was reused with different content or operator")
                 if prior.revision != command.expected:
                     return WorkflowConflict(prior.revision, "workflow changed before retry authorization")
+                if terminal:
+                    return WorkflowRejected(WorkflowRejection.INVALID_SCOPE, "the pull request is terminal")
                 gate = next((g for g in prior.gates if isinstance(g, OpenGate) and g.gate_id == command.gate_id), None)
                 if gate is None or not isinstance(gate.cause, RetryAuthorizationRequired) or (
                     gate.cause.command_id, gate.cause.absence_evidence_id,

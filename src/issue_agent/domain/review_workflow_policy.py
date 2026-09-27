@@ -249,6 +249,9 @@ def escalation_signal_identity(command: object) -> str | None:
     return None
 
 
+REVIEW_REARM_OBSERVATION_GATE_PREFIX = "review-rearm-observation:"
+
+
 def review_rearm_observation_gate_id(request_id: str) -> str:
     """The one visible hold a pending review re-arm's unavailable reconciliation reads can open.
 
@@ -256,7 +259,7 @@ def review_rearm_observation_gate_id(request_id: str) -> str:
     stopping the intent removes it with the stop (ADR 0012/0015).
     """
     validate_workflow_identifier(request_id, "request")
-    return "review-rearm-observation:" + _digest("review_rearm_observation", request_id)
+    return REVIEW_REARM_OBSERVATION_GATE_PREFIX + _digest("review_rearm_observation", request_id)
 
 
 def review_dismissal_command_id(key: WorkflowKey, request_id: str, review_id: str) -> CommandId:
@@ -886,12 +889,30 @@ def _plan(command_id: CommandId, held: bool, trigger_label: Label) -> ReviewProj
     return ReviewProjectionPlan(command_id, Label.NEEDS_HUMAN_REVIEW, trigger)
 
 
-def _replacement(
+@dataclass(frozen=True)
+class RearmKeptHolds:
+    """What a re-arm keeps holding, exactly as its acceptance plans the projection (ADR 0015).
+
+    `gates` are the independent gates the re-arm keeps, `external` the trusted
+    external holds of the read it plans from, `covered` the retired
+    obligations it replaces. Held means the relabel keeps needs-human-review
+    and no review is bought; otherwise the relabel returns the pull request to
+    review and one fresh review is owed.
+    """
+    gates: tuple[UnresolvedGate, ...]
+    external: tuple[str, ...]
+    covered: tuple[CommandId, ...]
+
+    @property
+    def held(self) -> bool:
+        return bool(self.gates) or bool(self.external)
+
+
+def _kept_holds(
     snapshot: ReviewWorkflowSnapshot, gates: tuple[UnresolvedGate, ...], selected_gate_id: str,
-    obligations: tuple[CommandId, ...], projection_id: CommandId, external_holds: tuple[str, ...],
-    trigger_label: Label,
-) -> tuple[tuple[CommandId, ...], ReviewProjectionPlan]:
-    """Which retired obligations the replacement covers, and the projection it plans.
+    obligations: tuple[CommandId, ...], external_holds: tuple[str, ...], trigger_label: Label,
+) -> RearmKeptHolds:
+    """Which retired obligations the replacement covers, and the holds that remain.
 
     Retired dismissals are idempotent and always covered. The stopped relabel
     is covered only when it would land the replacement's own labels; an
@@ -899,15 +920,49 @@ def _replacement(
     effect and stays an independent hold, so the replacement is held (ADR 0015).
     """
     holds = _holds(external_holds)
-    intended = _plan(projection_id, _held(gates, selected_gate_id, obligations, holds), trigger_label)
+
+    def kept(covered: tuple[CommandId, ...]) -> RearmKeptHolds:
+        return RearmKeptHolds(tuple(g for g in gates if _open(g).gate_id != selected_gate_id
+                                    and not _covered(g, covered)), holds, covered)
+    intended = kept(obligations)
     stopped = snapshot.intent
     if not isinstance(stopped, (SupersededReviewRearm, CancelledReviewRearm)):
-        return obligations, intended
+        return intended
     relabel = stopped.projection.command_id
-    if relabel not in obligations or stopped.projection.labels == intended.labels:
-        return obligations, intended
-    covered = tuple(c for c in obligations if c != relabel)
-    return covered, _plan(projection_id, _held(gates, selected_gate_id, covered, holds), trigger_label)
+    if relabel not in obligations or stopped.projection.labels == _plan(relabel, intended.held, trigger_label).labels:
+        return intended
+    return kept(tuple(c for c in obligations if c != relabel))
+
+
+def _request_gates(snapshot: ReviewWorkflowSnapshot) -> tuple[UnresolvedGate, ...]:
+    """The gates a new request keeps: it absorbs every decision gate, and its advance ends the rest (`ends_with_advance`)."""
+    return tuple(g for g in snapshot.gates if not _is_decision(g) and not ends_with_advance(g))
+
+
+def request_rearm_kept_holds(
+    snapshot: ReviewWorkflowSnapshot, gate_id: str, external_holds: tuple[str, ...], trigger_label: Label,
+) -> RearmKeptHolds:
+    """The holds `request_review_rearm` on ceiling `gate_id` keeps, given a read's trusted external holds.
+
+    The one predicate acceptance plans its projection from and the operator
+    view describes the re-arm by, so the two can never disagree.
+    """
+    absorbed = tuple(c for g in snapshot.gates if isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision)
+                     for c in g.cause.obligations)
+    return _kept_holds(snapshot, _request_gates(snapshot), gate_id, absorbed, external_holds, trigger_label)
+
+
+def continue_rearm_kept_holds(
+    snapshot: ReviewWorkflowSnapshot, gate_id: str, external_holds: tuple[str, ...], trigger_label: Label,
+) -> RearmKeptHolds:
+    """The holds `continue_review_rearm` on decision gate `gate_id` keeps, given a read's trusted external holds."""
+    gate = next((g for g in snapshot.gates if isinstance(g, OpenGate) and g.gate_id == gate_id
+                 and isinstance(g.cause, RearmNeedsDecision)), None)
+    if gate is None:
+        raise ValueError("a continuation's holds are planned for one of its decision gates")
+    assert isinstance(gate.cause, RearmNeedsDecision)
+    return _kept_holds(snapshot, tuple(g for g in snapshot.gates if not ends_with_advance(g)), gate_id,
+                       gate.cause.obligations, external_holds, trigger_label)
 
 
 def _projection(snapshot: ReviewWorkflowSnapshot, head_sha: str, labels: frozenset[Label], *,
@@ -1310,19 +1365,15 @@ def request_review_rearm(
     by_id = {review.review_id: review for review in cause.counted}
     dismissals = tuple(by_id[review.review_id] for review in counted)
     revision = _next(snapshot, advance_generation=True)
-    # A generation advance fences every older command, so pre-write holds end.
-    gates = tuple(RearmingGate(gate, command.request_id) if g == gate else g
-                  for g in snapshot.gates if not _is_decision(g) and not ends_with_advance(g))
-    # The absorbed decision's retired obligations are covered by this request
+    # A generation advance fences every older command, so pre-write holds end;
+    # the absorbed decision's retired obligations are covered by this request
     # exactly as a continuation covers its own.
-    absorbed = tuple(c for g in snapshot.gates if isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision)
-                     for c in g.cause.obligations)
-    replaces, projection = _replacement(
-        snapshot, gates, gate.gate_id, absorbed, review_projection_command_id(snapshot.revision.fence.key,
-                                                                              command.request_id),
-        external_holds, trigger_label)
+    gates = tuple(RearmingGate(gate, command.request_id) if g == gate else g for g in _request_gates(snapshot))
+    kept = request_rearm_kept_holds(snapshot, gate.gate_id, external_holds, trigger_label)
+    projection = _plan(review_projection_command_id(snapshot.revision.fence.key, command.request_id), kept.held,
+                       trigger_label)
     intent = _pending_intent(snapshot, command.request_id, gate.gate_id, dismissals, cause.counted, cause.rule,
-                             projection, replaces)
+                             projection, kept.covered)
     episode = replace(snapshot.episode, guidance=_guidance(snapshot, command),
                       continuation=FreshReviewRequired(revision.fence.generation))
     after = replace(snapshot, revision=revision, episode=episode, intent=intent, gates=gates)
@@ -1531,11 +1582,11 @@ def continue_review_rearm(
     assert isinstance(gate.cause, RearmNeedsDecision)
     gates = tuple(RearmingGate(gate, command.request_id) if g == gate else g
                   for g in snapshot.gates if not ends_with_advance(g))
-    replaces, projection = _replacement(
-        snapshot, gates, gate.gate_id, gate.cause.obligations,
-        review_projection_command_id(snapshot.revision.fence.key, command.request_id), external_holds, trigger_label)
+    kept = continue_rearm_kept_holds(snapshot, gate.gate_id, external_holds, trigger_label)
+    projection = _plan(review_projection_command_id(snapshot.revision.fence.key, command.request_id), kept.held,
+                       trigger_label)
     intent = _pending_intent(snapshot, command.request_id, gate.gate_id, dismissals, stopped.authorized, stopped.rule,
-                             projection, replaces)
+                             projection, kept.covered)
     after = replace(
         snapshot, revision=revision, intent=intent,
         episode=replace(snapshot.episode, continuation=FreshReviewRequired(revision.fence.generation)), gates=gates,

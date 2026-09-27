@@ -105,6 +105,11 @@ def load_resolve_authority(db: sqlite3.Connection, repository: str) -> FamilyAut
     return load_family_authority(db, WorkflowFamily.RESOLVE, repository)
 
 
+def active_families(db: sqlite3.Connection, repository: str) -> tuple[WorkflowFamily, ...]:
+    """Every family activated for this repository; the legacy unblock is retired while any is (ADR 0015)."""
+    return tuple(family for family in WorkflowFamily if load_family_authority(db, family, repository) is not None)
+
+
 def _require_family(key: WorkflowKey, family: WorkflowFamily) -> tuple[str, str, int]:
     if not isinstance(key, WorkflowKey) or target_family(key.target) is not family:
         raise WorkflowAuthorityError(f"{family.value} authority does not own this workflow target")

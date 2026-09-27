@@ -225,6 +225,40 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/repos/{name}/pulls/{pr}/review-control": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Review Control */
+        get: operations["api_review_control_api_repos__name__pulls__pr__review_control_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/repos/{name}/pulls/{pr}/review-control/commands": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Api Review Command */
+        post: operations["api_review_command_api_repos__name__pulls__pr__review_control_commands_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/repos/{name}/start": {
         parameters: {
             query?: never;
@@ -236,6 +270,23 @@ export interface paths {
         put?: never;
         /** Api Start */
         post: operations["api_start_api_repos__name__start_post"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/api/repos/{name}/workflow-families": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Workflow Families */
+        get: operations["api_workflow_families_api_repos__name__workflow_families_get"];
+        put?: never;
+        post?: never;
         delete?: never;
         options?: never;
         head?: never;
@@ -1277,6 +1328,830 @@ export interface components {
              */
             kind: "retry_authorization_required";
         };
+        /** ReviewAbsentControl */
+        ReviewAbsentControl: {
+            /** Epoch */
+            epoch: number;
+            /** Pull Request */
+            pull_request: number;
+            /** Repository */
+            repository: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "absent";
+        };
+        /** ReviewActionOffered */
+        ReviewActionOffered: {
+            /** Effect */
+            effect: string;
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry";
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "offered";
+        };
+        /** ReviewActionRefused */
+        ReviewActionRefused: {
+            /**
+             * Operation
+             * @enum {string}
+             */
+            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry";
+            /** Reason */
+            reason: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "refused";
+        };
+        /** ReviewAttemptedRemediation */
+        ReviewAttemptedRemediation: {
+            /** Evidence Ids */
+            evidence_ids: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "attempted";
+            /** Operation */
+            operation: string;
+            /** Outcome */
+            outcome: string;
+        };
+        /**
+         * ReviewAuthorizeRetry
+         * @description One execution of an existing command; the evidence is the harness's own read.
+         */
+        ReviewAuthorizeRetry: {
+            /** Authorization Id */
+            authorization_id: string;
+            /** Command Id */
+            command_id: string;
+            /** Evidence Id */
+            evidence_id: string;
+            expected: components["schemas"]["ReviewExpected"];
+            /** Gate Id */
+            gate_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "authorize_retry";
+        };
+        /** ReviewAvailableControl */
+        ReviewAvailableControl: {
+            /** Continuation */
+            continuation: components["schemas"]["ReviewFreshReviewRequired"] | components["schemas"]["ReviewReviewedBaseline"];
+            /** Current Intent */
+            current_intent: (components["schemas"]["ReviewPendingRearm"] | components["schemas"]["ReviewCompletedRearm"] | components["schemas"]["ReviewStoppedRearm"]) | null;
+            /**
+             * Daemon
+             * @description The review daemon's recorded dispatch decision, never derived by this API.
+             */
+            daemon: components["schemas"]["ReviewDaemonRecorded"] | components["schemas"]["ReviewDaemonUnrecorded"] | components["schemas"]["ReviewDaemonUnreadable"];
+            expected: components["schemas"]["ReviewExpected"];
+            /** Gates */
+            gates: components["schemas"]["ReviewGate"][];
+            /** Guidance */
+            guidance: string;
+            observation: components["schemas"]["ReviewObservation"] | null;
+            /** Requested Id */
+            requested_id: string | null;
+            /** Requested Intent */
+            requested_intent: (components["schemas"]["ReviewPendingRearm"] | components["schemas"]["ReviewCompletedRearm"] | components["schemas"]["ReviewStoppedRearm"]) | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "available";
+            /**
+             * Workflow Held
+             * @description SQLite workflow holds only, not a remote readiness assertion; acceptance re-reads GitHub.
+             */
+            workflow_held: boolean;
+        };
+        /** ReviewBoundSubmission */
+        ReviewBoundSubmission: {
+            /** Command Id */
+            command_id: string;
+            /** Generation */
+            generation: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "bound_submission";
+        };
+        /** ReviewCancelRearm */
+        ReviewCancelRearm: {
+            /** Cancellation Id */
+            cancellation_id: string;
+            expected: components["schemas"]["ReviewExpected"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "cancel_rearm";
+            /** Reason */
+            reason: string;
+            /** Request Id */
+            request_id: string;
+        };
+        /** ReviewCommandResult */
+        ReviewCommandResult: {
+            /** Control */
+            control: components["schemas"]["ReviewAvailableControl"] | components["schemas"]["ReviewInactiveControl"] | components["schemas"]["ReviewMigrationRequiredControl"] | components["schemas"]["ReviewAbsentControl"] | components["schemas"]["ReviewUnavailableControl"];
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "accepted" | "replayed" | "conflict" | "rejected" | "unavailable";
+            /** Reason */
+            reason: string;
+        };
+        /** ReviewCompletedRearm */
+        ReviewCompletedRearm: {
+            /** Gate Id */
+            gate_id: string;
+            /** Generation */
+            generation: number;
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "completed";
+            /** Verified Commands */
+            verified_commands: string[];
+        };
+        /** ReviewContinueRearm */
+        ReviewContinueRearm: {
+            expected: components["schemas"]["ReviewExpected"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "continue_rearm";
+            /** Request Id */
+            request_id: string;
+            /** Stopped Request Id */
+            stopped_request_id: string;
+        };
+        /** ReviewCountedReview */
+        ReviewCountedReview: {
+            /** Author */
+            author: string;
+            /** Commit Id */
+            commit_id: string | null;
+            /** Review Id */
+            review_id: string;
+        };
+        /**
+         * ReviewDaemonRecorded
+         * @description The review daemon's own latest decision: made at `decided_at`, last confirmed unchanged at `as_of`.
+         */
+        ReviewDaemonRecorded: {
+            /** As Of */
+            as_of: string;
+            /** Decided At */
+            decided_at: string;
+            /** Dispatch */
+            dispatch: components["schemas"]["ReviewDispatchTerminal"] | components["schemas"]["ReviewDispatchNotAdmitted"] | components["schemas"]["ReviewDispatchDeferred"] | components["schemas"]["ReviewDispatchHeld"] | components["schemas"]["ReviewDispatchSubmissionUnresolved"] | components["schemas"]["ReviewDispatchReleasePending"] | components["schemas"]["ReviewDispatchOwed"] | components["schemas"]["ReviewDispatchWithheld"] | components["schemas"]["ReviewDispatchInFlight"] | components["schemas"]["ReviewDispatchNotOwed"];
+            pull_request: components["schemas"]["ReviewDecisionBasis"] | null;
+            /**
+             * Read
+             * @enum {string}
+             */
+            read: "review_read" | "departed_read";
+            /** @description The pull request's own read keeps failing; null once a read succeeds. */
+            read_failure: components["schemas"]["ReviewReadFailure"] | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "recorded";
+        };
+        /** ReviewDaemonUnreadable */
+        ReviewDaemonUnreadable: {
+            /** Reason */
+            reason: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "unreadable";
+        };
+        /**
+         * ReviewDaemonUnrecorded
+         * @description The review daemon has not recorded a decision for this pull request yet.
+         */
+        ReviewDaemonUnrecorded: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "unrecorded";
+        };
+        /**
+         * ReviewDecisionBasis
+         * @description The pull request facts the review daemon decided from, all from its own read.
+         */
+        ReviewDecisionBasis: {
+            /**
+             * External Holds
+             * @description Holds a re-arm keeps: trusted hold labels and the unproductive-round breaker.
+             */
+            external_holds: string[];
+            /** Head Sha */
+            head_sha: string;
+            /** Labels */
+            labels: string[];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "open" | "closed" | "merged";
+        };
+        /** ReviewDismissalObligation */
+        ReviewDismissalObligation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "dismiss_review";
+            /** Review Id */
+            review_id: string;
+        };
+        /**
+         * ReviewDispatchDeferred
+         * @description The daemon could not decide (an unreadable fact) or waits for a bounded read schedule.
+         */
+        ReviewDispatchDeferred: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "deferred";
+            /** Reason */
+            reason: string;
+        };
+        /** ReviewDispatchHeld */
+        ReviewDispatchHeld: {
+            /** Gate Ids */
+            gate_ids: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "held";
+        };
+        /**
+         * ReviewDispatchInFlight
+         * @description Owed, and already running: this pull request's own review dispatch still holds its reservation.
+         */
+        ReviewDispatchInFlight: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "in_flight";
+            /**
+             * Review
+             * @enum {string}
+             */
+            review: "initial" | "re_review";
+        };
+        /**
+         * ReviewDispatchNotAdmitted
+         * @description Holds outside the review workflow keep review dispatch off this pull request; no re-arm removes them.
+         */
+        ReviewDispatchNotAdmitted: {
+            /** Holds */
+            holds: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "not_admitted";
+        };
+        /** ReviewDispatchNotOwed */
+        ReviewDispatchNotOwed: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "not_owed";
+            /** Reason */
+            reason: string;
+        };
+        /** ReviewDispatchOwed */
+        ReviewDispatchOwed: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "owed";
+            /**
+             * Review
+             * @enum {string}
+             */
+            review: "initial" | "re_review";
+        };
+        /** ReviewDispatchReleasePending */
+        ReviewDispatchReleasePending: {
+            /** Command Id */
+            command_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "release_projection_pending";
+        };
+        /** ReviewDispatchSubmissionUnresolved */
+        ReviewDispatchSubmissionUnresolved: {
+            /** Command Ids */
+            command_ids: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "submission_unresolved";
+        };
+        /** ReviewDispatchTerminal */
+        ReviewDispatchTerminal: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "terminal";
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "closed" | "merged";
+        };
+        /**
+         * ReviewDispatchWithheld
+         * @description Owed, but this tick's dispatch admission withheld it: a fix run's claim, or another reservation.
+         */
+        ReviewDispatchWithheld: {
+            /** Detail */
+            detail: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "withheld";
+            /**
+             * Reason
+             * @enum {string}
+             */
+            reason: "fix_claim" | "reserved";
+            /**
+             * Review
+             * @enum {string}
+             */
+            review: "initial" | "re_review";
+        };
+        /** ReviewEvidenceUnavailableCause */
+        ReviewEvidenceUnavailableCause: {
+            /**
+             * Evidence
+             * @enum {string}
+             */
+            evidence: "exemption_trailers" | "review_history" | "prewrite_read" | "rearm_observation" | "other";
+            /** Failed Reads */
+            failed_reads: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "evidence_unavailable";
+            /** Last Error */
+            last_error: string;
+            /** Source */
+            source: string;
+            /** Unresolved Since */
+            unresolved_since: string;
+        };
+        /** ReviewExpected */
+        ReviewExpected: {
+            /** Episode Id */
+            episode_id: string;
+            /** Epoch */
+            epoch: number;
+            /**
+             * Family
+             * @constant
+             * @enum {string}
+             */
+            family: "review_rejections";
+            /** Generation */
+            generation: number;
+            /** Pull Request */
+            pull_request: number;
+            /** Repository */
+            repository: string;
+            /** Version */
+            version: number;
+        };
+        /** ReviewFreshReviewRequired */
+        ReviewFreshReviewRequired: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "fresh_review_required";
+            /** Owed Since Generation */
+            owed_since_generation: number;
+        };
+        /** ReviewGate */
+        ReviewGate: {
+            /** Actions */
+            actions: (components["schemas"]["ReviewActionOffered"] | components["schemas"]["ReviewActionRefused"])[];
+            /** Cause */
+            cause: components["schemas"]["ReviewRejectionCeilingCause"] | components["schemas"]["ReviewRemoteUncertainCause"] | components["schemas"]["ReviewRetryAuthorizationRequiredCause"] | components["schemas"]["ReviewEvidenceUnavailableCause"] | components["schemas"]["ReviewRearmNeedsDecisionCause"] | components["schemas"]["ReviewProjectionRefusedCause"] | components["schemas"]["ReviewGateFactsUnavailableCause"];
+            /** Gate Id */
+            gate_id: string;
+            /** Opened Generation */
+            opened_generation: number;
+            pending_retry: components["schemas"]["ReviewPendingRetry"] | null;
+            /** Remediation */
+            remediation: components["schemas"]["ReviewNoRemediation"] | components["schemas"]["ReviewAttemptedRemediation"];
+            /**
+             * State
+             * @enum {string}
+             */
+            state: "open" | "rearming";
+        };
+        /**
+         * ReviewGateFactsUnavailableCause
+         * @description The store's own facts about this gate disagree (its retry grants or obligation receipts).
+         *
+         *     The gate still holds and reconciliation is unaffected; nothing is offered
+         *     on it until the facts agree again.
+         */
+        ReviewGateFactsUnavailableCause: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "facts_unavailable";
+            /** Reason */
+            reason: string;
+            /**
+             * Underlying
+             * @enum {string}
+             */
+            underlying: "review_rejection_ceiling" | "remote_uncertain" | "retry_authorization_required" | "evidence_unavailable" | "rearm_needs_decision" | "review_projection_refused";
+        };
+        /**
+         * ReviewHoldContested
+         * @description Restorations are spent: an actor keeps removing the hold; the gate alone still holds every review.
+         */
+        ReviewHoldContested: {
+            /** Restore Limit */
+            restore_limit: number;
+            /** Restores */
+            restores: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "contested";
+        };
+        /**
+         * ReviewHoldUncontested
+         * @description The harness restores a removed attention hold, a bounded number of times.
+         */
+        ReviewHoldUncontested: {
+            /** Restore Limit */
+            restore_limit: number;
+            /** Restores */
+            restores: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "restoring";
+        };
+        /**
+         * ReviewHoldUnreadable
+         * @description The harness's restoration record for this ceiling is malformed; the gate and its lever are unaffected.
+         */
+        ReviewHoldUnreadable: {
+            /** Reason */
+            reason: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "unreadable";
+        };
+        /** ReviewImportedBaseline */
+        ReviewImportedBaseline: {
+            /** Evidence Id */
+            evidence_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "imported";
+        };
+        /**
+         * ReviewInactiveControl
+         * @description Not activated; the legacy unblock still owns this repository's review holds.
+         */
+        ReviewInactiveControl: {
+            /** Pull Request */
+            pull_request: number;
+            /** Repository */
+            repository: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "inactive";
+        };
+        /**
+         * ReviewMigrationRequiredControl
+         * @description Not activated, and another family's activation retired the legacy unblock: no lever until activation.
+         */
+        ReviewMigrationRequiredControl: {
+            /** Active Families */
+            active_families: string[];
+            /** Pull Request */
+            pull_request: number;
+            /** Repository */
+            repository: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "migration_required";
+        };
+        /** ReviewNoRemediation */
+        ReviewNoRemediation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "none_authorized";
+            /** Reason */
+            reason: string;
+        };
+        /** ReviewObservation */
+        ReviewObservation: {
+            /** Failed Reads */
+            failed_reads: number;
+            /** Last Error */
+            last_error: string;
+            /** Next Read At */
+            next_read_at: string;
+            /** Unresolved Since */
+            unresolved_since: string;
+        };
+        /** ReviewPendingRearm */
+        ReviewPendingRearm: {
+            /** Authorized Reviews */
+            authorized_reviews: string[];
+            /** Commands */
+            commands: components["schemas"]["ReviewRearmCommand"][];
+            /** Gate Id */
+            gate_id: string;
+            /** Generation */
+            generation: number;
+            /** Request Id */
+            request_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "pending";
+        };
+        /**
+         * ReviewPendingRetry
+         * @description One authorized retry accepted and awaiting the executor's decision.
+         */
+        ReviewPendingRetry: {
+            /** Authorization Id */
+            authorization_id: string;
+            /** Command Id */
+            command_id: string;
+        };
+        /** ReviewProjectionObligation */
+        ReviewProjectionObligation: {
+            /** Add */
+            add: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "projection";
+            /** Remove */
+            remove: string | null;
+        };
+        /** ReviewProjectionRefusedCause */
+        ReviewProjectionRefusedCause: {
+            /** Command Id */
+            command_id: string;
+            /** Generation */
+            generation: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "review_projection_refused";
+            /**
+             * Projection
+             * @enum {string}
+             */
+            projection: "ceiling_release" | "escalation_hold";
+            /** Reason */
+            reason: string;
+        };
+        /**
+         * ReviewReadFailure
+         * @description Consecutive failed departed reads; the decision and facts beside it are the last good read's, if any.
+         */
+        ReviewReadFailure: {
+            /** Failed Reads */
+            failed_reads: number;
+            /** First Failed At */
+            first_failed_at: string;
+            /** Last Failed At */
+            last_failed_at: string;
+            /** Reason */
+            reason: string;
+        };
+        /** ReviewRearmCommand */
+        ReviewRearmCommand: {
+            /** Command Id */
+            command_id: string;
+            /** Obligation */
+            obligation: components["schemas"]["ReviewDismissalObligation"] | components["schemas"]["ReviewProjectionObligation"] | components["schemas"]["ReviewUnlabelledObligation"];
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "pending" | "verified" | "refused" | "uncertain" | "held" | "unavailable";
+        };
+        /** ReviewRearmNeedsDecisionCause */
+        ReviewRearmNeedsDecisionCause: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "rearm_needs_decision";
+            /** Obligations */
+            obligations: string[];
+            /** Reason */
+            reason: string;
+            /** Stopped Request Id */
+            stopped_request_id: string;
+        };
+        /** ReviewRejectionCeilingCause */
+        ReviewRejectionCeilingCause: {
+            /** Authorization Bound */
+            authorization_bound: number;
+            /** Ceiling */
+            ceiling: number;
+            /** Counted */
+            counted: components["schemas"]["ReviewCountedReview"][];
+            /** Counted Total */
+            counted_total: number;
+            /** Episode Id */
+            episode_id: string;
+            /** Head Sha */
+            head_sha: string;
+            /** Hold */
+            hold: components["schemas"]["ReviewHoldUncontested"] | components["schemas"]["ReviewHoldContested"] | components["schemas"]["ReviewHoldUnreadable"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "review_rejection_ceiling";
+            /** Non Resetting Commits */
+            non_resetting_commits: string[];
+            /** Review Bot */
+            review_bot: string;
+        };
+        /** ReviewRemoteUncertainCause */
+        ReviewRemoteUncertainCause: {
+            /** Command Id */
+            command_id: string;
+            /** Failed Reads */
+            failed_reads: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "remote_uncertain";
+            /** Last Error */
+            last_error: string;
+            /** Unresolved Since */
+            unresolved_since: string;
+        };
+        /**
+         * ReviewRequestRearm
+         * @description Authorize dismissal of exactly the gate's observed counted bot reviews; the set is never on the wire.
+         */
+        ReviewRequestRearm: {
+            expected: components["schemas"]["ReviewExpected"];
+            /** Gate Id */
+            gate_id: string;
+            /** Guidance */
+            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "request_rearm";
+            /** Request Id */
+            request_id: string;
+        };
+        /** ReviewRetryAuthorizationRequiredCause */
+        ReviewRetryAuthorizationRequiredCause: {
+            /** Absence Evidence Id */
+            absence_evidence_id: string;
+            /** Command Id */
+            command_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "retry_authorization_required";
+            /** Retry Authorizable */
+            retry_authorizable: boolean;
+        };
+        /** ReviewReviewedBaseline */
+        ReviewReviewedBaseline: {
+            /** Head Sha */
+            head_sha: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "reviewed_baseline";
+            /** Patch Id */
+            patch_id: string;
+            /** Reviewed Generation */
+            reviewed_generation: number;
+            /** Source */
+            source: components["schemas"]["ReviewBoundSubmission"] | components["schemas"]["ReviewImportedBaseline"];
+        };
+        /**
+         * ReviewStoppedRearm
+         * @description A cancelled or superseded request; retired obligations never execute.
+         */
+        ReviewStoppedRearm: {
+            /** Authorized Reviews */
+            authorized_reviews: string[];
+            /** Gate Id */
+            gate_id: string;
+            /** Generation */
+            generation: number;
+            /** Reason */
+            reason: string;
+            /** Request Id */
+            request_id: string;
+            /** Retired Commands */
+            retired_commands: string[];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            state: "cancelled" | "superseded";
+            /** Verified Commands */
+            verified_commands: string[];
+        };
+        /** ReviewUnavailableControl */
+        ReviewUnavailableControl: {
+            /** Reason */
+            reason: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "unavailable";
+        };
+        /** ReviewUnlabelledObligation */
+        ReviewUnlabelledObligation: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "unlabelled";
+        };
         /** RoleHealth */
         RoleHealth: {
             /** Alive */
@@ -1435,6 +2310,31 @@ export interface components {
             status: string | null;
         } & {
             [key: string]: unknown;
+        };
+        /**
+         * WorkflowFamiliesAvailable
+         * @description The repository's activated workflow families; the legacy unblock is retired while any is active.
+         */
+        WorkflowFamiliesAvailable: {
+            /** Active Families */
+            active_families: ("resolve" | "review_rejections")[];
+            /** Repository */
+            repository: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "available";
+        };
+        /** WorkflowFamiliesUnavailable */
+        WorkflowFamiliesUnavailable: {
+            /** Reason */
+            reason: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "unavailable";
         };
     };
     responses: never;
@@ -1868,6 +2768,76 @@ export interface operations {
             };
         };
     };
+    api_review_control_api_repos__name__pulls__pr__review_control_get: {
+        parameters: {
+            query?: {
+                request_id?: string | null;
+            };
+            header?: never;
+            path: {
+                name: string;
+                pr: number;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewAvailableControl"] | components["schemas"]["ReviewInactiveControl"] | components["schemas"]["ReviewMigrationRequiredControl"] | components["schemas"]["ReviewAbsentControl"] | components["schemas"]["ReviewUnavailableControl"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_review_command_api_repos__name__pulls__pr__review_control_commands_post: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+                pr: number;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["ReviewRequestRearm"] | components["schemas"]["ReviewContinueRearm"] | components["schemas"]["ReviewCancelRearm"] | components["schemas"]["ReviewAuthorizeRetry"];
+            };
+        };
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["ReviewCommandResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     api_start_api_repos__name__start_post: {
         parameters: {
             query?: never;
@@ -1886,6 +2856,37 @@ export interface operations {
                 };
                 content: {
                     "application/json": components["schemas"]["ActionResult"];
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
+    api_workflow_families_api_repos__name__workflow_families_get: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["WorkflowFamiliesAvailable"] | components["schemas"]["WorkflowFamiliesUnavailable"];
                 };
             };
             /** @description Validation Error */

@@ -8,12 +8,13 @@ bounded run of unavailable or undecidable reads opens one visible
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 
 from .contracts import CommandId
-from .resolve_rearm import RearmObservation
+from .resolve_rearm import PendingRetry, RearmObservation
+from .review_dispatch_record import RecordedReviewDecision
 from .review_workflow import (
     CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, ObservedPullRequest, PendingReviewRearm, ReviewRearmIntent,
     ReviewRearmPreflight, ReviewWorkflowSnapshot, SupersededReviewRearm,
@@ -25,9 +26,12 @@ from .review_workflow_policy import (
 from .labels import Label
 from .workflow import (
     EvidenceUnavailable, NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationPolicy, RemoteOutcomeUncertain,
-    StopReason, WorkflowRejected, WorkflowRejection, WorkflowTransition, WorkflowUnchanged,
+    RetryAuthorizationRequired, StopReason, WorkflowRejected, WorkflowRejection, WorkflowTransition, WorkflowUnchanged,
 )
-from .workflow_identity import FamilyAuthority, WorkflowKey, validate_workflow_identifier
+from .workflow_identity import (
+    MAX_DETAIL_CHARS, MAX_WORKFLOW_GATES, FamilyAuthority, WorkflowFamily, WorkflowKey, validate_workflow_identifier,
+    validate_workflow_text,
+)
 
 
 @dataclass(frozen=True)
@@ -162,11 +166,32 @@ class ReleaseProjection:
 
 @dataclass(frozen=True)
 class InactiveReviewControl:
+    """The review family is not activated and no other family retired the legacy unblock."""
     key: WorkflowKey
 
     def __post_init__(self) -> None:
         if not isinstance(self.key, WorkflowKey):
             raise ValueError("inactive review control requires a queried workflow")
+
+
+@dataclass(frozen=True)
+class MigrationRequiredReviewControl:
+    """The review family is not activated, yet another family's activation retired the legacy unblock.
+
+    No lever exists for this pull request's review holds until the review
+    family is activated (plan decision 2: never two authorities, no fallback).
+    """
+    key: WorkflowKey
+    active_families: tuple[WorkflowFamily, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.key, WorkflowKey):
+            raise ValueError("migration-required review control requires a queried workflow")
+        if (not isinstance(self.active_families, tuple) or not self.active_families
+                or any(not isinstance(family, WorkflowFamily) or family is WorkflowFamily.REVIEW_REJECTIONS
+                       for family in self.active_families)
+                or len(set(self.active_families)) != len(self.active_families)):
+            raise ValueError("migration-required review control names the other active families")
 
 
 @dataclass(frozen=True)
@@ -179,9 +204,107 @@ class AbsentReviewControl:
             raise ValueError("absent review control requires its active family authority")
 
 
+# The harness restores an open ceiling's hold at most MAX_HOLD_RESTORES times;
+# a stored count is bounded far above that so corruption is refused, not shown.
+_MAX_RESTORE_COUNT = 2**31
+
+
+@dataclass(frozen=True)
+class HoldRestoration:
+    """How often the harness re-projected an open ceiling's missing hold, and whether it gave up (contested)."""
+    gate_id: str
+    restores: int
+    contested: bool
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.gate_id, "restored gate")
+        if type(self.restores) is not int or not 0 <= self.restores <= _MAX_RESTORE_COUNT:
+            raise ValueError("hold restorations are a bounded non-negative count")
+        if not isinstance(self.contested, bool):
+            raise ValueError("a hold contest is recorded as a boolean fact")
+
+
+@dataclass(frozen=True)
+class UnreadableHoldRestoration:
+    """The harness's restoration record for this ceiling cannot be read; the gate and its lever are unaffected."""
+    gate_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.gate_id, "restored gate")
+        validate_workflow_text(self.reason, "unreadable restoration", limit=MAX_DETAIL_CHARS)
+
+
+@dataclass(frozen=True)
+class GateFactsUnavailable:
+    """The store's own facts about this gate (retry grants, obligation receipts) disagree; nothing is offered on it.
+
+    Only the view degrades: the gate still holds and reconciliation, which
+    reads the same facts strictly, is unchanged.
+    """
+    gate_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.gate_id, "gate with unavailable facts")
+        validate_workflow_text(self.reason, "unavailable gate facts", limit=MAX_DETAIL_CHARS)
+
+
+@dataclass(frozen=True)
+class UnreadableReviewDecision:
+    """The review daemon's recorded decision for this pull request is malformed."""
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_text(self.reason, "unreadable review decision", limit=MAX_DETAIL_CHARS)
+
+
+@dataclass(frozen=True)
+class RetryRefusal:
+    """Why the shared grant policy would refuse a retry authorization for this gate now."""
+    gate_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.gate_id, "retry gate")
+        validate_workflow_text(self.reason, "retry refusal", limit=MAX_DETAIL_CHARS)
+
+
+class RearmCommandStatus(str, Enum):
+    PENDING = "pending"          # not yet settled: queued or executing before any expiry
+    VERIFIED = "verified"        # its SUCCEEDED receipt
+    REFUSED = "refused"          # a verified refusal (the command's guard no longer held)
+    UNCERTAIN = "uncertain"      # outcome unknown; bounded reconciliation continues
+    HELD = "held"                # reconciliation-only under its own visible gate
+    UNAVAILABLE = "unavailable"  # the store's facts about this command disagree (view only)
+
+
+@dataclass(frozen=True)
+class RearmCommandProgress:
+    command_id: CommandId
+    status: RearmCommandStatus
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "re-arm command")
+        if not isinstance(self.status, RearmCommandStatus):
+            raise ValueError("re-arm command status must be typed")
+
+
+def _unique_gates(items: tuple, name: str) -> set[str]:
+    gates = [item.gate_id for item in items]
+    if len(set(gates)) != len(gates):
+        raise ValueError(f"{name} name each gate at most once")
+    return set(gates)
+
+
 @dataclass(frozen=True)
 class ReviewControlView:
-    """One read snapshot of a PR's review control; inspection never schedules or writes."""
+    """One read snapshot of a PR's review control; inspection never schedules or writes.
+
+    Every field is a harness-owned fact read in one SQLite snapshot.
+    `decision` is the review daemon's own recorded dispatch decision (with
+    the read it decided from and its as-of time), never re-derived here.
+    """
     snapshot: ReviewWorkflowSnapshot
     requested_id: str | None
     requested: ReviewRearmIntent | None
@@ -190,10 +313,22 @@ class ReviewControlView:
     # Retry gates the shared grant policy would admit now: offered exactly
     # when acceptance would succeed, never a grant the executor must discard.
     retry_authorizable: frozenset[str] = frozenset()
+    retry_refusals: tuple[RetryRefusal, ...] = ()
+    retry_pending: tuple[PendingRetry, ...] = ()
+    decision: RecordedReviewDecision | UnreadableReviewDecision | None = None
+    hold_restorations: tuple[HoldRestoration | UnreadableHoldRestoration, ...] = ()
+    review_runs_active: bool = False
+    command_progress: tuple[RearmCommandProgress, ...] = ()
+    gate_facts_unavailable: tuple[GateFactsUnavailable, ...] = ()
+    # The configured review trigger acceptance plans a release with; the view
+    # describes a re-arm with the same kept-holds predicate acceptance uses.
+    trigger_label: Label = field(kw_only=True)
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ReviewWorkflowSnapshot):
             raise ValueError("review control view requires current workflow authority")
+        if not isinstance(self.trigger_label, Label) or self.trigger_label is Label.NEEDS_HUMAN_REVIEW:
+            raise ValueError("the review trigger is a label other than the attention hold")
         if self.requested_id is not None:
             validate_workflow_identifier(self.requested_id, "requested re-arm")
         if self.requested is not None and (
@@ -202,7 +337,8 @@ class ReviewControlView:
             or self.requested.request_id != self.requested_id
         ):
             raise ValueError("requested review re-arm must belong to this exact request")
-        if isinstance(self.snapshot.intent, PendingReviewRearm):
+        intent = self.snapshot.intent
+        if isinstance(intent, PendingReviewRearm):
             if self.observation is None:
                 raise ValueError("pending review control requires its observation history")
             PendingReviewRecovery(self.snapshot, self.observation)
@@ -210,13 +346,48 @@ class ReviewControlView:
             raise ValueError("only current pending control carries observation history")
         if self.release is not None and not isinstance(self.release, ReleaseProjection):
             raise ValueError("release projection must be typed")
+        gates = {(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in self.snapshot.gates}
+        retry_gates = {g.gate_id for g in self.snapshot.gates
+                       if isinstance(g, OpenGate) and isinstance(g.cause, RetryAuthorizationRequired)}
         if not isinstance(self.retry_authorizable, frozenset) or any(
             not isinstance(gate_id, str) for gate_id in self.retry_authorizable
         ):
             raise ValueError("retry-authorizable gates must be a frozenset of gate identities")
-        gates = {(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in self.snapshot.gates}
         if not self.retry_authorizable <= gates:
             raise ValueError("only open gates can offer a retry authorization")
+        for name, items, kind in (("retry refusals", self.retry_refusals, RetryRefusal),
+                                  ("pending retries", self.retry_pending, PendingRetry),
+                                  ("hold restorations", self.hold_restorations,
+                                   (HoldRestoration, UnreadableHoldRestoration)),
+                                  ("re-arm command progress", self.command_progress, RearmCommandProgress),
+                                  ("gates with unavailable facts", self.gate_facts_unavailable,
+                                   GateFactsUnavailable)):
+            if not isinstance(items, tuple) or len(items) > MAX_WORKFLOW_GATES * 2 or any(
+                not isinstance(item, kind) for item in items
+            ):
+                raise ValueError(f"{name} must be a bounded tuple of typed facts")
+        refused = _unique_gates(self.retry_refusals, "retry refusals")
+        if not refused <= retry_gates or refused & self.retry_authorizable:
+            raise ValueError("a retry refusal explains one retry gate that is not offered")
+        waiting = _unique_gates(self.retry_pending, "pending retries")
+        if not waiting <= gates or waiting & self.retry_authorizable:
+            raise ValueError("a pending retry names one visible gate that is not also offered")
+        if not _unique_gates(self.hold_restorations, "hold restorations") <= gates:
+            raise ValueError("hold restorations belong to visible gates")
+        unavailable = _unique_gates(self.gate_facts_unavailable, "gates with unavailable facts")
+        if not unavailable <= gates or unavailable & (self.retry_authorizable | refused | waiting):
+            raise ValueError("a gate whose facts are unavailable is visible and neither offered, refused nor waiting")
+        if isinstance(self.decision, RecordedReviewDecision):
+            if self.decision.key != self.snapshot.revision.fence.key:
+                raise ValueError("the recorded review decision belongs to this workflow")
+        elif self.decision is not None and not isinstance(self.decision, UnreadableReviewDecision):
+            raise ValueError("the review decision is recorded, unreadable or absent")
+        if not isinstance(self.review_runs_active, bool):
+            raise ValueError("whether a review run is live is a boolean fact")
+        progress = tuple(item.command_id for item in self.command_progress)
+        expected = intent.required_commands if isinstance(intent, PendingReviewRearm) else ()
+        if progress and progress != expected:
+            raise ValueError("re-arm command progress follows exactly the pending intent's obligations")
 
 
-ReviewControlRead = InactiveReviewControl | AbsentReviewControl | ReviewControlView
+ReviewControlRead = InactiveReviewControl | MigrationRequiredReviewControl | AbsentReviewControl | ReviewControlView

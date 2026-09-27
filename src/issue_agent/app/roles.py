@@ -74,6 +74,9 @@ from ..domain.fix import (
     merge_preconditions_met,
 )
 from ..domain.review import REVIEW_APPROVED
+from ..domain.review_dispatch_record import (
+    AdmissionInFlight, AdmissionOutcome, AdmissionWithheld, WithheldReason,
+)
 from ..domain.labels import Label
 from ..domain.ci import parse_timestamp
 from ..domain.workflow import (
@@ -180,8 +183,8 @@ from .infra_breaker import InfraBreaker
 from ..domain.infra_breaker import BreakerPolicy
 from .execute import Executor
 from .review_runtime import (
-    ActiveReviewRuntime, compose_review_control, review_external_holds,
-    review_guidance_reader, unproductive_round_keys, unproductive_rounds_reader,
+    ActiveReviewRuntime, ReviewDispatchPlan, configured_review_control,
+    review_guidance_reader, unproductive_round_keys,
 )
 from .workflows.resolve_rearm import ResolveRearmWorkflow
 from .loop import Daemon
@@ -920,6 +923,11 @@ class DispatchPathReservations:
     def issue_for(self, action: RunAgent) -> int | None:
         with self._lock:
             return self._actions.get(action)
+
+    def running(self, number: int) -> bool:
+        """Whether a dispatch this process reserved for target number `number` still holds its reservation."""
+        with self._lock:
+            return any(action.number == number for action in self._actions)
 
     def snapshot(self) -> tuple[InFlightFix, ...]:
         with self._lock:
@@ -3318,45 +3326,61 @@ def compose_review_daemon(
         journal, cfg.repo, say, control
     )
 
-    def decide_actions(world) -> list:
+    def decide_actions(world) -> tuple[list, ReviewDispatchPlan | None]:
         try:
             active = review_family_activated(control, cfg.repo)
         except WorkflowAuthorityError as exc:
             # Unknown activation: neither path may buy a review this tick.
             say(f"review dispatch held: {exc}")
-            return []
+            return [], None
         if not active:
             state = _review_state(
                 store, world, control.abandoned_dispatch_counts(owner_id)
             )
             for target, reason in state.control_errors.items():
                 say(f"PR #{target} held: {reason}")
-            return decide_review(world, rcfg, state)
+            return decide_review(world, rcfg, state), None
         if runtime is None:
             say("review dispatch held: the review family is active but this "
                 "gateway cannot read pull request reviews")
-            return []
-        plan = runtime.plan(world, rcfg)
-        errors: dict[int, str] = dict(plan.errors)
+            return [], None
+        # The breaker counters come first: the plan records the admission
+        # decision `decide_bound_review` applies with exactly these counts.
+        counter_errors: dict[int, str] = {}
         unproductive = _review_unproductive_rounds(
-            store, world, control.abandoned_dispatch_counts(owner_id), errors
+            store, world, control.abandoned_dispatch_counts(owner_id), counter_errors
         )
+        plan = runtime.plan(world, rcfg, unproductive, counter_errors)
+        errors: dict[int, str] = {**plan.errors, **counter_errors}
         for target, reason in errors.items():
             say(f"PR #{target} held: {reason}")
         for target, reason in plan.held.items():
             say(f"PR #{target} review held by its workflow: {reason}")
         return decide_bound_review(world, rcfg, BoundReviewState(
             owed=plan.owed, unproductive_rounds=unproductive, control_errors=errors,
-        ))
+        )), plan
 
     def decide(world):
-        actions = decide_actions(world)
+        actions, review_plan = decide_actions(world)
+        admissions: dict[int, AdmissionOutcome] = {}
+        admitted = _admit(world, actions, admissions)
+        if review_plan is not None and runtime is not None:
+            # After admission, so an owed review it did not start is recorded
+            # as withheld or running. `record_plan` never raises: the record
+            # is the operator view's projection, never dispatch authority.
+            runtime.record_plan(review_plan, admissions)
+        return admitted
+
+    def _admit(world, actions, admissions: dict[int, AdmissionOutcome]) -> list:
         plan = hold_review_dispatch(
             actions,
             _fix_holds(control, cfg.repo, world, datetime.now(timezone.utc)),
             ceiling_seconds=fix_hold_ceiling_seconds(cfg.agent_max_runtime),
         )
         report_fix_holds(plan.deferred, plan.forced)
+        for hold in plan.deferred:
+            admissions[hold.pr] = AdmissionWithheld(
+                WithheldReason.FIX_CLAIM, f"a fix run still holds this pull request's issue ({int(hold.held_seconds)}s)")
         actions = list(plan.actions)
         prs = {pr.number: pr for pr in world.prs}
         rejected_prs: set[int] = set()
@@ -3375,6 +3399,14 @@ def compose_review_daemon(
             ):
                 continue
             rejected_prs.add(action.number)
+            if reservations.running(action.number):
+                # This pull request's own review still holds the target: it is
+                # the owed review, running, not a competing claim.
+                admissions[action.number] = AdmissionInFlight()
+                continue
+            admissions[action.number] = AdmissionWithheld(WithheldReason.RESERVED, (
+                f"target {issue} is already reserved (another pull request on the same issue here, or another "
+                "deployment's claim)"))
             say(
                 f"dispatch {action.kind.name} PR #{action.number}: "
                 f"deferred — target {issue} is already reserved (another PR "
@@ -3468,19 +3500,9 @@ def _active_review_runtime(
     """The review family's runtime, or None when the gateway cannot read reviews."""
     if not isinstance(gateway, ReviewReads):
         return None
-    trailers = getattr(gateway, "pr_commit_messages", None)
-    workflow = compose_review_control(
-        control, gateway, repository=cfg.repo, owner_id=owner_id,
-        ceiling=cfg.review_runtime.max_rejections, trigger_label=rcfg.trigger_label,
-        review_bot=rcfg.review_bot,
-        external_holds=review_external_holds(
-            unproductive_rounds_reader(
-                store, lambda: control.abandoned_dispatch_counts(owner_id)
-            ),
-            rcfg.max_unproductive_rounds,
-        ),
-        trailers=trailers if callable(trailers) else None,
-    )
+    # `rcfg` is derived from `cfg.review_runtime`, the same values the shared
+    # composition reads, so the operator transport enforces this daemon's rule.
+    workflow = configured_review_control(cfg, control, gateway, store, owner_id)
     return ActiveReviewRuntime(
         workflow, effects, gateway, review_bot=rcfg.review_bot, log=log,
     )

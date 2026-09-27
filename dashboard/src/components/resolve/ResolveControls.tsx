@@ -10,6 +10,8 @@ interface ResolveControlsProps {
   issue: number;
   /** The issue is held for a human by labels or stage (legacy choreography). */
   heldForHuman: boolean;
+  /** Set when a linked pull request's review control retires the label-based unblock. */
+  legacyRefusal?: string | null;
   onChanged: () => void;
 }
 
@@ -22,13 +24,14 @@ export function ResolveControls(props: ResolveControlsProps) {
   return <ResolveControlsForIssue key={JSON.stringify([props.deployment, props.issue])} {...props} />;
 }
 
-function ResolveControlsForIssue({ deployment, issue, heldForHuman, onChanged }: ResolveControlsProps) {
+function ResolveControlsForIssue({ deployment, issue, heldForHuman, legacyRefusal = null, onChanged }: ResolveControlsProps) {
   const controller = useResolveControl(deployment, issue);
   const [legacy, setLegacy] = useState<{ busy: boolean; error: string | null } | null>(null);
   const { control, readError, loading, operation } = controller;
   // Only a fresh, witnessed inactive family may use the label-based unblock.
-  // Absent, unavailable, unknown and active authority never fall back to it.
-  const legacyAllowed = heldForHuman && control?.status === "inactive"
+  // Absent, unavailable, unknown and active authority never fall back to it,
+  // and neither does an active review family (the server refuses it too).
+  const legacyAllowed = heldForHuman && control?.status === "inactive" && !legacyRefusal
     && !readError && !loading && !operationLocksActions(operation);
   const quiet = operation.kind === "idle" && !readError && !controller.actionError && !heldForHuman
     && !controller.lookupId
@@ -60,6 +63,7 @@ function ResolveControlsForIssue({ deployment, issue, heldForHuman, onChanged }:
       actionError={controller.actionError}
       operation={operation}
       legacyAllowed={legacyAllowed}
+      legacyRefusal={heldForHuman && control?.status === "inactive" ? legacyRefusal : null}
       onPrepare={controller.onPrepare}
       onConfirm={controller.onConfirm}
       onDismiss={controller.onDismiss}

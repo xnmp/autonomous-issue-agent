@@ -752,7 +752,8 @@ test("operator workflow preserves semantics and navigation", async ({ page }) =>
   await expect(page.getByRole("tab", { name: /Done/ })).toHaveAttribute("aria-selected", "true");
 
   await page.getByRole("button", { name: "Verification ledger" }).click();
-  await expect(page.getByText("Verification ledger", { selector: ".section-title span" })).toBeVisible();
+  // getByText takes no `selector` option; scope to the view's own title (the sidebar and mainbar repeat the name).
+  await expect(page.locator(".section-title span", { hasText: "Verification ledger" })).toBeVisible();
   await expect(page.getByRole("tab", { name: "Verification" })).toHaveCount(0);
   await expect(page.getByRole("tab", { name: "Overview" })).toHaveCount(0);
 });

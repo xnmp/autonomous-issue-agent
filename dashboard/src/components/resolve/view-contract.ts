@@ -9,6 +9,8 @@ export interface ResolveControlViewProps {
   actionError: string | null;
   operation: ResolveOperation;
   legacyAllowed: boolean;
+  /** Why the legacy unblock is retired even though resolve is inactive (an active review family). */
+  legacyRefusal?: string | null;
   /** The request ID whose history is being read, or "" for the current intent. */
   lookupId: string;
   onPrepare: (draft: ResolveDraft) => void;

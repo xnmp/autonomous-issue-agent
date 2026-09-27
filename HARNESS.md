@@ -310,6 +310,197 @@ activated resolve authority, including missing targets. It also refuses absent,
 unwitnessed, corrupt or outdated databases; operators must use the explicit
 offline migration/activation procedure when that slice is accepted.
 
+### Review rejection operator API
+
+The same loopback dashboard exposes the pull-request-scoped review family:
+`GET /api/repos/{name}/pulls/{pr}/review-control` and `POST` to the same path
+plus `/commands`. Guards, size limits, request-ID replay and the status-code
+taxonomy are the resolve API's: 202 accepted durable intent, 200 canonical
+replay, 409 stale revision or reused identity, 422 invalid or refused, 503
+unavailable (always a typed body, never an empty gate list). Commands are
+accepted by the review owner's workflow authority under the fix→review→steward
+barriers; the HTTP request executes no GitHub effect. The review daemon's drain
+executes every accepted obligation. GET reads SQLite only.
+
+The issue page mounts one review panel per linked pull request that is not
+merged. The panel is quiet while the family is `inactive`. Other statuses:
+
+- `absent` (404): the review daemon has recorded no workflow for this pull
+  request, so it holds no review-rejection gate and nothing can be re-armed.
+  A label on GitHub is not such a hold. The panel says so.
+
+- `migration_required`: the review family is not activated but another family
+  is. The legacy unblock is retired, so this pull request's review holds have
+  no lever until the review family is activated (plan decision 2: activate both
+  families together).
+- `unavailable` (503): the authority is unreadable or corrupt.
+- `available`: gates with typed causes, the continuation (fresh review owed,
+  or the reviewed baseline and its provenance), the pending intent with
+  per-obligation progress, and the review daemon's recorded decision.
+
+A gate whose own SQLite facts disagree (two open retry grants, or obligation
+receipts that contradict the intent) reads `facts_unavailable`, naming the
+underlying cause. That gate still holds and offers nothing; every other gate,
+the decision and the daemon are unaffected. A malformed hold-restoration
+record reads `hold.state = unreadable` on its ceiling only, and a malformed
+recorded decision reads `daemon.state = unreadable`. Neither makes the view 503.
+
+`GET /api/repos/{name}/workflow-families` returns the repository's activated
+families, read exactly as the server's legacy `/unblock` refusal reads them.
+It returns 503 while the authority is unreadable or uninitialized. The
+label-based legacy unblock stays disabled, with the reason shown, unless that
+read shows no family active. While review control is active, the reason
+points at the linked pull requests' review panels, or says that an issue with
+none has no lever until resolve control is active.
+
+Every applicable command appears on its gate, either offered with its effect
+or refused with its reason. The UI never sends a refused command. Refusals
+cover only facts SQLite proves:
+
+- another request is pending;
+- the counted set exceeds the 63-review bound of one re-arm;
+- a review run for the pull request is still live;
+- a retry grant is already waiting, or the shared grant policy refuses one.
+
+- the review daemon recorded the pull request merged; every action on every
+  gate is then refused.
+
+A pull request the daemon recorded closed keeps its gates and its commands:
+closing retires nothing, and a reopen needs the lever. `request_rearm`,
+`continue_rearm` and `authorize_retry` say that acceptance re-reads GitHub and
+refuses while the pull request stays closed; a refused retry grant is never
+stored, so none is spent on a certain refusal. Remote facts (a moved head, a closed pull request,
+reviews counted since the gate opened) are decided by acceptance's own fresh
+read, which returns 422 for a moved head or a terminal pull request.
+
+The commands:
+
+- `request_rearm` on a `review_rejection_ceiling` gate authorizes dismissal of
+  exactly the counted bot reviews listed in the gate. It never dismisses a
+  human review or a later review, and the review set is never on the wire.
+  Tagged guidance (`keep`/`clear`/`set`) reaches exactly the next paid review.
+  The re-arm then owes one fresh review and returns the pull request to review
+  once every dismissal and the relabel are verified. The view and acceptance
+  share one predicate for the holds a re-arm keeps
+  (`request_rearm_kept_holds`): other open gates except the ones its
+  generation advance ends (unreadable review evidence, pre-write reads, a
+  refused projection), a stopped re-arm's decision gate it absorbs, and
+  uncertainty over a retired obligation it covers; plus the trusted external
+  holds (`ai-blocked`, `ai-parked`, `needs-budget-review`, the
+  unproductive-round breaker) of the daemon's last read, where acceptance uses
+  its own fresh read. When any remain, the effect text says the re-arm buys no
+  review and names them.
+  When it showed labels the relabel leaves but review dispatch skips
+  (`no-ai-review`, `needs-design`, `ai-done`, `ai-working`, an untrusted
+  `ai-parked`), the text says the pull request returns to review but no review
+  is bought until they are removed. The ceiling's own `needs-human-review` is
+  neither. A ceiling with more than
+  63 counted reviews is shown refused. Dismiss some on GitHub; ceiling
+  reconciliation then refreshes or releases the gate.
+- `cancel_rearm` stops the pending request. Verified effects remain,
+  unexecuted obligations are retired and never run, and a
+  `rearm_needs_decision` gate holds the pull request.
+- `continue_rearm` on that decision gate re-plans the stopped request's
+  remaining authorized dismissals against a fresh read. It carries no new
+  authorization. Its effect text says, from the same kept-holds predicate as
+  its acceptance (`continue_rearm_kept_holds`), whether it buys a review.
+- `authorize_retry` behaves as it does for resolve, except that acceptance
+  first reads the pull request and refuses a closed or merged one. The review
+  drain executes it.
+
+A command naming another family epoch or episode conflicts (409).
+
+The view's `daemon` is the review daemon's own recorded dispatch decision; the
+view never decides dispatch itself. Provenance: harness-owned. Only the review
+role's plan tick writes it, from the daemon's own GitHub read, through the
+review owner's workflow control (SQLite `dedupe_keys` namespace
+`review-dispatch-decision`, one row per pull request). The operator transport
+and the dashboard only read it. It carries:
+
+- `dispatch`, the plan's typed decision, in the daemon's order: `terminal`
+  (closed or merged, first); then the workflow's own holds: `held` by gates,
+  `submission_unresolved`, `release_projection_pending` (an open gate's
+  projected `needs-human-review` is recorded here, never as a label hold);
+  `not_admitted` naming each hold outside the review workflow (a missing
+  trigger, `needs-human-review`, `ai-parked`, `no-ai-review`, a draft or the
+  bot's own pull request when adopting, lifecycle holds, the unproductive-round
+  breaker, solo identity); `deferred` (an unreadable fact or a failed read);
+  `owed` (it passed the tick's dispatch admission; the spend cap still decides
+  when the paid leg runs); `withheld` (owed, but this tick's admission withheld
+  it: `fix_claim`, a live fix run on the same issue, or `reserved`, another
+  pull request's or deployment's claim on the target); `in_flight` (owed and
+  already running: the pull request's own dispatch still holds its
+  reservation); `not_owed`;
+- `pull_request`, the facts it decided from (head, state, labels, and the
+  holds a re-arm keeps), or null when no read of its own succeeded;
+- `read`: `review_read` (the trigger-labelled review read) or `departed_read`
+  (the pull request's own read after it left that read);
+- `decided_at`, and `as_of`: when it was last confirmed unchanged;
+- `read_failure`: consecutive failed departed reads (count, latest reason,
+  first and latest failure), or null.
+
+The record is the view's projection, never dispatch authority. The departed
+reads run in the plan, before admission; after admission only pure
+construction and one SQLite write run, and any failure there is logged and
+journalled (`review_dispatch_record` `record_failed`) at most once per 15
+minutes with the count it suppressed. It never changes or drops an admitted
+review.
+
+A changed decision or basis is written at once; an unchanged one refreshes
+`as_of` at most every 5 minutes. A stopped or wedged daemon therefore shows an
+old `as_of`, never a fresher guess. A pull request that leaves the review read
+(its trigger swapped for a hold, or closed) is read on its own at once, then
+every 15 minutes. A closed one is re-read every 15 minutes for the first 24
+hours after its recorded close while its workflow holds gates (so a prompt
+reopen is seen promptly), otherwise every 6 hours; a merged one never again; at
+most 4 such reads per tick. A failed read keeps the last good facts of the
+pull request's own read (a closed one stays shown closed, as of that read) and
+adds `read_failure`; with no such facts it records `deferred`. Consecutive
+failures back off 15 min, 30 min, 1 h, 2 h, 4 h, then every 6 h from the latest
+failure. The control journal records `review_departed_read` `read_failed` at
+the first failure and `read_backoff_ceiling` when the backoff reaches 6 h; a
+successful read clears the failure. Only a read decides that a
+pull request is closed. `daemon.state = unrecorded` means no tick has recorded
+it yet.
+
+`REVIEW_MAX_REJECTIONS=0` disables the ceiling. Relaunch the review role from a
+fresh launch snapshot (`issue-agent start`); each open ceiling gate is then
+released at its next ceiling reconciliation, on the held-ceiling backoff of at
+most 30 minutes. The release is `RELEASE_CEILING`: it advances the generation,
+owes one fresh review, and relabels the pull request back to the trigger label
+unless another hold remains. A human dismissing the counted reviews on GitHub
+releases the gate the same way.
+
+Contested hold. An open ceiling's `needs-human-review` hold is restored when an
+actor removes it, at most three times. After that the ceiling reads
+`hold.state = contested`: the harness stops restoring the label and journals
+`hold_contested` once. The operator is signalled at most once per escalation.
+The gate alone still holds every review.
+It exits when the gate closes, through a completed re-arm, a human dismissal
+of the counted reviews, or a disabled ceiling; `hold_contest_cleared` is
+journalled then. Stop the automation that removes the label first.
+
+Exhausted escalation. A verdict escalation's `needs-human-review` projection
+refused by hold facts is re-planned at most twice. After that it becomes a
+`review_projection_refused` gate with `projection = escalation_hold` and one
+operator signal. No operator command applies. To exit:
+
+- apply the planned labels by hand; the next harness read verifies them;
+- or push a new head, or close the pull request, which makes the escalation
+  moot.
+
+A refused ceiling-release relabel (`projection = ceiling_release`) exits when
+the labels are corrected by hand or a later generation supersedes it.
+
+Residual (phase 4): the review control releases only rejection-ceiling holds.
+Two external holds are never removed by a review projection (plan decision 3):
+`needs-human-review` from an ESCALATE verdict, and the unproductive-round
+breaker. Once a family is active, the legacy unblock no longer clears them
+either. A re-arm under such a hold keeps `needs-human-review` and buys no
+review; its effect text says so when the daemon's last read showed the hold,
+and acceptance's fresh read decides it otherwise. The projection obligation
+reads "add needs-human-review". The release path for these holds is phase 4.
+
 ### Resolve family activation (offline, operator-only)
 
 A deployment's resolve family stays **inactive** until an operator activates it;

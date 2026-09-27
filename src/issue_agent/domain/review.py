@@ -21,7 +21,7 @@ from .exemptions import AuthenticatedGrantPairs
 from .identity import IdentityMode, login_eq
 from .labels import Label
 from .lifecycle import (
-    AllowedEligibility, LifecycleOperation, pr_eligibility, pr_escalation,
+    AllowedEligibility, HeldEligibility, InvalidEligibility, LifecycleOperation, pr_eligibility, pr_escalation,
     retry_breaker,
 )
 from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
@@ -645,6 +645,90 @@ class BoundReviewState:
     control_errors: Mapping[int, str] = field(default_factory=dict)
 
 
+# The unproductive-round breaker as a named hold. Persisted inside accepted
+# re-arm preflights (their external holds), so the text never changes.
+UNPRODUCTIVE_ROUND_HOLD = "unproductive review round ceiling"
+
+
+@dataclass(frozen=True)
+class ReviewAdmitted:
+    """Review dispatch may buy a review of this pull request; `adopt` claims a rogue PR's trigger first."""
+    adopt: bool
+
+
+@dataclass(frozen=True)
+class ReviewExcluded:
+    """Facts outside the review workflow keep review dispatch off this pull request, each hold named.
+
+    `breaker` marks the unproductive-round ceiling, which escalates a
+    triggered pull request instead of silently skipping it.
+    """
+    holds: tuple[str, ...]
+    breaker: bool = False
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.holds, tuple) or not self.holds
+                or any(not isinstance(hold, str) or not hold for hold in self.holds)):
+            raise ValueError("an exclusion names each hold that applies")
+        if not isinstance(self.breaker, bool):
+            raise ValueError("whether the unproductive-round breaker tripped is a boolean fact")
+
+
+ReviewAdmission = ReviewAdmitted | ReviewExcluded
+
+# Labels that take a pull request out of review, in the order they are named.
+_EXCLUDING_LABELS = (Label.NEEDS_HUMAN_REVIEW, Label.AI_PARKED, Label.NO_AI_REVIEW)
+
+
+@dataclass(frozen=True)
+class _OpenLabelled:
+    """An open pull request carrying exactly `labels`: what lifecycle eligibility reads of one."""
+    labels: frozenset[Label]
+    state: str = "OPEN"
+
+
+def labels_holding_review(labels: frozenset[Label]) -> tuple[str, ...]:
+    """The labels that keep review dispatch off an open pull request carrying them (lifecycle eligibility)."""
+    # Eligibility stops at `ai-done` (a terminal lifecycle); every holding label is named.
+    eligibility = pr_eligibility(_OpenLabelled(frozenset(labels) - {Label.AI_DONE}), LifecycleOperation.REVIEW)
+    held = set(eligibility.reasons) if isinstance(eligibility, HeldEligibility) else set()
+    if Label.AI_DONE in labels:
+        held.add(Label.AI_DONE.value)
+    return tuple(sorted(held))
+
+
+def review_candidacy(pr: PRView, cfg: ReviewConfig) -> ReviewAdmission:
+    """Whether review dispatch considers this pull request at all: its trigger label, or rogue-PR adoption.
+
+    The review plan and `review_eligibility` share this predicate, so the
+    recorded decision can never name a different reason than the one the
+    daemon acted on.
+    """
+    if pr.has(cfg.trigger_label):
+        return ReviewAdmitted(adopt=False)
+    if should_adopt(pr, cfg):
+        return ReviewAdmitted(adopt=True)
+    holds = tuple(label.value for label in _EXCLUDING_LABELS if pr.has(label))
+    if not holds and cfg.adopt_unlabeled and pr.state == "OPEN":
+        holds = (("draft",) if pr.is_draft else
+                 ("opened by the review bot",) if login_eq(pr.author, cfg.review_bot) else ())
+    return ReviewExcluded(holds or (f"no {cfg.trigger_label.value} label",))
+
+
+def review_eligibility(pr: PRView, cfg: ReviewConfig, unproductive_rounds: int) -> ReviewAdmission:
+    """The complete admission `decide_bound_review` applies to a pull request its workflow owes a review."""
+    if cfg.identity_mode == IdentityMode.SOLO:
+        return ReviewExcluded(("solo identity mode",))
+    eligibility = pr_eligibility(pr, LifecycleOperation.REVIEW)
+    if isinstance(eligibility, HeldEligibility):
+        return ReviewExcluded(eligibility.reasons or ("lifecycle hold",))
+    if isinstance(eligibility, InvalidEligibility):
+        return ReviewExcluded((eligibility.reason,))
+    if retry_breaker(unproductive_rounds, cfg.max_unproductive_rounds).tripped:
+        return ReviewExcluded((UNPRODUCTIVE_ROUND_HOLD,), breaker=True)
+    return review_candidacy(pr, cfg)
+
+
 def decide_bound_review(
     world: WorldState, cfg: ReviewConfig, state: BoundReviewState
 ) -> list[Action]:
@@ -654,22 +738,22 @@ def decide_bound_review(
     its captured binding. The legacy `sessions`/`last_sha` predicates and the
     abandoned-at-ceiling re-escalation are not consulted: the ceiling gate is
     the hold, released only by a re-arm or ceiling reconciliation, so there is
-    no dead state to re-escalate. The unproductive-round breaker and rogue-PR
-    adoption behave as in `decide_review`.
+    no dead state to re-escalate. Admission is `review_eligibility`, the
+    predicate the review plan records; the unproductive-round breaker and
+    rogue-PR adoption behave as in `decide_review`.
     """
     if cfg.identity_mode == IdentityMode.SOLO:
         return []
     actions: list[Action] = []
 
-    def eligible(pr: PRView) -> bool:
-        return pr.number not in state.control_errors and isinstance(
-            pr_eligibility(pr, LifecycleOperation.REVIEW), AllowedEligibility)
+    def admission(pr: PRView) -> ReviewAdmission | None:
+        if state.owed.get(pr.number) is None or pr.number in state.control_errors:
+            return None
+        return review_eligibility(pr, cfg, state.unproductive_rounds.get(pr.number, 0))
 
     for pr in world.prs_with(cfg.trigger_label):
-        owed = state.owed.get(pr.number)
-        if owed is None or not eligible(pr):
-            continue
-        if retry_breaker(state.unproductive_rounds.get(pr.number, 0), cfg.max_unproductive_rounds).tripped:
+        verdict = admission(pr)
+        if isinstance(verdict, ReviewExcluded) and verdict.breaker:
             if not pr.has(Label.NEEDS_HUMAN_REVIEW):
                 actions.extend(pr_escalation(
                     pr.number,
@@ -677,16 +761,16 @@ def decide_bound_review(
                     from_label=cfg.trigger_label,
                 ).actions())
             continue
-        kind, binding = owed
+        if not isinstance(verdict, ReviewAdmitted):
+            continue
+        kind, binding = state.owed[pr.number]
         actions.append(RunAgent(kind, pr.number, workflow=binding))
     for pr in world.prs:
-        owed = state.owed.get(pr.number)
-        if owed is None or not eligible(pr) or not should_adopt(pr, cfg):
-            continue
-        if retry_breaker(state.unproductive_rounds.get(pr.number, 0), cfg.max_unproductive_rounds).tripped:
+        verdict = admission(pr)
+        if not isinstance(verdict, ReviewAdmitted) or not verdict.adopt:
             continue
         claim = Relabel(Target.PR, pr.number, None, cfg.trigger_label, pr.head_ref_oid)
-        kind, binding = owed
+        kind, binding = state.owed[pr.number]
         actions.append(claim)
         actions.append(RunAgent(kind, pr.number, claim, workflow=binding))
     return actions

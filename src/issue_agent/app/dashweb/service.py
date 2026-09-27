@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from .resolve_contracts import CommandResult, ResolveCommand, ResolveControl
+    from .review_contracts import ReviewCommandBody, ReviewCommandResult, ReviewControl, WorkflowFamilies
 
 from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verification
 from ...adapters.control_store import SQLiteControlStore
@@ -42,6 +43,7 @@ from ...domain.events import (
 from .. import cli, config
 from ..review_identity import review_identity
 from ..resolve_control import load_operator_configuration, open_resolve_operator
+from ..review_control import open_review_operator
 from . import snapshots
 from .guidance import GuidanceError, parse_guidance
 from .ports import GitHubQueries
@@ -207,6 +209,7 @@ class Backend:
         effects_factory=build_operator_effects,
         control_db_path: str = "",
         resolve_factory=open_resolve_operator,
+        review_factory=open_review_operator,
     ):
         self.harness_root = harness_root or cli.HARNESS_ROOT
         self.gh = gh or ghdata.GhReader()
@@ -234,6 +237,7 @@ class Backend:
         self.effects_factory = effects_factory
         self.control_db_path = control_db_path
         self._resolve_factory = resolve_factory
+        self._review_factory = review_factory
         self._journals: dict[tuple[str, str, str], TypedJournal | None] = {}
 
     # ── journal side ──
@@ -712,6 +716,49 @@ class Backend:
             return submit_control(self._resolve_operator(name), number, body)
         except Exception as exc:  # noqa: BLE001 - storage or authority failure is a 503, never a crash
             return unavailable_command(exc)
+
+    def _review_operator(self, name: str):
+        if not self.known(name):
+            raise ValueError(f"unknown deployment '{name}'")
+        return self._review_factory(name, harness_root=self.harness_root,
+                                    control_db_path=self.control_db_path, now=self.now_fn)
+
+    def review_control(self, name: str, pr: int, request_id: str | None = None) -> ReviewControl:
+        from .review_control import read_review_control, unavailable_review_control
+
+        try:
+            return read_review_control(self._review_operator(name), pr, request_id)
+        except Exception as exc:  # noqa: BLE001 - absence is never inferred from a failed read
+            return unavailable_review_control(exc)
+
+    def workflow_families(self, name: str) -> WorkflowFamilies:
+        """The repository's activated families, read exactly as the legacy unblock refusal reads them."""
+        from .review_contracts import WorkflowFamiliesAvailable, WorkflowFamiliesUnavailable
+        from .resolve_control import control_error
+
+        try:
+            if not self.known(name):
+                raise ValueError(f"unknown deployment '{name}'")
+            cfg, _env = load_operator_configuration(name, harness_root=self.harness_root)
+            state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
+            path = control_store_path(state_dirs, authority_root=cfg.control_authority_root, temporary_on_missing=False)
+            if self.control_db_path and os.path.realpath(self.control_db_path) != os.path.realpath(path):
+                raise ValueError("workflow family authority differs from the configured deployment")
+            active = SQLiteControlStore(path).active_workflow_families(cfg.repo)
+            return WorkflowFamiliesAvailable(status="available", repository=cfg.repo,
+                                             active_families=[family.value for family in active])
+        except Exception as exc:  # noqa: BLE001 - an unread activation never reads as none active
+            return WorkflowFamiliesUnavailable(status="unavailable", reason=control_error(exc))
+
+    def review_command(self, name: str, pr: int, body: ReviewCommandBody) -> ReviewCommandResult:
+        from .review_control import submit_review_control, unavailable_review_command
+
+        # Reject malformed direct callers before opening configured authority.
+        body.command()
+        try:
+            return submit_review_control(self._review_operator(name), pr, body)
+        except Exception as exc:  # noqa: BLE001 - storage or authority failure is a 503, never a crash
+            return unavailable_review_command(exc)
 
     def unblock(
         self, name: str, number: int, channel: str = "api", guidance: str | None = None,

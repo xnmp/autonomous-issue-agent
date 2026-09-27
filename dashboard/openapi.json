@@ -3426,6 +3426,2239 @@
         "title": "RetryAuthorizationRequired",
         "type": "object"
       },
+      "ReviewAbsentControl": {
+        "additionalProperties": false,
+        "properties": {
+          "epoch": {
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "pull_request": {
+            "title": "Pull Request",
+            "type": "integer"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "const": "absent",
+            "enum": [
+              "absent"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "repository",
+          "pull_request",
+          "epoch"
+        ],
+        "title": "ReviewAbsentControl",
+        "type": "object"
+      },
+      "ReviewActionOffered": {
+        "additionalProperties": false,
+        "properties": {
+          "effect": {
+            "title": "Effect",
+            "type": "string"
+          },
+          "operation": {
+            "enum": [
+              "request_rearm",
+              "continue_rearm",
+              "cancel_rearm",
+              "authorize_retry"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "state": {
+            "const": "offered",
+            "enum": [
+              "offered"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "operation",
+          "effect"
+        ],
+        "title": "ReviewActionOffered",
+        "type": "object"
+      },
+      "ReviewActionRefused": {
+        "additionalProperties": false,
+        "properties": {
+          "operation": {
+            "enum": [
+              "request_rearm",
+              "continue_rearm",
+              "cancel_rearm",
+              "authorize_retry"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "state": {
+            "const": "refused",
+            "enum": [
+              "refused"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "operation",
+          "reason"
+        ],
+        "title": "ReviewActionRefused",
+        "type": "object"
+      },
+      "ReviewAttemptedRemediation": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Evidence Ids",
+            "type": "array"
+          },
+          "kind": {
+            "const": "attempted",
+            "enum": [
+              "attempted"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "operation": {
+            "title": "Operation",
+            "type": "string"
+          },
+          "outcome": {
+            "title": "Outcome",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "operation",
+          "evidence_ids",
+          "outcome"
+        ],
+        "title": "ReviewAttemptedRemediation",
+        "type": "object"
+      },
+      "ReviewAuthorizeRetry": {
+        "additionalProperties": false,
+        "description": "One execution of an existing command; the evidence is the harness's own read.",
+        "properties": {
+          "authorization_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Authorization Id",
+            "type": "string"
+          },
+          "command_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Command Id",
+            "type": "string"
+          },
+          "evidence_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "gate_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "operation": {
+            "const": "authorize_retry",
+            "enum": [
+              "authorize_retry"
+            ],
+            "title": "Operation",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "authorization_id",
+          "gate_id",
+          "command_id",
+          "evidence_id"
+        ],
+        "title": "ReviewAuthorizeRetry",
+        "type": "object"
+      },
+      "ReviewAvailableControl": {
+        "additionalProperties": false,
+        "properties": {
+          "continuation": {
+            "discriminator": {
+              "mapping": {
+                "fresh_review_required": "#/components/schemas/ReviewFreshReviewRequired",
+                "reviewed_baseline": "#/components/schemas/ReviewReviewedBaseline"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewFreshReviewRequired"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewReviewedBaseline"
+              }
+            ],
+            "title": "Continuation"
+          },
+          "current_intent": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "cancelled": "#/components/schemas/ReviewStoppedRearm",
+                    "completed": "#/components/schemas/ReviewCompletedRearm",
+                    "pending": "#/components/schemas/ReviewPendingRearm",
+                    "superseded": "#/components/schemas/ReviewStoppedRearm"
+                  },
+                  "propertyName": "state"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ReviewPendingRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewCompletedRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewStoppedRearm"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Current Intent"
+          },
+          "daemon": {
+            "description": "The review daemon's recorded dispatch decision, never derived by this API.",
+            "discriminator": {
+              "mapping": {
+                "recorded": "#/components/schemas/ReviewDaemonRecorded",
+                "unreadable": "#/components/schemas/ReviewDaemonUnreadable",
+                "unrecorded": "#/components/schemas/ReviewDaemonUnrecorded"
+              },
+              "propertyName": "state"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewDaemonRecorded"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDaemonUnrecorded"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDaemonUnreadable"
+              }
+            ],
+            "title": "Daemon"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "gates": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewGate"
+            },
+            "title": "Gates",
+            "type": "array"
+          },
+          "guidance": {
+            "title": "Guidance",
+            "type": "string"
+          },
+          "observation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewObservation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "requested_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Id"
+          },
+          "requested_intent": {
+            "anyOf": [
+              {
+                "discriminator": {
+                  "mapping": {
+                    "cancelled": "#/components/schemas/ReviewStoppedRearm",
+                    "completed": "#/components/schemas/ReviewCompletedRearm",
+                    "pending": "#/components/schemas/ReviewPendingRearm",
+                    "superseded": "#/components/schemas/ReviewStoppedRearm"
+                  },
+                  "propertyName": "state"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ReviewPendingRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewCompletedRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewStoppedRearm"
+                  }
+                ]
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Requested Intent"
+          },
+          "status": {
+            "const": "available",
+            "enum": [
+              "available"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "workflow_held": {
+            "description": "SQLite workflow holds only, not a remote readiness assertion; acceptance re-reads GitHub.",
+            "title": "Workflow Held",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "expected",
+          "workflow_held",
+          "gates",
+          "guidance",
+          "continuation",
+          "daemon",
+          "current_intent",
+          "requested_id",
+          "requested_intent",
+          "observation"
+        ],
+        "title": "ReviewAvailableControl",
+        "type": "object"
+      },
+      "ReviewBoundSubmission": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "bound_submission",
+            "enum": [
+              "bound_submission"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "command_id",
+          "generation"
+        ],
+        "title": "ReviewBoundSubmission",
+        "type": "object"
+      },
+      "ReviewCancelRearm": {
+        "additionalProperties": false,
+        "properties": {
+          "cancellation_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Cancellation Id",
+            "type": "string"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "operation": {
+            "const": "cancel_rearm",
+            "enum": [
+              "cancel_rearm"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "reason": {
+            "maxLength": 16384,
+            "minLength": 1,
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "cancellation_id",
+          "request_id",
+          "reason"
+        ],
+        "title": "ReviewCancelRearm",
+        "type": "object"
+      },
+      "ReviewCommandResult": {
+        "additionalProperties": false,
+        "properties": {
+          "control": {
+            "discriminator": {
+              "mapping": {
+                "absent": "#/components/schemas/ReviewAbsentControl",
+                "available": "#/components/schemas/ReviewAvailableControl",
+                "inactive": "#/components/schemas/ReviewInactiveControl",
+                "migration_required": "#/components/schemas/ReviewMigrationRequiredControl",
+                "unavailable": "#/components/schemas/ReviewUnavailableControl"
+              },
+              "propertyName": "status"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewAvailableControl"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewInactiveControl"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewMigrationRequiredControl"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewAbsentControl"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewUnavailableControl"
+              }
+            ],
+            "title": "Control"
+          },
+          "outcome": {
+            "enum": [
+              "accepted",
+              "replayed",
+              "conflict",
+              "rejected",
+              "unavailable"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "outcome",
+          "reason",
+          "control"
+        ],
+        "title": "ReviewCommandResult",
+        "type": "object"
+      },
+      "ReviewCompletedRearm": {
+        "additionalProperties": false,
+        "properties": {
+          "gate_id": {
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "state": {
+            "const": "completed",
+            "enum": [
+              "completed"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "verified_commands": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Verified Commands",
+            "type": "array"
+          }
+        },
+        "required": [
+          "state",
+          "request_id",
+          "gate_id",
+          "generation",
+          "verified_commands"
+        ],
+        "title": "ReviewCompletedRearm",
+        "type": "object"
+      },
+      "ReviewContinueRearm": {
+        "additionalProperties": false,
+        "properties": {
+          "expected": {
+            "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "operation": {
+            "const": "continue_rearm",
+            "enum": [
+              "continue_rearm"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "stopped_request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Stopped Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "request_id",
+          "stopped_request_id"
+        ],
+        "title": "ReviewContinueRearm",
+        "type": "object"
+      },
+      "ReviewCountedReview": {
+        "additionalProperties": false,
+        "properties": {
+          "author": {
+            "title": "Author",
+            "type": "string"
+          },
+          "commit_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Commit Id"
+          },
+          "review_id": {
+            "title": "Review Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "review_id",
+          "author",
+          "commit_id"
+        ],
+        "title": "ReviewCountedReview",
+        "type": "object"
+      },
+      "ReviewDaemonRecorded": {
+        "additionalProperties": false,
+        "description": "The review daemon's own latest decision: made at `decided_at`, last confirmed unchanged at `as_of`.",
+        "properties": {
+          "as_of": {
+            "title": "As Of",
+            "type": "string"
+          },
+          "decided_at": {
+            "title": "Decided At",
+            "type": "string"
+          },
+          "dispatch": {
+            "discriminator": {
+              "mapping": {
+                "deferred": "#/components/schemas/ReviewDispatchDeferred",
+                "held": "#/components/schemas/ReviewDispatchHeld",
+                "in_flight": "#/components/schemas/ReviewDispatchInFlight",
+                "not_admitted": "#/components/schemas/ReviewDispatchNotAdmitted",
+                "not_owed": "#/components/schemas/ReviewDispatchNotOwed",
+                "owed": "#/components/schemas/ReviewDispatchOwed",
+                "release_projection_pending": "#/components/schemas/ReviewDispatchReleasePending",
+                "submission_unresolved": "#/components/schemas/ReviewDispatchSubmissionUnresolved",
+                "terminal": "#/components/schemas/ReviewDispatchTerminal",
+                "withheld": "#/components/schemas/ReviewDispatchWithheld"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewDispatchTerminal"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchNotAdmitted"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchDeferred"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchHeld"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchSubmissionUnresolved"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchReleasePending"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchOwed"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchWithheld"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchInFlight"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewDispatchNotOwed"
+              }
+            ],
+            "title": "Dispatch"
+          },
+          "pull_request": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewDecisionBasis"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "read": {
+            "enum": [
+              "review_read",
+              "departed_read"
+            ],
+            "title": "Read",
+            "type": "string"
+          },
+          "read_failure": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewReadFailure"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The pull request's own read keeps failing; null once a read succeeds."
+          },
+          "state": {
+            "const": "recorded",
+            "enum": [
+              "recorded"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "dispatch",
+          "pull_request",
+          "read",
+          "decided_at",
+          "as_of",
+          "read_failure"
+        ],
+        "title": "ReviewDaemonRecorded",
+        "type": "object"
+      },
+      "ReviewDaemonUnreadable": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "state": {
+            "const": "unreadable",
+            "enum": [
+              "unreadable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "reason"
+        ],
+        "title": "ReviewDaemonUnreadable",
+        "type": "object"
+      },
+      "ReviewDaemonUnrecorded": {
+        "additionalProperties": false,
+        "description": "The review daemon has not recorded a decision for this pull request yet.",
+        "properties": {
+          "state": {
+            "const": "unrecorded",
+            "enum": [
+              "unrecorded"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "ReviewDaemonUnrecorded",
+        "type": "object"
+      },
+      "ReviewDecisionBasis": {
+        "additionalProperties": false,
+        "description": "The pull request facts the review daemon decided from, all from its own read.",
+        "properties": {
+          "external_holds": {
+            "description": "Holds a re-arm keeps: trusted hold labels and the unproductive-round breaker.",
+            "items": {
+              "type": "string"
+            },
+            "title": "External Holds",
+            "type": "array"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "labels": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Labels",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "closed",
+              "merged"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "head_sha",
+          "state",
+          "labels",
+          "external_holds"
+        ],
+        "title": "ReviewDecisionBasis",
+        "type": "object"
+      },
+      "ReviewDismissalObligation": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "dismiss_review",
+            "enum": [
+              "dismiss_review"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "review_id": {
+            "title": "Review Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "review_id"
+        ],
+        "title": "ReviewDismissalObligation",
+        "type": "object"
+      },
+      "ReviewDispatchDeferred": {
+        "additionalProperties": false,
+        "description": "The daemon could not decide (an unreadable fact) or waits for a bounded read schedule.",
+        "properties": {
+          "kind": {
+            "const": "deferred",
+            "enum": [
+              "deferred"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reason"
+        ],
+        "title": "ReviewDispatchDeferred",
+        "type": "object"
+      },
+      "ReviewDispatchHeld": {
+        "additionalProperties": false,
+        "properties": {
+          "gate_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Gate Ids",
+            "type": "array"
+          },
+          "kind": {
+            "const": "held",
+            "enum": [
+              "held"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "gate_ids"
+        ],
+        "title": "ReviewDispatchHeld",
+        "type": "object"
+      },
+      "ReviewDispatchInFlight": {
+        "additionalProperties": false,
+        "description": "Owed, and already running: this pull request's own review dispatch still holds its reservation.",
+        "properties": {
+          "kind": {
+            "const": "in_flight",
+            "enum": [
+              "in_flight"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "review": {
+            "enum": [
+              "initial",
+              "re_review"
+            ],
+            "title": "Review",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "review"
+        ],
+        "title": "ReviewDispatchInFlight",
+        "type": "object"
+      },
+      "ReviewDispatchNotAdmitted": {
+        "additionalProperties": false,
+        "description": "Holds outside the review workflow keep review dispatch off this pull request; no re-arm removes them.",
+        "properties": {
+          "holds": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Holds",
+            "type": "array"
+          },
+          "kind": {
+            "const": "not_admitted",
+            "enum": [
+              "not_admitted"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "holds"
+        ],
+        "title": "ReviewDispatchNotAdmitted",
+        "type": "object"
+      },
+      "ReviewDispatchNotOwed": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "not_owed",
+            "enum": [
+              "not_owed"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reason"
+        ],
+        "title": "ReviewDispatchNotOwed",
+        "type": "object"
+      },
+      "ReviewDispatchOwed": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "owed",
+            "enum": [
+              "owed"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "review": {
+            "enum": [
+              "initial",
+              "re_review"
+            ],
+            "title": "Review",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "review"
+        ],
+        "title": "ReviewDispatchOwed",
+        "type": "object"
+      },
+      "ReviewDispatchReleasePending": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "release_projection_pending",
+            "enum": [
+              "release_projection_pending"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "command_id"
+        ],
+        "title": "ReviewDispatchReleasePending",
+        "type": "object"
+      },
+      "ReviewDispatchSubmissionUnresolved": {
+        "additionalProperties": false,
+        "properties": {
+          "command_ids": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Command Ids",
+            "type": "array"
+          },
+          "kind": {
+            "const": "submission_unresolved",
+            "enum": [
+              "submission_unresolved"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "command_ids"
+        ],
+        "title": "ReviewDispatchSubmissionUnresolved",
+        "type": "object"
+      },
+      "ReviewDispatchTerminal": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "terminal",
+            "enum": [
+              "terminal"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "state": {
+            "enum": [
+              "closed",
+              "merged"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "state"
+        ],
+        "title": "ReviewDispatchTerminal",
+        "type": "object"
+      },
+      "ReviewDispatchWithheld": {
+        "additionalProperties": false,
+        "description": "Owed, but this tick's dispatch admission withheld it: a fix run's claim, or another reservation.",
+        "properties": {
+          "detail": {
+            "title": "Detail",
+            "type": "string"
+          },
+          "kind": {
+            "const": "withheld",
+            "enum": [
+              "withheld"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "reason": {
+            "enum": [
+              "fix_claim",
+              "reserved"
+            ],
+            "title": "Reason",
+            "type": "string"
+          },
+          "review": {
+            "enum": [
+              "initial",
+              "re_review"
+            ],
+            "title": "Review",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "review",
+          "reason",
+          "detail"
+        ],
+        "title": "ReviewDispatchWithheld",
+        "type": "object"
+      },
+      "ReviewEvidenceUnavailableCause": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence": {
+            "enum": [
+              "exemption_trailers",
+              "review_history",
+              "prewrite_read",
+              "rearm_observation",
+              "other"
+            ],
+            "title": "Evidence",
+            "type": "string"
+          },
+          "failed_reads": {
+            "title": "Failed Reads",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "evidence_unavailable",
+            "enum": [
+              "evidence_unavailable"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_error": {
+            "title": "Last Error",
+            "type": "string"
+          },
+          "source": {
+            "title": "Source",
+            "type": "string"
+          },
+          "unresolved_since": {
+            "title": "Unresolved Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "evidence",
+          "source",
+          "unresolved_since",
+          "failed_reads",
+          "last_error"
+        ],
+        "title": "ReviewEvidenceUnavailableCause",
+        "type": "object"
+      },
+      "ReviewExpected": {
+        "additionalProperties": false,
+        "properties": {
+          "episode_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "epoch": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Epoch",
+            "type": "integer"
+          },
+          "family": {
+            "const": "review_rejections",
+            "enum": [
+              "review_rejections"
+            ],
+            "title": "Family",
+            "type": "string"
+          },
+          "generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "pull_request": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Pull Request",
+            "type": "integer"
+          },
+          "repository": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Repository",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "repository",
+          "pull_request",
+          "family",
+          "epoch",
+          "generation",
+          "version",
+          "episode_id"
+        ],
+        "title": "ReviewExpected",
+        "type": "object"
+      },
+      "ReviewFreshReviewRequired": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "fresh_review_required",
+            "enum": [
+              "fresh_review_required"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "owed_since_generation": {
+            "title": "Owed Since Generation",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "kind",
+          "owed_since_generation"
+        ],
+        "title": "ReviewFreshReviewRequired",
+        "type": "object"
+      },
+      "ReviewGate": {
+        "additionalProperties": false,
+        "properties": {
+          "actions": {
+            "items": {
+              "discriminator": {
+                "mapping": {
+                  "offered": "#/components/schemas/ReviewActionOffered",
+                  "refused": "#/components/schemas/ReviewActionRefused"
+                },
+                "propertyName": "state"
+              },
+              "oneOf": [
+                {
+                  "$ref": "#/components/schemas/ReviewActionOffered"
+                },
+                {
+                  "$ref": "#/components/schemas/ReviewActionRefused"
+                }
+              ]
+            },
+            "title": "Actions",
+            "type": "array"
+          },
+          "cause": {
+            "discriminator": {
+              "mapping": {
+                "evidence_unavailable": "#/components/schemas/ReviewEvidenceUnavailableCause",
+                "facts_unavailable": "#/components/schemas/ReviewGateFactsUnavailableCause",
+                "rearm_needs_decision": "#/components/schemas/ReviewRearmNeedsDecisionCause",
+                "remote_uncertain": "#/components/schemas/ReviewRemoteUncertainCause",
+                "retry_authorization_required": "#/components/schemas/ReviewRetryAuthorizationRequiredCause",
+                "review_projection_refused": "#/components/schemas/ReviewProjectionRefusedCause",
+                "review_rejection_ceiling": "#/components/schemas/ReviewRejectionCeilingCause"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewRejectionCeilingCause"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewRemoteUncertainCause"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewRetryAuthorizationRequiredCause"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewEvidenceUnavailableCause"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewRearmNeedsDecisionCause"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewProjectionRefusedCause"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewGateFactsUnavailableCause"
+              }
+            ],
+            "title": "Cause"
+          },
+          "gate_id": {
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "opened_generation": {
+            "title": "Opened Generation",
+            "type": "integer"
+          },
+          "pending_retry": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ReviewPendingRetry"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "remediation": {
+            "discriminator": {
+              "mapping": {
+                "attempted": "#/components/schemas/ReviewAttemptedRemediation",
+                "none_authorized": "#/components/schemas/ReviewNoRemediation"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewNoRemediation"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewAttemptedRemediation"
+              }
+            ],
+            "title": "Remediation"
+          },
+          "state": {
+            "enum": [
+              "open",
+              "rearming"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "gate_id",
+          "state",
+          "opened_generation",
+          "cause",
+          "remediation",
+          "actions",
+          "pending_retry"
+        ],
+        "title": "ReviewGate",
+        "type": "object"
+      },
+      "ReviewGateFactsUnavailableCause": {
+        "additionalProperties": false,
+        "description": "The store's own facts about this gate disagree (its retry grants or obligation receipts).\n\nThe gate still holds and reconciliation is unaffected; nothing is offered\non it until the facts agree again.",
+        "properties": {
+          "kind": {
+            "const": "facts_unavailable",
+            "enum": [
+              "facts_unavailable"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "underlying": {
+            "enum": [
+              "review_rejection_ceiling",
+              "remote_uncertain",
+              "retry_authorization_required",
+              "evidence_unavailable",
+              "rearm_needs_decision",
+              "review_projection_refused"
+            ],
+            "title": "Underlying",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "underlying",
+          "reason"
+        ],
+        "title": "ReviewGateFactsUnavailableCause",
+        "type": "object"
+      },
+      "ReviewHoldContested": {
+        "additionalProperties": false,
+        "description": "Restorations are spent: an actor keeps removing the hold; the gate alone still holds every review.",
+        "properties": {
+          "restore_limit": {
+            "title": "Restore Limit",
+            "type": "integer"
+          },
+          "restores": {
+            "title": "Restores",
+            "type": "integer"
+          },
+          "state": {
+            "const": "contested",
+            "enum": [
+              "contested"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "restores",
+          "restore_limit"
+        ],
+        "title": "ReviewHoldContested",
+        "type": "object"
+      },
+      "ReviewHoldUncontested": {
+        "additionalProperties": false,
+        "description": "The harness restores a removed attention hold, a bounded number of times.",
+        "properties": {
+          "restore_limit": {
+            "title": "Restore Limit",
+            "type": "integer"
+          },
+          "restores": {
+            "title": "Restores",
+            "type": "integer"
+          },
+          "state": {
+            "const": "restoring",
+            "enum": [
+              "restoring"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "restores",
+          "restore_limit"
+        ],
+        "title": "ReviewHoldUncontested",
+        "type": "object"
+      },
+      "ReviewHoldUnreadable": {
+        "additionalProperties": false,
+        "description": "The harness's restoration record for this ceiling is malformed; the gate and its lever are unaffected.",
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "state": {
+            "const": "unreadable",
+            "enum": [
+              "unreadable"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "reason"
+        ],
+        "title": "ReviewHoldUnreadable",
+        "type": "object"
+      },
+      "ReviewImportedBaseline": {
+        "additionalProperties": false,
+        "properties": {
+          "evidence_id": {
+            "title": "Evidence Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "imported",
+            "enum": [
+              "imported"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "evidence_id"
+        ],
+        "title": "ReviewImportedBaseline",
+        "type": "object"
+      },
+      "ReviewInactiveControl": {
+        "additionalProperties": false,
+        "description": "Not activated; the legacy unblock still owns this repository's review holds.",
+        "properties": {
+          "pull_request": {
+            "title": "Pull Request",
+            "type": "integer"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "const": "inactive",
+            "enum": [
+              "inactive"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "repository",
+          "pull_request"
+        ],
+        "title": "ReviewInactiveControl",
+        "type": "object"
+      },
+      "ReviewMigrationRequiredControl": {
+        "additionalProperties": false,
+        "description": "Not activated, and another family's activation retired the legacy unblock: no lever until activation.",
+        "properties": {
+          "active_families": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Active Families",
+            "type": "array"
+          },
+          "pull_request": {
+            "title": "Pull Request",
+            "type": "integer"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "const": "migration_required",
+            "enum": [
+              "migration_required"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "repository",
+          "pull_request",
+          "active_families"
+        ],
+        "title": "ReviewMigrationRequiredControl",
+        "type": "object"
+      },
+      "ReviewNoRemediation": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "none_authorized",
+            "enum": [
+              "none_authorized"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "reason"
+        ],
+        "title": "ReviewNoRemediation",
+        "type": "object"
+      },
+      "ReviewObservation": {
+        "additionalProperties": false,
+        "properties": {
+          "failed_reads": {
+            "title": "Failed Reads",
+            "type": "integer"
+          },
+          "last_error": {
+            "title": "Last Error",
+            "type": "string"
+          },
+          "next_read_at": {
+            "title": "Next Read At",
+            "type": "string"
+          },
+          "unresolved_since": {
+            "title": "Unresolved Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "unresolved_since",
+          "next_read_at",
+          "failed_reads",
+          "last_error"
+        ],
+        "title": "ReviewObservation",
+        "type": "object"
+      },
+      "ReviewPendingRearm": {
+        "additionalProperties": false,
+        "properties": {
+          "authorized_reviews": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Authorized Reviews",
+            "type": "array"
+          },
+          "commands": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewRearmCommand"
+            },
+            "title": "Commands",
+            "type": "array"
+          },
+          "gate_id": {
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "state": {
+            "const": "pending",
+            "enum": [
+              "pending"
+            ],
+            "title": "State",
+            "type": "string"
+          }
+        },
+        "required": [
+          "state",
+          "request_id",
+          "gate_id",
+          "generation",
+          "authorized_reviews",
+          "commands"
+        ],
+        "title": "ReviewPendingRearm",
+        "type": "object"
+      },
+      "ReviewPendingRetry": {
+        "additionalProperties": false,
+        "description": "One authorized retry accepted and awaiting the executor's decision.",
+        "properties": {
+          "authorization_id": {
+            "title": "Authorization Id",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "authorization_id",
+          "command_id"
+        ],
+        "title": "ReviewPendingRetry",
+        "type": "object"
+      },
+      "ReviewProjectionObligation": {
+        "additionalProperties": false,
+        "properties": {
+          "add": {
+            "title": "Add",
+            "type": "string"
+          },
+          "kind": {
+            "const": "projection",
+            "enum": [
+              "projection"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "remove": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Remove"
+          }
+        },
+        "required": [
+          "kind",
+          "remove",
+          "add"
+        ],
+        "title": "ReviewProjectionObligation",
+        "type": "object"
+      },
+      "ReviewProjectionRefusedCause": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "review_projection_refused",
+            "enum": [
+              "review_projection_refused"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "projection": {
+            "enum": [
+              "ceiling_release",
+              "escalation_hold"
+            ],
+            "title": "Projection",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "projection",
+          "command_id",
+          "generation",
+          "reason"
+        ],
+        "title": "ReviewProjectionRefusedCause",
+        "type": "object"
+      },
+      "ReviewReadFailure": {
+        "additionalProperties": false,
+        "description": "Consecutive failed departed reads; the decision and facts beside it are the last good read's, if any.",
+        "properties": {
+          "failed_reads": {
+            "title": "Failed Reads",
+            "type": "integer"
+          },
+          "first_failed_at": {
+            "title": "First Failed At",
+            "type": "string"
+          },
+          "last_failed_at": {
+            "title": "Last Failed At",
+            "type": "string"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "required": [
+          "failed_reads",
+          "reason",
+          "first_failed_at",
+          "last_failed_at"
+        ],
+        "title": "ReviewReadFailure",
+        "type": "object"
+      },
+      "ReviewRearmCommand": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "obligation": {
+            "discriminator": {
+              "mapping": {
+                "dismiss_review": "#/components/schemas/ReviewDismissalObligation",
+                "projection": "#/components/schemas/ReviewProjectionObligation",
+                "unlabelled": "#/components/schemas/ReviewUnlabelledObligation"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewDismissalObligation"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewProjectionObligation"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewUnlabelledObligation"
+              }
+            ],
+            "title": "Obligation"
+          },
+          "status": {
+            "enum": [
+              "pending",
+              "verified",
+              "refused",
+              "uncertain",
+              "held",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "command_id",
+          "obligation",
+          "status"
+        ],
+        "title": "ReviewRearmCommand",
+        "type": "object"
+      },
+      "ReviewRearmNeedsDecisionCause": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "rearm_needs_decision",
+            "enum": [
+              "rearm_needs_decision"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "obligations": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Obligations",
+            "type": "array"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "stopped_request_id": {
+            "title": "Stopped Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "stopped_request_id",
+          "obligations",
+          "reason"
+        ],
+        "title": "ReviewRearmNeedsDecisionCause",
+        "type": "object"
+      },
+      "ReviewRejectionCeilingCause": {
+        "additionalProperties": false,
+        "properties": {
+          "authorization_bound": {
+            "title": "Authorization Bound",
+            "type": "integer"
+          },
+          "ceiling": {
+            "title": "Ceiling",
+            "type": "integer"
+          },
+          "counted": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewCountedReview"
+            },
+            "title": "Counted",
+            "type": "array"
+          },
+          "counted_total": {
+            "title": "Counted Total",
+            "type": "integer"
+          },
+          "episode_id": {
+            "title": "Episode Id",
+            "type": "string"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "hold": {
+            "discriminator": {
+              "mapping": {
+                "contested": "#/components/schemas/ReviewHoldContested",
+                "restoring": "#/components/schemas/ReviewHoldUncontested",
+                "unreadable": "#/components/schemas/ReviewHoldUnreadable"
+              },
+              "propertyName": "state"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewHoldUncontested"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewHoldContested"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewHoldUnreadable"
+              }
+            ],
+            "title": "Hold"
+          },
+          "kind": {
+            "const": "review_rejection_ceiling",
+            "enum": [
+              "review_rejection_ceiling"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "non_resetting_commits": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Non Resetting Commits",
+            "type": "array"
+          },
+          "review_bot": {
+            "title": "Review Bot",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "episode_id",
+          "head_sha",
+          "review_bot",
+          "ceiling",
+          "counted_total",
+          "counted",
+          "authorization_bound",
+          "non_resetting_commits",
+          "hold"
+        ],
+        "title": "ReviewRejectionCeilingCause",
+        "type": "object"
+      },
+      "ReviewRemoteUncertainCause": {
+        "additionalProperties": false,
+        "properties": {
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "failed_reads": {
+            "title": "Failed Reads",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "remote_uncertain",
+            "enum": [
+              "remote_uncertain"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "last_error": {
+            "title": "Last Error",
+            "type": "string"
+          },
+          "unresolved_since": {
+            "title": "Unresolved Since",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "command_id",
+          "unresolved_since",
+          "failed_reads",
+          "last_error"
+        ],
+        "title": "ReviewRemoteUncertainCause",
+        "type": "object"
+      },
+      "ReviewRequestRearm": {
+        "additionalProperties": false,
+        "description": "Authorize dismissal of exactly the gate's observed counted bot reviews; the set is never on the wire.",
+        "properties": {
+          "expected": {
+            "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "gate_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "guidance": {
+            "discriminator": {
+              "mapping": {
+                "clear": "#/components/schemas/ClearGuidance",
+                "keep": "#/components/schemas/KeepGuidance",
+                "set": "#/components/schemas/SetGuidance"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeepGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/ClearGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/SetGuidance"
+              }
+            ],
+            "title": "Guidance"
+          },
+          "operation": {
+            "const": "request_rearm",
+            "enum": [
+              "request_rearm"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "request_id",
+          "gate_id",
+          "guidance"
+        ],
+        "title": "ReviewRequestRearm",
+        "type": "object"
+      },
+      "ReviewRetryAuthorizationRequiredCause": {
+        "additionalProperties": false,
+        "properties": {
+          "absence_evidence_id": {
+            "title": "Absence Evidence Id",
+            "type": "string"
+          },
+          "command_id": {
+            "title": "Command Id",
+            "type": "string"
+          },
+          "kind": {
+            "const": "retry_authorization_required",
+            "enum": [
+              "retry_authorization_required"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "retry_authorizable": {
+            "title": "Retry Authorizable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "kind",
+          "command_id",
+          "absence_evidence_id",
+          "retry_authorizable"
+        ],
+        "title": "ReviewRetryAuthorizationRequiredCause",
+        "type": "object"
+      },
+      "ReviewReviewedBaseline": {
+        "additionalProperties": false,
+        "properties": {
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "kind": {
+            "const": "reviewed_baseline",
+            "enum": [
+              "reviewed_baseline"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "patch_id": {
+            "title": "Patch Id",
+            "type": "string"
+          },
+          "reviewed_generation": {
+            "title": "Reviewed Generation",
+            "type": "integer"
+          },
+          "source": {
+            "discriminator": {
+              "mapping": {
+                "bound_submission": "#/components/schemas/ReviewBoundSubmission",
+                "imported": "#/components/schemas/ReviewImportedBaseline"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewBoundSubmission"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewImportedBaseline"
+              }
+            ],
+            "title": "Source"
+          }
+        },
+        "required": [
+          "kind",
+          "head_sha",
+          "patch_id",
+          "reviewed_generation",
+          "source"
+        ],
+        "title": "ReviewReviewedBaseline",
+        "type": "object"
+      },
+      "ReviewStoppedRearm": {
+        "additionalProperties": false,
+        "description": "A cancelled or superseded request; retired obligations never execute.",
+        "properties": {
+          "authorized_reviews": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Authorized Reviews",
+            "type": "array"
+          },
+          "gate_id": {
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "generation": {
+            "title": "Generation",
+            "type": "integer"
+          },
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          },
+          "retired_commands": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Retired Commands",
+            "type": "array"
+          },
+          "state": {
+            "enum": [
+              "cancelled",
+              "superseded"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "verified_commands": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Verified Commands",
+            "type": "array"
+          }
+        },
+        "required": [
+          "state",
+          "request_id",
+          "gate_id",
+          "generation",
+          "reason",
+          "authorized_reviews",
+          "verified_commands",
+          "retired_commands"
+        ],
+        "title": "ReviewStoppedRearm",
+        "type": "object"
+      },
+      "ReviewUnavailableControl": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "const": "unavailable",
+            "enum": [
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "ReviewUnavailableControl",
+        "type": "object"
+      },
+      "ReviewUnlabelledObligation": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "unlabelled",
+            "enum": [
+              "unlabelled"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind"
+        ],
+        "title": "ReviewUnlabelledObligation",
+        "type": "object"
+      },
       "RoleHealth": {
         "additionalProperties": true,
         "properties": {
@@ -3932,6 +6165,65 @@
           "raw"
         ],
         "title": "VerificationRow",
+        "type": "object"
+      },
+      "WorkflowFamiliesAvailable": {
+        "additionalProperties": false,
+        "description": "The repository's activated workflow families; the legacy unblock is retired while any is active.",
+        "properties": {
+          "active_families": {
+            "items": {
+              "enum": [
+                "resolve",
+                "review_rejections"
+              ],
+              "type": "string"
+            },
+            "title": "Active Families",
+            "type": "array"
+          },
+          "repository": {
+            "title": "Repository",
+            "type": "string"
+          },
+          "status": {
+            "const": "available",
+            "enum": [
+              "available"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "repository",
+          "active_families"
+        ],
+        "title": "WorkflowFamiliesAvailable",
+        "type": "object"
+      },
+      "WorkflowFamiliesUnavailable": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "const": "unavailable",
+            "enum": [
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "WorkflowFamiliesUnavailable",
         "type": "object"
       }
     }
@@ -4654,6 +6946,179 @@
         "summary": "Api Overview"
       }
     },
+    "/api/repos/{name}/pulls/{pr}/review-control": {
+      "get": {
+        "operationId": "api_review_control_api_repos__name__pulls__pr__review_control_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "pr",
+            "required": true,
+            "schema": {
+              "title": "Pr",
+              "type": "integer"
+            }
+          },
+          {
+            "in": "query",
+            "name": "request_id",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 512,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Request Id"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "discriminator": {
+                    "mapping": {
+                      "absent": "#/components/schemas/ReviewAbsentControl",
+                      "available": "#/components/schemas/ReviewAvailableControl",
+                      "inactive": "#/components/schemas/ReviewInactiveControl",
+                      "migration_required": "#/components/schemas/ReviewMigrationRequiredControl",
+                      "unavailable": "#/components/schemas/ReviewUnavailableControl"
+                    },
+                    "propertyName": "status"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/ReviewAvailableControl"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReviewInactiveControl"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReviewMigrationRequiredControl"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReviewAbsentControl"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ReviewUnavailableControl"
+                    }
+                  ],
+                  "title": "Response Api Review Control Api Repos  Name  Pulls  Pr  Review Control Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Review Control"
+      }
+    },
+    "/api/repos/{name}/pulls/{pr}/review-control/commands": {
+      "post": {
+        "operationId": "api_review_command_api_repos__name__pulls__pr__review_control_commands_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "pr",
+            "required": true,
+            "schema": {
+              "title": "Pr",
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "discriminator": {
+                  "mapping": {
+                    "authorize_retry": "#/components/schemas/ReviewAuthorizeRetry",
+                    "cancel_rearm": "#/components/schemas/ReviewCancelRearm",
+                    "continue_rearm": "#/components/schemas/ReviewContinueRearm",
+                    "request_rearm": "#/components/schemas/ReviewRequestRearm"
+                  },
+                  "propertyName": "operation"
+                },
+                "oneOf": [
+                  {
+                    "$ref": "#/components/schemas/ReviewRequestRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewContinueRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewCancelRearm"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewAuthorizeRetry"
+                  }
+                ],
+                "title": "Body"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ReviewCommandResult"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Review Command"
+      }
+    },
     "/api/repos/{name}/start": {
       "post": {
         "operationId": "api_start_api_repos__name__start_post",
@@ -4691,6 +7156,60 @@
           }
         },
         "summary": "Api Start"
+      }
+    },
+    "/api/repos/{name}/workflow-families": {
+      "get": {
+        "operationId": "api_workflow_families_api_repos__name__workflow_families_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "name",
+            "required": true,
+            "schema": {
+              "title": "Name",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "discriminator": {
+                    "mapping": {
+                      "available": "#/components/schemas/WorkflowFamiliesAvailable",
+                      "unavailable": "#/components/schemas/WorkflowFamiliesUnavailable"
+                    },
+                    "propertyName": "status"
+                  },
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/WorkflowFamiliesAvailable"
+                    },
+                    {
+                      "$ref": "#/components/schemas/WorkflowFamiliesUnavailable"
+                    }
+                  ],
+                  "title": "Response Api Workflow Families Api Repos  Name  Workflow Families Get"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Api Workflow Families"
       }
     },
     "/api/usage": {

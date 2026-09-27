@@ -135,6 +135,36 @@ matches = "src/issue_agent/adapters/workflow_control.py"
 [tool.pyrefly.sub-config.errors]
 missing-attribute = "error"
 
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/app/dashweb/review_*.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/app/review_control.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/domain/review_control.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/domain/review_rearm.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
+[[tool.pyrefly.sub-config]]
+matches = "src/issue_agent/domain/review_dispatch_record.py"
+
+[tool.pyrefly.sub-config.errors]
+missing-attribute = "error"
+
 # ── Architectural linting (import-linter) ─────────────────────────────────────
 # Enforces the hexagonal layering the design depends on: the domain is pure
 # (no adapters, no app, no SDK), and dependencies only ever point downward

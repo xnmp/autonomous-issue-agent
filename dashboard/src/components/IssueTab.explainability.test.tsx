@@ -86,6 +86,8 @@ describe("issue explainability", () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       if (init?.method === "POST") return json({ ok: true, detail: "unblocked" });
       if (String(input).includes("/resolve-control")) return controlResponse(inactiveControl);
+      // The repository-scoped family read the server's legacy refusal also reads: none active.
+      if (String(input).includes("/workflow-families")) return json({ status: "available", repository: "o/r", active_families: [] });
       return json(detail);
     });
     vi.stubGlobal("fetch", fetchMock);

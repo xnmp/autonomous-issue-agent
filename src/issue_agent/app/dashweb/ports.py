@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Protocol
 
 if TYPE_CHECKING:
     from .resolve_contracts import CommandResult, ResolveCommand, ResolveControl
+    from .review_contracts import ReviewCommandBody, ReviewCommandResult, ReviewControl, WorkflowFamilies
 
 
 class GitHubQueries(Protocol):
@@ -34,6 +35,10 @@ class IssueQueries(Protocol):
 
     def resolve_control(self, name: str, number: int, request_id: str | None = None) -> ResolveControl: ...
 
+    def review_control(self, name: str, pr: int, request_id: str | None = None) -> ReviewControl: ...
+
+    def workflow_families(self, name: str) -> WorkflowFamilies: ...
+
 
 class OperatorQueries(Protocol):
     def usage(self) -> dict: ...
@@ -48,6 +53,8 @@ class DashboardCommands(Protocol):
     ) -> tuple[bool, str]: ...
 
     def resolve_command(self, name: str, number: int, body: ResolveCommand) -> CommandResult: ...
+
+    def review_command(self, name: str, pr: int, body: ReviewCommandBody) -> ReviewCommandResult: ...
 
 
 class DashboardBackend(

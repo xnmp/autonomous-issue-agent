@@ -484,7 +484,8 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
-`domain/review_rearm.py`, `domain/review_evidence.py`, `domain/deployment.py`
+`domain/review_rearm.py`, `domain/review_control.py`, `domain/review_dispatch_record.py`,
+`domain/review_evidence.py`, `domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration; the PR-owned review-rejection
 family has its own snapshot, continuation and handoff-free intents, sharing only
@@ -496,7 +497,11 @@ family activation plans legacy imports offline and refuses rather than defaultin
 an operator retry authorization buys exactly one execution of an existing
 reconciliation-only command after harness-proven absence; an unreadable
 exemption-trailer or review-history read backs off to a visible, never-approving
-hold).
+hold; the review daemon's plan records its own per-pull-request dispatch
+decision, with the facts and the read it came from and an as-of time, which the
+operator view renders instead of deciding; the view offers each gate's commands
+or refuses them with the reason the snapshot or that recorded decision already
+proves, refusing every command on a recorded terminal pull request).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/agent_publish.py`,
@@ -538,7 +543,10 @@ adapters live under `adapters/dashweb/`.
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`,
 `app/review_runtime.py` (the active review family's dispatch plan, bound
-submission authority, trusted external holds and fix-side guidance read),
+submission authority, trusted external holds and fix-side guidance read, and the
+one review-control composition the daemon and the operator transport share),
+`app/review_control.py` (the review owner's operator composition from the
+launch snapshot for the PR-scoped dashboard API),
 `app/service_doctor.py`, `app/webhook.py`,
 `app/world_probe.py`, and `app/world_reporter.py`.
 Provider-neutral task construction is isolated in `app/planners/`; paid

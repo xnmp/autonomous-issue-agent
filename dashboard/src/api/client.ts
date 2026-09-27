@@ -21,6 +21,10 @@ import type {
   ResolveControl,
   ResolveCommand,
   ResolveCommandResult,
+  ReviewControl,
+  ReviewCommand,
+  ReviewCommandResult,
+  WorkflowFamilies,
 } from "./types";
 import { z } from "zod";
 import { schemas } from "./generated-zod";
@@ -190,6 +194,22 @@ const resolveWrites = Object.fromEntries(
     .map(([status, outcome]) => [status, schemas.CommandResult.refine((value) => value.outcome === outcome)]),
 );
 
+const reviewReads = {
+  200: z.discriminatedUnion("status", [
+    schemas.ReviewAvailableControl, schemas.ReviewInactiveControl, schemas.ReviewMigrationRequiredControl,
+  ]),
+  404: schemas.ReviewAbsentControl,
+  503: schemas.ReviewUnavailableControl,
+};
+const familyReads = {
+  200: schemas.WorkflowFamiliesAvailable,
+  503: schemas.WorkflowFamiliesUnavailable,
+};
+const reviewWrites = Object.fromEntries(
+  [[202, "accepted"], [200, "replayed"], [409, "conflict"], [422, "rejected"], [503, "unavailable"]]
+    .map(([status, outcome]) => [status, schemas.ReviewCommandResult.refine((value) => value.outcome === outcome)]),
+);
+
 /* -------------------------------------------------------------- endpoints */
 
 export const api = {
@@ -203,6 +223,22 @@ export const api = {
     postJson<ResolveCommandResult>(
       `/api/repos/${enc(name)}/issues/${n}/resolve-control/commands`, command,
       schemas.CommandResult, s, resolveWrites,
+    ),
+
+  reviewControl: (name: string, pr: number, requestId?: string, s?: AbortSignal) =>
+    getJson<ReviewControl>(
+      `/api/repos/${enc(name)}/pulls/${pr}/review-control${requestId ? `?request_id=${enc(requestId)}` : ""}`,
+      schemas.ReviewCommandResult.shape.control, s, undefined, reviewReads,
+    ),
+
+  /** The repository's activated workflow families: the authority the legacy unblock refusal reads. */
+  workflowFamilies: (name: string, s?: AbortSignal) =>
+    getJson<WorkflowFamilies>(`/api/repos/${enc(name)}/workflow-families`, schemas.WorkflowFamiliesAvailable, s, undefined, familyReads),
+
+  reviewCommand: (name: string, pr: number, command: ReviewCommand, s?: AbortSignal) =>
+    postJson<ReviewCommandResult>(
+      `/api/repos/${enc(name)}/pulls/${pr}/review-control/commands`, command,
+      schemas.ReviewCommandResult, s, reviewWrites,
     ),
 
   repos: (s?: AbortSignal) =>

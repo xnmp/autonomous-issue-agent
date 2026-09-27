@@ -41,3 +41,4 @@
   .resolve-history-form { grid-template-columns: minmax(0, 1fr); }
   .resolve-actions > .btn { flex: 1 1 auto; white-space: normal; }
 }
+.resolve-legacy-refused { display: grid; gap: var(--space-2); justify-items: start; }

@@ -555,6 +555,437 @@ const OverviewPayload = z
     warnings: z.array(z.string()),
   })
   .passthrough();
+const ReviewFreshReviewRequired = z.object({
+  kind: z.literal("fresh_review_required"),
+  owed_since_generation: z.number().int(),
+});
+const ReviewBoundSubmission = z.object({
+  command_id: z.string(),
+  generation: z.number().int(),
+  kind: z.literal("bound_submission"),
+});
+const ReviewImportedBaseline = z.object({
+  evidence_id: z.string(),
+  kind: z.literal("imported"),
+});
+const ReviewReviewedBaseline = z.object({
+  head_sha: z.string(),
+  kind: z.literal("reviewed_baseline"),
+  patch_id: z.string(),
+  reviewed_generation: z.number().int(),
+  source: z.discriminatedUnion("kind", [
+    ReviewBoundSubmission,
+    ReviewImportedBaseline,
+  ]),
+});
+const ReviewDismissalObligation = z.object({
+  kind: z.literal("dismiss_review"),
+  review_id: z.string(),
+});
+const ReviewProjectionObligation = z.object({
+  add: z.string(),
+  kind: z.literal("projection"),
+  remove: z.union([z.string(), z.null()]),
+});
+const ReviewUnlabelledObligation = z.object({ kind: z.literal("unlabelled") });
+const ReviewRearmCommand = z.object({
+  command_id: z.string(),
+  obligation: z.discriminatedUnion("kind", [
+    ReviewDismissalObligation,
+    ReviewProjectionObligation,
+    ReviewUnlabelledObligation,
+  ]),
+  status: z.enum([
+    "pending",
+    "verified",
+    "refused",
+    "uncertain",
+    "held",
+    "unavailable",
+  ]),
+});
+const ReviewPendingRearm = z.object({
+  authorized_reviews: z.array(z.string()),
+  commands: z.array(ReviewRearmCommand),
+  gate_id: z.string(),
+  generation: z.number().int(),
+  request_id: z.string(),
+  state: z.literal("pending"),
+});
+const ReviewCompletedRearm = z.object({
+  gate_id: z.string(),
+  generation: z.number().int(),
+  request_id: z.string(),
+  state: z.literal("completed"),
+  verified_commands: z.array(z.string()),
+});
+const ReviewStoppedRearm = z.object({
+  authorized_reviews: z.array(z.string()),
+  gate_id: z.string(),
+  generation: z.number().int(),
+  reason: z.string(),
+  request_id: z.string(),
+  retired_commands: z.array(z.string()),
+  state: z.enum(["cancelled", "superseded"]),
+  verified_commands: z.array(z.string()),
+});
+const ReviewDispatchTerminal = z.object({
+  kind: z.literal("terminal"),
+  state: z.enum(["closed", "merged"]),
+});
+const ReviewDispatchNotAdmitted = z.object({
+  holds: z.array(z.string()),
+  kind: z.literal("not_admitted"),
+});
+const ReviewDispatchDeferred = z.object({
+  kind: z.literal("deferred"),
+  reason: z.string(),
+});
+const ReviewDispatchHeld = z.object({
+  gate_ids: z.array(z.string()),
+  kind: z.literal("held"),
+});
+const ReviewDispatchSubmissionUnresolved = z.object({
+  command_ids: z.array(z.string()),
+  kind: z.literal("submission_unresolved"),
+});
+const ReviewDispatchReleasePending = z.object({
+  command_id: z.string(),
+  kind: z.literal("release_projection_pending"),
+});
+const ReviewDispatchOwed = z.object({
+  kind: z.literal("owed"),
+  review: z.enum(["initial", "re_review"]),
+});
+const ReviewDispatchWithheld = z.object({
+  detail: z.string(),
+  kind: z.literal("withheld"),
+  reason: z.enum(["fix_claim", "reserved"]),
+  review: z.enum(["initial", "re_review"]),
+});
+const ReviewDispatchInFlight = z.object({
+  kind: z.literal("in_flight"),
+  review: z.enum(["initial", "re_review"]),
+});
+const ReviewDispatchNotOwed = z.object({
+  kind: z.literal("not_owed"),
+  reason: z.string(),
+});
+const ReviewDecisionBasis = z.object({
+  external_holds: z.array(z.string()),
+  head_sha: z.string(),
+  labels: z.array(z.string()),
+  state: z.enum(["open", "closed", "merged"]),
+});
+const ReviewReadFailure = z.object({
+  failed_reads: z.number().int(),
+  first_failed_at: z.string(),
+  last_failed_at: z.string(),
+  reason: z.string(),
+});
+const ReviewDaemonRecorded = z.object({
+  as_of: z.string(),
+  decided_at: z.string(),
+  dispatch: z.discriminatedUnion("kind", [
+    ReviewDispatchTerminal,
+    ReviewDispatchNotAdmitted,
+    ReviewDispatchDeferred,
+    ReviewDispatchHeld,
+    ReviewDispatchSubmissionUnresolved,
+    ReviewDispatchReleasePending,
+    ReviewDispatchOwed,
+    ReviewDispatchWithheld,
+    ReviewDispatchInFlight,
+    ReviewDispatchNotOwed,
+  ]),
+  pull_request: z.union([ReviewDecisionBasis, z.null()]),
+  read: z.enum(["review_read", "departed_read"]),
+  read_failure: z.union([ReviewReadFailure, z.null()]),
+  state: z.literal("recorded"),
+});
+const ReviewDaemonUnrecorded = z.object({ state: z.literal("unrecorded") });
+const ReviewDaemonUnreadable = z.object({
+  reason: z.string(),
+  state: z.literal("unreadable"),
+});
+const ReviewExpected = z.object({
+  episode_id: z.string().min(1).max(512),
+  epoch: z.number().int().gte(1).lte(9007199254740991),
+  family: z.literal("review_rejections"),
+  generation: z.number().int().gte(0).lte(9007199254740991),
+  pull_request: z.number().int().gte(1).lte(9007199254740991),
+  repository: z.string().min(1).max(512),
+  version: z.number().int().gte(0).lte(9007199254740991),
+});
+const ReviewActionOffered = z.object({
+  effect: z.string(),
+  operation: z.enum([
+    "request_rearm",
+    "continue_rearm",
+    "cancel_rearm",
+    "authorize_retry",
+  ]),
+  state: z.literal("offered"),
+});
+const ReviewActionRefused = z.object({
+  operation: z.enum([
+    "request_rearm",
+    "continue_rearm",
+    "cancel_rearm",
+    "authorize_retry",
+  ]),
+  reason: z.string(),
+  state: z.literal("refused"),
+});
+const ReviewCountedReview = z.object({
+  author: z.string(),
+  commit_id: z.union([z.string(), z.null()]),
+  review_id: z.string(),
+});
+const ReviewHoldUncontested = z.object({
+  restore_limit: z.number().int(),
+  restores: z.number().int(),
+  state: z.literal("restoring"),
+});
+const ReviewHoldContested = z.object({
+  restore_limit: z.number().int(),
+  restores: z.number().int(),
+  state: z.literal("contested"),
+});
+const ReviewHoldUnreadable = z.object({
+  reason: z.string(),
+  state: z.literal("unreadable"),
+});
+const ReviewRejectionCeilingCause = z.object({
+  authorization_bound: z.number().int(),
+  ceiling: z.number().int(),
+  counted: z.array(ReviewCountedReview),
+  counted_total: z.number().int(),
+  episode_id: z.string(),
+  head_sha: z.string(),
+  hold: z.discriminatedUnion("state", [
+    ReviewHoldUncontested,
+    ReviewHoldContested,
+    ReviewHoldUnreadable,
+  ]),
+  kind: z.literal("review_rejection_ceiling"),
+  non_resetting_commits: z.array(z.string()),
+  review_bot: z.string(),
+});
+const ReviewRemoteUncertainCause = z.object({
+  command_id: z.string(),
+  failed_reads: z.number().int(),
+  kind: z.literal("remote_uncertain"),
+  last_error: z.string(),
+  unresolved_since: z.string(),
+});
+const ReviewRetryAuthorizationRequiredCause = z.object({
+  absence_evidence_id: z.string(),
+  command_id: z.string(),
+  kind: z.literal("retry_authorization_required"),
+  retry_authorizable: z.boolean(),
+});
+const ReviewEvidenceUnavailableCause = z.object({
+  evidence: z.enum([
+    "exemption_trailers",
+    "review_history",
+    "prewrite_read",
+    "rearm_observation",
+    "other",
+  ]),
+  failed_reads: z.number().int(),
+  kind: z.literal("evidence_unavailable"),
+  last_error: z.string(),
+  source: z.string(),
+  unresolved_since: z.string(),
+});
+const ReviewRearmNeedsDecisionCause = z.object({
+  kind: z.literal("rearm_needs_decision"),
+  obligations: z.array(z.string()),
+  reason: z.string(),
+  stopped_request_id: z.string(),
+});
+const ReviewProjectionRefusedCause = z.object({
+  command_id: z.string(),
+  generation: z.number().int(),
+  kind: z.literal("review_projection_refused"),
+  projection: z.enum(["ceiling_release", "escalation_hold"]),
+  reason: z.string(),
+});
+const ReviewGateFactsUnavailableCause = z.object({
+  kind: z.literal("facts_unavailable"),
+  reason: z.string(),
+  underlying: z.enum([
+    "review_rejection_ceiling",
+    "remote_uncertain",
+    "retry_authorization_required",
+    "evidence_unavailable",
+    "rearm_needs_decision",
+    "review_projection_refused",
+  ]),
+});
+const ReviewPendingRetry = z.object({
+  authorization_id: z.string(),
+  command_id: z.string(),
+});
+const ReviewNoRemediation = z.object({
+  kind: z.literal("none_authorized"),
+  reason: z.string(),
+});
+const ReviewAttemptedRemediation = z.object({
+  evidence_ids: z.array(z.string()),
+  kind: z.literal("attempted"),
+  operation: z.string(),
+  outcome: z.string(),
+});
+const ReviewGate = z.object({
+  actions: z.array(
+    z.discriminatedUnion("state", [ReviewActionOffered, ReviewActionRefused])
+  ),
+  cause: z.discriminatedUnion("kind", [
+    ReviewRejectionCeilingCause,
+    ReviewRemoteUncertainCause,
+    ReviewRetryAuthorizationRequiredCause,
+    ReviewEvidenceUnavailableCause,
+    ReviewRearmNeedsDecisionCause,
+    ReviewProjectionRefusedCause,
+    ReviewGateFactsUnavailableCause,
+  ]),
+  gate_id: z.string(),
+  opened_generation: z.number().int(),
+  pending_retry: z.union([ReviewPendingRetry, z.null()]),
+  remediation: z.discriminatedUnion("kind", [
+    ReviewNoRemediation,
+    ReviewAttemptedRemediation,
+  ]),
+  state: z.enum(["open", "rearming"]),
+});
+const ReviewObservation = z.object({
+  failed_reads: z.number().int(),
+  last_error: z.string(),
+  next_read_at: z.string(),
+  unresolved_since: z.string(),
+});
+const ReviewAvailableControl = z.object({
+  continuation: z.discriminatedUnion("kind", [
+    ReviewFreshReviewRequired,
+    ReviewReviewedBaseline,
+  ]),
+  current_intent: z.union([
+    z.discriminatedUnion("state", [
+      ReviewPendingRearm,
+      ReviewCompletedRearm,
+      ReviewStoppedRearm,
+    ]),
+    z.null(),
+  ]),
+  daemon: z.discriminatedUnion("state", [
+    ReviewDaemonRecorded,
+    ReviewDaemonUnrecorded,
+    ReviewDaemonUnreadable,
+  ]),
+  expected: ReviewExpected,
+  gates: z.array(ReviewGate),
+  guidance: z.string(),
+  observation: z.union([ReviewObservation, z.null()]),
+  requested_id: z.union([z.string(), z.null()]),
+  requested_intent: z.union([
+    z.discriminatedUnion("state", [
+      ReviewPendingRearm,
+      ReviewCompletedRearm,
+      ReviewStoppedRearm,
+    ]),
+    z.null(),
+  ]),
+  status: z.literal("available"),
+  workflow_held: z.boolean(),
+});
+const ReviewInactiveControl = z.object({
+  pull_request: z.number().int(),
+  repository: z.string(),
+  status: z.literal("inactive"),
+});
+const ReviewMigrationRequiredControl = z.object({
+  active_families: z.array(z.string()),
+  pull_request: z.number().int(),
+  repository: z.string(),
+  status: z.literal("migration_required"),
+});
+const ReviewAbsentControl = z.object({
+  epoch: z.number().int(),
+  pull_request: z.number().int(),
+  repository: z.string(),
+  status: z.literal("absent"),
+});
+const ReviewUnavailableControl = z.object({
+  reason: z.string(),
+  status: z.literal("unavailable"),
+});
+const ReviewRequestRearm = z.object({
+  expected: ReviewExpected,
+  gate_id: z.string().min(1).max(512),
+  guidance: z.discriminatedUnion("kind", [
+    KeepGuidance,
+    ClearGuidance,
+    SetGuidance,
+  ]),
+  operation: z.literal("request_rearm"),
+  request_id: z.string().min(1).max(512),
+});
+const ReviewContinueRearm = z.object({
+  expected: ReviewExpected,
+  operation: z.literal("continue_rearm"),
+  request_id: z.string().min(1).max(512),
+  stopped_request_id: z.string().min(1).max(512),
+});
+const ReviewCancelRearm = z.object({
+  cancellation_id: z.string().min(1).max(512),
+  expected: ReviewExpected,
+  operation: z.literal("cancel_rearm"),
+  reason: z.string().min(1).max(16384),
+  request_id: z.string().min(1).max(512),
+});
+const ReviewAuthorizeRetry = z.object({
+  authorization_id: z.string().min(1).max(512),
+  command_id: z.string().min(1).max(512),
+  evidence_id: z.string().min(1).max(512),
+  expected: ReviewExpected,
+  gate_id: z.string().min(1).max(512),
+  operation: z.literal("authorize_retry"),
+});
+const api_review_command_api_repos__name__pulls__pr__review_control_commands_post_Body =
+  z.discriminatedUnion("operation", [
+    ReviewRequestRearm,
+    ReviewContinueRearm,
+    ReviewCancelRearm,
+    ReviewAuthorizeRetry,
+  ]);
+const ReviewCommandResult = z.object({
+  control: z.discriminatedUnion("status", [
+    ReviewAvailableControl,
+    ReviewInactiveControl,
+    ReviewMigrationRequiredControl,
+    ReviewAbsentControl,
+    ReviewUnavailableControl,
+  ]),
+  outcome: z.enum([
+    "accepted",
+    "replayed",
+    "conflict",
+    "rejected",
+    "unavailable",
+  ]),
+  reason: z.string(),
+});
+const WorkflowFamiliesAvailable = z.object({
+  active_families: z.array(z.enum(["resolve", "review_rejections"])),
+  repository: z.string(),
+  status: z.literal("available"),
+});
+const WorkflowFamiliesUnavailable = z.object({
+  reason: z.string(),
+  status: z.literal("unavailable"),
+});
 const ClaudeUsage = z
   .object({
     error: z.union([z.string(), z.null()]),
@@ -675,6 +1106,64 @@ export const schemas = {
   AttentionItem,
   SpendBucket,
   OverviewPayload,
+  ReviewFreshReviewRequired,
+  ReviewBoundSubmission,
+  ReviewImportedBaseline,
+  ReviewReviewedBaseline,
+  ReviewDismissalObligation,
+  ReviewProjectionObligation,
+  ReviewUnlabelledObligation,
+  ReviewRearmCommand,
+  ReviewPendingRearm,
+  ReviewCompletedRearm,
+  ReviewStoppedRearm,
+  ReviewDispatchTerminal,
+  ReviewDispatchNotAdmitted,
+  ReviewDispatchDeferred,
+  ReviewDispatchHeld,
+  ReviewDispatchSubmissionUnresolved,
+  ReviewDispatchReleasePending,
+  ReviewDispatchOwed,
+  ReviewDispatchWithheld,
+  ReviewDispatchInFlight,
+  ReviewDispatchNotOwed,
+  ReviewDecisionBasis,
+  ReviewReadFailure,
+  ReviewDaemonRecorded,
+  ReviewDaemonUnrecorded,
+  ReviewDaemonUnreadable,
+  ReviewExpected,
+  ReviewActionOffered,
+  ReviewActionRefused,
+  ReviewCountedReview,
+  ReviewHoldUncontested,
+  ReviewHoldContested,
+  ReviewHoldUnreadable,
+  ReviewRejectionCeilingCause,
+  ReviewRemoteUncertainCause,
+  ReviewRetryAuthorizationRequiredCause,
+  ReviewEvidenceUnavailableCause,
+  ReviewRearmNeedsDecisionCause,
+  ReviewProjectionRefusedCause,
+  ReviewGateFactsUnavailableCause,
+  ReviewPendingRetry,
+  ReviewNoRemediation,
+  ReviewAttemptedRemediation,
+  ReviewGate,
+  ReviewObservation,
+  ReviewAvailableControl,
+  ReviewInactiveControl,
+  ReviewMigrationRequiredControl,
+  ReviewAbsentControl,
+  ReviewUnavailableControl,
+  ReviewRequestRearm,
+  ReviewContinueRearm,
+  ReviewCancelRearm,
+  ReviewAuthorizeRetry,
+  api_review_command_api_repos__name__pulls__pr__review_control_commands_post_Body,
+  ReviewCommandResult,
+  WorkflowFamiliesAvailable,
+  WorkflowFamiliesUnavailable,
   ClaudeUsage,
   CodexUsage,
   HarnessRepoSpend,
@@ -1116,6 +1605,76 @@ const endpoints = makeApi([
     ],
   },
   {
+    method: "get",
+    path: "/api/repos/:name/pulls/:pr/review-control",
+    alias: "api_review_control_api_repos__name__pulls__pr__review_control_get",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "pr",
+        type: "Path",
+        schema: z.number().int(),
+      },
+      {
+        name: "request_id",
+        type: "Query",
+        schema: request_id,
+      },
+    ],
+    response: z.discriminatedUnion("status", [
+      ReviewAvailableControl,
+      ReviewInactiveControl,
+      ReviewMigrationRequiredControl,
+      ReviewAbsentControl,
+      ReviewUnavailableControl,
+    ]),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "post",
+    path: "/api/repos/:name/pulls/:pr/review-control/commands",
+    alias:
+      "api_review_command_api_repos__name__pulls__pr__review_control_commands_post",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "body",
+        type: "Body",
+        schema:
+          api_review_command_api_repos__name__pulls__pr__review_control_commands_post_Body,
+      },
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "pr",
+        type: "Path",
+        schema: z.number().int(),
+      },
+    ],
+    response: ReviewCommandResult,
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
     method: "post",
     path: "/api/repos/:name/start",
     alias: "api_start_api_repos__name__start_post",
@@ -1128,6 +1687,30 @@ const endpoints = makeApi([
       },
     ],
     response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "get",
+    path: "/api/repos/:name/workflow-families",
+    alias: "api_workflow_families_api_repos__name__workflow_families_get",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+    ],
+    response: z.discriminatedUnion("status", [
+      WorkflowFamiliesAvailable,
+      WorkflowFamiliesUnavailable,
+    ]),
     errors: [
       {
         status: 422,

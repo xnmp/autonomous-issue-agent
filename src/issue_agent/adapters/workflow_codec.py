@@ -13,6 +13,8 @@ from typing import TypeVar
 
 from ..domain import workflow as w
 from ..domain import review_workflow as rw
+from ..domain import review_dispatch_record as rd
+from ..domain import review_workflow_policy as rp
 from ..domain import workflow_identity as identity
 from ..domain.contracts import WorkflowAttemptIdentity
 from ..domain.labels import Label
@@ -66,12 +68,16 @@ _VALUES = (
     rw.ReviewWorkflowSnapshot, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
     rw.ObservedPullRequest, rw.PullRequestAbsent, rw.PullRequestUnavailable,
     rw.ReviewProjectionRefused, rw.RecordedPullRequest,
+    # The review daemon's recorded dispatch decision (operator surface).
+    rp.ReviewHeld, rp.ReviewOwed, rp.ReviewNotOwed, rp.ReleaseProjectionPending, rp.SubmissionUnresolved,
+    rd.ReviewNotAdmitted, rd.ReviewDeferred, rd.ReviewTerminal, rd.ReviewWithheld, rd.ReviewInFlight,
+    rd.DecisionBasis, rd.DepartedReadFailure, rd.RecordedReviewDecision,
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.StopReason, w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
-    rw.SubmittedReviewState, rw.PullRequestState,
+    rw.SubmittedReviewState, rw.PullRequestState, rp.ReviewKind, rd.DecisionRead, rd.WithheldReason,
 )
 _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
 if len(_TAGS) != len(_VALUES) + len(_ENUMS):
