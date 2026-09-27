@@ -500,6 +500,7 @@ class AccountingRuntime(AgentRuntime):
             "ISSUE_AGENT_CONTROL_DB": self.store.path,
             "ISSUE_AGENT_REPOSITORY": self.repository,
             "ISSUE_AGENT_OWNER_ID": request.owner_id,
+            **({"ISSUE_AGENT_REVIEW_CHILD": "1"} if review_child is not None else {}),
             **(
                 {
                     "ISSUE_AGENT_EVENT_LOG": self.event_log_path,
@@ -620,6 +621,12 @@ class AccountingRuntime(AgentRuntime):
         returned: ReturnedResolve | None = None,
         returned_review: ReturnedReviewChild | None = None,
     ) -> AgentResult:
+        if returned_review is not None:
+            stopped = self.store.settle_review_preflight_stop(returned_review)
+            if stopped is not None:
+                if stopped.disposition is not AccountingDisposition.AVAILABLE:
+                    raise RuntimeError("review preflight stop settlement failed closed")
+                return result
         def retain_invalid_accounting() -> None:
             if returned_review is not None:
                 self.store.record_reservation_retained(

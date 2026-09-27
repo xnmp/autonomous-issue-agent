@@ -112,7 +112,10 @@ review children. `settle_review_return` joins admission, preflight runtime and
 launch history, then records the raw return with the actual charge in one
 transaction. Retained spend also keeps the raw return; reconciler-first charge
 settlement accepts it later without rewriting money. These receipts remain
-unclassified. A separate positive preflight-stop receipt must distinguish
+unclassified. The positive `review-execution-preflight-stop` receipt now
+captures Codex's local before-spawn failure, fences launch/release, and
+settles its exact synthetic zero charge with raw output atomically. Later
+classification must join that receipt and actual charge to distinguish
 settled-without-launch from missing launch evidence. Reuse existing run, lease,
 reservation-recovery and provider receipts to prove launch/refusal/death and
 parent abandonment. Terminal children alone do not authorize sealing an open

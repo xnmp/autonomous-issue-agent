@@ -224,9 +224,37 @@ plus hooks, governor, gate parity, four import contracts and both Pyrefly
 passes. Ten strict xfails remained expected. Local log:
 `/tmp/phase4-return-full.log` (ephemeral). No live activation occurred.
 
+## Checkpoint 9 — verified runtime stop before launch (accepted)
+
+`CodexRunner` records a typed `review-execution-preflight-stop` receipt only
+on its local preflight-failure branch, before any supervised child is spawned.
+The receipt binds the exact paid admission and complete normalized failure
+envelope. Its transaction requires a reserved active run, spawn-pending
+recovery, the planned Codex runtime, and no process, launch, charge or raw
+return. Receipt creation changes no money. Guarded registration and every
+reservation release path refuse a stopped child; exact stop replay is inert.
+
+Accounting settles a matching stop as a synthetic zero charge with canonical
+raw output in one transaction. It verifies the stop, no launch, reserved
+state and actual charge identity, including on replay. Generic settlement
+cannot settle a stopped child. A crash after stop receipt can be completed by
+the regular Codex spend reconciler from the retained harness envelope; a
+pending stop retains its active reservation and is never reclassified as an
+unlaunched release. This positive stop and exact zero charge can later support
+`ReviewChildSettledWithoutLaunch`, while a missing launch receipt alone cannot.
+The receipt does not classify the outer round or activate live execution.
+
+Independent adversarial review reproduced and verified fixes for receipt
+lookups that scanned historical stop rows and a terminal replay that accepted
+a contradictory run provider receipt. Fresh review found no remaining blocker
+in this scope. Final `make test` passed with 3,093 domain, 2,673 adapter and
+2,863 app tests, hooks, governor, gate parity, four import contracts and both
+Pyrefly passes; ten strict xfails remained expected. Local log:
+`/tmp/phase4-stop-full.log` (ephemeral).
+
 ## Required subsequent work
 
-- No-launch preflight-stop and pre-reservation refusal receipts, then sealed outer outcomes and
+- Pre-reservation refusal receipts, then sealed outer outcomes and
   evidence-based finalization after parent/claim abandonment. Distinguish
   released-before-launch and settled-without-launch evidence; preserve actual
   accounting and bound unpaid preparation faults through evidence holds.

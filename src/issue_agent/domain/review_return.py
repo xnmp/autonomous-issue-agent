@@ -6,7 +6,7 @@ import json
 
 from .agent_task import RuntimeName
 from .outcome import AgentResult, ExitReason
-from .review_execution import ReviewChildIdentity
+from .review_execution import ReviewChildAdmission, ReviewChildIdentity
 from .workflow_identity import validate_workflow_identifier as identifier
 
 MAX_RETURN_EVIDENCE_BYTES = 200000
@@ -85,3 +85,29 @@ class ReturnedReviewChild:
         if (not isinstance(self.returned_at, datetime) or self.returned_at.tzinfo is None
                 or self.returned_at.utcoffset() is None):
             raise ValueError("review return requires an aware time")
+
+
+@dataclass(frozen=True)
+class ReviewRuntimePreflightStop:
+    """Harness observation before any supervised child launch is attempted."""
+
+    admission: ReviewChildAdmission
+    receipt_id: str
+    result: ReviewReturnedEnvelope
+    stopped_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.admission, ReviewChildAdmission):
+            raise ValueError("review preflight stop requires its paid child admission")
+        if self.receipt_id != f"review-execution-preflight-stop:{self.admission.run_id}":
+            raise ValueError("review preflight stop receipt disagrees with its run")
+        if (not isinstance(self.result, ReviewReturnedEnvelope)
+                or not self.result.is_error or self.result.status != "blocked"
+                or self.result.exit_reason is not ExitReason.RUNTIME_UNAVAILABLE
+                or self.result.needs or self.result.envelope_subtype
+                or self.result.session_id or self.result.structured_json != "null"
+                or not self.result.summary):
+            raise ValueError("review preflight stop requires the exact local runtime failure")
+        if (not isinstance(self.stopped_at, datetime) or self.stopped_at.tzinfo is None
+                or self.stopped_at.utcoffset() is None):
+            raise ValueError("review preflight stop requires an aware time")

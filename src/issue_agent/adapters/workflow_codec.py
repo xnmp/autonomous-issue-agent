@@ -81,6 +81,7 @@ _VALUES = (
     rx.ReviewExecutionBinding, rx.ReviewRoundIdentity, rx.ReviewChildIdentity,
     rx.ReviewChildAdmission, rx.ReviewChildLaunchRegistration,
     review_return.ReviewReturnedEnvelope, review_return.ReturnedReviewChild,
+    review_return.ReviewRuntimePreflightStop,
     rx.LaunchedReviewChild, rx.ImportedReviewSession, rx.NoReviewSession,
     rx.ReusableReviewSession, rx.PreserveReviewSession, rx.ReplaceReviewSession,
     rx.ClearReviewSession, rx.PreserveDisplayedRound, rx.SetDisplayedRound,

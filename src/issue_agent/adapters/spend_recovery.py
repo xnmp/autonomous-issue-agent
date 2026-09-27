@@ -38,6 +38,8 @@ class CodexSpendReconciler:
     evidence_dirs: tuple[str, ...]
 
     def reconcile(self, run_id: RunId) -> bool:
+        if self.store.reconcile_review_preflight_stop(run_id):
+            return True
         for directory in self.evidence_dirs:
             evidence = self._read(directory, run_id)
             if evidence is None:

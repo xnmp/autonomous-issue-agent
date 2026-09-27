@@ -46,6 +46,7 @@ from ..domain.outcome import (
     declared_status,
     no_session_evidence,
 )
+from ..domain.review_return import review_returned_envelope
 
 
 # Model the CodexRunner defaults to when neither CODEX_MODEL nor a task's `model`
@@ -1455,12 +1456,20 @@ class CodexRunner(AgentRuntime):
         reason = self.preflight()
         if reason is not None:
             self._log(f"codex: NOT READY — {reason}")
-            return AgentResult(
+            stopped = AgentResult(
                 is_error=True,
                 status="blocked",
                 summary=reason,
                 exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
             )
+            if task.env.get("ISSUE_AGENT_REVIEW_CHILD") == "1":
+                from .control_store import SQLiteControlStore
+
+                run_id = RunId(task.env["ISSUE_AGENT_RUN_ID"])
+                SQLiteControlStore(task.env["ISSUE_AGENT_CONTROL_DB"]).record_review_runtime_preflight_stop(
+                    run_id, task.env["ISSUE_AGENT_OWNER_ID"], review_returned_envelope(stopped),
+                )
+            return stopped
 
         # Review M17: the per-run scratch dir used to be an un-removed mkdtemp, so
         # a long-lived daemon leaked one `codex-run-*` directory (schema + the last

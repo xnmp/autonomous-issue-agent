@@ -50,9 +50,10 @@ from ..domain.workflow import (
     AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveEpisode, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
+from ..domain.agent_task import RuntimeName
 from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildIdentity, ReviewChildLaunchRegistration
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
-from ..domain.review_return import ReturnedReviewChild
+from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
 from ..domain.review_rounds import ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
@@ -2451,6 +2452,8 @@ class SQLiteControlStore:
         if outcome == "unlaunched_released":
             raise ValueError("never-launched evidence can only be minted by reservation release")
         with self.transaction() as db:
+            if self._has_review_preflight_stop(db, run_id):
+                raise ControlStoreError("review preflight stop requires atomic accounting completion")
             row = db.execute(
                 "SELECT state, outcome, provider_receipt_id FROM runs WHERE run_id=?",
                 (str(run_id),),
@@ -2636,6 +2639,11 @@ class SQLiteControlStore:
                 raise ControlStoreError("review launch lacks its captured round scope")
             if review_scope is not None and not review_attached:
                 raise ControlStoreError("review launch scope changed before process registration")
+            if review_attached and db.execute(
+                "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-preflight-stop' "
+                "AND scope=? AND key=?", (review_scope[0], str(run_id)),
+            ).fetchone() is not None:
+                raise ControlStoreError("review preflight stop fenced child launch")
             existing = db.execute(
                 "SELECT dispatch_id, owner_id, pid, pgid, process_start_ticks, "
                 "started_at FROM leases WHERE run_id=?",
@@ -3091,7 +3099,7 @@ class SQLiteControlStore:
             raise ValueError("retained review return requires its exact run")
         with self.transaction() as db:
             row = db.execute(
-                "SELECT b.state, r.dispatch_id FROM budget_reservations b "
+                "SELECT b.state,b.workload_repository,r.dispatch_id FROM budget_reservations b "
                 "JOIN runs r ON r.run_id=b.run_id WHERE b.run_id=?",
                 (str(run_id),),
             ).fetchone()
@@ -3103,6 +3111,17 @@ class SQLiteControlStore:
                 if returned_review is not None:
                     raise ControlStoreError("review return lacks its paid reservation")
                 return False
+            stop = db.execute(
+                "SELECT payload_json FROM dedupe_keys "
+                "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
+                (row["workload_repository"], str(run_id)),
+            ).fetchone()
+            if stop is not None:
+                stopped = decode_workflow(stop["payload_json"], ReviewRuntimePreflightStop)
+                if (stopped.admission.run_id != str(run_id)
+                        or (returned_review is not None and stopped.result != returned_review.result)):
+                    raise ControlStoreError("review retained return disagrees with its runtime preflight stop")
+                return True
             if row["state"] == "settled" and review_return is not None:
                 charge = db.execute(
                     "SELECT 1 FROM charges WHERE run_id=?", (str(run_id),),
@@ -4765,6 +4784,63 @@ class SQLiteControlStore:
         with self.transaction() as db:
             return self._settle(db, request)
 
+    def record_review_runtime_preflight_stop(
+        self, run_id: RunId, expected_owner_id: str, result: ReviewReturnedEnvelope,
+    ) -> ReviewRuntimePreflightStop:
+        """Retain the Codex harness branch that returned before any child spawn."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT r.*,b.workload_repository,b.state AS budget_state, "
+                "rr.policy AS recovery_policy FROM runs r "
+                "JOIN budget_reservations b USING(run_id) "
+                "JOIN reservation_recovery rr USING(run_id) WHERE r.run_id=?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None or row["review_round_id"] is None:
+                raise ControlStoreError("review preflight stop lacks an attached paid child")
+            repository = row["workload_repository"]
+            admission = self._load_review_launch_admission(db, run_id, repository, row)
+            recorded = load_review_preflight_record(
+                db, repository, expected_owner_id, admission.child.round.round_id,
+            )
+            if (admission.owner_id != expected_owner_id or recorded is None
+                    or admission.child not in recorded[2].children
+                    or recorded[2].runtime is not RuntimeName.CODEX):
+                raise ControlStoreError("review preflight stop disagrees with its admission or runtime")
+            if (row["started_at"] is not None
+                    or db.execute("SELECT 1 FROM leases WHERE run_id=?", (str(run_id),)).fetchone()
+                    or db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-launch' "
+                                  "AND scope=? AND key=?", (repository, str(run_id))).fetchone()):
+                raise ControlStoreError("review preflight stop contradicts a child launch")
+            receipt_id = f"review-execution-preflight-stop:{run_id}"
+            prior = db.execute(
+                "SELECT payload_json FROM dedupe_keys "
+                "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
+                (repository, str(run_id)),
+            ).fetchone()
+            if prior is not None:
+                stopped = decode_workflow(prior["payload_json"], ReviewRuntimePreflightStop)
+                if stopped.admission != admission or stopped.result != result:
+                    raise ControlStoreError("review preflight stop conflicts with its immutable receipt")
+                return stopped
+            if (row["state"] != "reserved"
+                    or row["budget_state"] != "active" or row["recovery_policy"] != "spawn_pending"
+                    or db.execute("SELECT 1 FROM leases WHERE run_id=?", (str(run_id),)).fetchone()
+                    or db.execute("SELECT 1 FROM charges WHERE run_id=?", (str(run_id),)).fetchone()
+                    or db.execute("SELECT 1 FROM dedupe_keys WHERE namespace IN "
+                                  "('review-execution-launch','review-execution-return') "
+                                  "AND scope=? AND key=?", (repository, str(run_id))).fetchone()):
+                raise ControlStoreError("review preflight stop has contradictory launch or money evidence")
+            stopped = ReviewRuntimePreflightStop(
+                admission, receipt_id, result, _parse_stamp(_stamp(self._now())),
+            )
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES ('review-execution-preflight-stop',?,?,?,?)",
+                (repository, str(run_id), _stamp(stopped.stopped_at), encode_workflow(stopped)),
+            )
+            return stopped
+
     def settle_review_return(
         self, request: SettlementRequest, returned: ReturnedReviewChild,
     ) -> SettlementResult:
@@ -4783,6 +4859,71 @@ class SQLiteControlStore:
                     raise ControlStoreError("review return settlement lacks its actual charge")
                 if not prior:
                     self._insert_review_return(db, repository, returned)
+            return settled
+
+    def settle_review_preflight_stop(
+        self, returned: ReturnedReviewChild,
+    ) -> SettlementResult | None:
+        """Settle a verified local Codex stop as zero with its raw return."""
+        if not isinstance(returned, ReturnedReviewChild):
+            raise ValueError("review preflight settlement requires a typed return")
+        with self.transaction() as db:
+            run = db.execute(
+                "SELECT b.workload_repository,b.state AS budget_state,r.state AS run_state, "
+                "r.outcome,r.provider_receipt_id,r.started_at,rr.policy FROM budget_reservations b "
+                "JOIN runs r USING(run_id) JOIN reservation_recovery rr USING(run_id) "
+                "WHERE b.run_id=?", (returned.run_id,),
+            ).fetchone()
+            if run is None:
+                return None
+            repository = run["workload_repository"]
+            row = db.execute(
+                "SELECT payload_json FROM dedupe_keys "
+                "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
+                (repository, returned.run_id),
+            ).fetchone()
+            if row is None:
+                return None
+            stopped = decode_workflow(row["payload_json"], ReviewRuntimePreflightStop)
+            if (stopped.admission.child != returned.child
+                    or stopped.admission.owner_id != returned.owner_id
+                    or returned.runtime is not RuntimeName.CODEX
+                    or stopped.result != returned.result):
+                raise ControlStoreError("review preflight settlement disagrees with its stop")
+            canonical = replace(returned, returned_at=stopped.stopped_at)
+            source, prior = self._review_return_authority(db, canonical)
+            if source != repository:
+                raise ControlStoreError("review preflight settlement changed repository")
+            receipt_id = f"codex:preflight-stop:{returned.run_id}"
+            charge = db.execute(
+                "SELECT provider_receipt_id,amount_micros,currency,basis,usage_json, "
+                "rate_card_id,rate_card_version FROM charges WHERE run_id=?",
+                (returned.run_id,),
+            ).fetchone()
+            if prior and (
+                run["run_state"] != "completed" or run["outcome"] != "settled"
+                or run["budget_state"] != "settled" or charge is None
+                or run["provider_receipt_id"] != receipt_id
+                or tuple(charge) != (receipt_id, 0, "USD", PricingBasis.SYNTHETIC.value,
+                                    None, None, None)
+            ):
+                raise ControlStoreError("review preflight replay disagrees with its settled charge")
+            if not prior and (
+                run["run_state"] != "reserved" or run["budget_state"] != "active"
+                or run["policy"] != "spawn_pending" or run["started_at"] is not None
+                or run["provider_receipt_id"] is not None
+                or charge is not None
+            ):
+                raise ControlStoreError("review preflight stop lost its pending zero-settlement state")
+            request = SettlementRequest(
+                RunId(returned.run_id), Money.zero("USD"), PricingBasis.SYNTHETIC,
+                receipt_id, None, None, None,
+            )
+            settled = self._settle(db, request, review_stop=True)
+            if settled.disposition is not AccountingDisposition.AVAILABLE:
+                raise ControlStoreError("review preflight stop cannot settle its zero charge")
+            if not prior:
+                self._insert_review_return(db, repository, canonical)
             return settled
 
     def returned_review_child(
@@ -4851,6 +4992,16 @@ class SQLiteControlStore:
                 or _parse_stamp(row["lease_started_at"]) != registered.registered_at
             ):
                 raise ControlStoreError("review return launch receipt disagrees with its live lease")
+        stop = db.execute(
+            "SELECT payload_json FROM dedupe_keys "
+            "WHERE namespace='review-execution-preflight-stop' AND scope=? AND key=?",
+            (repository, returned.run_id),
+        ).fetchone()
+        if stop is not None:
+            stopped = decode_workflow(stop["payload_json"], ReviewRuntimePreflightStop)
+            if (stopped.admission != admission or stopped.result != returned.result
+                    or launch is not None or row["started_at"] is not None or row["leased"] is not None):
+                raise ControlStoreError("review return contradicts its runtime preflight stop")
         prior = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
             "AND scope=? AND key=?", (repository, returned.run_id),
@@ -4871,7 +5022,42 @@ class SQLiteControlStore:
             (repository, returned.run_id, _stamp(returned.returned_at), encode_workflow(returned)),
         )
 
-    def _settle(self, db: sqlite3.Connection, request: SettlementRequest) -> SettlementResult:
+    def reconcile_review_preflight_stop(self, run_id: RunId) -> bool:
+        """Complete a pending local stop after its caller disappeared."""
+        with self.transaction() as db:
+            row = db.execute(
+                "SELECT d.payload_json FROM dedupe_keys d "
+                "JOIN budget_reservations b ON b.workload_repository=d.scope AND b.run_id=d.key "
+                "WHERE d.namespace='review-execution-preflight-stop' AND d.key=?",
+                (str(run_id),),
+            ).fetchone()
+            if row is None:
+                return False
+            stopped = decode_workflow(row["payload_json"], ReviewRuntimePreflightStop)
+        returned = ReturnedReviewChild(
+            stopped.admission.child, str(run_id), stopped.admission.owner_id,
+            RuntimeName.CODEX, stopped.result, stopped.stopped_at,
+        )
+        settled = self.settle_review_preflight_stop(returned)
+        return settled is not None and settled.disposition is AccountingDisposition.AVAILABLE
+
+    @staticmethod
+    def _has_review_preflight_stop(db: sqlite3.Connection, run_id: RunId) -> bool:
+        return db.execute(
+            "SELECT 1 FROM budget_reservations b JOIN dedupe_keys d "
+            "ON d.namespace='review-execution-preflight-stop' "
+            "AND d.scope=b.workload_repository AND d.key=b.run_id "
+            "WHERE b.run_id=?", (str(run_id),),
+        ).fetchone() is not None
+
+    def _settle(
+        self, db: sqlite3.Connection, request: SettlementRequest, *, review_stop: bool = False,
+    ) -> SettlementResult:
+        if not review_stop and self._has_review_preflight_stop(db, request.run_id):
+            return SettlementResult(
+                AccountingDisposition.CONFLICT, request.amount,
+                detail="review preflight stop requires its atomic zero settlement",
+            )
         reservation = db.execute(
             "SELECT b.state, b.maximum_micros, b.currency, r.dispatch_id "
             "FROM budget_reservations b JOIN runs r ON r.run_id=b.run_id "
@@ -5167,6 +5353,9 @@ class SQLiteControlStore:
             raise ValueError("retained reservation release reason is required")
         cutoff = _stamp(retained_before)
         with self.transaction() as db:
+            if self._has_review_preflight_stop(db, run_id):
+                return ReleaseResult(AccountingDisposition.CONFLICT, run_id,
+                                     detail="review preflight stop awaits accounting capture")
             row = db.execute(
                 "SELECT b.state AS reservation_state, b.release_reason, "
                 "rr.policy, rr.updated_at AS recovery_updated_at, "
@@ -5252,6 +5441,9 @@ class SQLiteControlStore:
             "SELECT state, release_reason FROM budget_reservations WHERE run_id=?",
             (str(run_id),),
         ).fetchone()
+        if self._has_review_preflight_stop(db, run_id):
+            return ReleaseResult(AccountingDisposition.CONFLICT, run_id,
+                                 detail="review preflight stop awaits accounting capture")
         if reservation is None:
             return ReleaseResult(
                 AccountingDisposition.CONFLICT,
