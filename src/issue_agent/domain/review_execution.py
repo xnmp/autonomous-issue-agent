@@ -347,6 +347,18 @@ class ReviewRoundFailure:
 
 
 @dataclass(frozen=True)
+class ReviewInfrastructureDeath:
+    """A launched round ended from verified non-striking infrastructure loss."""
+
+    launched: tuple[LaunchedReviewChild, ...]
+    outcome_receipt: str
+
+    def __post_init__(self) -> None:
+        _launched(self.launched)
+        identifier(self.outcome_receipt, "infrastructure death closure receipt")
+
+
+@dataclass(frozen=True)
 class ReviewPinDeferred:
     preflight_receipt: str
 
@@ -426,12 +438,12 @@ class ReviewRoundCancelled:
 
 
 ReviewExecutionDisposition = (
-    PaidReviewProgress | CopiedReviewProgress | ReviewRoundFailure | ReviewPinDeferred
+    PaidReviewProgress | CopiedReviewProgress | ReviewRoundFailure | ReviewInfrastructureDeath | ReviewPinDeferred
     | ReviewAdmissionRefused | ReviewReservationReleased | ReviewRoundCancelled
     | ReviewUnlaunchedRound | ReviewPreparationDeferred
 )
 _DISPOSITIONS = (
-    PaidReviewProgress, CopiedReviewProgress, ReviewRoundFailure, ReviewPinDeferred,
+    PaidReviewProgress, CopiedReviewProgress, ReviewRoundFailure, ReviewInfrastructureDeath, ReviewPinDeferred,
     ReviewAdmissionRefused, ReviewReservationReleased, ReviewRoundCancelled,
     ReviewUnlaunchedRound, ReviewPreparationDeferred,
 )
@@ -453,7 +465,7 @@ class ReviewRoundOutcome:
             raise ValueError("review outcome requires a typed session disposition")
         if not isinstance(self.display, (PreserveDisplayedRound, SetDisplayedRound)):
             raise ValueError("review outcome requires a typed displayed-round disposition")
-        paid = isinstance(self.disposition, (PaidReviewProgress, ReviewRoundFailure))
+        paid = isinstance(self.disposition, (PaidReviewProgress, ReviewRoundFailure, ReviewInfrastructureDeath))
         if paid:
             if any(value.child.round != self.round for value in self.disposition.launched):
                 raise ValueError("outcome launch evidence belongs to another round")

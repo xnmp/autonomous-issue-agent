@@ -79,8 +79,8 @@ def test_normal_success_only_retains_an_eligible_reviewer_session(runtime, kind,
 @pytest.mark.parametrize("is_error,reason,expected", [
     (True, ExitReason.AGENT_ERROR, rounds.ReviewChildFailed),
     (True, ExitReason.TRANSPORT_DEATH, type(None)),
-    (True, ExitReason.KILLED_EXTERNALLY, type(None)),
-    (True, ExitReason.RUNTIME_UNAVAILABLE, type(None)),
+    (True, ExitReason.KILLED_EXTERNALLY, rounds.ReviewChildInfrastructureFailure),
+    (True, ExitReason.RUNTIME_UNAVAILABLE, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.BUDGET_EXHAUSTED, type(None)),
     (True, ExitReason.OPERATOR_CANCELLED, type(None)),
     (False, ExitReason.AGENT_ERROR, type(None)),
@@ -94,7 +94,8 @@ def test_normal_return_classification_waits_for_special_or_contradictory_results
 
 def failure(child, *, deterministic=False):
     determinism = rounds.DeterministicReviewFailure("deterministic:verified") if deterministic else rounds.OrdinaryReviewFailure()
-    return returned(child, result=rounds.ReviewChildFailed(ExitReason.TRANSPORT_DEATH, determinism))
+    reason = ExitReason.TRANSPORT_DEATH if deterministic else ExitReason.AGENT_ERROR
+    return returned(child, result=rounds.ReviewChildFailed(reason, determinism))
 
 
 def submission(kind=rounds.ReviewSubmissionKind.PAID, command="submission"):
@@ -126,6 +127,42 @@ def project(outcome, *, failures=2, pins=0):
     checkpoint = execution.ReviewExecutionCheckpoint(0, execution.ReviewExecutionState(
         outcome.round.binding, failures=failures, pin_deferrals=pins))
     return execution.project_review_execution(checkpoint, (outcome,)).state
+
+
+@pytest.mark.parametrize("reason", [ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE])
+def test_settled_infrastructure_only_round_preserves_failure_allowance(reason):
+    planned = plan()
+    child = planned.children[0]
+    infra = returned(child, result=rounds.ReviewChildInfrastructureFailure(reason))
+    outcome = finalized(facts(planned, children=(infra,)))
+    assert outcome.disposition == execution.ReviewInfrastructureDeath((infra.launched,), "complete-closure")
+    assert project(outcome, failures=3).failures == 3
+
+
+def test_ordinary_failed_sibling_still_charges_once_beside_infrastructure_loss():
+    planned = plan(mode=ReviewMode.MULTI)
+    children = (returned(planned.children[0], result=rounds.ReviewChildInfrastructureFailure(
+        ExitReason.KILLED_EXTERNALLY)), failure(planned.children[1]),
+        returned(planned.children[2]), returned(planned.children[3]))
+    outcome = finalized(facts(planned, children=children))
+    assert isinstance(outcome.disposition, execution.ReviewRoundFailure)
+    assert project(outcome, failures=3).failures == 4
+
+
+def test_refused_paid_submission_is_ordinary_failure_even_with_infrastructure_child():
+    command = submission()
+    planned = plan(submissions=(command,))
+    child = planned.children[0]
+    infra = returned(child, result=rounds.ReviewChildInfrastructureFailure(ExitReason.KILLED_EXTERNALLY))
+    outcome = finalized(facts(planned, children=(infra,), submissions=(refused(command),)))
+    assert isinstance(outcome.disposition, execution.ReviewRoundFailure)
+    assert project(outcome, failures=3).failures == 4
+
+
+@pytest.mark.parametrize("reason", ["killed_externally", ExitReason.AGENT_ERROR, None])
+def test_infrastructure_child_requires_a_typed_non_striking_reason(reason):
+    with pytest.raises(ValueError):
+        rounds.ReviewChildInfrastructureFailure(reason)
 
 
 @pytest.mark.parametrize("mode", list(ReviewMode))
@@ -521,7 +558,10 @@ def test_stage_child_and_submission_limits_are_enforced_across_the_whole_round()
         replace(base, submissions=tuple(submission(command=f"command:{n}") for n in range(rounds.MAX_ROUND_SUBMISSIONS + 1)))
 
 
-@pytest.mark.parametrize("reason", [ExitReason.OK, ExitReason.OPERATOR_CANCELLED, "transport_death", None])
+@pytest.mark.parametrize("reason", [ExitReason.OK, ExitReason.OPERATOR_CANCELLED,
+                                     ExitReason.TRANSPORT_DEATH, ExitReason.KILLED_EXTERNALLY,
+                                     ExitReason.RUNTIME_UNAVAILABLE, ExitReason.BUDGET_EXHAUSTED,
+                                     "transport_death", None])
 def test_failed_child_cannot_claim_success_or_operator_cancellation(reason):
     with pytest.raises(ValueError):
         rounds.ReviewChildFailed(reason)

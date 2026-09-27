@@ -14,7 +14,8 @@ from issue_agent.domain.review_execution import (
     ReviewPreparationFailure, ReviewPreparationKind,
 )
 from issue_agent.domain.review_rounds import (
-    ReviewChildCancelled, ReviewChildFailed, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned,
+    ReviewChildCancelled, ReviewChildFailed, ReviewChildInfrastructureFailure, ReviewChildPending,
+    ReviewChildRefused, ReviewChildReleased, ReviewChildReturned,
     ReviewChildSettledWithoutLaunch, ReviewStagePlan,
 )
 from issue_agent.domain.review_return import ReturnedReviewChild
@@ -188,8 +189,7 @@ def test_reconciled_charge_before_raw_return_stays_pending_until_return_capture(
 
 
 @pytest.mark.parametrize("reason", [
-    ExitReason.TRANSPORT_DEATH, ExitReason.KILLED_EXTERNALLY,
-    ExitReason.RUNTIME_UNAVAILABLE, ExitReason.BUDGET_EXHAUSTED,
+    ExitReason.TRANSPORT_DEATH, ExitReason.BUDGET_EXHAUSTED,
 ])
 def test_settled_non_striking_error_without_specific_disposition_stays_pending(admitted, reason):
     store, _, proposed = admitted
@@ -201,6 +201,19 @@ def test_settled_non_striking_error_without_specific_disposition_stays_pending(a
     ))
     store.settle_review_return(settlement(proposed), raw)
     assert observed(store, child) == (ReviewChildPending(child),)
+
+
+@pytest.mark.parametrize("reason", [ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE])
+def test_settled_infrastructure_return_mints_non_striking_child(admitted, reason):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed, result=AgentResult(True, status="raised", exit_reason=reason))
+    store.settle_review_return(settlement(proposed), raw)
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+    assert evidence[0].result == ReviewChildInfrastructureFailure(reason)
 
 
 def test_settled_operator_cancel_waits_for_exact_shutdown_intent(admitted):

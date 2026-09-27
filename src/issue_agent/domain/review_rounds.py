@@ -16,7 +16,7 @@ from .review_execution import (
     LaunchedReviewChild, NoReviewSession, PaidReviewProgress, PreserveReviewSession,
     ReplaceReviewSession, ReusableReviewSession, ReviewAdmissionRefused,
     ReviewCancellationReason, ReviewChildIdentity, ReviewChildKind,
-    ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
+    ReviewInfrastructureDeath, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewRoundCancelled, ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome,
     ReviewUnlaunchedRound, SaturateReviewFailures, SetDisplayedRound,
 )
@@ -229,10 +229,15 @@ class ReviewChildFailed:
     determinism: OrdinaryReviewFailure | DeterministicReviewFailure = OrdinaryReviewFailure()
 
     def __post_init__(self) -> None:
-        if not isinstance(self.reason, ExitReason) or self.reason in (ExitReason.OK, ExitReason.OPERATOR_CANCELLED):
+        if not isinstance(self.reason, ExitReason) or self.reason in (
+            ExitReason.OK, ExitReason.OPERATOR_CANCELLED, ExitReason.KILLED_EXTERNALLY,
+            ExitReason.RUNTIME_UNAVAILABLE, ExitReason.BUDGET_EXHAUSTED,
+        ):
             raise ValueError("failed child requires a non-cancellation failure reason")
         if not isinstance(self.determinism, (OrdinaryReviewFailure, DeterministicReviewFailure)):
             raise ValueError("child failure requires typed deterministic classification")
+        if self.reason is ExitReason.TRANSPORT_DEATH and not isinstance(self.determinism, DeterministicReviewFailure):
+            raise ValueError("transport death requires positive deterministic classification before a strike")
 
 
 @dataclass(frozen=True)
@@ -247,16 +252,27 @@ class ReviewChildCancelled:
 
 
 @dataclass(frozen=True)
+class ReviewChildInfrastructureFailure:
+    reason: ExitReason
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.reason, ExitReason) or self.reason not in (
+            ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
+        ):
+            raise ValueError("review infrastructure failure requires a non-striking exit reason")
+
+
+@dataclass(frozen=True)
 class ReviewChildReturned:
     launched: LaunchedReviewChild
     return_receipt: str
-    result: ReviewChildSucceeded | ReviewChildFailed | ReviewChildCancelled
+    result: ReviewChildSucceeded | ReviewChildFailed | ReviewChildCancelled | ReviewChildInfrastructureFailure
 
     def __post_init__(self) -> None:
         if not isinstance(self.launched, LaunchedReviewChild):
             raise ValueError("returned child requires verified launch evidence")
         identifier(self.return_receipt, "settled child return receipt")
-        if not isinstance(self.result, (ReviewChildSucceeded, ReviewChildFailed, ReviewChildCancelled)):
+        if not isinstance(self.result, (ReviewChildSucceeded, ReviewChildFailed, ReviewChildCancelled, ReviewChildInfrastructureFailure)):
             raise ValueError("child return requires a typed settled result")
         if isinstance(self.result, ReviewChildSucceeded) and isinstance(self.result.session, ReusableReviewSession):
             if self.result.session.source != self.launched:
@@ -269,7 +285,7 @@ class ReviewChildReturned:
 
 def classify_normal_review_return(
     launched: LaunchedReviewChild, runtime: RuntimeName, envelope: ReviewReturnedEnvelope,
-) -> ReviewChildSucceeded | ReviewChildFailed | None:
+) -> ReviewChildSucceeded | ReviewChildFailed | ReviewChildInfrastructureFailure | None:
     """Interpret a settled normal return; unusual deaths need separate proof."""
     if not isinstance(launched, LaunchedReviewChild) or not isinstance(runtime, RuntimeName) or not isinstance(envelope, ReviewReturnedEnvelope):
         raise ValueError("review return classification requires typed source facts")
@@ -284,10 +300,11 @@ def classify_normal_review_return(
             except ValueError:
                 pass
         return ReviewChildSucceeded(session)
+    if envelope.is_error and reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE):
+        return ReviewChildInfrastructureFailure(reason)
     if (envelope.is_error and reason is not None
             and reason not in (
                 ExitReason.OK, ExitReason.OPERATOR_CANCELLED, ExitReason.TRANSPORT_DEATH,
-                ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
                 ExitReason.BUDGET_EXHAUSTED,
             )):
         return ReviewChildFailed(reason)
@@ -537,10 +554,16 @@ def finalize_review_round(
     if isinstance(conclusion, ReviewPinDeferred) or any(isinstance(child, ReviewChildPinDeferred) for child in facts.children):
         return finished(ReviewRoundOutcome(plan.round, ReviewPinDeferred(facts.closure_receipt)))
     if launched:
-        deterministic = any(isinstance(child.result, ReviewChildFailed) and isinstance(child.result.determinism, DeterministicReviewFailure)
-                            for child in returned)
-        debit = SaturateReviewFailures(plan.failure_ceiling, facts.closure_receipt) if deterministic and plan.failure_ceiling else AddReviewStrike()
-        return finished(ReviewRoundOutcome(plan.round, ReviewRoundFailure(launched, facts.closure_receipt, debit)))
+        failed = tuple(child for child in returned if isinstance(child.result, ReviewChildFailed))
+        refused_submission = any(isinstance(submission.result, ReviewSubmissionRefused)
+                                 for submission in facts.submissions)
+        if (failed or refused_submission
+                or not any(isinstance(child.result, ReviewChildInfrastructureFailure) for child in returned)):
+            deterministic = any(isinstance(child.result.determinism, DeterministicReviewFailure)
+                                for child in failed)
+            debit = SaturateReviewFailures(plan.failure_ceiling, facts.closure_receipt) if deterministic and plan.failure_ceiling else AddReviewStrike()
+            return finished(ReviewRoundOutcome(plan.round, ReviewRoundFailure(launched, facts.closure_receipt, debit)))
+        return finished(ReviewRoundOutcome(plan.round, ReviewInfrastructureDeath(launched, facts.closure_receipt)))
     if preparation:
         disposition = conclusion if isinstance(conclusion, ReviewPreparationDeferred) and not facts.children else ReviewUnlaunchedRound(facts.closure_receipt)
         return DeferredReviewPreparation(ReviewRoundOutcome(plan.round, disposition), preparation)

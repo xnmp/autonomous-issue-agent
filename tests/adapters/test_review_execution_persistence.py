@@ -50,7 +50,7 @@ def round_facts(snapshot, sequence, *, copied=False):
     )
     children = () if copied else (rounds.ReviewChildReturned(
         execution.LaunchedReviewChild(child, f"run:{sequence}", f"launch:{sequence}"), f"return:{sequence}",
-        rounds.ReviewChildFailed(ExitReason.TRANSPORT_DEATH)),)
+        rounds.ReviewChildFailed(ExitReason.AGENT_ERROR)),)
     submissions = (rounds.ReviewSubmissionEvidence(submission, rounds.ReviewSubmissionConfirmed(f"confirmed:{sequence}")),) if copied else ()
     facts = rounds.ReviewRoundFacts(f"closure:{sequence}", plan, planning, children, submissions)
     result = rounds.finalize_review_round(facts)
