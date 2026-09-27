@@ -353,6 +353,38 @@ parity, four import contracts and both Pyrefly checks. Log:
 No live activation, target mutation, service restart or paid harness run
 occurred.
 
+## Checkpoint 13 — settled normal child returns (accepted)
+
+`read_review_child_evidence` now constructs `ReviewChildReturned` only after
+the exact guarded launch, indexed admission, immutable raw return, settled
+budget and matching actual charge agree. A charge that arrives before its raw
+return, or a raw return while spend remains active, stays pending. The reader
+accepts the documented reconciled-spend order once both sources are present,
+without treating a terminal run status alone as proof. Contradictory money or
+source rows refuse.
+
+Pure `classify_normal_review_return` derives successful normal output and
+ordinary agent errors from the typed runtime envelope. A reusable session
+comes only from a successful normal reviewer on a runtime that can resume
+while preserving the review sandbox, and its source is the exact launched
+child. Auxiliary outputs and invalid handles cannot become continuation.
+A settled shutdown cancellation requires the exact same-run persisted
+`run_cancellation_intents` row, matching dispatch/kind and the harness
+shutdown reason. Operator cancellation without that proof stays pending.
+
+Sol review found that external kills, runtime unavailability and budget
+exhaustion were initially headed toward an ordinary strike. The classifier
+now keeps those and transport death pending until their specific
+non-striking or deterministic disposition is supported. The fresh Sol pass
+found no further material fault. Tests cover settled success/failure,
+reconciliation order, absent return/charge, corrupt money, session
+eligibility, cancellation intent and all four non-striking exit reasons.
+Final `make test` passed with 3,107 domain, 2,732 adapter and 2,863 app
+tests, hooks, governor, parity, four import contracts and both Pyrefly
+checks. Log: `/tmp/phase4-launched-return-full.log` (ephemeral). Commit
+`8ac97be`. No live activation, target mutation, service restart or paid
+harness run occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,
