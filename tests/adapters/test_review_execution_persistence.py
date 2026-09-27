@@ -124,6 +124,26 @@ def test_one_stored_ordinary_failure_restores_one_outer_debit_and_exact_rejectio
         assert tuple(db.iterdump()) == before
 
 
+def test_stored_budget_exhaustion_restores_visible_non_striking_outcome(active):
+    store, snapshot = active
+    original, _ = round_facts(snapshot, 1)
+    failed = original.children[0]
+    assert isinstance(failed, rounds.ReviewChildReturned)
+    exhausted = replace(failed, result=rounds.ReviewChildBudgetExhausted())
+    facts = replace(original, children=(exhausted,))
+    result = rounds.finalize_review_round(facts)
+    assert isinstance(result, rounds.FinalizedReviewRound)
+    assert result.outcome.disposition == execution.ReviewBudgetExhausted((exhausted.launched,), facts.closure_receipt)
+    with store.transaction() as db:
+        insert_round(db, facts, result.outcome)
+        expected = set_projection(db, snapshot, (result.outcome,), 1)
+        before = tuple(db.iterdump())
+        restored = load_review_workflow_row(db, snapshot.revision.fence.key)
+        assert restored == expected
+        assert restored.execution.state.failures == snapshot.execution.state.failures
+        assert tuple(db.iterdump()) == before
+
+
 @pytest.mark.parametrize("corruption", ["missing", "changed_plan", "changed_seal_id", "orphan_open",
                                         "future_revision"])
 def test_canonical_execution_loader_requires_exact_completed_planning_seal(active, corruption):

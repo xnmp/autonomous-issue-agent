@@ -412,6 +412,28 @@ Log: `/tmp/phase4-infra-outcome-full.log` (ephemeral). Commit `6f02589`.
 No live activation, target mutation, service restart or paid harness run
 occurred.
 
+## Checkpoint 15 — settled budget-exhausted review result (accepted)
+
+A settled, guarded launched child whose raw return reports an error with
+`BUDGET_EXHAUSTED` now produces typed `ReviewChildBudgetExhausted` evidence.
+The reader still requires its exact admission, launch, raw return and actual
+settled charge. Pure finalization selects `ReviewBudgetExhausted` for a
+nonproductive round with such a child, retaining all launched children and
+preserving the quality allowance, pin streak, session and displayed round.
+Confirmed submission, cancellation, pin deferral, ordinary failed children
+and refused paid submissions retain their higher precedence. The distinct
+outer disposition is encoded in the canonical review codec and re-derived
+from stored closure facts on authoritative reload.
+
+Behavioral tests cover source-backed terminal evidence, non-striking
+projection, failed sibling and refused submission precedence, and persisted
+closure/outcome reload. Independent Sol review found no material defect and
+identified the latter two coverage cases, which were added before the final
+gate. `make test` passed: 3,121 domain, 2,733 adapter and 2,863 app tests;
+hooks, governor, parity, four import contracts and both Pyrefly checks.
+Log: `/tmp/phase4-budget-outcome-final-full.log` (ephemeral). No live
+activation, target mutation, service restart or paid harness run occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,

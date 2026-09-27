@@ -14,7 +14,7 @@ from issue_agent.domain.review_execution import (
     ReviewPreparationFailure, ReviewPreparationKind,
 )
 from issue_agent.domain.review_rounds import (
-    ReviewChildCancelled, ReviewChildFailed, ReviewChildInfrastructureFailure, ReviewChildPending,
+    ReviewChildBudgetExhausted, ReviewChildCancelled, ReviewChildFailed, ReviewChildInfrastructureFailure, ReviewChildPending,
     ReviewChildRefused, ReviewChildReleased, ReviewChildReturned,
     ReviewChildSettledWithoutLaunch, ReviewStagePlan,
 )
@@ -188,9 +188,7 @@ def test_reconciled_charge_before_raw_return_stays_pending_until_return_capture(
     assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
 
 
-@pytest.mark.parametrize("reason", [
-    ExitReason.TRANSPORT_DEATH, ExitReason.BUDGET_EXHAUSTED,
-])
+@pytest.mark.parametrize("reason", [ExitReason.TRANSPORT_DEATH])
 def test_settled_non_striking_error_without_specific_disposition_stays_pending(admitted, reason):
     store, _, proposed = admitted
     child = proposed.review_child
@@ -201,6 +199,20 @@ def test_settled_non_striking_error_without_specific_disposition_stays_pending(a
     ))
     store.settle_review_return(settlement(proposed), raw)
     assert observed(store, child) == (ReviewChildPending(child),)
+
+
+def test_settled_budget_exhaustion_has_terminal_non_striking_child_evidence(admitted):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed, result=AgentResult(
+        True, status="budget exhausted", exit_reason=ExitReason.BUDGET_EXHAUSTED,
+    ))
+    assert store.settle_review_return(settlement(proposed), raw).disposition is AccountingDisposition.AVAILABLE
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+    assert evidence[0].result == ReviewChildBudgetExhausted()
 
 
 @pytest.mark.parametrize("reason", [ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE])

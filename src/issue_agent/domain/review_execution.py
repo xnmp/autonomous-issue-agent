@@ -359,6 +359,18 @@ class ReviewInfrastructureDeath:
 
 
 @dataclass(frozen=True)
+class ReviewBudgetExhausted:
+    """A settled launched child stopped at the provider's budget boundary."""
+
+    launched: tuple[LaunchedReviewChild, ...]
+    outcome_receipt: str
+
+    def __post_init__(self) -> None:
+        _launched(self.launched)
+        identifier(self.outcome_receipt, "budget-exhausted closure receipt")
+
+
+@dataclass(frozen=True)
 class ReviewPinDeferred:
     preflight_receipt: str
 
@@ -438,12 +450,12 @@ class ReviewRoundCancelled:
 
 
 ReviewExecutionDisposition = (
-    PaidReviewProgress | CopiedReviewProgress | ReviewRoundFailure | ReviewInfrastructureDeath | ReviewPinDeferred
+    PaidReviewProgress | CopiedReviewProgress | ReviewRoundFailure | ReviewInfrastructureDeath | ReviewBudgetExhausted | ReviewPinDeferred
     | ReviewAdmissionRefused | ReviewReservationReleased | ReviewRoundCancelled
     | ReviewUnlaunchedRound | ReviewPreparationDeferred
 )
 _DISPOSITIONS = (
-    PaidReviewProgress, CopiedReviewProgress, ReviewRoundFailure, ReviewInfrastructureDeath, ReviewPinDeferred,
+    PaidReviewProgress, CopiedReviewProgress, ReviewRoundFailure, ReviewInfrastructureDeath, ReviewBudgetExhausted, ReviewPinDeferred,
     ReviewAdmissionRefused, ReviewReservationReleased, ReviewRoundCancelled,
     ReviewUnlaunchedRound, ReviewPreparationDeferred,
 )
@@ -465,7 +477,7 @@ class ReviewRoundOutcome:
             raise ValueError("review outcome requires a typed session disposition")
         if not isinstance(self.display, (PreserveDisplayedRound, SetDisplayedRound)):
             raise ValueError("review outcome requires a typed displayed-round disposition")
-        paid = isinstance(self.disposition, (PaidReviewProgress, ReviewRoundFailure, ReviewInfrastructureDeath))
+        paid = isinstance(self.disposition, (PaidReviewProgress, ReviewRoundFailure, ReviewInfrastructureDeath, ReviewBudgetExhausted))
         if paid:
             if any(value.child.round != self.round for value in self.disposition.launched):
                 raise ValueError("outcome launch evidence belongs to another round")

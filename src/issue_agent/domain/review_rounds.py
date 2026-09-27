@@ -16,7 +16,7 @@ from .review_execution import (
     LaunchedReviewChild, NoReviewSession, PaidReviewProgress, PreserveReviewSession,
     ReplaceReviewSession, ReusableReviewSession, ReviewAdmissionRefused,
     ReviewCancellationReason, ReviewChildIdentity, ReviewChildKind,
-    ReviewInfrastructureDeath, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
+    ReviewInfrastructureDeath, ReviewBudgetExhausted, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewRoundCancelled, ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome,
     ReviewUnlaunchedRound, SaturateReviewFailures, SetDisplayedRound,
 )
@@ -263,16 +263,21 @@ class ReviewChildInfrastructureFailure:
 
 
 @dataclass(frozen=True)
+class ReviewChildBudgetExhausted:
+    """A settled launched invocation reported the provider's budget boundary."""
+
+
+@dataclass(frozen=True)
 class ReviewChildReturned:
     launched: LaunchedReviewChild
     return_receipt: str
-    result: ReviewChildSucceeded | ReviewChildFailed | ReviewChildCancelled | ReviewChildInfrastructureFailure
+    result: ReviewChildSucceeded | ReviewChildFailed | ReviewChildCancelled | ReviewChildInfrastructureFailure | ReviewChildBudgetExhausted
 
     def __post_init__(self) -> None:
         if not isinstance(self.launched, LaunchedReviewChild):
             raise ValueError("returned child requires verified launch evidence")
         identifier(self.return_receipt, "settled child return receipt")
-        if not isinstance(self.result, (ReviewChildSucceeded, ReviewChildFailed, ReviewChildCancelled, ReviewChildInfrastructureFailure)):
+        if not isinstance(self.result, (ReviewChildSucceeded, ReviewChildFailed, ReviewChildCancelled, ReviewChildInfrastructureFailure, ReviewChildBudgetExhausted)):
             raise ValueError("child return requires a typed settled result")
         if isinstance(self.result, ReviewChildSucceeded) and isinstance(self.result.session, ReusableReviewSession):
             if self.result.session.source != self.launched:
@@ -285,7 +290,7 @@ class ReviewChildReturned:
 
 def classify_normal_review_return(
     launched: LaunchedReviewChild, runtime: RuntimeName, envelope: ReviewReturnedEnvelope,
-) -> ReviewChildSucceeded | ReviewChildFailed | ReviewChildInfrastructureFailure | None:
+) -> ReviewChildSucceeded | ReviewChildFailed | ReviewChildInfrastructureFailure | ReviewChildBudgetExhausted | None:
     """Interpret a settled normal return; unusual deaths need separate proof."""
     if not isinstance(launched, LaunchedReviewChild) or not isinstance(runtime, RuntimeName) or not isinstance(envelope, ReviewReturnedEnvelope):
         raise ValueError("review return classification requires typed source facts")
@@ -302,6 +307,8 @@ def classify_normal_review_return(
         return ReviewChildSucceeded(session)
     if envelope.is_error and reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE):
         return ReviewChildInfrastructureFailure(reason)
+    if envelope.is_error and reason is ExitReason.BUDGET_EXHAUSTED:
+        return ReviewChildBudgetExhausted()
     if (envelope.is_error and reason is not None
             and reason not in (
                 ExitReason.OK, ExitReason.OPERATOR_CANCELLED, ExitReason.TRANSPORT_DEATH,
@@ -557,12 +564,15 @@ def finalize_review_round(
         failed = tuple(child for child in returned if isinstance(child.result, ReviewChildFailed))
         refused_submission = any(isinstance(submission.result, ReviewSubmissionRefused)
                                  for submission in facts.submissions)
-        if (failed or refused_submission
-                or not any(isinstance(child.result, ReviewChildInfrastructureFailure) for child in returned)):
+        if failed or refused_submission:
             deterministic = any(isinstance(child.result.determinism, DeterministicReviewFailure)
                                 for child in failed)
             debit = SaturateReviewFailures(plan.failure_ceiling, facts.closure_receipt) if deterministic and plan.failure_ceiling else AddReviewStrike()
             return finished(ReviewRoundOutcome(plan.round, ReviewRoundFailure(launched, facts.closure_receipt, debit)))
+        if any(isinstance(child.result, ReviewChildBudgetExhausted) for child in returned):
+            return finished(ReviewRoundOutcome(plan.round, ReviewBudgetExhausted(launched, facts.closure_receipt)))
+        if not any(isinstance(child.result, ReviewChildInfrastructureFailure) for child in returned):
+            return finished(ReviewRoundOutcome(plan.round, ReviewRoundFailure(launched, facts.closure_receipt)))
         return finished(ReviewRoundOutcome(plan.round, ReviewInfrastructureDeath(launched, facts.closure_receipt)))
     if preparation:
         disposition = conclusion if isinstance(conclusion, ReviewPreparationDeferred) and not facts.children else ReviewUnlaunchedRound(facts.closure_receipt)

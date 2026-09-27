@@ -81,7 +81,7 @@ def test_normal_success_only_retains_an_eligible_reviewer_session(runtime, kind,
     (True, ExitReason.TRANSPORT_DEATH, type(None)),
     (True, ExitReason.KILLED_EXTERNALLY, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.RUNTIME_UNAVAILABLE, rounds.ReviewChildInfrastructureFailure),
-    (True, ExitReason.BUDGET_EXHAUSTED, type(None)),
+    (True, ExitReason.BUDGET_EXHAUSTED, rounds.ReviewChildBudgetExhausted),
     (True, ExitReason.OPERATOR_CANCELLED, type(None)),
     (False, ExitReason.AGENT_ERROR, type(None)),
     (True, ExitReason.OK, type(None)),
@@ -139,6 +139,25 @@ def test_settled_infrastructure_only_round_preserves_failure_allowance(reason):
     assert project(outcome, failures=3).failures == 3
 
 
+def test_settled_budget_exhaustion_is_visible_without_charging_a_quality_strike():
+    planned = plan()
+    child = planned.children[0]
+    exhausted = returned(child, result=rounds.ReviewChildBudgetExhausted())
+    outcome = finalized(facts(planned, children=(exhausted,)))
+    assert outcome.disposition == execution.ReviewBudgetExhausted((exhausted.launched,), "complete-closure")
+    assert project(outcome, failures=3).failures == 3
+
+
+def test_ordinary_failed_sibling_precedes_budget_exhaustion():
+    planned = plan(mode=ReviewMode.MULTI)
+    children = (returned(planned.children[0], result=rounds.ReviewChildBudgetExhausted()),
+                failure(planned.children[1]), returned(planned.children[2]),
+                returned(planned.children[3]))
+    outcome = finalized(facts(planned, children=children))
+    assert isinstance(outcome.disposition, execution.ReviewRoundFailure)
+    assert project(outcome, failures=3).failures == 4
+
+
 def test_ordinary_failed_sibling_still_charges_once_beside_infrastructure_loss():
     planned = plan(mode=ReviewMode.MULTI)
     children = (returned(planned.children[0], result=rounds.ReviewChildInfrastructureFailure(
@@ -155,6 +174,15 @@ def test_refused_paid_submission_is_ordinary_failure_even_with_infrastructure_ch
     child = planned.children[0]
     infra = returned(child, result=rounds.ReviewChildInfrastructureFailure(ExitReason.KILLED_EXTERNALLY))
     outcome = finalized(facts(planned, children=(infra,), submissions=(refused(command),)))
+    assert isinstance(outcome.disposition, execution.ReviewRoundFailure)
+    assert project(outcome, failures=3).failures == 4
+
+
+def test_refused_paid_submission_precedes_budget_exhaustion():
+    command = submission()
+    planned = plan(submissions=(command,))
+    exhausted = returned(planned.children[0], result=rounds.ReviewChildBudgetExhausted())
+    outcome = finalized(facts(planned, children=(exhausted,), submissions=(refused(command),)))
     assert isinstance(outcome.disposition, execution.ReviewRoundFailure)
     assert project(outcome, failures=3).failures == 4
 
