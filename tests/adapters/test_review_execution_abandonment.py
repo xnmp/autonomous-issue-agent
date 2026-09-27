@@ -1,6 +1,7 @@
 """Abandoned planning requires the exact terminated parent claim occurrence."""
 
 import sqlite3
+from dataclasses import replace
 
 import pytest
 
@@ -52,6 +53,75 @@ def test_exact_released_parent_seals_empty_round_and_fences_late_stage(rig):
     with pytest.raises(WorkflowAuthorityError, match="claim"):
         control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
     assert dump(store) == before
+
+
+def test_recovery_sweep_fences_only_exact_terminal_parent_occurrences(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    assert control.recover_abandoned_planning().sealed == ()
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    sweep = control.recover_abandoned_planning()
+    assert sweep.sealed == (plan.round.round_id,)
+    assert sweep.blocked == () and not sweep.has_more
+    with store.transaction() as db:
+        planning = db.execute(
+            "SELECT planning_json FROM review_execution_rounds WHERE round_id=?",
+            (plan.round.round_id,),
+        ).fetchone()[0]
+    assert isinstance(decode_workflow(planning, ReviewParentAbandoned), ReviewParentAbandoned)
+    assert control.recover_abandoned_planning().sealed == ()
+
+
+def test_recovery_sweep_reports_missing_terminal_receipt_without_forging_abandonment(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dispatch_claims WHERE occurrence_id=?", (selection.claim_occurrence_id,))
+    before = dump(store)
+    sweep = control.recover_abandoned_planning()
+    assert sweep.sealed == ()
+    assert sweep.blocked[0][0] == plan.round.round_id
+    assert "terminal claim receipt" in sweep.blocked[0][1]
+    assert dump(store) == before
+
+
+def test_recovery_sweep_pages_open_rounds_without_reprocessing_earlier_ones(rig, monkeypatch):
+    import issue_agent.adapters.review_execution_control as module
+
+    monkeypatch.setattr(module, "MAX_ABANDONMENT_SWEEP", 2)
+    store, _, _, selection, control = rig
+    round_ids = []
+    for index in range(3):
+        next_selection = replace(selection, request_id=f"preflight:page:{index}",
+                                 expected=current(store, selection).revision)
+        round_ids.append(control.preflight(next_selection).round.round_id)
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    first = control.recover_abandoned_planning()
+    second = control.recover_abandoned_planning()
+    assert first.sealed == tuple(round_ids[:2]) and first.has_more
+    assert second.sealed == (round_ids[2],) and not second.has_more
+    assert control.recover_abandoned_planning().sealed == ()
+
+
+def test_recovery_sweep_bounds_a_backlog_of_fenced_but_unfinalized_rounds(rig, monkeypatch):
+    import issue_agent.adapters.review_execution_control as module
+
+    monkeypatch.setattr(module, "MAX_ABANDONMENT_SWEEP", 2)
+    store, _, _, selection, control = rig
+    round_ids = []
+    for index in range(5):
+        next_selection = replace(selection, request_id=f"preflight:backlog:{index}",
+                                 expected=current(store, selection).revision)
+        round_ids.append(control.preflight(next_selection).round.round_id)
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    for round_id in round_ids[:4]:
+        control.seal_abandoned_planning(round_id)
+    first = control.recover_abandoned_planning()
+    second = control.recover_abandoned_planning()
+    third = control.recover_abandoned_planning()
+    assert first.sealed == second.sealed == ()
+    assert first.has_more and second.has_more
+    assert third.sealed == (round_ids[4],) and not third.has_more
 
 
 def test_replaced_claim_does_not_reopen_old_occurrence(rig):

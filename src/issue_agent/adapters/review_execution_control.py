@@ -1,6 +1,6 @@
 """Transaction-local review execution preflight over a live parent claim."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 import hashlib
 import sqlite3
 
@@ -42,6 +42,17 @@ from .workflow_rows import (
 )
 
 
+MAX_ABANDONMENT_SWEEP = 64
+_START_CURSOR = (0, 0, "", 0)
+
+
+@dataclass(frozen=True)
+class ReviewAbandonmentSweep:
+    sealed: tuple[str, ...]
+    blocked: tuple[tuple[str, str], ...]
+    has_more: bool
+
+
 class SQLiteReviewExecutionControl:
     """Allocate one unpaid round, preserving its exact read and claim provenance."""
 
@@ -55,6 +66,41 @@ class SQLiteReviewExecutionControl:
         self._control = control
         self._writer = writer
         self._gateway = gateway
+        self._abandonment_cursor = _START_CURSOR
+
+    def recover_abandoned_planning(self) -> ReviewAbandonmentSweep:
+        """Inspect one indexed page, including sealed gaps, before advancing the cursor."""
+        with self._control.transaction() as db:
+            rows = db.execute(
+                "SELECT rr.round_id,rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence,"
+                "rr.planning_json,rr.closure_json,dc.occurrence_id AS live_claim "
+                "FROM review_execution_rounds rr LEFT JOIN dispatch_claims dc "
+                "ON dc.repository=rr.repository AND dc.role='review' "
+                "AND dc.occurrence_id=rr.claim_occurrence_id "
+                "WHERE rr.repository=? AND rr.outcome_json IS NULL "
+                "AND (rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence)>(?,?,?,?) "
+                "ORDER BY rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence LIMIT ?",
+                (self._writer.repository, *self._abandonment_cursor, MAX_ABANDONMENT_SWEEP + 1),
+            ).fetchall()
+        page = rows[:MAX_ABANDONMENT_SWEEP]
+        sealed: list[str] = []
+        blocked: list[tuple[str, str]] = []
+        for row in page:
+            if (row["planning_json"] != encode_workflow(ReviewPlanningOpen())
+                    or row["closure_json"] is not None or row["live_claim"] is not None):
+                continue
+            try:
+                self.seal_abandoned_planning(row["round_id"])
+            except ValueError as exc:
+                blocked.append((row["round_id"], str(exc)))
+            else:
+                sealed.append(row["round_id"])
+        self._abandonment_cursor = (
+            (page[-1]["target_number"], page[-1]["execution_epoch"],
+             page[-1]["execution_episode"], page[-1]["sequence"])
+            if len(rows) > MAX_ABANDONMENT_SWEEP else _START_CURSOR
+        )
+        return ReviewAbandonmentSweep(tuple(sealed), tuple(blocked), len(rows) > MAX_ABANDONMENT_SWEEP)
 
     def _stored_round(
         self, db: sqlite3.Connection, request_id: str,

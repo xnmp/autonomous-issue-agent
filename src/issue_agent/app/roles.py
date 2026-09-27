@@ -55,6 +55,7 @@ from ..adapters.wake import WakeSignal, wake_path
 from ..adapters.worktree import ReviewCheckouts, Worktrees
 from ..adapters.workflow_control import SQLiteWorkflowControl
 from ..adapters.review_effects import ReviewReads
+from ..adapters.review_execution_control import SQLiteReviewExecutionControl
 from ..adapters.review_workflow_control import review_family_activated
 from ..adapters.workflow_rows import WorkflowAuthorityError
 _PR_COMMITS_FETCH_CEILING = 100  # gh pr view --json commits silent cap
@@ -3428,6 +3429,30 @@ def compose_review_daemon(
         owner_id=owner_id,
         reconciler=review_reconciler,
     )
+    if isinstance(gateway, ReviewReads):
+        execution_recovery = SQLiteReviewExecutionControl(
+            control, WorkflowWriter(cfg.repo, "review", owner_id), gateway,
+        )
+        base_reconcile = recovery.reconcile
+        blocked_reported_at: datetime | None = None
+
+        def reconcile_review(trigger: RecoveryTrigger) -> RecoveryReport:
+            nonlocal blocked_reported_at
+            report = base_reconcile(trigger)
+            sweep = execution_recovery.recover_abandoned_planning()
+            if sweep.sealed:
+                say(f"review recovery: fenced {len(sweep.sealed)} abandoned parent round(s)")
+            if sweep.blocked:
+                now = datetime.now(timezone.utc)
+                if blocked_reported_at is None or now - blocked_reported_at >= timedelta(minutes=15):
+                    blocked_reported_at = now
+                    detail = "; ".join(f"{round_id}: {reason}" for round_id, reason in sweep.blocked[:3])
+                    say(f"review recovery: {len(sweep.blocked)} parent round(s) could not be fenced: {detail}")
+            return report
+
+        recovery = _RecoveryHooks(reconcile_review)
+    else:
+        say("review execution recovery unavailable: the gateway cannot read pull request reviews")
 
     daemon = Daemon("review", _reported_world(
                       gateway.build_review_world, control, cfg, "review",

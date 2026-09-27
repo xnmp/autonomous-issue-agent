@@ -6,7 +6,7 @@ Phase 4 follows the [review execution design](2026-09-27-phase-4-review-executio
 [persistence map](2026-09-27-phase-4-persistence-map.md).
 The [post-stage handover](2026-09-27-phase-4-post-stage-handover.md)
 records the next transaction boundary and standing restrictions.
-The latest [post-submission handover](2026-09-27-phase-4-post-submission-handover.md)
+The latest [post-recovery handover](2026-09-27-phase-4-post-recovery-handover.md)
 records the current boundary and remaining work.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
@@ -493,15 +493,43 @@ tests; hooks, governor, parity, four import contracts and both Pyrefly checks.
 Log: `/tmp/phase4-submission-final-full.log` (ephemeral). No live activation,
 target mutation, service restart or paid harness run occurred.
 
+## Checkpoint 18 — parent-abandonment recovery caller (accepted offline)
+
+The composed review daemon now calls `recover_abandoned_planning` after each
+boot, wake or periodic recovery pass. The sweep visits at most 64 rows from
+the existing ordered `review_execution_rounds_open` index, then filters that
+page for open planning, absent exact parent claim occurrence and unclosed
+rounds. It advances its cursor across sealed-but-unfinalized rows, so a
+growing backlog cannot make one recovery transaction scan the repository.
+The existing abandonment writer still requires the exact creation and
+released/reclaimed claim receipts before it writes the fence. A malformed or
+missing terminal receipt is reported without inventing abandonment; failures
+are logged at most once per 15 minutes.
+
+Adapter tests cover live and released claims, missing terminal proof,
+pagination and a backlog of already fenced but unfinalized rounds. A composed
+daemon test calls production recovery and observes the durable abandonment
+fence. It explicitly confirms that closure and outcome remain pending.
+`EXPLAIN QUERY PLAN` selected `review_execution_rounds_open` and
+`dispatch_claims_occurrence` for the bounded page. Independent Sol review
+found the original unindexed planning filter; after the bounded-page fix,
+re-review found no blocker for this offline fence-only checkpoint. This
+checkpoint does **not** terminalize the outer round or advance the ordered
+projection; both are required before real execution activation. Final
+`make test` passed: 3,121 domain, 2,764 adapter and 2,864 app tests; hooks,
+governor, parity, four import contracts and both Pyrefly checks. Log:
+`/tmp/phase4-abandonment-recovery-final-full.log` (ephemeral). No live
+activation, target mutation, service restart or paid harness run occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,
   including parent/claim abandonment, released-before-launch and
   settled-without-launch outcomes. Preserve actual accounting and bound unpaid
   preparation faults through evidence holds.
-- Call the abandonment writer from production recovery for exact terminated
-  parent occurrences, and pass an execution round through the production
-  review workflow so copied and paid verdicts use atomic registration.
+- Pass an execution round through the production review workflow so copied
+  and paid verdicts use atomic registration; terminalize fenced abandoned
+  rounds from complete evidence before execution activation.
 - Project finalized rounds transactionally over the canonical v25 component;
   settle productive submissions, recover real multi-child execution, and
   capture free copied verdicts.
