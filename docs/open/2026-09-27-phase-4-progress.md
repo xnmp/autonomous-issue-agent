@@ -679,9 +679,9 @@ Compaction needs an explicit trusted snapshot boundary backed by an immutable
 activation/import source and a separate source-audit contract, so ordinary
 reads stay bounded. Its performance remains an activation gate.
 
-- Finalize completed and abandoned rounds with preparation failures. Preserve
-  actual accounting and bind preparation faults to bounded evidence holds
-  before committing their outer outcomes.
+- Add source-specific preparation outcomes for revision diff and containment
+  failures. The verified Codex runtime preflight path is checkpoint 25;
+  preserve actual accounting and bind each remaining fault to a bounded hold.
 - Pass an execution round through the production review workflow so copied
   and paid verdicts use atomic registration; terminalize fenced abandoned
   rounds from complete evidence before execution activation.
@@ -697,3 +697,26 @@ reads stay bounded. Its performance remains an activation gate.
 
 Phase 5 offline measurement and phase 6 remain pending. Live phase-5 windows
 still require explicit user authorization.
+
+## Checkpoint 25 — bounded runtime preparation outcomes (offline)
+
+A verified Codex preflight stop can now close a sealed completed or departed
+review round without a paid failure strike. The outcome, exact preparation
+obligation, execution projection, and a visible runtime preparation gate commit
+in one SQLite transaction. A scheduled local preflight uses the existing review
+hold reconciler and bounded evidence schedule to retry; success releases the
+gate without creating a verdict. Composition requires a preflight reader.
+Claude's configured reader treats a switch from Codex as a new runtime choice;
+Codex without `TARGET_DIR` remains unready. Both the local probe and changed
+head release compare the observed workflow binding and evidence schedule under
+the write transaction, so a stale read cannot erase a newer hold.
+
+Behavioral tests cover both parent branches, no-strike settlement, exact
+replay, bounded failure and success, atomic rollback, missing reader, and two
+interleaved newer failures. Independent Sol review found and verified the
+reader and concurrency fixes. Full `make test` passed: 3,123 domain, 2,806
+adapter and 2,866 app tests, plus hooks, governor, parity, four import
+contracts and both Pyrefly checks. Log:
+`/tmp/phase4-runtime-preparation-full.log` (ephemeral). Other preparation
+kinds (`REVISION_DIFF`, `CONTAINMENT`) still need their own source-specific
+reread paths. No live activation, paid run, migration or push occurred.

@@ -18,7 +18,7 @@ import json
 import sqlite3
 from collections.abc import Callable, Iterator
 from contextlib import ExitStack, closing, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from ..domain.contracts import CommandId, CommandKind, EffectStatus
@@ -120,6 +120,7 @@ _EVIDENCE_NAMESPACES = {
     ReviewEvidenceKind.EXEMPTION_TRAILERS: "review-exemption-evidence",
     ReviewEvidenceKind.REVIEW_HISTORY: "review-history-evidence",
     ReviewEvidenceKind.LINKED_ISSUE: "review-linked-issue-evidence",
+    ReviewEvidenceKind.RUNTIME_PREPARATION: "review-runtime-preparation-evidence",
 }
 _REVIEW_INTENTS = PendingReviewRearm | CompletedReviewRearm | SupersededReviewRearm | CancelledReviewRearm
 _BARRIER_ORDERED = frozenset({
@@ -204,6 +205,7 @@ class SQLiteReviewWorkflowControl:
         external_holds: Callable[[ObservedPullRequest, object], tuple[str, ...]] = _no_external_holds,
         policy: ReconciliationPolicy = ReconciliationPolicy(),
         trailers: Callable[[int], object] | None = None,
+        runtime_preflight: Callable[[], str | None] | None = None,
     ) -> None:
         if not isinstance(control, SQLiteControlStore) or not isinstance(writer, WorkflowWriter):
             raise ValueError("review workflow control requires the existing store and a typed writer")
@@ -219,6 +221,8 @@ class SQLiteReviewWorkflowControl:
             raise ValueError("review workflow control requires a counting rule, hold source and read policy")
         if trailers is not None and not callable(trailers):
             raise ValueError("the exemption evidence reader must be callable")
+        if runtime_preflight is not None and not callable(runtime_preflight):
+            raise ValueError("the runtime preparation reader must be callable")
         self._control = control
         self._writer = writer
         self._gateway = gateway
@@ -230,6 +234,7 @@ class SQLiteReviewWorkflowControl:
         # The read-only commit-trailer read behind exemption declarations
         # (ADR 0014); None leaves evidence holds to the dispatching review.
         self._trailers = trailers
+        self._runtime_preflight = runtime_preflight
 
     @property
     def writer(self) -> WorkflowWriter:
@@ -2375,58 +2380,74 @@ class SQLiteReviewWorkflowControl:
         return self.evidence_due(key, head_sha, ReviewEvidenceKind.EXEMPTION_TRAILERS)
 
     def record_evidence(self, key: WorkflowKey, head_sha: str, kind: ReviewEvidenceKind, *, error: str | None) -> None:
-        """Persist one read of the current generation's evidence of `kind` at `head_sha`.
+        """Persist one bounded evidence read and its visible gate atomically."""
+        self._scope(key)
+        with self._control.transaction() as db:
+            self._record_evidence_in_tx(db, key, head_sha, kind, error=error)
 
-        An unavailable read backs off and, at the policy ceiling, opens (or
-        refreshes) the visible `EvidenceUnavailable` hold. An available read
-        ends the schedule and closes that kind's hold; it grants, counts and
-        approves nothing.
-        """
+    def _record_evidence_in_tx(
+        self, db: sqlite3.Connection, key: WorkflowKey, head_sha: str,
+        kind: ReviewEvidenceKind, *, error: str | None,
+    ) -> None:
+        """Share the existing evidence schedule with a round's outcome transaction."""
         self._scope(key)
         namespace, scope = _EVIDENCE_NAMESPACES[kind], f"pr:{key.target.number}"
-        with self._control.transaction() as db:
-            state = self._load(db, key)
-            prior = self._evidence_schedule(db, key, kind)
-            now = self._now()
-            gate_id = evidence_gate_id(kind, key.target.number, head_sha)
-            held = [(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in state.gates
-                    if review_evidence_gate_kind(g) is kind]
-            if error is None:
-                if prior is None and not held:
-                    return
-                db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                           (namespace, self._writer.repository, scope))
-                for stale_id in held:
-                    self._control._reconciliation_gate(db, state.binding, stale_id, None)
-                self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_available",
-                                          {"head": head_sha, "closed_gates": len(held)})
+        state = self._load(db, key)
+        prior = self._evidence_schedule(db, key, kind)
+        now = self._now()
+        gate_id = evidence_gate_id(kind, key.target.number, head_sha)
+        held = [(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in state.gates
+                if review_evidence_gate_kind(g) is kind]
+        if error is None:
+            if prior is None and not held:
                 return
-            progress = unavailable_evidence(kind, state.binding, head_sha, prior, now=now, error=error,
-                                            policy=self._policy)
-            schedule = progress.schedule
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
-                "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,"
-                "payload_json=excluded.payload_json",
-                (namespace, self._writer.repository, scope, schedule.history.next_read_at.isoformat(), json.dumps({
-                    "head": schedule.head_sha, "since": schedule.history.unresolved_since.isoformat(),
-                    "next": schedule.history.next_read_at.isoformat(), "reads": schedule.history.failed_reads,
-                    "error": schedule.last_error})),
-            )
-            # Another head's hold is a different, now obsolete, question.
+            db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                       (namespace, self._writer.repository, scope))
             for stale_id in held:
-                if stale_id != gate_id:
-                    self._control._reconciliation_gate(db, state.binding, stale_id, None)
-            if progress.gate is not None:
-                self._control._reconciliation_gate(db, state.binding, gate_id, progress.gate)
-            self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_unavailable", {
-                "head": head_sha, "failed_reads": schedule.history.failed_reads,
-                "next_read_at": schedule.history.next_read_at.isoformat(), "gated": progress.gate is not None,
-                "error": schedule.last_error[:512],
-            })
+                self._control._reconciliation_gate(db, state.binding, stale_id, None)
+            self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_available",
+                                      {"head": head_sha, "closed_gates": len(held)})
+            return
+        progress = unavailable_evidence(kind, state.binding, head_sha, prior, now=now, error=error,
+                                        policy=(replace(self._policy, maximum_reads=1)
+                                                    if kind is ReviewEvidenceKind.RUNTIME_PREPARATION else self._policy))
+        schedule = progress.schedule
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,"
+            "payload_json=excluded.payload_json",
+            (namespace, self._writer.repository, scope, schedule.history.next_read_at.isoformat(), json.dumps({
+                "head": schedule.head_sha, "since": schedule.history.unresolved_since.isoformat(),
+                "next": schedule.history.next_read_at.isoformat(), "reads": schedule.history.failed_reads,
+                "error": schedule.last_error})),
+        )
+        # Another head's hold is a different, now obsolete, question.
+        for stale_id in held:
+            if stale_id != gate_id:
+                self._control._reconciliation_gate(db, state.binding, stale_id, None)
+        if progress.gate is not None:
+            self._control._reconciliation_gate(db, state.binding, gate_id, progress.gate)
+        self._control._transition(db, "workflow", encode_workflow(key), f"{kind.value}_unavailable", {
+            "head": head_sha, "failed_reads": schedule.history.failed_reads,
+            "next_read_at": schedule.history.next_read_at.isoformat(), "gated": progress.gate is not None,
+            "error": schedule.last_error[:512],
+        })
 
     def record_exemption_evidence(self, key: WorkflowKey, head_sha: str, *, error: str | None) -> None:
         self.record_evidence(key, head_sha, ReviewEvidenceKind.EXEMPTION_TRAILERS, error=error)
+
+    def _record_runtime_evidence_if_current(
+        self, state: ReviewWorkflowSnapshot, schedule: EvidenceSchedule | None,
+        head_sha: str, *, error: str | None,
+    ) -> bool:
+        key = state.revision.fence.key
+        with self._control.transaction() as db:
+            current = self._load(db, key)
+            if (current.binding != state.binding
+                    or self._evidence_schedule(db, key, ReviewEvidenceKind.RUNTIME_PREPARATION) != schedule):
+                return False
+            self._record_evidence_in_tx(db, key, head_sha, ReviewEvidenceKind.RUNTIME_PREPARATION, error=error)
+        return True
 
     def _reread_evidence(self, state: ReviewWorkflowSnapshot, kind: ReviewEvidenceKind) -> tuple[bool, str]:
         """The scheduled read that alone may release an unreadable-evidence hold."""
@@ -2450,8 +2471,23 @@ class SQLiteReviewWorkflowControl:
                                                                            observed.head_sha) not in held:
             # A new head (or a terminal pull request) is a different question:
             # the next dispatch or settlement reads its evidence afresh.
+            if kind is ReviewEvidenceKind.RUNTIME_PREPARATION:
+                return self._record_runtime_evidence_if_current(
+                    state, schedule, observed.head_sha, error=None,
+                ), ""
             self.record_evidence(key, observed.head_sha, kind, error=None)
             return True, ""
+        if kind is ReviewEvidenceKind.RUNTIME_PREPARATION:
+            if self._runtime_preflight is None:
+                return False, "local review runtime preflight reader is unavailable"
+            try:
+                reason = self._runtime_preflight()
+            except Exception as exc:  # noqa: BLE001 - a failed local probe cannot release its hold
+                reason = _reason(exc) or "local review runtime preflight failed"
+            committed = self._record_runtime_evidence_if_current(
+                state, schedule, observed.head_sha, error=reason,
+            )
+            return committed and reason is None, ""
         if history:
             reviews = observed.reviews
             complete = isinstance(reviews, CompleteReviews)

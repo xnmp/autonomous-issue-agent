@@ -54,6 +54,7 @@ REVIEW_ABANDONMENT_NAMESPACE = "review-round-abandonment"
 REVIEW_SUBMISSION_NAMESPACE = "review-round-submission"
 REVIEW_SUBMISSION_INDEX_NAMESPACE = "review-round-submission-index"
 REVIEW_OUTCOME_NAMESPACE = "review-round-outcome"
+REVIEW_PREPARATION_NAMESPACE = "review-round-preparation"
 
 
 def review_submission_receipt_prefix(round_id: str) -> str:
@@ -605,6 +606,15 @@ def _check_execution_projection(
         outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
         if facts.plan != plan or facts.planning != planning or outcome != result.outcome:
             raise WorkflowAuthorityError("review round outcome disagrees with verified closure facts")
+        preparation = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_PREPARATION_NAMESPACE, scope[0], identity.round_id),
+        ).fetchone()
+        if isinstance(result, DeferredReviewPreparation):
+            if preparation is None or decode_workflow(preparation["payload_json"], tuple) != (facts, result.failures):
+                raise WorkflowAuthorityError("review preparation outcome lacks its immutable obligation")
+        elif preparation is not None:
+            raise WorkflowAuthorityError("review round has a contradictory preparation obligation")
         if isinstance(planning, (ReviewParentAbandoned, ReviewPlanningSealed)):
             # Both nonproductive writers commit the same source-backed receipt.
             from .review_round_sources import read_review_round_sources

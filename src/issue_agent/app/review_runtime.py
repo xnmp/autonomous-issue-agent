@@ -112,16 +112,18 @@ def compose_review_control(
     trigger_label: Label, review_bot: str,
     external_holds: Callable[[ObservedPullRequest, object], tuple[str, ...]],
     trailers: Callable[[int], object] | None,
+    runtime_preflight: Callable[[], str | None] | None = None,
 ) -> SQLiteReviewWorkflowControl:
     return SQLiteReviewWorkflowControl(
         control, WorkflowWriter(repository, "review", owner_id), gateway=gateway, ceiling=ceiling,
         trigger_label=trigger_label, rule=CountingRule(review_bot), external_holds=external_holds,
-        trailers=trailers,
+        trailers=trailers, runtime_preflight=runtime_preflight,
     )
 
 
 def configured_review_control(
     cfg: HarnessConfig, control: SQLiteControlStore, gateway: object, store, owner_id: str,
+    *, runtime_preflight: Callable[[], str | None] | None = None,
 ) -> SQLiteReviewWorkflowControl:
     """The review owner's workflow authority as configured for this deployment.
 
@@ -140,6 +142,7 @@ def configured_review_control(
             linked_holds=lambda observed, view: review_linked_issue_holds(control, gateway, observed.key, view),
         ),
         trailers=trailers if callable(trailers) else None,
+        runtime_preflight=runtime_preflight,
     )
 
 

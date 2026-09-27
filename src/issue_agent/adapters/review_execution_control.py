@@ -9,15 +9,18 @@ from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import (
     ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress,
+    ReviewPreparationKind,
     ReviewRoundOutcome, project_review_execution,
 )
 from ..domain.review_rounds import (
-    FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningComplete,
+    DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningComplete,
     ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     ReviewRoundAwaitingEvidence, ReviewSubmissionKind, ReviewSubmissionPlan,
     ReviewSubmissionRegistration, finalize_review_round,
 )
 from ..domain.review_workflow import ObservedPullRequest
+from ..domain.review_evidence import ReviewEvidenceKind
+from ..domain.review_return import ReviewRuntimePreflightStop
 from ..domain.review_workflow_policy import review_owed
 from ..domain.review_rearm import ReleaseStatus
 from ..domain.workflow_identity import (
@@ -35,10 +38,12 @@ from .review_execution_claims import (
 )
 from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from .review_round_sources import read_review_round_sources
+from .review_workflow_control import SQLiteReviewWorkflowControl
 from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
-    REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE, REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
+    REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE, REVIEW_PREPARATION_NAMESPACE,
+    REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
     REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
     WorkflowAuthorityError, WorkflowRevisionConflict,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
@@ -69,16 +74,26 @@ class ReviewRoundSweep:
 class SQLiteReviewExecutionControl:
     """Allocate one unpaid round, preserving its exact read and claim provenance."""
 
-    def __init__(self, control: SQLiteControlStore, writer: WorkflowWriter, gateway: ReviewReads) -> None:
+    def __init__(
+        self, control: SQLiteControlStore, writer: WorkflowWriter, gateway: ReviewReads,
+        *, preparation_control: SQLiteReviewWorkflowControl | None = None,
+    ) -> None:
         if not isinstance(control, SQLiteControlStore) or not isinstance(writer, WorkflowWriter):
             raise ValueError("review execution requires a typed control store and writer")
         if writer.role != "review" or deployment_role(writer.repository, writer.owner_id) != "review":
             raise ValueError("review execution requires the repository review owner")
         if not isinstance(gateway, ReviewReads):
             raise ValueError("review execution requires a read-only pull request gateway")
+        if preparation_control is not None and (
+            not isinstance(preparation_control, SQLiteReviewWorkflowControl)
+            or preparation_control._control is not control or preparation_control.writer != writer
+            or preparation_control._runtime_preflight is None
+        ):
+            raise ValueError("review preparation requires a local reader and the same execution authority")
         self._control = control
         self._writer = writer
         self._gateway = gateway
+        self._preparation_control = preparation_control
         self._round_cursor = _START_CURSOR
 
     def reconcile_review_rounds(self) -> ReviewRoundSweep:
@@ -123,7 +138,7 @@ class SQLiteReviewExecutionControl:
                     if isinstance(planning, ReviewPlanningSealed)
                     else self.finalize_abandoned_round(round_id)
                 )
-                if isinstance(result, FinalizedReviewRound):
+                if isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)):
                     finalized.append(round_id)
                 elif self._recovery_wait_at_ceiling(round_id):
                     blocked.append((round_id, "round evidence remains pending after bounded recovery observations"))
@@ -262,20 +277,20 @@ class SQLiteReviewExecutionControl:
 
     def finalize_abandoned_round(
         self, round_id: str,
-    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound:
+    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound | DeferredReviewPreparation:
         """Settle a nonproductive abandoned round and its execution projection atomically."""
         return self._finalize_nonproductive_round(round_id, ReviewParentAbandoned)
 
     def finalize_completed_round(
         self, round_id: str,
-    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound:
+    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound | DeferredReviewPreparation:
         """Settle a sealed, nonproductive round from its durable sources."""
         return self._finalize_nonproductive_round(round_id, ReviewPlanningSealed)
 
     def _finalize_nonproductive_round(
         self, round_id: str,
         planning_type: type[ReviewParentAbandoned] | type[ReviewPlanningSealed],
-    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound:
+    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound | DeferredReviewPreparation:
         validate_workflow_identifier(round_id, "review round")
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self._writer.owner_id)
@@ -294,7 +309,11 @@ class SQLiteReviewExecutionControl:
                 return result
             if not isinstance(facts.planning, planning_type):
                 raise WorkflowAuthorityError("review round planning has a different settlement path")
-            if not isinstance(result, FinalizedReviewRound):
+            preparation_error = (
+                self._runtime_preparation_error(db, plan, result)
+                if isinstance(result, DeferredReviewPreparation) else None
+            )
+            if not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)):
                 raise WorkflowAuthorityError("review preparation requires its bounded schedule")
             if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
                 raise WorkflowAuthorityError("productive review requires joint rejection settlement")
@@ -322,6 +341,12 @@ class SQLiteReviewExecutionControl:
                 (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, round_id,
                  _stamp(self._control.now()), encode_workflow((facts, result.outcome))),
             )
+            if isinstance(result, DeferredReviewPreparation):
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (REVIEW_PREPARATION_NAMESPACE, self._writer.repository, round_id,
+                     _stamp(self._control.now()), encode_workflow((facts, result.failures))),
+                )
             execution = snapshot.execution
             rows = db.execute(
                 "SELECT outcome_json FROM review_execution_rounds WHERE repository=? AND target_number=? "
@@ -343,7 +368,43 @@ class SQLiteReviewExecutionControl:
                 "disposition": type(result.outcome.disposition).__name__,
                 "sequence": plan.round.sequence,
             })
+            if isinstance(result, DeferredReviewPreparation):
+                assert preparation_error is not None
+                if snapshot.revision.fence.generation == plan.round.binding.rejection.fence.generation:
+                    assert self._preparation_control is not None
+                    self._preparation_control._record_evidence_in_tx(
+                        db, plan.round.binding.rejection.fence.key, plan.head_sha,
+                        ReviewEvidenceKind.RUNTIME_PREPARATION, error=preparation_error,
+                    )
+                else:
+                    self._control._transition(db, "review_round", round_id, "preparation_superseded", {
+                        "settled_generation": snapshot.revision.fence.generation,
+                    })
             return result
+
+    def _runtime_preparation_error(
+        self, db: sqlite3.Connection, plan: ReviewRoundPlan, result: DeferredReviewPreparation,
+    ) -> str:
+        if self._preparation_control is None:
+            raise WorkflowAuthorityError("review preparation has no bounded evidence controller")
+        summaries: list[str] = []
+        prefix = "review-execution-preflight-stop:"
+        for failure in result.failures:
+            if failure.kind is not ReviewPreparationKind.RUNTIME or not failure.evidence_id.startswith(prefix):
+                raise WorkflowAuthorityError("review preparation kind lacks a verified reread path")
+            run_id = failure.evidence_id[len(prefix):]
+            row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-preflight-stop' "
+                "AND scope=? AND key=?", (self._writer.repository, run_id),
+            ).fetchone()
+            if row is None:
+                raise WorkflowAuthorityError("review runtime preparation lost its exact stop receipt")
+            stopped = decode_workflow(row["payload_json"], ReviewRuntimePreflightStop)
+            if (stopped.receipt_id != failure.evidence_id or stopped.admission.child.round != plan.round
+                    or not stopped.result.summary):
+                raise WorkflowAuthorityError("review runtime preparation disagrees with its round")
+            summaries.append(stopped.result.summary)
+        return "; ".join(dict.fromkeys(summaries))[:512]
 
     def _stored_round(
         self, db: sqlite3.Connection, request_id: str,

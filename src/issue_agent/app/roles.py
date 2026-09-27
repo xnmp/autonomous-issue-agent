@@ -1359,6 +1359,12 @@ class _ReviewRuntimeBinding:
     runner: AgentRuntime
     execution_cwd: str = ""
     prepare_cwd: Callable[[str], None] | None = None
+    runtime_preflight: Callable[[], str | None] | None = None
+
+
+def _claude_review_runtime_preflight() -> None:
+    """Claude has no local static preflight; changing runtimes resolves a prior Codex setup hold."""
+    return None
 
 
 def _bind_claude_review_runtime(
@@ -1374,6 +1380,7 @@ def _bind_claude_review_runtime(
     return _ReviewRuntimeBinding(
         RepositoryGuidanceRuntime(runner, log=_log("review")),
         execution_cwd=cfg.target_dir,
+        runtime_preflight=_claude_review_runtime_preflight,
     )
 
 
@@ -1433,7 +1440,10 @@ def _bind_codex_review_runtime(
             "codex: NOT READY at startup — REVIEWER_RUNTIME=codex requires "
             "TARGET_DIR so its read-only governor has an explicit checkout"
         )
-        return _ReviewRuntimeBinding(runner)
+        return _ReviewRuntimeBinding(
+            runner,
+            runtime_preflight=lambda: "REVIEWER_RUNTIME=codex requires TARGET_DIR",
+        )
     prepare_cwd = partial(
         write_hook_config,
         review_only=True,
@@ -1447,6 +1457,7 @@ def _bind_codex_review_runtime(
         HookPreparingRuntime(runner, prepare_cwd),
         execution_cwd,
         prepare_cwd,
+        runner.preflight,
     )
 
 
@@ -3256,6 +3267,7 @@ def compose_review_daemon(
     )
     runtime = _active_review_runtime(
         cfg, rcfg, control, gateway, store, effect_executor.actions, owner_id, say,
+        runtime_preflight=runtime_binding.runtime_preflight,
     )
     if runtime is not None:
         executor.bind_workflow_reconciliation(runtime.reconcile)
@@ -3432,6 +3444,7 @@ def compose_review_daemon(
     if isinstance(gateway, ReviewReads):
         execution_recovery = SQLiteReviewExecutionControl(
             control, WorkflowWriter(cfg.repo, "review", owner_id), gateway,
+            preparation_control=runtime.control if runtime is not None else None,
         )
         base_reconcile = recovery.reconcile
         blocked_reported_at: datetime | None = None
@@ -3510,13 +3523,16 @@ def compose_review_daemon(
 def _active_review_runtime(
     cfg: HarnessConfig, rcfg: ReviewConfig, control: SQLiteControlStore, gateway,
     store: Store, effects: GitHubEffectExecutor, owner_id: str, log,
+    *, runtime_preflight: Callable[[], str | None] | None = None,
 ) -> ActiveReviewRuntime | None:
     """The review family's runtime, or None when the gateway cannot read reviews."""
     if not isinstance(gateway, ReviewReads):
         return None
     # `rcfg` is derived from `cfg.review_runtime`, the same values the shared
     # composition reads, so the operator transport enforces this daemon's rule.
-    workflow = configured_review_control(cfg, control, gateway, store, owner_id)
+    workflow = configured_review_control(
+        cfg, control, gateway, store, owner_id, runtime_preflight=runtime_preflight,
+    )
     return ActiveReviewRuntime(
         workflow, effects, gateway, review_bot=rcfg.review_bot, log=log,
     )

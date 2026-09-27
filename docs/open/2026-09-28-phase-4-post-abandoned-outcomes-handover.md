@@ -83,10 +83,24 @@ its initial state is source-backed, how archived sources are audited, and how
 ordinary reads and recovery remain bounded. The implementation remains at
 checkpoint 24.
 
-1. Add the bounded preparation-failure schedule and hold in the same
-   transaction as `DeferredReviewPreparation` outcomes. Reuse existing
-   rejection-family gate/hold machinery where applicable; do not invent a
-   second queue.
+Checkpoint 25 adds the offline `RUNTIME` preparation path. A verified Codex
+preflight stop now finalizes either sealed completed or departed planning with
+no paid strike, while the round outcome, exact preparation receipt, execution
+projection and visible hold commit together. The existing hold reconciler
+retries the local preflight on a bounded schedule. A successful probe releases
+the hold; stale probes and stale changed-head reads cannot clear newer failures.
+Production composition supplies an explicit readiness reader for both review
+runtimes. Independent Sol review found and verified fixes for a missing reader
+and both concurrency release paths. Focused tests cover nine behaviors. Full
+`make test` passed: 3,123 domain, 2,806 adapter and 2,866 app tests, plus
+hooks, governor, parity, architecture and both Pyrefly checks (ephemeral log
+`/tmp/phase4-runtime-preparation-full.log`). No live activation,
+target mutation, paid run, migration or push occurred.
+
+1. Add source-specific bounded reread paths for `REVISION_DIFF` and
+   `CONTAINMENT` preparation failures when their adapter sources are minted.
+   The runtime preparation path already uses the rejection-family hold
+   machinery; unsupported kinds remain refused.
 2. Settle confirmed paid/copied submissions jointly with the existing
    `record_review` rejection baseline or `open_ceiling` transaction before
    their later marker. Capture its canonical round outcome and execution reset

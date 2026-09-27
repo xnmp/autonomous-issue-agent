@@ -9,6 +9,8 @@ These reads decide what a review may do; none may be guessed:
   can neither count nor disprove the ceiling.
 - `LINKED_ISSUE`: the linked issue's lifecycle and current workflow holds.
   A failed known-issue read is never interpreted as an unlinked PR.
+- `RUNTIME_PREPARATION`: a local runtime preflight after a verified child
+  could not launch. It cannot manufacture a review verdict.
 
 An unavailable read is UNVERIFIABLE, so the review (or the settlement)
 defers without a verdict. Unbounded, that is a silent retry loop that pays a
@@ -38,12 +40,14 @@ class ReviewEvidenceKind(str, Enum):
     EXEMPTION_TRAILERS = "exemption-evidence"
     REVIEW_HISTORY = "review-history"
     LINKED_ISSUE = "linked-issue"
+    RUNTIME_PREPARATION = "review-runtime-preparation"
 
 
 _SUBJECT = {
     ReviewEvidenceKind.EXEMPTION_TRAILERS: "gate-exemption declarations",
     ReviewEvidenceKind.REVIEW_HISTORY: "the complete review history",
     ReviewEvidenceKind.LINKED_ISSUE: "the linked issue and its current holds",
+    ReviewEvidenceKind.RUNTIME_PREPARATION: "the local review runtime configuration",
 }
 _REMEDIATION = {
     ReviewEvidenceKind.EXEMPTION_TRAILERS: (
@@ -52,6 +56,8 @@ _REMEDIATION = {
         "a scheduled harness read of every review page must succeed; it never counts, clears or approves"),
     ReviewEvidenceKind.LINKED_ISSUE: (
         "a scheduled harness read of the linked issue and its authority must succeed; it never releases that issue"),
+    ReviewEvidenceKind.RUNTIME_PREPARATION: (
+        "a scheduled local runtime preflight must succeed; it never creates a review verdict"),
 }
 
 
