@@ -5,6 +5,7 @@ production admission and provenance minting remain a later checkpoint.
 """
 
 from dataclasses import replace
+import hashlib
 
 import pytest
 
@@ -18,6 +19,7 @@ from issue_agent.domain.outcome import ExitReason
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain import review_execution as execution
 from issue_agent.domain import review_rounds as rounds
+from issue_agent.domain.workflow_identity import WorkflowRevision
 from tests.adapters.test_control_store import _activate_execution_fixture, _seed_v24_workflow_history, _store
 
 
@@ -39,7 +41,13 @@ def round_facts(snapshot, sequence, *, copied=False):
                                   rounds.ReviewSessionReuse.REUSABLE, 1, 5,
                                   () if copied else (rounds.ReviewStagePlan("review", child.kind, (child,)),),
                                   (submission,) if copied else ())
-    planning = rounds.ReviewPlanningSealed(f"seal:{sequence}", rounds.ReviewPlanningComplete())
+    sealed_payload = encode_workflow((identity.round_id, "fixture-owner", "claim:fixture",
+                                      WorkflowRevision(identity.binding.rejection.fence, 0),
+                                      plan, rounds.ReviewPlanningComplete()))
+    planning = rounds.ReviewPlanningSealed(
+        "review-round-seal:" + hashlib.sha256(sealed_payload.encode()).hexdigest(),
+        rounds.ReviewPlanningComplete(),
+    )
     children = () if copied else (rounds.ReviewChildReturned(
         execution.LaunchedReviewChild(child, f"run:{sequence}", f"launch:{sequence}"), f"return:{sequence}",
         rounds.ReviewChildFailed(ExitReason.TRANSPORT_DEATH)),)
@@ -48,6 +56,17 @@ def round_facts(snapshot, sequence, *, copied=False):
     result = rounds.finalize_review_round(facts)
     assert isinstance(result, rounds.FinalizedReviewRound)
     return facts, result.outcome
+
+
+def insert_seal_receipt(db, facts):
+    identity = facts.plan.round
+    db.execute(
+        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+        "VALUES ('review-round-seal',?,?,'2026-09-27T00:00:00+00:00',?)",
+        (identity.binding.rejection.fence.key.repository, identity.round_id,
+         encode_workflow((identity.round_id, "fixture-owner", "claim:fixture",
+                          WorkflowRevision(identity.binding.rejection.fence, 0), facts.plan, facts.planning))),
+    )
 
 
 def insert_round(db, facts, outcome=None, *, index_sequence=None):
@@ -72,6 +91,8 @@ def insert_round(db, facts, outcome=None, *, index_sequence=None):
              review_stage_receipt_key(identity.round_id, stage.stage_id),
              encode_workflow((identity.round_id, stage))),
         )
+    if outcome is not None:
+        insert_seal_receipt(db, facts)
 
 
 def set_projection(db, snapshot, outcomes, last_sequence):
@@ -100,6 +121,50 @@ def test_one_stored_ordinary_failure_restores_one_outer_debit_and_exact_rejectio
         assert restored == expected
         assert restored.execution.state.failures == 4
         assert restored.episode == snapshot.episode
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("corruption", ["missing", "changed_plan", "changed_seal_id", "orphan_open",
+                                        "future_revision"])
+def test_canonical_execution_loader_requires_exact_completed_planning_seal(active, corruption):
+    store, snapshot = active
+    facts, outcome = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        if corruption == "orphan_open":
+            insert_round(db, facts)
+            insert_seal_receipt(db, facts)
+            set_projection(db, snapshot, (), 1)
+        else:
+            insert_round(db, facts, outcome)
+            set_projection(db, snapshot, (outcome,), 1)
+            if corruption == "missing":
+                db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-seal'")
+            elif corruption == "changed_plan":
+                db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-seal'",
+                           (encode_workflow((facts.plan.round.round_id, "fixture-owner", "claim:fixture",
+                                             WorkflowRevision(facts.plan.round.binding.rejection.fence, 0),
+                                             replace(facts.plan, head_sha="b" * 40), facts.planning)),))
+            elif corruption == "changed_seal_id":
+                assert isinstance(facts.planning, rounds.ReviewPlanningSealed)
+                changed = replace(facts.planning, seal_receipt="different-seal")
+                db.execute("UPDATE review_execution_rounds SET planning_json=?",
+                           (encode_workflow(changed),))
+            else:
+                future = WorkflowRevision(facts.plan.round.binding.rejection.fence, snapshot.revision.version + 100)
+                body = encode_workflow((facts.plan.round.round_id, "fixture-owner", "claim:fixture",
+                                        future, facts.plan, rounds.ReviewPlanningComplete()))
+                changed = rounds.ReviewPlanningSealed(
+                    "review-round-seal:" + hashlib.sha256(body.encode()).hexdigest(),
+                    rounds.ReviewPlanningComplete(),
+                )
+                db.execute("UPDATE review_execution_rounds SET planning_json=?,closure_json=?",
+                           (encode_workflow(changed), encode_workflow(replace(facts, planning=changed))))
+                db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-seal'",
+                           (encode_workflow((facts.plan.round.round_id, "fixture-owner", "claim:fixture",
+                                             future, facts.plan, changed)),))
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="revision" if corruption == "future_revision" else None):
+            load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before
 
 
@@ -133,6 +198,7 @@ def test_out_of_order_round_settlement_preserves_later_failure_across_earlier_co
         assert load_review_workflow_row(db, snapshot.revision.fence.key).execution.state.failures == 4
         db.execute("UPDATE review_execution_rounds SET planning_json=?,closure_json=?,outcome_json=? WHERE round_id=?",
                    (encode_workflow(early.planning), encode_workflow(early), encode_workflow(progress), early.plan.round.round_id))
+        insert_seal_receipt(db, early)
         set_projection(db, snapshot, (failed, progress), 2)
         before = tuple(db.iterdump())
         restored = load_review_workflow_row(db, snapshot.revision.fence.key)

@@ -64,6 +64,18 @@ def test_guarded_registration_commits_exact_launch_without_changing_allowance_or
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
 
 
+def test_existing_planned_child_can_launch_after_parent_seals_the_stage_list(planned):
+    store, selection, control, child = planned
+    control.seal_completed_planning(child.round.round_id, current(store, selection).revision)
+    proposed = request(child)
+    assert store.reserve(proposed).admitted
+
+    lease = register(store, proposed)
+
+    assert lease.run_id == proposed.run_id
+    assert launch_receipt(store) is not None
+
+
 def test_exact_registration_replay_is_inert_after_parent_release(admitted):
     store, _, proposed = admitted
     lease = register(store, proposed)

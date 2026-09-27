@@ -75,6 +75,46 @@ def test_admission_reserves_money_and_attaches_one_child_without_launching(plann
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
 
 
+def test_parent_seal_closes_stage_list_but_preserves_admission_of_planned_child(planned):
+    store, selection, control, child = planned
+    sealed = control.seal_completed_planning(child.round.round_id, current(store, selection).revision)
+    assert isinstance(sealed, ReviewPlanningSealed)
+
+    admitted = store.reserve(request(child))
+
+    assert admitted.admitted
+    assert receipt(store).child == child
+    with store.transaction() as db:
+        row = db.execute("SELECT planning_json,closure_json,outcome_json FROM review_execution_rounds").fetchone()
+        assert decode_workflow(row["planning_json"], ReviewPlanningSealed) == sealed
+        assert row["closure_json"] is None and row["outcome_json"] is None
+
+
+def test_parent_can_seal_after_child_admission_advanced_the_shared_revision(planned):
+    store, selection, control, child = planned
+    assert store.reserve(request(child)).admitted
+    before = current(store, selection)
+
+    sealed = control.seal_completed_planning(child.round.round_id, before.revision)
+
+    assert isinstance(sealed, ReviewPlanningSealed)
+    assert current(store, selection).revision.version == before.revision.version + 1
+    assert store.reserve(request(child)).admitted
+
+
+def test_missing_completed_seal_receipt_fences_planned_child_admission(planned):
+    store, selection, control, child = planned
+    control.seal_completed_planning(child.round.round_id, current(store, selection).revision)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-seal'")
+    before = dump(store)
+
+    assert store.reserve(request(child)).disposition is AccountingDisposition.UNAVAILABLE
+
+    assert receipt(store) is None and dump(store) == before
+    assert_unpaid(store)
+
+
 def test_exact_admission_replay_after_parent_release_is_inert(planned):
     store, _, _, child = planned
     accepted = request(child)

@@ -285,6 +285,36 @@ parity, four import contracts and both Pyrefly passes. Ten strict xfails
 remained expected. Local log: `/tmp/phase4-refusal-full.log` (ephemeral).
 No live activation, target mutation, service restart or paid harness run occurred.
 
+## Checkpoint 11 — parent-owned normal planning seal (accepted)
+
+`SQLiteReviewExecutionControl.seal_completed_planning` now closes a round's
+registered stage/submission list under the exact preflight, live parent claim
+occurrence, active dual binding and current aggregate revision. The parent
+process is probed outside SQLite and rechecked in the write transaction.
+The same transaction advances the aggregate revision, stores
+`ReviewPlanningSealed(ReviewPlanningComplete)` and an immutable
+`review-round-seal` receipt. Exact replay is inert after claim release;
+changed facts, stale revisions, replaced parents and partial receipt writes
+refuse without changing the round.
+
+The seal stops new stages. It still permits admission and guarded launch of
+children already in the plan, including when the parent sealed before paying
+them. `workflow_rows` validates the receipt for every completed sealed round
+in the canonical suffix, rejecting missing, conflicting and orphan receipts
+and future captured revisions. Admission and launch verify the same seal.
+The seal records planning completion only; it does not classify a child,
+submission or outer outcome. Other planning conclusions and abandoned-parent
+fences remain later work.
+
+Behavioral tests cover sealing before/after child admission, post-seal launch,
+late-stage refusal, exact replay, missing/changed receipts, stale and replaced
+parent claims, replacement during the OS probe, transaction rollback and
+canonical loader corruption. Independent Sol review found no material issue
+after re-review. Final `make test` passed with 3,094 domain, 2,706 adapter and
+2,863 app tests, hooks, governor, parity, four import contracts and both
+Pyrefly checks; ten strict xfails remained expected. Local log:
+`/tmp/phase4-seal-final-full.log` (ephemeral). No live activation occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,

@@ -18,7 +18,7 @@ from ..domain.review_execution import (
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
-    MAX_REVIEW_STAGES, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
+    MAX_REVIEW_STAGES, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     finalize_review_round,
 )
 from ..domain.workflow import (
@@ -44,6 +44,39 @@ class WorkflowRevisionConflict(WorkflowAuthorityError):
 
 WORKSPACE_ACK_NAMESPACE = "workflow-workspace-completed"
 REVIEW_STAGE_NAMESPACE = "review-round-stage"
+REVIEW_SEAL_NAMESPACE = "review-round-seal"
+
+
+def verified_review_completed_seal(
+    db: sqlite3.Connection, repository: str, owner_id: str, claim_occurrence_id: str,
+    plan: ReviewRoundPlan, planning: ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+) -> WorkflowRevision | None:
+    """Match a completed parent decision to its immutable round receipt."""
+    row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (REVIEW_SEAL_NAMESPACE, repository, plan.round.round_id),
+    ).fetchone()
+    if isinstance(planning, ReviewPlanningOpen):
+        if row is not None:
+            raise WorkflowAuthorityError("open review planning has a contradictory seal receipt")
+        return None
+    if not isinstance(planning, ReviewPlanningSealed) or not isinstance(planning.conclusion, ReviewPlanningComplete):
+        if row is not None:
+            raise WorkflowAuthorityError("review planning seal receipt contradicts its branch")
+        return None
+    if row is None:
+        raise WorkflowAuthorityError("review planning seal lacks its immutable receipt")
+    recorded = decode_workflow(row["payload_json"], tuple)
+    if (len(recorded) != 6 or not isinstance(recorded[3], WorkflowRevision)
+            or recorded != (plan.round.round_id, owner_id, claim_occurrence_id,
+                            recorded[3], plan, planning)
+            or recorded[3].fence != plan.round.binding.rejection.fence):
+        raise WorkflowAuthorityError("review planning seal disagrees with its round and parent")
+    payload = encode_workflow((plan.round.round_id, owner_id, claim_occurrence_id,
+                               recorded[3], plan, ReviewPlanningComplete()))
+    if planning.seal_receipt != "review-round-seal:" + hashlib.sha256(payload.encode()).hexdigest():
+        raise WorkflowAuthorityError("review planning seal identity disagrees with its facts")
+    return recorded[3]
 
 
 def review_stage_receipt_prefix(round_id: str) -> str:
@@ -246,6 +279,7 @@ def _check_intent_index(intent_row: sqlite3.Row, intent: RearmIntent | ReviewRea
 
 def _check_execution_projection(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+    revision: WorkflowRevision,
 ) -> None:
     episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
     count = db.execute(
@@ -307,6 +341,24 @@ def _check_execution_projection(
             or not row["claim_occurrence_id"]
         ):
             raise WorkflowAuthorityError("review execution round index disagrees with its plan")
+        seal_row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_SEAL_NAMESPACE, scope[0], identity.round_id),
+        ).fetchone()
+        if isinstance(planning, ReviewPlanningSealed) and isinstance(planning.conclusion, ReviewPlanningComplete):
+            if seal_row is None:
+                raise WorkflowAuthorityError("sealed review round lacks its immutable planning receipt")
+            seal_record = decode_workflow(seal_row["payload_json"], tuple)
+            if len(seal_record) != 6 or not isinstance(seal_record[1], str) or not seal_record[1]:
+                raise WorkflowAuthorityError("sealed review round has malformed parent provenance")
+            captured = verified_review_completed_seal(
+                db, scope[0], seal_record[1], row["claim_occurrence_id"], plan, planning,
+            )
+            if (captured is None or captured.fence.generation > revision.fence.generation
+                    or (captured.fence == revision.fence and captured.version > revision.version)):
+                raise WorkflowAuthorityError("review planning seal revision is not applicable")
+        elif seal_row is not None:
+            raise WorkflowAuthorityError("review planning state contradicts its completed seal receipt")
         expected_sequence += 1
         if row["outcome_json"] is None:
             if row["closure_json"] is not None:
@@ -413,7 +465,7 @@ def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Review
             authority, episode, gates, intent, execution,
         )
         if isinstance(execution, ActivatedReviewExecution):
-            _check_execution_projection(db, scope, execution)
+            _check_execution_projection(db, scope, execution, snapshot.revision)
         return snapshot
     except (ValueError, TypeError, KeyError) as exc:
         raise WorkflowAuthorityError(f"invalid workflow authority: {exc}") from exc

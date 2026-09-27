@@ -8,6 +8,7 @@ import sys
 import pytest
 
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, WorkflowRevisionConflict
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.review import ReviewMode
@@ -243,6 +244,130 @@ def test_stage_receipt_failure_rolls_back_plan_version_and_all_other_effects(rig
     with store.transaction() as db:
         db.execute("DROP TRIGGER refuse_stage_receipt")
     assert control.register_stage(plan.round.round_id, expected, proposed).stages == (proposed,)
+    assert_unpaid(store)
+
+
+def test_parent_seals_registered_stages_and_replay_is_inert_after_claim_release(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    proposed = stage(plan)
+    registered = control.register_stage(plan.round.round_id, current(store, selection).revision, proposed)
+    before_seal = current(store, selection)
+    expected = before_seal.revision
+
+    sealed = control.seal_completed_planning(plan.round.round_id, expected)
+
+    after = current(store, selection)
+    assert sealed.conclusion == ReviewPlanningComplete()
+    assert after.revision.version == expected.version + 1
+    assert after.execution == before_seal.execution and after.episode == before_seal.episode
+    with store.transaction() as db:
+        row = db.execute("SELECT planning_json,plan_json,closure_json,outcome_json FROM review_execution_rounds").fetchone()
+        assert decode_workflow(row["planning_json"], ReviewPlanningSealed) == sealed
+        assert decode_workflow(row["plan_json"], ReviewRoundPlan) == registered
+        assert row["closure_json"] is None and row["outcome_json"] is None
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="sealed"):
+        control.register_stage(plan.round.round_id, after.revision, stage(plan, name="late", child="late"))
+    assert dump(store) == before
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    before = dump(store)
+    assert control.seal_completed_planning(plan.round.round_id, expected) == sealed
+    assert dump(store) == before
+    assert_unpaid(store)
+
+
+def test_empty_completed_seal_and_stale_revision_do_not_change_round(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="no registered work"):
+        control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+    assert dump(store) == before
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    before = dump(store)
+    with pytest.raises(WorkflowRevisionConflict):
+        control.seal_completed_planning(plan.round.round_id, selection.expected)
+    assert dump(store) == before
+    assert_unpaid(store)
+
+
+def test_lost_or_changed_parent_claim_cannot_seal_planning(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    expected = current(store, selection).revision
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="claim"):
+        control.seal_completed_planning(plan.round.round_id, expected)
+    assert dump(store) == before
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="claim"):
+        control.seal_completed_planning(plan.round.round_id, expected)
+    assert dump(store) == before
+    assert_unpaid(store)
+
+
+def test_parent_replacement_after_liveness_probe_cannot_seal_planning(rig, monkeypatch):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    expected = current(store, selection).revision
+    original = ProcessSupervisor.matches_identity
+    after_replacement = []
+
+    def replace_parent(pid, ticks):
+        live = original(pid, ticks)
+        if not after_replacement:
+            assert live
+            assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+            assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+            after_replacement.append(dump(store))
+        return live
+
+    monkeypatch.setattr(ProcessSupervisor, "matches_identity", replace_parent)
+    with pytest.raises(WorkflowAuthorityError, match="claim"):
+        control.seal_completed_planning(plan.round.round_id, expected)
+    assert dump(store) == after_replacement[0]
+    assert_unpaid(store)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "changed", "unreadable"])
+def test_completed_seal_replay_requires_exact_receipt(rig, corruption):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    expected = current(store, selection).revision
+    sealed = control.seal_completed_planning(plan.round.round_id, expected)
+    with store.transaction() as db:
+        if corruption == "missing":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-seal'")
+        else:
+            payload = ("unreadable" if corruption == "unreadable" else
+                       encode_workflow((plan.round.round_id, OWNER, selection.claim_occurrence_id,
+                                        expected, replace(plan, head_sha="c" * 40), sealed)))
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-seal'", (payload,))
+    before = dump(store)
+    with pytest.raises((WorkflowAuthorityError, ValueError)):
+        control.seal_completed_planning(plan.round.round_id, expected)
+    assert dump(store) == before
+    assert_unpaid(store)
+
+
+def test_seal_receipt_failure_rolls_back_planning_and_aggregate_version(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    expected = current(store, selection).revision
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_planning_seal BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='review-round-seal' BEGIN SELECT RAISE(ABORT,'seal receipt refused'); END")
+    before = dump(store)
+    with pytest.raises(sqlite3.IntegrityError, match="seal receipt refused"):
+        control.seal_completed_planning(plan.round.round_id, expected)
+    assert dump(store) == before
     assert_unpaid(store)
 
 

@@ -99,7 +99,7 @@ from .deployment_authority import (
 from .review_effects import bound_submission_op, review_family_op
 from .review_execution_claims import load_review_preflight_record, require_review_parent_claim
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 25
 
@@ -4660,12 +4660,18 @@ class SQLiteControlStore:
         if recorded is None:
             raise WorkflowAuthorityError("review child admission lacks its exact preflight receipt")
         selection, _, plan, row = recorded
+        planning = decode_workflow(
+            row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+        )
         if (child.round.binding != snapshot.execution.binding or child not in plan.children
-                or not isinstance(decode_workflow(
-                    row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
-                ), ReviewPlanningOpen)
                 or row["closure_json"] is not None or row["outcome_json"] is not None):
-            raise WorkflowAuthorityError("review child is unplanned, stale or sealed")
+            raise WorkflowAuthorityError("review child is unplanned, stale or finalized")
+        sealed_at = verified_review_completed_seal(
+            db, repository, owner_id, selection.claim_occurrence_id, plan, planning,
+        )
+        if not isinstance(planning, ReviewPlanningOpen) and (
+                sealed_at is None or sealed_at.version > snapshot.revision.version):
+            raise WorkflowAuthorityError("review child planning lacks an applicable completed seal")
         try:
             require_review_execution_eligibility(snapshot, plan.head_sha, plan.failure_ceiling)
         except ValueError as exc:

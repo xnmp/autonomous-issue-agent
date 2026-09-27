@@ -1,13 +1,14 @@
 """Transaction-local review execution preflight over a live parent claim."""
 
 from dataclasses import replace
+import hashlib
 import sqlite3
 
 from ..domain.fix import breaker_key
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import ActivatedReviewExecution
 from ..domain.review_rounds import (
-    ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan,
+    ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan,
     ReviewStagePlan,
 )
 from ..domain.review_workflow import ObservedPullRequest
@@ -26,9 +27,9 @@ from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_ho
 from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
-    REVIEW_STAGE_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict,
+    REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
-    review_stage_receipt_key,
+    review_stage_receipt_key, verified_review_completed_seal,
 )
 
 
@@ -243,3 +244,100 @@ class SQLiteReviewExecutionControl:
                 "stage_id": stage.stage_id, "children": len(stage.children),
             })
             return updated
+
+    def _completed_seal_receipt(
+        self, db: sqlite3.Connection, expected: WorkflowRevision,
+        selection: ReviewPreflightSelection, plan: ReviewRoundPlan, row: sqlite3.Row,
+    ) -> ReviewPlanningSealed | None:
+        planning = decode_workflow(
+            row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+        )
+        captured = verified_review_completed_seal(
+            db, self._writer.repository, self._writer.owner_id,
+            selection.claim_occurrence_id, plan, planning,
+        )
+        if captured is None:
+            if not isinstance(planning, ReviewPlanningOpen):
+                raise WorkflowAuthorityError("review planning already has another conclusion")
+            return None
+        if captured != expected or not isinstance(planning, ReviewPlanningSealed):
+            raise WorkflowAuthorityError("review planning seal has conflicting revision")
+        return planning
+
+    def seal_completed_planning(
+        self, round_id: str, expected: WorkflowRevision,
+    ) -> ReviewPlanningSealed:
+        """Close the parent's stage list without classifying child outcomes."""
+        validate_workflow_identifier(round_id, "review round")
+        if not isinstance(expected, WorkflowRevision):
+            raise ValueError("planning seal requires a captured aggregate revision")
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._stored_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review planning seal lacks its preflight")
+            selection, _, plan, row = stored
+            prior = self._completed_seal_receipt(db, expected, selection, plan, row)
+            if prior is not None:
+                return prior
+            claim = db.execute(
+                "SELECT owner_pid,owner_start_ticks FROM dispatch_claims "
+                "WHERE repository=? AND role='review' AND occurrence_id=?",
+                (self._writer.repository, selection.claim_occurrence_id),
+            ).fetchone()
+            if claim is None:
+                raise WorkflowAuthorityError("review parent claim occurrence is absent")
+            parent_pid, parent_start_ticks = claim["owner_pid"], claim["owner_start_ticks"]
+
+        if not ProcessSupervisor.matches_identity(parent_pid, parent_start_ticks):
+            raise WorkflowAuthorityError("review parent claim process is no longer live")
+
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._stored_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review planning seal lost its preflight")
+            selection, _, plan, row = stored
+            prior = self._completed_seal_receipt(db, expected, selection, plan, row)
+            if prior is not None:
+                return prior
+            require_review_parent_claim(
+                db, self._writer.repository, self._writer.owner_id, selection.claim_occurrence_id,
+                selection.claim_target, probed_identity=(parent_pid, parent_start_ticks),
+            )
+            if not (plan.stages or plan.submissions):
+                raise WorkflowAuthorityError("completed review planning has no registered work")
+            snapshot = load_review_workflow_row(db, expected.fence.key)
+            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+                raise WorkflowAuthorityError("review execution workflow is absent or inactive")
+            if snapshot.revision != expected:
+                raise WorkflowRevisionConflict(snapshot.revision, "review planning seal aggregate version changed")
+            if (snapshot.execution.binding != plan.round.binding
+                    or snapshot.binding != plan.round.binding.rejection):
+                raise WorkflowAuthorityError("review planning seal captured a stale dual binding")
+            payload = encode_workflow((round_id, self._writer.owner_id, selection.claim_occurrence_id,
+                                       expected, plan, ReviewPlanningComplete()))
+            sealed = ReviewPlanningSealed(
+                "review-round-seal:" + hashlib.sha256(payload.encode()).hexdigest(),
+                ReviewPlanningComplete(),
+            )
+            changed = db.execute(
+                "UPDATE review_execution_rounds SET planning_json=? WHERE round_id=? "
+                "AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
+                (encode_workflow(sealed), round_id, row["planning_json"]),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("review round changed during planning seal")
+            after = replace(snapshot, revision=WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1))
+            persist_workflow_snapshot(db, after)
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_SEAL_NAMESPACE, self._writer.repository, round_id,
+                 _stamp(self._control.now()), encode_workflow((
+                     round_id, self._writer.owner_id, selection.claim_occurrence_id, expected, plan, sealed,
+                 ))),
+            )
+            self._control._transition(db, "review_round", round_id, "planning_sealed", {
+                "seal_receipt": sealed.seal_receipt,
+            })
+            return sealed
