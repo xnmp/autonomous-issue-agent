@@ -1,11 +1,18 @@
 # Phase 4 — review execution persistence map
 
-Date: 2026-09-27. **Implementation recommendation pending parent shared-seam
-decisions.** This read-only analysis supports the
+Date: 2026-09-27. **Implementation recommendation; canonical shape selected,
+remaining schema/transaction details pending.** This read-only analysis supports the
 [review execution design](2026-09-27-phase-4-review-execution-design.md) and
 [implementation conventions](2026-09-27-phase-4-conventions.md). It does not
 authorize activation or supersede those documents. The parent owns canonical
 values, bindings, codec, schema and transaction signatures.
+
+Parent decision: add the explicit execution field to `ReviewWorkflowSnapshot`
+and persist a tagged `ReviewFamilyEpisodes` envelope containing rejection
+authority, rejection episode and execution component. Execution is not a field
+of the rejection-owned `ReviewEpisode`. Resolve retains its existing pair
+encoding. Planned child stages and finalization contracts must be settled before
+freezing schema v25; the pure projection checkpoint alone is not cutover.
 
 ## Canonical payload
 
@@ -22,7 +29,8 @@ ways to persist the execution component:
 
 Either choice must persist the active variant canonically, validate its distinct
 epoch/episode, retain one workflow generation/version, and preserve resolve's
-accepted encoded bytes. Parent selection precedes adapter work.
+accepted encoded bytes. The selected snapshot/envelope composition keeps this
+boundary explicit; the alternatives above record the design tradeoff.
 
 Legacy PR payloads may decode as explicitly inactive only when execution
 activation/component evidence is absent. Schema evolution must not create an
@@ -119,3 +127,49 @@ values and their behavioral contracts. The parent then selects the exact v25
 projection shape before persistence work. Schema migration and strict canonical
 decoding fence old binaries; supported rollback retains both SQL authorities.
 No runtime cutover or selected file-API removal precedes composed acceptance.
+
+## Migration and codec acceptance checklist
+
+- **Mixed v24 history:** migrate resolve and review rows with baselines,
+  guidance, gates/intents, historical runs/commands and activation evidence.
+  Resolve payload bytes remain identical. PR rejection authority, episode,
+  baseline, generation/version and receipts retain their meaning. Backfill only
+  resolve/rejection component indices; execution remains explicitly inactive.
+- **Atomic replay:** repeated initialization changes nothing. Interrupt v25
+  before commit and verify canonical payload, component indices and schema
+  history roll back together; restart applies the migration once. Extend the
+  existing migration digest, contiguity and concurrent-boot tests.
+- **Legacy/active truth table:** a legacy PR pair with no execution evidence
+  loads inactive. An existing inactive/legacy PR under active execution
+  authority refuses. Active payload with missing/mismatched execution epoch
+  refuses. An entirely absent PR with no retained evidence remains absent;
+  empty repository activation remains valid.
+- **Corruption:** independently delete or alter parent/component/epoch rows;
+  change repository, target, family, epoch or episode identity; add an active
+  index to inactive payload or remove it from active payload. Authoritative
+  loaders refuse without mutation. Target loads must detect retained canonical
+  authority even when its index is missing. Retained rounds/imports/receipts
+  must also prevent missing authority from becoming fresh state.
+- **Isolation:** one PR or repository's execution history cannot imply
+  activation for another. Rejection-only PR rows do not imply execution
+  authority. Hot reads use component and episode indices, not historical JSON
+  scans or lifetime owner counters.
+- **Codec:** round-trip inactive/active envelopes, dual bindings, checkpoints
+  with nondefault pin policy, imported/launched sessions and typed session
+  updates. Reject unknown variants, missing required execution field, null
+  component, extra fields, duplicate JSON keys, wrong nested types,
+  boolean/overflow identities and inconsistent source captures. Keep resolve
+  byte goldens exact. Read/persist/read must retain execution state through
+  every PR writer.
+- **Old binary fence:** a schema-v24 reader refuses v25 before writes. Its
+  strict codec refuses the new PR envelope instead of dropping execution.
+  Supported rollback retains both SQL authorities; it never downgrades schema
+  or restores stopped file counters.
+- **Transactional projection:** canonical execution state, component index and
+  parent CAS advance together; stale CAS leaves all unchanged. Rejection and
+  resolve authority survive unrelated execution updates.
+- **Later admission checkpoint:** exact reservation replay includes dual
+  capture, round and child. Forged attachment, stale generation, duplicate
+  child under another run, or mismatched receipt must refuse before paid
+  run/lease/reservation creation. These checks belong to the admission seam,
+  not a codec-only construction checkpoint.

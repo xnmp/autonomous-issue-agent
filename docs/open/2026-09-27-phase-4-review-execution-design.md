@@ -134,6 +134,9 @@ the suffix by execution episode and sequence; do not scan owner lifetime
 history or truncate unresolved gaps. Recovery must terminalize abandoned
 preflights from evidence. Exact duplicate outcomes are inert; contradictory
 outcomes for the same immutable round are corruption, never last-write-wins.
+The checkpoint captures its execution episode's pin-deferral policy. Replaying
+the same history from a compacted prefix must equal full replay; a caller
+cannot silently substitute a new policy after the prefix was computed.
 
 ## Recovery operations
 

@@ -59,6 +59,8 @@ job someone still has to do; the same file in `history/` is a record.
 - [2026-09-27-phase-4-review-execution-design.md](open/2026-09-27-phase-4-review-execution-design.md)
   — independently reviewed execution/continuation design; implementation follows
   phase-3 acceptance, under the linked implementation conventions.
+- [2026-09-27-phase-4-progress.md](open/2026-09-27-phase-4-progress.md)
+  — continuation checkpoint evidence, construction boundaries and remaining work.
 - [issues/](open/issues/) — unresolved incident write-ups awaiting
   re-validation against the current tree.
 

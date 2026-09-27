@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-08-01. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-09-27. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -484,6 +484,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
 `domain/review_activation.py`, `domain/review_exemptions.py`, `domain/review_linkage.py`,
+`domain/review_execution.py` (phase-4 pure ordered execution projection; runtime cutover pending),
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
 `domain/review_rearm.py`, `domain/review_control.py`, `domain/review_dispatch_record.py`,
 `domain/review_evidence.py`, `domain/deployment.py`
