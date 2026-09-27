@@ -1,17 +1,23 @@
 # ADR 0015 — Generation-fenced gate re-arm authority
 
-Status: Proposed (2026-09-14). Phases 1–2 accepted at `1703195`. The resolve
+Status: Accepted for resolve and review rejections. Proposed 2026-09-14;
+phases 1–2 accepted at `1703195`. The resolve
 slice is accepted (2026-09-25) at `6905184` (operator UI `6a6d769`, offline
 activation `f559282`, absence-authorized retry `bba05c8`, composed fault-matrix
-acceptance `6905184`); the review-rejection slice is not yet accepted. No live
+acceptance `6905184`). The review-rejection slice is accepted (2026-09-27) at
+`a7214bf`, including offline activation/import, retired legacy authority,
+transactional operator fences and linked-issue holds. Independent adversarial
+review and full-suite evidence are in the
+[verification record](../open/2026-09-27-review-slice-verification.md). No live
 workflow family has been activated: acceptance of implementation does not
 authorize activation on real deployment data.
 
 Governs: src/issue_agent/domain/workflow.py src/issue_agent/domain/workflow_policy.py src/issue_agent/adapters/workflow_control.py src/issue_agent/adapters/control_store.py
 
-Proposed authority change: partially supersedes ADR 0009 only for the families
-accepted below. Refines the proposed ADR 0013; neither document's status is
-changed by this proposal. ADRs 0001–0003, 0008, 0010 and 0012 remain applicable.
+Authority change: partially supersedes ADR 0009 for the accepted resolve and
+review-rejection families. Review execution counters and session continuation
+remain phase-4 work. Refines the proposed ADR 0013 without accepting its wider
+scope. ADRs 0001–0003, 0008, 0010 and 0012 remain applicable.
 
 ## Context and scope
 

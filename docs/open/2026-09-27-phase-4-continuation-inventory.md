@@ -1,7 +1,7 @@
 # Phase 4 — remaining continuation authority inventory
 
-Date: 2026-09-27. Read-only preparation while phase-3 review acceptance runs.
-Implementation remains gated on that acceptance. The
+Date: 2026-09-27. Phase 3 is accepted at `a7214bf`; this inventory now guides
+phase-4 implementation under the reviewed execution design. The
 [six-phase plan](2026-09-14-architecture-implementation.md) and ADR 0015 remain
 authoritative; this inventory does not authorize live migration.
 

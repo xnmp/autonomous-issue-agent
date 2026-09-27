@@ -1,7 +1,7 @@
 # Phase 4 — review execution design
 
-Date: 2026-09-27. **Independently reviewed implementation design.** Implementation
-begins after phase-3 acceptance. Companion to the
+Date: 2026-09-27. **Independently reviewed implementation design.** Phase 3 is
+accepted at `a7214bf`; implementation may proceed. Companion to the
 [continuation inventory](2026-09-27-phase-4-continuation-inventory.md), ADR 0009
 and ADR 0015. Real activation and deployment remain paused.
 Implementation ownership and checkpoints are in the

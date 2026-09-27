@@ -1,10 +1,14 @@
 # ADR 0009 — Workflow continuation authority
 
 Status: Accepted; partially superseded by [ADR 0015](0015-generation-fenced-gate-rearm.md)
-for the resolve family only (accepted 2026-09-25 at `6905184`): in a repository whose
-resolve family is activated, resolve continuation, ceiling gates and re-arm authority
-live in the SQLite workflow tables, not Store files. Review continuation is unchanged
-until the ADR 0015 review slice is accepted.
+for resolve (accepted 2026-09-25 at `6905184`) and review rejections (accepted
+2026-09-27 at `a7214bf`). Activated resolve continuation, ceiling gates and
+re-arm authority live in SQLite workflow tables. Review baselines, fresh-review
+obligations, operator guidance, rejection gates and re-arm authority also live
+there; inactive review authority is migration-required. Review runtime sessions,
+displayed rounds and the distinct unproductive-round breaker remain under this
+ADR until their phase-4 slice is accepted. Retained baseline/guidance files are
+read-only import evidence, never runtime authority.
 Date: 2026-08-01
 Governs: src/issue_agent/adapters/store.py src/issue_agent/app/workflows/fix.py src/issue_agent/app/workflows/review.py src/issue_agent/adapters/worktree.py
 

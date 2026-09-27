@@ -9,6 +9,8 @@ independent adversarial review and the final frozen full suite. Together with
 the accepted resolve slice, this completes phase 3. No real workflow family
 was activated and no services were started.
 
+Implementation commit: **`a7214bf`**.
+
 ## Increment 8
 
 - Operator-only `review-activation inventory`, `shadow`, `rehearse` and

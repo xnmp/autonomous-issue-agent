@@ -5,9 +5,11 @@ stop until it's complete"). The [paused handover](2026-09-25-architecture-resume
 is historical input. The operator UI checkpoint below is accepted, as is the
 offline activation/import checkpoint that follows it. The **resolve slice is
 accepted** at `6905184` (absence-authorized retry `bba05c8`; composed fault-matrix
-acceptance through the production fix-daemon composition `6905184`). Current work:
-the review-rejection slice per the
-[review slice plan](2026-09-25-phase-3-review-slice-plan.md). Live operation, family activation on
+acceptance through the production fix-daemon composition `6905184`). The
+**review-rejection slice and phase 3 are accepted** at `a7214bf`; see the
+[verification record](2026-09-27-review-slice-verification.md). Current work is
+phase 4 under the [review execution design](2026-09-27-phase-4-review-execution-design.md).
+Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 
 Offline activation checkpoint (2026-09-25): `issue-agent resolve-activation
@@ -40,11 +42,16 @@ keyboard flow, 320–1440 px layout), two independent adversarial reviews with
 all substantiated findings fixed and regression-tested. Python `make test` was
 green on the unchanged backend (1,624 domain / 1,753 adapter / 2,577 app).
 
-Overall status: **1–2 accepted; 3 in progress; 4–6 dependency-gated.** The
-[phase table](#phases-and-acceptance) below covers all six phases. The latest
-bounded increment is the [operator API checkpoint](2026-09-23-phase-3-operator-handover.md):
-typed commands, coherent status reads, generated client contracts and legacy
-authority fencing. It is not full phase-3 acceptance or permission to restart.
+Overall status: **1–3 accepted; 4 in progress; 5–6 dependency-gated.** The
+[phase table](#phases-and-acceptance) below covers all six phases. Phase 3 ended
+with explicit offline review activation, legacy deletion and complete linked
+issue hold enforcement. Full `make test`: 2,869 domain, 2,401 adapter and 2,861
+app tests; all remaining checks and both Pyrefly passes green. Dashboard:
+479 Vitest, 3 build and 21 Playwright tests. Independent adversarial review
+found no remaining blockers. This does not authorize a live restart.
+
+The checkpoint narratives below preserve the implementation history; their
+then-outstanding phase-3 work is superseded by this acceptance record.
 
 The operator checkpoint passed independent adversarial review and the final
 frozen full suite: 1,624 domain, 1,753 adapter, 2,577 application tests, all
@@ -339,7 +346,7 @@ are isolated per run and use a bounded, restart-safe audit schedule; healthy
 targets continue. Receipt-capacity refusal is infrastructure unavailability,
 not budget exhaustion. This is not yet full resolve-slice acceptance.
 
-### Phase 3 remaining checkpoints
+### Phase 3 checkpoint history (complete)
 
 1. **Checkpoint verified:** scheduler, continuation and ordinary paid-return
    integration; held/stale command projection debt uses shared typed retirement
@@ -353,23 +360,19 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
    final independent review and the full suite passed. Final log:
    `/tmp/phase3-split-final-verified.log`. This accepts the bounded recovery increment,
    not phase 3 overall.
-3. Re-arm/continuation/cancellation, exclusive barriers and daemon recovery now
-   have production composition. The operator API supplies exact-bound commands
-   and coherent authoritative reads; legacy unblock is fenced. Complete explicit
-   offline activation/import and remaining absence-authorized retry controls.
-4. Build visible dashboard controls over the new API (not yet implemented), and
-   finish aged-command uncertainty operator outcomes. Complete migration,
-   rollback, old-writer fencing and remaining legacy-path deletion. The existing
-   inactive-family legacy path is preserved, not claimed deleted.
+3. **Complete:** re-arm/continuation/cancellation, exclusive barriers, daemon
+   recovery, exact-bound operator commands, explicit offline activation/import
+   and absence-authorized retry controls.
+4. **Complete:** visible dashboard controls, aged-command operator outcomes,
+   migration/rehearsal, rollback constraints, old-writer fencing and selected
+   legacy deletion. Inactive review authority now reports migration-required.
 5. **Resolve slice accepted** at `6905184` with independent review and full
-   composed failure coverage. Next: implement/accept the review-rejection slice
-   ([plan](2026-09-25-phase-3-review-slice-plan.md)). Review-slice increments
-   1–7 are accepted and committed (`282c320`…`1cdc834`); increment 8
-   (activation/import, legacy deletion) is in progress on branch
-   `wip/review-inc8-activation`. Current stop state:
-   [review slice handover](2026-09-27-review-slice-handover.md).
-6. Only then accept phase 3 and start phase 4. Live activation and soak remain
-   separately blocked by the deployment pause, not simulated as completed.
+   composed failure coverage. **Review-rejection slice accepted** at `a7214bf`
+   after increments 1–8, independent adversarial review and the final full
+   suite ([verification](2026-09-27-review-slice-verification.md)).
+6. **Phase 3 accepted. Phase 4 started** with the reviewed continuation design
+   and inventory. Live activation and soak remain separately blocked by the
+   deployment pause, not simulated as completed.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched

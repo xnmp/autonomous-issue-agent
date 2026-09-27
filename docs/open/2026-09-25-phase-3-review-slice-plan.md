@@ -1,5 +1,12 @@
 # Phase 3 — review-rejection slice plan
 
+**Accepted 2026-09-27 at `a7214bf`.** All eight increments are implemented,
+independently reviewed and fully tested; see the
+[verification record](2026-09-27-review-slice-verification.md). This completes
+phase 3 alongside the accepted resolve slice. No real family activation or
+deployment restart was performed. The design decisions below remain binding;
+the initial-code facts are historical.
+
 Date: 2026-09-25, grounded at `f559282`; resolve slice accepted at `6905184`. Companion to
 [ADR 0015](../adr/0015-generation-fenced-gate-rearm.md) and the
 [gate design](2026-09-14-phase-3-gate-design.md). Implementation starts only
