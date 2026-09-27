@@ -7,12 +7,14 @@ import sys
 
 import pytest
 
-from issue_agent.adapters.control_store import AccountingDisposition
+from issue_agent.adapters.control_store import AccountingDisposition, BudgetLimit
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_rows import encode_workflow_episodes
 from issue_agent.domain.actions import AgentKind
-from issue_agent.domain.review_execution import ExecutionNotActivated, ReviewChildAdmission
+from issue_agent.domain.review_execution import ExecutionNotActivated, ReviewChildAdmission, ReviewChildAdmissionRefusal
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+from issue_agent.domain.contracts import Money
 from issue_agent.domain.review_rounds import ReviewPlanningComplete, ReviewPlanningSealed, ReviewRoundPlan
 from tests.adapters.test_control_store import _request, _seed_v24_workflow_history, _store
 from tests.adapters.test_review_execution_control import OWNER, assert_unpaid, current, dump, rig
@@ -41,6 +43,16 @@ def receipt(store, run_id="run-1"):
         row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-admission' "
                          "AND scope='o/r' AND key=?", (run_id,)).fetchone()
     return decode_workflow(row[0], ReviewChildAdmission) if row else None
+
+
+def refusal_receipt(store, child):
+    key = json.dumps((child.round.round_id, child.child_id), separators=(",", ":"))
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-refusal' "
+            "AND scope='o/r' AND key=?", (key,),
+        ).fetchone()
+    return decode_workflow(row[0], ReviewChildAdmissionRefusal) if row else None
 
 
 def test_admission_reserves_money_and_attaches_one_child_without_launching(planned):
@@ -138,6 +150,123 @@ def test_exhausted_budget_allocates_neither_admission_receipt_nor_aggregate_revi
     before = dump(store)
     assert store.reserve(request(child, cap=59)).disposition is AccountingDisposition.EXHAUSTED
     assert receipt(store) is None and dump(store) == before
+    assert_unpaid(store)
+
+
+def test_final_exhaustion_records_exact_child_refusal_without_paid_state(planned):
+    store, selection, _, child = planned
+    proposed = request(child, cap=59)
+    before = current(store, selection)
+    assert store.reserve(proposed).disposition is AccountingDisposition.EXHAUSTED
+    refusal = store.record_review_admission_refusal(proposed)
+    assert refusal == refusal_receipt(store, child)
+    assert refusal.child == child
+    assert refusal.claim_occurrence_id == selection.claim_occurrence_id
+    assert refusal.refused_revision.version == before.revision.version + 1
+    assert (refusal.limit_repository, refusal.limit_dimension, refusal.limit_period_id,
+            refusal.committed_micros, refusal.requested_micros, refusal.cap_micros) == (
+                proposed.scope.repository, proposed.scope.dimension, proposed.scope.period_id, 0, 60, 59)
+    assert current(store, selection).revision == refusal.refused_revision
+    assert_unpaid(store)
+    snapshot = dump(store)
+    assert store.record_review_admission_refusal(proposed) == refusal
+    assert dump(store) == snapshot
+    assert store.reserve(replace(proposed, cap=Money("USD", 100))).disposition is AccountingDisposition.UNAVAILABLE
+    assert dump(store) == snapshot
+
+
+def test_changed_request_cannot_replay_a_child_refusal(planned):
+    store, _, _, child = planned
+    proposed = request(child, cap=59)
+    store.record_review_admission_refusal(proposed)
+    before = dump(store)
+    for changed in (replace(proposed, cap=Money("USD", 58)),
+                    replace(proposed, dispatch_id=proposed.dispatch_id + " "),
+                    replace(proposed, run_id=type(proposed.run_id)("another-run"))):
+        with pytest.raises(WorkflowAuthorityError, match="conflicting refusal"):
+            store.record_review_admission_refusal(changed)
+        assert dump(store) == before
+
+
+@pytest.mark.parametrize("corruption", ["committed", "cap", "scope", "claim", "future_revision", "unreadable"])
+def test_refusal_replay_rejects_corrupted_proof(planned, corruption):
+    store, _, _, child = planned
+    proposed = request(child, cap=59)
+    refusal = store.record_review_admission_refusal(proposed)
+    assert refusal is not None
+    if corruption == "committed":
+        changed = replace(refusal, committed_micros=1)
+    elif corruption == "cap":
+        changed = replace(refusal, cap_micros=58)
+    elif corruption == "scope":
+        changed = replace(refusal, limit_dimension="global")
+    elif corruption == "claim":
+        changed = replace(refusal, claim_occurrence_id="other-claim")
+    else:
+        changed = replace(refusal, refused_revision=replace(refusal.refused_revision,
+                                                            version=refusal.refused_revision.version + 100))
+    payload = "unreadable" if corruption == "unreadable" else encode_workflow(changed)
+    with store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-refusal'", (payload,))
+    before = dump(store)
+    with pytest.raises((WorkflowAuthorityError, ValueError)):
+        store.record_review_admission_refusal(proposed)
+    assert dump(store) == before
+
+
+def test_refusal_rechecks_current_cap_and_parent_before_writing(planned):
+    store, _, _, child = planned
+    proposed = request(child, cap=59)
+    assert store.reserve(proposed).disposition is AccountingDisposition.EXHAUSTED
+    before = dump(store)
+    assert store.record_review_admission_refusal(replace(proposed, cap=Money("USD", 60))) is None
+    assert dump(store) == before
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="live parent"):
+        store.record_review_admission_refusal(proposed)
+    assert refusal_receipt(store, child) is None and dump(store) == before
+    assert_unpaid(store)
+
+
+def test_admission_and_refusal_are_mutually_exclusive_for_child(planned):
+    store, _, _, child = planned
+    admitted = request(child)
+    assert store.reserve(admitted).admitted
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="paid admission"):
+        store.record_review_admission_refusal(replace(admitted, cap=Money("USD", 59)))
+    assert refusal_receipt(store, child) is None and dump(store) == before
+
+
+def test_refusal_retains_the_exact_secondary_limit_scope(planned):
+    store, _, _, child = planned
+    proposed = request(child)
+    secondary = BudgetLimit(replace(proposed.scope, repository="global/all", dimension="global",
+                                    period_id="global:day"), Money("USD", 59))
+    proposed = replace(proposed, additional_limits=(secondary,))
+    assert store.reserve(proposed).tripped_dimension == "global"
+    refusal = store.record_review_admission_refusal(proposed)
+    assert refusal is not None
+    assert (refusal.limit_repository, refusal.limit_dimension, refusal.limit_period_id,
+            refusal.limit_period_start, refusal.limit_period_end, refusal.limit_period_timezone,
+            refusal.currency, refusal.committed_micros, refusal.requested_micros,
+            refusal.cap_micros) == (
+                secondary.scope.repository, secondary.scope.dimension, secondary.scope.period_id,
+                secondary.scope.period_start, secondary.scope.period_end,
+                str(secondary.scope.period_timezone), "USD", 0, 60, 59)
+    assert_unpaid(store)
+
+
+def test_refusal_receipt_write_failure_rolls_back_revision_and_all_paid_state(planned):
+    store, _, _, child = planned
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_child_refusal BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='review-execution-refusal' BEGIN SELECT RAISE(ABORT,'receipt refused'); END")
+    before = dump(store)
+    with pytest.raises(Exception, match="receipt refused"):
+        store.record_review_admission_refusal(request(child, cap=59))
+    assert refusal_receipt(store, child) is None and dump(store) == before
     assert_unpaid(store)
 
 
@@ -254,7 +383,8 @@ def test_late_claim_attachment_failure_rolls_back_admission_and_reserved_money(p
     assert_unpaid(store)
 
 
-@pytest.mark.parametrize("corruption", ["missing", "changed_child", "changed_claim", "unreadable", "future_revision"])
+@pytest.mark.parametrize("corruption", ["missing", "changed_child", "changed_claim", "unreadable", "future_revision",
+                                        "missing_child_index", "changed_child_index"])
 def test_exact_replay_requires_the_original_admission_receipt(planned, corruption):
     store, _, _, child = planned
     accepted = request(child)
@@ -263,6 +393,11 @@ def test_exact_replay_requires_the_original_admission_receipt(planned, corruptio
     with store.transaction() as db:
         if corruption == "missing":
             db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-admission'")
+        elif corruption == "missing_child_index":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-child-admission'")
+        elif corruption == "changed_child_index":
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-child-admission'",
+                       (encode_workflow(replace(recorded, claim_occurrence_id="changed")),))
         else:
             payload = ("unreadable" if corruption == "unreadable" else
                        encode_workflow(replace(recorded, admitted_revision=replace(recorded.admitted_revision,

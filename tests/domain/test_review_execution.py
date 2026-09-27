@@ -1,6 +1,7 @@
 """Ordered outer review outcomes and continuation contracts; no runtime cutover."""
 
 from dataclasses import FrozenInstanceError, replace
+from datetime import datetime, timedelta, timezone
 from itertools import permutations
 
 import pytest
@@ -10,7 +11,7 @@ from issue_agent.domain.review_execution import (
     MAX_EXECUTION_SUFFIX, MAX_ROUND_CHILDREN, ActivatedReviewExecution, AddReviewStrike, ClearReviewSession,
     CopiedReviewProgress, ImportedReviewSession, LaunchedReviewChild, NoReviewSession,
     PaidReviewProgress, PreserveDisplayedRound, PreserveReviewSession, ReplaceReviewSession,
-    ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildIdentity,
+    ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
     ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
@@ -68,6 +69,24 @@ def pin(sequence, *, captured=None):
 
 def checkpoint(*, captured=None, through=0, policy=ReviewExecutionPolicy(), **state):
     return ReviewExecutionCheckpoint(through, ReviewExecutionState(captured or binding(), **state), policy)
+
+
+def test_child_refusal_requires_actual_cap_exhaustion_and_bound_revision():
+    child = launched(round_id(1)).child
+    now = datetime.now(timezone.utc)
+    refusal = ReviewChildAdmissionRefusal(
+        child, "receipt:1", "run:1", "reservation:1", "claim:1",
+        WorkflowRevision(child.round.binding.rejection.fence, 1), "owner:1", "fingerprint:1",
+        "o/r", "repository", "day:1", now, now + timedelta(days=1), "UTC", "USD",
+        0, 60, 59, now,
+    )
+    assert refusal.committed_micros + refusal.requested_micros > refusal.cap_micros
+    with pytest.raises(ValueError, match="cap exhaustion"):
+        replace(refusal, cap_micros=60)
+    with pytest.raises(ValueError, match="timestamps"):
+        replace(refusal, refused_at=now.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="revision"):
+        replace(refusal, refused_revision=WorkflowRevision(WorkflowFence(child.round.binding.rejection.fence.key, 1), 1))
 
 
 def test_out_of_order_delivery_and_incremental_compaction_preserve_the_same_outcomes():

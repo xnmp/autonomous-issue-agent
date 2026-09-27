@@ -94,6 +94,54 @@ class ReviewChildAdmission:
 
 
 @dataclass(frozen=True)
+class ReviewChildAdmissionRefusal:
+    """A final, transactionally proved cap refusal for one planned child."""
+
+    child: ReviewChildIdentity
+    receipt_id: str
+    run_id: str
+    reservation_id: str
+    claim_occurrence_id: str
+    refused_revision: WorkflowRevision
+    owner_id: str
+    request_fingerprint: str
+    limit_repository: str
+    limit_dimension: str
+    limit_period_id: str
+    limit_period_start: datetime
+    limit_period_end: datetime
+    limit_period_timezone: str
+    currency: str
+    committed_micros: int
+    requested_micros: int
+    cap_micros: int
+    refused_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.child, ReviewChildIdentity):
+            raise ValueError("review refusal requires one planned child")
+        if (not isinstance(self.refused_revision, WorkflowRevision)
+                or self.refused_revision.fence != self.child.round.binding.rejection.fence):
+            raise ValueError("review refusal revision disagrees with its child binding")
+        for name in ("receipt_id", "run_id", "reservation_id", "claim_occurrence_id", "owner_id",
+                     "request_fingerprint", "limit_dimension", "limit_period_id", "currency"):
+            identifier(getattr(self, name), f"review refusal {name}")
+        if not isinstance(self.limit_repository, str) or not isinstance(self.limit_period_timezone, str):
+            raise ValueError("review refusal limit scope is malformed")
+        if not self.limit_period_timezone:
+            raise ValueError("review refusal limit timezone is required")
+        for value in (self.limit_period_start, self.limit_period_end, self.refused_at):
+            if not isinstance(value, datetime) or value.tzinfo is None or value.utcoffset() is None:
+                raise ValueError("review refusal timestamps require offsets")
+        if self.limit_period_start >= self.limit_period_end:
+            raise ValueError("review refusal limit period is empty")
+        for name in ("committed_micros", "requested_micros", "cap_micros"):
+            integer(getattr(self, name), f"review refusal {name}", minimum=0)
+        if self.committed_micros + self.requested_micros <= self.cap_micros:
+            raise ValueError("review refusal requires proved cap exhaustion")
+
+
+@dataclass(frozen=True)
 class ReviewChildLaunchRegistration:
     """Durable guarded process registration, before provider exec or billing."""
 

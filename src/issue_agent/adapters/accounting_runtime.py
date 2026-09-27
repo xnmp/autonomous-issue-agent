@@ -433,6 +433,21 @@ class AccountingRuntime(AgentRuntime):
         # The daemon itself must not be registered as the reservation lease:
         # doing so makes a transport failure look live until daemon restart.
         reservation = self._reserve_reclaiming_dead_headroom(request)
+        if review_child is not None and reservation.disposition is AccountingDisposition.EXHAUSTED:
+            try:
+                refusal = self.store.record_review_admission_refusal(request)
+            except Exception as exc:  # noqa: BLE001 - uncertain authority cannot become a budget verdict
+                return _return_refused(f"review child refusal authority unavailable: {exc}")
+            if refusal is None:
+                return _return_refused("review child budget or authority changed before final refusal")
+            reservation = ReservationResult(
+                AccountingDisposition.EXHAUSTED, None,
+                Money(refusal.currency, refusal.committed_micros),
+                Money(refusal.currency, refusal.requested_micros),
+                Money(refusal.currency, refusal.cap_micros),
+                f"final planned-child refusal receipt {refusal.receipt_id}",
+                refusal.limit_dimension,
+            )
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
                 return _return_refused(reservation.detail or reservation.disposition.value)

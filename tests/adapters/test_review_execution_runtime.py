@@ -1,18 +1,20 @@
 """Offline accounting and journal execution for one admitted review child."""
 
 import asyncio
+from dataclasses import replace
 import os
 
 import pytest
 
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
+from issue_agent.adapters.control_store import AccountingDisposition, ReservationResult
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money, RunId
-from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATUS
 from issue_agent.domain.pricing import BudgetPolicy
-from tests.adapters.test_review_execution_admission import planned
+from tests.adapters.test_review_execution_admission import planned, refusal_receipt
 from tests.adapters.test_review_execution_control import OWNER, rig
 from tests.fakes.legacy_journal import Journal
 
@@ -34,10 +36,10 @@ class ChildRuntime:
         return self.result
 
 
-def runtime(store, child, result, journal_path):
+def runtime(store, child, result, journal_path, *, repository_cap=5_000_000):
     inner = ChildRuntime(store, result)
     accounting = AccountingRuntime(
-        inner, store, "o/r", "review", Money("USD", 5_000_000), None, None,
+        inner, store, "o/r", "review", Money("USD", repository_cap), None, None,
         "cfg", "claude", BudgetPolicy({("review", "REVIEW"): Money("USD", 2_000_000)}),
         owner_id=OWNER,
     )
@@ -52,6 +54,54 @@ def runtime(store, child, result, journal_path):
 def planned_child(planned):
     store, _, _, child = planned
     return store, child
+
+
+def test_final_budget_trip_records_refusal_and_never_launches_child(planned_child, tmp_path):
+    store, child = planned_child
+    journal, inner = runtime(store, child, AgentResult(False, status="reviewed"),
+                             tmp_path / "journal.jsonl", repository_cap=1_999_999)
+
+    result = asyncio.run(journal.run(RuntimePlan("review", model="model-a", max_budget_usd=2)))
+
+    assert not inner.called
+    assert result.status == MAX_BUDGET_STATUS and result.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    refusal = refusal_receipt(store, child)
+    assert refusal is not None and refusal.cap_micros == 1_999_999
+    assert refusal.requested_micros == 2_000_000
+    assert result.admission_budget_block is not None
+    assert result.admission_budget_block.cap_micros == refusal.cap_micros
+    with store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+
+
+def test_reconciled_first_trip_then_admission_leaves_no_refusal(planned_child, tmp_path):
+    store, child = planned_child
+    journal, inner = runtime(store, child, AgentResult(False, status="reviewed", cost_usd=1),
+                             tmp_path / "journal.jsonl")
+    attempts = 0
+
+    def admit(proposed):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            return ReservationResult(AccountingDisposition.EXHAUSTED, None,
+                                     Money.zero("USD"), proposed.quote.maximum_charge,
+                                     Money("USD", 1_999_999), "transient trip", "repository")
+        return store.reserve(proposed)
+
+    class Reconciler:
+        def reconcile_stale_reservations(self):
+            return 1
+
+    journal.inner = replace(journal.inner, admit=admit, reservation_reconciler=Reconciler())
+    journal.set_context("review", "REVIEW", 9, None, claim_target=-9,
+                        workflow=child.round.binding.rejection, review_child=child)
+    result = asyncio.run(journal.run(RuntimePlan("review", model="model-a", max_budget_usd=2)))
+
+    assert attempts == 2 and inner.called and result.status == "reviewed"
+    assert refusal_receipt(store, child) is None
 
 
 def test_launched_review_result_settles_charge_and_retains_raw_return(planned_child, tmp_path):

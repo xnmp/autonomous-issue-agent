@@ -252,21 +252,54 @@ in this scope. Final `make test` passed with 3,093 domain, 2,673 adapter and
 Pyrefly passes; ten strict xfails remained expected. Local log:
 `/tmp/phase4-stop-full.log` (ephemeral).
 
+## Checkpoint 10 — final planned-child budget refusal (accepted)
+
+`AccountingRuntime` records a pre-reservation refusal only after the final
+`EXHAUSTED` result, following the bounded reconciliation attempt and retry.
+`SQLiteControlStore.record_review_admission_refusal` rechecks the live parent,
+open planned child, current dual binding, holds and every cap balance in one
+write transaction. It advances the aggregate revision and stores a child-keyed
+`ReviewChildAdmissionRefusal` receipt naming the exact request, claim occurrence,
+limiting scope and period, committed amount, requested maximum and cap. It
+creates no run, reservation, charge, claim attachment or lease. If headroom or
+authority changes before the refusal transaction, accounting returns a
+nonterminal authority refusal rather than an outdated budget verdict.
+
+Admission and refusal use the same child key under SQLite's write lock. A
+child-keyed admission index remains alongside the run-keyed admission receipt,
+so retained admission evidence still fences a refusal if its run row is lost.
+Exact refusal replay validates the request, preflight claim, cap scope and
+amount, revision bound and content-addressed receipt ID; exact paid admission
+replay and launch cross-check the child index against the run receipt. The
+digest detects ordinary row corruption within the trusted SQLite authority;
+it is not an independent tamper seal.
+
+Behavioral tests cover final refusal without paid state, exact and changed
+replay, cap/parent drift, admission/refusal exclusion, secondary limiting
+scope, transactional rollback, corrupt receipts, no provider launch and a
+first trip followed by successful reconciliation admission. Independent Sol
+review found and verified fixes for refusal replay validation and child-index
+consistency, then found no further material issue. Final `make test` passed
+with 3,094 domain, 2,689 adapter and 2,863 app tests, hooks, governor, gate
+parity, four import contracts and both Pyrefly passes. Ten strict xfails
+remained expected. Local log: `/tmp/phase4-refusal-full.log` (ephemeral).
+No live activation, target mutation, service restart or paid harness run occurred.
+
 ## Required subsequent work
 
-- Pre-reservation refusal receipts, then sealed outer outcomes and
-  evidence-based finalization after parent/claim abandonment. Distinguish
-  released-before-launch and settled-without-launch evidence; preserve actual
-  accounting and bound unpaid preparation faults through evidence holds.
-- Return receipts and transactional projection over the canonical v25
-  component; productive submission settlement, real multi-child recovery and
-  free copied-verdict capture.
-- Distinct verdict-release and execution-ceiling recovery with one aggregate
+- Seal outer outcomes and finalize them from receipt-backed child evidence,
+  including parent/claim abandonment, released-before-launch and
+  settled-without-launch outcomes. Preserve actual accounting and bound unpaid
+  preparation faults through evidence holds.
+- Project finalized rounds transactionally over the canonical v25 component;
+  settle productive submissions, recover real multi-child execution, and
+  capture free copied verdicts.
+- Separate verdict-release and execution-ceiling recovery under one aggregate
   intent, preserving rejection allowance and other holds.
-- Offline import/shadow/rehearsal/activation, strict provenance for inherited
-  failures and sessions, old-writer fencing and selected Store API retirement.
-- Composed acceptance, dashboard authority and independent review before
-  execution-family cutover. Other fix/steward continuation families follow.
+- Complete offline import, shadow, rehearsal and activation; prove inherited
+  failure/session provenance, fence old writers and retire selected Store APIs.
+- Complete composed acceptance, dashboard authority and independent review
+  before execution-family cutover. Other fix/steward continuation families follow.
 
 Phase 5 offline measurement and phase 6 remain pending. Live phase-5 windows
 still require explicit user authorization.

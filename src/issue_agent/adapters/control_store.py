@@ -51,7 +51,7 @@ from ..domain.workflow import (
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.agent_task import RuntimeName
-from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildIdentity, ReviewChildLaunchRegistration
+from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
 from ..domain.review_rounds import ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed
@@ -108,6 +108,54 @@ def workflow_episode_key(binding: WorkflowBinding) -> str:
     """An indexed projection of immutable admission scope, not an allowance."""
     return json.dumps((*workflow_scope(binding.fence.key), binding.authority.family.value,
                        binding.authority.epoch, binding.episode_id), ensure_ascii=False, separators=(",", ":"))
+
+
+def _review_child_key(child: ReviewChildIdentity) -> str:
+    return json.dumps((child.round.round_id, child.child_id), separators=(",", ":"))
+
+
+def _indexed_review_child_admission(
+    db: sqlite3.Connection, repository: str, child: ReviewChildIdentity,
+) -> ReviewChildAdmission | None:
+    indexed = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-child-admission' "
+        "AND scope=? AND key=?", (repository, _review_child_key(child)),
+    ).fetchone()
+    if indexed is None:
+        return None
+    admission = decode_workflow(indexed["payload_json"], ReviewChildAdmission)
+    run_receipt = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-admission' "
+        "AND scope=? AND key=?", (repository, admission.run_id),
+    ).fetchone()
+    if admission.child != child or run_receipt is None or run_receipt["payload_json"] != indexed["payload_json"]:
+        raise WorkflowAuthorityError("review child admission index disagrees with its run receipt")
+    return admission
+
+
+def _review_request_fingerprint(request: ReservationRequest) -> str:
+    def limit_fields(limit: BudgetLimit) -> tuple[object, ...]:
+        scope = limit.scope
+        return (scope.repository, scope.dimension, scope.currency, scope.period_id,
+                _stamp(scope.period_start), _stamp(scope.period_end), str(scope.period_timezone),
+                limit.cap.micros)
+
+    quote = request.quote
+    payload = (
+        str(request.reservation_id), str(request.run_id), request.dispatch_id,
+        request.workload_repository, request.kind, request.owner_id, request.config_version,
+        encode_workflow(request.workflow), encode_workflow(request.review_child),
+        quote.model, quote.rate_card_id, quote.rate_card_version,
+        _stamp(quote.effective_at), quote.maximum_charge.currency, quote.maximum_charge.micros,
+        tuple(limit_fields(limit) for limit in (
+            BudgetLimit(request.scope, request.cap), *request.additional_limits,
+        )),
+    )
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
+
+
+def _review_refusal_receipt_id(refusal: ReviewChildAdmissionRefusal) -> str:
+    return hashlib.sha256(encode_workflow(replace(refusal, receipt_id="pending")).encode()).hexdigest()
 
 
 def target_has_work_admissions(db: sqlite3.Connection, key: WorkflowKey) -> bool:
@@ -2758,10 +2806,14 @@ class SQLiteControlStore:
             raise ControlStoreError("review launch lacks its admission or reservation")
         try:
             admission = decode_workflow(receipt["payload_json"], ReviewChildAdmission)
+            indexed = _indexed_review_child_admission(db, repository, admission.child)
         except WorkflowEncodingError as exc:
             raise ControlStoreError("review launch admission receipt is unreadable") from exc
+        except WorkflowAuthorityError as exc:
+            raise ControlStoreError(str(exc)) from exc
         binding = admission.child.round.binding.rejection
-        if (admission.run_id != str(run_id) or admission.reservation_id != budget["reservation_id"]
+        if (indexed != admission or admission.run_id != str(run_id)
+                or admission.reservation_id != budget["reservation_id"]
                 or budget["workload_repository"] != repository or admission.owner_id != run["owner_id"]
                 or admission.child.round.round_id != run["review_round_id"]
                 or admission.child.child_id != run["review_child_id"]
@@ -4082,6 +4134,116 @@ class SQLiteControlStore:
                 Money.zero(request.scope.currency), request.quote.maximum_charge,
                 request.cap, f"deployment effect authority unavailable: {exc}")
 
+    def record_review_admission_refusal(
+        self, request: ReservationRequest,
+    ) -> ReviewChildAdmissionRefusal | None:
+        """Record a final cap trip only while the planned child is still eligible.
+
+        The earlier exhausted result is advisory. This transaction repeats both
+        authority and every cap check after reconciliation and races with reserve
+        under SQLite's write lock.
+        """
+        child = request.review_child
+        if child is None:
+            raise ValueError("review refusal requires a planned child")
+        self.integrity_check()
+        with deployment_effect_authority(
+            self.path, request.workload_repository,
+            deployment_role(request.workload_repository, request.owner_id), blocking=False,
+        ):
+            parent_identity = self._review_parent_identity(request)
+            with self.transaction() as db:
+                key = _review_child_key(child)
+                fingerprint = _review_request_fingerprint(request)
+                prior = db.execute(
+                    "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-refusal' "
+                    "AND scope=? AND key=?",
+                    (request.workload_repository, key),
+                ).fetchone()
+                if prior is not None:
+                    refusal = decode_workflow(prior["payload_json"], ReviewChildAdmissionRefusal)
+                    recorded = load_review_preflight_record(
+                        db, request.workload_repository, request.owner_id, child.round.round_id,
+                    )
+                    limits = (BudgetLimit(request.scope, request.cap), *request.additional_limits)
+                    matching_limit = any(
+                        (refusal.limit_repository, refusal.limit_dimension, refusal.limit_period_id,
+                         refusal.limit_period_start, refusal.limit_period_end, refusal.limit_period_timezone,
+                         refusal.currency, refusal.cap_micros) == (
+                             limit.scope.repository, limit.scope.dimension, limit.scope.period_id,
+                             limit.scope.period_start, limit.scope.period_end, str(limit.scope.period_timezone),
+                             limit.scope.currency, limit.cap.micros,
+                         ) for limit in limits
+                    )
+                    workflow_row = db.execute(
+                        "SELECT generation,version FROM workflows WHERE repository=? AND target_kind=? AND target_number=?",
+                        workflow_scope(child.round.binding.rejection.fence.key),
+                    ).fetchone()
+                    if (refusal.child != child or refusal.owner_id != request.owner_id
+                            or refusal.request_fingerprint != fingerprint
+                            or refusal.run_id != str(request.run_id)
+                            or refusal.reservation_id != str(request.reservation_id)
+                            or refusal.receipt_id != _review_refusal_receipt_id(refusal)
+                            or refusal.requested_micros != request.quote.maximum_charge.micros
+                            or not matching_limit or recorded is None
+                            or refusal.claim_occurrence_id != recorded[0].claim_occurrence_id
+                            or workflow_row is None
+                            or (workflow_row["generation"] == refusal.refused_revision.fence.generation
+                                and workflow_row["version"] < refusal.refused_revision.version)):
+                        raise WorkflowAuthorityError("review child has a conflicting refusal receipt")
+                    return refusal
+                if _indexed_review_child_admission(
+                    db, request.workload_repository, child,
+                ) is not None or db.execute(
+                    "SELECT 1 FROM runs WHERE review_round_id=? AND review_child_id=?",
+                    (child.round.round_id, child.child_id),
+                ).fetchone() or db.execute(
+                    "SELECT 1 FROM runs WHERE run_id=?", (str(request.run_id),),
+                ).fetchone():
+                    raise WorkflowAuthorityError("review child already has a paid admission")
+                self._assert_owner_active(db, request.owner_id)
+                snapshot = self._validate_workflow_reservation(
+                    db, request, review_parent_identity=parent_identity,
+                )
+                if not isinstance(snapshot, ReviewWorkflowSnapshot):
+                    raise WorkflowAuthorityError("review refusal requires active execution authority")
+                recorded = load_review_preflight_record(
+                    db, request.workload_repository, request.owner_id, child.round.round_id,
+                )
+                if recorded is None:
+                    raise WorkflowAuthorityError("review refusal lost its preflight receipt")
+                requested = request.quote.maximum_charge
+                for limit in (BudgetLimit(request.scope, request.cap), *request.additional_limits):
+                    settled, reserved = self._balance(db, limit.scope)
+                    committed = settled + reserved
+                    if committed + requested.micros <= limit.cap.micros:
+                        continue
+                    revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
+                    now = self._now()
+                    refusal = ReviewChildAdmissionRefusal(
+                        child, "pending", str(request.run_id), str(request.reservation_id),
+                        recorded[0].claim_occurrence_id, revision, request.owner_id, fingerprint,
+                        limit.scope.repository, limit.scope.dimension, limit.scope.period_id,
+                        limit.scope.period_start, limit.scope.period_end, str(limit.scope.period_timezone),
+                        limit.scope.currency, committed, requested.micros, limit.cap.micros, now,
+                    )
+                    refusal = replace(refusal, receipt_id=_review_refusal_receipt_id(refusal))
+                    changed = db.execute(
+                        "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=? "
+                        "AND generation=? AND version=?",
+                        (revision.version, *workflow_scope(revision.fence.key), revision.fence.generation,
+                         snapshot.revision.version),
+                    ).rowcount
+                    if changed != 1:
+                        raise WorkflowAuthorityError("review refusal lost the aggregate version")
+                    db.execute(
+                        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                        "VALUES ('review-execution-refusal',?,?,?,?)",
+                        (request.workload_repository, key, _stamp(now), encode_workflow(refusal)),
+                    )
+                    return refusal
+                return None
+
     def _review_parent_identity(self, request: ReservationRequest) -> tuple[int, int] | None:
         """Probe the selected parent outside SQLite's write transaction."""
         if request.review_child is None:
@@ -4434,6 +4596,10 @@ class SQLiteControlStore:
             if isinstance(snapshot.execution, ActivatedReviewExecution):
                 if request.review_child is None:
                     raise WorkflowAuthorityError("active review execution requires a planned child")
+                if _indexed_review_child_admission(
+                    db, request.workload_repository, request.review_child,
+                ) is not None:
+                    raise WorkflowAuthorityError("review child already has a paid admission")
                 self._require_review_child_authority(
                     db, request.workload_repository, request.owner_id, request.review_child,
                     request.kind, dispatch, snapshot, review_parent_identity,
@@ -4482,6 +4648,12 @@ class SQLiteControlStore:
     ) -> ReviewPreflightSelection:
         if parent_identity is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
             raise WorkflowAuthorityError("review child admission lacks its live parent or execution authority")
+        key = _review_child_key(child)
+        if db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-refusal' AND scope=? AND key=?",
+            (repository, key),
+        ).fetchone():
+            raise WorkflowAuthorityError("review child has a final admission refusal")
         recorded = load_review_preflight_record(
             db, repository, owner_id, child.round.round_id,
         )
@@ -4597,6 +4769,11 @@ class SQLiteControlStore:
             "VALUES ('review-execution-admission',?,?,?,?)",
             (request.workload_repository, str(request.run_id), now, encode_workflow(admission)),
         )
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-execution-child-admission',?,?,?,?)",
+            (request.workload_repository, _review_child_key(child), now, encode_workflow(admission)),
+        )
 
     @staticmethod
     def _reservation_request_matches(
@@ -4633,6 +4810,10 @@ class SQLiteControlStore:
                         or run["review_child_id"] != request.review_child.child_id):
                     return False
                 admission = decode_workflow(receipt["payload_json"], ReviewChildAdmission)
+                if _indexed_review_child_admission(
+                    db, request.workload_repository, request.review_child,
+                ) != admission:
+                    return False
                 recorded = load_review_preflight_record(
                     db, request.workload_repository, request.owner_id,
                     request.review_child.round.round_id,
