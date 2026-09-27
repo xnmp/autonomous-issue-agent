@@ -4,6 +4,8 @@ Phase 3 is accepted at `a7214bf`; ADR/plan acceptance is recorded in `5abacab`.
 Phase 4 follows the [review execution design](2026-09-27-phase-4-review-execution-design.md),
 [conventions](2026-09-27-phase-4-conventions.md) and
 [persistence map](2026-09-27-phase-4-persistence-map.md).
+The [post-persistence handover](2026-09-27-phase-4-post-persistence-handover.md)
+records the next transaction boundary and standing restrictions.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
 and [execution provenance map](2026-09-27-phase-4-execution-provenance.md).
