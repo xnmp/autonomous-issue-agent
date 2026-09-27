@@ -668,6 +668,17 @@ No live activation or paid run occurred.
 
 ## Required subsequent work
 
+An offline checkpoint-compaction prototype was reviewed and withdrawn after
+checkpoint 24. Checking only the newest proof failed to detect corruption in
+older compacted source receipts; checking every proof/source on each canonical
+load made hot reads grow with lifetime history (a 65-round focused case took
+about 43 seconds including construction). The proposed chain also lacked an
+authoritative anchor for imported sequence-zero state, and a recovery scan
+revisited historical PRs every tick. No part of that prototype was committed.
+Compaction needs an explicit trusted snapshot boundary backed by an immutable
+activation/import source and a separate source-audit contract, so ordinary
+reads stay bounded. Its performance remains an activation gate.
+
 - Finalize completed and abandoned rounds with preparation failures. Preserve
   actual accounting and bind preparation faults to bounded evidence holds
   before committing their outer outcomes.

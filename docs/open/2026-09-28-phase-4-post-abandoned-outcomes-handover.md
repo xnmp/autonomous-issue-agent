@@ -72,6 +72,17 @@ architecture and Pyrefly. Log: `/tmp/phase4-post-seal-abandonment-full.log`
 (ephemeral). Restore composed ordered/compacted suffix coverage alongside
 the productive and checkpoint writers.
 
+An attempted source-backed checkpoint writer was reverted after independent
+Sol review. Validating only its newest batch missed old source corruption;
+validating every batch on each canonical read caused lifetime-sized hot reads
+and quadratic repeated finalization (the 65-round focused case took about
+43 seconds including setup). The chain also lacked an activation/import anchor
+for its sequence-zero state, and its recovery scan revisited historical PRs.
+The next design must state which immutable checkpoint becomes authority, how
+its initial state is source-backed, how archived sources are audited, and how
+ordinary reads and recovery remain bounded. The implementation remains at
+checkpoint 24.
+
 1. Add the bounded preparation-failure schedule and hold in the same
    transaction as `DeferredReviewPreparation` outcomes. Reuse existing
    rejection-family gate/hold machinery where applicable; do not invent a
