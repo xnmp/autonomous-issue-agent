@@ -116,6 +116,30 @@ test-tier layout entries; the corrected run was green.
 This checkpoint does not register child stages, admit paid work, prove launch
 or return, seal rounds, activate the execution family or cut over the daemon.
 
+## Checkpoint 5 — immutable planned stages (accepted)
+
+`SQLiteReviewExecutionControl.register_stage` appends one validated stage and
+its planned children to an open round under the exact preflight receipt, live
+parent claim occurrence, active dual binding and current aggregate revision.
+It advances the shared version once, with no paid run or reservation. Exact
+replay is inert; changed children, sealed planning and stale authority refuse.
+The append and an immutable `review-round-stage` receipt commit together.
+
+The active loader and stage writer both require an exact two-way match between
+the bounded stage list and its receipt set. Receipt keys use an indexed
+round-scoped range, so one active round does not scan every repository stage.
+Independent review reproduced missing prior receipts and orphan receipts that
+otherwise permitted an append over altered history; both now refuse. The
+reviewer found no remaining blocker in this stage-registration scope. Final
+`make test` passed with 3,093 domain, 2,547 adapter and 2,863 app tests, plus
+hooks, governor, gate parity, four import contracts and both Pyrefly passes.
+Ten pre-existing strict xfails remained expected. Local log:
+`/tmp/phase4-stage-final-full.log` (ephemeral).
+
+This checkpoint does not admit or launch any child. The next boundary must
+join a planned child and exact parent occurrence to run/budget reservation in
+one transaction; reservation alone cannot prove launch.
+
 ## Required subsequent work
 
 - Planned immutable child stages and sealed outer outcomes; evidence-based

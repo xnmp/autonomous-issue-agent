@@ -18,7 +18,7 @@ from ..domain.review_execution import (
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
-    ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan,
+    MAX_REVIEW_STAGES, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     finalize_review_round,
 )
 from ..domain.workflow import (
@@ -43,6 +43,36 @@ class WorkflowRevisionConflict(WorkflowAuthorityError):
 
 
 WORKSPACE_ACK_NAMESPACE = "workflow-workspace-completed"
+REVIEW_STAGE_NAMESPACE = "review-round-stage"
+
+
+def review_stage_receipt_prefix(round_id: str) -> str:
+    return hashlib.sha256(encode_workflow(round_id).encode()).hexdigest() + ":"
+
+
+def review_stage_receipt_key(round_id: str, stage_id: str) -> str:
+    return review_stage_receipt_prefix(round_id) + hashlib.sha256(encode_workflow(stage_id).encode()).hexdigest()
+
+
+def require_review_stage_receipts(db: sqlite3.Connection, repository: str, plan: ReviewRoundPlan) -> None:
+    """The bounded append-only stage list and its immutable receipts are one authority."""
+    round_id = plan.round.round_id
+    prefix = review_stage_receipt_prefix(round_id)
+    receipts = db.execute(
+        "SELECT key,payload_json FROM dedupe_keys WHERE namespace=? AND scope=? "
+        "AND key>=? AND key<? LIMIT ?",
+        (REVIEW_STAGE_NAMESPACE, repository, prefix, prefix[:-1] + ";", MAX_REVIEW_STAGES + 1),
+    ).fetchall()
+    if len(receipts) != len(plan.stages):
+        raise WorkflowAuthorityError("review round stage receipts disagree with its canonical plan")
+    planned = {stage.stage_id: stage for stage in plan.stages}
+    for receipt in receipts:
+        recorded = decode_workflow(receipt["payload_json"], tuple)
+        if (len(recorded) != 2 or recorded[0] != round_id
+                or not isinstance(recorded[1], ReviewStagePlan)
+                or receipt["key"] != review_stage_receipt_key(round_id, recorded[1].stage_id)
+                or planned.get(recorded[1].stage_id) != recorded[1]):
+            raise WorkflowAuthorityError("review round stage receipt conflicts with its canonical plan")
 
 
 def load_workspace_ack(db: sqlite3.Connection, handoff: EpisodeWorkspaceHandoff) -> EpisodeWorkspacePrepared | None:
@@ -257,6 +287,7 @@ def _check_execution_projection(
     expected_sequence = execution.checkpoint.through_sequence + 1
     for row in rows:
         plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
+        require_review_stage_receipts(db, scope[0], plan)
         planning = decode_workflow(
             row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
         )

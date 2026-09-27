@@ -10,7 +10,8 @@ import pytest
 
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.workflow_rows import (
-    WorkflowAuthorityError, encode_workflow_episodes, load_review_workflow_row,
+    REVIEW_STAGE_NAMESPACE, WorkflowAuthorityError, encode_workflow_episodes,
+    load_review_workflow_row, review_stage_receipt_key,
 )
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.outcome import ExitReason
@@ -63,6 +64,14 @@ def insert_round(db, facts, outcome=None, *, index_sequence=None):
          encode_workflow(facts) if outcome is not None else None,
          encode_workflow(outcome) if outcome is not None else None),
     )
+    for stage in facts.plan.stages:
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES (?,?,?,'2026-09-27T00:00:00+00:00',?)",
+            (REVIEW_STAGE_NAMESPACE, binding.rejection.fence.key.repository,
+             review_stage_receipt_key(identity.round_id, stage.stage_id),
+             encode_workflow((identity.round_id, stage))),
+        )
 
 
 def set_projection(db, snapshot, outcomes, last_sequence):
@@ -91,6 +100,25 @@ def test_one_stored_ordinary_failure_restores_one_outer_debit_and_exact_rejectio
         assert restored == expected
         assert restored.execution.state.failures == 4
         assert restored.episode == snapshot.episode
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("corruption", ["missing_receipt", "orphan_receipt"])
+def test_execution_authority_requires_the_complete_accepted_stage_set(active, corruption):
+    store, snapshot = active
+    facts, _ = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts)
+        expected = set_projection(db, snapshot, (), 1)
+        assert load_review_workflow_row(db, snapshot.revision.fence.key) == expected
+        if corruption == "missing_receipt":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace=?", (REVIEW_STAGE_NAMESPACE,))
+        else:
+            db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE round_id=?",
+                       (encode_workflow(replace(facts.plan, stages=())), facts.plan.round.round_id))
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError):
+            load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before
 
 

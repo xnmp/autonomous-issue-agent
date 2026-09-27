@@ -8,10 +8,15 @@ from ..domain.actions import AgentKind
 from ..domain.fix import breaker_key
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import ActivatedReviewExecution
-from ..domain.review_rounds import ReviewPlanningOpen, ReviewRoundPlan
+from ..domain.review_rounds import (
+    ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan,
+    ReviewStagePlan,
+)
 from ..domain.review_workflow import ObservedPullRequest
 from ..domain.review_rearm import ReleaseStatus
-from ..domain.workflow_identity import IssueRef, WorkflowKey, WorkflowRevision, WorkflowWriter
+from ..domain.workflow_identity import (
+    IssueRef, WorkflowKey, WorkflowRevision, WorkflowWriter, validate_workflow_identifier,
+)
 from .control_store import SQLiteControlStore, _stamp
 from .deployment_authority import deployment_role
 from .review_effects import ReviewReads, read_pull_request
@@ -20,8 +25,9 @@ from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_ho
 from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
-    WorkflowAuthorityError, WorkflowRevisionConflict, linked_issue_workflow_holds,
-    load_review_workflow_row, persist_workflow_snapshot,
+    REVIEW_STAGE_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict,
+    linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
+    require_review_stage_receipts, review_stage_receipt_key,
 )
 
 
@@ -44,28 +50,73 @@ class SQLiteReviewExecutionControl:
         self._writer = writer
         self._gateway = gateway
 
-    def _receipt(self, db: sqlite3.Connection, selection: ReviewPreflightSelection) -> ReviewRoundPlan | None:
+    def _stored_round(
+        self, db: sqlite3.Connection, request_id: str,
+    ) -> tuple[ReviewPreflightSelection, ReviewRoundPlan, ReviewRoundPlan, sqlite3.Row] | None:
         row = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (_PREFLIGHT_NAMESPACE, self._writer.repository, selection.request_id),
+            (_PREFLIGHT_NAMESPACE, self._writer.repository, request_id),
         ).fetchone()
         if row is None:
             return None
         stored = decode_workflow(row["payload_json"], tuple)
-        if (len(stored) != 3 or stored[0] != selection or stored[1] != self._writer.owner_id
+        if (len(stored) != 3 or not isinstance(stored[0], ReviewPreflightSelection)
+                or stored[0].request_id != request_id or stored[1] != self._writer.owner_id
                 or not isinstance(stored[2], ReviewRoundPlan)):
-            raise WorkflowAuthorityError("review preflight idempotency key has conflicting facts")
-        plan = stored[2]
+            raise WorkflowAuthorityError("review preflight receipt contains conflicting facts")
+        selection, plan = stored[0], stored[2]
+        if plan.round.round_id != request_id or plan.round.binding != selection.binding:
+            raise WorkflowAuthorityError("review preflight receipt disagrees with its round identity")
         round_row = db.execute(
-            "SELECT claim_occurrence_id,plan_json FROM review_execution_rounds WHERE round_id=?",
-            (plan.round.round_id,),
+            "SELECT * FROM review_execution_rounds WHERE round_id=?", (request_id,),
         ).fetchone()
         if round_row is None or round_row["claim_occurrence_id"] != selection.claim_occurrence_id:
             raise WorkflowAuthorityError("review preflight receipt lacks its exact durable round")
         current_plan = decode_workflow(round_row["plan_json"], ReviewRoundPlan)
         if replace(plan, stages=current_plan.stages, submissions=current_plan.submissions) != current_plan:
             raise WorkflowAuthorityError("review preflight receipt disagrees with its evolved round plan")
+        identity = plan.round
+        binding = identity.binding
+        if (
+            round_row["repository"] != selection.expected.fence.key.repository
+            or round_row["target_kind"] != "pr"
+            or round_row["target_number"] != selection.expected.fence.key.target.number
+            or round_row["execution_epoch"] != binding.execution_epoch
+            or round_row["execution_episode"] != binding.execution_episode
+            or round_row["generation"] != binding.rejection.fence.generation
+            or round_row["sequence"] != identity.sequence
+        ):
+            raise WorkflowAuthorityError("review preflight receipt disagrees with its round index")
+        require_review_stage_receipts(db, self._writer.repository, current_plan)
+        return selection, plan, current_plan, round_row
+
+    def _receipt(self, db: sqlite3.Connection, selection: ReviewPreflightSelection) -> ReviewRoundPlan | None:
+        stored = self._stored_round(db, selection.request_id)
+        if stored is None:
+            return None
+        recorded, plan, _, _ = stored
+        if recorded != selection:
+            raise WorkflowAuthorityError("review preflight idempotency key has conflicting facts")
         return plan
+
+    def _stage_receipt(
+        self, db: sqlite3.Connection, round_id: str, stage: ReviewStagePlan, current: ReviewRoundPlan,
+    ) -> bool:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_STAGE_NAMESPACE, self._writer.repository, review_stage_receipt_key(round_id, stage.stage_id)),
+        ).fetchone()
+        existing = next((item for item in current.stages if item.stage_id == stage.stage_id), None)
+        if existing is not None and existing != stage:
+            raise WorkflowAuthorityError("review stage identity has conflicting children")
+        if row is None:
+            if existing is not None:
+                raise WorkflowAuthorityError("registered review stage lacks its immutable receipt")
+            return False
+        recorded = decode_workflow(row["payload_json"], tuple)
+        if recorded != (round_id, stage) or existing != stage:
+            raise WorkflowAuthorityError("review stage receipt conflicts with its canonical plan")
+        return True
 
     def _claim(self, db: sqlite3.Connection, selection: ReviewPreflightSelection) -> None:
         target = f"issue:{selection.claim_target}" if selection.claim_target > 0 else f"pr:{-selection.claim_target}"
@@ -193,3 +244,83 @@ class SQLiteReviewExecutionControl:
                 "sequence": plan.round.sequence, "claim_occurrence_id": selection.claim_occurrence_id,
             })
             return plan
+
+    def register_stage(
+        self, round_id: str, expected: WorkflowRevision, stage: ReviewStagePlan,
+    ) -> ReviewRoundPlan:
+        """Append one immutable child stage to an open round before reservation."""
+        validate_workflow_identifier(round_id, "review round")
+        if not isinstance(expected, WorkflowRevision) or not isinstance(stage, ReviewStagePlan):
+            raise ValueError("stage registration requires a revision and typed stage")
+        if any(child.round.round_id != round_id for child in stage.children):
+            raise ValueError("planned review stage belongs to another round")
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._stored_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review round has no preflight receipt")
+            selection, _, current, _ = stored
+            if self._stage_receipt(db, round_id, stage, current):
+                return current
+            claim = db.execute(
+                "SELECT owner_pid,owner_start_ticks FROM dispatch_claims "
+                "WHERE repository=? AND role='review' AND occurrence_id=?",
+                (self._writer.repository, selection.claim_occurrence_id),
+            ).fetchone()
+            if claim is None:
+                raise WorkflowAuthorityError("review parent claim occurrence is absent")
+            parent_pid, parent_start_ticks = claim["owner_pid"], claim["owner_start_ticks"]
+
+        if not ProcessSupervisor.matches_identity(parent_pid, parent_start_ticks):
+            raise WorkflowAuthorityError("review parent claim process is no longer live")
+
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._stored_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review round preflight receipt disappeared")
+            selection, _, current, row = stored
+            if self._stage_receipt(db, round_id, stage, current):
+                return current
+            self._claim(db, selection)
+            claim = db.execute(
+                "SELECT owner_pid,owner_start_ticks FROM dispatch_claims "
+                "WHERE repository=? AND role='review' AND occurrence_id=?",
+                (self._writer.repository, selection.claim_occurrence_id),
+            ).fetchone()
+            if claim is None or (claim["owner_pid"], claim["owner_start_ticks"]) != (
+                parent_pid, parent_start_ticks,
+            ):
+                raise WorkflowAuthorityError("review parent claim process identity changed during stage planning")
+            if (not isinstance(decode_workflow(row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned),
+                               ReviewPlanningOpen)
+                    or row["closure_json"] is not None or row["outcome_json"] is not None):
+                raise WorkflowAuthorityError("review round planning is already sealed")
+            snapshot = load_review_workflow_row(db, expected.fence.key)
+            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+                raise WorkflowAuthorityError("review execution workflow is absent or inactive")
+            if snapshot.revision != expected:
+                raise WorkflowRevisionConflict(snapshot.revision, "review stage aggregate version changed")
+            if (snapshot.execution.binding != current.round.binding
+                    or snapshot.binding != current.round.binding.rejection):
+                raise WorkflowAuthorityError("review stage captured a stale dual binding")
+            updated = replace(current, stages=current.stages + (stage,))
+            changed = db.execute(
+                "UPDATE review_execution_rounds SET plan_json=? WHERE round_id=? "
+                "AND plan_json=? AND closure_json IS NULL AND outcome_json IS NULL",
+                (encode_workflow(updated), round_id, row["plan_json"]),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("review round changed during stage planning")
+            after = replace(snapshot, revision=WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1))
+            persist_workflow_snapshot(db, after)
+            now = self._control.now()
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_STAGE_NAMESPACE, self._writer.repository, review_stage_receipt_key(round_id, stage.stage_id),
+                 _stamp(now), encode_workflow((round_id, stage))),
+            )
+            self._control._transition(db, "review_round", round_id, "stage_registered", {
+                "stage_id": stage.stage_id, "children": len(stage.children),
+            })
+            return updated

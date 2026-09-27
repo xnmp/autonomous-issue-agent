@@ -407,17 +407,14 @@ def test_pending_current_generation_release_projection_blocks_preflight(rig):
 
 
 def test_exact_preflight_replay_after_child_stage_planning_is_inert(rig):
-    from issue_agent.adapters.workflow_codec import encode_workflow
     from issue_agent.domain.review_execution import ReviewChildIdentity, ReviewChildKind
     from issue_agent.domain.review_rounds import ReviewStagePlan
 
     store, _, gateway, selection, control = rig
     initial = control.preflight(selection)
     child = ReviewChildIdentity(initial.round, "review", "reviewer", ReviewChildKind.REVIEWER)
-    expanded = replace(initial, stages=(ReviewStagePlan("review", ReviewChildKind.REVIEWER, (child,)),))
-    with store.transaction() as db:
-        db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE round_id=?",
-                   (encode_workflow(expanded), initial.round.round_id))
+    control.register_stage(initial.round.round_id, current(store, selection).revision,
+                           ReviewStagePlan("review", ReviewChildKind.REVIEWER, (child,)))
     before = dump(store)
     gateway.error = AssertionError("preflight replay read gateway")
     reads = list(gateway.calls)
