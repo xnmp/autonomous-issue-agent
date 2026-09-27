@@ -10,9 +10,8 @@ from ..domain.workflow import RetiredSettledCommand, RetiredUncertainCommand
 from ..domain.workflow_identity import WorkflowBinding, WorkflowWriter
 from .control_store import SQLiteControlStore, _command_from_row
 from .workflow_commit import owns_command
-from .workflow_rows import WorkflowAuthorityError
+from .workflow_rows import RECORDED_REVIEW_NAMESPACE, WorkflowAuthorityError
 
-RECORDED_REVIEW_NAMESPACE = "review-recorded-submission"
 RELEASE_RESOLVED_NAMESPACE = "review-release-resolved"
 SETTLED_SUBMISSION_NAMESPACE = "review-submission-settled"
 

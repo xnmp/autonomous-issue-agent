@@ -10,18 +10,20 @@ from ..domain.review_preflight import ReviewPreflightSelection, plan_review_pref
 from ..domain.review_execution import (
     ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress,
     ReviewPreparationKind,
-    ReviewRoundOutcome, project_review_execution,
+    ReviewRoundOutcome, project_review_execution, same_execution_episode,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningComplete,
     ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
-    ReviewRoundAwaitingEvidence, ReviewSubmissionKind, ReviewSubmissionPlan,
+    ReviewRoundAwaitingEvidence, ReviewSubmissionConfirmed, ReviewSubmissionKind, ReviewSubmissionPlan,
     ReviewSubmissionRegistration, finalize_review_round,
 )
-from ..domain.review_workflow import ObservedPullRequest
+from ..domain.review_workflow import ObservedPullRequest, PullRequestState, RecordedPullRequest, ReviewWorkflowSnapshot
 from ..domain.review_evidence import ReviewEvidenceKind
 from ..domain.review_return import ReviewRuntimePreflightStop
-from ..domain.review_workflow_policy import review_owed
+from ..domain.review_workflow_policy import (
+    OBSERVATION_MAX_AGE_SECONDS, CeilingProductivityDecision, review_owed,
+)
 from ..domain.review_rearm import ReleaseStatus
 from ..domain.workflow_identity import (
     IssueRef, WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowWriter, validate_workflow_identifier,
@@ -43,6 +45,8 @@ from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
     REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE, REVIEW_PREPARATION_NAMESPACE,
+    REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_STALE_PRODUCTIVITY_NAMESPACE,
+    REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
     REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
     REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
     WorkflowAuthorityError, WorkflowRevisionConflict,
@@ -315,8 +319,6 @@ class SQLiteReviewExecutionControl:
             )
             if not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)):
                 raise WorkflowAuthorityError("review preparation requires its bounded schedule")
-            if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
-                raise WorkflowAuthorityError("productive review requires joint rejection settlement")
             receipt = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
                 (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, round_id),
@@ -326,6 +328,21 @@ class SQLiteReviewExecutionControl:
                         or row["outcome_json"] != encode_workflow(result.outcome)
                         or receipt is None or receipt["payload_json"] != encode_workflow((facts, result.outcome))):
                     raise WorkflowAuthorityError("review round replay changed its sealed outcome")
+                return result
+            if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+                confirmed = tuple(item.plan.command_id for item in facts.submissions
+                                  if isinstance(item.result, ReviewSubmissionConfirmed))
+                if len(confirmed) != 1:
+                    raise WorkflowAuthorityError("productive review lacks one confirmed submission")
+                recorded = db.execute(
+                    "SELECT 1 FROM dedupe_keys WHERE namespace='review-recorded-submission' "
+                    "AND scope=? AND key=?", (self._writer.repository, confirmed[0]),
+                ).fetchone() is not None
+                stale = plan.round.binding.rejection.fence.generation < snapshot.revision.fence.generation
+                if not recorded and not stale:
+                    raise WorkflowAuthorityError("productive review requires joint rejection settlement")
+                self._settle_productive_in_tx(db, confirmed[0], snapshot, stale=not recorded)
+                load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
                 return result
             if receipt is not None or row["closure_json"] is not None:
                 raise WorkflowAuthorityError("review round has an orphaned outcome receipt")
@@ -347,21 +364,10 @@ class SQLiteReviewExecutionControl:
                     (REVIEW_PREPARATION_NAMESPACE, self._writer.repository, round_id,
                      _stamp(self._control.now()), encode_workflow((facts, result.failures))),
                 )
-            execution = snapshot.execution
-            rows = db.execute(
-                "SELECT outcome_json FROM review_execution_rounds WHERE repository=? AND target_number=? "
-                "AND execution_epoch=? AND execution_episode=? AND sequence>? "
-                "AND outcome_json IS NOT NULL ORDER BY sequence",
-                (self._writer.repository, plan.round.binding.rejection.fence.key.target.number,
-                 execution.binding.execution_epoch, execution.binding.execution_episode,
-                 execution.checkpoint.through_sequence),
-            ).fetchall()
-            outcomes = tuple(decode_workflow(item["outcome_json"], ReviewRoundOutcome) for item in rows)
-            projected = project_review_execution(execution.checkpoint, outcomes)
             after = replace(
                 snapshot,
                 revision=WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1),
-                execution=replace(execution, state=projected.state),
+                execution=self._project_outcomes(db, snapshot, plan),
             )
             persist_workflow_snapshot(db, after)
             self._control._transition(db, "review_round", round_id, "outcome_finalized", {
@@ -381,6 +387,140 @@ class SQLiteReviewExecutionControl:
                         "settled_generation": snapshot.revision.fence.generation,
                     })
             return result
+
+    def _project_outcomes(
+        self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot, plan: ReviewRoundPlan,
+    ) -> ActivatedReviewExecution:
+        execution = snapshot.execution
+        assert isinstance(execution, ActivatedReviewExecution)
+        rows = db.execute(
+            "SELECT outcome_json FROM review_execution_rounds WHERE repository=? AND target_number=? "
+            "AND execution_epoch=? AND execution_episode=? AND sequence>? "
+            "AND outcome_json IS NOT NULL ORDER BY sequence",
+            (self._writer.repository, plan.round.binding.rejection.fence.key.target.number,
+             execution.binding.execution_epoch, execution.binding.execution_episode,
+             execution.checkpoint.through_sequence),
+        ).fetchall()
+        outcomes = tuple(decode_workflow(item["outcome_json"], ReviewRoundOutcome) for item in rows)
+        projected = project_review_execution(execution.checkpoint, outcomes)
+        return replace(execution, state=projected.state)
+
+    def _settle_productive_in_tx(
+        self, db: sqlite3.Connection, command_id: str, after_rejection: ReviewWorkflowSnapshot,
+        *, stale: bool = False, superseded_evidence_id: str | None = None,
+        ceiling: CeilingProductivityDecision | None = None,
+    ) -> None:
+        """Join a confirmed verdict to its sealed round in the baseline's SQL transaction."""
+        self._control._assert_owner_active(db, self._writer.owner_id)
+        registration = read_review_submission_registration(db, self._writer.repository, command_id)
+        if registration is None:
+            raise WorkflowAuthorityError("active review verdict lacks its originating round")
+        stored = self._round_record(db, registration.round.round_id)
+        if stored is None:
+            raise WorkflowAuthorityError("review verdict lost its originating round")
+        parent_owner, selection, plan, row = stored
+        settled_at = self._control.now()
+        if (plan.round != registration.round or registration.submission not in plan.submissions
+                or not isinstance(after_rejection.execution, ActivatedReviewExecution)
+                or not same_execution_episode(after_rejection.execution.binding, plan.round.binding)
+                or plan.round.binding.rejection.fence.generation > after_rejection.revision.fence.generation
+                or (stale and plan.round.binding.rejection.fence.generation
+                    >= after_rejection.revision.fence.generation)):
+            raise WorkflowAuthorityError("review verdict round disagrees with active execution")
+        if ceiling is not None and (
+            stale or superseded_evidence_id is not None or ceiling.escalation.escalate_cause != "ceiling"
+            or str(ceiling.escalation.submission.command_id) != command_id
+            or ceiling.escalation.submission.binding != plan.round.binding.rejection
+            or plan.round.binding.rejection.fence != after_rejection.revision.fence
+        ):
+            raise WorkflowAuthorityError("ceiling review verdict disagrees with its round binding")
+        if ceiling is not None:
+            evidence = db.execute(
+                "SELECT payload_json FROM workflow_evidence WHERE evidence_id=? AND repository=? "
+                "AND target_kind='pr' AND target_number=? AND kind='observation'",
+                (ceiling.observation_evidence_id, self._writer.repository,
+                 plan.round.binding.rejection.fence.key.target.number),
+            ).fetchone()
+            if evidence is None:
+                raise WorkflowAuthorityError("ceiling review verdict lacks its fresh observation")
+            observed = decode_workflow(evidence["payload_json"], RecordedPullRequest)
+            age = (settled_at - observed.observation.observed_at).total_seconds()
+            if not 0 <= age <= OBSERVATION_MAX_AGE_SECONDS:
+                raise WorkflowAuthorityError("ceiling review observation expired before settlement")
+        if superseded_evidence_id is not None:
+            evidence = db.execute(
+                "SELECT payload_json FROM workflow_evidence WHERE evidence_id=? AND repository=? "
+                "AND target_kind='pr' AND target_number=? AND kind='observation'",
+                (superseded_evidence_id, self._writer.repository,
+                 plan.round.binding.rejection.fence.key.target.number),
+            ).fetchone()
+            if (stale or plan.round.binding.rejection.fence != after_rejection.revision.fence
+                    or evidence is None):
+                raise WorkflowAuthorityError("superseded review verdict lacks current observation authority")
+            observed = decode_workflow(evidence["payload_json"], RecordedPullRequest)
+            observation_age = (settled_at - observed.observation.observed_at).total_seconds()
+            if (observed.observation.key != after_rejection.revision.fence.key
+                    or (observed.observation.head_sha == plan.head_sha
+                        and observed.observation.state is PullRequestState.OPEN)
+                    or not 0 <= observation_age <= OBSERVATION_MAX_AGE_SECONDS):
+                raise WorkflowAuthorityError("review verdict was not superseded by a changed pull request")
+        if row["outcome_json"] is not None or row["closure_json"] is not None:
+            raise WorkflowAuthorityError("review verdict round already has an outcome")
+        planning = decode_workflow(
+            row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+        )
+        facts = read_review_round_sources(
+            db, self._writer.repository, parent_owner, selection, plan, planning,
+            after_rejection.revision,
+        )
+        result = finalize_review_round(facts)
+        if (not isinstance(result, FinalizedReviewRound)
+                or not isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or not any(submission.plan.command_id == command_id
+                           and isinstance(submission.result, ReviewSubmissionConfirmed)
+                           for submission in facts.submissions)):
+            raise WorkflowAuthorityError("review verdict has no sealed, settled productive round")
+        changed = db.execute(
+            "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
+            "WHERE round_id=? AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
+            (encode_workflow(facts), encode_workflow(result.outcome),
+             plan.round.round_id, row["planning_json"]),
+        ).rowcount
+        if changed != 1:
+            raise WorkflowAuthorityError("review verdict round changed during settlement")
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+            (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, plan.round.round_id,
+             _stamp(settled_at), encode_workflow((facts, result.outcome))),
+        )
+        if stale:
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
+                 _stamp(settled_at), encode_workflow((facts, result.outcome))),
+            )
+        if superseded_evidence_id is not None:
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
+                 _stamp(settled_at),
+                 encode_workflow((superseded_evidence_id, after_rejection.revision,
+                                  settled_at.isoformat()))),
+            )
+        if ceiling is not None:
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
+                 _stamp(settled_at), encode_workflow((ceiling, after_rejection.revision,
+                                                    settled_at.isoformat()))),
+            )
+        persist_workflow_snapshot(db, replace(
+            after_rejection, execution=self._project_outcomes(db, after_rejection, plan),
+        ))
+        self._control._transition(db, "review_round", plan.round.round_id, "outcome_finalized", {
+            "disposition": type(result.outcome.disposition).__name__,
+            "sequence": plan.round.sequence,
+        })
 
     def _runtime_preparation_error(
         self, db: sqlite3.Connection, plan: ReviewRoundPlan, result: DeferredReviewPreparation,

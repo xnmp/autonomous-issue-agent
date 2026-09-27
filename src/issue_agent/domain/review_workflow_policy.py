@@ -342,6 +342,32 @@ class CeilingEscalation:
             raise ValueError("escalation requires the counting rule its verdict used")
 
 
+@dataclass(frozen=True)
+class CeilingProductivityDecision:
+    escalation: CeilingEscalation
+    prior: ReviewWorkflowSnapshot
+    observation_evidence_id: str
+    decided_at: datetime
+    configured_rule: CountingRule
+    configured_ceiling: int
+    trigger_label: Label
+    executor_identity: str
+    refusal: WorkflowRejected | None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.escalation, CeilingEscalation) or not isinstance(self.prior, ReviewWorkflowSnapshot):
+            raise ValueError("ceiling settlement requires a bound escalation and prior workflow")
+        validate_workflow_identifier(self.observation_evidence_id, "ceiling observation")
+        _aware(self.decided_at)
+        if not isinstance(self.configured_rule, CountingRule):
+            raise ValueError("ceiling settlement requires its captured counting rule")
+        _ceiling_value(self.configured_ceiling)
+        if not isinstance(self.trigger_label, Label) or not isinstance(self.executor_identity, str) or not self.executor_identity:
+            raise ValueError("ceiling settlement requires its trigger and executor")
+        if self.refusal is not None and not isinstance(self.refusal, WorkflowRejected):
+            raise ValueError("ceiling settlement refusal must be typed")
+
+
 def _evidence(required: tuple[str, ...], extra: object) -> tuple[str, ...]:
     """Required evidence first; idempotent when re-applied to its own output."""
     if not isinstance(extra, tuple):

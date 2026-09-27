@@ -41,6 +41,10 @@ from ..domain.review_evidence import (
     EvidenceSchedule, ReviewEvidenceKind, evidence_due, evidence_gate_id, review_evidence_gate_kind,
     unavailable_evidence, unavailable_first_observation,
 )
+from ..domain.review_execution import ActivatedReviewExecution
+from ..domain.review_rounds import (
+    FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed,
+)
 from ..domain.review_rejection import CountingRule, ReviewProjectionRefused, ReviewRejectionCeiling
 from ..domain.review_workflow import (
     CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, ObservedPullRequest, PendingReviewRearm,
@@ -49,7 +53,8 @@ from ..domain.review_workflow import (
 )
 from ..domain.review_workflow_policy import (
     ESCALATION_PROJECTION_PREFIX, OBSERVATION_MAX_AGE_SECONDS, CeilingEscalation, EscalationHoldPresent,
-    EscalationMoot, EscalationProjectionExhausted, EscalationReprojected, HoldContested, RestoreHold, ReviewDispatch,
+    CeilingProductivityDecision, EscalationMoot, EscalationProjectionExhausted, EscalationReprojected,
+    HoldContested, RestoreHold, ReviewDispatch,
     ReviewSubmissionReceipt, ReviewTransitionFacts, cancel_review_rearm, ceiling_hold_restoration,
     continue_review_rearm, escalation_projection_identity, initial_review_workflow, is_review_escalation_projection,
     open_review_ceiling, reconcile_review_ceiling, record_escalated_review, record_review, replan_escalation_hold,
@@ -92,7 +97,8 @@ from .workflow_commit import (
 )
 from .workflow_rows import (
     WorkflowAuthorityError, active_families, load_family_authority, load_review_workflow_row, load_workflow_read,
-    persist_workflow_snapshot, workflow_run_scope_bounds, workflow_scope,
+    persist_workflow_snapshot, read_review_submission_registration, workflow_run_scope_bounds, workflow_scope,
+    REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
     insert_workflow_component, encode_workflow_episodes,
 )
 
@@ -888,6 +894,19 @@ class SQLiteReviewWorkflowControl:
             raise WorkflowAuthorityError(f"review proposal refused: {exc}") from exc
         self._validate_receipts(db, prior, transition, facts)
         self._persist(db, prior, transition, encoded)
+        if (transition.mutation is WorkflowMutation.RECORD_REVIEW
+                and isinstance(prior.execution, ActivatedReviewExecution)):
+            # The confirmed verdict is the reset boundary. A later settled
+            # marker cannot repair a crash between baseline and round writes.
+            from .review_execution_control import SQLiteReviewExecutionControl
+
+            SQLiteReviewExecutionControl(self._control, self._writer, self._gateway)._settle_productive_in_tx(
+                db, self._recorded_submission(transition), transition.snapshot,
+            )
+        if transition.mutation is WorkflowMutation.RECORD_REVIEW:
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       (_RECORDED_REVIEW_NAMESPACE, self._writer.repository, self._recorded_submission(transition),
+                        self._now().isoformat(), encode_workflow(transition.snapshot.revision)))
         committed = record_commit(db, self._control, self._writer.repository, transition, encoded)
         # Retiring an uncertain older-generation command opens its gate in this
         # transaction: the caller receives the stored row, never a stale one.
@@ -1205,10 +1224,6 @@ class SQLiteReviewWorkflowControl:
             for command_id in intent.retired_obligations:
                 retire_rearm_obligation(db, intent, str(command_id))
                 self._retire_obligation(db, prior, after, str(command_id), retirement_id)
-        if transition.mutation is WorkflowMutation.RECORD_REVIEW:
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                       (_RECORDED_REVIEW_NAMESPACE, self._writer.repository, self._recorded_submission(transition),
-                        self._now().isoformat(), encode_workflow(after.revision)))
 
     def _retire_stale_generation(
         self, db: sqlite3.Connection, prior: ReviewWorkflowSnapshot, after: ReviewWorkflowSnapshot,
@@ -1308,17 +1323,56 @@ class SQLiteReviewWorkflowControl:
             return WorkflowRejected(WorkflowRejection.INVALID_SCOPE,
                                     "a rejection ceiling opens only on a verified ceiling escalation receipt")
         key = self._scope(bound.submission.binding.fence.key)
+        with closing(self._control._connect()) as db:
+            db.execute("BEGIN")
+            current = load_review_workflow_row(db, key)
+            if current is not None and isinstance(current.execution, ActivatedReviewExecution):
+                registration = read_review_submission_registration(db, self._writer.repository, str(escalation))
+                if registration is None:
+                    raise WorkflowAuthorityError("active ceiling escalation lacks its originating round")
+                receipt = db.execute(
+                    "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                    (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, self._writer.repository,
+                     registration.round.round_id),
+                ).fetchone()
+                if receipt is not None:
+                    recorded = decode_workflow(receipt["payload_json"], tuple)
+                    if (len(recorded) != 3 or not isinstance(recorded[0], CeilingProductivityDecision)
+                            or recorded[0].escalation != bound):
+                        raise WorkflowAuthorityError("ceiling escalation replay disagrees with its round")
+                    return (recorded[0].refusal if recorded[0].refusal is not None
+                            else WorkflowCommitted(current, idempotent=True))
         recorded = self._observe(key)
         with self._control.transaction() as db:
             prior = self._load(db, key)
             if isinstance(recorded, PullRequestUnavailable):
                 return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, recorded.reason)
+            decided_at = self._now()
             proposal = open_review_ceiling(
-                prior, recorded.observation, now=self._now(), rule=self._rule, ceiling=self._ceiling,
+                prior, recorded.observation, now=decided_at, rule=self._rule, ceiling=self._ceiling,
                 escalation=bound, trigger_label=self._trigger, executor_identity=self._writer.owner_id,
                 evidence_ids=(self._evidence_id(recorded),),
             )
-            return self._apply(db, prior, key, recorded, proposal)
+            result = self._apply(db, prior, key, recorded, proposal)
+            if (isinstance(prior.execution, ActivatedReviewExecution)
+                    and not isinstance(result, WorkflowConflict)
+                    and not (isinstance(result, WorkflowRejected)
+                             and result.code is WorkflowRejection.OBSERVATION_UNAVAILABLE)):
+                from .review_execution_control import SQLiteReviewExecutionControl
+
+                evidence_id = self._insert_evidence(db, key, recorded)
+                decision = CeilingProductivityDecision(
+                    bound, prior, evidence_id, decided_at, self._rule, self._ceiling,
+                    self._trigger, self._writer.owner_id,
+                    result if isinstance(result, WorkflowRejected) else None,
+                )
+                SQLiteReviewExecutionControl(self._control, self._writer, self._gateway)._settle_productive_in_tx(
+                    db, str(escalation), self._load(db, key), ceiling=decision,
+                )
+                settled = self._load(db, key)
+                if isinstance(result, WorkflowCommitted):
+                    return WorkflowCommitted(settled)
+            return result
 
     def reconcile_ceiling(self, key: WorkflowKey) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected:
         """Refresh or release this episode's ceiling from a fresh complete read (under the barriers).
@@ -2140,17 +2194,149 @@ class SQLiteReviewWorkflowControl:
             return None
         key = self._scope(bound.submission.binding.fence.key)
         result: WorkflowCommitted | WorkflowConflict | WorkflowRejected
+        stale_submission = False
         if isinstance(bound, ReviewSubmissionReceipt):
-            result = self.record_review(submission)
+            stale_round_id: str | None = None
+            active_round_id: str | None = None
+            superseded_finalized = False
+            planning: ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned = ReviewPlanningOpen()
+            with closing(self._control._connect()) as db:
+                db.execute("BEGIN")
+                current = load_review_workflow_row(db, key)
+                if current is not None and isinstance(current.execution, ActivatedReviewExecution):
+                    registration = read_review_submission_registration(db, self._writer.repository, str(submission))
+                    if registration is None:
+                        raise WorkflowAuthorityError("active review verdict lacks its originating round")
+                    planning_row = db.execute(
+                        "SELECT planning_json FROM review_execution_rounds WHERE round_id=?",
+                        (registration.round.round_id,),
+                    ).fetchone()
+                    if planning_row is None:
+                        raise WorkflowAuthorityError("active review verdict lost its originating round")
+                    active_round_id = registration.round.round_id
+                    superseded_finalized = db.execute(
+                        "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                        (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, self._writer.repository, active_round_id),
+                    ).fetchone() is not None
+                    planning = decode_workflow(
+                        planning_row["planning_json"], ReviewParentAbandoned | ReviewPlanningSealed
+                        | ReviewPlanningOpen,
+                    )
+                    if isinstance(planning, ReviewPlanningOpen):
+                        return None
+                    stale_submission = (
+                        bound.submission.binding.fence.generation < current.revision.fence.generation
+                    )
+                    if stale_submission:
+                        stale_round_id = registration.round.round_id
+            if stale_round_id is not None:
+                from .review_execution_control import SQLiteReviewExecutionControl
+
+                execution = SQLiteReviewExecutionControl(self._control, self._writer, self._gateway)
+                finalized = (
+                    execution.finalize_completed_round(stale_round_id)
+                    if isinstance(planning, ReviewPlanningSealed)
+                    else execution.finalize_abandoned_round(stale_round_id)
+                )
+                if not isinstance(finalized, FinalizedReviewRound):
+                    return None
+                result = WorkflowRejected(WorkflowRejection.INVALID_SCOPE,
+                                          "older-generation review verdict has no baseline authority")
+            elif superseded_finalized:
+                result = WorkflowRejected(WorkflowRejection.INVALID_SCOPE,
+                                          "superseded review verdict has no baseline authority")
+            else:
+                result = self.record_review(submission)
+            if (active_round_id is not None and not stale_submission and not superseded_finalized
+                    and isinstance(result, WorkflowRejected)):
+                if result.code is not WorkflowRejection.INVALID_SCOPE or not bound.escalated:
+                    return result
+                observed = self._observe(key)
+                if isinstance(observed, PullRequestUnavailable):
+                    self.record_evidence(key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
+                                         error=observed.reason)
+                    return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, observed.reason)
+                age = (self._now() - observed.observation.observed_at).total_seconds()
+                if not 0 <= age <= OBSERVATION_MAX_AGE_SECONDS:
+                    self.record_evidence(key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
+                                         error="supersession observation expired before settlement")
+                    return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE,
+                                            "supersession observation expired before settlement")
+                if (observed.observation.head_sha == bound.head_sha
+                        and observed.observation.state is PullRequestState.OPEN):
+                    return result
+                from .review_execution_control import SQLiteReviewExecutionControl
+
+                with self._control.transaction() as db:
+                    current = self._load(db, key)
+                    evidence_id = self._insert_evidence(db, key, observed)
+                    SQLiteReviewExecutionControl(self._control, self._writer, self._gateway)._settle_productive_in_tx(
+                        db, str(submission), current, superseded_evidence_id=evidence_id,
+                    )
         else:
-            result = self.open_ceiling(submission)
+            stale_round_id: str | None = None
+            ceiling_replay: CeilingProductivityDecision | None = None
+            planning: ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned = ReviewPlanningOpen()
+            with closing(self._control._connect()) as db:
+                db.execute("BEGIN")
+                current = load_review_workflow_row(db, key)
+                if current is not None and isinstance(current.execution, ActivatedReviewExecution):
+                    registration = read_review_submission_registration(db, self._writer.repository, str(submission))
+                    if registration is None:
+                        raise WorkflowAuthorityError("active ceiling escalation lacks its originating round")
+                    planning_row = db.execute(
+                        "SELECT planning_json FROM review_execution_rounds WHERE round_id=?",
+                        (registration.round.round_id,),
+                    ).fetchone()
+                    if planning_row is None:
+                        raise WorkflowAuthorityError("active ceiling escalation lost its originating round")
+                    planning = decode_workflow(
+                        planning_row["planning_json"], ReviewParentAbandoned | ReviewPlanningSealed
+                        | ReviewPlanningOpen,
+                    )
+                    if isinstance(planning, ReviewPlanningOpen):
+                        return None
+                    receipt = db.execute(
+                        "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                        (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, self._writer.repository,
+                         registration.round.round_id),
+                    ).fetchone()
+                    if receipt is not None:
+                        captured = decode_workflow(receipt["payload_json"], tuple)
+                        if (len(captured) != 3 or not isinstance(captured[0], CeilingProductivityDecision)
+                                or captured[0].escalation != bound):
+                            raise WorkflowAuthorityError("ceiling escalation replay disagrees with its round")
+                        ceiling_replay = captured[0]
+                    stale_submission = (
+                        bound.submission.binding.fence.generation < current.revision.fence.generation
+                    )
+                    if stale_submission and ceiling_replay is None:
+                        stale_round_id = registration.round.round_id
+            if ceiling_replay is not None:
+                result = (ceiling_replay.refusal if ceiling_replay.refusal is not None
+                          else WorkflowCommitted(current, idempotent=True))
+            elif stale_round_id is not None:
+                from .review_execution_control import SQLiteReviewExecutionControl
+
+                execution = SQLiteReviewExecutionControl(self._control, self._writer, self._gateway)
+                finalized = (
+                    execution.finalize_completed_round(stale_round_id)
+                    if isinstance(planning, ReviewPlanningSealed)
+                    else execution.finalize_abandoned_round(stale_round_id)
+                )
+                if not isinstance(finalized, FinalizedReviewRound):
+                    return None
+                result = WorkflowRejected(WorkflowRejection.INVALID_SCOPE,
+                                          "older-generation ceiling escalation has no gate authority")
+            else:
+                result = self.open_ceiling(submission)
         if isinstance(result, WorkflowRejected) and result.code is WorkflowRejection.OBSERVATION_UNAVAILABLE:
             self.record_evidence(key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
                                  error=result.reason or "pull request read unavailable")
             return result  # retried by a later reconciliation pass on its schedule
         if isinstance(result, WorkflowConflict):
             return result  # retried by the next reconciliation pass
-        if self._reads_review_history(bound):
+        if self._reads_review_history(bound) and not stale_submission:
             self.record_evidence(key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY, error=None)
         outcome = ("applied" if isinstance(result, WorkflowCommitted) and not result.idempotent
                    else "unchanged" if isinstance(result, WorkflowCommitted)
@@ -2198,10 +2384,24 @@ class SQLiteReviewWorkflowControl:
                 with closing(self._control._connect()) as db:
                     db.execute("BEGIN")
                     bound = load_bound_review_submission(db, CommandId(row["command_id"]))
-                if bound is not None and self._reads_review_history(bound) and not self.evidence_due(
-                    bound.submission.binding.fence.key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
-                ):
-                    continue
+                if bound is not None and self._reads_review_history(bound):
+                    with closing(self._control._connect()) as db:
+                        db.execute("BEGIN")
+                        snapshot = load_review_workflow_row(db, bound.submission.binding.fence.key)
+                        registration = read_review_submission_registration(
+                            db, self._writer.repository, row["command_id"],
+                        )
+                        finalized_productivity = registration is not None and db.execute(
+                            "SELECT 1 FROM dedupe_keys WHERE namespace IN (?, ?) AND scope=? AND key=?",
+                            (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, REVIEW_CEILING_PRODUCTIVITY_NAMESPACE,
+                             self._writer.repository, registration.round.round_id),
+                        ).fetchone() is not None
+                    stale = (snapshot is not None
+                             and bound.submission.binding.fence.generation < snapshot.revision.fence.generation)
+                    if not stale and not finalized_productivity and not self.evidence_due(
+                        bound.submission.binding.fence.key, bound.head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
+                    ):
+                        continue
                 result = self.settle_submission(CommandId(row["command_id"]))
             except (WorkflowAuthorityError, ControlStoreError, KeyError) as exc:
                 with self._control.transaction() as db:

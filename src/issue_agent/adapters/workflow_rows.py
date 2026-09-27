@@ -6,15 +6,17 @@ import hashlib
 import sqlite3
 import json
 from dataclasses import replace
+from datetime import datetime
 from typing import TypeVar
 
 from ..domain.resolve_workspace import EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
 from ..domain.review_workflow import (
-    AnyWorkflowSnapshot, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, ReviewEpisode,
+    AnyWorkflowSnapshot, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, PullRequestState,
+    RecordedPullRequest, ReviewEpisode,
     ReviewFamilyEpisodes, ReviewRearmIntent, ReviewWorkflowSnapshot, SupersededReviewRearm,
 )
 from ..domain.review_execution import (
-    MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, ExecutionNotActivated,
+    MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
     ReviewExecutionCheckpoint, ReviewRoundOutcome, project_review_execution,
 )
 from ..domain.review_rounds import (
@@ -22,13 +24,17 @@ from ..domain.review_rounds import (
     ReviewSealedParentAbandoned,
     MAX_REVIEW_STAGES, MAX_ROUND_SUBMISSIONS, ReviewPlanningComplete, ReviewPlanningOpen,
     ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
-    ReviewSubmissionRegistration,
+    ReviewSubmissionConfirmed, ReviewSubmissionRegistration,
     finalize_review_round,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
+from ..domain.review_workflow_policy import (
+    OBSERVATION_MAX_AGE_SECONDS, CeilingProductivityDecision, open_review_ceiling,
+)
 from ..domain.workflow import (
     CancelledRearm, CompletedRearm, OpenGate, PendingRearm, RearmIntent, RearmingGate,
-    ResolveEpisode, SupersededRearm, WorkflowAbsent, WorkflowMigrationRequired, WorkflowSnapshot,
+    ResolveEpisode, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowMigrationRequired,
+    WorkflowRejected, WorkflowSnapshot, WorkflowUnchanged,
 )
 from ..domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence,
@@ -55,6 +61,10 @@ REVIEW_SUBMISSION_NAMESPACE = "review-round-submission"
 REVIEW_SUBMISSION_INDEX_NAMESPACE = "review-round-submission-index"
 REVIEW_OUTCOME_NAMESPACE = "review-round-outcome"
 REVIEW_PREPARATION_NAMESPACE = "review-round-preparation"
+REVIEW_STALE_PRODUCTIVITY_NAMESPACE = "review-round-stale-productivity"
+REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE = "review-round-superseded-productivity"
+REVIEW_CEILING_PRODUCTIVITY_NAMESPACE = "review-round-ceiling-productivity"
+RECORDED_REVIEW_NAMESPACE = "review-recorded-submission"
 
 
 def review_submission_receipt_prefix(round_id: str) -> str:
@@ -606,6 +616,127 @@ def _check_execution_projection(
         outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
         if facts.plan != plan or facts.planning != planning or outcome != result.outcome:
             raise WorkflowAuthorityError("review round outcome disagrees with verified closure facts")
+        if isinstance(outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+            confirmed = tuple(item.plan.command_id for item in facts.submissions
+                              if isinstance(item.result, ReviewSubmissionConfirmed))
+            if len(confirmed) != 1:
+                raise WorkflowAuthorityError("productive review round lacks one confirmed submission")
+            baseline = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (RECORDED_REVIEW_NAMESPACE, scope[0], confirmed[0]),
+            ).fetchone()
+            stale = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
+            ).fetchone()
+            superseded = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
+            ).fetchone()
+            ceiling = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
+            ).fetchone()
+            if sum(item is not None for item in (baseline, stale, superseded, ceiling)) != 1:
+                raise WorkflowAuthorityError("productive review round lacks one settlement authority")
+            if baseline is not None:
+                recorded_revision = decode_workflow(baseline["payload_json"], WorkflowRevision)
+                if (recorded_revision.fence != plan.round.binding.rejection.fence
+                        or (recorded_revision.fence == revision.fence
+                            and recorded_revision.version > revision.version)):
+                    raise WorkflowAuthorityError("productive review round baseline receipt disagrees with its generation")
+            elif stale is not None and (decode_workflow(stale["payload_json"], tuple) != (facts, outcome)
+                  or plan.round.binding.rejection.fence.generation >= revision.fence.generation):
+                raise WorkflowAuthorityError("stale productive review round lacks its exact retirement")
+            elif superseded is not None:
+                supersession = decode_workflow(superseded["payload_json"], tuple)
+                if (len(supersession) != 3 or not isinstance(supersession[0], str)
+                        or not isinstance(supersession[1], WorkflowRevision)
+                        or not isinstance(supersession[2], str)):
+                    raise WorkflowAuthorityError("superseded review round receipt is malformed")
+                recorded_id, recorded_revision, settled_stamp = supersession
+                evidence = db.execute(
+                    "SELECT payload_json,kind,repository,target_kind,target_number,command_id FROM workflow_evidence "
+                    "WHERE evidence_id=?", (recorded_id,),
+                ).fetchone()
+                if (evidence is None or evidence["kind"] != "observation" or evidence["command_id"] is not None
+                        or (evidence["repository"], evidence["target_kind"], evidence["target_number"]) != scope
+                        or recorded_id != "pr-observation:" + hashlib.sha256(evidence["payload_json"].encode()).hexdigest()):
+                    raise WorkflowAuthorityError("superseded review round lacks its exact observation")
+                observed = decode_workflow(evidence["payload_json"], RecordedPullRequest)
+                settled_at = datetime.fromisoformat(settled_stamp)
+                if settled_at.tzinfo is None or settled_at.utcoffset() is None:
+                    raise WorkflowAuthorityError("superseded review round settlement time is not aware")
+                observation_age = (settled_at - observed.observation.observed_at).total_seconds()
+                if (observed.observation.key != revision.fence.key
+                        or (observed.observation.head_sha == plan.head_sha
+                            and observed.observation.state is PullRequestState.OPEN)
+                        or not 0 <= observation_age <= OBSERVATION_MAX_AGE_SECONDS
+                        or recorded_revision.fence != plan.round.binding.rejection.fence
+                        or (recorded_revision.fence == revision.fence
+                            and recorded_revision.version > revision.version)):
+                    raise WorkflowAuthorityError("superseded review round observation disagrees with its head")
+            elif ceiling is not None:
+                record = decode_workflow(ceiling["payload_json"], tuple)
+                if (len(record) != 3 or not isinstance(record[0], CeilingProductivityDecision)
+                        or not isinstance(record[1], WorkflowRevision)
+                        or not isinstance(record[2], str)):
+                    raise WorkflowAuthorityError("ceiling review round receipt is malformed")
+                decision, recorded_revision, settled_stamp = record
+                if (decision.escalation.escalate_cause != "ceiling"
+                        or str(decision.escalation.submission.command_id) != confirmed[0]
+                        or decision.escalation.submission.binding != plan.round.binding.rejection
+                        or decision.prior.revision.fence != plan.round.binding.rejection.fence
+                        or record[1].fence != plan.round.binding.rejection.fence
+                        or (recorded_revision.fence == revision.fence
+                            and recorded_revision.version > revision.version)):
+                    raise WorkflowAuthorityError("ceiling review round lacks its bound escalation")
+                evidence = db.execute(
+                    "SELECT payload_json,kind,repository,target_kind,target_number,command_id FROM workflow_evidence "
+                    "WHERE evidence_id=?", (decision.observation_evidence_id,),
+                ).fetchone()
+                if (evidence is None or evidence["kind"] != "observation" or evidence["command_id"] is not None
+                        or (evidence["repository"], evidence["target_kind"], evidence["target_number"]) != scope
+                        or decision.observation_evidence_id != "pr-observation:" + hashlib.sha256(
+                            evidence["payload_json"].encode()).hexdigest()):
+                    raise WorkflowAuthorityError("ceiling review round lacks its exact observation")
+                observed = decode_workflow(evidence["payload_json"], RecordedPullRequest)
+                settled_at = datetime.fromisoformat(settled_stamp)
+                if settled_at.tzinfo is None or settled_at.utcoffset() is None:
+                    raise WorkflowAuthorityError("ceiling review round settlement time is not aware")
+                if (observed.observation.key != revision.fence.key
+                        or not 0 <= (decision.decided_at - observed.observation.observed_at).total_seconds()
+                        <= OBSERVATION_MAX_AGE_SECONDS
+                        or not 0 <= (settled_at - observed.observation.observed_at).total_seconds()
+                        <= OBSERVATION_MAX_AGE_SECONDS):
+                    raise WorkflowAuthorityError("ceiling review round observation expired")
+                replayed = open_review_ceiling(
+                    decision.prior, observed.observation, now=decision.decided_at,
+                    rule=decision.configured_rule, ceiling=decision.configured_ceiling,
+                    escalation=decision.escalation, trigger_label=decision.trigger_label,
+                    executor_identity=decision.executor_identity,
+                    evidence_ids=(decision.observation_evidence_id,),
+                )
+                if (isinstance(replayed, WorkflowRejected)
+                        and (replayed != decision.refusal or recorded_revision != decision.prior.revision)):
+                    raise WorkflowAuthorityError("ceiling review refusal disagrees with its observation")
+                if (isinstance(replayed, WorkflowChanged)
+                        and (decision.refusal is not None or recorded_revision != replayed.snapshot.revision)):
+                    raise WorkflowAuthorityError("ceiling review gate disagrees with its observation")
+                if (isinstance(replayed, WorkflowUnchanged)
+                        and (decision.refusal is not None or recorded_revision != decision.prior.revision)):
+                    raise WorkflowAuthorityError("ceiling review replay disagrees with its observation")
+        elif db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
+        ).fetchone() is not None or db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
+        ).fetchone() is not None or db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
+        ).fetchone() is not None:
+            raise WorkflowAuthorityError("nonproductive review round has an unapplied productivity receipt")
         preparation = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
             (REVIEW_PREPARATION_NAMESPACE, scope[0], identity.round_id),

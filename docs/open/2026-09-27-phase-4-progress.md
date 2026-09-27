@@ -6,7 +6,7 @@ Phase 4 follows the [review execution design](2026-09-27-phase-4-review-executio
 [persistence map](2026-09-27-phase-4-persistence-map.md).
 The [post-stage handover](2026-09-27-phase-4-post-stage-handover.md)
 records the next transaction boundary and standing restrictions.
-The latest [post-abandoned-outcomes handover](2026-09-28-phase-4-post-abandoned-outcomes-handover.md)
+The latest [post-productive-settlement handover](2026-09-28-phase-4-post-productive-settlement-handover.md)
 records the current boundary and remaining work.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
@@ -686,8 +686,8 @@ reads stay bounded. Its performance remains an activation gate.
   and paid verdicts use atomic registration; terminalize fenced abandoned
   rounds from complete evidence before execution activation.
 - Compact the ordered execution prefix with a source-backed checkpoint receipt,
-  then settle productive submissions jointly with the rejection baseline,
-  recover real multi-child execution, and capture free copied verdicts.
+  recover real multi-child execution, and capture free copied verdicts through
+  the joint settlement path added in checkpoint 26.
 - Separate verdict-release and execution-ceiling recovery under one aggregate
   intent, preserving rejection allowance and other holds.
 - Complete offline import, shadow, rehearsal and activation; prove inherited
@@ -720,3 +720,32 @@ contracts and both Pyrefly checks. Log:
 `/tmp/phase4-runtime-preparation-full.log` (ephemeral). Other preparation
 kinds (`REVISION_DIFF`, `CONTAINMENT`) still need their own source-specific
 reread paths. No live activation, paid run, migration or push occurred.
+
+## Checkpoint 26 — joint productive review settlement (offline)
+
+Confirmed paid and copied submissions now finalize their source-backed outer
+round and execution projection in the rejection baseline or ceiling-gate
+transaction. The later settled marker cannot leave a committed baseline or
+gate with an open round.
+Open planning waits for a parent seal or abandonment without marking the
+submission settled; a bounded recovery sweep repairs older recorded-baseline
+states with unfinalized rounds. Stale-generation confirmed verdicts finalize as
+audit-only outcomes before their settled marker. A ceiling refused by a fresh
+read still closes its confirmed productive round; the immutable decision
+retains and rechecks that read. A superseded same-generation
+escalated verdict closes under a fresh, immutable head/terminal observation
+without creating a new baseline, and its confirmed productive work resets the
+execution allowance. Canonical reload requires one exact authority receipt per
+productive outcome and checks the supersession observation's age against the
+settlement timestamp. A crash between outcome and marker replays inertly.
+
+Behavioral adapter tests cover paid and copied outcomes, ceiling opening and
+refusal, rollback, historical repair, stale generation, open planning,
+supersession and expired observations. Independent Sol review found and
+verified fixes for the split state, stale outcome, supersession, ceiling
+decision replay and timestamp boundaries. No live activation,
+paid run, migration or push occurred.
+Full `make test` passed: 3,123 domain, 2,826 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten accepted strict xfails remained expected. Log:
+`/tmp/review-productive-final-gate.log` (ephemeral).

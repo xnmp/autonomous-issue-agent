@@ -617,7 +617,10 @@ class ReviewExecutionProjection:
     latest_sequence: int
 
 
-def _same_episode(current: ReviewExecutionBinding, observed: ReviewExecutionBinding) -> bool:
+def same_execution_episode(current: ReviewExecutionBinding, observed: ReviewExecutionBinding) -> bool:
+    """Whether two round bindings belong to one execution episode across generations."""
+    if not isinstance(current, ReviewExecutionBinding) or not isinstance(observed, ReviewExecutionBinding):
+        return False
     return (
         current.execution_epoch == observed.execution_epoch
         and current.execution_episode == observed.execution_episode
@@ -680,7 +683,7 @@ def project_review_execution(
         if not isinstance(outcome, ReviewRoundOutcome):
             raise ValueError("execution suffix contains an invalid outcome")
         identity = outcome.round
-        if not _same_episode(checkpoint.state.binding, identity.binding):
+        if not same_execution_episode(checkpoint.state.binding, identity.binding):
             raise ValueError("execution outcome belongs to another authority or episode")
         if identity.binding.rejection.fence.generation > checkpoint.state.binding.rejection.fence.generation:
             raise ValueError("execution outcome belongs to a future generation")

@@ -65,7 +65,7 @@ _VALUES = (
     w.StandaloneCommand, w.RearmObligation, w.UnconsumedRetryAuthorization,
     w.ConsumedRetryAuthorization, w.ClosedRetryAuthorization, w.ActiveReconciliation, w.ReconciliationOnly,
     w.RetiredUncertainCommand, w.RetiredSettledCommand, w.ResolveAttemptResult,
-    w.AuthorizedOperatorCommand, w.ObservedTransition,
+    w.AuthorizedOperatorCommand, w.ObservedTransition, w.WorkflowRejected,
     # Review-rejection family (ADR 0015 review slice).
     rw.CountedReview, rw.CountingRule, rw.ReviewRejectionCeiling, rw.ReviewRearmPreflight,
     rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ImportedBaseline, rw.ReviewedBaseline,
@@ -76,6 +76,7 @@ _VALUES = (
     rw.ReviewProjectionRefused, rw.RecordedPullRequest,
     # The review daemon's recorded dispatch decision (operator surface).
     rp.ReviewHeld, rp.ReviewOwed, rp.ReviewNotOwed, rp.ReleaseProjectionPending, rp.SubmissionUnresolved,
+    rp.CeilingEscalation, rp.CeilingProductivityDecision,
     rd.ReviewNotAdmitted, rd.ReviewDeferred, rd.ReviewTerminal, rd.ReviewWithheld, rd.ReviewInFlight,
     rd.DecisionBasis, rd.DepartedReadFailure, rd.RecordedReviewDecision,
     rx.ReviewExecutionBinding, rx.ReviewRoundIdentity, rx.ReviewChildIdentity,
@@ -109,7 +110,7 @@ _VALUES = (
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,
-    Label, identity.WorkflowFamily, w.StopReason, w.RetryDisposition, w.RemediationOperation,
+    Label, identity.WorkflowFamily, w.StopReason, w.WorkflowRejection, w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
     rw.SubmittedReviewState, rw.PullRequestState, rp.ReviewKind, rd.DecisionRead, rd.WithheldReason,
     RuntimeName, ReviewMode, rx.ReviewChildKind, rx.ReviewPreparationKind,
