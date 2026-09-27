@@ -5,14 +5,17 @@ import hashlib
 import sqlite3
 
 from ..domain.fix import breaker_key
-from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
+from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
-from ..domain.review_execution import ActivatedReviewExecution
+from ..domain.review_execution import (
+    ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress,
+    ReviewRoundOutcome, project_review_execution,
+)
 from ..domain.review_rounds import (
-    ReviewChildNotAdmitted, ReviewChildPending, ReviewParentAbandoned, ReviewPlanningComplete,
+    FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningComplete,
     ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
-    ReviewSubmissionConfirmed, ReviewSubmissionEvidence, ReviewSubmissionKind, ReviewSubmissionPending,
-    ReviewSubmissionPlan, ReviewSubmissionRefused, ReviewSubmissionRegistration,
+    ReviewRoundAwaitingEvidence, ReviewSubmissionKind, ReviewSubmissionPlan,
+    ReviewSubmissionRegistration, finalize_review_round,
 )
 from ..domain.review_workflow import ObservedPullRequest
 from ..domain.review_workflow_policy import review_owed
@@ -21,8 +24,8 @@ from ..domain.workflow_identity import (
     IssueRef, WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowWriter, validate_workflow_identifier,
 )
 from .control_store import (
-    PendingCommand, SQLiteControlStore, _command_from_row, _command_payload_digest,
-    _indexed_review_child_admission, _json, _parse_stamp, _receipt_digest, _stamp,
+    ControlStoreError, PendingCommand, SQLiteControlStore, _command_from_row, _command_payload_digest,
+    _json, _stamp,
 )
 from .deployment_authority import deployment_role
 from .review_effects import ReviewReads, bound_submission_op, read_pull_request
@@ -31,10 +34,11 @@ from .review_execution_claims import (
     PREFLIGHT_NAMESPACE, load_review_preflight_record, require_review_parent_claim,
 )
 from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
+from .review_round_sources import read_review_round_sources
 from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
-    REVIEW_ABANDONMENT_NAMESPACE, REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
+    REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE, REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
     REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
     WorkflowAuthorityError, WorkflowRevisionConflict,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
@@ -46,18 +50,17 @@ from .workflow_rows import (
 
 
 MAX_ABANDONMENT_SWEEP = 64
+MAX_ABANDONMENT_WAIT_OBSERVATIONS = 8
+MAX_ABANDONMENT_BLOCK_REASONS = 8
 _START_CURSOR = (0, 0, "", 0)
-
-
-def _review_effect_receipt_id(command_id: str, receipt_digest: str) -> str:
-    return "effect-receipt:" + hashlib.sha256(
-        encode_workflow((command_id, receipt_digest)).encode(),
-    ).hexdigest()
+_WAIT_NAMESPACE = "review-round-recovery-wait"
+_BLOCK_NAMESPACE = "review-round-recovery-block"
 
 
 @dataclass(frozen=True)
 class ReviewAbandonmentSweep:
     sealed: tuple[str, ...]
+    finalized: tuple[str, ...]
     blocked: tuple[tuple[str, str], ...]
     has_more: bool
 
@@ -77,8 +80,8 @@ class SQLiteReviewExecutionControl:
         self._gateway = gateway
         self._abandonment_cursor = _START_CURSOR
 
-    def recover_abandoned_planning(self) -> ReviewAbandonmentSweep:
-        """Inspect one indexed page, including sealed gaps, before advancing the cursor."""
+    def recover_abandoned_rounds(self) -> ReviewAbandonmentSweep:
+        """Fence and finalize one indexed page of abandoned outer rounds."""
         with self._control.transaction() as db:
             rows = db.execute(
                 "SELECT rr.round_id,rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence,"
@@ -93,23 +96,144 @@ class SQLiteReviewExecutionControl:
             ).fetchall()
         page = rows[:MAX_ABANDONMENT_SWEEP]
         sealed: list[str] = []
+        finalized: list[str] = []
         blocked: list[tuple[str, str]] = []
         for row in page:
-            if (row["planning_json"] != encode_workflow(ReviewPlanningOpen())
-                    or row["closure_json"] is not None or row["live_claim"] is not None):
+            if row["closure_json"] is not None:
+                reason = "closed review round is missing its outcome"
+                blocked.append((row["round_id"], reason))
+                self._record_recovery_block(row["round_id"], reason)
+                continue
+            round_id = row["round_id"]
+            open_planning = row["planning_json"] == encode_workflow(ReviewPlanningOpen())
+            if open_planning and row["live_claim"] is not None:
                 continue
             try:
-                self.seal_abandoned_planning(row["round_id"])
-            except ValueError as exc:
-                blocked.append((row["round_id"], str(exc)))
-            else:
-                sealed.append(row["round_id"])
+                if not open_planning:
+                    planning = decode_workflow(
+                        row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+                    )
+                    if not isinstance(planning, ReviewParentAbandoned):
+                        continue
+                if open_planning:
+                    self.seal_abandoned_planning(round_id)
+                    sealed.append(round_id)
+                result = self.finalize_abandoned_round(round_id)
+                if isinstance(result, FinalizedReviewRound):
+                    finalized.append(round_id)
+                elif self._recovery_wait_at_ceiling(round_id):
+                    blocked.append((round_id, "round evidence remains pending after bounded recovery observations"))
+            except (ValueError, ControlStoreError) as exc:
+                blocked.append((round_id, str(exc)))
+                self._record_recovery_block(round_id, str(exc))
         self._abandonment_cursor = (
             (page[-1]["target_number"], page[-1]["execution_epoch"],
              page[-1]["execution_episode"], page[-1]["sequence"])
             if len(rows) > MAX_ABANDONMENT_SWEEP else _START_CURSOR
         )
-        return ReviewAbandonmentSweep(tuple(sealed), tuple(blocked), len(rows) > MAX_ABANDONMENT_SWEEP)
+        return ReviewAbandonmentSweep(tuple(sealed), tuple(finalized), tuple(blocked),
+                                      len(rows) > MAX_ABANDONMENT_SWEEP)
+
+    def _recovery_wait_at_ceiling(self, round_id: str) -> bool:
+        with self._control.transaction() as db:
+            row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (_WAIT_NAMESPACE, self._writer.repository, round_id),
+            ).fetchone()
+            if row is None:
+                return False
+            recorded = decode_workflow(row["payload_json"], tuple)
+            if (len(recorded) != 4 or not isinstance(recorded[0], str)
+                    or not isinstance(recorded[1], tuple)
+                    or any(not isinstance(reason, str) for reason in recorded[1])
+                    or not isinstance(recorded[2], str)
+                    or type(recorded[3]) is not int
+                    or not 1 <= recorded[3] <= MAX_ABANDONMENT_WAIT_OBSERVATIONS):
+                raise WorkflowAuthorityError("review recovery wait observation is malformed")
+            return recorded[3] == MAX_ABANDONMENT_WAIT_OBSERVATIONS
+
+    def _record_recovery_block(self, round_id: str, reason: str) -> None:
+        with self._control.transaction() as db:
+            row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (_BLOCK_NAMESPACE, self._writer.repository, round_id),
+            ).fetchone()
+            seen = decode_workflow(row["payload_json"], tuple) if row is not None else ()
+            if (not isinstance(seen, tuple) or len(seen) > MAX_ABANDONMENT_BLOCK_REASONS
+                    or any(not isinstance(item, str) or len(item) != 64 for item in seen)):
+                raise WorkflowAuthorityError("review recovery block observation is malformed")
+            digest = hashlib.sha256(reason.encode()).hexdigest()
+            if digest in seen or len(seen) == MAX_ABANDONMENT_BLOCK_REASONS:
+                return
+            payload = encode_workflow((*seen, digest))
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+                "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,"
+                "payload_json=excluded.payload_json",
+                (_BLOCK_NAMESPACE, self._writer.repository, round_id,
+                 _stamp(self._control.now()), payload),
+            )
+            self._control._transition(db, "review_round", round_id, "recovery_blocked", {
+                "reason": reason[:480],
+            })
+
+    @staticmethod
+    def _pending_progress_digest(db: sqlite3.Connection, facts: ReviewRoundFacts) -> tuple[str, bool]:
+        child_rows = tuple(tuple(row) for row in db.execute(
+            "SELECT r.review_child_id,r.run_id,r.state,r.outcome,r.started_at,r.completed_at,"
+            "b.state,rr.policy,l.run_id,c.provider_receipt_id FROM runs r "
+            "JOIN budget_reservations b USING(run_id) JOIN reservation_recovery rr USING(run_id) "
+            "LEFT JOIN leases l USING(run_id) LEFT JOIN charges c USING(run_id) "
+            "WHERE r.review_round_id=? ORDER BY r.review_child_id",
+            (facts.plan.round.round_id,),
+        ))
+        command_rows = tuple(
+            tuple(row) if row is not None else None
+            for submission in facts.plan.submissions
+            for row in (db.execute(
+                "SELECT c.state,c.attempts,c.attempt_owner,e.status,e.receipt_digest "
+                "FROM lifecycle_commands c LEFT JOIN effect_receipts e USING(command_id) "
+                "WHERE c.command_id=?", (submission.command_id,),
+            ).fetchone(),)
+        )
+        live_child = any(row[2] == "running" and row[8] is not None for row in child_rows)
+        return hashlib.sha256(encode_workflow((child_rows, command_rows)).encode()).hexdigest(), live_child
+
+    def _record_recovery_wait(
+        self, db: sqlite3.Connection, facts: ReviewRoundFacts, waiting: ReviewRoundAwaitingEvidence,
+    ) -> None:
+        round_id = facts.plan.round.round_id
+        reasons = tuple(sorted(reason.value for reason in waiting.reasons))
+        progress, live_child = self._pending_progress_digest(db, facts)
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (_WAIT_NAMESPACE, self._writer.repository, round_id),
+        ).fetchone()
+        prior = decode_workflow(row["payload_json"], tuple) if row is not None else None
+        if prior is not None and (
+            len(prior) != 4 or not isinstance(prior[0], str)
+            or not isinstance(prior[1], tuple)
+            or any(not isinstance(reason, str) for reason in prior[1])
+            or not isinstance(prior[2], str)
+            or type(prior[3]) is not int
+            or not 1 <= prior[3] <= MAX_ABANDONMENT_WAIT_OBSERVATIONS
+        ):
+            raise WorkflowAuthorityError("review recovery wait observation is malformed")
+        same = prior is not None and prior[:3] == (facts.closure_receipt, reasons, progress)
+        attempts = min(prior[3] + 1, MAX_ABANDONMENT_WAIT_OBSERVATIONS) if same and not live_child else 1
+        if same and attempts == prior[3]:
+            return
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
+            "ON CONFLICT(namespace,scope,key) DO UPDATE SET claimed_at=excluded.claimed_at,"
+            "payload_json=excluded.payload_json",
+            (_WAIT_NAMESPACE, self._writer.repository, round_id,
+             _stamp(self._control.now()), encode_workflow((facts.closure_receipt, reasons, progress, attempts))),
+        )
+        if attempts in (1, MAX_ABANDONMENT_WAIT_OBSERVATIONS):
+            self._control._transition(db, "review_round", round_id, "evidence_wait", {
+                "reasons": reasons, "observations": attempts,
+            })
 
     def read_round_facts(self, round_id: str) -> ReviewRoundFacts:
         """Join one round's source receipts under a single SQLite snapshot."""
@@ -125,83 +249,85 @@ class SQLiteReviewExecutionControl:
         planning = decode_workflow(
             row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
         )
-        verified_review_completed_seal(
-            db, self._writer.repository, parent_owner,
-            selection.claim_occurrence_id, plan, planning,
-        )
-        verified_review_parent_abandonment(
-            db, self._writer.repository, parent_owner,
-            selection.claim_occurrence_id, selection.claim_target, plan, planning,
-        )
-        if (isinstance(planning, ReviewPlanningSealed)
-                and not isinstance(planning.conclusion, ReviewPlanningComplete)):
-            raise WorkflowAuthorityError("review planning conclusion lacks a source-backed writer")
         snapshot = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
         if snapshot is None:
             raise WorkflowAuthorityError("review round lost its aggregate")
-        require_review_submission_receipts(
-            db, self._writer.repository, plan, selection.claim_occurrence_id, snapshot.revision,
+        return read_review_round_sources(
+            db, self._writer.repository, parent_owner, selection, plan, planning, snapshot.revision,
         )
-        children = self._control._read_review_child_evidence(
-            db, self._writer.repository, parent_owner, round_id,
-        )
-        if isinstance(planning, ReviewParentAbandoned):
-            children = tuple(
-                ReviewChildNotAdmitted(item.child, planning.abandonment_receipt)
-                if isinstance(item, ReviewChildPending) and _indexed_review_child_admission(
-                    db, self._writer.repository, item.child,
-                ) is None else item
-                for item in children
-            )
-        submissions: list[ReviewSubmissionEvidence] = []
-        for submission in plan.submissions:
-            command = db.execute(
-                "SELECT state,attempts,attempt_owner FROM lifecycle_commands WHERE command_id=?",
-                (submission.command_id,),
-            ).fetchone()
+
+    def finalize_abandoned_round(
+        self, round_id: str,
+    ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound:
+        """Settle a nonproductive abandoned round and its execution projection atomically."""
+        validate_workflow_identifier(round_id, "review round")
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._abandonment_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review round lacks its preflight")
+            _, _, plan, row = stored
+            snapshot = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
+            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+                raise WorkflowAuthorityError("review execution workflow is absent or inactive")
+            facts = self._read_round_facts(db, round_id)
+            result = finalize_review_round(facts)
+            if isinstance(result, ReviewRoundAwaitingEvidence):
+                if isinstance(facts.planning, ReviewParentAbandoned):
+                    self._record_recovery_wait(db, facts, result)
+                return result
+            if not isinstance(facts.planning, ReviewParentAbandoned):
+                raise WorkflowAuthorityError("completed planning requires its own outcome settlement path")
+            if not isinstance(result, FinalizedReviewRound):
+                raise WorkflowAuthorityError("abandoned preparation requires its bounded schedule")
+            if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+                raise WorkflowAuthorityError("productive review requires joint rejection settlement")
             receipt = db.execute(
-                "SELECT * FROM effect_receipts WHERE command_id=?",
-                (submission.command_id,),
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, round_id),
             ).fetchone()
-            if command is None:
-                raise WorkflowAuthorityError("planned review submission lost its command")
-            if receipt is not None:
-                try:
-                    source_receipt = EffectReceipt(
-                        CommandId(submission.command_id), receipt["executor_identity"],
-                        _parse_stamp(receipt["started_at"]), _parse_stamp(receipt["completed_at"]),
-                        EffectStatus(receipt["status"]), receipt["remote_object_id"],
-                        receipt["remote_revision"], receipt["error"],
-                    )
-                except (TypeError, ValueError) as exc:
-                    raise WorkflowAuthorityError("review submission effect receipt is malformed") from exc
-                if (command["attempt_owner"] != source_receipt.executor_identity
-                        or _receipt_digest(source_receipt) != receipt["receipt_digest"]):
-                    raise WorkflowAuthorityError("review submission effect receipt changed after settlement")
-            state = command["state"]
-            if state == EffectStatus.SUCCEEDED.value:
-                if (receipt is None or receipt["status"] != state
-                        or not receipt["remote_object_id"] or command["attempts"] < 1):
-                    raise WorkflowAuthorityError("confirmed review submission lacks its effect receipt")
-                result = ReviewSubmissionConfirmed(
-                    _review_effect_receipt_id(submission.command_id, receipt["receipt_digest"]),
-                )
-            elif state == EffectStatus.PERMANENT_FAILURE.value:
-                if (receipt is None or receipt["status"] != state
-                        or receipt["remote_object_id"] is not None or command["attempts"] < 1):
-                    raise WorkflowAuthorityError("refused review submission lacks its effect receipt")
-                result = ReviewSubmissionRefused(
-                    _review_effect_receipt_id(submission.command_id, receipt["receipt_digest"]),
-                )
-            else:
-                if (receipt is not None and receipt["status"] in (
-                        EffectStatus.SUCCEEDED.value, EffectStatus.PERMANENT_FAILURE.value)):
-                    raise WorkflowAuthorityError("pending review submission contradicts its effect receipt")
-                result = ReviewSubmissionPending()
-            submissions.append(ReviewSubmissionEvidence(submission, result))
-        source = (plan, planning, children, tuple(submissions))
-        closure_receipt = "review-round-closure:" + hashlib.sha256(encode_workflow(source).encode()).hexdigest()
-        return ReviewRoundFacts(closure_receipt, plan, planning, children, tuple(submissions))
+            if row["outcome_json"] is not None:
+                if (row["closure_json"] != encode_workflow(facts)
+                        or row["outcome_json"] != encode_workflow(result.outcome)
+                        or receipt is None or receipt["payload_json"] != encode_workflow((facts, result.outcome))):
+                    raise WorkflowAuthorityError("review round replay changed its sealed outcome")
+                return result
+            if receipt is not None or row["closure_json"] is not None:
+                raise WorkflowAuthorityError("review round has an orphaned outcome receipt")
+            changed = db.execute(
+                "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
+                "WHERE round_id=? AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
+                (encode_workflow(facts), encode_workflow(result.outcome), round_id, row["planning_json"]),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("review round changed during finalization")
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, round_id,
+                 _stamp(self._control.now()), encode_workflow((facts, result.outcome))),
+            )
+            execution = snapshot.execution
+            rows = db.execute(
+                "SELECT outcome_json FROM review_execution_rounds WHERE repository=? AND target_number=? "
+                "AND execution_epoch=? AND execution_episode=? AND sequence>? "
+                "AND outcome_json IS NOT NULL ORDER BY sequence",
+                (self._writer.repository, plan.round.binding.rejection.fence.key.target.number,
+                 execution.binding.execution_epoch, execution.binding.execution_episode,
+                 execution.checkpoint.through_sequence),
+            ).fetchall()
+            outcomes = tuple(decode_workflow(item["outcome_json"], ReviewRoundOutcome) for item in rows)
+            projected = project_review_execution(execution.checkpoint, outcomes)
+            after = replace(
+                snapshot,
+                revision=WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1),
+                execution=replace(execution, state=projected.state),
+            )
+            persist_workflow_snapshot(db, after)
+            self._control._transition(db, "review_round", round_id, "outcome_finalized", {
+                "disposition": type(result.outcome.disposition).__name__,
+                "sequence": plan.round.sequence,
+            })
+            return result
 
     def _stored_round(
         self, db: sqlite3.Connection, request_id: str,

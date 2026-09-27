@@ -529,7 +529,8 @@ pull request retains its lever subject to fresh acceptance reads).
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
 `adapters/review_execution_claims.py` (exact parent claim and lifecycle receipt validation),
-`adapters/review_execution_control.py` (unpaid review-round preflight under exact claim authority),
+`adapters/review_execution_control.py` (review-round preflight, source-backed registration and abandoned-round recovery),
+`adapters/review_round_sources.py` (transaction-local reconstruction of child, planning and submission receipts),
 `adapters/review_workflow_control.py` (the review owner's generation-fenced
 commit boundary: store-minted facts, barrier-ordered acceptance, bounded
 re-arm reconciliation and the ceiling-release projection fact),

@@ -52,6 +52,7 @@ REVIEW_SEAL_NAMESPACE = "review-round-seal"
 REVIEW_ABANDONMENT_NAMESPACE = "review-round-abandonment"
 REVIEW_SUBMISSION_NAMESPACE = "review-round-submission"
 REVIEW_SUBMISSION_INDEX_NAMESPACE = "review-round-submission-index"
+REVIEW_OUTCOME_NAMESPACE = "review-round-outcome"
 
 
 def review_submission_receipt_prefix(round_id: str) -> str:
@@ -539,6 +540,7 @@ def _check_execution_projection(
             (REVIEW_ABANDONMENT_NAMESPACE, scope[0], identity.round_id),
         ).fetchone() is not None:
             raise WorkflowAuthorityError("review planning has a contradictory abandonment fence")
+        preflight = None
         if isinstance(planning, ReviewParentAbandoned):
             preflight_row = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-preflight' "
@@ -572,6 +574,22 @@ def _check_execution_projection(
         outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
         if facts.plan != plan or facts.planning != planning or outcome != result.outcome:
             raise WorkflowAuthorityError("review round outcome disagrees with verified closure facts")
+        if isinstance(planning, ReviewParentAbandoned):
+            # This source-backed path is shared with the abandonment writer.
+            from .review_round_sources import read_review_round_sources
+
+            assert preflight is not None
+            source = read_review_round_sources(
+                db, scope[0], preflight[1], preflight[0], plan, planning, revision,
+            )
+            receipt = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_OUTCOME_NAMESPACE, scope[0], identity.round_id),
+            ).fetchone()
+            if source != facts or receipt is None or decode_workflow(
+                receipt["payload_json"], tuple,
+            ) != (facts, outcome):
+                raise WorkflowAuthorityError("abandoned review outcome disagrees with durable source receipt")
         outcomes.append(outcome)
     if expected_sequence != execution.last_sequence + 1:
         raise WorkflowAuthorityError("review execution round suffix has a gap")

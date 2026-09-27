@@ -6,7 +6,7 @@ Phase 4 follows the [review execution design](2026-09-27-phase-4-review-executio
 [persistence map](2026-09-27-phase-4-persistence-map.md).
 The [post-stage handover](2026-09-27-phase-4-post-stage-handover.md)
 records the next transaction boundary and standing restrictions.
-The latest [post-facts handover](2026-09-27-phase-4-post-facts-handover.md)
+The latest [post-abandoned-outcomes handover](2026-09-28-phase-4-post-abandoned-outcomes-handover.md)
 records the current boundary and remaining work.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
@@ -546,18 +546,56 @@ hooks, governor, parity, four import contracts and both Pyrefly checks. Log:
 `/tmp/phase4-round-facts-final-full.log` (ephemeral). No live activation,
 target mutation, service restart or paid harness run occurred.
 
+## Checkpoint 20 — source-backed abandoned-round outcomes (offline)
+
+`SQLiteReviewExecutionControl.finalize_abandoned_round` now rereads the parent
+fence, canonical child evidence and registered submission effect receipts in
+one transaction. A terminal nonproductive result writes closure facts, the
+purely derived outer outcome, an immutable round-outcome receipt and the
+execution state under one aggregate revision. Exact replay is inert. Pending
+children or submissions remain open. Productive submissions and preparation
+deferrals fail closed until their joint settlement and bounded preparation
+schedule exist. The canonical loader reconstructs sources for every finalized
+abandoned round retained in the suffix, and refuses changed closure or outcome
+receipts. Child evidence reconstruction is now transaction-local and shared
+between this writer and canonical reads.
+
+The composed review recovery sweeps up to 64 indexed open rows, fences newly
+abandoned planning, then finalizes both new and previously fenced abandoned
+rounds. A crash between those transactions leaves a valid fence for the next
+pass. Unchanged pending facts and run/command progress are recorded with a
+durable observation count capped at eight; a live leased child does not
+advance the count. The ceiling is reported without repeated writes. Distinct
+blocked reasons have a capped durable journal.
+Tests cover empty and planned unadmitted abandonment, refused copy commands
+and child admission, pending submission, out-of-order closure, exact replay,
+source corruption, transaction rollback, recovery pagination, composed daemon
+recovery, bounded waits and changed command progress. Independent Sol review
+identified the recovery caller and terminal classification gaps, then the
+observation fingerprint and block-journal gaps; all four were corrected.
+
+The execution prefix is deliberately not compacted by this writer: keeping
+abandoned outcomes in the bounded suffix allows every canonical read to
+reconstruct their sources. This costs increasing read work and caps the
+uncompacted episode at the existing 4,096-round limit. Prefix compaction and
+its source-backed receipt need a separate scale/performance acceptance before
+activation. Final `make test` passed: 3,121 domain, 2,788 adapter and 2,864
+app tests, plus hooks, governor, parity, four import contracts and both
+Pyrefly checks. Log: `/tmp/phase4-abandoned-outcomes-final-full.log`
+(ephemeral). No live activation, target mutation, service restart or paid
+harness run occurred.
+
 ## Required subsequent work
 
-- Seal outer outcomes and finalize them from receipt-backed child evidence,
-  including parent/claim abandonment, released-before-launch and
-  settled-without-launch outcomes. Preserve actual accounting and bound unpaid
-  preparation faults through evidence holds.
+- Finalize completed-planning rounds and source-backed abandoned rounds with
+  preparation failures. Preserve actual accounting and bind preparation faults
+  to bounded evidence holds before committing their outer outcomes.
 - Pass an execution round through the production review workflow so copied
   and paid verdicts use atomic registration; terminalize fenced abandoned
   rounds from complete evidence before execution activation.
-- Project finalized rounds transactionally over the canonical v25 component;
-  settle productive submissions, recover real multi-child execution, and
-  capture free copied verdicts.
+- Compact the ordered execution prefix with a source-backed checkpoint receipt,
+  then settle productive submissions jointly with the rejection baseline,
+  recover real multi-child execution, and capture free copied verdicts.
 - Separate verdict-release and execution-ceiling recovery under one aggregate
   intent, preserving rejection allowance and other holds.
 - Complete offline import, shadow, rehearsal and activation; prove inherited

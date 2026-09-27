@@ -5144,8 +5144,9 @@ class SQLiteControlStore:
         with self.transaction() as db:
             return self._read_review_child_evidence(db, repository, owner_id, round_id)
 
+    @staticmethod
     def _read_review_child_evidence(
-        self, db: sqlite3.Connection, repository: str, owner_id: str, round_id: str,
+        db: sqlite3.Connection, repository: str, owner_id: str, round_id: str,
     ) -> tuple[ReviewChildEvidence, ...]:
         stored = load_review_preflight_record(db, repository, owner_id, round_id)
         if stored is None:
@@ -5203,7 +5204,7 @@ class SQLiteControlStore:
                     or indexed.claim_occurrence_id != selection.claim_occurrence_id
                     or indexed.owner_id != owner_id or not revision_recorded(indexed.admitted_revision)):
                 raise ControlStoreError("review child admission disagrees with its round")
-            admission = self._load_review_launch_admission(db, RunId(indexed.run_id), repository, run)
+            admission = SQLiteControlStore._load_review_launch_admission(db, RunId(indexed.run_id), repository, run)
             if admission != indexed:
                 raise ControlStoreError("review child admission changed during evidence read")
             release_row = db.execute(
@@ -5254,7 +5255,7 @@ class SQLiteControlStore:
                     evidence.append(ReviewChildPending(child))
                     continue
                 returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
-                if self._review_return_authority(db, returned) != (repository, True):
+                if SQLiteControlStore._review_return_authority(db, returned) != (repository, True):
                     raise ControlStoreError("review stop return disagrees with its admission")
                 charge = db.execute(
                     "SELECT provider_receipt_id,amount_micros,currency,basis,usage_json,"
@@ -5291,7 +5292,7 @@ class SQLiteControlStore:
                     raise ControlStoreError("review child launch disagrees with its admitted run")
                 if return_row is not None:
                     returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
-                    if self._review_return_authority(db, returned) != (repository, True):
+                    if SQLiteControlStore._review_return_authority(db, returned) != (repository, True):
                         raise ControlStoreError("review child return disagrees with its guarded launch")
                     charge = db.execute(
                         "SELECT provider_receipt_id,amount_micros,currency,basis FROM charges WHERE run_id=?",
@@ -5334,8 +5335,9 @@ class SQLiteControlStore:
             evidence.append(ReviewChildPending(child))
         return tuple(evidence)
 
+    @staticmethod
     def _review_return_authority(
-        self, db: sqlite3.Connection, returned: ReturnedReviewChild,
+        db: sqlite3.Connection, returned: ReturnedReviewChild,
     ) -> tuple[str, bool]:
         row = db.execute(
             "SELECT r.*,b.workload_repository,l.run_id AS leased, "
@@ -5350,7 +5352,7 @@ class SQLiteControlStore:
         if row is None or row["review_round_id"] is None:
             raise ControlStoreError("review return lacks its attached paid run")
         repository = row["workload_repository"]
-        admission = self._load_review_launch_admission(
+        admission = SQLiteControlStore._load_review_launch_admission(
             db, RunId(returned.run_id), repository, row,
         )
         if (returned.child != admission.child or returned.owner_id != admission.owner_id

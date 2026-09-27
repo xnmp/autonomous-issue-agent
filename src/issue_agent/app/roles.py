@@ -3439,15 +3439,17 @@ def compose_review_daemon(
         def reconcile_review(trigger: RecoveryTrigger) -> RecoveryReport:
             nonlocal blocked_reported_at
             report = base_reconcile(trigger)
-            sweep = execution_recovery.recover_abandoned_planning()
+            sweep = execution_recovery.recover_abandoned_rounds()
             if sweep.sealed:
                 say(f"review recovery: fenced {len(sweep.sealed)} abandoned parent round(s)")
+            if sweep.finalized:
+                say(f"review recovery: finalized {len(sweep.finalized)} abandoned parent round(s)")
             if sweep.blocked:
                 now = datetime.now(timezone.utc)
                 if blocked_reported_at is None or now - blocked_reported_at >= timedelta(minutes=15):
                     blocked_reported_at = now
                     detail = "; ".join(f"{round_id}: {reason}" for round_id, reason in sweep.blocked[:3])
-                    say(f"review recovery: {len(sweep.blocked)} parent round(s) could not be fenced: {detail}")
+                    say(f"review recovery: {len(sweep.blocked)} parent round(s) could not be recovered: {detail}")
             return report
 
         recovery = _RecoveryHooks(reconcile_review)

@@ -58,10 +58,11 @@ def test_exact_released_parent_seals_empty_round_and_fences_late_stage(rig):
 def test_recovery_sweep_fences_only_exact_terminal_parent_occurrences(rig):
     store, _, _, selection, control = rig
     plan = control.preflight(selection)
-    assert control.recover_abandoned_planning().sealed == ()
+    assert control.recover_abandoned_rounds().sealed == ()
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    sweep = control.recover_abandoned_planning()
+    sweep = control.recover_abandoned_rounds()
     assert sweep.sealed == (plan.round.round_id,)
+    assert sweep.finalized == (plan.round.round_id,)
     assert sweep.blocked == () and not sweep.has_more
     with store.transaction() as db:
         planning = db.execute(
@@ -69,7 +70,7 @@ def test_recovery_sweep_fences_only_exact_terminal_parent_occurrences(rig):
             (plan.round.round_id,),
         ).fetchone()[0]
     assert isinstance(decode_workflow(planning, ReviewParentAbandoned), ReviewParentAbandoned)
-    assert control.recover_abandoned_planning().sealed == ()
+    assert control.recover_abandoned_rounds().sealed == ()
 
 
 def test_recovery_sweep_reports_missing_terminal_receipt_without_forging_abandonment(rig):
@@ -78,11 +79,41 @@ def test_recovery_sweep_reports_missing_terminal_receipt_without_forging_abandon
     with store.transaction() as db:
         db.execute("DELETE FROM dispatch_claims WHERE occurrence_id=?", (selection.claim_occurrence_id,))
     before = dump(store)
-    sweep = control.recover_abandoned_planning()
+    sweep = control.recover_abandoned_rounds()
     assert sweep.sealed == ()
     assert sweep.blocked[0][0] == plan.round.round_id
     assert "terminal claim receipt" in sweep.blocked[0][1]
-    assert dump(store) == before
+    assert dump(store) != before
+    with store.transaction() as db:
+        row = db.execute("SELECT planning_json,outcome_json FROM review_execution_rounds WHERE round_id=?",
+                         (plan.round.round_id,)).fetchone()
+        assert row["outcome_json"] is None
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-round-recovery-block'").fetchone()[0] == 1
+
+
+def test_recovery_block_journal_deduplicates_alternating_faults(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    key = f"{selection.claim_occurrence_id}:released"
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='dispatch-claim-lifecycle' AND key=?", (key,))
+    first = control.recover_abandoned_rounds().blocked
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+            ("dispatch-claim-lifecycle", "o/r", key, store.now().isoformat(), "{}"),
+        )
+    second = control.recover_abandoned_rounds().blocked
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='dispatch-claim-lifecycle' AND key=?", (key,))
+    assert control.recover_abandoned_rounds().blocked == first
+    assert first != second and first[0][0] == plan.round.round_id
+    with store.transaction() as db:
+        payload = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-recovery-block'",
+        ).fetchone()[0]
+    assert len(decode_workflow(payload, tuple)) == 2
 
 
 def test_recovery_sweep_pages_open_rounds_without_reprocessing_earlier_ones(rig, monkeypatch):
@@ -96,11 +127,13 @@ def test_recovery_sweep_pages_open_rounds_without_reprocessing_earlier_ones(rig,
                                  expected=current(store, selection).revision)
         round_ids.append(control.preflight(next_selection).round.round_id)
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
-    first = control.recover_abandoned_planning()
-    second = control.recover_abandoned_planning()
+    first = control.recover_abandoned_rounds()
+    second = control.recover_abandoned_rounds()
     assert first.sealed == tuple(round_ids[:2]) and first.has_more
+    assert first.finalized == tuple(round_ids[:2])
     assert second.sealed == (round_ids[2],) and not second.has_more
-    assert control.recover_abandoned_planning().sealed == ()
+    assert second.finalized == (round_ids[2],)
+    assert control.recover_abandoned_rounds().sealed == ()
 
 
 def test_recovery_sweep_bounds_a_backlog_of_fenced_but_unfinalized_rounds(rig, monkeypatch):
@@ -116,12 +149,15 @@ def test_recovery_sweep_bounds_a_backlog_of_fenced_but_unfinalized_rounds(rig, m
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     for round_id in round_ids[:4]:
         control.seal_abandoned_planning(round_id)
-    first = control.recover_abandoned_planning()
-    second = control.recover_abandoned_planning()
-    third = control.recover_abandoned_planning()
+    first = control.recover_abandoned_rounds()
+    second = control.recover_abandoned_rounds()
+    third = control.recover_abandoned_rounds()
     assert first.sealed == second.sealed == ()
+    assert first.finalized == tuple(round_ids[:2])
+    assert second.finalized == tuple(round_ids[2:4])
     assert first.has_more and second.has_more
     assert third.sealed == (round_ids[4],) and not third.has_more
+    assert third.finalized == (round_ids[4],)
 
 
 def test_replaced_claim_does_not_reopen_old_occurrence(rig):

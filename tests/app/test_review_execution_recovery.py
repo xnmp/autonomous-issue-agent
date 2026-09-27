@@ -1,4 +1,4 @@
-"""The composed review daemon fences an abandoned execution round during recovery."""
+"""The composed review daemon finalizes an abandoned execution round during recovery."""
 
 from issue_agent.adapters.review_effects import read_pull_request
 from issue_agent.adapters.review_execution_control import SQLiteReviewExecutionControl
@@ -68,5 +68,6 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
                          (plan.round.round_id,)).fetchone()
     abandoned = decode_workflow(row["planning_json"], ReviewParentAbandoned)
     assert abandoned.abandonment_receipt.endswith(":released")
-    assert row["closure_json"] is None and row["outcome_json"] is None
+    assert row["closure_json"] is not None and row["outcome_json"] is not None
     assert any("fenced 1 abandoned parent round" in line for line in composed.log)
+    assert any("finalized 1 abandoned parent round" in line for line in composed.log)
