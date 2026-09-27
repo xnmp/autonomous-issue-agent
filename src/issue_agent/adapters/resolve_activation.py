@@ -33,6 +33,7 @@ from .deployment_authority import deployment_effect_barrier
 from .workflow_codec import encode_workflow
 from .workflow_rows import (
     WorkflowAuthorityError, family_run_scope_bounds, family_target_kind, persist_workflow_snapshot, workflow_scope,
+    insert_workflow_component,
 )
 
 _LEGACY_NAME = re.compile(r"issue-(.*)\.(" + "|".join(re.escape(s) for s in LEGACY_SUFFIXES) + r")", re.DOTALL)
@@ -326,6 +327,7 @@ class SQLiteResolveActivation:
                 (*scope, initial.revision.fence.generation, initial.revision.version,
                  encode_workflow((initial.authority, initial.episode))),
             )
+            insert_workflow_component(db, initial.revision.fence.key, initial.authority, initial.episode.episode_id)
             after = imported_workflow(plan, target)
             if bool(after.gates) != target.held:
                 raise ResolveActivationRefused(f"issue #{target.issue}: import decision disagrees with the ceiling policy")

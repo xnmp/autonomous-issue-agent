@@ -615,6 +615,8 @@ def test_changed_binding_during_barrier_acquisition_refuses_before_gateway(envir
             with store.transaction() as db:
                 db.execute("UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='issue' AND target_number=1",
                            (encode_workflow((changed.authority, changed.episode)),))
+                db.execute("UPDATE workflow_components SET episode_id=? WHERE repository='o/r' AND target_kind='issue' AND target_number=1 AND family='resolve'",
+                           (changed.episode.episode_id,))
             yield
     monkeypatch.setattr(workflow.control, "_rearm_barriers", advance_at_acquisition)
     monkeypatch.setattr(gateway, "get_issue", lambda *a: pytest.fail("stale binding fetched GitHub"))

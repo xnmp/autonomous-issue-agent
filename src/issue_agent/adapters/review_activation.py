@@ -34,7 +34,7 @@ from .resolve_activation import (
     LegacyAbsent, LegacyFile, LegacyRoots, _printable, _read_legacy_file, distinct_roots, family_inventory,
 )
 from .workflow_codec import encode_workflow
-from .workflow_rows import WorkflowAuthorityError, persist_workflow_snapshot, workflow_scope
+from .workflow_rows import WorkflowAuthorityError, persist_workflow_snapshot, workflow_scope, insert_workflow_component, encode_workflow_episodes
 
 LEGACY_REVIEW_NAME = re.compile(r"pr-(.*)\.(" + "|".join(re.escape(s) for s in LEGACY_SUFFIXES) + r")", re.DOTALL)
 _PR_NUMBER = re.compile(r"[1-9][0-9]{0,18}")
@@ -283,8 +283,9 @@ class SQLiteReviewActivation:
             db.execute(
                 "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?)",
                 (*scope, snapshot.revision.fence.generation, snapshot.revision.version,
-                 encode_workflow((snapshot.authority, snapshot.episode))),
+                 encode_workflow_episodes(snapshot)),
             )
+            insert_workflow_component(db, snapshot.revision.fence.key, snapshot.authority, snapshot.episode.episode_id)
             if snapshot.gates:
                 persist_workflow_snapshot(db, snapshot)
                 held += 1

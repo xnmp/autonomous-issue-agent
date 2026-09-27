@@ -17,6 +17,8 @@ from ..domain.review_workflow import (
     AnyWorkflowSnapshot, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, ReviewRearmIntent,
     SupersededReviewRearm,
 )
+from ..domain.review_execution import ExecutionNotActivated
+from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.workflow import (
     AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, OpenGate, PendingRearm, RearmIntent, RearmObligation, RearmingGate, RequestRearm,
@@ -73,7 +75,36 @@ def transition_receipt(proposal: WorkflowChanged) -> str:
 
 def same_receipt(raw: str, proposal: WorkflowChanged, encoded: str) -> bool:
     if not isinstance(proposal.audit, AuthorizedOperatorCommand):
-        return raw == encoded
+        if raw == encoded:
+            return True
+        # A v24 review observation embedded the five-field snapshot tag.
+        # Preserve its immutable receipt while accepting the identical current
+        # proposal with an explicitly inactive execution component.
+        if not isinstance(proposal.snapshot, ReviewWorkflowSnapshot) or not isinstance(proposal.snapshot.execution, ExecutionNotActivated):
+            return False
+        try:
+            accepted = json.loads(raw, object_pairs_hook=_unique_receipt_object)
+            current = json.loads(encoded, object_pairs_hook=_unique_receipt_object)
+            required = {"mutation", "expected", "snapshot", "audit", "commands"}
+            if not isinstance(accepted, dict) or not isinstance(current, dict) or set(accepted) != required or set(current) != required:
+                return False
+            if any(accepted[key] != current[key] for key in required - {"snapshot"}):
+                return False
+            old_snapshot = accepted["snapshot"]
+            if not isinstance(old_snapshot, str):
+                return False
+            envelope = json.loads(old_snapshot, object_pairs_hook=_unique_receipt_object)
+            if not isinstance(envelope, dict) or set(envelope) != {"format", "value"} or type(envelope["format"]) is not int or envelope["format"] != 1:
+                return False
+            value = envelope["value"]
+            if not isinstance(value, dict) or value.get("type") != "ReviewWorkflowSnapshot":
+                return False
+            normalized = current["snapshot"]
+            if not isinstance(normalized, str):
+                return False
+            return decode_workflow(old_snapshot, ReviewWorkflowSnapshot) == decode_workflow(normalized, ReviewWorkflowSnapshot)
+        except (ValueError, TypeError):
+            return False
     try:
         accepted = json.loads(raw)
         if not isinstance(accepted, dict):
@@ -89,6 +120,15 @@ def same_receipt(raw: str, proposal: WorkflowChanged, encoded: str) -> bool:
     # refreshed observations, channel provenance and regenerated plans do not
     # authorize a second write or replace the original accepted audit.
     return audit.actor.subject == proposal.audit.actor.subject and audit.command == proposal.audit.command
+
+
+def _unique_receipt_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate accepted workflow receipt field")
+        result[key] = value
+    return result
 
 
 def transition_dedupe_key(proposal: WorkflowChanged) -> tuple[str, str]:

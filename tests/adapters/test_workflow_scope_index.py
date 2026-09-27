@@ -160,23 +160,10 @@ def test_quiescence_ignores_unrelated_and_terminal_publication_history_in_bounde
 
 
 def _downgrade_to_v20(control):
+    # Isolated historical fixture construction, never a supported rollback.
+    from tests.adapters.test_control_store import _historical_fixture
     with control.transaction() as db:
-        db.execute("DROP INDEX effect_receipts_remote_object")
-        db.execute("ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json")
-        db.execute("DROP TRIGGER workflow_retry_grant_insert")
-        db.execute("DROP TRIGGER workflow_retry_grant_update")
-        db.execute("DROP INDEX workflow_retry_open_grant")
-        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition")
-        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN disposed_at")
-        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition_reason")
-        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN accepted_at")
-        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN first_visit_at")
-        db.execute("ALTER TABLE workflow_retry_authorizations DROP COLUMN unavailable_reads")
-        db.execute("DROP TABLE workflow_activation_evidence")
-        db.execute("DROP TABLE workflow_activation_imports")
-        db.execute("DROP INDEX runs_workflow_scope")
-        db.execute("DROP INDEX lifecycle_publication_runs")
-        db.execute("DELETE FROM schema_migrations WHERE version>=21")
+        _historical_fixture(db, 20)
 
 
 def test_v21_upgrade_preserves_old_target_evidence_and_is_idempotent(control):

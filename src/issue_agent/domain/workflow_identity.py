@@ -77,6 +77,7 @@ class WorkflowKey:
 class WorkflowFamily(str, Enum):
     RESOLVE = "resolve"
     REVIEW_REJECTIONS = "review_rejections"
+    REVIEW_EXECUTION = "review_execution"
 
 
 def target_family(target: WorkflowTarget) -> WorkflowFamily:
@@ -133,8 +134,8 @@ class WorkflowBinding:
             raise ValueError("workflow binding requires a validated fence and authority")
         if self.authority.family is WorkflowFamily.RESOLVE and not isinstance(self.fence.key.target, IssueRef):
             raise ValueError("resolve episodes belong to issues, not pull requests")
-        if self.authority.family is WorkflowFamily.REVIEW_REJECTIONS and not isinstance(self.fence.key.target, PullRequestRef):
-            raise ValueError("review rejection episodes belong to pull requests, not issues")
+        if self.authority.family in (WorkflowFamily.REVIEW_REJECTIONS, WorkflowFamily.REVIEW_EXECUTION) and not isinstance(self.fence.key.target, PullRequestRef):
+            raise ValueError("review episodes belong to pull requests, not issues")
         validate_workflow_identifier(self.episode_id, "workflow episode")
 
 

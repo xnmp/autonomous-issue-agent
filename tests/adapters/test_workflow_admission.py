@@ -174,6 +174,7 @@ def test_new_episode_gets_new_adjudication_allowance_without_deleting_old_runs(c
     with control.transaction() as db:
         db.execute("UPDATE workflows SET generation=generation+1, version=version+1, episode_json=?",
                    (encode_workflow((prior.authority, ResolveEpisode("new-episode"))),))
+        db.execute("UPDATE workflow_components SET episode_id='new-episode' WHERE family='resolve'")
     with control.transaction() as db:
         assert admitted_adjudications(db, snapshot(control).binding) == 0
         assert admitted_adjudications(db, prior.binding) == 1

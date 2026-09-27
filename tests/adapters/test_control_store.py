@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 25))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 26))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -119,6 +119,14 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     # This constructs test fixtures, not a production downgrade: migrations
     # which rewrite rows need their historical inputs seeded by the caller.
     removals = {
+        25: (
+            "DROP TRIGGER runs_review_attachment_insert", "DROP TRIGGER runs_review_attachment_update",
+            "DROP INDEX runs_review_child",
+            "ALTER TABLE runs DROP COLUMN review_child_id", "ALTER TABLE runs DROP COLUMN review_round_id",
+            "DROP TABLE review_execution_rounds", "DROP TABLE workflow_components",
+            "DROP TRIGGER dispatch_claims_occurrence_insert", "DROP TRIGGER dispatch_claims_occurrence_update",
+            "DROP INDEX dispatch_claims_occurrence", "ALTER TABLE dispatch_claims DROP COLUMN occurrence_id",
+        ),
         24: (
             "DROP INDEX effect_receipts_remote_object",
             "ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json",
@@ -168,7 +176,7 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
         11: ("DROP INDEX runs_active_dispatch_unique", "DROP TABLE dispatch_claims"),
         10: ("DROP TABLE run_cancellation_intents",),
     }
-    assert version in {8, 9, 12, 15}
+    assert version == 8 or version in EXPECTED_SCHEMA_VERSIONS
     history = tuple(row[0] for row in db.execute(
         "SELECT version FROM schema_migrations ORDER BY version"
     ))
@@ -459,17 +467,21 @@ def test_v17_recovers_pre_v16_launch_proof(
     assert workload_repository == "o/r"
 
 
-@pytest.mark.parametrize("starting_version", ("fresh", "v8", "v9"))
+@pytest.mark.parametrize("starting_version", ("fresh", "v8", "v9", "v24"))
 def test_concurrent_role_boot_serializes_schema_migrations(
     tmp_path,
     starting_version,
 ):
     path = tmp_path / f"concurrent-{starting_version}.db"
     if starting_version != "fresh":
-        SQLiteControlStore(str(path)).initialize()
-        with sqlite3.connect(path) as db:
-            _historical_fixture(db, int(starting_version[1:]))
-            db.commit()
+        store = SQLiteControlStore(str(path))
+        store.initialize()
+        if starting_version == "v24":
+            _seed_v24_workflow_history(store)
+        else:
+            with sqlite3.connect(path) as db:
+                _historical_fixture(db, int(starting_version[1:]))
+                db.commit()
     context = multiprocessing.get_context("spawn")
     start = context.Event()
     results = context.Queue()
@@ -500,6 +512,9 @@ def test_concurrent_role_boot_serializes_schema_migrations(
             if starting_version == "v8"
             else EXPECTED_SCHEMA_VERSIONS
         )
+        if starting_version == "v24":
+            assert db.execute("SELECT COUNT(*) FROM workflow_components").fetchone()[0] == 2
+            assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 0
 
 
 def test_dispatch_claims_serialize_targets_and_overlapping_paths(
@@ -2835,3 +2850,312 @@ def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
     # Once that run reaches a terminal state nothing keeps the claim alive.
     assert store.release(run_id, "spend_unknown").disposition.value == "available"
     assert store.active_dispatch_claims("o/r", "fix") == ()
+
+
+def _seed_v24_workflow_history(store):
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.domain.review_workflow import ImportedBaseline, ReviewEpisode, ReviewedBaseline
+    from issue_agent.domain.workflow import ResolveEpisode
+    from issue_agent.domain.workflow_identity import FamilyAuthority, WorkflowFamily
+
+    resolve = encode_workflow((FamilyAuthority(WorkflowFamily.RESOLVE, 2),
+                               ResolveEpisode("resolve:legacy", 4, "prior failure", "resolve guidance")))
+    review = encode_workflow((FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 3),
+                              ReviewEpisode("review:legacy", "review guidance\nexact", ReviewedBaseline(
+                                  "a" * 40, "c" * 64, 2, ImportedBaseline("import:review")))))
+    with sqlite3.connect(store.path) as db:
+        _historical_fixture(db, 24)
+        for family, epoch in (("resolve", 2), ("review_rejections", 3)):
+            db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r', ?, ?, 'source', 'inventory', ?)",
+                       (family, epoch, NOW.isoformat()))
+        for kind, number, payload in (("issue", 7, resolve), ("pr", 9, review)):
+            db.execute("INSERT INTO workflows VALUES ('o/r', ?, ?, 2, 11, ?)", (kind, number, payload))
+        db.execute("INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,paths_json,claimed_at) "
+                   "VALUES ('o/r','review','pr:9','REVIEW','legacy-owner',123,456,'[]',?)", (NOW.isoformat(),))
+    return resolve, review
+
+
+def test_v25_backfills_only_validated_legacy_components_and_preserves_claim_occurrence_on_restart(tmp_path):
+    store = _store(tmp_path)
+    resolve, review = _seed_v24_workflow_history(store)
+    reopened = SQLiteControlStore(store.path, now=lambda: NOW)
+    reopened.initialize()
+    with sqlite3.connect(store.path) as db:
+        rows = db.execute("SELECT target_kind,generation,version,episode_json FROM workflows ORDER BY target_kind").fetchall()
+        components = db.execute("SELECT target_kind,target_number,family,epoch,episode_id FROM workflow_components ORDER BY target_kind").fetchall()
+        occurrence = db.execute("SELECT occurrence_id FROM dispatch_claims").fetchone()[0]
+        imported_claim = json.loads(db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='dispatch-claim-lifecycle' AND scope='o/r' AND key=?",
+            (f"{occurrence}:created",),
+        ).fetchone()[0])
+        assert imported_claim == {
+            "role": "review", "target": "pr:9", "leg": "REVIEW", "owner_id": "legacy-owner",
+            "owner_pid": 123, "owner_start_ticks": 456, "claimed_at": NOW.isoformat(), "source": "v24-migration",
+        }
+        assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM workflow_authority_epochs WHERE family='review_execution'").fetchone()[0] == 0
+        before = tuple(db.iterdump())
+    assert rows == [("issue", 2, 11, resolve), ("pr", 2, 11, review)]
+    assert components == [("issue", 7, "resolve", 2, "resolve:legacy"), ("pr", 9, "review_rejections", 3, "review:legacy")]
+    assert isinstance(occurrence, str) and occurrence
+    reopened.initialize()
+    with sqlite3.connect(store.path) as db:
+        assert tuple(db.iterdump()) == before
+        assert db.execute("SELECT occurrence_id FROM dispatch_claims").fetchone()[0] == occurrence
+
+
+@pytest.mark.parametrize("corruption", ["invalid_json", "wrong_target_family", "missing_epoch", "different_epoch"])
+def test_v25_invalid_legacy_authority_rolls_back_schema_and_all_component_backfill(tmp_path, corruption):
+    store = _store(tmp_path)
+    resolve, _ = _seed_v24_workflow_history(store)
+    with sqlite3.connect(store.path) as db:
+        if corruption in {"invalid_json", "wrong_target_family"}:
+            db.execute("UPDATE workflows SET episode_json=? WHERE target_kind='pr'",
+                       ("not valid json" if corruption == "invalid_json" else resolve,))
+        elif corruption == "missing_epoch":
+            db.execute("DELETE FROM workflow_authority_epochs WHERE family='review_rejections'")
+        else:
+            db.execute("UPDATE workflow_authority_epochs SET epoch=4 WHERE family='review_rejections'")
+        before = tuple(db.iterdump())
+    with pytest.raises(IncompatibleSchema, match="historical workflow component"):
+        SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+    with sqlite3.connect(store.path) as db:
+        assert tuple(db.iterdump()) == before
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 24
+        assert not db.execute("SELECT name FROM sqlite_master WHERE name IN ('workflow_components','review_execution_rounds')").fetchall()
+
+
+def test_v25_interrupted_nonempty_backfill_restarts_without_partial_authority(tmp_path):
+    store = _store(tmp_path)
+    _seed_v24_workflow_history(store)
+    with sqlite3.connect(store.path) as db:
+        before = tuple(db.iterdump())
+
+    def interrupt(version, phase):
+        if version == 25 and phase == "before_commit":
+            raise RuntimeError("interrupted v25 backfill")
+
+    with pytest.raises(RuntimeError, match="interrupted v25"):
+        SQLiteControlStore(store.path, now=lambda: NOW, migration_observer=interrupt).initialize()
+    with sqlite3.connect(store.path) as db:
+        assert tuple(db.iterdump()) == before
+    SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+    with sqlite3.connect(store.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM workflow_components").fetchone()[0] == 2
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 25
+
+
+def test_a_v24_binary_refuses_v25_without_rewriting_authority(tmp_path, monkeypatch):
+    import issue_agent.adapters.control_store as control_module
+
+    store = _store(tmp_path)
+    _seed_v24_workflow_history(store)
+    SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+    with sqlite3.connect(store.path) as db:
+        before = tuple(db.iterdump())
+    monkeypatch.setattr(control_module, "SCHEMA_VERSION", 24)
+    with pytest.raises(IncompatibleSchema, match="newer than 24"):
+        SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+    with sqlite3.connect(store.path) as db:
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("kind,number", [("issue", 7), ("pr", 9)])
+@pytest.mark.parametrize("corruption", ["deleted", "epoch", "episode"])
+def test_v25_component_index_corruption_refuses_authoritative_reads_without_repair(tmp_path, kind, number, corruption):
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_workflow_read
+    from issue_agent.domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey
+
+    store = _store(tmp_path)
+    _seed_v24_workflow_history(store)
+    store.initialize()
+    key = WorkflowKey("o/r", IssueRef(number) if kind == "issue" else PullRequestRef(number))
+    with store.transaction() as db:
+        assert load_workflow_read(db, key).episode.episode_id == f"{'resolve' if kind == 'issue' else 'review'}:legacy"
+        if corruption == "deleted":
+            db.execute("DELETE FROM workflow_components WHERE target_kind=?", (kind,))
+        elif corruption == "epoch":
+            db.execute("UPDATE workflow_components SET epoch=99 WHERE target_kind=?", (kind,))
+        else:
+            db.execute("UPDATE workflow_components SET episode_id='other-episode' WHERE target_kind=?", (kind,))
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="component index"):
+            load_workflow_read(db, key)
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("retained", ["index", "activation", "both"])
+def test_v25_inactive_review_cannot_load_with_retained_execution_authority(tmp_path, retained):
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_workflow_read
+    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
+
+    store = _store(tmp_path)
+    _seed_v24_workflow_history(store)
+    store.initialize()
+    with store.transaction() as db:
+        if retained in {"activation", "both"}:
+            db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_execution',5,'source','inventory',?)",
+                       (NOW.isoformat(),))
+        if retained in {"index", "both"}:
+            db.execute("INSERT INTO workflow_components VALUES ('o/r','pr',9,'review_execution',5,'execution:legacy')")
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="execution"):
+            load_workflow_read(db, WorkflowKey("o/r", PullRequestRef(9)))
+        assert tuple(db.iterdump()) == before
+
+
+def _activate_execution_fixture(db):
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    from issue_agent.domain.review_execution import (
+        ActivatedReviewExecution, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionOrigin,
+        ReviewExecutionOriginKind, ReviewExecutionPolicy, ReviewExecutionState,
+    )
+    from issue_agent.domain.review_workflow import ReviewFamilyEpisodes
+    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
+
+    key = WorkflowKey("o/r", PullRequestRef(9))
+    prior = load_review_workflow_row(db, key)
+    assert prior is not None
+    state = ReviewExecutionState(ReviewExecutionBinding(prior.binding, 5, "execution:legacy"), failures=3, pin_deferrals=2)
+    execution = ActivatedReviewExecution(ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "import:execution"),
+                                         ReviewExecutionCheckpoint(0, state, ReviewExecutionPolicy(1)), state, 0)
+    snapshot = dataclasses.replace(prior, execution=execution)
+    db.execute("UPDATE workflows SET episode_json=? WHERE target_kind='pr'",
+               (encode_workflow(ReviewFamilyEpisodes(prior.authority, prior.episode, execution)),))
+    db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_execution',5,'source','inventory',?)",
+               (NOW.isoformat(),))
+    db.execute("INSERT INTO workflow_components VALUES ('o/r','pr',9,'review_execution',5,'execution:legacy')")
+    assert load_review_workflow_row(db, key) == snapshot
+    return snapshot
+
+
+@pytest.mark.parametrize("corruption", ["missing_index", "index_epoch", "index_episode", "missing_activation",
+                                         "activation_epoch", "parent_generation", "missing_index_and_activation"])
+def test_v25_active_execution_requires_matching_canonical_index_and_activation(tmp_path, corruption):
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
+
+    store = _store(tmp_path)
+    _seed_v24_workflow_history(store)
+    store.initialize()
+    with store.transaction() as db:
+        original = _activate_execution_fixture(db)
+        if corruption in {"missing_index", "missing_index_and_activation"}:
+            db.execute("DELETE FROM workflow_components WHERE family='review_execution'")
+        if corruption in {"missing_activation", "missing_index_and_activation"}:
+            db.execute("DELETE FROM workflow_authority_epochs WHERE family='review_execution'")
+        if corruption == "index_epoch":
+            db.execute("UPDATE workflow_components SET epoch=6 WHERE family='review_execution'")
+        elif corruption == "index_episode":
+            db.execute("UPDATE workflow_components SET episode_id='other-execution' WHERE family='review_execution'")
+        elif corruption == "activation_epoch":
+            db.execute("UPDATE workflow_authority_epochs SET epoch=6 WHERE family='review_execution'")
+        elif corruption == "parent_generation":
+            db.execute("UPDATE workflows SET generation=3 WHERE target_kind='pr'")
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError):
+            load_review_workflow_row(db, original.revision.fence.key)
+        assert tuple(db.iterdump()) == before
+
+
+def _claim_rows(store):
+    with sqlite3.connect(store.path) as db:
+        db.row_factory = sqlite3.Row
+        return tuple(dict(row) for row in db.execute("SELECT * FROM dispatch_claims ORDER BY repository,role,target"))
+
+
+def _claim_receipts(store):
+    with sqlite3.connect(store.path) as db:
+        return {key: json.loads(payload) for key, payload in db.execute(
+            "SELECT key,payload_json FROM dedupe_keys WHERE namespace='dispatch-claim-lifecycle' AND scope='o/r'")}
+
+
+def test_dispatch_claim_occurrence_retains_create_and_normal_release_provenance_once(tmp_path):
+    store = _store(tmp_path)
+    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    claim, = _claim_rows(store)
+    occurrence = claim["occurrence_id"]
+    created = _claim_receipts(store)[f"{occurrence}:created"]
+    for field in ("role", "target", "leg", "owner_id", "owner_pid", "owner_start_ticks", "claimed_at"):
+        assert created[field] == claim[field]
+    assert created["source"] == "admission"
+    assert store.active_dispatch_claims("o/r", "fix")[0].claim_key == occurrence
+    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    assert _claim_rows(store) == (claim,)
+    assert len(_claim_receipts(store)) == 1
+    assert store.release_dispatch_claim("o/r", "fix", 42, "owner")
+    assert _claim_rows(store) == ()
+    retained = _claim_receipts(store)
+    released = retained[f"{occurrence}:released"]
+    assert released == {key: created[key] for key in created if key != "source"}
+    assert not store.release_dispatch_claim("o/r", "fix", 42, "owner")
+    assert _claim_receipts(store) == retained
+
+
+def test_stale_dispatch_reclaim_retains_exact_old_occurrence_and_mints_new_one(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    old, = _claim_rows(store)
+    monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(lambda _pid, _ticks: False))
+    assert store.claim_dispatch("o/r", "fix", 42, "RESUME", "successor", frozenset({"file.py"}))
+    new, = _claim_rows(store)
+    assert old["occurrence_id"] != new["occurrence_id"]
+    receipts = _claim_receipts(store)
+    reclaimed = receipts[f"{old['occurrence_id']}:reclaimed"]
+    for field in ("role", "target", "leg", "owner_id", "owner_pid", "owner_start_ticks", "claimed_at"):
+        assert reclaimed[field] == old[field]
+    assert receipts[f"{new['occurrence_id']}:created"]["owner_id"] == "successor"
+    assert len(receipts) == 3
+
+
+def test_same_owner_pid_and_timestamp_replacement_is_not_reclaimed_from_an_old_probe(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+    old, = _claim_rows(store)
+    replacements = []
+
+    def replace_during_probe(pid, start_ticks):
+        assert not replacements
+        assert (pid, start_ticks) == (old["owner_pid"], old["owner_start_ticks"])
+        assert store.release_dispatch_claim("o/r", "fix", 42, "owner")
+        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+        replacements.extend(_claim_rows(store))
+        return False
+
+    monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(replace_during_probe))
+    assert not store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "competitor", frozenset({"file.py"}))
+    replacement, = replacements
+    assert replacement["occurrence_id"] != old["occurrence_id"]
+    assert {key: value for key, value in replacement.items() if key != "occurrence_id"} == {
+        key: value for key, value in old.items() if key != "occurrence_id"}
+    assert _claim_rows(store) == (replacement,)
+    receipts = _claim_receipts(store)
+    assert set(receipts) == {f"{old['occurrence_id']}:created", f"{old['occurrence_id']}:released",
+                             f"{replacement['occurrence_id']}:created"}
+
+
+@pytest.mark.parametrize("event", ["created", "released", "reclaimed"])
+def test_claim_lifecycle_receipt_conflict_rolls_back_its_entire_authority_change(tmp_path, monkeypatch, event):
+    import uuid
+    import issue_agent.adapters.control_store as control_module
+
+    store = _store(tmp_path)
+    if event == "created":
+        identity = uuid.UUID("00000000-0000-0000-0000-000000000001")
+        monkeypatch.setattr(control_module.uuid, "uuid4", lambda: identity)
+        occurrence = identity.hex
+    else:
+        assert store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "owner", frozenset({"file.py"}))
+        occurrence = _claim_rows(store)[0]["occurrence_id"]
+    assert store.receipt("dispatch-claim-lifecycle", "o/r", f"{occurrence}:{event}", {"conflicting": "accepted fact"})
+    with sqlite3.connect(store.path) as db:
+        before = tuple(db.iterdump())
+    if event == "reclaimed":
+        monkeypatch.setattr(ProcessSupervisor, "matches_identity", staticmethod(lambda _pid, _ticks: False))
+    with pytest.raises(sqlite3.IntegrityError):
+        if event == "released":
+            store.release_dispatch_claim("o/r", "fix", 42, "owner")
+        else:
+            store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "successor", frozenset({"file.py"}))
+    with sqlite3.connect(store.path) as db:
+        assert tuple(db.iterdump()) == before

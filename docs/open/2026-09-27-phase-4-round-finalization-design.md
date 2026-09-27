@@ -1,6 +1,7 @@
 # Phase 4 — review round finalization proposal
 
-Date: 2026-09-27. **Proposed next pure-domain checkpoint.** Companion to the
+Date: 2026-09-27. **Pure-domain checkpoint accepted at `10b31e6`; persistence
+integration continues.** Companion to the
 [execution design](2026-09-27-phase-4-review-execution-design.md) and
 [implementation conventions](2026-09-27-phase-4-conventions.md). This document
 does not activate execution authority or authorize a runtime/schema cutover.
@@ -97,9 +98,9 @@ is awaiting evidence rather than one of the final dispositions.
 | All relevant children refused before reservation, with no launch | Admission-refused outcome; no strike. Retain each applicable refusal's evidence. |
 | Relevant reservations proven never launched and released, with no launch | Unlaunched release outcome; no strike. Retain all applicable release evidence. |
 | Verified runtime preflight stopped before spawn, but accounting completed/settled a synthetic result | Distinct no-launch-settled outcome; no strike. Preserve the settled accounting receipt; a provider receipt ID is not launch proof. |
-| Mixed pre-admission refusals, unlaunched releases and verified no-launch-settled results, with no launched child | Non-charging outcome with the complete child evidence set; do not arbitrarily select one child's receipt as proof for every child. Exact value shape remains to be designed. |
+| Mixed pre-admission refusals, unlaunched releases and verified no-launch-settled results, with no launched child | `ReviewUnlaunchedRound` retains the complete child evidence set and charges no strike. |
 | Proven abandoned parent with no paid child, no unresolved submission and no more specific pin/refusal result | Unpaid abandonment; no strike. |
-| Unreadable revision-bound diff or unavailable containment before launch | Bounded evidence/configuration hold through the existing evidence schedule/gate; no fabricated paid failure. Exact typed control/outcome extension remains to be settled. |
+| Unreadable revision-bound diff or unavailable containment before launch | `ReviewPreparationDeferred` retains typed fault evidence without a paid strike. Its bounded control schedule and gate remain to be wired. |
 
 ## Continuation and displayed round
 

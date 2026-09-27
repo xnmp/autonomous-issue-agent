@@ -1,0 +1,23 @@
+{
+  "accepted_proposal": "{\"audit\":\"{\\\"format\\\":1,\\\"value\\\":{\\\"fields\\\":{\\\"evidence_ids\\\":[\\\"submit:review-v24\\\",\\\"github-review:review-v24\\\"]},\\\"type\\\":\\\"ObservedTransition\\\"}}\",\"commands\":[],\"expected\":\"{\\\"format\\\":1,\\\"value\\\":{\\\"fields\\\":{\\\"fence\\\":{\\\"fields\\\":{\\\"generation\\\":2,\\\"key\\\":{\\\"fields\\\":{\\\"repository\\\":\\\"o/r\\\",\\\"target\\\":{\\\"fields\\\":{\\\"number\\\":9},\\\"type\\\":\\\"PullRequestRef\\\"}},\\\"type\\\":\\\"WorkflowKey\\\"}},\\\"type\\\":\\\"WorkflowFence\\\"},\\\"version\\\":7},\\\"type\\\":\\\"WorkflowRevision\\\"}}\",\"mutation\":\"record_review\",\"snapshot\":\"{\\\"format\\\":1,\\\"value\\\":{\\\"fields\\\":{\\\"authority\\\":{\\\"fields\\\":{\\\"epoch\\\":1,\\\"family\\\":{\\\"type\\\":\\\"WorkflowFamily\\\",\\\"value\\\":\\\"review_rejections\\\"}},\\\"type\\\":\\\"FamilyAuthority\\\"},\\\"episode\\\":{\\\"fields\\\":{\\\"continuation\\\":{\\\"fields\\\":{\\\"head_sha\\\":\\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\\"patch_id\\\":\\\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\\\",\\\"reviewed_generation\\\":2,\\\"source\\\":{\\\"fields\\\":{\\\"binding\\\":{\\\"fields\\\":{\\\"authority\\\":{\\\"fields\\\":{\\\"epoch\\\":1,\\\"family\\\":{\\\"type\\\":\\\"WorkflowFamily\\\",\\\"value\\\":\\\"review_rejections\\\"}},\\\"type\\\":\\\"FamilyAuthority\\\"},\\\"episode_id\\\":\\\"review-v24-episode\\\",\\\"fence\\\":{\\\"fields\\\":{\\\"generation\\\":2,\\\"key\\\":{\\\"fields\\\":{\\\"repository\\\":\\\"o/r\\\",\\\"target\\\":{\\\"fields\\\":{\\\"number\\\":9},\\\"type\\\":\\\"PullRequestRef\\\"}},\\\"type\\\":\\\"WorkflowKey\\\"}},\\\"type\\\":\\\"WorkflowFence\\\"}},\\\"type\\\":\\\"WorkflowBinding\\\"},\\\"command_id\\\":\\\"submit:review-v24\\\"},\\\"type\\\":\\\"BoundReviewSubmission\\\"}},\\\"type\\\":\\\"ReviewedBaseline\\\"},\\\"episode_id\\\":\\\"review-v24-episode\\\",\\\"guidance\\\":\\\"Retain exact guidance.\\\\nSecond line.\\\"},\\\"type\\\":\\\"ReviewEpisode\\\"},\\\"gates\\\":[],\\\"intent\\\":null,\\\"revision\\\":{\\\"fields\\\":{\\\"fence\\\":{\\\"fields\\\":{\\\"generation\\\":2,\\\"key\\\":{\\\"fields\\\":{\\\"repository\\\":\\\"o/r\\\",\\\"target\\\":{\\\"fields\\\":{\\\"number\\\":9},\\\"type\\\":\\\"PullRequestRef\\\"}},\\\"type\\\":\\\"WorkflowKey\\\"}},\\\"type\\\":\\\"WorkflowFence\\\"},\\\"version\\\":8},\\\"type\\\":\\\"WorkflowRevision\\\"}},\\\"type\\\":\\\"ReviewWorkflowSnapshot\\\"}}\"}",
+  "accepted_proposal_sha256": "775a94fde94b3ffcb30ad653b8f384a0cf5a90061631ea49a14c40aa05666d7e",
+  "description": "Frozen accepted_proposal bytes from the v24 codec; do not regenerate with the current codec.",
+  "facts": {
+    "command_id": "submit:review-v24",
+    "episode_id": "review-v24-episode",
+    "escalated": false,
+    "generation": 2,
+    "guidance": "Retain exact guidance.\nSecond line.",
+    "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "owed_since_generation": 2,
+    "patch_id": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "pr_number": 9,
+    "receipt_id": "github-review:review-v24",
+    "rejection_epoch": 1,
+    "repository": "o/r",
+    "version": 7
+  },
+  "reconstruction": "Construct prior ReviewWorkflowSnapshot from revision(repository, PullRequestRef(pr_number), generation, version), REVIEW_REJECTIONS authority at rejection_epoch, and ReviewEpisode(episode_id, guidance, FreshReviewRequired(owed_since_generation)); gates=(), intent=None. Construct ReviewSubmissionReceipt(BoundReviewSubmission(CommandId(command_id), prior.binding), head_sha, patch_id, receipt_id, escalated). Call record_review(prior, receipt). The result records ReviewedBaseline, retains generation 2, advances version 7 to 8, and carries ObservedTransition((command_id, receipt_id)) with no commands.",
+  "schema_version": 24,
+  "source_commit": "10b31e6d4d418e1c8dbe44ce143a25e8dd44e5d5"
+}

@@ -5,8 +5,7 @@ from dataclasses import replace
 
 import pytest
 
-from issue_agent.adapters.workflow_codec import encode_workflow
-from issue_agent.adapters.workflow_rows import WorkflowRevisionConflict
+from issue_agent.adapters.workflow_rows import WorkflowRevisionConflict, persist_workflow_snapshot
 from issue_agent.domain.workflow import CancelRearm, CancelledRearm, WorkflowCommitted, WorkflowConflict
 from issue_agent.domain.workflow_identity import IssueRef
 from tests.adapters.test_workflow_control import ACTOR, adapter, commit, control, held, request, resolve_snapshot
@@ -85,8 +84,7 @@ def test_binding_is_checked_after_barrier_acquisition_not_only_before_it(control
     def changed_while_acquiring():
         with barrier():
             with control.transaction() as db:
-                db.execute("UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='issue' AND target_number=1",
-                           (encode_workflow((changed.authority, changed.episode)),))
+                persist_workflow_snapshot(db, changed)
             yield
     monkeypatch.setattr(workflow, "_rearm_barriers", changed_while_acquiring)
     with pytest.raises(WorkflowRevisionConflict):

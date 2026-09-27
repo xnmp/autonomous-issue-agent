@@ -70,7 +70,7 @@ from .workflow_commit import (
 )
 from .workflow_rows import (
     WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict, load_resolve_workflow_row,
-    load_resolve_authority, load_workspace_ack, persist_workflow_snapshot, workflow_scope,
+    load_resolve_authority, load_workspace_ack, persist_workflow_snapshot, workflow_scope, insert_workflow_component,
 )
 
 
@@ -158,6 +158,7 @@ class SQLiteWorkflowControl:
                 "INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
                 (*scope, encode_workflow((authority, snapshot.episode))),
             )
+            insert_workflow_component(db, observation.key, authority, snapshot.episode.episode_id)
             db.execute(
                 "INSERT INTO workflow_evidence VALUES (?, ?, ?, ?, NULL, 'observation', ?)",
                 (snapshot.episode.episode_id, *scope, encode_workflow(observation)),
@@ -1674,4 +1675,3 @@ class SQLiteWorkflowControl:
         self._control._retire_workflow_command(
             db, row, _command_from_row(row), snapshot, retirement_id,
         )
-

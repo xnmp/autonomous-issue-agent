@@ -99,7 +99,7 @@ def test_retained_rows_without_activation_fail_closed_only_for_their_own_family(
         read(store, load_resolve_authority, "o/r")
 
 
-@pytest.mark.parametrize("family", list(WorkflowFamily))
+@pytest.mark.parametrize("family", [WorkflowFamily.RESOLVE, WorkflowFamily.REVIEW_REJECTIONS])
 def test_a_retained_run_alone_blocks_only_its_own_familys_absent_activation(store, family):
     binding = held().binding if family is WorkflowFamily.REVIEW_REJECTIONS else resolve_snapshot().binding
     owner = REVIEWER if family is WorkflowFamily.REVIEW_REJECTIONS else FIX
@@ -108,6 +108,17 @@ def test_a_retained_run_alone_blocks_only_its_own_familys_absent_activation(stor
     with pytest.raises(WorkflowAuthorityError, match="missing despite retained"):
         read(store, load_family_authority, family, "o/r")
     assert read(store, load_family_authority, other, "o/r") is None
+
+
+def test_a_retained_execution_component_cannot_be_confused_with_rejection_activation(store):
+    install_review(store, held())
+    assert read(store, load_family_authority, WorkflowFamily.REVIEW_EXECUTION, "o/r") is None
+    with store.transaction() as db:
+        db.execute("INSERT INTO workflow_components VALUES ('o/r','pr',9,'review_execution',2,'execution:retained')")
+    with pytest.raises(WorkflowAuthorityError, match="review_execution activation is missing"):
+        read(store, load_family_authority, WorkflowFamily.REVIEW_EXECUTION, "o/r")
+    assert read(store, load_family_authority, WorkflowFamily.REVIEW_REJECTIONS, "o/r") == REVIEW
+    assert read(store, load_resolve_authority, "o/r") is None
 
 
 def test_family_authority_rejects_untyped_families(store):

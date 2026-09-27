@@ -10,7 +10,16 @@ from typing import TypeVar
 from ..domain.resolve_workspace import EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
 from ..domain.review_workflow import (
     AnyWorkflowSnapshot, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, ReviewEpisode,
-    ReviewRearmIntent, ReviewWorkflowSnapshot, SupersededReviewRearm,
+    ReviewFamilyEpisodes, ReviewRearmIntent, ReviewWorkflowSnapshot, SupersededReviewRearm,
+)
+from ..domain.review_execution import (
+    MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, ExecutionNotActivated,
+    ReviewExecutionCheckpoint, ReviewRoundOutcome, project_review_execution,
+)
+from ..domain.review_rounds import (
+    DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
+    ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan,
+    finalize_review_round,
 )
 from ..domain.workflow import (
     CancelledRearm, CompletedRearm, OpenGate, PendingRearm, RearmIntent, RearmingGate,
@@ -56,6 +65,33 @@ def workflow_scope(key: WorkflowKey) -> tuple[str, str, int]:
     return key.repository, "issue" if isinstance(key.target, IssueRef) else "pr", key.target.number
 
 
+def _require_component_index(
+    db: sqlite3.Connection, scope: tuple[str, str, int], authority: FamilyAuthority, episode_id: str,
+) -> None:
+    row = db.execute(
+        "SELECT epoch,episode_id FROM workflow_components WHERE repository=? AND target_kind=? "
+        "AND target_number=? AND family=?", (*scope, authority.family.value),
+    ).fetchone()
+    if row is None or row["epoch"] != authority.epoch or row["episode_id"] != episode_id:
+        raise WorkflowAuthorityError("workflow component index disagrees with canonical authority")
+
+
+def insert_workflow_component(
+    db: sqlite3.Connection, key: WorkflowKey, authority: FamilyAuthority, episode_id: str,
+) -> None:
+    db.execute(
+        "INSERT INTO workflow_components(repository,target_kind,target_number,family,epoch,episode_id) "
+        "VALUES (?,?,?,?,?,?)",
+        (*workflow_scope(key), authority.family.value, authority.epoch, episode_id),
+    )
+
+
+def encode_workflow_episodes(snapshot: AnyWorkflowSnapshot) -> str:
+    if isinstance(snapshot, ReviewWorkflowSnapshot):
+        return encode_workflow(ReviewFamilyEpisodes(snapshot.authority, snapshot.episode, snapshot.execution))
+    return encode_workflow((snapshot.authority, snapshot.episode))
+
+
 def workflow_run_scope_bounds(key: WorkflowKey) -> tuple[str, str]:
     """Indexed target scope across retained epochs/episodes, never JSON payload scans."""
     prefix = json.dumps(workflow_scope(key), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
@@ -64,7 +100,11 @@ def workflow_run_scope_bounds(key: WorkflowKey) -> tuple[str, str]:
 
 # Phase 3 owns one family per target kind (ADR 0015): the indexed target kind is
 # the family discriminator for rows that carry no family column.
-_FAMILY_TARGET_KIND = {WorkflowFamily.RESOLVE: "issue", WorkflowFamily.REVIEW_REJECTIONS: "pr"}
+_FAMILY_TARGET_KIND = {
+    WorkflowFamily.RESOLVE: "issue",
+    WorkflowFamily.REVIEW_REJECTIONS: "pr",
+    WorkflowFamily.REVIEW_EXECUTION: "pr",
+}
 
 
 def family_target_kind(family: WorkflowFamily) -> str:
@@ -89,13 +129,20 @@ def load_family_authority(db: sqlite3.Connection, family: WorkflowFamily, reposi
             return FamilyAuthority(family, row["epoch"])
         except (ValueError, TypeError) as exc:
             raise WorkflowAuthorityError(f"invalid {family.value} activation epoch: {exc}") from exc
-    retained = (
+    if family is WorkflowFamily.REVIEW_EXECUTION:
+        retained = (
+            db.execute("SELECT 1 FROM workflow_components WHERE repository=? AND family=? LIMIT 1", (repository, family.value)).fetchone()
+            or db.execute("SELECT 1 FROM review_execution_rounds WHERE repository=? LIMIT 1", (repository,)).fetchone()
+            or db.execute("SELECT 1 FROM workflow_activation_imports WHERE repository=? AND family=? LIMIT 1", (repository, family.value)).fetchone()
+        )
+    else:
+        retained = (
         db.execute("SELECT 1 FROM workflows WHERE repository=? AND target_kind=? LIMIT 1", (repository, kind)).fetchone()
         or db.execute("SELECT 1 FROM workflow_rearms WHERE repository=? AND target_kind=? LIMIT 1", (repository, kind)).fetchone()
         or db.execute("SELECT 1 FROM workflow_gates WHERE repository=? AND target_kind=? LIMIT 1", (repository, kind)).fetchone()
         or db.execute("SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? LIMIT 1",
                       family_run_scope_bounds(repository, family)).fetchone()
-    )
+        )
     if retained is not None:
         raise WorkflowAuthorityError(f"{family.value} activation is missing despite retained workflow authority")
     return None
@@ -129,6 +176,9 @@ def _row_or_absence(db: sqlite3.Connection, key: WorkflowKey, family: WorkflowFa
         retained = (
             db.execute("SELECT 1 FROM workflow_rearms WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
             or db.execute("SELECT 1 FROM workflow_gates WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
+            or db.execute("SELECT 1 FROM workflow_components WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
+            or db.execute("SELECT 1 FROM review_execution_rounds WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
+            or db.execute("SELECT 1 FROM workflow_activation_imports WHERE repository=? AND target_kind=? AND target_number=? LIMIT 1", scope).fetchone()
             or db.execute("SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? LIMIT 1",
                           workflow_run_scope_bounds(key)).fetchone()
         )
@@ -164,6 +214,90 @@ def _check_intent_index(intent_row: sqlite3.Row, intent: RearmIntent | ReviewRea
         raise WorkflowEncodingError("rearm index disagrees with its validated payload")
 
 
+def _check_execution_projection(
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+) -> None:
+    episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
+    count = db.execute(
+        "SELECT COUNT(*) AS total FROM review_execution_rounds WHERE repository=? AND target_number=? "
+        "AND execution_epoch=? AND execution_episode=?", episode_scope,
+    ).fetchone()["total"]
+    if count != execution.last_sequence:
+        raise WorkflowAuthorityError("review execution rounds disagree with allocated sequence")
+    if execution.checkpoint.through_sequence:
+        if execution.checkpoint_receipt is None:
+            raise WorkflowAuthorityError("review execution checkpoint lacks its compaction receipt")
+        compacted = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-checkpoint' "
+            "AND scope=? AND key=?", (scope[0], execution.checkpoint_receipt),
+        ).fetchone()
+        if compacted is None or decode_workflow(compacted["payload_json"], ReviewExecutionCheckpoint) != execution.checkpoint:
+            raise WorkflowAuthorityError("review execution checkpoint disagrees with its compaction receipt")
+        prefix_scope = (*episode_scope, execution.checkpoint.through_sequence)
+        if db.execute(
+            "SELECT 1 FROM review_execution_rounds WHERE repository=? AND target_number=? "
+            "AND execution_epoch=? AND execution_episode=? AND sequence<=? "
+            "AND outcome_json IS NULL LIMIT 1", prefix_scope,
+        ).fetchone() is not None or db.execute(
+            "SELECT 1 FROM review_execution_rounds WHERE repository=? AND target_number=? "
+            "AND execution_epoch=? AND execution_episode=? AND sequence<=? "
+            "AND closure_json IS NULL LIMIT 1", prefix_scope,
+        ).fetchone() is not None:
+            raise WorkflowAuthorityError("execution checkpoint includes an unfinalized review round")
+    suffix_count = count - execution.checkpoint.through_sequence
+    if suffix_count > MAX_EXECUTION_SUFFIX:
+        raise WorkflowAuthorityError("review execution suffix exceeds its bounded projection")
+    outcomes: list[ReviewRoundOutcome] = []
+    rows = db.execute(
+        "SELECT round_id,generation,sequence,claim_occurrence_id,plan_json,planning_json,closure_json,outcome_json "
+        "FROM review_execution_rounds WHERE repository=? AND target_number=? AND execution_epoch=? "
+        "AND execution_episode=? AND sequence>? ORDER BY sequence",
+        (*episode_scope, execution.checkpoint.through_sequence),
+    )
+    expected_sequence = execution.checkpoint.through_sequence + 1
+    for row in rows:
+        plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
+        planning = decode_workflow(
+            row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+        )
+        identity = plan.round
+        if (
+            row["sequence"] != expected_sequence
+            or row["round_id"] != identity.round_id
+            or row["sequence"] != identity.sequence
+            or row["generation"] != identity.binding.rejection.fence.generation
+            or row["generation"] > execution.binding.rejection.fence.generation
+            or identity.binding.execution_epoch != execution.binding.execution_epoch
+            or identity.binding.execution_episode != execution.binding.execution_episode
+            or identity.binding.rejection.authority != execution.binding.rejection.authority
+            or identity.binding.rejection.episode_id != execution.binding.rejection.episode_id
+            or identity.binding.rejection.fence.key != execution.binding.rejection.fence.key
+            or not isinstance(row["claim_occurrence_id"], str)
+            or not row["claim_occurrence_id"]
+        ):
+            raise WorkflowAuthorityError("review execution round index disagrees with its plan")
+        expected_sequence += 1
+        if row["outcome_json"] is None:
+            if row["closure_json"] is not None:
+                raise WorkflowAuthorityError("closed review round is missing its outcome")
+            continue
+        if row["closure_json"] is None:
+            raise WorkflowAuthorityError("review round outcome lacks closure facts")
+        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
+        result = finalize_review_round(facts)
+        if not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)):
+            raise WorkflowAuthorityError("review round closure has not finalized")
+        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+        if facts.plan != plan or facts.planning != planning or outcome != result.outcome:
+            raise WorkflowAuthorityError("review round outcome disagrees with verified closure facts")
+        outcomes.append(outcome)
+    if expected_sequence != execution.last_sequence + 1:
+        raise WorkflowAuthorityError("review execution round suffix has a gap")
+    projected = project_review_execution(execution.checkpoint, tuple(outcomes))
+    if projected.state != execution.state:
+        raise WorkflowAuthorityError("review execution state disagrees with ordered outcomes")
+
+
 def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> WorkflowSnapshot | None:
     """Resolve authority for an issue; a PR key is never read as resolve."""
     activation, row = _row_or_absence(db, key, WorkflowFamily.RESOLVE)
@@ -177,6 +311,7 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
         authority, episode = family
         if authority != activation:
             raise WorkflowEncodingError("workflow activation epoch does not match its episode")
+        _require_component_index(db, scope, authority, episode.episode_id)
         gates = _load_gates(db, scope)
         intent_row = _latest_intent_row(db, scope)
         intent = None
@@ -205,12 +340,31 @@ def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Review
         return None
     scope = workflow_scope(key)
     try:
-        family = decode_workflow(row["episode_json"], tuple)
-        if len(family) != 2 or not isinstance(family[0], FamilyAuthority) or not isinstance(family[1], ReviewEpisode):
+        family = decode_workflow(row["episode_json"], tuple | ReviewFamilyEpisodes)
+        execution = ExecutionNotActivated()
+        if isinstance(family, ReviewFamilyEpisodes):
+            authority, episode, execution = family.authority, family.episode, family.execution
+        elif len(family) == 2 and isinstance(family[0], FamilyAuthority) and isinstance(family[1], ReviewEpisode):
+            authority, episode = family
+        else:
             raise WorkflowEncodingError("invalid review rejection family episode")
-        authority, episode = family
         if authority != activation:
             raise WorkflowEncodingError("workflow activation epoch does not match its episode")
+        _require_component_index(db, scope, authority, episode.episode_id)
+        execution_authority = load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository)
+        if isinstance(execution, ActivatedReviewExecution):
+            if execution_authority is None or execution.binding.execution_epoch != execution_authority.epoch:
+                raise WorkflowEncodingError("execution activation epoch disagrees with its component")
+            _require_component_index(
+                db, scope, execution_authority, execution.binding.execution_episode,
+            )
+        elif execution_authority is not None:
+            raise WorkflowEncodingError("activated review execution component is absent")
+        elif db.execute(
+            "SELECT 1 FROM workflow_components WHERE repository=? AND target_kind=? AND target_number=? "
+            "AND family=?", (*scope, WorkflowFamily.REVIEW_EXECUTION.value),
+        ).fetchone() is not None:
+            raise WorkflowEncodingError("inactive review has an execution component index")
         gates = _load_gates(db, scope)
         intent_row = _latest_intent_row(db, scope)
         intent = None
@@ -223,10 +377,13 @@ def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Review
                 PendingReviewRearm: "pending", CompletedReviewRearm: "completed",
                 SupersededReviewRearm: "superseded", CancelledReviewRearm: "cancelled",
             })
-        return ReviewWorkflowSnapshot(
+        snapshot = ReviewWorkflowSnapshot(
             WorkflowRevision(WorkflowFence(key, row["generation"]), row["version"]),
-            authority, episode, gates, intent,
+            authority, episode, gates, intent, execution,
         )
+        if isinstance(execution, ActivatedReviewExecution):
+            _check_execution_projection(db, scope, execution)
+        return snapshot
     except (ValueError, TypeError, KeyError) as exc:
         raise WorkflowAuthorityError(f"invalid workflow authority: {exc}") from exc
 
@@ -304,14 +461,26 @@ def _require_current(snapshot: _Snapshot | None, binding: WorkflowBinding, *, al
 def persist_workflow_snapshot(db: sqlite3.Connection, after: AnyWorkflowSnapshot) -> None:
     """Write an existing workflow row and its unresolved gate index."""
     scope = workflow_scope(after.revision.fence.key)
+    if isinstance(after, ReviewWorkflowSnapshot) and isinstance(after.execution, ActivatedReviewExecution):
+        _require_component_index(
+            db, scope, FamilyAuthority(WorkflowFamily.REVIEW_EXECUTION, after.execution.binding.execution_epoch),
+            after.execution.binding.execution_episode,
+        )
     changed = db.execute(
         "UPDATE workflows SET generation=?, version=?, episode_json=? "
         "WHERE repository=? AND target_kind=? AND target_number=?",
         (after.revision.fence.generation, after.revision.version,
-         encode_workflow((after.authority, after.episode)), *scope),
+         encode_workflow_episodes(after), *scope),
     ).rowcount
     if changed != 1:
         raise WorkflowAuthorityError("persisted workflow row is absent")
+    component = db.execute(
+        "UPDATE workflow_components SET epoch=?,episode_id=? WHERE repository=? AND target_kind=? "
+        "AND target_number=? AND family=?",
+        (after.authority.epoch, after.episode.episode_id, *scope, after.authority.family.value),
+    ).rowcount
+    if component != 1:
+        raise WorkflowAuthorityError("workflow component index is absent")
     # Closed causes remain forensic history, never a runtime file fallback.
     db.execute(
         "UPDATE workflow_gates SET state='closed' WHERE repository=? AND target_kind=? AND target_number=?",

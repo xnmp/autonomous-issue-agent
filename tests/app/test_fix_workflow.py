@@ -2350,6 +2350,7 @@ def test_selected_resolve_refuses_missing_or_stale_authority_before_paid_work(mi
     elif missing in ("row", "activation", "stale"):
         with store._workflow_db.transaction() as db:
             if missing == "row":
+                db.execute("DELETE FROM workflow_components")
                 db.execute("DELETE FROM workflows")
             elif missing == "activation":
                 db.execute("DELETE FROM workflow_authority_epochs")
@@ -2679,6 +2680,7 @@ def test_pr_only_repair_does_not_require_a_selected_resolve_authority_row():
     runner = _pushed_runner()
     workflow = _workflow(gateway, store, runner)
     with store._workflow_db.transaction() as db:
+        db.execute("DELETE FROM workflow_components")
         db.execute("DELETE FROM workflows")
     asyncio.run(workflow.fix_ci(100))
     assert len(runner.tasks) == 1

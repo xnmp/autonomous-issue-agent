@@ -871,20 +871,9 @@ def test_v23_backfills_legacy_consumed_grants_as_terminal(control, absent, clock
     assert isinstance(_authorize(control, _grant(control, command)), WorkflowCommitted)
     clock[0] += timedelta(seconds=5)
     assert executor(control, gateway).drain_pending_commands() == 1
+    from tests.adapters.test_control_store import _historical_fixture
     with control.transaction() as db:  # Isolated v22 fixture, never a supported rollback.
-        for statement in ("DROP INDEX effect_receipts_remote_object",
-                          "ALTER TABLE lifecycle_commands DROP COLUMN prewrite_read_json",
-                          "DELETE FROM schema_migrations WHERE version=24",
-                          "DROP TRIGGER workflow_retry_grant_insert", "DROP TRIGGER workflow_retry_grant_update",
-                          "DROP INDEX workflow_retry_open_grant",
-                          "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition",
-                          "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposed_at",
-                          "ALTER TABLE workflow_retry_authorizations DROP COLUMN disposition_reason",
-                          "ALTER TABLE workflow_retry_authorizations DROP COLUMN accepted_at",
-                          "ALTER TABLE workflow_retry_authorizations DROP COLUMN first_visit_at",
-                          "ALTER TABLE workflow_retry_authorizations DROP COLUMN unavailable_reads",
-                          "DELETE FROM schema_migrations WHERE version=23"):
-            db.execute(statement)
+        _historical_fixture(db, 22)
     SQLiteControlStore(control.path, now=lambda: clock[0]).initialize()
     row = _grant_row(control)
     assert row["disposition"] == "consumed" and row["consumed_attempt"] == 2

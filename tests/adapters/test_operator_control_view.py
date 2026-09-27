@@ -166,6 +166,7 @@ def test_missing_activation_with_only_a_retained_rearm_is_unavailable(control) -
         db.execute("BEGIN IMMEDIATE")
         db.execute("DELETE FROM workflow_gates WHERE repository='o/r'")
         db.execute("DELETE FROM workflow_evidence WHERE repository='o/r'")
+        db.execute("DELETE FROM workflow_components WHERE repository='o/r'")
         db.execute("DELETE FROM workflows WHERE repository='o/r'")
         db.execute("DELETE FROM workflow_authority_epochs WHERE repository='o/r'")
         db.commit()
@@ -193,6 +194,7 @@ def test_missing_activation_with_only_a_bound_run_is_unavailable(control) -> Non
         db.execute(
             "DELETE FROM workflow_evidence WHERE repository='o/r'"
         )
+        db.execute("DELETE FROM workflow_components WHERE repository='o/r'")
         db.execute("DELETE FROM workflows WHERE repository='o/r'")
         db.execute("DELETE FROM workflow_authority_epochs WHERE repository='o/r'")
 
@@ -211,6 +213,7 @@ def test_active_epoch_missing_target_with_retained_rearm_is_unavailable(control)
         db.execute("BEGIN IMMEDIATE")
         db.execute("DELETE FROM workflow_gates WHERE repository='o/r'")
         db.execute("DELETE FROM workflow_evidence WHERE repository='o/r'")
+        db.execute("DELETE FROM workflow_components WHERE repository='o/r'")
         db.execute("DELETE FROM workflows WHERE repository='o/r'")
         db.commit()
 
@@ -226,6 +229,7 @@ def test_active_epoch_missing_target_with_bound_run_is_unavailable(control) -> N
     run(control, state, name="active-orphan-bound-run")
     with control.transaction() as db:
         db.execute("DELETE FROM workflow_evidence WHERE repository='o/r'")
+        db.execute("DELETE FROM workflow_components WHERE repository='o/r'")
         db.execute("DELETE FROM workflows WHERE repository='o/r'")
 
     prefix_neighbor = adapter(control).resolve_control_view(
@@ -248,6 +252,7 @@ def test_active_epoch_missing_target_with_retained_gate_is_unavailable(control) 
     with closing(control._connect()) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute("BEGIN IMMEDIATE")
+        db.execute("DELETE FROM workflow_components WHERE repository='o/r' AND target_kind='issue' AND target_number=10")
         db.execute(
             "DELETE FROM workflows WHERE repository='o/r' "
             "AND target_kind='issue' AND target_number=10"

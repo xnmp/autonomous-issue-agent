@@ -1,10 +1,11 @@
 # Phase 4 — review execution provenance
 
-Date: 2026-09-27. Read-only implementation analysis supporting the
+Date: 2026-09-27. Implementation provenance record supporting the
 [persistence map](2026-09-27-phase-4-persistence-map.md) and
 [outer-round/finalization design](2026-09-27-phase-4-review-execution-design.md#outer-round-outcome-contract).
 The parent owns the planned-stage, finalization, claim-occurrence and receipt
-contracts. Settle those contracts before freezing schema v25. No live migration
+contracts. Schema v25 now retains dispatch claim occurrences and lifecycle
+receipts; launch and round settlement hooks remain. No live migration
 or deployment is authorized by this document.
 
 ## Admission is not launch
@@ -101,28 +102,33 @@ is insufficient.
 ## Parent claim occurrence and abandonment
 
 `dispatch_claims` stores repository, role, target, leg, owner ID, parent PID,
-parent start ticks, paths and claim timestamp. `dispatch_claim_runs` links its
+parent start ticks, paths, claim timestamp and immutable occurrence ID.
+`dispatch_claim_runs` links its
 admitted children. `claim_dispatch` probes parent identity outside SQL and
 revalidates observations before reclaiming; a live parent or a bound
 reserved/starting/running child protects the claim.
 
-Existing limitations matter to outer-round recovery:
+Remaining limits matter to outer-round recovery:
 
-- `release_dispatch_claim` deletes the claim, cascading deletion of child
-  links. Claim reclamation also deletes it. Neither retains an immutable
-  release/abandonment receipt.
-- `_dispatch_claim_observations` omits the claim timestamp and leg. Its
-  snapshot is not a complete immutable occurrence identity.
+- `release_dispatch_claim` and stale-claim reclamation retain separate
+  occurrence-scoped receipts before deleting the live claim and cascading its
+  child links. Those receipts establish which occurrence ended, but do not by
+  themselves prove every child settled or fence a planned remote submission.
+- `_dispatch_claim_observations` includes the claim timestamp, leg and
+  occurrence. Reclamation compares the exact observation after the external
+  process probe and deletes by occurrence ID.
 - `active_dispatch_claims` is an explicitly fail-soft advisory reader that
   skips malformed rows. It cannot authorize abandonment.
 - The same daemon/owner can release and reacquire the same target. Owner and
   target alone cannot identify the original outer invocation.
 
-At preflight, capture the exact claim occurrence, including PID/start ticks
-and claim timestamp, or introduce a durable occurrence ID. Each stage/child
-admission must match that occurrence. Persist an immutable release/reclaim
-receipt at the existing claim-removal hooks, tied to its outer round, before
-the row disappears.
+At preflight, capture the exact claim occurrence and bind it to the durable
+outer round. Each stage/child admission must match that occurrence. Finalization
+must join the retained release/reclaim receipt to the exact round and fence late
+admission/submission before treating it as parent abandonment. The current
+release API still accepts owner/target without a caller-supplied occurrence;
+its receipt must never be treated as proof for an earlier round without exact
+occurrence validation.
 
 For an unsealed round, snapshot authoritative parent/child/lease facts, probe
 the captured process identity outside SQL, then revalidate and record the

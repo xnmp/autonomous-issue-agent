@@ -15,6 +15,10 @@ from ..domain import workflow as w
 from ..domain import review_workflow as rw
 from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
+from ..domain import review_execution as rx
+from ..domain import review_rounds as rr
+from ..domain.agent_task import RuntimeName
+from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
 from ..domain.contracts import WorkflowAttemptIdentity
 from ..domain.labels import Label
@@ -65,23 +69,51 @@ _VALUES = (
     rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ImportedBaseline, rw.ReviewedBaseline,
     rw.ReviewEpisode, rw.DismissCountedReview, rw.RequireFreshReview, rw.EnsureReviewProjection, rw.ReviewProjectionPlan,
     rw.PendingReviewRearm, rw.CompletedReviewRearm, rw.SupersededReviewRearm, rw.CancelledReviewRearm,
-    rw.ReviewWorkflowSnapshot, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
+    rw.ReviewWorkflowSnapshot, rw.ReviewFamilyEpisodes, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
     rw.ObservedPullRequest, rw.PullRequestAbsent, rw.PullRequestUnavailable,
     rw.ReviewProjectionRefused, rw.RecordedPullRequest,
     # The review daemon's recorded dispatch decision (operator surface).
     rp.ReviewHeld, rp.ReviewOwed, rp.ReviewNotOwed, rp.ReleaseProjectionPending, rp.SubmissionUnresolved,
     rd.ReviewNotAdmitted, rd.ReviewDeferred, rd.ReviewTerminal, rd.ReviewWithheld, rd.ReviewInFlight,
     rd.DecisionBasis, rd.DepartedReadFailure, rd.RecordedReviewDecision,
+    rx.ReviewExecutionBinding, rx.ReviewRoundIdentity, rx.ReviewChildIdentity,
+    rx.LaunchedReviewChild, rx.ImportedReviewSession, rx.NoReviewSession,
+    rx.ReusableReviewSession, rx.PreserveReviewSession, rx.ReplaceReviewSession,
+    rx.ClearReviewSession, rx.PreserveDisplayedRound, rx.SetDisplayedRound,
+    rx.PaidReviewProgress, rx.CopiedReviewProgress, rx.AddReviewStrike,
+    rx.SaturateReviewFailures, rx.ReviewRoundFailure, rx.ReviewPinDeferred,
+    rx.ReviewAdmissionRefused, rx.ReviewReservationReleased, rx.ReviewUnlaunchedRound,
+    rx.ReviewPreparationFailure, rx.ReviewPreparationDeferred,
+    rx.ReviewRoundCancelled, rx.ReviewRoundOutcome, rx.ReviewExecutionPolicy,
+    rx.ReviewExecutionState, rx.ReviewExecutionCheckpoint,
+    rx.ReviewExecutionOrigin, rx.ExecutionNotActivated, rx.ActivatedReviewExecution,
+    rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewRoundPlan,
+    rr.ReviewChildPending, rr.ReviewChildRefused, rr.ReviewChildReleased,
+    rr.ReviewChildSettledWithoutLaunch, rr.ReviewChildNotAdmitted,
+    rr.ReviewChildPinDeferred, rr.ReviewChildSucceeded, rr.OrdinaryReviewFailure,
+    rr.DeterministicReviewFailure, rr.ReviewChildFailed, rr.ReviewChildCancelled,
+    rr.ReviewChildReturned, rr.ReviewSubmissionPending,
+    rr.ReviewSubmissionConfirmed, rr.ReviewSubmissionRefused,
+    rr.ReviewSubmissionEvidence, rr.ReviewPlanningOpen,
+    rr.ReviewPlanningComplete, rr.ReviewPlanningRefused, rr.ReviewPlanningSealed,
+    rr.ReviewParentAbandoned, rr.ReviewRoundFacts, rr.ReviewRoundAwaitingEvidence,
+    rr.FinalizedReviewRound, rr.DeferredReviewPreparation,
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.StopReason, w.RetryDisposition, w.RemediationOperation,
     w.RemediationOutcome, w.ResolveResultKind, w.ResolveStage,
     rw.SubmittedReviewState, rw.PullRequestState, rp.ReviewKind, rd.DecisionRead, rd.WithheldReason,
+    RuntimeName, ReviewMode, rx.ReviewChildKind, rx.ReviewPreparationKind,
+    rx.ReviewCancellationReason, rx.ReviewExecutionOriginKind,
+    rr.ReviewSubmissionKind, rr.ReviewSessionReuse, rr.ReviewRoundWait,
 )
 _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
 if len(_TAGS) != len(_VALUES) + len(_ENUMS):
     raise RuntimeError("workflow codec tags must name exactly one registered variant")
+
+_CURRENT_REVIEW_SNAPSHOT_TAG = "ReviewWorkflowSnapshotV2"
+_LEGACY_REVIEW_SNAPSHOT_FIELDS = frozenset({"revision", "authority", "episode", "gates", "intent"})
 
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
@@ -112,7 +144,8 @@ def _encode(value: object, depth: int = 0) -> object:
         return {"type": type(value).__name__, "value": value.value}
     if type(value) in _VALUES and is_dataclass(value):
         return {
-            "type": type(value).__name__,
+            "type": (_CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
+                     else type(value).__name__),
             "fields": {
                 field.name: _encode(getattr(value, field.name), depth + 1)
                 for field in fields(value)
@@ -162,6 +195,14 @@ def _decode(value: object, depth: int = 0) -> object:
         if len(result) != len(items):
             raise WorkflowEncodingError("duplicate workflow set members")
         return result
+    if tag == "ReviewWorkflowSnapshot":
+        payload = value.get("fields")
+        if set(value) != {"type", "fields"} or not isinstance(payload, dict) or set(payload) != _LEGACY_REVIEW_SNAPSHOT_FIELDS:
+            raise WorkflowEncodingError("wrong fields for legacy review snapshot")
+        decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
+        return rw.ReviewWorkflowSnapshot(**decoded, execution=rx.ExecutionNotActivated())
+    if tag == _CURRENT_REVIEW_SNAPSHOT_TAG:
+        tag = "ReviewWorkflowSnapshot"
     constructor = _TAGS.get(tag)
     if constructor is None:
         raise WorkflowEncodingError(f"unknown workflow variant: {tag}")

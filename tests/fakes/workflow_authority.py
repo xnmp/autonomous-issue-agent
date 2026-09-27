@@ -1,7 +1,7 @@
 """Explicit isolated workflow authority fixtures, never a production importer."""
 
 from issue_agent.adapters.workflow_codec import encode_workflow
-from issue_agent.adapters.workflow_rows import workflow_scope
+from issue_agent.adapters.workflow_rows import insert_workflow_component, workflow_scope, encode_workflow_episodes
 from issue_agent.domain.workflow import OpenGate, RearmingGate, ResolveEpisode, WorkflowSnapshot
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
@@ -27,8 +27,9 @@ def install_workflow(store, snapshot):
         db.execute(
             "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?)",
             (*scope, snapshot.revision.fence.generation, snapshot.revision.version,
-             encode_workflow((snapshot.authority, snapshot.episode))),
+             encode_workflow_episodes(snapshot)),
         )
+        insert_workflow_component(db, snapshot.revision.fence.key, snapshot.authority, snapshot.episode.episode_id)
         for gate in snapshot.gates:
             opened = gate.gate if isinstance(gate, RearmingGate) else gate
             db.execute(

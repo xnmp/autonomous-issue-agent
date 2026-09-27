@@ -405,6 +405,69 @@ class ReviewExecutionCheckpoint:
             raise ValueError("execution checkpoint cannot contain a future outcome")
 
 
+class ReviewExecutionOriginKind(str, Enum):
+    INITIALIZED = "initialized"
+    IMPORTED = "imported"
+    RENEWED = "renewed"
+
+
+@dataclass(frozen=True)
+class ReviewExecutionOrigin:
+    kind: ReviewExecutionOriginKind
+    evidence_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ReviewExecutionOriginKind):
+            raise ValueError("execution origin requires a typed cause")
+        identifier(self.evidence_id, "execution origin evidence")
+
+
+@dataclass(frozen=True)
+class ExecutionNotActivated:
+    pass
+
+
+@dataclass(frozen=True)
+class ActivatedReviewExecution:
+    origin: ReviewExecutionOrigin
+    checkpoint: ReviewExecutionCheckpoint
+    state: ReviewExecutionState
+    last_sequence: int
+    checkpoint_receipt: str | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.origin, ReviewExecutionOrigin):
+            raise ValueError("activated execution requires its origin evidence")
+        if not isinstance(self.checkpoint, ReviewExecutionCheckpoint) or not isinstance(self.state, ReviewExecutionState):
+            raise ValueError("activated execution requires its checkpoint and current state")
+        if self.checkpoint.state.binding != self.state.binding:
+            raise ValueError("execution checkpoint and state belong to different bindings")
+        integer(self.last_sequence, "last allocated review round")
+        if self.checkpoint.through_sequence > self.last_sequence:
+            raise ValueError("execution checkpoint exceeds allocated rounds")
+        if self.checkpoint_receipt is not None:
+            identifier(self.checkpoint_receipt, "execution checkpoint receipt")
+        if self.checkpoint.through_sequence == 0 and self.checkpoint_receipt is not None:
+            raise ValueError("initial execution checkpoint has no compaction receipt")
+        if max(self.state.session_sequence, self.state.display_sequence, self.state.productive_sequence) > self.last_sequence:
+            raise ValueError("execution state contains a future outcome")
+        if self.checkpoint.through_sequence == self.last_sequence and self.checkpoint.state != self.state:
+            raise ValueError("execution state disagrees with its completed checkpoint")
+        if isinstance(self.state.session, ReusableReviewSession) and isinstance(self.state.session.source, ImportedReviewSession):
+            if self.origin.kind is not ReviewExecutionOriginKind.IMPORTED:
+                raise ValueError("an imported session requires an imported execution origin")
+        if self.last_sequence == 0 and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED:
+            if self.state.failures or self.state.pin_deferrals or not isinstance(self.state.session, NoReviewSession):
+                raise ValueError("a fresh execution origin cannot invent failures or a reusable session")
+
+    @property
+    def binding(self) -> ReviewExecutionBinding:
+        return self.state.binding
+
+
+ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution
+
+
 @dataclass(frozen=True)
 class ReviewExecutionProjection:
     state: ReviewExecutionState

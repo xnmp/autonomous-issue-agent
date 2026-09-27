@@ -14,6 +14,7 @@ import os
 import sqlite3
 import stat
 import tempfile
+import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, replace
@@ -39,17 +40,17 @@ from ..domain.contracts import (
     TokenUsage,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
+from ..domain.workflow_identity import FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
 from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, CommandRetryApplicability,
     ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryAlreadyConsumed,
     RetryBegan, RetryDeclined, RetryDisposition, RetryStale, StandaloneCommand,
     UnconsumedRetryAuthorization, NoAuthorizedRemediation, OpenGate, RearmingGate, ReconciliationOnly,
     RemoteOutcomeUncertain, RetiredSettledCommand, RetiredUncertainCommand, RetryAuthorizationRequired,
-    AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
+    AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveEpisode, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
-from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewWorkflowSnapshot
+from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
     ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX, CeilingEscalation, ReviewSubmissionReceipt,
     bound_submission_owed, escalation_signal_identity,
@@ -94,7 +95,7 @@ from .review_effects import bound_submission_op, review_family_op
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 24
+SCHEMA_VERSION = 25
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -698,9 +699,12 @@ class Lease:
 @dataclass(frozen=True)
 class _DispatchClaimObservation:
     target: str
+    leg: str
     owner_id: str
     owner_pid: int
     owner_start_ticks: int
+    occurrence_id: str
+    claimed_at: str
     paths_json: str
     bound_runs: tuple[tuple[str, str, int, int], ...]
 
@@ -1290,6 +1294,60 @@ def _backfill_workflow_episode_index_v20(db: sqlite3.Connection) -> None:
         db.execute("UPDATE runs SET workflow_episode_key=? WHERE run_id=?", (workflow_episode_key(binding), row["run_id"]))
 
 
+def _backfill_workflow_components_v25(db: sqlite3.Connection) -> None:
+    for row in db.execute("SELECT repository,target_kind,target_number,episode_json FROM workflows"):
+        try:
+            family = decode_workflow(row["episode_json"], tuple)
+            if len(family) != 2 or not isinstance(family[0], FamilyAuthority):
+                raise ValueError("legacy workflow family is malformed")
+            authority, episode = family
+            expected = (
+                WorkflowFamily.RESOLVE if row["target_kind"] == "issue" and isinstance(episode, ResolveEpisode)
+                else WorkflowFamily.REVIEW_REJECTIONS if row["target_kind"] == "pr" and isinstance(episode, ReviewEpisode)
+                else None
+            )
+            if authority.family is not expected:
+                raise ValueError("legacy workflow family disagrees with its target")
+            active = db.execute(
+                "SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family=?",
+                (row["repository"], authority.family.value),
+            ).fetchone()
+            if active is None or active["epoch"] != authority.epoch:
+                raise ValueError("legacy workflow family disagrees with activation")
+            db.execute(
+                "INSERT INTO workflow_components(repository,target_kind,target_number,family,epoch,episode_id) "
+                "VALUES (?,?,?,?,?,?)",
+                (row["repository"], row["target_kind"], row["target_number"],
+                 authority.family.value, authority.epoch, episode.episode_id),
+            )
+        except (ValueError, TypeError) as exc:
+            raise IncompatibleSchema(f"cannot project historical workflow component: {exc}") from exc
+    for row in db.execute("SELECT repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,claimed_at FROM dispatch_claims"):
+        digest = hashlib.sha256(_json(tuple(row)).encode()).hexdigest()
+        occurrence_id = f"legacy:{digest}"
+        db.execute(
+            "UPDATE dispatch_claims SET occurrence_id=? WHERE repository=? AND role=? AND target=?",
+            (occurrence_id, row["repository"], row["role"], row["target"]),
+        )
+        _claim_lifecycle_receipt(db, row["repository"], occurrence_id, "created", row["claimed_at"], {
+            "role": row["role"], "target": row["target"], "leg": row["leg"],
+            "owner_id": row["owner_id"],
+            "owner_pid": row["owner_pid"], "owner_start_ticks": row["owner_start_ticks"],
+            "claimed_at": row["claimed_at"], "source": "v24-migration",
+        })
+
+
+def _claim_lifecycle_receipt(
+    db: sqlite3.Connection, repository: str, occurrence_id: str, event: str,
+    observed_at: str, fact: dict[str, object],
+) -> None:
+    db.execute(
+        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+        ("dispatch-claim-lifecycle", repository, f"{occurrence_id}:{event}",
+         observed_at, _json(fact)),
+    )
+
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -1408,6 +1466,69 @@ END;
 ALTER TABLE lifecycle_commands ADD COLUMN prewrite_read_json TEXT;
 CREATE INDEX effect_receipts_remote_object ON effect_receipts(remote_object_id)
 WHERE remote_object_id IS NOT NULL;
+"""),
+    SchemaMigration(25, """
+CREATE TABLE workflow_components (
+    repository TEXT NOT NULL,
+    target_kind TEXT NOT NULL,
+    target_number INTEGER NOT NULL CHECK (target_number > 0),
+    family TEXT NOT NULL,
+    epoch INTEGER NOT NULL CHECK (epoch > 0),
+    episode_id TEXT NOT NULL CHECK (length(episode_id) BETWEEN 1 AND 512),
+    PRIMARY KEY (repository,target_kind,target_number,family),
+    FOREIGN KEY (repository,target_kind,target_number)
+        REFERENCES workflows(repository,target_kind,target_number),
+    CHECK ((family='resolve' AND target_kind='issue') OR
+           (family IN ('review_rejections','review_execution') AND target_kind='pr'))
+);
+CREATE INDEX workflow_components_family ON workflow_components(repository,family);
+CREATE TABLE review_execution_rounds (
+    round_id TEXT PRIMARY KEY,
+    repository TEXT NOT NULL,
+    target_kind TEXT NOT NULL CHECK (target_kind='pr'),
+    target_number INTEGER NOT NULL CHECK (target_number > 0),
+    execution_epoch INTEGER NOT NULL CHECK (execution_epoch > 0),
+    execution_episode TEXT NOT NULL,
+    generation INTEGER NOT NULL CHECK (generation >= 0),
+    sequence INTEGER NOT NULL CHECK (sequence > 0),
+    claim_occurrence_id TEXT NOT NULL,
+    plan_json TEXT NOT NULL,
+    planning_json TEXT NOT NULL,
+    closure_json TEXT,
+    outcome_json TEXT,
+    UNIQUE (repository,target_number,execution_epoch,execution_episode,sequence),
+    FOREIGN KEY (repository,target_kind,target_number)
+        REFERENCES workflows(repository,target_kind,target_number)
+);
+CREATE INDEX review_execution_rounds_episode
+ON review_execution_rounds(repository,target_number,execution_epoch,execution_episode,sequence);
+CREATE INDEX review_execution_rounds_open
+ON review_execution_rounds(repository,target_number,execution_epoch,execution_episode,sequence)
+WHERE outcome_json IS NULL;
+CREATE INDEX review_execution_rounds_unclosed
+ON review_execution_rounds(repository,target_number,execution_epoch,execution_episode,sequence)
+WHERE closure_json IS NULL;
+ALTER TABLE runs ADD COLUMN review_round_id TEXT REFERENCES review_execution_rounds(round_id);
+ALTER TABLE runs ADD COLUMN review_child_id TEXT;
+CREATE UNIQUE INDEX runs_review_child ON runs(review_round_id,review_child_id)
+WHERE review_round_id IS NOT NULL;
+CREATE TRIGGER runs_review_attachment_insert BEFORE INSERT ON runs
+WHEN (NEW.review_round_id IS NULL) != (NEW.review_child_id IS NULL)
+BEGIN SELECT RAISE(ABORT,'review round and child must be attached together'); END;
+CREATE TRIGGER runs_review_attachment_update BEFORE UPDATE ON runs
+WHEN (NEW.review_round_id IS NULL) != (NEW.review_child_id IS NULL)
+    OR NEW.review_round_id IS NOT OLD.review_round_id
+    OR NEW.review_child_id IS NOT OLD.review_child_id
+BEGIN SELECT RAISE(ABORT,'review run attachment is immutable'); END;
+ALTER TABLE dispatch_claims ADD COLUMN occurrence_id TEXT;
+CREATE UNIQUE INDEX dispatch_claims_occurrence ON dispatch_claims(occurrence_id);
+CREATE TRIGGER dispatch_claims_occurrence_insert BEFORE INSERT ON dispatch_claims
+WHEN NEW.occurrence_id IS NULL OR length(NEW.occurrence_id)=0
+BEGIN SELECT RAISE(ABORT,'dispatch claim requires an occurrence'); END;
+CREATE TRIGGER dispatch_claims_occurrence_update BEFORE UPDATE ON dispatch_claims
+WHEN NEW.occurrence_id IS NULL OR length(NEW.occurrence_id)=0
+    OR (OLD.occurrence_id IS NOT NULL AND NEW.occurrence_id IS NOT OLD.occurrence_id)
+BEGIN SELECT RAISE(ABORT,'dispatch claim occurrence is immutable'); END;
 """),
 )
 
@@ -1822,6 +1943,8 @@ class SQLiteControlStore:
                     db.execute(statement)
                 if migration.version == 20:
                     _backfill_workflow_episode_index_v20(db)
+                if migration.version == 25:
+                    _backfill_workflow_components_v25(db)
                 db.execute(
                     "INSERT INTO schema_migrations("
                     "version, applied_at, source_digest) VALUES (?, ?, ?)",
@@ -3063,15 +3186,22 @@ class SQLiteControlStore:
                     db.execute(
                         "DELETE FROM dispatch_claims "
                         "WHERE repository=? AND role=? AND target=? "
-                        "AND owner_pid=? AND owner_start_ticks=?",
+                        "AND owner_pid=? AND owner_start_ticks=? AND occurrence_id=?",
                         (
                             repository,
                             role,
                             claim.target,
                             claim.owner_pid,
                             claim.owner_start_ticks,
+                            claim.occurrence_id,
                         ),
                     )
+                    _claim_lifecycle_receipt(db, repository, claim.occurrence_id, "reclaimed", _stamp(self._now()), {
+                        "role": role, "target": claim.target, "leg": claim.leg,
+                        "owner_id": claim.owner_id, "owner_pid": claim.owner_pid,
+                        "owner_start_ticks": claim.owner_start_ticks,
+                        "claimed_at": claim.claimed_at,
+                    })
                 for claim in live:
                     try:
                         other_paths = frozenset(json.loads(claim.paths_json))
@@ -3086,11 +3216,13 @@ class SQLiteControlStore:
                         or bool(paths & other_paths)
                     ):
                         return False
+                occurrence_id = uuid.uuid4().hex
+                claimed_at = _stamp(self._now())
                 db.execute(
                     "INSERT INTO dispatch_claims("
                     "repository, role, target, leg, owner_id, owner_pid, "
-                    "owner_start_ticks, paths_json, claimed_at"
-                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    "owner_start_ticks, paths_json, claimed_at, occurrence_id"
+                    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         repository,
                         role,
@@ -3100,9 +3232,15 @@ class SQLiteControlStore:
                         identity.pid,
                         identity.start_ticks,
                         encoded_paths,
-                        _stamp(self._now()),
+                        claimed_at,
+                        occurrence_id,
                     ),
                 )
+                _claim_lifecycle_receipt(db, repository, occurrence_id, "created", claimed_at, {
+                    "role": role, "target": target, "leg": leg, "owner_id": owner_id,
+                    "owner_pid": identity.pid, "owner_start_ticks": identity.start_ticks,
+                    "claimed_at": claimed_at, "source": "admission",
+                })
                 return True
         except RetiredOwnerError:
             return False
@@ -3114,8 +3252,8 @@ class SQLiteControlStore:
         role: str,
     ) -> tuple[_DispatchClaimObservation, ...]:
         rows = db.execute(
-            "SELECT dc.target, dc.owner_id, dc.owner_pid, "
-            "dc.owner_start_ticks, dc.paths_json, dcr.run_id, r.state, "
+            "SELECT dc.target, dc.leg, dc.owner_id, dc.owner_pid, "
+            "dc.owner_start_ticks, dc.occurrence_id, dc.claimed_at, dc.paths_json, dcr.run_id, r.state, "
             "l.pid AS lease_pid, l.process_start_ticks AS lease_start_ticks "
             "FROM dispatch_claims dc "
             "LEFT JOIN dispatch_claim_runs dcr "
@@ -3146,9 +3284,12 @@ class SQLiteControlStore:
         return tuple(
             _DispatchClaimObservation(
                 target,
+                str(base["leg"]),
                 str(base["owner_id"]),
                 int(base["owner_pid"]),
                 int(base["owner_start_ticks"]),
+                str(base["occurrence_id"]),
+                str(base["claimed_at"]),
                 str(base["paths_json"]),
                 tuple(bindings),
             )
@@ -3275,11 +3416,25 @@ class SQLiteControlStore:
     ) -> bool:
         target = _dispatch_claim_target(issue)
         with self.transaction() as db:
-            cursor = db.execute(
-                "DELETE FROM dispatch_claims "
+            claim = db.execute(
+                "SELECT occurrence_id,leg,owner_pid,owner_start_ticks,claimed_at FROM dispatch_claims "
                 "WHERE repository=? AND role=? AND target=? AND owner_id=?",
                 (repository, role, target, owner_id),
+            ).fetchone()
+            if claim is None:
+                return False
+            cursor = db.execute(
+                "DELETE FROM dispatch_claims "
+                "WHERE repository=? AND role=? AND target=? AND owner_id=? AND occurrence_id=?",
+                (repository, role, target, owner_id, claim["occurrence_id"]),
             )
+            if cursor.rowcount == 1:
+                _claim_lifecycle_receipt(db, repository, claim["occurrence_id"], "released", _stamp(self._now()), {
+                    "role": role, "target": target, "leg": claim["leg"],
+                    "owner_id": owner_id, "owner_pid": claim["owner_pid"],
+                    "owner_start_ticks": claim["owner_start_ticks"],
+                    "claimed_at": claim["claimed_at"],
+                })
             return cursor.rowcount == 1
 
     def active_dispatch_claims(
@@ -3303,7 +3458,7 @@ class SQLiteControlStore:
         with self._connect() as db:
             rows = db.execute(
                 "SELECT dc.target, dc.leg, dc.owner_id, dc.owner_pid, "
-                "dc.owner_start_ticks, dc.claimed_at, dcr.run_id, r.state "
+                "dc.owner_start_ticks, dc.claimed_at, dc.occurrence_id, dcr.run_id, r.state "
                 "FROM dispatch_claims dc "
                 "LEFT JOIN dispatch_claim_runs dcr "
                 "ON dcr.repository=dc.repository AND dcr.role=dc.role "
@@ -3329,6 +3484,9 @@ class SQLiteControlStore:
                 claimed_at = _parse_stamp(str(base["claimed_at"]))
             except ValueError:
                 continue
+            occurrence_id = base["occurrence_id"]
+            if not isinstance(occurrence_id, str) or not occurrence_id:
+                continue
             live_run = any(
                 state in {"reserved", "starting", "running"}
                 for _run_id, state in bindings
@@ -3345,7 +3503,7 @@ class SQLiteControlStore:
                     leg=str(base["leg"]),
                     owner_id=owner_id,
                     claimed_at=claimed_at,
-                    claim_key=f"{owner_id}@{target}@{_stamp(claimed_at)}",
+                    claim_key=occurrence_id,
                 )
             )
         return tuple(claims)

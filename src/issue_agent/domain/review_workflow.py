@@ -26,6 +26,7 @@ from .workflow import (
     _command_ids, _count, _items, _text, _time,
 )
 from .review_evidence import is_review_evidence_gate
+from .review_execution import ActivatedReviewExecution, ExecutionNotActivated, ReviewExecutionComponent
 from .workflow_reconciliation import is_prewrite_gate
 from .workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
@@ -38,6 +39,7 @@ __all__ = [
     "ReviewProjectionPlan",
     "PendingReviewRearm", "CompletedReviewRearm", "SupersededReviewRearm", "CancelledReviewRearm",
     "ReviewRearmIntent", "ReviewWorkflowSnapshot", "AnyWorkflowSnapshot", "ReviewWorkflowRead",
+    "ReviewFamilyEpisodes",
     "SubmittedReviewState", "SubmittedReviewFact", "CompleteReviews", "PartialReviews", "ReviewRead",
     "PullRequestState", "ObservedPullRequest", "PullRequestAbsent", "PullRequestUnavailable",
     "PullRequestObservation", "RecordedPullRequest", "ReviewProjectionRefused", "decisive_reviews",
@@ -355,6 +357,7 @@ class ReviewWorkflowSnapshot:
     episode: ReviewEpisode
     gates: tuple[OpenGate | RearmingGate, ...] = ()
     intent: ReviewRearmIntent | None = None
+    execution: ReviewExecutionComponent = ExecutionNotActivated()
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, WorkflowRevision) or not isinstance(
@@ -363,6 +366,12 @@ class ReviewWorkflowSnapshot:
             raise ValueError("snapshot requires validated revision, authority and episode")
         if self.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
             raise ValueError("this snapshot supports only review rejections")
+        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution)):
+            raise ValueError("review snapshot requires a typed execution component")
+        if isinstance(self.execution, ActivatedReviewExecution):
+            binding = self.execution.binding.rejection
+            if binding != WorkflowBinding(self.revision.fence, self.authority, self.episode.episode_id):
+                raise ValueError("execution component disagrees with the review workflow binding")
         if not isinstance(self.revision.fence.key.target, PullRequestRef):
             raise ValueError("review rejection workflow requires a pull request")
         generation = self.revision.fence.generation
@@ -426,6 +435,25 @@ class ReviewWorkflowSnapshot:
     @property
     def binding(self) -> WorkflowBinding:
         return WorkflowBinding(self.revision.fence, self.authority, self.episode.episode_id)
+
+
+@dataclass(frozen=True)
+class ReviewFamilyEpisodes:
+    authority: FamilyAuthority
+    episode: ReviewEpisode
+    execution: ReviewExecutionComponent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authority, FamilyAuthority) or self.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
+            raise ValueError("review family envelope requires rejection authority")
+        if not isinstance(self.episode, ReviewEpisode):
+            raise ValueError("review family envelope requires its rejection episode")
+        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution)):
+            raise ValueError("review family envelope requires a typed execution component")
+        if isinstance(self.execution, ActivatedReviewExecution):
+            parent = self.execution.binding.rejection
+            if parent.authority != self.authority or parent.episode_id != self.episode.episode_id:
+                raise ValueError("execution envelope disagrees with rejection authority")
 
 
 AnyWorkflowSnapshot = WorkflowSnapshot | ReviewWorkflowSnapshot

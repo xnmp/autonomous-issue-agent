@@ -59,14 +59,40 @@ This checkpoint remains pure construction: schema v24 and existing runtime
 execution authority are unchanged. The next persistence checkpoint must re-derive outcomes from retained
 closure facts, never accept a caller-constructed outcome as authority.
 
+## Checkpoint 3 — canonical persistence (accepted)
+
+The checkpoint adds an explicit inactive/active execution component to the
+review snapshot, a tagged PR episode envelope, schema v25 component/round/run
+indices and durable dispatch-claim occurrence identities. Existing resolve
+episode encoding remains unchanged. A frozen v24 observation fixture protects
+historical review receipt replay through the new snapshot tag.
+
+The active PR loader joins the canonical envelope, execution activation and
+component index. It validates ordered round suffix outcomes against retained
+closure facts, refuses missing parents and unresolved compacted prefixes, and
+requires an exact retained compaction receipt for a noninitial checkpoint.
+Dispatch claim creation, release and reclaim retain occurrence-scoped receipts;
+the external liveness probe is revalidated under the write transaction.
+
+Independent review reproduced two corruption paths: an absent parent with
+retained component/round rows, and a checkpoint moved over an open round.
+Both now refuse, with targeted regressions. The reviewer found no remaining
+blocker in the current migration/loader/claim-lifecycle scope. Final `make test`
+passed with 3,085 domain, 2,481 adapter and 2,861 app tests, plus hooks,
+governor, configuration/environment/parity, four import contracts and both
+Pyrefly passes. Ten pre-existing strict-xfail residuals remained expected.
+Local log: `/tmp/phase4-persistence-final-full.log` (ephemeral). Runtime round admission,
+settlement and real execution activation are later checkpoints; no execution
+authority has been activated.
+
 ## Required subsequent work
 
 - Planned immutable child stages and sealed outer outcomes; evidence-based
   finalization after parent/claim abandonment. Distinguish guarded launch,
   released-before-launch and settled-without-launch evidence; preserve actual
   accounting and bound unpaid preparation faults through evidence holds.
-- Canonical inactive/active execution component, explicit family indexing,
-  schema v25, indexed round/run receipts and captured-policy persistence.
+- Indexed round/admission/return receipts and transactional projection over
+  the canonical v25 component; guarded-launch and exact claim occurrence proof.
 - Actual admission/return accounting transactions and productive submission
   settlement; real multi-child recovery and free copied-verdict capture.
 - Distinct verdict-release and execution-ceiling recovery with one aggregate

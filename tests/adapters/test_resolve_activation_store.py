@@ -209,8 +209,8 @@ def test_inventory_attributes_legacy_repository_variants_and_unparseable_values(
                 "VALUES (?, ?, ?, 'relabel', 'issue:7', ?, ?, '{}', 'x', 'pending', ?, ?)",
                 (command_id, command_id, command_id, repository, OWNER, NOW.isoformat(), NOW.isoformat()))
         for repository, target in (("O/R", "issue:7"), ("other/repo", "issue:8")):
-            db.execute("INSERT INTO dispatch_claims VALUES (?, 'fix', ?, 'RESOLVE', ?, 1, 1, '[]', ?)",
-                       (repository, target, OWNER, NOW.isoformat()))
+            db.execute("INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,paths_json,claimed_at,occurrence_id) VALUES (?, 'fix', ?, 'RESOLVE', ?, 1, 1, '[]', ?, ?)",
+                       (repository, target, OWNER, NOW.isoformat(), f"claim:{repository}:{target}"))
     inventory = SQLiteResolveActivation(control).inventory(REPO)
     assert inventory.open_commands == ("garbage", "padded", "upper")
     assert inventory.dispatch_claims == ("fix:issue:7",)
@@ -222,7 +222,7 @@ def test_inventory_counts_open_commands_claims_and_reservations(control):
                                  expected_revision="r1", repository=REPO, executor_identity=OWNER)
     control.enqueue_command(command)
     with control.transaction() as db:
-        db.execute("INSERT INTO dispatch_claims VALUES ('o/r', 'fix', 'issue:7', 'RESOLVE', ?, 1, 1, '[]', ?)",
+        db.execute("INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,paths_json,claimed_at,occurrence_id) VALUES ('o/r', 'fix', 'issue:7', 'RESOLVE', ?, 1, 1, '[]', ?, 'claim:fixture')",
                    (OWNER, NOW.isoformat()))
     inventory = SQLiteResolveActivation(control).inventory(REPO)
     assert inventory.open_commands == (str(command.command_id),)
@@ -291,7 +291,7 @@ def test_non_quiescent_deployment_cannot_activate(control, state, work):
                 db.execute("INSERT INTO leases VALUES ('live', 'd', ?, 10, 10, 0, ?)", (OWNER, NOW.isoformat()))
     elif work == "claim":
         with control.transaction() as db:
-            db.execute("INSERT INTO dispatch_claims VALUES ('o/r', 'fix', 'issue:7', 'RESOLVE', ?, 1, 1, '[]', ?)",
+            db.execute("INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,owner_start_ticks,paths_json,claimed_at,occurrence_id) VALUES ('o/r', 'fix', 'issue:7', 'RESOLVE', ?, 1, 1, '[]', ?, 'claim:fixture')",
                        (OWNER, NOW.isoformat()))
     else:
         control.enqueue_command(command_for_action(

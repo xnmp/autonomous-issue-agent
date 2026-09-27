@@ -207,3 +207,226 @@ def test_histories_persisted_before_re_execution_counting_decode_as_none_spent()
     assert decode_workflow(json.dumps(raw), ActiveReconciliation) == history
     del raw["value"]["fields"]["reexecutions"]
     assert decode_workflow(json.dumps(raw), ActiveReconciliation) == ActiveReconciliation(now, now, 3, 0)
+
+
+def review_v24_proposal():
+    """Rebuild the domain decision independently of its frozen historical bytes."""
+    from pathlib import Path
+    from issue_agent.domain.review_workflow import (
+        BoundReviewSubmission, FreshReviewRequired, ReviewEpisode, ReviewWorkflowSnapshot,
+    )
+    from issue_agent.domain.review_workflow_policy import ReviewSubmissionReceipt, record_review
+    from issue_agent.domain.workflow import WorkflowChanged
+    from issue_agent.domain.workflow_identity import PullRequestRef
+
+    fixture = json.loads((Path(__file__).parents[1] / "fixtures/workflow_review_v24_observation.json").read_text())
+    facts = fixture["facts"]
+    prior = ReviewWorkflowSnapshot(
+        WorkflowRevision(WorkflowFence(WorkflowKey(facts["repository"], PullRequestRef(facts["pr_number"])),
+                                       facts["generation"]), facts["version"]),
+        FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, facts["rejection_epoch"]),
+        ReviewEpisode(facts["episode_id"], facts["guidance"], FreshReviewRequired(facts["owed_since_generation"])),
+    )
+    receipt = ReviewSubmissionReceipt(BoundReviewSubmission(CommandId(facts["command_id"]), prior.binding),
+                                      facts["head_sha"], facts["patch_id"], facts["receipt_id"], facts["escalated"])
+    proposal = record_review(prior, receipt)
+    assert isinstance(proposal, WorkflowChanged)
+    return fixture, proposal
+
+
+def activated_review_execution(state, *, imported=False):
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.review_execution import (
+        ActivatedReviewExecution, ImportedReviewSession, LaunchedReviewChild, ReusableReviewSession,
+        ReviewChildIdentity, ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint,
+        ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionPolicy, ReviewExecutionState,
+        ReviewRoundIdentity,
+    )
+
+    binding = ReviewExecutionBinding(state.binding, 3, "execution:codec")
+    source = (ImportedReviewSession("import:codec") if imported else
+              LaunchedReviewChild(ReviewChildIdentity(ReviewRoundIdentity(binding, "round:codec", 4),
+                                                       "review", "reviewer", ReviewChildKind.REVIEWER),
+                                  "run:codec", "launch:codec"))
+    execution = ReviewExecutionState(binding, failures=2, pin_deferrals=7,
+                                     session=ReusableReviewSession(RuntimeName.CLAUDE, "session:codec", source),
+                                     session_sequence=0 if imported else 4, displayed_round=3,
+                                     display_sequence=4, productive_sequence=4)
+    checkpoint = ReviewExecutionCheckpoint(6, execution, ReviewExecutionPolicy(free_pin_deferrals=1))
+    return ActivatedReviewExecution(ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:codec"),
+                                    checkpoint, execution, 6)
+
+
+def test_current_review_snapshot_has_a_distinct_tag_and_required_inactive_component():
+    from issue_agent.domain.review_execution import ExecutionNotActivated
+    from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
+
+    _, proposal = review_v24_proposal()
+    raw = json.loads(encode_workflow(proposal.snapshot))
+    assert raw["value"]["type"] == "ReviewWorkflowSnapshotV2"
+    assert raw["value"]["fields"]["execution"]["type"] == "ExecutionNotActivated"
+    recovered = decode_workflow(json.dumps(raw), ReviewWorkflowSnapshot)
+    assert recovered == proposal.snapshot and recovered.execution == ExecutionNotActivated()
+
+
+def test_exact_v24_review_snapshot_decodes_inactive_without_changing_baseline_or_revision():
+    from issue_agent.domain.review_execution import ExecutionNotActivated
+    from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
+
+    fixture, proposal = review_v24_proposal()
+    raw = json.loads(fixture["accepted_proposal"])["snapshot"]
+    assert json.loads(raw)["value"]["type"] == "ReviewWorkflowSnapshot"
+    recovered = decode_workflow(raw, ReviewWorkflowSnapshot)
+    assert recovered == proposal.snapshot
+    assert recovered.execution == ExecutionNotActivated()
+    assert recovered.revision.version == 8 and recovered.revision.fence.generation == 2
+    assert recovered.episode.continuation.head_sha == "a" * 40
+
+
+@pytest.mark.parametrize("change", ["old_extra_execution", "old_missing_intent", "new_missing_execution",
+                                     "new_null_execution", "new_unknown_execution", "new_unknown_field"])
+def test_review_snapshot_wire_evolution_never_synthesizes_missing_current_authority(change):
+    from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
+
+    fixture, proposal = review_v24_proposal()
+    raw = json.loads(json.loads(fixture["accepted_proposal"])["snapshot"] if change.startswith("old") else
+                     encode_workflow(proposal.snapshot))
+    fields_ = raw["value"]["fields"]
+    if change == "old_extra_execution":
+        fields_["execution"] = {"type": "ExecutionNotActivated", "fields": {}}
+    elif change == "old_missing_intent":
+        del fields_["intent"]
+    elif change == "new_missing_execution":
+        del fields_["execution"]
+    elif change == "new_null_execution":
+        fields_["execution"] = None
+    elif change == "new_unknown_execution":
+        fields_["execution"] = {"type": "UnknownReviewExecution", "fields": {}}
+    else:
+        fields_["future_allowance"] = 100
+    with pytest.raises(WorkflowEncodingError):
+        decode_workflow(json.dumps(raw), ReviewWorkflowSnapshot)
+
+
+@pytest.mark.parametrize("variant", ["inactive", "active_imported", "active_launched"])
+def test_review_family_envelope_and_snapshot_preserve_execution_policy_and_provenance(variant):
+    from issue_agent.domain.review_execution import ActivatedReviewExecution
+    from issue_agent.domain.review_workflow import ReviewFamilyEpisodes, ReviewWorkflowSnapshot
+
+    _, proposal = review_v24_proposal()
+    state = proposal.snapshot
+    assert isinstance(state, ReviewWorkflowSnapshot)
+    if variant != "inactive":
+        state = replace(state, execution=activated_review_execution(state, imported=variant == "active_imported"))
+    envelope = ReviewFamilyEpisodes(state.authority, state.episode, state.execution)
+    recovered = decode_workflow(encode_workflow(envelope), ReviewFamilyEpisodes)
+    recovered_state = decode_workflow(encode_workflow(state), ReviewWorkflowSnapshot)
+    assert recovered == envelope and recovered_state == state
+    if isinstance(recovered.execution, ActivatedReviewExecution):
+        assert recovered.execution.checkpoint.policy.free_pin_deferrals == 1
+        assert recovered.execution.state.failures == 2
+        assert recovered.execution.state.pin_deferrals == 7
+        assert recovered.execution.state.session.handle == "session:codec"
+        assert recovered.execution.state.session.source == state.execution.state.session.source
+
+
+@pytest.mark.parametrize("change", ["missing", "null", "unknown"])
+def test_review_family_envelope_requires_its_explicit_execution_variant(change):
+    from issue_agent.domain.review_workflow import ReviewFamilyEpisodes
+
+    _, proposal = review_v24_proposal()
+    state = proposal.snapshot
+    raw = json.loads(encode_workflow(ReviewFamilyEpisodes(state.authority, state.episode, state.execution)))
+    fields_ = raw["value"]["fields"]
+    if change == "missing":
+        del fields_["execution"]
+    else:
+        fields_["execution"] = None if change == "null" else {"type": "FutureExecution", "fields": {}}
+    with pytest.raises(WorkflowEncodingError):
+        decode_workflow(json.dumps(raw), ReviewFamilyEpisodes)
+
+
+def test_historical_review_observation_exact_replay_retains_accepted_semantics():
+    import hashlib
+    from issue_agent.adapters.workflow_commit import accepted_proposal, same_receipt
+
+    fixture, proposal = review_v24_proposal()
+    raw = fixture["accepted_proposal"]
+    assert hashlib.sha256(raw.encode()).hexdigest() == fixture["accepted_proposal_sha256"]
+    current = accepted_proposal(proposal)
+    assert current != raw
+    assert same_receipt(raw, proposal, current)
+    assert same_receipt(current, proposal, current)
+
+
+@pytest.mark.parametrize("change", ["baseline", "guidance", "gates", "execution", "audit", "commands", "mutation",
+                                     "expected", "outer_extra", "old_snapshot_extra"])
+def test_historical_review_observation_compatibility_does_not_accept_changed_facts(change):
+    from issue_agent.adapters.workflow_commit import accepted_proposal, same_receipt
+    from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
+
+    fixture, proposal = review_v24_proposal()
+    assert isinstance(proposal.snapshot, ReviewWorkflowSnapshot)
+    accepted = json.loads(fixture["accepted_proposal"])
+    if change in {"baseline", "guidance", "gates", "execution", "old_snapshot_extra"}:
+        snapshot_raw = json.loads(accepted["snapshot"])
+        fields_ = snapshot_raw["value"]["fields"]
+        if change == "baseline":
+            fields_["episode"]["fields"]["continuation"]["fields"]["head_sha"] = "b" * 40
+        elif change == "guidance":
+            fields_["episode"]["fields"]["guidance"] = "different guidance"
+        elif change == "gates":
+            fields_["gates"] = [json.loads(encode_workflow(snapshot().gates[0]))["value"]]
+        elif change == "execution":
+            snapshot_raw = json.loads(encode_workflow(replace(proposal.snapshot,
+                                                             execution=activated_review_execution(proposal.snapshot))))
+        else:
+            fields_["execution"] = {"type": "ExecutionNotActivated", "fields": {}}
+        accepted["snapshot"] = json.dumps(snapshot_raw, sort_keys=True, separators=(",", ":"))
+    elif change == "audit":
+        from issue_agent.domain.workflow import ObservedTransition
+        accepted["audit"] = encode_workflow(ObservedTransition(("submit:review-v24", "other:receipt")))
+    elif change == "commands":
+        accepted["commands"] = [{"id": "another-command"}]
+    elif change == "mutation":
+        accepted["mutation"] = "open_gate"
+    elif change == "expected":
+        accepted["expected"] = encode_workflow(replace(proposal.expected, version=6))
+    else:
+        accepted["unrecognized"] = "must refuse"
+    changed = json.dumps(accepted, sort_keys=True, separators=(",", ":"))
+    assert not same_receipt(changed, proposal, accepted_proposal(proposal))
+
+
+def test_historical_observation_replay_accepts_equivalent_caller_gate_order():
+    from issue_agent.adapters.workflow_commit import accepted_proposal, same_receipt
+    from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
+    from issue_agent.domain.review_workflow_policy import ReviewSubmissionReceipt, record_review
+
+    fixture, original = review_v24_proposal()
+    assert original.prior is not None
+    assert isinstance(original.snapshot, ReviewWorkflowSnapshot)
+    gate = OpenGate("z-gate", 2, RemoteOutcomeUncertain(CommandId("z-command"), datetime(2026, 9, 27, tzinfo=timezone.utc),
+                                                     1, "awaiting observation"), NoAuthorizedRemediation("reconcile"))
+    assert isinstance(gate.cause, RemoteOutcomeUncertain)
+    first = replace(gate, gate_id="a-gate", cause=replace(gate.cause, command_id=CommandId("a-command")))
+    prior = replace(original.prior, gates=(gate, first))
+    facts = fixture["facts"]
+    baseline = original.snapshot.episode.continuation
+    proposal = record_review(prior, ReviewSubmissionReceipt(baseline.source, facts["head_sha"], facts["patch_id"],
+                                                           facts["receipt_id"]))
+    from issue_agent.domain.workflow import WorkflowChanged
+    assert isinstance(proposal, WorkflowChanged)
+    current = accepted_proposal(proposal)
+    historical = json.loads(current)
+    encoded_snapshot = json.loads(historical["snapshot"])
+    encoded_snapshot["value"]["type"] = "ReviewWorkflowSnapshot"
+    del encoded_snapshot["value"]["fields"]["execution"]
+    historical["snapshot"] = json.dumps(encoded_snapshot, sort_keys=True, separators=(",", ":"))
+    raw = json.dumps(historical, sort_keys=True, separators=(",", ":"))
+    assert same_receipt(raw, proposal, current)
+    # Changed gate evidence is a changed accepted fact, even under canonical ordering.
+    changed = json.loads(historical["snapshot"])
+    changed["value"]["fields"]["gates"][0]["fields"]["cause"]["fields"]["last_error"] = "changed evidence"
+    historical["snapshot"] = json.dumps(changed, sort_keys=True, separators=(",", ":"))
+    assert not same_receipt(json.dumps(historical, sort_keys=True, separators=(",", ":")), proposal, current)

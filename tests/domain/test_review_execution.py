@@ -7,18 +7,19 @@ import pytest
 
 from issue_agent.domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from issue_agent.domain.review_execution import (
-    MAX_EXECUTION_SUFFIX, MAX_ROUND_CHILDREN, AddReviewStrike, ClearReviewSession,
+    MAX_EXECUTION_SUFFIX, MAX_ROUND_CHILDREN, ActivatedReviewExecution, AddReviewStrike, ClearReviewSession,
     CopiedReviewProgress, ImportedReviewSession, LaunchedReviewChild, NoReviewSession,
     PaidReviewProgress, PreserveDisplayedRound, PreserveReviewSession, ReplaceReviewSession,
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
-    ReviewExecutionState, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
+    ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
     SetDisplayedRound, compatible_review_session, project_review_execution,
 )
+from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
 from issue_agent.domain.workflow_identity import (
-    FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
+    FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
 )
 
 
@@ -400,3 +401,129 @@ def test_execution_values_are_immutable_and_empty_projection_preserves_initial_a
     assert result.state == initial.state and result.checkpoint == initial and result.latest_sequence == 0
     with pytest.raises(FrozenInstanceError):
         setattr(initial.state, "failures", 0)
+
+
+def activated(*, captured=None, origin=ReviewExecutionOriginKind.INITIALIZED, **state_fields):
+    initial = checkpoint(captured=captured, **state_fields)
+    return ActivatedReviewExecution(ReviewExecutionOrigin(origin, "origin:verified"), initial, initial.state, 0)
+
+
+def composed_review(component=None):
+    parent = binding().rejection
+    return ReviewWorkflowSnapshot(WorkflowRevision(parent.fence, 4), parent.authority,
+                                  ReviewEpisode(parent.episode_id, "preserve rejection guidance"),
+                                  execution=component or activated())
+
+
+def test_composed_execution_has_its_own_episode_without_replacing_rejection_authority():
+    state = composed_review()
+    assert state.binding == binding().rejection
+    assert state.execution.binding.execution_epoch == 2
+    assert state.execution.binding.execution_episode == "execution:1"
+    assert state.episode.episode_id == "rejections:1"
+    assert state.episode.guidance == "preserve rejection guidance"
+    envelope = ReviewFamilyEpisodes(state.authority, state.episode, state.execution)
+    assert envelope.execution == state.execution
+    with pytest.raises(FrozenInstanceError):
+        setattr(envelope, "execution", None)
+
+
+@pytest.mark.parametrize("mismatch", ["repository", "target", "generation", "rejection_epoch", "rejection_episode"])
+def test_execution_component_cannot_attach_to_another_parent_binding(mismatch):
+    parent = binding().rejection
+    if mismatch in {"repository", "target", "generation"}:
+        key = parent.fence.key
+        if mismatch == "repository":
+            key = WorkflowKey("other/repo", key.target)
+        elif mismatch == "target":
+            key = WorkflowKey(key.repository, PullRequestRef(99))
+        parent = replace(parent, fence=replace(parent.fence, key=key, generation=1 if mismatch == "generation" else 0))
+    elif mismatch == "rejection_epoch":
+        parent = replace(parent, authority=replace(parent.authority, epoch=99))
+    else:
+        parent = replace(parent, episode_id="another-rejection-episode")
+    component = activated(captured=replace(binding(), rejection=parent))
+    with pytest.raises(ValueError, match="review workflow binding"):
+        composed_review(component)
+    if mismatch in {"rejection_epoch", "rejection_episode"}:
+        state = composed_review()
+        with pytest.raises(ValueError, match="rejection authority"):
+            ReviewFamilyEpisodes(state.authority, state.episode, component)
+
+
+@pytest.mark.parametrize("mismatch", ["execution_epoch", "execution_episode"])
+def test_checkpoint_and_current_execution_cannot_mix_distinct_episodes(mismatch):
+    component = activated()
+    changed = replace(component.binding, **{mismatch: 3 if mismatch == "execution_epoch" else "another-execution"})
+    with pytest.raises(ValueError, match="different bindings"):
+        replace(component, state=replace(component.state, binding=changed))
+
+
+@pytest.mark.parametrize("field", ["session_sequence", "display_sequence", "productive_sequence"])
+def test_active_execution_rejects_a_current_watermark_beyond_its_last_allocated_round(field):
+    component = activated()
+    with pytest.raises(ValueError, match="future outcome"):
+        replace(component, state=replace(component.state, **{field: 2}), last_sequence=1)
+
+
+@pytest.mark.parametrize("invalid", [None, True, -1, 1.5, "1", 2**63])
+def test_active_execution_last_sequence_rejects_invalid_or_overflow_values(invalid):
+    with pytest.raises(ValueError):
+        replace(activated(), last_sequence=invalid)
+
+
+def test_checkpoint_cannot_cover_unallocated_rounds_or_disagree_with_its_complete_projection():
+    component = activated()
+    with pytest.raises(ValueError, match="exceeds allocated"):
+        replace(component, checkpoint=replace(component.checkpoint, through_sequence=1))
+    completed = project_review_execution(component.checkpoint, (failed(1),)).checkpoint
+    with pytest.raises(ValueError, match="completed checkpoint"):
+        replace(component, checkpoint=completed, state=replace(completed.state, failures=99), last_sequence=1)
+
+
+@pytest.mark.parametrize("origin", [ReviewExecutionOriginKind.INITIALIZED, ReviewExecutionOriginKind.RENEWED])
+def test_imported_session_can_only_enter_an_imported_execution_origin(origin):
+    session = ReusableReviewSession(RuntimeName.CLAUDE, "legacy:session", ImportedReviewSession("import:session"))
+    accepted = activated(origin=ReviewExecutionOriginKind.IMPORTED, failures=4, pin_deferrals=7, session=session)
+    assert accepted.state.failures == 4 and accepted.state.pin_deferrals == 7 and accepted.state.session == session
+    with pytest.raises(ValueError, match="imported execution origin"):
+        replace(accepted, origin=ReviewExecutionOrigin(origin, "new:origin"))
+
+
+@pytest.mark.parametrize("origin", [ReviewExecutionOriginKind.INITIALIZED, ReviewExecutionOriginKind.RENEWED])
+@pytest.mark.parametrize("field", ["failures", "pin_deferrals"])
+def test_new_execution_origin_cannot_invent_prior_failure_or_pin_history(origin, field):
+    with pytest.raises(ValueError, match="fresh execution origin"):
+        activated(origin=origin, **{field: 1})
+
+
+@pytest.mark.parametrize("receipt", [None, "", " ", "line\nbreak", True, 123, "x" * 513])
+def test_nonempty_checkpoint_receipt_identity_is_validated_when_supplied(receipt):
+    component = activated()
+    completed = project_review_execution(component.checkpoint, (failed(1),)).checkpoint
+    if receipt is None:
+        # An unverified candidate can exist in the pure domain; SQL loads require its receipt.
+        assert replace(component, checkpoint=completed, state=completed.state, last_sequence=1,
+                       checkpoint_receipt=None).checkpoint_receipt is None
+    else:
+        with pytest.raises(ValueError):
+            replace(component, checkpoint=completed, state=completed.state, last_sequence=1, checkpoint_receipt=receipt)
+
+
+def test_compaction_receipt_belongs_to_a_noninitial_checkpoint():
+    component = activated()
+    with pytest.raises(ValueError, match="initial execution checkpoint"):
+        replace(component, checkpoint_receipt="checkpoint:verified")
+    completed = project_review_execution(component.checkpoint, (failed(1),)).checkpoint
+    compacted = replace(component, checkpoint=completed, state=completed.state, last_sequence=1,
+                        checkpoint_receipt="checkpoint:verified")
+    assert compacted.checkpoint_receipt == "checkpoint:verified" and compacted.state.failures == 1
+
+
+@pytest.mark.parametrize("component", [None, "active", {}, 0])
+def test_snapshot_and_family_envelope_require_an_explicit_typed_execution_component(component):
+    state = composed_review()
+    with pytest.raises(ValueError, match="typed execution component"):
+        replace(state, execution=component)
+    with pytest.raises(ValueError, match="typed execution component"):
+        ReviewFamilyEpisodes(state.authority, state.episode, component)

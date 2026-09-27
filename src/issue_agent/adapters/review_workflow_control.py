@@ -87,6 +87,7 @@ from .workflow_commit import (
 from .workflow_rows import (
     WorkflowAuthorityError, active_families, load_family_authority, load_review_workflow_row, load_workflow_read,
     persist_workflow_snapshot, workflow_run_scope_bounds, workflow_scope,
+    insert_workflow_component, encode_workflow_episodes,
 )
 
 # Deployment barriers are always taken in this order (ADR 0015 acceptance).
@@ -814,9 +815,12 @@ class SQLiteReviewWorkflowControl:
             prior = load_review_workflow_row(db, key)
             if prior is not None:
                 return WorkflowCommitted(prior, idempotent=True)
+            if load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository) is not None:
+                raise WorkflowAuthorityError("activated review execution requires explicit composed initialization")
             snapshot = initial_review_workflow(key, authority)
             db.execute("INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
-                       (*workflow_scope(key), encode_workflow((authority, snapshot.episode))))
+                       (*workflow_scope(key), encode_workflow_episodes(snapshot)))
+            insert_workflow_component(db, key, authority, snapshot.episode.episode_id)
             self._insert_evidence(db, key, recorded)
             self._control._transition(db, "workflow", encode_workflow(key), "discovered",
                                       {"generation": 0, "version": 0, "epoch": authority.epoch})

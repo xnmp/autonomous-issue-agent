@@ -1,7 +1,7 @@
 # Phase 4 — review execution persistence map
 
-Date: 2026-09-27. **Implementation recommendation; canonical shape selected,
-remaining schema/transaction details pending.** This read-only analysis supports the
+Date: 2026-09-27. **Canonical shape and schema v25 implemented; admission and
+settlement transactions remain pending.** This record supports the
 [review execution design](2026-09-27-phase-4-review-execution-design.md) and
 [implementation conventions](2026-09-27-phase-4-conventions.md). It does not
 authorize activation or supersede those documents. The parent owns canonical
@@ -11,14 +11,14 @@ Parent decision: add the explicit execution field to `ReviewWorkflowSnapshot`
 and persist a tagged `ReviewFamilyEpisodes` envelope containing rejection
 authority, rejection episode and execution component. Execution is not a field
 of the rejection-owned `ReviewEpisode`. Resolve retains its existing pair
-encoding. Planned child stages and finalization contracts must be settled before
-freezing schema v25; the pure projection checkpoint alone is not cutover.
+encoding. Planned child stages and finalization contracts were settled before
+schema v25. This persistence checkpoint does not activate execution authority.
 
 ## Canonical payload
 
-`workflows.episode_json` currently stores the encoded pair `(authority,
-episode)`, not a complete `ReviewWorkflowSnapshot`. There are two reasonable
-ways to persist the execution component:
+Legacy `workflows.episode_json` stores the encoded pair `(authority, episode)`.
+Current PR writes store the tagged `ReviewFamilyEpisodes` envelope. The design
+considered two shapes:
 
 - Add `ExecutionNotActivated | ActivatedReviewExecution` to `ReviewEpisode`.
   This preserves the outer pair and changes fewer persistence call sites, but
@@ -51,6 +51,15 @@ The round table records evidence for the existing reconciler; it does not
 dispatch work or create a second queue. Allocate the preflight sequence and
 advance the parent CAS version in one transaction, including free rounds.
 Actual child admission remains a separate paid reservation transaction.
+
+Schema v25 also gives each dispatch claim an immutable occurrence ID. Migration
+backfills live v24 claims with an explicit `legacy:` identity and a created
+receipt with owner/process/leg/time. New claims retain created, released and
+reclaimed receipts in the existing dedupe table. The active loader verifies a
+compacted prefix against an exact checkpoint receipt, refuses open prefix
+rounds, and derives current state from typed suffix closure facts. A running
+claim row's disappearance alone is not parent abandonment evidence; later
+finalization must join the exact occurrence and fenced terminal receipt.
 
 Family retention can no longer infer every PR family from any PR row.
 `load_family_authority(REVIEW_EXECUTION)` must inspect explicit component,
@@ -122,10 +131,10 @@ continue to own effect ordering.
 
 ## Construction boundary
 
-First define pure execution, round, outcome, return and canonical-composition
-values and their behavioral contracts. The parent then selects the exact v25
-projection shape before persistence work. Schema migration and strict canonical
-decoding fence old binaries; supported rollback retains both SQL authorities.
+Pure execution, round, outcome and canonical-composition values now exist.
+Schema v25 and strict canonical decoding fence old binaries; supported rollback
+retains both SQL authorities. Round admission, launch and return settlement
+remain the next transaction boundary.
 No runtime cutover or selected file-API removal precedes composed acceptance.
 
 ## Migration and codec acceptance checklist
