@@ -1,10 +1,8 @@
 """Transaction-local review execution preflight over a live parent claim."""
 
 from dataclasses import replace
-import json
 import sqlite3
 
-from ..domain.actions import AgentKind
 from ..domain.fix import breaker_key
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import ActivatedReviewExecution
@@ -21,19 +19,17 @@ from .control_store import SQLiteControlStore, _stamp
 from .deployment_authority import deployment_role
 from .review_effects import ReviewReads, read_pull_request
 from .review_dispatch_holds import review_release_projection, unresolved_review_submissions
+from .review_execution_claims import (
+    PREFLIGHT_NAMESPACE, load_review_preflight_record, require_review_parent_claim,
+)
 from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
     REVIEW_STAGE_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
-    require_review_stage_receipts, review_stage_receipt_key,
+    review_stage_receipt_key,
 )
-
-
-_PREFLIGHT_NAMESPACE = "review-round-preflight"
-_CLAIM_NAMESPACE = "dispatch-claim-lifecycle"
-_REVIEW_CLAIM_LEGS = frozenset({AgentKind.REVIEW.name, AgentKind.RE_REVIEW.name})
 
 
 class SQLiteReviewExecutionControl:
@@ -53,42 +49,7 @@ class SQLiteReviewExecutionControl:
     def _stored_round(
         self, db: sqlite3.Connection, request_id: str,
     ) -> tuple[ReviewPreflightSelection, ReviewRoundPlan, ReviewRoundPlan, sqlite3.Row] | None:
-        row = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (_PREFLIGHT_NAMESPACE, self._writer.repository, request_id),
-        ).fetchone()
-        if row is None:
-            return None
-        stored = decode_workflow(row["payload_json"], tuple)
-        if (len(stored) != 3 or not isinstance(stored[0], ReviewPreflightSelection)
-                or stored[0].request_id != request_id or stored[1] != self._writer.owner_id
-                or not isinstance(stored[2], ReviewRoundPlan)):
-            raise WorkflowAuthorityError("review preflight receipt contains conflicting facts")
-        selection, plan = stored[0], stored[2]
-        if plan.round.round_id != request_id or plan.round.binding != selection.binding:
-            raise WorkflowAuthorityError("review preflight receipt disagrees with its round identity")
-        round_row = db.execute(
-            "SELECT * FROM review_execution_rounds WHERE round_id=?", (request_id,),
-        ).fetchone()
-        if round_row is None or round_row["claim_occurrence_id"] != selection.claim_occurrence_id:
-            raise WorkflowAuthorityError("review preflight receipt lacks its exact durable round")
-        current_plan = decode_workflow(round_row["plan_json"], ReviewRoundPlan)
-        if replace(plan, stages=current_plan.stages, submissions=current_plan.submissions) != current_plan:
-            raise WorkflowAuthorityError("review preflight receipt disagrees with its evolved round plan")
-        identity = plan.round
-        binding = identity.binding
-        if (
-            round_row["repository"] != selection.expected.fence.key.repository
-            or round_row["target_kind"] != "pr"
-            or round_row["target_number"] != selection.expected.fence.key.target.number
-            or round_row["execution_epoch"] != binding.execution_epoch
-            or round_row["execution_episode"] != binding.execution_episode
-            or round_row["generation"] != binding.rejection.fence.generation
-            or round_row["sequence"] != identity.sequence
-        ):
-            raise WorkflowAuthorityError("review preflight receipt disagrees with its round index")
-        require_review_stage_receipts(db, self._writer.repository, current_plan)
-        return selection, plan, current_plan, round_row
+        return load_review_preflight_record(db, self._writer.repository, self._writer.owner_id, request_id)
 
     def _receipt(self, db: sqlite3.Connection, selection: ReviewPreflightSelection) -> ReviewRoundPlan | None:
         stored = self._stored_round(db, selection.request_id)
@@ -117,36 +78,6 @@ class SQLiteReviewExecutionControl:
         if recorded != (round_id, stage) or existing != stage:
             raise WorkflowAuthorityError("review stage receipt conflicts with its canonical plan")
         return True
-
-    def _claim(self, db: sqlite3.Connection, selection: ReviewPreflightSelection) -> None:
-        target = f"issue:{selection.claim_target}" if selection.claim_target > 0 else f"pr:{-selection.claim_target}"
-        claim = db.execute(
-            "SELECT * FROM dispatch_claims WHERE repository=? AND role='review' AND target=?",
-            (self._writer.repository, target),
-        ).fetchone()
-        if (claim is None or claim["occurrence_id"] != selection.claim_occurrence_id
-                or claim["owner_id"] != self._writer.owner_id or claim["leg"] not in _REVIEW_CLAIM_LEGS):
-            raise WorkflowAuthorityError("review parent dispatch claim is absent, changed or unowned")
-        created = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (_CLAIM_NAMESPACE, self._writer.repository, f"{selection.claim_occurrence_id}:created"),
-        ).fetchone()
-        try:
-            fact = json.loads(created["payload_json"]) if created is not None else None
-        except (TypeError, json.JSONDecodeError) as exc:
-            raise WorkflowAuthorityError("review parent claim creation receipt is unreadable") from exc
-        if not isinstance(fact, dict) or fact != {
-            "role": "review", "target": target, "leg": claim["leg"], "owner_id": claim["owner_id"],
-            "owner_pid": claim["owner_pid"], "owner_start_ticks": claim["owner_start_ticks"],
-            "claimed_at": claim["claimed_at"], "source": fact.get("source"),
-        } or fact["source"] not in ("admission", "v24-migration"):
-            raise WorkflowAuthorityError("review parent claim disagrees with its creation receipt")
-        if db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key IN (?,?) LIMIT 1",
-            (_CLAIM_NAMESPACE, self._writer.repository, f"{selection.claim_occurrence_id}:released",
-             f"{selection.claim_occurrence_id}:reclaimed"),
-        ).fetchone() is not None:
-            raise WorkflowAuthorityError("review parent claim has a contradictory terminal receipt")
 
     def preflight(self, selection: ReviewPreflightSelection) -> ReviewRoundPlan:
         """Mint one free round after a fresh gateway read; replay is exact and inert."""
@@ -191,16 +122,10 @@ class SQLiteReviewExecutionControl:
             prior = self._receipt(db, selection)
             if prior is not None:
                 return prior
-            self._claim(db, selection)
-            current_claim = db.execute(
-                "SELECT owner_pid,owner_start_ticks FROM dispatch_claims "
-                "WHERE repository=? AND role='review' AND occurrence_id=?",
-                (self._writer.repository, selection.claim_occurrence_id),
-            ).fetchone()
-            if current_claim is None or (current_claim["owner_pid"], current_claim["owner_start_ticks"]) != (
-                parent_pid, parent_start_ticks,
-            ):
-                raise WorkflowAuthorityError("review parent claim process identity changed during preflight")
+            require_review_parent_claim(
+                db, self._writer.repository, self._writer.owner_id, selection.claim_occurrence_id,
+                selection.claim_target, probed_identity=(parent_pid, parent_start_ticks),
+            )
             if selection.claim_target > 0 and linked_issue_workflow_holds(
                 db, WorkflowKey(key.repository, IssueRef(selection.claim_target)),
             ):
@@ -237,7 +162,7 @@ class SQLiteReviewExecutionControl:
             persist_workflow_snapshot(db, after)
             db.execute(
                 "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                (_PREFLIGHT_NAMESPACE, key.repository, selection.request_id, _stamp(now),
+                (PREFLIGHT_NAMESPACE, key.repository, selection.request_id, _stamp(now),
                  encode_workflow((selection, self._writer.owner_id, plan))),
             )
             self._control._transition(db, "review_round", plan.round.round_id, "preflight_open", {
@@ -282,16 +207,10 @@ class SQLiteReviewExecutionControl:
             selection, _, current, row = stored
             if self._stage_receipt(db, round_id, stage, current):
                 return current
-            self._claim(db, selection)
-            claim = db.execute(
-                "SELECT owner_pid,owner_start_ticks FROM dispatch_claims "
-                "WHERE repository=? AND role='review' AND occurrence_id=?",
-                (self._writer.repository, selection.claim_occurrence_id),
-            ).fetchone()
-            if claim is None or (claim["owner_pid"], claim["owner_start_ticks"]) != (
-                parent_pid, parent_start_ticks,
-            ):
-                raise WorkflowAuthorityError("review parent claim process identity changed during stage planning")
+            require_review_parent_claim(
+                db, self._writer.repository, self._writer.owner_id, selection.claim_occurrence_id,
+                selection.claim_target, probed_identity=(parent_pid, parent_start_ticks),
+            )
             if (not isinstance(decode_workflow(row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned),
                                ReviewPlanningOpen)
                     or row["closure_json"] is not None or row["outcome_json"] is not None):

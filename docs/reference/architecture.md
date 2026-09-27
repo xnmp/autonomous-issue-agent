@@ -486,7 +486,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_activation.py`, `domain/review_exemptions.py`, `domain/review_linkage.py`,
 `domain/review_execution.py` (phase-4 pure ordered execution projection; runtime cutover pending),
 `domain/review_rounds.py` (pure outer-round plans, verified evidence and finalization),
-`domain/review_preflight.py` (pure selection of a bounded review round under captured execution authority),
+`domain/review_preflight.py` (pure round selection and current paid-work eligibility under captured execution authority),
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
 `domain/review_rearm.py`, `domain/review_control.py`, `domain/review_dispatch_record.py`,
 `domain/review_evidence.py`, `domain/deployment.py`
@@ -527,6 +527,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
+`adapters/review_execution_claims.py` (exact parent claim and lifecycle receipt validation),
 `adapters/review_execution_control.py` (unpaid review-round preflight under exact claim authority),
 `adapters/review_workflow_control.py` (the review owner's generation-fenced
 commit boundary: store-minted facts, barrier-ordered acceptance, bounded

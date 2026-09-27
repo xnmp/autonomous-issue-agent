@@ -10,7 +10,7 @@ from enum import Enum
 
 from .agent_task import RuntimeCapabilities, RuntimeName
 from .workflow_identity import (
-    PullRequestRef, WorkflowBinding, WorkflowFamily,
+    PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowRevision,
     validate_workflow_identifier as identifier,
     validate_workflow_integer as integer,
 )
@@ -69,6 +69,27 @@ class ReviewChildIdentity:
             raise ValueError("review child requires a round and typed role")
         identifier(self.stage_id, "review stage")
         identifier(self.child_id, "review child")
+
+
+@dataclass(frozen=True)
+class ReviewChildAdmission:
+    """One budget reservation attached to a planned child; no launch is implied."""
+
+    child: ReviewChildIdentity
+    run_id: str
+    reservation_id: str
+    claim_occurrence_id: str
+    admitted_revision: WorkflowRevision
+    owner_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.child, ReviewChildIdentity):
+            raise ValueError("review admission requires one planned child")
+        for name in ("run_id", "reservation_id", "claim_occurrence_id", "owner_id"):
+            identifier(getattr(self, name), f"review admission {name}")
+        if (not isinstance(self.admitted_revision, WorkflowRevision)
+                or self.admitted_revision.fence != self.child.round.binding.rejection.fence):
+            raise ValueError("review admission revision disagrees with its child binding")
 
 
 @dataclass(frozen=True)

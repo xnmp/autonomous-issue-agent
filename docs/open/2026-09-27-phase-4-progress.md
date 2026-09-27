@@ -140,16 +140,40 @@ This checkpoint does not admit or launch any child. The next boundary must
 join a planned child and exact parent occurrence to run/budget reservation in
 one transaction; reservation alone cannot prove launch.
 
+## Checkpoint 6 — paid planned-child admission (accepted)
+
+`ReservationRequest` now captures a typed planned review child alongside its
+rejection binding. Active review execution requires that child; inactive
+execution retains the earlier bound-review path. The reservation writer probes
+the selected parent process outside SQLite, then rechecks its exact claim
+occurrence, creation and terminal receipts, current dual binding, open plan,
+stage receipts, linked issue holds, submission/release holds, failure ceiling
+and reviewed-head baseline inside the budget transaction. Retained workflow
+authority is checked before admitting any unbound legacy review run.
+
+One transaction now attaches the round and child to the run, reserves money,
+records the parent claim/run link, advances the aggregate revision and mints an
+immutable `review-execution-admission` receipt. Exhaustion and late insertion
+failures roll back every effect. Exact replay compares the captured child,
+round, binding, receipt and canonical revision; changed work conflicts.
+Independent review reproduced and verified fixes for current allowance and
+baseline changes, forged future admission revision, and missing activation
+rows despite retained execution authority. Reservation records admission
+only; lease registration and launch evidence remain the next boundary.
+Final `make test` passed with 3,093 domain, 2,577 adapter and 2,863 app
+tests, plus hooks, governor, gate parity, four import contracts and both
+Pyrefly passes. Ten strict xfails remained expected. Local log:
+`/tmp/phase4-admission-verified-full.log` (ephemeral).
+
 ## Required subsequent work
 
-- Planned immutable child stages and sealed outer outcomes; evidence-based
-  finalization after parent/claim abandonment. Distinguish guarded launch,
+- Guarded launch, returned evidence, then sealed outer outcomes and
+  evidence-based finalization after parent/claim abandonment. Distinguish
   released-before-launch and settled-without-launch evidence; preserve actual
   accounting and bound unpaid preparation faults through evidence holds.
-- Indexed round/admission/return receipts and transactional projection over
-  the canonical v25 component; guarded-launch and exact claim occurrence proof.
-- Actual admission/return accounting transactions and productive submission
-  settlement; real multi-child recovery and free copied-verdict capture.
+- Return receipts and transactional projection over the canonical v25
+  component; productive submission settlement, real multi-child recovery and
+  free copied-verdict capture.
 - Distinct verdict-release and execution-ceiling recovery with one aggregate
   intent, preserving rejection allowance and other holds.
 - Offline import/shadow/rehearsal/activation, strict provenance for inherited

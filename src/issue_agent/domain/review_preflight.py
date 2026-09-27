@@ -54,6 +54,21 @@ class ReviewPreflightSelection:
         integer(self.failure_ceiling, "review failure ceiling")
 
 
+def require_review_execution_eligibility(
+    snapshot: ReviewWorkflowSnapshot, head_sha: str, failure_ceiling: int,
+) -> None:
+    """Current paid-work allowance for an already selected review head."""
+    if not isinstance(snapshot.execution, ActivatedReviewExecution):
+        raise ValueError("review execution activation is required")
+    if snapshot.gates or isinstance(snapshot.intent, PendingReviewRearm):
+        raise ValueError("review execution is held by workflow recovery")
+    if failure_ceiling and snapshot.execution.state.failures >= failure_ceiling:
+        raise ValueError("the review execution allowance is exhausted")
+    continuation = snapshot.episode.continuation
+    if isinstance(continuation, ReviewedBaseline) and continuation.head_sha == head_sha:
+        raise ValueError("the current review head already has a settled baseline")
+
+
 def plan_review_preflight(
     snapshot: ReviewWorkflowSnapshot, selection: ReviewPreflightSelection, *, now: datetime,
 ) -> ReviewRoundPlan:
@@ -66,8 +81,6 @@ def plan_review_preflight(
         raise ValueError("review execution activation is required")
     if snapshot.revision != selection.expected or snapshot.execution.binding != selection.binding:
         raise ValueError("review preflight captured a stale aggregate revision or execution binding")
-    if snapshot.gates or isinstance(snapshot.intent, PendingReviewRearm):
-        raise ValueError("review preflight is held by workflow recovery")
     observed = selection.observation
     if observed.state is not PullRequestState.OPEN or not isinstance(observed.reviews, CompleteReviews):
         raise ValueError("review preflight requires an open pull request and complete reviews")
@@ -75,14 +88,10 @@ def plan_review_preflight(
         raise ValueError("review preflight observation is stale or from the future")
     if selection.trigger_label not in observed.labels or labels_holding_review(observed.labels):
         raise ValueError("review preflight trigger is absent or the pull request is held")
-    continuation = snapshot.episode.continuation
-    if isinstance(continuation, ReviewedBaseline) and continuation.head_sha == observed.head_sha:
-        raise ValueError("the current review head already has a settled baseline")
+    require_review_execution_eligibility(snapshot, observed.head_sha, selection.failure_ceiling)
     state = snapshot.execution.state
     if snapshot.execution.last_sequence - snapshot.execution.checkpoint.through_sequence >= MAX_EXECUTION_SUFFIX:
         raise ValueError("review execution requires checkpoint compaction before another round")
-    if selection.failure_ceiling and state.failures >= selection.failure_ceiling:
-        raise ValueError("the review execution allowance is exhausted")
     session = compatible_review_session(state.session, selection.runtime, RUNTIME_CAPABILITIES[selection.runtime])
     reuse = ReviewSessionReuse.REUSABLE if isinstance(session, ReusableReviewSession) else ReviewSessionReuse.FRESH
     integer(snapshot.execution.last_sequence + 1, "next review round sequence", minimum=1)

@@ -50,6 +50,9 @@ from ..domain.workflow import (
     AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveEpisode, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
+from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildIdentity
+from ..domain.review_preflight import require_review_execution_eligibility
+from ..domain.review_rounds import ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
     ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX, CeilingEscalation, ReviewSubmissionReceipt,
@@ -92,7 +95,8 @@ from .deployment_authority import (
     deployment_role,
 )
 from .review_effects import bound_submission_op, review_family_op
-from .workflow_codec import decode_workflow, encode_workflow
+from .review_execution_claims import load_review_preflight_record, require_review_parent_claim
+from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 25
@@ -581,6 +585,7 @@ class ReservationRequest:
     owner_id: str = "reservation"
     workflow: WorkflowBinding | None = None
     adjudication_ceiling: int | None = None
+    review_child: ReviewChildIdentity | None = None
 
     def __post_init__(self) -> None:
         workload_repository = canonical_repository(
@@ -598,6 +603,12 @@ class ReservationRequest:
             validate_workflow_integer(self.adjudication_ceiling, "adjudication ceiling")
             if self.workflow is None or self.kind != ResolveStage.ADJUDICATE.value:
                 raise ValueError("adjudication ceiling requires a bound adjudication admission")
+        if self.review_child is not None and (
+            not isinstance(self.review_child, ReviewChildIdentity)
+            or self.workflow != self.review_child.round.binding.rejection
+            or self.kind not in _REVIEW_PAID_KINDS
+        ):
+            raise ValueError("planned review child requires its matching rejection binding and review leg")
         if self.scope.currency != self.quote.maximum_charge.currency:
             raise ValueError("reservation scope and quote currency differ")
         if self.cap.currency != self.scope.currency:
@@ -3822,11 +3833,32 @@ class SQLiteControlStore:
         try:
             with deployment_effect_authority(self.path, request.workload_repository,
                                              deployment_role(request.workload_repository, request.owner_id), blocking=False):
-                return self._reserve(request, lease=lease)
-        except OSError as exc:
+                parent_identity = self._review_parent_identity(request) if request.review_child is not None else None
+                return self._reserve(request, lease=lease, review_parent_identity=parent_identity)
+        except (OSError, sqlite3.DatabaseError) as exc:
             return ReservationResult(AccountingDisposition.UNAVAILABLE, None,
                 Money.zero(request.scope.currency), request.quote.maximum_charge,
                 request.cap, f"deployment effect authority unavailable: {exc}")
+
+    def _review_parent_identity(self, request: ReservationRequest) -> tuple[int, int] | None:
+        """Probe the selected parent outside SQLite's write transaction."""
+        if request.review_child is None:
+            return None
+        with closing(self._connect()) as db:
+            db.execute("BEGIN")
+            if db.execute("SELECT 1 FROM budget_reservations WHERE run_id=?", (str(request.run_id),)).fetchone():
+                return None
+            row = db.execute(
+                "SELECT dc.owner_pid,dc.owner_start_ticks FROM review_execution_rounds rr "
+                "JOIN dispatch_claims dc ON dc.repository=rr.repository AND dc.occurrence_id=rr.claim_occurrence_id "
+                "WHERE rr.round_id=? AND rr.repository=? AND dc.role='review'",
+                (request.review_child.round.round_id, request.workload_repository),
+            ).fetchone()
+        if row is None:
+            return None
+        from .process_supervisor import ProcessSupervisor
+        identity = (row["owner_pid"], row["owner_start_ticks"])
+        return identity if ProcessSupervisor.matches_identity(*identity) else None
 
     @contextmanager
     def workspace_entry_authority(self, request: ReservationRequest) -> Iterator[EpisodeWorkspacePrepared | None]:
@@ -3860,8 +3892,11 @@ class SQLiteControlStore:
     def _reserve(
         self, request: ReservationRequest, *, lease: Lease | None = None,
         workspace_verified: EpisodeWorkspacePrepared | None = None,
+        review_parent_identity: tuple[int, int] | None = None,
     ) -> ReservationResult:
         requested = request.quote.maximum_charge
+        if request.review_child is not None and lease is not None:
+            raise ValueError("planned review admission cannot register a process lease")
         if lease is not None and (
             lease.run_id != request.run_id
             or lease.dispatch_id != request.dispatch_id
@@ -3901,7 +3936,10 @@ class SQLiteControlStore:
                         request.cap,
                         "idempotent reservation" if identical else "conflicting reservation",
                     )
-                workflow_snapshot = self._validate_workflow_reservation(db, request, workspace_verified=workspace_verified)
+                workflow_snapshot = self._validate_workflow_reservation(
+                    db, request, workspace_verified=workspace_verified,
+                    review_parent_identity=review_parent_identity,
+                )
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
                     settled, reserved = self._balance(db, limit.scope)
@@ -3922,11 +3960,14 @@ class SQLiteControlStore:
                             limit.scope.dimension,
                         )
                 now = _stamp(self._now())
-                if workflow_snapshot is not None:
+                if isinstance(workflow_snapshot, ReviewWorkflowSnapshot):
+                    self._record_review_admission(db, request, workflow_snapshot, now)
+                elif workflow_snapshot is not None:
                     self._record_workflow_admission(db, request, workflow_snapshot, now)
                 db.execute(
                     "INSERT INTO runs(run_id, dispatch_id, kind, owner_id, state, "
-                    "config_version, workflow_binding_json, workflow_episode_key) VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?)",
+                    "config_version, workflow_binding_json, workflow_episode_key,review_round_id,review_child_id) "
+                    "VALUES (?, ?, ?, ?, 'reserved', ?, ?, ?, ?, ?)",
                     (
                         str(request.run_id),
                         request.dispatch_id,
@@ -3935,6 +3976,8 @@ class SQLiteControlStore:
                         request.config_version,
                         encode_workflow(request.workflow) if request.workflow is not None else None,
                         workflow_episode_key(request.workflow) if request.workflow is not None else None,
+                        request.review_child.round.round_id if request.review_child is not None else None,
+                        request.review_child.child_id if request.review_child is not None else None,
                     ),
                 )
                 db.execute(
@@ -3975,6 +4018,21 @@ class SQLiteControlStore:
                     ") VALUES (?, 'spawn_pending', NULL, ?)",
                     (str(request.run_id), now),
                 )
+                if request.review_child is not None:
+                    recorded = load_review_preflight_record(
+                        db, request.workload_repository, request.owner_id,
+                        request.review_child.round.round_id,
+                    )
+                    if recorded is None:
+                        raise WorkflowAuthorityError("review admission lost its preflight receipt")
+                    selection = recorded[0]
+                    target = (f"issue:{selection.claim_target}" if selection.claim_target > 0
+                              else f"pr:{-selection.claim_target}")
+                    db.execute(
+                        "INSERT INTO dispatch_claim_runs(repository,role,target,run_id,bound_at) "
+                        "VALUES (?,'review',?,?,?)",
+                        (request.workload_repository, target, str(request.run_id), now),
+                    )
                 for limit in limits:
                     db.execute(
                         "INSERT INTO reservation_limits("
@@ -4077,7 +4135,7 @@ class SQLiteControlStore:
                 request.cap,
                 str(exc),
             )
-        except (sqlite3.DatabaseError, OSError, WorkflowAuthorityError) as exc:
+        except (sqlite3.DatabaseError, OSError, WorkflowAuthorityError, WorkflowEncodingError) as exc:
             return ReservationResult(
                 AccountingDisposition.UNAVAILABLE,
                 None,
@@ -4087,15 +4145,17 @@ class SQLiteControlStore:
                 str(exc),
             )
 
-    @staticmethod
-    def _validate_workflow_reservation(db: sqlite3.Connection, request: ReservationRequest, *, workspace_verified: EpisodeWorkspacePrepared | None = None) -> WorkflowSnapshot | None:
+    def _validate_workflow_reservation(
+        self, db: sqlite3.Connection, request: ReservationRequest, *,
+        workspace_verified: EpisodeWorkspacePrepared | None = None,
+        review_parent_identity: tuple[int, int] | None = None,
+    ) -> WorkflowSnapshot | ReviewWorkflowSnapshot | None:
         binding = request.workflow
-        families = {
-            row["family"] for row in db.execute(
-                "SELECT family FROM workflow_authority_epochs WHERE repository=?", (request.workload_repository,),
-            ).fetchall()
-        }
-        if binding is None and not families & {WorkflowFamily.RESOLVE.value, WorkflowFamily.REVIEW_REJECTIONS.value}:
+        families = {family.value for family in active_families(db, request.workload_repository)}
+        if binding is None and not families & {
+            WorkflowFamily.RESOLVE.value, WorkflowFamily.REVIEW_REJECTIONS.value,
+            WorkflowFamily.REVIEW_EXECUTION.value,
+        }:
             return
         try:
             role = deployment_role(request.workload_repository, request.owner_id)
@@ -4107,14 +4167,15 @@ class SQLiteControlStore:
             # Once review rejection is active every paid review is bound, so
             # no unbound review run can overlap a re-arm (ADR 0015 quiescence).
             if (role == "review" and request.kind in _REVIEW_PAID_KINDS
-                    and WorkflowFamily.REVIEW_REJECTIONS.value in families):
+                    and families & {WorkflowFamily.REVIEW_REJECTIONS.value,
+                                    WorkflowFamily.REVIEW_EXECUTION.value}):
                 raise WorkflowAuthorityError("activated review admission requires a captured workflow binding")
             return
         if binding.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
             if role != "review" or request.kind not in _REVIEW_PAID_KINDS:
                 raise WorkflowAuthorityError("review rejection admission requires the review owner's review leg")
             try:
-                require_review_binding(db, binding)
+                snapshot = require_review_binding(db, binding)
                 dispatch = json.loads(request.dispatch_id)
             except (ValueError, TypeError) as exc:
                 raise WorkflowAuthorityError(str(exc)) from exc
@@ -4128,6 +4189,15 @@ class SQLiteControlStore:
                 holds = linked_issue_workflow_holds(db, WorkflowKey(binding.fence.key.repository, IssueRef(issue)))
                 if holds:
                     raise WorkflowAuthorityError(f"linked issue #{issue}: {'; '.join(holds)}")
+            if isinstance(snapshot.execution, ActivatedReviewExecution):
+                if request.review_child is None:
+                    raise WorkflowAuthorityError("active review execution requires a planned child")
+                self._validate_review_child_reservation(
+                    db, request, snapshot, dispatch, review_parent_identity,
+                )
+                return snapshot
+            if request.review_child is not None:
+                raise WorkflowAuthorityError("review execution child belongs to an inactive component")
             # The run row records the captured binding (and so its generation);
             # this transaction proved it current and ungated. Review has no
             # ordered continuation to receipt, unlike resolve.
@@ -4161,6 +4231,50 @@ class SQLiteControlStore:
             return snapshot
         except (ValueError, TypeError) as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
+
+    def _validate_review_child_reservation(
+        self, db: sqlite3.Connection, request: ReservationRequest,
+        snapshot: ReviewWorkflowSnapshot, dispatch: dict[str, object],
+        parent_identity: tuple[int, int] | None,
+    ) -> None:
+        child = request.review_child
+        if child is None or parent_identity is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+            raise WorkflowAuthorityError("review child admission lacks its live parent or execution authority")
+        recorded = load_review_preflight_record(
+            db, request.workload_repository, request.owner_id, child.round.round_id,
+        )
+        if recorded is None:
+            raise WorkflowAuthorityError("review child admission lacks its exact preflight receipt")
+        selection, _, plan, row = recorded
+        if (child.round.binding != snapshot.execution.binding or child not in plan.children
+                or not isinstance(decode_workflow(
+                    row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+                ), ReviewPlanningOpen)
+                or row["closure_json"] is not None or row["outcome_json"] is not None):
+            raise WorkflowAuthorityError("review child is unplanned, stale or sealed")
+        try:
+            require_review_execution_eligibility(snapshot, plan.head_sha, plan.failure_ceiling)
+        except ValueError as exc:
+            raise WorkflowAuthorityError(str(exc)) from exc
+        if (dispatch.get("kind") != request.kind or dispatch.get("claim_target") != selection.claim_target
+                or not isinstance(dispatch.get("leg_id"), str) or not dispatch["leg_id"]
+                or (selection.claim_target > 0 and dispatch.get("issue") != selection.claim_target)
+                or (selection.claim_target < 0 and dispatch.get("issue") is not None)):
+            raise WorkflowAuthorityError("review child dispatch identity disagrees with its preflight")
+        require_review_parent_claim(
+            db, request.workload_repository, request.owner_id, selection.claim_occurrence_id,
+            selection.claim_target, probed_identity=parent_identity,
+        )
+        from .review_dispatch_holds import review_release_projection, unresolved_review_submissions
+        from ..domain.review_rearm import ReleaseStatus
+        from ..domain.workflow_identity import WorkflowWriter
+        if unresolved_review_submissions(db, self, snapshot.binding):
+            raise WorkflowAuthorityError("review child admission is held by unresolved submission")
+        release = review_release_projection(
+            db, WorkflowWriter(request.workload_repository, "review", request.owner_id), snapshot,
+        )
+        if release is not None and release.status is not ReleaseStatus.VERIFIED:
+            raise WorkflowAuthorityError("review child admission is held by release projection")
 
     @staticmethod
     def _record_workflow_admission(
@@ -4200,6 +4314,38 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError(f"invalid workflow admission: {exc}") from exc
 
     @staticmethod
+    def _record_review_admission(
+        db: sqlite3.Connection, request: ReservationRequest,
+        snapshot: ReviewWorkflowSnapshot, now: str,
+    ) -> None:
+        child = request.review_child
+        if child is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+            raise WorkflowAuthorityError("review admission requires an active planned child")
+        recorded = load_review_preflight_record(
+            db, request.workload_repository, request.owner_id, child.round.round_id,
+        )
+        if recorded is None:
+            raise WorkflowAuthorityError("review admission lost its preflight receipt")
+        revision = WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1)
+        admission = ReviewChildAdmission(
+            child, str(request.run_id), str(request.reservation_id),
+            recorded[0].claim_occurrence_id, revision, request.owner_id,
+        )
+        changed = db.execute(
+            "UPDATE workflows SET version=? WHERE repository=? AND target_kind=? AND target_number=? "
+            "AND generation=? AND version=?",
+            (revision.version, *workflow_scope(revision.fence.key), revision.fence.generation,
+             snapshot.revision.version),
+        ).rowcount
+        if changed != 1:
+            raise WorkflowAuthorityError("review admission lost the aggregate version")
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-execution-admission',?,?,?,?)",
+            (request.workload_repository, str(request.run_id), now, encode_workflow(admission)),
+        )
+
+    @staticmethod
     def _reservation_request_matches(
         db: sqlite3.Connection,
         prior: sqlite3.Row,
@@ -4210,7 +4356,8 @@ class SQLiteControlStore:
         """Match the complete authority, not a convenient subset of its IDs."""
 
         run = db.execute(
-            "SELECT dispatch_id, kind, owner_id, state, config_version, workflow_binding_json, workflow_episode_key "
+            "SELECT dispatch_id, kind, owner_id, state, config_version, workflow_binding_json, "
+            "workflow_episode_key,review_round_id,review_child_id "
             "FROM runs WHERE run_id=?",
             (str(request.run_id),),
         ).fetchone()
@@ -4220,6 +4367,34 @@ class SQLiteControlStore:
             if (run["workflow_episode_key"] != workflow_episode_key(request.workflow)
                     or run["workflow_binding_json"] != encode_workflow(request.workflow)):
                 return False
+            receipt = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-admission' "
+                "AND scope=? AND key=?",
+                (request.workload_repository, str(request.run_id)),
+            ).fetchone()
+            if request.review_child is None:
+                if receipt is not None or run["review_round_id"] is not None or run["review_child_id"] is not None:
+                    return False
+            else:
+                if (receipt is None or run["review_round_id"] != request.review_child.round.round_id
+                        or run["review_child_id"] != request.review_child.child_id):
+                    return False
+                admission = decode_workflow(receipt["payload_json"], ReviewChildAdmission)
+                recorded = load_review_preflight_record(
+                    db, request.workload_repository, request.owner_id,
+                    request.review_child.round.round_id,
+                )
+                current = load_workflow_row(db, request.workflow.fence.key)
+                if (recorded is None or current is None
+                        or current.revision.fence != admission.admitted_revision.fence
+                        or admission.admitted_revision.version > current.revision.version
+                        or admission.child != request.review_child
+                        or admission.run_id != str(request.run_id)
+                        or admission.reservation_id != str(request.reservation_id)
+                        or admission.claim_occurrence_id != recorded[0].claim_occurrence_id
+                        or admission.owner_id != request.owner_id
+                        or admission.admitted_revision.fence != request.workflow.fence):
+                    return False
         elif request.workflow is not None:
             if run["workflow_episode_key"] != workflow_episode_key(request.workflow):
                 return False
@@ -4288,6 +4463,8 @@ class SQLiteControlStore:
                 "state",
                 "config_version",
                 "workflow_binding_json",
+                "review_round_id",
+                "review_child_id",
             )
         )
         expected_run = (
@@ -4297,6 +4474,8 @@ class SQLiteControlStore:
             "running" if lease is not None else "reserved",
             request.config_version,
             encode_workflow(request.workflow) if request.workflow is not None else None,
+            request.review_child.round.round_id if request.review_child is not None else None,
+            request.review_child.child_id if request.review_child is not None else None,
         )
         actual_limits = [
             tuple(row)
