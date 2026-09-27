@@ -188,17 +188,18 @@ def test_reconciled_charge_before_raw_return_stays_pending_until_return_capture(
     assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
 
 
-@pytest.mark.parametrize("reason", [ExitReason.TRANSPORT_DEATH])
-def test_settled_non_striking_error_without_specific_disposition_stays_pending(admitted, reason):
+def test_settled_transport_death_without_deterministic_proof_is_infrastructure_evidence(admitted):
     store, _, proposed = admitted
     child = proposed.review_child
     assert child is not None
     register(store, proposed)
     raw = returned(store, proposed, result=AgentResult(
-        True, status="raised", exit_reason=reason,
+        True, status="raised", exit_reason=ExitReason.TRANSPORT_DEATH,
     ))
     store.settle_review_return(settlement(proposed), raw)
-    assert observed(store, child) == (ReviewChildPending(child),)
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+    assert evidence[0].result == ReviewChildInfrastructureFailure(ExitReason.TRANSPORT_DEATH)
 
 
 def test_settled_budget_exhaustion_has_terminal_non_striking_child_evidence(admitted):

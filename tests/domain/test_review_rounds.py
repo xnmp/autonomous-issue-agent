@@ -78,7 +78,7 @@ def test_normal_success_only_retains_an_eligible_reviewer_session(runtime, kind,
 
 @pytest.mark.parametrize("is_error,reason,expected", [
     (True, ExitReason.AGENT_ERROR, rounds.ReviewChildFailed),
-    (True, ExitReason.TRANSPORT_DEATH, type(None)),
+    (True, ExitReason.TRANSPORT_DEATH, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.KILLED_EXTERNALLY, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.RUNTIME_UNAVAILABLE, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.BUDGET_EXHAUSTED, rounds.ReviewChildBudgetExhausted),
@@ -129,7 +129,8 @@ def project(outcome, *, failures=2, pins=0):
     return execution.project_review_execution(checkpoint, (outcome,)).state
 
 
-@pytest.mark.parametrize("reason", [ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE])
+@pytest.mark.parametrize("reason", [ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
+                                    ExitReason.TRANSPORT_DEATH])
 def test_settled_infrastructure_only_round_preserves_failure_allowance(reason):
     planned = plan()
     child = planned.children[0]

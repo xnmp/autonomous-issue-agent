@@ -585,6 +585,23 @@ Pyrefly checks. Log: `/tmp/phase4-abandoned-outcomes-final-full.log`
 (ephemeral). No live activation, target mutation, service restart or paid
 harness run occurred.
 
+## Checkpoint 21 — settled stochastic transport return (offline)
+
+A settled review child return whose harness exit reason is
+`TRANSPORT_DEATH` now becomes `ReviewChildInfrastructureFailure`. Its outer
+round can therefore close as a non-striking infrastructure death after the
+existing launch, raw-return and charge proofs have all settled. Previously the
+child remained pending indefinitely even with complete source evidence. The
+normal return does not claim deterministic failure; that strike still requires
+separate positive harness provenance. Domain tests cover infrastructure-only
+projection and reject an unproved transport strike. Adapter tests construct
+the actual guarded launch, returned envelope and settled charge before reading
+the child evidence. No live activation or paid harness run occurred. Final
+`make test` passed: 3,122 domain, 2,788 adapter and 2,864 app tests, plus
+hooks, governor, parity, four import contracts and both Pyrefly checks. Log:
+`/tmp/phase4-transport-return-final-full.log` (ephemeral). Independent Sol
+review found no blocker.
+
 ## Required subsequent work
 
 - Finalize completed-planning rounds and source-backed abandoned rounds with

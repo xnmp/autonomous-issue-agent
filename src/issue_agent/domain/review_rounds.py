@@ -287,6 +287,7 @@ class ReviewChildInfrastructureFailure:
     def __post_init__(self) -> None:
         if not isinstance(self.reason, ExitReason) or self.reason not in (
             ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
+            ExitReason.TRANSPORT_DEATH,
         ):
             raise ValueError("review infrastructure failure requires a non-striking exit reason")
 
@@ -320,7 +321,7 @@ class ReviewChildReturned:
 def classify_normal_review_return(
     launched: LaunchedReviewChild, runtime: RuntimeName, envelope: ReviewReturnedEnvelope,
 ) -> ReviewChildSucceeded | ReviewChildFailed | ReviewChildInfrastructureFailure | ReviewChildBudgetExhausted | None:
-    """Interpret a settled normal return; unusual deaths need separate proof."""
+    """Classify settled returns; a deterministic transport strike needs separate proof."""
     if not isinstance(launched, LaunchedReviewChild) or not isinstance(runtime, RuntimeName) or not isinstance(envelope, ReviewReturnedEnvelope):
         raise ValueError("review return classification requires typed source facts")
     reason = envelope.exit_reason
@@ -334,7 +335,10 @@ def classify_normal_review_return(
             except ValueError:
                 pass
         return ReviewChildSucceeded(session)
-    if envelope.is_error and reason in (ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE):
+    if envelope.is_error and reason in (
+        ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
+        ExitReason.TRANSPORT_DEATH,
+    ):
         return ReviewChildInfrastructureFailure(reason)
     if envelope.is_error and reason is ExitReason.BUDGET_EXHAUSTED:
         return ReviewChildBudgetExhausted()

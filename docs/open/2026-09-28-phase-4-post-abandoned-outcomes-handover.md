@@ -39,6 +39,14 @@ harness run, migration or push occurred.
 
 ## Next implementation boundaries
 
+The subsequent offline transport-return checkpoint classifies a settled
+`TRANSPORT_DEATH` envelope as non-striking infrastructure evidence. A
+deterministic transport strike still needs its own positive harness proof;
+SDK exceptions and Codex's multiple supervised attempts remain separate
+composition work. The transport checkpoint passed the full gate: 3,122
+domain, 2,788 adapter and 2,864 app tests, plus hooks, governor, parity,
+architecture and Pyrefly. Independent Sol review found no blocker.
+
 1. Add the bounded preparation-failure schedule and hold in the same
    transaction as `DeferredReviewPreparation` outcomes. Reuse existing
    rejection-family gate/hold machinery where applicable; do not invent a
