@@ -315,6 +315,44 @@ after re-review. Final `make test` passed with 3,094 domain, 2,706 adapter and
 Pyrefly checks; ten strict xfails remained expected. Local log:
 `/tmp/phase4-seal-final-full.log` (ephemeral). No live activation occurred.
 
+## Checkpoint 12 — receipt-backed non-launch child evidence (accepted)
+
+`SQLiteControlStore.read_review_child_evidence` reads one canonical planned
+round under one SQLite transaction. It joins the child-keyed refusal or
+admission index to the exact preflight, owner, claim occurrence, round plan,
+run and budget rows. It returns typed pending, refused, released or
+settled-without-launch child facts. It rejects conflicting admission/refusal,
+future receipt revisions, missing admission indices, orphan paid children,
+incomplete unlaunched proof, and contradictory stop, launch, return or money
+evidence. A pending Codex preflight stop remains pending until its exact
+synthetic zero charge and raw return are committed together.
+
+For an unlaunched review run, `_release` now atomically records a typed
+`ReviewUnlaunchedRelease` alongside the budget/run transition. Its bounded
+receipt includes the exact admission, release time and a SHA-256 digest of
+the original release reason; the reason remains in the budget row. This
+preserves the public release API's acceptance of long and multiline reasons.
+The reader requires both that immutable receipt and
+`proven_unlaunched_run`; absent lease or released money alone is insufficient.
+
+Launched children deliberately remain `ReviewChildPending` here, even after a
+validated raw return: this checkpoint does not yet classify result,
+deterministic death, cancellation or reusable session eligibility. It does
+not construct `ReviewRoundFacts`, finalize outcomes or activate live review
+execution. Positive abandonment, submission and closure writers remain open.
+
+Behavioral tests cover mixed multi-child rounds, pending-to-terminal
+transitions, corrupt/future receipts, release receipt write rollback, long
+and multiline release reasons, exact synthetic settlement, missing money,
+forged launch with a stop, and orphan admission indices. Independent Sol
+review found and verified a fix for the release reason compatibility issue;
+its fresh pass found no remaining material issue. Final `make test` passed
+with 3,094 domain, 2,720 adapter and 2,863 app tests, hooks, governor, gate
+parity, four import contracts and both Pyrefly checks. Log:
+`/tmp/phase4-child-evidence-final-full.log` (ephemeral). Commit `7e407d0`.
+No live activation, target mutation, service restart or paid harness run
+occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,
