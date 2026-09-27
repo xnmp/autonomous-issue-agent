@@ -50,8 +50,8 @@ from ..domain.workflow import (
     AuthoredResolve, CompletedRearm, PendingRearm, ResolveAdmission, ResolveEpisode, ResolveResultKind, ResolveStage, WorkflowSnapshot, adjudication_allowed,
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
-from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildIdentity
-from ..domain.review_preflight import require_review_execution_eligibility
+from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildIdentity, ReviewChildLaunchRegistration
+from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_rounds import ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
@@ -2483,9 +2483,13 @@ class SQLiteControlStore:
 
     def register_lease(self, lease: Lease) -> None:
         with self.transaction() as db:
-            run = db.execute("SELECT state FROM runs WHERE run_id=?", (str(lease.run_id),)).fetchone()
+            run = db.execute(
+                "SELECT state,review_round_id FROM runs WHERE run_id=?", (str(lease.run_id),),
+            ).fetchone()
             if run is None or run["state"] in {"completed", "cancelled", "abandoned"}:
                 raise ControlStoreError("process lease requires a nonterminal run")
+            if run["review_round_id"] is not None:
+                raise ControlStoreError("review child requires guarded process registration")
             db.execute(
                 "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, "
                 "process_start_ticks, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -2536,18 +2540,78 @@ class SQLiteControlStore:
         process_start_ticks: int,
     ) -> Lease:
         """Bind a spawned process to its reserved run before paid work executes."""
-
         if (
             not expected_owner_id
-            or pid <= 0
-            or pgid <= 0
-            or process_start_ticks <= 0
+            or type(pid) is not int or pid <= 0
+            or type(pgid) is not int or pgid <= 0
+            or type(process_start_ticks) is not int or process_start_ticks <= 0
         ):
             raise ValueError("live process identity is required")
+        scope = self._review_launch_scope(run_id)
+        if scope is None:
+            return self._register_process_lease(
+                run_id, expected_owner_id=expected_owner_id, pid=pid, pgid=pgid,
+                process_start_ticks=process_start_ticks,
+            )
+        repository, round_id, had_lease = scope
+        with deployment_effect_authority(
+            self.path, repository, deployment_role(repository, expected_owner_id), blocking=False,
+        ):
+            child_identity_proven = False
+            if not had_lease:
+                from .process_supervisor import ProcessSupervisor
+                try:
+                    same_group = os.getpgid(pid) == pgid
+                except OSError:
+                    same_group = False
+                if not same_group or not ProcessSupervisor.matches_identity(pid, process_start_ticks):
+                    raise ControlStoreError("review launch process identity is not live")
+                child_identity_proven = True
+            parent_identity = self._review_round_parent_identity(repository, round_id)
+            return self._register_process_lease(
+                run_id, expected_owner_id=expected_owner_id, pid=pid, pgid=pgid,
+                process_start_ticks=process_start_ticks, review_scope=(repository, round_id),
+                review_parent_identity=parent_identity,
+                review_child_identity_proven=child_identity_proven,
+            )
+
+    def _review_launch_scope(self, run_id: RunId) -> tuple[str, str, bool] | None:
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT b.workload_repository,r.review_round_id,l.run_id AS leased FROM runs r "
+                "JOIN budget_reservations b ON b.run_id=r.run_id "
+                "LEFT JOIN leases l ON l.run_id=r.run_id WHERE r.run_id=?",
+                (str(run_id),),
+            ).fetchone()
+        return ((row["workload_repository"], row["review_round_id"], row["leased"] is not None)
+                if row is not None and row["review_round_id"] is not None else None)
+
+    def _review_round_parent_identity(self, repository: str, round_id: str) -> tuple[int, int] | None:
+        with closing(self._connect()) as db:
+            row = db.execute(
+                "SELECT dc.owner_pid,dc.owner_start_ticks FROM review_execution_rounds rr "
+                "JOIN dispatch_claims dc ON dc.repository=rr.repository AND dc.occurrence_id=rr.claim_occurrence_id "
+                "WHERE rr.round_id=? AND rr.repository=? AND dc.role='review'",
+                (round_id, repository),
+            ).fetchone()
+        if row is None:
+            return None
+        from .process_supervisor import ProcessSupervisor
+        identity = (row["owner_pid"], row["owner_start_ticks"])
+        return identity if ProcessSupervisor.matches_identity(*identity) else None
+
+    def _register_process_lease(
+        self, run_id: RunId, *, expected_owner_id: str, pid: int, pgid: int,
+        process_start_ticks: int, review_scope: tuple[str, str] | None = None,
+        review_parent_identity: tuple[int, int] | None = None,
+        review_child_identity_proven: bool = False,
+    ) -> Lease:
         with self.transaction() as db:
             self._assert_owner_active(db, expected_owner_id)
             run = db.execute(
-                "SELECT dispatch_id, owner_id, state FROM runs WHERE run_id=?",
+                "SELECT dispatch_id, kind, owner_id, state, workflow_binding_json, "
+                "workflow_episode_key, review_round_id, review_child_id "
+                "FROM runs WHERE run_id=?",
                 (str(run_id),),
             ).fetchone()
             if run is None:
@@ -2563,6 +2627,14 @@ class SQLiteControlStore:
                 raise ControlStoreError(
                     f"process lease cannot attach to terminal run: {run_id}"
                 )
+            review_attached = run["review_round_id"] is not None or run["review_child_id"] is not None
+            if review_attached and (
+                review_scope is None or run["review_round_id"] != review_scope[1]
+                or run["review_child_id"] is None
+            ):
+                raise ControlStoreError("review launch lacks its captured round scope")
+            if review_scope is not None and not review_attached:
+                raise ControlStoreError("review launch scope changed before process registration")
             existing = db.execute(
                 "SELECT dispatch_id, owner_id, pid, pgid, process_start_ticks, "
                 "started_at FROM leases WHERE run_id=?",
@@ -2578,6 +2650,10 @@ class SQLiteControlStore:
                     raise ControlStoreError(
                         f"conflicting live process lease for run: {run_id}"
                     )
+                if review_attached:
+                    self._require_review_launch_receipt(
+                        db, run_id, review_scope[0], run, existing,
+                    )
                 return Lease(
                     run_id,
                     existing["dispatch_id"],
@@ -2587,7 +2663,14 @@ class SQLiteControlStore:
                     _parse_stamp(existing["started_at"]),
                     process_start_ticks,
                 )
-            started_at = self._now()
+            review_admission = None
+            if review_attached:
+                if not review_child_identity_proven:
+                    raise ControlStoreError("review launch lacks a live registered process")
+                review_admission = self._require_review_launch_admission(
+                    db, run_id, review_scope[0], run, review_parent_identity,
+                )
+            started_at = _parse_stamp(_stamp(self._now()))
             lease = Lease(
                 run_id,
                 run["dispatch_id"],
@@ -2620,6 +2703,16 @@ class SQLiteControlStore:
                 "reason=NULL, updated_at=? WHERE run_id=?",
                 (_stamp(started_at), str(run_id)),
             )
+            if review_admission is not None:
+                launch = ReviewChildLaunchRegistration(
+                    review_admission, f"review-execution-launch:{run_id}",
+                    lease.dispatch_id, pid, pgid, process_start_ticks, started_at,
+                )
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                    "VALUES ('review-execution-launch',?,?,?,?)",
+                    (review_scope[0], str(run_id), _stamp(started_at), encode_workflow(launch)),
+                )
             self._transition(
                 db,
                 "lease",
@@ -2638,6 +2731,107 @@ class SQLiteControlStore:
                 ),
             )
             return lease
+
+    @staticmethod
+    def _load_review_launch_admission(
+        db: sqlite3.Connection, run_id: RunId, repository: str, run: sqlite3.Row,
+    ) -> ReviewChildAdmission:
+        receipt = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-admission' "
+            "AND scope=? AND key=?",
+            (repository, str(run_id)),
+        ).fetchone()
+        budget = db.execute(
+            "SELECT reservation_id,workload_repository,state FROM budget_reservations WHERE run_id=?",
+            (str(run_id),),
+        ).fetchone()
+        if receipt is None or budget is None:
+            raise ControlStoreError("review launch lacks its admission or reservation")
+        try:
+            admission = decode_workflow(receipt["payload_json"], ReviewChildAdmission)
+        except WorkflowEncodingError as exc:
+            raise ControlStoreError("review launch admission receipt is unreadable") from exc
+        binding = admission.child.round.binding.rejection
+        if (admission.run_id != str(run_id) or admission.reservation_id != budget["reservation_id"]
+                or budget["workload_repository"] != repository or admission.owner_id != run["owner_id"]
+                or admission.child.round.round_id != run["review_round_id"]
+                or admission.child.child_id != run["review_child_id"]
+                or run["workflow_binding_json"] != encode_workflow(binding)
+                or run["workflow_episode_key"] != workflow_episode_key(binding)
+                or run["kind"] not in _REVIEW_PAID_KINDS):
+            raise ControlStoreError("review launch disagrees with its admitted run")
+        return admission
+
+    def _require_review_launch_admission(
+        self, db: sqlite3.Connection, run_id: RunId, repository: str,
+        run: sqlite3.Row, parent_identity: tuple[int, int] | None,
+    ) -> ReviewChildAdmission:
+        if run["state"] != "reserved":
+            raise ControlStoreError("review launch requires a still reserved run")
+        if db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-launch' "
+            "AND scope=? AND key=?", (repository, str(run_id)),
+        ).fetchone() is not None:
+            raise ControlStoreError("review run already has a launch registration")
+        admission = self._load_review_launch_admission(db, run_id, repository, run)
+        budget = db.execute(
+            "SELECT state FROM budget_reservations WHERE run_id=?", (str(run_id),),
+        ).fetchone()
+        recovery = db.execute(
+            "SELECT policy FROM reservation_recovery WHERE run_id=?", (str(run_id),),
+        ).fetchone()
+        if (budget is None or budget["state"] != "active" or recovery is None
+                or recovery["policy"] != "spawn_pending"):
+            raise ControlStoreError("review launch requires an active unlaunched reservation")
+        snapshot = require_review_binding(db, admission.child.round.binding.rejection)
+        if (admission.admitted_revision.fence != snapshot.revision.fence
+                or admission.admitted_revision.version > snapshot.revision.version):
+            raise ControlStoreError("review launch admission revision is stale or impossible")
+        try:
+            dispatch = json.loads(run["dispatch_id"])
+        except (TypeError, ValueError) as exc:
+            raise ControlStoreError("review launch dispatch identity is unreadable") from exc
+        if not isinstance(dispatch, dict):
+            raise ControlStoreError("review launch dispatch identity is malformed")
+        selection = self._require_review_child_authority(
+            db, repository, run["owner_id"], admission.child, run["kind"],
+            dispatch, snapshot, parent_identity,
+        )
+        if admission.claim_occurrence_id != selection.claim_occurrence_id:
+            raise ControlStoreError("review launch changed its parent claim occurrence")
+        target = (f"issue:{selection.claim_target}" if selection.claim_target > 0
+                  else f"pr:{-selection.claim_target}")
+        if db.execute(
+            "SELECT 1 FROM dispatch_claim_runs WHERE repository=? AND role='review' "
+            "AND target=? AND run_id=?",
+            (repository, target, str(run_id)),
+        ).fetchone() is None:
+            raise ControlStoreError("review launch lost its parent claim/run link")
+        return admission
+
+    def _require_review_launch_receipt(
+        self, db: sqlite3.Connection, run_id: RunId, repository: str,
+        run: sqlite3.Row, lease: sqlite3.Row,
+    ) -> None:
+        admission = self._load_review_launch_admission(db, run_id, repository, run)
+        receipt = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-launch' "
+            "AND scope=? AND key=?", (repository, str(run_id)),
+        ).fetchone()
+        if receipt is None:
+            raise ControlStoreError("review process lease lacks its immutable launch receipt")
+        try:
+            recorded = decode_workflow(receipt["payload_json"], ReviewChildLaunchRegistration)
+            expected = ReviewChildLaunchRegistration(
+                admission, f"review-execution-launch:{run_id}", run["dispatch_id"],
+                lease["pid"], lease["pgid"], lease["process_start_ticks"],
+                _parse_stamp(lease["started_at"]),
+            )
+        except (WorkflowEncodingError, ValueError, TypeError) as exc:
+            raise ControlStoreError("review launch receipt is unreadable") from exc
+        if (recorded != expected or lease["dispatch_id"] != run["dispatch_id"]
+                or lease["owner_id"] != run["owner_id"] or run["state"] != "running"):
+            raise ControlStoreError("review launch receipt disagrees with its live lease")
 
     def release_lease(self, run_id: RunId) -> None:
         with self.transaction() as db:
@@ -4192,8 +4386,9 @@ class SQLiteControlStore:
             if isinstance(snapshot.execution, ActivatedReviewExecution):
                 if request.review_child is None:
                     raise WorkflowAuthorityError("active review execution requires a planned child")
-                self._validate_review_child_reservation(
-                    db, request, snapshot, dispatch, review_parent_identity,
+                self._require_review_child_authority(
+                    db, request.workload_repository, request.owner_id, request.review_child,
+                    request.kind, dispatch, snapshot, review_parent_identity,
                 )
                 return snapshot
             if request.review_child is not None:
@@ -4232,16 +4427,15 @@ class SQLiteControlStore:
         except (ValueError, TypeError) as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
 
-    def _validate_review_child_reservation(
-        self, db: sqlite3.Connection, request: ReservationRequest,
-        snapshot: ReviewWorkflowSnapshot, dispatch: dict[str, object],
-        parent_identity: tuple[int, int] | None,
-    ) -> None:
-        child = request.review_child
-        if child is None or parent_identity is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+    def _require_review_child_authority(
+        self, db: sqlite3.Connection, repository: str, owner_id: str,
+        child: ReviewChildIdentity, kind: str, dispatch: dict[str, object],
+        snapshot: ReviewWorkflowSnapshot, parent_identity: tuple[int, int] | None,
+    ) -> ReviewPreflightSelection:
+        if parent_identity is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
             raise WorkflowAuthorityError("review child admission lacks its live parent or execution authority")
         recorded = load_review_preflight_record(
-            db, request.workload_repository, request.owner_id, child.round.round_id,
+            db, repository, owner_id, child.round.round_id,
         )
         if recorded is None:
             raise WorkflowAuthorityError("review child admission lacks its exact preflight receipt")
@@ -4256,25 +4450,35 @@ class SQLiteControlStore:
             require_review_execution_eligibility(snapshot, plan.head_sha, plan.failure_ceiling)
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
-        if (dispatch.get("kind") != request.kind or dispatch.get("claim_target") != selection.claim_target
+        if (dispatch.get("repository") != repository or dispatch.get("role") != "review"
+                or type(dispatch.get("number")) is not int
+                or dispatch.get("number") != child.round.binding.rejection.fence.key.target.number
+                or type(dispatch.get("claim_target")) is not int
+                or dispatch.get("kind") != kind or dispatch.get("claim_target") != selection.claim_target
                 or not isinstance(dispatch.get("leg_id"), str) or not dispatch["leg_id"]
                 or (selection.claim_target > 0 and dispatch.get("issue") != selection.claim_target)
                 or (selection.claim_target < 0 and dispatch.get("issue") is not None)):
             raise WorkflowAuthorityError("review child dispatch identity disagrees with its preflight")
         require_review_parent_claim(
-            db, request.workload_repository, request.owner_id, selection.claim_occurrence_id,
+            db, repository, owner_id, selection.claim_occurrence_id,
             selection.claim_target, probed_identity=parent_identity,
         )
         from .review_dispatch_holds import review_release_projection, unresolved_review_submissions
         from ..domain.review_rearm import ReleaseStatus
         from ..domain.workflow_identity import WorkflowWriter
+        issue = dispatch.get("issue")
+        if issue is not None and (type(issue) is not int or not 0 < issue < 2**63):
+            raise WorkflowAuthorityError("review child linked issue identity is malformed")
+        if issue is not None and linked_issue_workflow_holds(db, WorkflowKey(repository, IssueRef(issue))):
+            raise WorkflowAuthorityError("review child admission is held by linked issue workflow")
         if unresolved_review_submissions(db, self, snapshot.binding):
             raise WorkflowAuthorityError("review child admission is held by unresolved submission")
         release = review_release_projection(
-            db, WorkflowWriter(request.workload_repository, "review", request.owner_id), snapshot,
+            db, WorkflowWriter(repository, "review", owner_id), snapshot,
         )
         if release is not None and release.status is not ReleaseStatus.VERIFIED:
             raise WorkflowAuthorityError("review child admission is held by release projection")
+        return selection
 
     @staticmethod
     def _record_workflow_admission(

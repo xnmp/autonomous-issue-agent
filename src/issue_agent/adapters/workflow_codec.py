@@ -78,7 +78,7 @@ _VALUES = (
     rd.ReviewNotAdmitted, rd.ReviewDeferred, rd.ReviewTerminal, rd.ReviewWithheld, rd.ReviewInFlight,
     rd.DecisionBasis, rd.DepartedReadFailure, rd.RecordedReviewDecision,
     rx.ReviewExecutionBinding, rx.ReviewRoundIdentity, rx.ReviewChildIdentity,
-    rx.ReviewChildAdmission,
+    rx.ReviewChildAdmission, rx.ReviewChildLaunchRegistration,
     rx.LaunchedReviewChild, rx.ImportedReviewSession, rx.NoReviewSession,
     rx.ReusableReviewSession, rx.PreserveReviewSession, rx.ReplaceReviewSession,
     rx.ClearReviewSession, rx.PreserveDisplayedRound, rx.SetDisplayedRound,

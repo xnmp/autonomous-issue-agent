@@ -82,6 +82,7 @@ Reuse indexed `dedupe_keys` records, scoped by repository and immutable IDs:
 | `review-round-preflight` | Idempotent request token → round and allocated sequence |
 | `review-round-stage` | Round/stage → immutable planned child identities |
 | `review-execution-admission` | Run → round, child and captured execution binding |
+| `review-execution-launch` | Run → exact guarded process registration and admission |
 | `review-execution-return` | Run → immutable returned evidence |
 | `review-execution-return-disposition` | Run → final classification or stale retirement |
 | `review-round-outcome` | Round → sealed outer outcome |

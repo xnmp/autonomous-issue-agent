@@ -6,6 +6,7 @@ no runtime authority until the execution family is explicitly activated.
 """
 
 from dataclasses import dataclass, replace
+from datetime import datetime
 from enum import Enum
 
 from .agent_task import RuntimeCapabilities, RuntimeName
@@ -90,6 +91,32 @@ class ReviewChildAdmission:
         if (not isinstance(self.admitted_revision, WorkflowRevision)
                 or self.admitted_revision.fence != self.child.round.binding.rejection.fence):
             raise ValueError("review admission revision disagrees with its child binding")
+
+
+@dataclass(frozen=True)
+class ReviewChildLaunchRegistration:
+    """Durable guarded process registration, before provider exec or billing."""
+
+    admission: ReviewChildAdmission
+    receipt_id: str
+    dispatch_id: str
+    pid: int
+    pgid: int
+    process_start_ticks: int
+    registered_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.admission, ReviewChildAdmission):
+            raise ValueError("review launch requires its exact child admission")
+        if self.receipt_id != f"review-execution-launch:{self.admission.run_id}":
+            raise ValueError("review launch receipt disagrees with its run")
+        if not isinstance(self.dispatch_id, str) or not self.dispatch_id:
+            raise ValueError("review launch requires its paid dispatch identity")
+        for name in ("pid", "pgid", "process_start_ticks"):
+            integer(getattr(self, name), f"review launch {name}", minimum=1)
+        if (not isinstance(self.registered_at, datetime) or self.registered_at.tzinfo is None
+                or self.registered_at.utcoffset() is None):
+            raise ValueError("review launch requires an aware registration time")
 
 
 @dataclass(frozen=True)

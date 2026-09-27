@@ -165,9 +165,39 @@ tests, plus hooks, governor, gate parity, four import contracts and both
 Pyrefly passes. Ten strict xfails remained expected. Local log:
 `/tmp/phase4-admission-verified-full.log` (ephemeral).
 
+## Checkpoint 7 — guarded review child launch (accepted)
+
+`register_process_lease` now joins attached review child admission, active
+reservation, open round, current dual binding, exact parent claim/run link,
+stage receipts and current SQL holds before writing a launch receipt. It
+probes the parent and supplied child PID/start ticks and process group outside
+SQLite under deployment effect authority, then revalidates the captured
+authority in the lease transaction. One transaction retains immutable
+`review-execution-launch` evidence with the lease, running run state and
+running recovery policy. The receipt names the exact admission and process.
+
+Exact existing-lease replay validates the receipt and is inert even after the
+parent claim releases or the registered child process exits. A missing or
+changed receipt refuses; a cleared lease cannot mint a second launch.
+`register_lease` cannot bypass the guarded path for an attached child, and
+release-before-registration wins over late launch. Independent review
+reproduced a fabricated child PID accepted at receipt minting; the child OS
+identity probe closes it. A real-clock subprocess test caught receipt/lease
+timestamp precision drift on replay; registration now uses the persisted
+millisecond timestamp for every copy.
+
+The receipt proves guarded process registration and possible provider
+execution. It does not prove provider exec, tokens billed, a returned session
+or a productive review. Those facts belong to later settlement and submission
+receipts. No real execution authority or daemon cutover has been activated.
+Final `make test` passed with 3,093 domain, 2,605 adapter and 2,863 app
+tests, plus hooks, governor, gate parity, four import contracts and both
+Pyrefly passes. Ten strict xfails remained expected. Local log:
+`/tmp/phase4-launch-final-full.log` (ephemeral).
+
 ## Required subsequent work
 
-- Guarded launch, returned evidence, then sealed outer outcomes and
+- Returned evidence, then sealed outer outcomes and
   evidence-based finalization after parent/claim abandonment. Distinguish
   released-before-launch and settled-without-launch evidence; preserve actual
   accounting and bound unpaid preparation faults through evidence holds.
