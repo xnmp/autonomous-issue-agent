@@ -10,17 +10,20 @@ from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.review_execution import (
-    ReviewChildIdentity, ReviewChildKind, ReviewChildLaunchRegistration,
+    ReusableReviewSession, ReviewCancellationReason, ReviewChildIdentity, ReviewChildKind, ReviewChildLaunchRegistration,
     ReviewPreparationFailure, ReviewPreparationKind,
 )
 from issue_agent.domain.review_rounds import (
-    ReviewChildPending, ReviewChildRefused, ReviewChildReleased,
+    ReviewChildCancelled, ReviewChildFailed, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned,
     ReviewChildSettledWithoutLaunch, ReviewStagePlan,
 )
 from issue_agent.domain.review_return import ReturnedReviewChild
+from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.contracts import PricingBasis
 from tests.adapters.test_review_execution_admission import planned, receipt, request
 from tests.adapters.test_review_execution_control import OWNER, current, rig
 from tests.adapters.test_review_execution_launch import admitted, register
+from tests.adapters.test_review_execution_return import returned, settlement
 from tests.adapters.test_review_preflight_stop import codex_admitted, codex_planned, stop
 
 
@@ -136,6 +139,117 @@ def test_guarded_launch_and_unsettled_return_are_not_terminal_child_facts(admitt
     assert child is not None
     register(store, proposed)
     assert observed(store, child) == (ReviewChildPending(child),)
+
+
+def test_guarded_launch_raw_return_and_settled_charge_mint_normal_success(admitted):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed)
+    assert store.settle_review_return(settlement(proposed), raw).disposition is AccountingDisposition.AVAILABLE
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+    assert evidence[0].launched.launch_receipt == f"review-execution-launch:{proposed.run_id}"
+    assert evidence[0].return_receipt == f"review-execution-return:{proposed.run_id}"
+    assert isinstance(evidence[0].result.session, ReusableReviewSession)
+    assert evidence[0].result.session.handle == "session:1"
+    assert evidence[0].result.session.source == evidence[0].launched
+
+
+def test_normal_failed_return_is_typed_only_after_settlement(admitted):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed, result=AgentResult(
+        True, status="error", summary="agent failed", exit_reason=ExitReason.AGENT_ERROR,
+    ))
+    assert store.record_reservation_retained(proposed.run_id, "usage unknown", returned_review=raw)
+    assert observed(store, child) == (ReviewChildPending(child),)
+    assert store.settle_review_return(settlement(proposed, basis=PricingBasis.RECONCILED), raw).disposition is AccountingDisposition.AVAILABLE
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+    assert isinstance(evidence[0].result, ReviewChildFailed)
+    assert evidence[0].result.reason is ExitReason.AGENT_ERROR
+
+
+def test_reconciled_charge_before_raw_return_stays_pending_until_return_capture(admitted):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed)
+    assert store.settle(settlement(proposed, basis=PricingBasis.RECONCILED)).disposition is AccountingDisposition.AVAILABLE
+    assert observed(store, child) == (ReviewChildPending(child),)
+    assert not store.record_reservation_retained(proposed.run_id, "late raw return", returned_review=raw)
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+
+
+@pytest.mark.parametrize("reason", [
+    ExitReason.TRANSPORT_DEATH, ExitReason.KILLED_EXTERNALLY,
+    ExitReason.RUNTIME_UNAVAILABLE, ExitReason.BUDGET_EXHAUSTED,
+])
+def test_settled_non_striking_error_without_specific_disposition_stays_pending(admitted, reason):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed, result=AgentResult(
+        True, status="raised", exit_reason=reason,
+    ))
+    store.settle_review_return(settlement(proposed), raw)
+    assert observed(store, child) == (ReviewChildPending(child),)
+
+
+def test_settled_operator_cancel_waits_for_exact_shutdown_intent(admitted):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed, result=AgentResult(
+        True, status="cancelled", exit_reason=ExitReason.OPERATOR_CANCELLED,
+    ))
+    store.settle_review_return(settlement(proposed), raw)
+    assert observed(store, child) == (ReviewChildPending(child),)
+
+
+def test_shutdown_intent_and_settled_cancel_mint_noncharging_child(admitted):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    intents = store.record_owned_cancellation_intents(OWNER, "shutdown_deadline_spend_unknown")
+    assert any(intent.run_id == proposed.run_id for intent in intents)
+    raw = returned(store, proposed, result=AgentResult(
+        True, status="cancelled", exit_reason=ExitReason.OPERATOR_CANCELLED,
+    ))
+    store.settle_review_return(settlement(proposed), raw)
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+    assert isinstance(evidence[0].result, ReviewChildCancelled)
+    assert evidence[0].result.reason is ReviewCancellationReason.SHUTDOWN
+    assert evidence[0].result.cancellation_receipt == f"run-cancellation-intent:{proposed.run_id}"
+
+
+@pytest.mark.parametrize("corruption", ["missing_charge", "wrong_provider", "wrong_currency"])
+def test_settled_return_refuses_corrupt_charge(admitted, corruption):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    raw = returned(store, proposed)
+    store.settle_review_return(settlement(proposed), raw)
+    with store.transaction() as db:
+        if corruption == "missing_charge":
+            db.execute("DELETE FROM charges WHERE run_id=?", (str(proposed.run_id),))
+        elif corruption == "wrong_provider":
+            db.execute("UPDATE runs SET provider_receipt_id='wrong' WHERE run_id=?", (str(proposed.run_id),))
+        else:
+            db.execute("UPDATE charges SET currency='EUR' WHERE run_id=?", (str(proposed.run_id),))
+    with pytest.raises(ControlStoreError):
+        observed(store, child)
 
 
 def test_mixed_multi_child_round_retains_each_exact_terminal_or_pending_fact(rig):

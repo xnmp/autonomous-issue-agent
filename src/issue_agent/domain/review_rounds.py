@@ -8,7 +8,7 @@ admission/submission before minting abandonment or no-launch facts.
 from dataclasses import dataclass
 from enum import Enum
 
-from .agent_task import RuntimeName
+from .agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from .outcome import ExitReason
 from .review import ReviewMode
 from .review_execution import (
@@ -21,6 +21,7 @@ from .review_execution import (
     ReviewUnlaunchedRound, SaturateReviewFailures, SetDisplayedRound,
 )
 from .review_rejection import validate_commit_sha
+from .review_return import ReviewReturnedEnvelope
 from .workflow_identity import (
     validate_workflow_identifier as identifier,
     validate_workflow_integer as integer,
@@ -264,6 +265,33 @@ class ReviewChildReturned:
     @property
     def child(self) -> ReviewChildIdentity:
         return self.launched.child
+
+
+def classify_normal_review_return(
+    launched: LaunchedReviewChild, runtime: RuntimeName, envelope: ReviewReturnedEnvelope,
+) -> ReviewChildSucceeded | ReviewChildFailed | None:
+    """Interpret a settled normal return; unusual deaths need separate proof."""
+    if not isinstance(launched, LaunchedReviewChild) or not isinstance(runtime, RuntimeName) or not isinstance(envelope, ReviewReturnedEnvelope):
+        raise ValueError("review return classification requires typed source facts")
+    reason = envelope.exit_reason
+    if reason is ExitReason.OK and not envelope.is_error:
+        session: NoReviewSession | ReusableReviewSession = NoReviewSession()
+        capabilities = RUNTIME_CAPABILITIES[runtime]
+        if (launched.child.kind is ReviewChildKind.REVIEWER and envelope.session_id
+                and capabilities.supports_resume and capabilities.resume_preserves_sandbox):
+            try:
+                session = ReusableReviewSession(runtime, envelope.session_id, launched)
+            except ValueError:
+                pass
+        return ReviewChildSucceeded(session)
+    if (envelope.is_error and reason is not None
+            and reason not in (
+                ExitReason.OK, ExitReason.OPERATOR_CANCELLED, ExitReason.TRANSPORT_DEATH,
+                ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
+                ExitReason.BUDGET_EXHAUSTED,
+            )):
+        return ReviewChildFailed(reason)
+    return None
 
 
 ReviewChildEvidence = (

@@ -51,10 +51,10 @@ from ..domain.workflow import (
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.agent_task import RuntimeName
-from ..domain.review_execution import ActivatedReviewExecution, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
+from ..domain.review_execution import ActivatedReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
-from ..domain.review_rounds import ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed
+from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed, classify_normal_review_return
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
     ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX, CeilingEscalation, ReviewSubmissionReceipt,
@@ -69,7 +69,7 @@ from ..domain.workflow_reconciliation import (
     prewrite_evidence_gate_id, unavailable_prewrite_read, unavailable_reconciliation, unknown_outcome_history,
 )
 from ..domain.resolve_return import FinalizedResolveReturn, ReturnedResolve
-from ..domain.outcome import AuthorFollowup, author_followup
+from ..domain.outcome import AuthorFollowup, ExitReason, author_followup
 from ..domain.resolve_split import MAX_SPLIT_TRAIL, AdjudicationInput, ContractResetCompleted, ReauthorInput, ReauthorResetIntent, SplitContext, SplitImplement, SplitInput, split_context, validate_contract_rounds
 from ..domain.events import (
     ActionApplied,
@@ -5134,8 +5134,9 @@ class SQLiteControlStore:
     ) -> tuple[ReviewChildEvidence, ...]:
         """Read one planned round's child facts from indexed, transaction-local proof.
 
-        Launched returns remain pending until result and session eligibility are
-        classified by the later closure writer. This read grants no outcome.
+        Non-striking or otherwise unclassified launched results remain pending
+        until a specific durable disposition exists. This read grants no
+        outer-round outcome.
         """
         repository = canonical_repository(repository)
         validate_workflow_identifier(round_id, "review round")
@@ -5158,7 +5159,7 @@ class SQLiteControlStore:
                             and revision.version <= revision_row["version"]))
 
             runs = db.execute(
-                "SELECT r.*,b.workload_repository,b.state AS budget_state,b.release_reason,"
+                "SELECT r.*,b.workload_repository,b.state AS budget_state,b.currency AS budget_currency,b.release_reason,"
                 "rr.policy AS recovery_policy FROM runs r "
                 "JOIN budget_reservations b USING(run_id) "
                 "JOIN reservation_recovery rr USING(run_id) "
@@ -5287,6 +5288,44 @@ class SQLiteControlStore:
                         returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
                         if self._review_return_authority(db, returned) != (repository, True):
                             raise ControlStoreError("review child return disagrees with its guarded launch")
+                        charge = db.execute(
+                            "SELECT provider_receipt_id,amount_micros,currency,basis FROM charges WHERE run_id=?",
+                            (indexed.run_id,),
+                        ).fetchone()
+                        if (charge is None) != (run["budget_state"] != "settled"):
+                            raise ControlStoreError("review return and budget disagree with settled charge")
+                        if charge is not None:
+                            if (run["provider_receipt_id"] != charge["provider_receipt_id"]
+                                    or charge["currency"] != run["budget_currency"]
+                                    or type(charge["amount_micros"]) is not int or charge["amount_micros"] < 0):
+                                raise ControlStoreError("review return charge disagrees with its admitted run")
+                            try:
+                                PricingBasis(charge["basis"])
+                            except ValueError as exc:
+                                raise ControlStoreError("review return has an invalid charge basis") from exc
+                            if (run["state"] == "completed" and run["outcome"] in
+                                    ("settled", "spend_unreconciled")):
+                                launched = LaunchedReviewChild(child, indexed.run_id, launch.receipt_id)
+                                result = classify_normal_review_return(launched, plan.runtime, returned.result)
+                                if returned.result.exit_reason is ExitReason.OPERATOR_CANCELLED:
+                                    intent = db.execute(
+                                        "SELECT dispatch_id,kind,reason FROM run_cancellation_intents WHERE run_id=?",
+                                        (indexed.run_id,),
+                                    ).fetchone()
+                                    if intent is not None:
+                                        if intent["dispatch_id"] != run["dispatch_id"] or intent["kind"] != run["kind"]:
+                                            raise ControlStoreError("review cancellation intent disagrees with its run")
+                                        if (intent["reason"] == "shutdown_deadline_spend_unknown"
+                                                and returned.result.is_error):
+                                            result = ReviewChildCancelled(
+                                                ReviewCancellationReason.SHUTDOWN,
+                                                f"run-cancellation-intent:{indexed.run_id}",
+                                            )
+                                if result is not None:
+                                    evidence.append(ReviewChildReturned(
+                                        launched, f"review-execution-return:{indexed.run_id}", result,
+                                    ))
+                                    continue
                 evidence.append(ReviewChildPending(child))
             return tuple(evidence)
 

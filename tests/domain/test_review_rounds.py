@@ -6,10 +6,11 @@ from itertools import permutations
 import pytest
 
 from issue_agent.domain.agent_task import RuntimeName
-from issue_agent.domain.outcome import ExitReason
+from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain import review_execution as execution
 from issue_agent.domain import review_rounds as rounds
+from issue_agent.domain.review_return import review_returned_envelope
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
 )
@@ -53,6 +54,42 @@ def returned(child, *, result=None, handle=None):
                    if handle else execution.NoReviewSession())
         result = rounds.ReviewChildSucceeded(session)
     return rounds.ReviewChildReturned(launched, f"return:{child.child_id}", result)
+
+
+@pytest.mark.parametrize("runtime,kind,handle,expected", [
+    (RuntimeName.CLAUDE, REVIEWER, "session:1", True),
+    (RuntimeName.CODEX, REVIEWER, "session:1", False),
+    (RuntimeName.CLAUDE, GATE, "session:1", False),
+    (RuntimeName.CLAUDE, REVIEWER, "multi", False),
+    (RuntimeName.CLAUDE, REVIEWER, "invalid\nhandle", False),
+])
+def test_normal_success_only_retains_an_eligible_reviewer_session(runtime, kind, handle, expected):
+    child = execution.ReviewChildIdentity(identity(), kind.value, "child", kind)
+    launched = launch(child)
+    envelope = review_returned_envelope(AgentResult(
+        False, status="APPROVE", session_id=handle, exit_reason=ExitReason.OK,
+    ))
+    result = rounds.classify_normal_review_return(launched, runtime, envelope)
+    assert isinstance(result, rounds.ReviewChildSucceeded)
+    assert isinstance(result.session, execution.ReusableReviewSession) is expected
+    if expected:
+        assert result.session.source == launched
+
+
+@pytest.mark.parametrize("is_error,reason,expected", [
+    (True, ExitReason.AGENT_ERROR, rounds.ReviewChildFailed),
+    (True, ExitReason.TRANSPORT_DEATH, type(None)),
+    (True, ExitReason.KILLED_EXTERNALLY, type(None)),
+    (True, ExitReason.RUNTIME_UNAVAILABLE, type(None)),
+    (True, ExitReason.BUDGET_EXHAUSTED, type(None)),
+    (True, ExitReason.OPERATOR_CANCELLED, type(None)),
+    (False, ExitReason.AGENT_ERROR, type(None)),
+    (True, ExitReason.OK, type(None)),
+])
+def test_normal_return_classification_waits_for_special_or_contradictory_results(is_error, reason, expected):
+    launched = launch(plan().children[0])
+    envelope = review_returned_envelope(AgentResult(is_error, exit_reason=reason))
+    assert isinstance(rounds.classify_normal_review_return(launched, RuntimeName.CLAUDE, envelope), expected)
 
 
 def failure(child, *, deterministic=False):
