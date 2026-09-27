@@ -94,6 +94,28 @@ class ReviewChildAdmission:
 
 
 @dataclass(frozen=True)
+class ReviewUnlaunchedRelease:
+    """Immutable release proof minted with the unlaunched accounting transition."""
+
+    admission: ReviewChildAdmission
+    receipt_id: str
+    reason_digest: str
+    released_at: datetime
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.admission, ReviewChildAdmission):
+            raise ValueError("review release requires its exact admission")
+        if self.receipt_id != f"review-execution-release:{self.admission.run_id}":
+            raise ValueError("review release receipt disagrees with its run")
+        if (not isinstance(self.reason_digest, str) or len(self.reason_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.reason_digest)):
+            raise ValueError("review release requires a SHA-256 reason digest")
+        if (not isinstance(self.released_at, datetime) or self.released_at.tzinfo is None
+                or self.released_at.utcoffset() is None):
+            raise ValueError("review release requires an aware time")
+
+
+@dataclass(frozen=True)
 class ReviewChildAdmissionRefusal:
     """A final, transactionally proved cap refusal for one planned child."""
 
