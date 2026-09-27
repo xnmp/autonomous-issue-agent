@@ -385,6 +385,33 @@ checks. Log: `/tmp/phase4-launched-return-full.log` (ephemeral). Commit
 `8ac97be`. No live activation, target mutation, service restart or paid
 harness run occurred.
 
+## Checkpoint 14 — non-striking infrastructure result (accepted)
+
+A settled launched child with a raw `KILLED_EXTERNALLY` or
+`RUNTIME_UNAVAILABLE` result now produces typed
+`ReviewChildInfrastructureFailure`. A sealed round whose launched children
+include that failure, with no ordinary failed child or refused paid
+submission, produces `ReviewInfrastructureDeath`. Its ordered projection
+preserves the failure allowance, pin streak, session and displayed round
+while retaining the actual launched children and their separately settled
+charges. An ordinary failed sibling or definitively refused paid submission
+still charges one outer failure; confirmed productive submission,
+operator/shutdown cancellation and pin deferral keep their existing higher
+precedence. `ReviewChildFailed` rejects infrastructure and budget reasons,
+and ordinary transport death cannot be represented without a positive
+deterministic-classification receipt.
+
+Sol review found and verified the refused-submission precedence fix and a
+raw-string reason validation fix. Its fresh pass found no further material
+issue. Behavioral tests cover infra-only non-charging projection, mixed
+ordinary/infra sibling precedence, refused paid submission, malformed
+typed reasons and adapter source-backed infrastructure returns. Final
+`make test` passed with 3,118 domain, 2,732 adapter and 2,863 app tests,
+hooks, governor, parity, four import contracts and both Pyrefly checks.
+Log: `/tmp/phase4-infra-outcome-full.log` (ephemeral). Commit `6f02589`.
+No live activation, target mutation, service restart or paid harness run
+occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,
