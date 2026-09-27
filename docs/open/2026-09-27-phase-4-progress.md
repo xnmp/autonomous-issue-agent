@@ -6,6 +6,8 @@ Phase 4 follows the [review execution design](2026-09-27-phase-4-review-executio
 [persistence map](2026-09-27-phase-4-persistence-map.md).
 The [post-stage handover](2026-09-27-phase-4-post-stage-handover.md)
 records the next transaction boundary and standing restrictions.
+The latest [post-abandonment handover](2026-09-27-phase-4-post-abandonment-handover.md)
+records the current boundary and remaining work.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
 and [execution provenance map](2026-09-27-phase-4-execution-provenance.md).
