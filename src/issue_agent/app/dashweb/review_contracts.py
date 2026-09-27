@@ -55,7 +55,8 @@ class ReviewRequestRearm(ClosedContract):
     def command(self) -> w.RequestRearm:
         guidance = (w.SetGuidance(self.guidance.text) if isinstance(self.guidance, SetGuidance)
                     else w.ClearGuidance() if isinstance(self.guidance, ClearGuidance) else w.KeepGuidance())
-        return w.RequestRearm(self.request_id, self.expected.revision(), self.gate_id, guidance)
+        return w.RequestRearm(self.request_id, self.expected.revision(), self.gate_id, guidance,
+                              expected_binding=self.expected.binding())
 
 
 class ReviewContinueRearm(ClosedContract):
@@ -65,7 +66,8 @@ class ReviewContinueRearm(ClosedContract):
     stopped_request_id: Identifier
 
     def command(self) -> w.ContinueGrantedRearm:
-        return w.ContinueGrantedRearm(self.request_id, self.expected.revision(), self.stopped_request_id)
+        return w.ContinueGrantedRearm(self.request_id, self.expected.revision(), self.stopped_request_id,
+                                      expected_binding=self.expected.binding())
 
 
 class ReviewCancelRearm(ClosedContract):
@@ -76,7 +78,8 @@ class ReviewCancelRearm(ClosedContract):
     reason: Annotated[str, Field(min_length=1, max_length=16384)]
 
     def command(self) -> w.CancelRearm:
-        return w.CancelRearm(self.cancellation_id, self.expected.revision(), self.request_id, self.reason)
+        return w.CancelRearm(self.cancellation_id, self.expected.revision(), self.request_id, self.reason,
+                             expected_binding=self.expected.binding())
 
 
 class ReviewAuthorizeRetry(ClosedContract):
@@ -91,7 +94,7 @@ class ReviewAuthorizeRetry(ClosedContract):
     def command(self) -> w.AuthorizeAbsentRetry:
         return w.AuthorizeAbsentRetry(
             self.authorization_id, self.expected.revision(), w.CommandId(self.command_id),
-            self.gate_id, self.evidence_id,
+            self.gate_id, self.evidence_id, expected_binding=self.expected.binding(),
         )
 
 
@@ -480,15 +483,8 @@ class ReviewAvailableControl(ClosedContract):
     observation: ReviewObservation | None
 
 
-class ReviewInactiveControl(ClosedContract):
-    """Not activated; the legacy unblock still owns this repository's review holds."""
-    status: Literal["inactive"]
-    repository: str
-    pull_request: int
-
-
 class ReviewMigrationRequiredControl(ClosedContract):
-    """Not activated, and another family's activation retired the legacy unblock: no lever until activation."""
+    """Review dispatch and operator re-arm require explicit family activation."""
     status: Literal["migration_required"]
     repository: str
     pull_request: int
@@ -508,7 +504,7 @@ class ReviewUnavailableControl(ClosedContract):
 
 
 ReviewControl = Annotated[
-    ReviewAvailableControl | ReviewInactiveControl | ReviewMigrationRequiredControl | ReviewAbsentControl
+    ReviewAvailableControl | ReviewMigrationRequiredControl | ReviewAbsentControl
     | ReviewUnavailableControl,
     Field(discriminator="status"),
 ]

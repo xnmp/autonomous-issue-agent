@@ -39,7 +39,7 @@ from ..domain.contracts import (
     TokenUsage,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
+from ..domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
 from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, CommandRetryApplicability,
     ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryAlreadyConsumed,
@@ -92,7 +92,7 @@ from .deployment_authority import (
 )
 from .review_effects import bound_submission_op, review_family_op
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, active_families, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 24
 
@@ -3963,6 +3963,13 @@ class SQLiteControlStore:
             if (not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository
                     or type(dispatch.get("number")) is not int or dispatch["number"] != binding.fence.key.target.number):
                 raise WorkflowAuthorityError("paid review identity disagrees with its workflow")
+            issue = dispatch.get("issue")
+            if issue is not None:
+                if type(issue) is not int or not 0 < issue < 2**63:
+                    raise WorkflowAuthorityError("paid review linked issue identity is malformed")
+                holds = linked_issue_workflow_holds(db, WorkflowKey(binding.fence.key.repository, IssueRef(issue)))
+                if holds:
+                    raise WorkflowAuthorityError(f"linked issue #{issue}: {'; '.join(holds)}")
             # The run row records the captured binding (and so its generation);
             # this transaction proved it current and ungated. Review has no
             # ordered continuation to receipt, unlike resolve.

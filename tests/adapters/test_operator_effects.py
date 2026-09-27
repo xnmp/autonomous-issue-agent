@@ -22,9 +22,6 @@ class Remote:
         self.local_head = "a" * 40
         self.lose_issue_reply = False
         self.before_mutation = None
-        # PR reviews, keyed by review id: {id: state}
-        self.reviews = {}
-        self.reject_dismissal = False
 
     def result(self, stdout="", returncode=0, stderr=""):
         return SimpleNamespace(
@@ -87,26 +84,6 @@ class Remote:
             if not self.reject_auto_merge:
                 self.auto_merge = True
                 self.repo_revision += 1
-            return self.result()
-        if argv[:3] == ["gh", "api", "--paginate"] and argv[3].endswith("/reviews"):
-            return self.result(
-                json.dumps(
-                    [
-                        {
-                            "id": int(review_id),
-                            "state": state,
-                            "user": {"login": "review-bot"},
-                            "submitted_at": f"2026-08-02T0{review_id}:00:00Z",
-                        }
-                        for review_id, state in sorted(self.reviews.items())
-                    ]
-                )
-            )
-        if argv[:4] == ["gh", "api", "--method", "PUT"] and "/dismissals" in argv[4]:
-            self._before_mutation()
-            if self.reject_dismissal:
-                return self.result(returncode=1, stderr="422 not permitted")
-            self.reviews[argv[4].split("/reviews/")[1].split("/")[0]] = "DISMISSED"
             return self.result()
         if argv[:3] == ["gh", "api", "repos/o/r/hooks"]:
             return self.result(json.dumps(self.hooks))
@@ -388,121 +365,3 @@ def test_a_failed_label_change_is_not_journalled_as_applied(tmp_path):
     applied, _detail = effects.set_issue_labels(9, remove=("ai-blocked",))
 
     assert applied is False and journal.events == []
-
-
-# ── review dismissal: the only true re-arm of the rejection ceiling ──────────
-def _rejection(review_id, state="CHANGES_REQUESTED"):
-    from issue_agent.domain.review import SubmittedReview
-
-    return SubmittedReview(review_id, state, "review-bot")
-
-
-def test_a_dismissal_is_committed_before_gh_and_leaves_the_review_dismissed(
-    tmp_path,
-) -> None:
-    effects, remote, store = _effects(tmp_path)
-    remote.reviews = {"41": "CHANGES_REQUESTED"}
-    observed = []
-    remote.before_mutation = lambda: observed.append(
-        store.pending_commands()[0].state
-    )
-
-    assert effects.dismiss_review(7, _rejection("41"), "operator re-arm") == (
-        True, "ok",
-    )
-
-    assert observed == ["executing"]
-    assert remote.reviews == {"41": "DISMISSED"}
-    assert store.pending_commands() == ()
-    put = [c for c in remote.calls if "/dismissals" in " ".join(c)]
-    assert put[0][:4] == ("gh", "api", "--method", "PUT")
-    assert "repos/o/r/pulls/7/reviews/41/dismissals" in put[0][4]
-    assert "message=operator re-arm" in put[0]
-
-
-def test_replaying_a_dismissal_does_not_re_issue_it(tmp_path) -> None:
-    effects, remote, _store = _effects(tmp_path)
-    remote.reviews = {"41": "CHANGES_REQUESTED"}
-
-    effects.dismiss_review(7, _rejection("41"), "m")
-    effects.dismiss_review(7, _rejection("41"), "m")
-
-    assert len([c for c in remote.calls if "/dismissals" in " ".join(c)]) == 1
-
-
-def test_a_refused_dismissal_is_reported_not_raised(tmp_path) -> None:
-    effects, remote, _store = _effects(tmp_path)
-    remote.reviews = {"41": "CHANGES_REQUESTED"}
-    remote.reject_dismissal = True
-
-    ok, detail = effects.dismiss_review(7, _rejection("41"), "m")
-
-    assert ok is False and "422" in detail
-    assert remote.reviews == {"41": "CHANGES_REQUESTED"}
-
-
-def test_an_unreadable_review_list_is_an_error_not_an_empty_history(
-    tmp_path,
-) -> None:
-    """"No reviews" and "GitHub would not say" lead to opposite operator
-    decisions, so they must not collapse into the same answer."""
-    effects, remote, _store = _effects(tmp_path)
-    effects.run = lambda argv, **_kw: remote.result("not json")
-
-    try:
-        effects.pr_reviews(7)
-    except Exception as exc:
-        assert "malformed" in str(exc)
-    else:
-        raise AssertionError("an unreadable review list must raise")
-
-
-def test_reviews_are_parsed_into_the_domains_value_object(tmp_path) -> None:
-    effects, remote, _store = _effects(tmp_path)
-    remote.reviews = {"41": "CHANGES_REQUESTED", "42": "APPROVED"}
-
-    reviews = effects.pr_reviews(7)
-
-    assert [(r.review_id, r.state, r.author) for r in reviews] == [
-        ("41", "CHANGES_REQUESTED", "review-bot"),
-        ("42", "APPROVED", "review-bot"),
-    ]
-
-
-def test_a_dismissal_without_a_review_id_never_reaches_github(tmp_path) -> None:
-    effects, remote, _store = _effects(tmp_path)
-
-    assert effects.dismiss_review(7, _rejection(""), "m")[0] is False
-    assert effects.dismiss_review(0, _rejection("41"), "m")[0] is False
-    assert remote.calls == []
-
-
-def test_an_error_object_from_gh_is_not_read_as_an_empty_review_list(
-    tmp_path,
-) -> None:
-    """`gh api` answers a 404 with a JSON OBJECT. Parsed as "no reviews" it
-    would report a PR as needing no re-arm at all."""
-    effects, remote, _store = _effects(tmp_path)
-    effects.run = lambda argv, **_kw: remote.result(
-        json.dumps({"message": "Not Found"})
-    )
-
-    try:
-        effects.pr_reviews(7)
-    except Exception as exc:
-        assert "invalid payload" in str(exc)
-    else:
-        raise AssertionError("an error object must not read as no reviews")
-
-
-def test_a_review_with_no_user_is_attributed_to_nobody_not_crashed_on(
-    tmp_path,
-) -> None:
-    effects, remote, _store = _effects(tmp_path)
-    effects.run = lambda argv, **_kw: remote.result(
-        json.dumps([{"id": 1, "state": "CHANGES_REQUESTED"}, {"state": "X"}])
-    )
-
-    reviews = effects.pr_reviews(7)
-
-    assert [(r.review_id, r.author) for r in reviews] == [("1", "")]

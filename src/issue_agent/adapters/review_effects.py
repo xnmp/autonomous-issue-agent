@@ -312,7 +312,8 @@ def read_pull_request(
     try:
         if not isinstance(gateway, ReviewReads):
             return PullRequestUnavailable(key, observed_at, "the executor gateway cannot read pull request reviews"), None
-        view = gateway.get_pr(number, mergeability=False, checks=False)
+        reader = getattr(gateway, "get_review_pull_request", None)
+        view = reader(number) if callable(reader) else gateway.get_pr(number, mergeability=False, checks=False)
         observed = pull_request_observation(key, view, observed_at, PartialReviews("reviews not yet read"))
         if isinstance(observed, PullRequestUnavailable):
             return observed, view

@@ -323,16 +323,15 @@ barriers; the HTTP request executes no GitHub effect. The review daemon's drain
 executes every accepted obligation. GET reads SQLite only.
 
 The issue page mounts one review panel per linked pull request that is not
-merged. The panel is quiet while the family is `inactive`. Other statuses:
+merged. Its statuses are:
 
 - `absent` (404): the review daemon has recorded no workflow for this pull
   request, so it holds no review-rejection gate and nothing can be re-armed.
   A label on GitHub is not such a hold. The panel says so.
 
-- `migration_required`: the review family is not activated but another family
-  is. The legacy unblock is retired, so this pull request's review holds have
-  no lever until the review family is activated (plan decision 2: activate both
-  families together).
+- `migration_required`: the review family is not activated. Review dispatch
+  and fix-side repairs needing its guidance defer until activation, regardless
+  of other families. Activate resolve and review together operationally.
 - `unavailable` (503): the authority is unreadable or corrupt.
 - `available`: gates with typed causes, the continuation (fresh review owed,
   or the reviewed baseline and its provenance), the pending intent with
@@ -404,11 +403,14 @@ The commands:
   remaining authorized dismissals against a fresh read. It carries no new
   authorization. Its effect text says, from the same kept-holds predicate as
   its acceptance (`continue_rearm_kept_holds`), whether it buys a review.
-- `authorize_retry` behaves as it does for resolve, except that acceptance
-  first reads the pull request and refuses a closed or merged one. The review
+- `authorize_retry` behaves as it does for resolve. After exact-replay and stale
+  binding checks, acceptance reads the pull request and refuses a closed or merged one. The review
   drain executes it.
 
-A command naming another family epoch or episode conflicts (409).
+A new command naming another family epoch or episode conflicts (409), checked
+inside the acceptance transaction. An exact replay retains its original
+episode even after that re-arm advanced the episode. Replay across another
+activation epoch conflicts.
 
 The view's `daemon` is the review daemon's own recorded dispatch decision; the
 view never decides dispatch itself. Provenance: harness-owned. Only the review
@@ -530,6 +532,49 @@ activation is never repeated or reversed. Rollback after activation means
 running compatible code against the retained SQLite authority (or keeping work
 paused) — never re-enabling the legacy files. Older binaries fail closed on the
 schema. Live activation remains paused under the architecture plan.
+
+### Review family activation (offline, operator-only)
+
+The review family uses the same four commands and liveness/quiescence checks:
+
+```bash
+issue-agent review-activation inventory
+issue-agent review-activation shadow
+issue-agent review-activation rehearse --copy-to /tmp/empty-review-rehearsal
+issue-agent review-activation activate --confirm-plan-digest <digest from shadow>
+```
+
+Inventory covers every open PR and every legacy review record across the
+configured role roots and repeatable `--legacy-state-dir` roots. A complete
+fresh bot-review history must corroborate both valid `last-sha` and `patch-id`
+before they import as a reviewed baseline. Otherwise the open PR owes a fresh
+review. Guidance imports verbatim; closed PR records remain evidence only.
+Fresh counting and exemption evidence may import a rejection ceiling only
+where legacy review holds it, including the abandoned-at-head escalation case.
+The latest bot escalation must prove the rejection-ceiling preamble; an
+independent ESCALATE verdict remains a separate hold. Unknown hold provenance
+or incomplete history on a potentially held PR blocks import.
+Unreadable or malformed sources and ambiguous duplicate roots block activation.
+
+The shadow report compares legacy and new dispatch, including configured
+adoption and external holds, and names paid reviews activation would cause.
+Linked issue lifecycle/dependency holds and SQLite gates are included in the
+new dispatch prediction. A known linked issue whose read fails is unavailable,
+never treated as an unlinked PR. Normal review operation preserves that same
+distinction and bounds repeated failures with an evidence gate and backoff.
+The confirmation digest covers sources, inventory, epoch and every decision.
+Activation revalidates under all three deployment barriers and commits once;
+same-digest replay reports `already_active_with_this_plan`. Import creates no
+daemon dispatch record: the daemon records its first decision from its own read.
+
+Rehearse both families on separate isolated copies first. With all roles still
+stopped, shadow and activate resolve, then obtain a fresh review shadow and
+activate review before restarting either role. Activating only resolve retires
+legacy unblock without supplying the review lever. Review baseline, patch and
+guidance files are retained as evidence; their runtime readers, writers and
+legacy dismissal/reset controls have been removed. Rollback retains SQLite
+authority and requires compatible code. Real activation and restart remain
+subject to the architecture plan's deployment pause.
 
 ## Testing
 

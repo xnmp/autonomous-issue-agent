@@ -3,7 +3,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { WorkflowFamilies } from "../api/types";
 import { IssueTab } from "./IssueTab";
 import { controlResponse, inactiveControl } from "./resolve/test-fixtures";
-import { reviewAbsent, reviewControl, reviewControlResponse, reviewInactive, reviewJson } from "./review/test-fixtures";
+import { reviewAbsent, reviewControl, reviewControlResponse, reviewMigrationRequired, reviewJson } from "./review/test-fixtures";
 
 const detail = {
   issue: 77, title: "Escalated issue", url: null, stage: "escalated", escalation_reason: "review ceiling reached",
@@ -26,7 +26,7 @@ interface Routes {
   issue?: typeof detail;
 }
 
-function serve({ review = () => reviewControlResponse(reviewInactive), families: family = () => familyResponse(families()), issue = detail }: Routes) {
+function serve({ review = () => reviewControlResponse(reviewMigrationRequired), families: family = () => familyResponse(families()), issue = detail }: Routes) {
   const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
     const path = new URL(String(input), "http://localhost").pathname;
     if (path.endsWith("/resolve-control")) return controlResponse(inactiveControl);
@@ -59,7 +59,7 @@ describe("linked pull request review control", () => {
     serve({});
     render(<IssueTab repo="demo" issue={77} />);
     await waitFor(() => expect(screen.getByRole("button", { name: "Review legacy unblock" })).toBeEnabled());
-    expect(screen.queryByRole("heading", { name: /Review control/ })).not.toBeInTheDocument();
+    expect(await screen.findByText(/Review rejection control is not activated/)).toBeVisible();
   });
 
   it("explains an absent pull request's panel, so the refusal never points at nothing", async () => {

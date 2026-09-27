@@ -44,7 +44,7 @@ from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
 from issue_agent.domain.workflow import KeepGuidance, OpenGate, OperatorActor, RearmingGate, RequestRearm
 from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowFamily, WorkflowKey
-from issue_agent.domain.world import PRView
+from issue_agent.domain.world import IssueView, PRView
 from tests.app.resolve_acceptance_harness import Clock, Crash, ScriptedProvider, fail_at, install_clock, isolate_authority
 from tests.fakes.persistent_github import PersistentGitHub
 
@@ -145,6 +145,7 @@ def create_review_deployment(root: Path, *, heads: int = 4, ceiling: int = CEILI
         shas.append(_git(target, "rev-parse", "HEAD"))
     deployment = ReviewDeployment(root, target, base, tuple(shas), ceiling)
     remote = deployment.github()
+    remote.seed(IssueView(1, title="Add thing", state="open"))
     remote.seed_pr(PRView(
         PR, head_ref_name="fix/1-thing", head_ref_oid=shas[0], base_ref_oid=base, title="Add thing",
         body="Adds the thing.", labels=frozenset({Label.AI_PR_OPEN}), state="OPEN", closing_issue=1,
@@ -209,7 +210,8 @@ class ReviewComposition:
         state = self.state()
         gate_id = gate_id or next(gate.gate_id for gate in self.gates() if isinstance(gate, OpenGate)
                                   and type(gate.cause).__name__ == "ReviewRejectionCeiling")
-        command = RequestRearm(request_id, state.revision, gate_id, guidance or KeepGuidance())
+        command = RequestRearm(request_id, state.revision, gate_id, guidance or KeepGuidance(),
+                               expected_binding=state.binding)
         return self.workflow.request_rearm(command, ACTOR)
 
     def charges(self) -> list[tuple]:

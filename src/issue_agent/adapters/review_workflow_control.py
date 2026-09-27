@@ -32,7 +32,7 @@ from ..domain.review_dispatch_record import (
     departed_read_due, next_decision_record,
 )
 from ..domain.review_rearm import (
-    AbsentReviewControl, GateFactsUnavailable, HoldRestoration, InactiveReviewControl, MigrationRequiredReviewControl,
+    AbsentReviewControl, GateFactsUnavailable, HoldRestoration, MigrationRequiredReviewControl,
     PendingReviewRecovery, RearmCommandProgress, RearmCommandStatus, ReleaseProjection, ReleaseStatus, RetryRefusal,
     ReviewControlRead, ReviewControlView, UnreadableHoldRestoration, UnreadableReviewDecision,
     decide_review_rearm_reconciliation, update_review_rearm_observation,
@@ -115,6 +115,7 @@ _NEVER_DUE = "9999-12-31T23:59:59.999999+00:00"
 _EVIDENCE_NAMESPACES = {
     ReviewEvidenceKind.EXEMPTION_TRAILERS: "review-exemption-evidence",
     ReviewEvidenceKind.REVIEW_HISTORY: "review-history-evidence",
+    ReviewEvidenceKind.LINKED_ISSUE: "review-linked-issue-evidence",
 }
 _REVIEW_INTENTS = PendingReviewRearm | CompletedReviewRearm | SupersededReviewRearm | CancelledReviewRearm
 _BARRIER_ORDERED = frozenset({
@@ -155,8 +156,8 @@ def review_family_activated(control: SQLiteControlStore, repository: str) -> boo
 def read_review_guidance(control: SQLiteControlStore, repository: str, pr: int) -> str | None:
     """A pull request's committed review-episode guidance, read-only for any role.
 
-    None means the review family is not activated for the repository, so the
-    legacy per-PR record still owns guidance; an activated but unobserved
+    None means the review family requires migration; callers must defer.
+    An activated but unobserved
     workflow has no guidance (""). An unreadable authority raises
     `WorkflowAuthorityError`: a caller defers rather than guessing (ADR 0015).
     """
@@ -266,7 +267,7 @@ class SQLiteReviewWorkflowControl:
             return observed
         try:
             return RecordedPullRequest(observed, tuple(self._external_holds(observed, view)))
-        except sqlite3.Error:
+        except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError):
             raise
         except Exception as exc:  # noqa: BLE001 - an unreadable hold source is unavailable evidence
             return PullRequestUnavailable(key, started, f"external holds unavailable: {_reason(exc)[:480]}")
@@ -518,10 +519,7 @@ class SQLiteReviewWorkflowControl:
                 self._control._assert_owner_active(db, self._writer.owner_id)
                 authority = load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, key.repository)
                 if authority is None:
-                    # The legacy unblock refuses a repository once any family is
-                    # active, so an inactive review family then has no lever.
-                    others = active_families(db, key.repository)
-                    return MigrationRequiredReviewControl(key, others) if others else InactiveReviewControl(key)
+                    return MigrationRequiredReviewControl(key, active_families(db, key.repository))
                 state = load_review_workflow_row(db, key)
                 if state is None:
                     return AbsentReviewControl(key, authority)
@@ -910,6 +908,10 @@ class SQLiteReviewWorkflowControl:
         replayed = self._replay(db, prior, transition, encoded)
         if replayed is not None:
             return replayed
+        if isinstance(transition.audit, AuthorizedOperatorCommand):
+            conflict = self._operator_binding_conflict(prior, transition.audit.command)
+            if conflict is not None:
+                return conflict
         # The proposal's prior is a caller claim: only the stored row is authority.
         if transition.prior != prior:
             raise WorkflowAuthorityError("review proposal does not replace the stored workflow snapshot")
@@ -1633,6 +1635,19 @@ class SQLiteReviewWorkflowControl:
 
     # -- operator acceptance -------------------------------------------------------------------
 
+    @staticmethod
+    def _operator_binding_conflict(
+        state: ReviewWorkflowSnapshot,
+        command: RequestRearm | ContinueGrantedRearm | CancelRearm | AuthorizeAbsentRetry,
+        *, replay: bool = False,
+    ) -> WorkflowConflict | None:
+        binding = command.expected_binding
+        if not isinstance(binding, WorkflowBinding) or binding.fence != command.expected.fence:
+            return WorkflowConflict(state.revision, "review operator commands require their captured workflow binding")
+        if binding.authority != state.authority or (not replay and binding.episode_id != state.episode.episode_id):
+            return WorkflowConflict(state.revision, "the command names another family epoch or episode")
+        return None
+
     def _request_replay(
         self, db: sqlite3.Connection, command: RequestRearm | ContinueGrantedRearm, actor: OperatorActor,
     ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected | None:
@@ -1706,20 +1721,41 @@ class SQLiteReviewWorkflowControl:
             raise ValueError("review re-arm requires a typed command and authenticated operator")
         key = self._scope(command.expected.fence.key)
         with self._control.transaction() as db:
+            current = self._load(db, key)
+            conflict = self._operator_binding_conflict(current, command, replay=True)
+            if conflict is not None:
+                return conflict
             replayed = self._request_replay(db, command, actor)
         if replayed is not None:
             return replayed
         with self._barriers():
             with self._control.transaction() as db:
                 current = self._load(db, key)
+                conflict = self._operator_binding_conflict(current, command, replay=True)
+                if conflict is not None:
+                    return conflict
+                replayed = self._request_replay(db, command, actor)
+                if replayed is not None:
+                    return replayed
+                conflict = self._operator_binding_conflict(current, command)
+                if conflict is not None:
+                    return conflict
                 if current.revision != command.expected:
                     return WorkflowConflict(current.revision, "workflow changed before re-arm acceptance")
             recorded = self._observe(key)
             with self._control.transaction() as db:
                 prior = self._load(db, key)
+                conflict = self._operator_binding_conflict(prior, command, replay=True)
+                if conflict is not None:
+                    return conflict
                 replayed = self._request_replay(db, command, actor)
                 if replayed is not None:
                     return replayed
+                conflict = self._operator_binding_conflict(prior, command)
+                if conflict is not None:
+                    return conflict
+                if prior.revision != command.expected:
+                    return WorkflowConflict(prior.revision, "workflow changed before re-arm acceptance")
                 if isinstance(recorded, PullRequestUnavailable):
                     return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, recorded.reason)
                 if self._active_review_runs(db, key):
@@ -1741,6 +1777,9 @@ class SQLiteReviewWorkflowControl:
         with self._barriers():
             with self._control.transaction() as db:
                 prior = self._load(db, key)
+                conflict = self._operator_binding_conflict(prior, command, replay=True)
+                if conflict is not None:
+                    return conflict
                 receipt = db.execute(
                     "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-cancellation' AND scope=? AND key=?",
                     (self._writer.repository, command.cancellation_id),
@@ -1757,6 +1796,9 @@ class SQLiteReviewWorkflowControl:
                     if audit.command == command and audit.actor.subject == actor.subject:
                         return WorkflowCommitted(prior, idempotent=True)
                     return WorkflowConflict(prior.revision, "durable workflow identity was reused with different content")
+                conflict = self._operator_binding_conflict(prior, command)
+                if conflict is not None:
+                    return conflict
                 if prior.revision != command.expected or not isinstance(prior.intent, PendingReviewRearm):
                     return WorkflowConflict(prior.revision, "review re-arm cancellation requires exact pending authority")
                 verified, _, uncertainty = self._rearm_command_facts(db, prior, None)
@@ -1783,6 +1825,19 @@ class SQLiteReviewWorkflowControl:
             raise ValueError("retry authorization requires a typed command and authenticated actor")
         key = self._scope(command.expected.fence.key)
         with self._barriers():
+            with self._control.transaction() as db:
+                prior = self._load(db, key)
+                conflict = self._operator_binding_conflict(prior, command, replay=True)
+                if conflict is not None:
+                    return conflict
+                replayed = self._retry_replay(db, prior, command, actor)
+                if replayed is not None:
+                    return replayed
+                conflict = self._operator_binding_conflict(prior, command)
+                if conflict is not None:
+                    return conflict
+                if prior.revision != command.expected:
+                    return WorkflowConflict(prior.revision, "workflow changed before retry authorization")
             # A grant on a closed pull request would be spent on a certain
             # refusal. Only a read that finds it terminal refuses here; an
             # unavailable read leaves the decision to the executor's own guard.
@@ -1790,19 +1845,15 @@ class SQLiteReviewWorkflowControl:
             terminal = isinstance(observed, ObservedPullRequest) and observed.state is not PullRequestState.OPEN
             with self._control.transaction() as db:
                 prior = self._load(db, key)
-                stored = db.execute(
-                    "SELECT actor_json FROM workflow_retry_authorizations WHERE authorization_id=?",
-                    (command.authorization_id,),
-                ).fetchone()
-                if stored is not None:
-                    try:
-                        accepted = decode_workflow(stored["actor_json"], AuthorizedOperatorCommand)
-                    except (ValueError, TypeError) as exc:
-                        raise WorkflowAuthorityError("invalid accepted retry authorization audit") from exc
-                    if accepted.command == command and accepted.actor.subject == actor.subject:
-                        return WorkflowCommitted(prior, idempotent=True)
-                    return WorkflowConflict(prior.revision,
-                                            "authorization identity was reused with different content or operator")
+                conflict = self._operator_binding_conflict(prior, command, replay=True)
+                if conflict is not None:
+                    return conflict
+                replayed = self._retry_replay(db, prior, command, actor)
+                if replayed is not None:
+                    return replayed
+                conflict = self._operator_binding_conflict(prior, command)
+                if conflict is not None:
+                    return conflict
                 if prior.revision != command.expected:
                     return WorkflowConflict(prior.revision, "workflow changed before retry authorization")
                 if terminal:
@@ -1822,6 +1873,24 @@ class SQLiteReviewWorkflowControl:
                     return proposal
                 assert isinstance(proposal, WorkflowChanged)
                 return self._commit(db, prior.revision, (prior.authority,), proposal)
+
+    @staticmethod
+    def _retry_replay(
+        db: sqlite3.Connection, prior: ReviewWorkflowSnapshot, command: AuthorizeAbsentRetry, actor: OperatorActor,
+    ) -> WorkflowCommitted | WorkflowConflict | None:
+        stored = db.execute(
+            "SELECT actor_json FROM workflow_retry_authorizations WHERE authorization_id=?",
+            (command.authorization_id,),
+        ).fetchone()
+        if stored is None:
+            return None
+        try:
+            accepted = decode_workflow(stored["actor_json"], AuthorizedOperatorCommand)
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError("invalid accepted retry authorization audit") from exc
+        if accepted.command == command and accepted.actor.subject == actor.subject:
+            return WorkflowCommitted(prior, idempotent=True)
+        return WorkflowConflict(prior.revision, "authorization identity was reused with different content or operator")
 
     # -- pending re-arm reconciliation ----------------------------------------------------------
 
@@ -2414,9 +2483,9 @@ class SQLiteReviewWorkflowControl:
         if schedule is not None and not evidence_due(schedule, schedule.head_sha, now=self._now()):
             return False, ""
         history = kind is ReviewEvidenceKind.REVIEW_HISTORY
-        observed = observe_pull_request(self._gateway, key, self._now(), reviews=history)
+        observed, view = read_pull_request(self._gateway, key, self._now(), reviews=history)
         if isinstance(observed, PullRequestUnavailable):
-            if history and schedule is not None:
+            if kind in {ReviewEvidenceKind.REVIEW_HISTORY, ReviewEvidenceKind.LINKED_ISSUE} and schedule is not None:
                 # The evidence schedule is this hold's backoff; its failure is journalled there.
                 self.record_evidence(key, schedule.head_sha, kind, error=observed.reason or "pull request unavailable")
                 return False, ""
@@ -2435,6 +2504,16 @@ class SQLiteReviewWorkflowControl:
             self.record_evidence(key, observed.head_sha, kind, error=(
                 None if complete else getattr(reviews, "reason", "") or "review history incomplete"))
             return complete, ""
+        if kind is ReviewEvidenceKind.LINKED_ISSUE:
+            from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
+
+            try:
+                review_linked_issue_holds(self._control, self._gateway, key, view)
+            except ReviewLinkedIssueUnavailable as exc:
+                self.record_evidence(key, observed.head_sha, kind, error=str(exc))
+                return False, ""
+            self.record_evidence(key, observed.head_sha, kind, error=None)
+            return True, ""
         if self._trailers is None:
             return False, ""
         try:

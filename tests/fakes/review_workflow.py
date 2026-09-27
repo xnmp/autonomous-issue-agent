@@ -92,7 +92,7 @@ def pending(request_id="request:1"):
 
 def request(before=None, request_id="request:1"):
     before = before or held()
-    return RequestRearm(request_id, before.revision, GATE, KeepGuidance())
+    return RequestRearm(request_id, before.revision, GATE, KeepGuidance(), expected_binding=before.binding)
 
 
 def preflight(key=PR_KEY, reviews=None, *, head=HEAD):

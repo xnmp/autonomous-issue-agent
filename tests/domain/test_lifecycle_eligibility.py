@@ -7,7 +7,8 @@ from issue_agent.domain.eligibility import IssueHoldGuard
 from issue_agent.domain.lifecycle import hold_guard, hold_guard_applies
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
 from issue_agent.domain.labels import Label
-from issue_agent.domain.review import ReviewConfig, ReviewState, decide_review
+from issue_agent.domain.review import BoundReviewState, ReviewConfig, decide_bound_review
+from tests.domain.test_review_bound_dispatch import owed
 from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review, WorldState
 
 
@@ -28,8 +29,8 @@ def test_ready_issue_with_hold_does_not_buy_resolve(hold):
 ])
 def test_review_trigger_with_hold_does_not_buy_review(hold):
     pr = PRView(2, labels=frozenset({Label.AI_PR_OPEN, hold}), head_ref_oid="head")
-    actions = decide_review(WorldState(prs=(pr,)),
-                            ReviewConfig(review_bot="review-bot"), ReviewState())
+    actions = decide_bound_review(WorldState(prs=(pr,)),
+                                  ReviewConfig(review_bot="review-bot"), BoundReviewState(owed=owed(2)))
     assert not any(isinstance(action, RunAgent) for action in actions)
 
 

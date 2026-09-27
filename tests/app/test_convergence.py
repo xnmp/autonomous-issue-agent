@@ -59,6 +59,7 @@ from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.loop import Daemon
 from issue_agent.app.planners.tasks import FixTaskConfig
+from issue_agent.app.review_runtime import review_guidance_reader
 from issue_agent.domain import outcome
 from issue_agent.domain.actions import Action, AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
@@ -68,7 +69,8 @@ from issue_agent.domain.pricing import BudgetPolicy
 from issue_agent.domain.refs import issue_from_branch
 from issue_agent.domain.world import IssueView, PRView, WorldState
 from issue_agent.domain.workflow import FreshResolve, ResolveSession
-from issue_agent.domain.workflow_identity import WorkflowWriter
+from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey, WorkflowWriter
+from tests.fakes.review_workflow import held as held_review
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 CFG = FixConfig(fix_bot="fix-bot")
@@ -373,6 +375,8 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
                 )),
             )
         install_workflow(control, snapshot)
+    for item in scenario.world.prs:
+        install_workflow(control, replace(held_review(key=WorkflowKey("o/r", PullRequestRef(item.number))), gates=()))
     workflow = SQLiteWorkflowControl(
         control, WorkflowWriter("o/r", "fix", "o/r:fix"),
         resolve_ceiling=scenario.cfg.max_resolve_retries,
@@ -396,6 +400,7 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
     )
     dcfg = DispatchConfig(
         fix=FixTaskConfig("o/r", agent_md="AM"), fix_bot=scenario.cfg.fix_bot, log=log,
+        operator_guidance=review_guidance_reader(control, "o/r"),
     )
     dispatcher = AgentDispatcher(dcfg, gw, store, worktrees, runner, executor, workflow_control=workflow)
     executor.bind_workflow_reconciliation(

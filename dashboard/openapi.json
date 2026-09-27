@@ -3862,7 +3862,6 @@
               "mapping": {
                 "absent": "#/components/schemas/ReviewAbsentControl",
                 "available": "#/components/schemas/ReviewAvailableControl",
-                "inactive": "#/components/schemas/ReviewInactiveControl",
                 "migration_required": "#/components/schemas/ReviewMigrationRequiredControl",
                 "unavailable": "#/components/schemas/ReviewUnavailableControl"
               },
@@ -3871,9 +3870,6 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ReviewAvailableControl"
-              },
-              {
-                "$ref": "#/components/schemas/ReviewInactiveControl"
               },
               {
                 "$ref": "#/components/schemas/ReviewMigrationRequiredControl"
@@ -4905,38 +4901,9 @@
         "title": "ReviewImportedBaseline",
         "type": "object"
       },
-      "ReviewInactiveControl": {
-        "additionalProperties": false,
-        "description": "Not activated; the legacy unblock still owns this repository's review holds.",
-        "properties": {
-          "pull_request": {
-            "title": "Pull Request",
-            "type": "integer"
-          },
-          "repository": {
-            "title": "Repository",
-            "type": "string"
-          },
-          "status": {
-            "const": "inactive",
-            "enum": [
-              "inactive"
-            ],
-            "title": "Status",
-            "type": "string"
-          }
-        },
-        "required": [
-          "status",
-          "repository",
-          "pull_request"
-        ],
-        "title": "ReviewInactiveControl",
-        "type": "object"
-      },
       "ReviewMigrationRequiredControl": {
         "additionalProperties": false,
-        "description": "Not activated, and another family's activation retired the legacy unblock: no lever until activation.",
+        "description": "Review dispatch and operator re-arm require explicit family activation.",
         "properties": {
           "active_families": {
             "items": {
@@ -5949,21 +5916,8 @@
       },
       "UnblockRequest": {
         "additionalProperties": false,
-        "description": "The unblock body. `guidance` is tri-state: absent/null leaves any stored\nnote alone, `\"\"` clears it, text sets it (see `guidance.parse_guidance`).\n\n`extra=\"forbid\"`, unlike every response contract above: a response gains\nfields over time and a client must tolerate them, but a REQUEST field the\nserver does not know is an operator whose note went nowhere \u2014 `{\"note\":\n...}` must 422, not succeed silently having stored nothing.",
-        "properties": {
-          "guidance": {
-            "anyOf": [
-              {
-                "maxLength": 4000,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Guidance"
-          }
-        },
+        "description": "Legacy breaker release accepts no review guidance or re-arm authority.",
+        "properties": {},
         "title": "UnblockRequest",
         "type": "object"
       },
@@ -6995,7 +6949,6 @@
                     "mapping": {
                       "absent": "#/components/schemas/ReviewAbsentControl",
                       "available": "#/components/schemas/ReviewAvailableControl",
-                      "inactive": "#/components/schemas/ReviewInactiveControl",
                       "migration_required": "#/components/schemas/ReviewMigrationRequiredControl",
                       "unavailable": "#/components/schemas/ReviewUnavailableControl"
                     },
@@ -7004,9 +6957,6 @@
                   "oneOf": [
                     {
                       "$ref": "#/components/schemas/ReviewAvailableControl"
-                    },
-                    {
-                      "$ref": "#/components/schemas/ReviewInactiveControl"
                     },
                     {
                       "$ref": "#/components/schemas/ReviewMigrationRequiredControl"

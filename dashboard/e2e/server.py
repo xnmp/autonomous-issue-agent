@@ -404,7 +404,8 @@ class ReviewFixture:
 
     def control(self, pr: int, request_id: str | None) -> wc.ReviewControl:
         if pr - REVIEW_PR_OFFSET not in REVIEW_ISSUES:
-            return wc.ReviewInactiveControl(status="inactive", repository=RESOLVE_REPO, pull_request=pr)
+            return wc.ReviewMigrationRequiredControl(status="migration_required", repository=RESOLVE_REPO,
+                                                     pull_request=pr, active_families=[])
         return self._control(self._state(pr), request_id)
 
     def _pending(self, state: _ReviewState, request_id: str) -> wc.ReviewPendingRearm:
@@ -738,7 +739,7 @@ class FixtureBackend:
         return wc.WorkflowFamiliesAvailable(status="available", repository=RESOLVE_REPO, active_families=[])
 
     def unblock(
-        self, _name: str, _number: int, _channel: str, _guidance: str | None
+        self, _name: str, _number: int, _channel: str
     ) -> tuple[bool, str]:
         return True, "unblocked"
 

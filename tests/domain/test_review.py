@@ -22,21 +22,18 @@ from issue_agent.domain.review import (
     RejectedExemptions,
     ReviewConfig,
     ReviewMode,
-    ReviewState,
+    BoundReviewState,
     ReviewTarget,
     UNGRANTED_DOWNGRADE_MARKER,
     count_prior_rejections,
-    decide_review,
+    decide_bound_review,
     gate_submission,
-    needs_initial_review,
-    needs_re_review,
     parse_findings,
     patch_signature,
     resolve_authenticated_grants,
     review_submission,
     reviewer_verdict_on_head,
     synthesize_review,
-    unproductive_ceiling_hit,
     unproductive_escalation_reason,
     FIX_HOLD_CEILING_SECONDS,
     FIX_HOLD_SETTLE_SECONDS,
@@ -45,6 +42,17 @@ from issue_agent.domain.review import (
     hold_review_dispatch,
 )
 from tests.domain.builders import Review
+
+from tests.domain.test_review_bound_dispatch import binding
+
+
+def _owed_state(*, kind=AgentKind.REVIEW, **kwargs):
+    return BoundReviewState(owed={number: (kind, binding(number)) for number in (100, 101, 200, 815)}, **kwargs)
+
+
+def _run(kind, number, claim=None):
+    return RunAgent(kind, number, claim, workflow=binding(number))
+
 
 CFG = ReviewConfig(review_bot="review-bot")
 
@@ -98,27 +106,21 @@ def test_review_mode_case_insensitive():
 
 def test_initial_review_for_unsessioned_pr():
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    actions = decide_review(world(prs=[p]), CFG, ReviewState())
-    assert RunAgent(AgentKind.REVIEW, 100) in actions
+    actions = decide_bound_review(world(prs=[p]), CFG, _owed_state())
+    assert _run(AgentKind.REVIEW, 100) in actions
 
 
 def test_re_review_when_sha_advances():
     p = pr(100, "ai-pr-open", head_ref_oid="def")
-    st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"})
-    actions = decide_review(world(prs=[p]), CFG, st)
-    assert RunAgent(AgentKind.RE_REVIEW, 100) in actions
-
-
-def test_no_re_review_when_sha_unchanged():
-    p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"})
-    assert decide_review(world(prs=[p]), CFG, st) == []
+    st = _owed_state(kind=AgentKind.RE_REVIEW)
+    actions = decide_bound_review(world(prs=[p]), CFG, st)
+    assert _run(AgentKind.RE_REVIEW, 100) in actions
 
 
 def test_solo_mode_disables_reviewer():
     cfg = ReviewConfig(review_bot="review-bot", identity_mode="solo")
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    assert decide_review(world(prs=[p]), cfg, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), cfg, _owed_state()) == []
 
 
 # ── configurable trigger label (external-repo reviewer) ───────────────────────
@@ -126,20 +128,20 @@ def test_custom_trigger_label_fires_on_ai_review():
     # An external-repo deployment triggers on `ai-review`, not `ai-pr-open`.
     cfg = ReviewConfig(review_bot="review-bot", trigger_label=Label.AI_REVIEW)
     p = pr(815, "ai-review", head_ref_oid="abc")
-    assert RunAgent(AgentKind.REVIEW, 815) in decide_review(world(prs=[p]), cfg, ReviewState())
+    assert _run(AgentKind.REVIEW, 815) in decide_bound_review(world(prs=[p]), cfg, _owed_state())
 
 
 def test_custom_trigger_label_ignores_ai_pr_open():
     # With trigger=ai-review, a plain ai-pr-open PR is NOT picked up.
     cfg = ReviewConfig(review_bot="review-bot", trigger_label=Label.AI_REVIEW)
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    assert decide_review(world(prs=[p]), cfg, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), cfg, _owed_state()) == []
 
 
 def test_default_trigger_label_is_ai_pr_open():
     # Default unchanged: an ai-review PR is ignored by the stock reviewer.
     p = pr(815, "ai-review", head_ref_oid="abc")
-    assert decide_review(world(prs=[p]), CFG, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), CFG, _owed_state()) == []
 
 
 # ── rogue-PR adoption ─────────────────────────────────────────────────────────
@@ -150,24 +152,24 @@ def test_adopts_unlabeled_open_pr():
     # A PR with no trigger label → labelled with it AND reviewed the same poll,
     # so a comment lands on the first tick (not a poll later).
     p = pr(200, head_ref_oid="abc", author="human")
-    acts = decide_review(world(prs=[p]), ADOPT, ReviewState())
+    acts = decide_bound_review(world(prs=[p]), ADOPT, _owed_state())
     assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN, "abc") in acts
-    assert RunAgent(AgentKind.REVIEW, 200) in acts
+    assert _run(AgentKind.REVIEW, 200) in acts
 
 
 def test_adopt_off_by_default_leaves_rogue_pr_alone():
     p = pr(200, head_ref_oid="abc", author="human")
-    assert decide_review(world(prs=[p]), CFG, ReviewState()) == []  # CFG adopt=False
+    assert decide_bound_review(world(prs=[p]), CFG, _owed_state()) == []  # CFG adopt=False
 
 
 def test_adopt_skips_draft():
     p = pr(200, head_ref_oid="abc", author="human", is_draft=True)
-    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), ADOPT, _owed_state()) == []
 
 
 def test_adopt_skips_review_bots_own_pr():
     p = pr(200, head_ref_oid="abc", author="review-bot")
-    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), ADOPT, _owed_state()) == []
 
 
 def test_c1_adopt_skips_own_pr_when_config_carries_the_bot_suffix():
@@ -176,18 +178,18 @@ def test_c1_adopt_skips_own_pr_when_config_carries_the_bot_suffix():
     # and review it — the self-review loop the guard exists to prevent.
     cfg = ReviewConfig(review_bot="review-bot[bot]", adopt_unlabeled=True)
     p = pr(200, head_ref_oid="abc", author="review-bot")
-    assert decide_review(world(prs=[p]), cfg, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), cfg, _owed_state()) == []
 
 
 def test_c1_adopt_skips_own_pr_when_author_carries_the_bot_suffix():
     # The asymmetry runs both ways: bare config, suffixed author.
     p = pr(200, head_ref_oid="abc", author="review-bot[bot]")
-    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), ADOPT, _owed_state()) == []
 
 
 def test_c1_adopt_self_guard_is_case_insensitive():
     p = pr(200, head_ref_oid="abc", author="Review-Bot")
-    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), ADOPT, _owed_state()) == []
 
 
 def test_c1_suffix_tolerance_still_adopts_a_strangers_pr():
@@ -195,21 +197,21 @@ def test_c1_suffix_tolerance_still_adopts_a_strangers_pr():
     # different author's rogue PR is still adopted and reviewed.
     cfg = ReviewConfig(review_bot="review-bot[bot]", adopt_unlabeled=True)
     p = pr(200, head_ref_oid="abc", author="some-human")
-    acts = decide_review(world(prs=[p]), cfg, ReviewState())
+    acts = decide_bound_review(world(prs=[p]), cfg, _owed_state())
     assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN, "abc") in acts
-    assert RunAgent(AgentKind.REVIEW, 200) in acts
+    assert _run(AgentKind.REVIEW, 200) in acts
 
 
 def test_adopt_skips_opt_out_label():
     p = pr(200, "no-ai-review", head_ref_oid="abc", author="human")
-    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), ADOPT, _owed_state()) == []
 
 
 def test_adopt_skips_already_labelled_pr():
     # already carries the trigger label → normal review path, not re-adopted.
     p = pr(200, "ai-pr-open", head_ref_oid="abc", author="human")
-    acts = decide_review(world(prs=[p]), ADOPT, ReviewState())
-    assert RunAgent(AgentKind.REVIEW, 200) in acts
+    acts = decide_bound_review(world(prs=[p]), ADOPT, _owed_state())
+    assert _run(AgentKind.REVIEW, 200) in acts
     assert not any(isinstance(a, Relabel) for a in acts)
 
 
@@ -218,20 +220,12 @@ def test_adopt_skips_parked_pr():
     # pipeline; adoption re-labelling it undid the park and let the budget arm
     # re-escalate (keifu PR #179, 2026-08-03). Parked PRs stay the operator's.
     p = pr(200, "ai-parked", head_ref_oid="abc", author="human")
-    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
+    assert decide_bound_review(world(prs=[p]), ADOPT, _owed_state()) == []
 
 
 def test_adopt_skips_closed_pr():
     p = pr(200, head_ref_oid="abc", author="human", state="MERGED")
-    assert decide_review(world(prs=[p]), ADOPT, ReviewState()) == []
-
-
-def test_needs_helpers():
-    p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    assert needs_initial_review(p, ReviewState()) is True
-    st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"})
-    assert needs_initial_review(p, st) is False
-    assert needs_re_review(p, st) is False
+    assert decide_bound_review(world(prs=[p]), ADOPT, _owed_state()) == []
 
 
 # ── unproductive-round ceiling (review P0R-3) ─────────────────────────────────
@@ -243,20 +237,20 @@ CAPPED = ReviewConfig(review_bot="review-bot", max_unproductive_rounds=3)
 
 
 def _state(pr_number, rounds, **kw):
-    return ReviewState(unproductive_rounds={pr_number: rounds}, **kw)
+    return _owed_state(unproductive_rounds={pr_number: rounds}, **kw)
 
 
 def test_below_the_ceiling_the_review_still_dispatches():
     """Anti-vacuity FIRST: a ceiling that fires early is a reviewer that never
     reviews. Two dead rounds out of three still buys the third."""
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    acts = decide_review(world(prs=[p]), CAPPED, _state(100, 2))
-    assert acts == [RunAgent(AgentKind.REVIEW, 100)]
+    acts = decide_bound_review(world(prs=[p]), CAPPED, _state(100, 2))
+    assert acts == [_run(AgentKind.REVIEW, 100)]
 
 
 def test_at_the_ceiling_the_dispatch_is_withheld_and_the_pr_escalates():
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    acts = decide_review(world(prs=[p]), CAPPED, _state(100, 3))
+    acts = decide_bound_review(world(prs=[p]), CAPPED, _state(100, 3))
     # Set equality, not membership (review §5): the ONLY thing this poll may emit
     # is the human handoff — no RunAgent hiding beside it.
     assert acts == [
@@ -270,9 +264,9 @@ def test_the_ceiling_also_stops_a_re_review_loop():
     """A PR that was reviewed once and then advances its SHA re-enters through
     `needs_re_review` — a second, equally unbounded entrance."""
     p = pr(100, "ai-pr-open", head_ref_oid="def")
-    st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"},
+    st = _owed_state(kind=AgentKind.RE_REVIEW,
                      unproductive_rounds={100: 3})
-    acts = decide_review(world(prs=[p]), CAPPED, st)
+    acts = decide_bound_review(world(prs=[p]), CAPPED, st)
     assert not any(isinstance(a, RunAgent) for a in acts)
     assert Relabel(Target.PR, 100, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in acts
 
@@ -282,24 +276,24 @@ def test_escalation_is_edge_triggered_on_the_needs_human_review_label():
     Without this a stuck relabel converts one paid loop into a comment loop —
     one 'Circuit breaker' comment + one ALERT_CMD run per poll, ~4,300/day."""
     p = pr(100, "ai-pr-open", "needs-human-review", head_ref_oid="abc")
-    assert decide_review(world(prs=[p]), CAPPED, _state(100, 3)) == []
+    assert decide_bound_review(world(prs=[p]), CAPPED, _state(100, 3)) == []
 
 
 def test_a_ceiling_of_zero_disables_the_breaker():
     """cap<=0 disables, like every other breaker in the harness."""
     cfg = ReviewConfig(review_bot="review-bot", max_unproductive_rounds=0)
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    assert decide_review(world(prs=[p]), cfg, _state(100, 99)) == [
-        RunAgent(AgentKind.REVIEW, 100)
+    assert decide_bound_review(world(prs=[p]), cfg, _state(100, 99)) == [
+        _run(AgentKind.REVIEW, 100)
     ]
 
 
 def test_the_ceiling_is_per_pr_and_does_not_leak_across_prs():
     a = pr(100, "ai-pr-open", head_ref_oid="abc")
     b = pr(101, "ai-pr-open", head_ref_oid="abc")
-    acts = decide_review(world(prs=[a, b]), CAPPED, _state(100, 3))
-    assert RunAgent(AgentKind.REVIEW, 101) in acts
-    assert RunAgent(AgentKind.REVIEW, 100) not in acts
+    acts = decide_bound_review(world(prs=[a, b]), CAPPED, _state(100, 3))
+    assert _run(AgentKind.REVIEW, 101) in acts
+    assert _run(AgentKind.REVIEW, 100) not in acts
 
 
 def test_default_ceiling_is_armed_without_any_configuration():
@@ -311,7 +305,7 @@ def test_default_ceiling_is_armed_without_any_configuration():
     st = _state(100, 5)
     assert not any(
         isinstance(a, RunAgent)
-        for a in decide_review(world(prs=[p]), ReviewConfig(review_bot="r"), st)
+        for a in decide_bound_review(world(prs=[p]), ReviewConfig(review_bot="r"), st)
     )
 
 
@@ -319,13 +313,13 @@ def test_adoption_is_a_second_entrance_and_is_bounded_too():
     """A rogue PR is adopted AND reviewed the same tick, so the adoption arm
     needs the same guard — otherwise the ceiling just moves the loop."""
     p = pr(200, head_ref_oid="abc", author="human")
-    assert decide_review(world(prs=[p]), replace(ADOPT, max_unproductive_rounds=3),
+    assert decide_bound_review(world(prs=[p]), replace(ADOPT, max_unproductive_rounds=3),
                          _state(200, 3)) == []
     # anti-vacuity: below the cap the rogue PR is still adopted and reviewed.
-    acts = decide_review(world(prs=[p]), replace(ADOPT, max_unproductive_rounds=3),
+    acts = decide_bound_review(world(prs=[p]), replace(ADOPT, max_unproductive_rounds=3),
                          _state(200, 2))
     assert Relabel(Target.PR, 200, None, Label.AI_PR_OPEN, "abc") in acts
-    assert RunAgent(AgentKind.REVIEW, 200) in acts
+    assert _run(AgentKind.REVIEW, 200) in acts
 
 
 def test_an_escalated_pr_is_not_re_adopted_into_the_loop():
@@ -335,15 +329,7 @@ def test_an_escalated_pr_is_not_re_adopted_into_the_loop():
     re-labels and re-dispatches the escalated PR on the very next poll and the
     ceiling buys nothing at all."""
     escalated = pr(200, "needs-human-review", head_ref_oid="abc", author="human")
-    assert decide_review(world(prs=[escalated]), ADOPT, ReviewState()) == []
-
-
-def test_unproductive_ceiling_hit_is_the_shared_breaker_primitive():
-    cfg = ReviewConfig(review_bot="r", max_unproductive_rounds=2)
-    assert unproductive_ceiling_hit(_state(1, 1), cfg, 1) is False
-    assert unproductive_ceiling_hit(_state(1, 2), cfg, 1) is True
-    assert unproductive_ceiling_hit(_state(1, 9), cfg, 1) is True
-    assert unproductive_ceiling_hit(ReviewState(), cfg, 1) is False  # unknown PR = 0
+    assert decide_bound_review(world(prs=[escalated]), ADOPT, _owed_state()) == []
 
 
 # ── count_prior_rejections: the ceiling counts rejections, not pushes ─────────
@@ -959,239 +945,6 @@ def test_a_removed_index_like_body_line_is_not_stripped():
     assert patch_signature(with_body) != patch_signature(without)
 
 
-# ── operator re-arm: which reviews still arm the ceiling ─────────────────────
-def _sub(review_id, state="CHANGES_REQUESTED", author="review-bot"):
-    from issue_agent.domain.review import SubmittedReview
-
-    return SubmittedReview(review_id, state, author, f"2026-08-02T0{review_id}:00Z")
-
-
-def test_only_the_bots_change_requests_since_its_approve_still_count():
-    from issue_agent.domain.review import stale_rejections
-
-    reviews = (
-        _sub("1"),
-        _sub("2", state="APPROVED"),
-        _sub("3"),
-        _sub("4", author="a-human"),
-        _sub("5", state="COMMENTED"),
-        _sub("6"),
-    )
-    assert [r.review_id for r in stale_rejections(reviews, "review-bot")] == ["3", "6"]
-
-
-def test_an_operator_held_pr_can_rearm_rejections_before_a_trailing_approval():
-    from issue_agent.domain.review import stale_rejections
-
-    reviews = (
-        _sub("1"),
-        _sub("2"),
-        _sub("3"),
-        _sub("4", state="APPROVED"),
-        _sub("5", state="COMMENTED"),
-    )
-    assert [
-        review.review_id
-        for review in stale_rejections(
-            reviews, "review-bot", trailing_approvals_reset=False
-        )
-    ] == ["1", "2", "3"]
-
-
-def test_an_already_dismissed_rejection_is_not_dismissed_again():
-    from issue_agent.domain.review import stale_rejections
-
-    reviews = (_sub("1", state="DISMISSED"), _sub("2"))
-    assert [r.review_id for r in stale_rejections(reviews, "review-bot")] == ["2"]
-
-
-def test_the_dismissal_set_matches_what_the_ceiling_counts():
-    """The re-arm's contract: dismiss exactly these and the ceiling reads zero."""
-    from issue_agent.domain.review import stale_rejections
-
-    reviews = (_sub("1"), _sub("2"), _sub("3", state="COMMENTED"))
-    counted = count_prior_rejections(
-        tuple(Review(r.state, r.author, r.submitted_at) for r in reviews),
-        "review-bot",
-    )
-    assert len(stale_rejections(reviews, "review-bot")) == counted
-
-
-def test_the_dismissal_set_is_bounded_newest_first():
-    from issue_agent.domain.review import stale_rejections
-
-    reviews = tuple(_sub(str(n)) for n in range(1, 6))
-    assert [r.review_id for r in stale_rejections(reviews, "review-bot", limit=2)] == [
-        "4", "5",
-    ]
-
-
-def test_an_empty_or_foreign_review_history_dismisses_nothing():
-    from issue_agent.domain.review import stale_rejections
-
-    assert stale_rejections((), "review-bot") == ()
-    assert stale_rejections((_sub("1", author="someone-else"),), "review-bot") == ()
-    # An unset review bot must select NOTHING: dismissing on a guess retracts
-    # verdicts that are not the harness's.
-    assert stale_rejections((_sub("1"),), "") == ()
-
-
-def test_a_state_the_ceiling_does_not_count_is_never_dismissed():
-    """The two must select the same set, or "dismiss these and the ceiling
-    reads zero" quietly stops holding. A lower-case state is not counted by
-    `count_prior_rejections`, so it must not be retracted here either."""
-    from issue_agent.domain.review import stale_rejections
-
-    weird = (_sub("1", state=""), _sub("2", state="changes_requested"),
-             _sub("3"))
-    assert [r.review_id for r in stale_rejections(weird, "review-bot")] == ["3"]
-    assert count_prior_rejections(
-        tuple(Review(r.state, r.author, r.submitted_at) for r in weird),
-        "review-bot",
-    ) == 1
-
-
-# ── self-healing: at ceiling with no attention label (keifu #173 / #25) ───────
-CEILING_CFG = ReviewConfig(review_bot="review-bot", max_rejections=4)
-
-
-def _abandoned_pr(number=9, *labels_, head="head1", rejections=3, escalation=True):
-    reviews = tuple(
-        Review("CHANGES_REQUESTED", "review-bot", f"2026-08-02T0{n}:00Z",
-               commit_id="head1")
-        for n in range(rejections)
-    )
-    if escalation:
-        reviews += (
-            Review("COMMENTED", "review-bot", "2026-08-02T09:00Z", commit_id=head),
-        )
-    return pr(number, *labels_, reviews=reviews, head_ref_oid=head)
-
-
-def _escalations(actions):
-    return [a for a in actions if isinstance(a, PostComment)]
-
-
-def test_a_ceiling_pr_whose_attention_label_was_cleared_is_escalated_again():
-    """The dead state: the ceiling escalation posted a COMMENT and swapped the
-    trigger label for needs-human-review; an operator unblock removed that label
-    and added none, so the reviewer would not review, the fixer would not fix,
-    and no further escalation could ever be emitted."""
-    actions = decide_review(
-        world(prs=(_abandoned_pr(),)), CEILING_CFG, ReviewState()
-    )
-    comments = _escalations(actions)
-    assert len(comments) == 1
-    assert "rejection ceiling (4)" in comments[0].body
-    relabels = [a for a in actions if isinstance(a, Relabel)]
-    assert [(r.target, r.number, r.add) for r in relabels] == [
-        (Target.PR, 9, Label.NEEDS_HUMAN_REVIEW)
-    ]
-
-
-def test_the_re_emission_happens_once_per_unblock_not_once_per_tick():
-    """Escalating re-applies needs-human-review, and the label's presence is the
-    dedup key: the very next poll sees a held PR and says nothing (ADR 0012)."""
-    held = _abandoned_pr(9, Label.NEEDS_HUMAN_REVIEW.value)
-    assert decide_review(world(prs=(held,)), CEILING_CFG, ReviewState()) == []
-
-
-def test_a_pr_below_the_ceiling_is_never_re_escalated():
-    below = _abandoned_pr(rejections=1)
-    assert _escalations(
-        decide_review(world(prs=(below,)), CEILING_CFG, ReviewState())
-    ) == []
-
-
-def test_an_incomplete_trailing_approval_does_not_hide_an_abandoned_ceiling():
-    abandoned = _abandoned_pr(escalation=False)
-    abandoned = replace(
-        abandoned,
-        reviews=abandoned.reviews
-        + (
-            Review(
-                "APPROVED",
-                "review-bot",
-                "2026-08-02T08:00Z",
-                commit_id="head1",
-            ),
-            Review(
-                "COMMENTED",
-                "review-bot",
-                "2026-08-02T09:00Z",
-                commit_id="head1",
-            ),
-        ),
-    )
-
-    assert len(
-        _escalations(decide_review(world(prs=(abandoned,)), CEILING_CFG, ReviewState()))
-    ) == 1
-
-
-def test_a_reviewer_that_has_not_given_up_on_this_head_still_gets_its_round():
-    """At 3 of 4 rejections the reviewer may still APPROVE the next revision —
-    re-escalating there would cut a healthy loop a round short."""
-    still_working = _abandoned_pr(escalation=False)
-    assert _escalations(
-        decide_review(world(prs=(still_working,)), CEILING_CFG, ReviewState())
-    ) == []
-
-
-def test_a_fixer_push_past_the_escalation_earns_a_re_review_not_a_re_escalation():
-    moved = _abandoned_pr(head="head1")
-    moved = replace(moved, head_ref_oid="head2")
-    assert _escalations(
-        decide_review(world(prs=(moved,)), CEILING_CFG, ReviewState())
-    ) == []
-
-
-def test_a_disabled_ceiling_never_re_escalates():
-    cfg = replace(CEILING_CFG, max_rejections=0)
-    assert _escalations(
-        decide_review(world(prs=(_abandoned_pr(),)), cfg, ReviewState())
-    ) == []
-
-
-def test_a_closed_pr_is_left_alone():
-    closed = replace(_abandoned_pr(), state="CLOSED")
-    assert decide_review(world(prs=(closed,)), CEILING_CFG, ReviewState()) == []
-
-
-def test_an_abandoned_pr_is_escalated_rather_than_adopted():
-    """Adoption matches the same shape (no trigger label, no needs-human-review)
-    and would pay for a review that can only skip — the silent half of #173."""
-    cfg = replace(CEILING_CFG, adopt_unlabeled=True)
-    actions = decide_review(
-        world(prs=(_abandoned_pr(),)), cfg, ReviewState()
-    )
-    assert not [a for a in actions if isinstance(a, RunAgent)]
-    assert len(_escalations(actions)) == 1
-
-
-def test_an_unplaceable_escalation_comment_falls_through_to_the_round_breaker():
-    """commit_id unknown ("" — the adapter could not resolve it) fails CLOSED:
-    the unproductive-rounds ceiling is the backstop."""
-    unplaceable = _abandoned_pr()
-    unplaceable = replace(
-        unplaceable,
-        reviews=unplaceable.reviews[:-1]
-        + (Review("COMMENTED", "review-bot", "2026-08-02T09:00Z"),),
-    )
-    assert _escalations(
-        decide_review(world(prs=(unplaceable,)), CEILING_CFG, ReviewState())
-    ) == []
-
-
-def test_a_pr_still_carrying_the_trigger_label_belongs_to_the_review_loop():
-    """The reviewer's own labelled arm decides whether it gets a round; acting
-    on it here would be a second decision about the same PR in one tick."""
-    labelled = _abandoned_pr(9, CEILING_CFG.trigger_label.value)
-    assert _escalations(
-        decide_review(world(prs=(labelled,)), CEILING_CFG, ReviewState())
-    ) == []
-
-
 # ── review dispatch defers while a fix leg holds the same PR (#176) ───────────
 _CEILING = fix_hold_ceiling_seconds(2700.0)
 
@@ -1214,7 +967,7 @@ def test_a_disabled_runtime_cap_falls_back_to_a_declared_ceiling():
 
 def test_review_dispatch_is_withheld_while_a_fix_leg_holds_the_pr():
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    actions = decide_review(world(prs=[p]), CFG, ReviewState())
+    actions = decide_bound_review(world(prs=[p]), CFG, _owed_state())
     plan = hold_review_dispatch(actions, {100: _held(100, 30.0)})
     assert plan.actions == ()
     assert plan.deferred == (_held(100, 30.0),)
@@ -1223,23 +976,23 @@ def test_review_dispatch_is_withheld_while_a_fix_leg_holds_the_pr():
 
 def test_a_finished_fix_leg_releases_the_review_on_the_next_tick():
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    actions = decide_review(world(prs=[p]), CFG, ReviewState())
+    actions = decide_bound_review(world(prs=[p]), CFG, _owed_state())
     assert hold_review_dispatch(actions, {}).actions == tuple(actions)
 
 
 def test_a_re_review_is_withheld_by_the_same_hold():
     p = pr(100, "ai-pr-open", head_ref_oid="def")
-    st = ReviewState(sessions=frozenset({100}), last_sha={100: "abc"})
-    actions = decide_review(world(prs=[p]), CFG, st)
+    st = _owed_state(kind=AgentKind.RE_REVIEW)
+    actions = decide_bound_review(world(prs=[p]), CFG, st)
     assert hold_review_dispatch(actions, {100: _held(100, 5.0)}).actions == ()
 
 
 def test_a_hold_past_the_ceiling_dispatches_anyway_and_is_reported():
     p = pr(100, "ai-pr-open", head_ref_oid="abc")
-    actions = decide_review(world(prs=[p]), CFG, ReviewState())
+    actions = decide_bound_review(world(prs=[p]), CFG, _owed_state())
     stuck = _held(100, _CEILING)
     plan = hold_review_dispatch(actions, {100: stuck}, ceiling_seconds=_CEILING)
-    assert RunAgent(AgentKind.REVIEW, 100) in plan.actions
+    assert _run(AgentKind.REVIEW, 100) in plan.actions
     assert plan.forced == (stuck,)
     assert plan.deferred == ()
 
@@ -1247,23 +1000,21 @@ def test_a_hold_past_the_ceiling_dispatches_anyway_and_is_reported():
 def test_a_hold_never_defers_another_prs_review_in_the_same_tick():
     held = pr(100, "ai-pr-open", head_ref_oid="abc")
     free = pr(101, "ai-pr-open", head_ref_oid="abc")
-    actions = decide_review(world(prs=[held, free]), CFG, ReviewState())
+    actions = decide_bound_review(world(prs=[held, free]), CFG, _owed_state())
     plan = hold_review_dispatch(actions, {100: _held(100, 30.0)})
-    assert plan.actions == (RunAgent(AgentKind.REVIEW, 101),)
+    assert plan.actions == (_run(AgentKind.REVIEW, 101),)
 
 
 def test_a_deferred_adoption_withholds_its_claim_label_too():
     # Labelling without reviewing would mark the PR in-pipeline a tick before
     # anyone looks at it; the whole adoption waits for the fix leg instead.
     p = pr(200, head_ref_oid="abc", author="human")
-    actions = decide_review(world(prs=[p]), ADOPT, ReviewState())
+    actions = decide_bound_review(world(prs=[p]), ADOPT, _owed_state())
     assert hold_review_dispatch(actions, {200: _held(200, 1.0)}).actions == ()
 
 
 def test_a_hold_does_not_withhold_a_non_dispatch_action():
-    escalations = decide_review(
-        world(prs=(_abandoned_pr(),)), CEILING_CFG, ReviewState()
-    )
+    escalations = [Relabel(Target.PR, 9, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW)]
     plan = hold_review_dispatch(escalations, {9: _held(9, 1.0)})
     assert escalations and plan.actions == tuple(escalations)
     assert plan.deferred == ()

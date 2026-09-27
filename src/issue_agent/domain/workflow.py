@@ -7,7 +7,7 @@ transition envelopes below admit them.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -388,6 +388,7 @@ class RequestRearm:
     expected: WorkflowRevision
     gate_id: str
     guidance: GuidanceEdit
+    expected_binding: WorkflowBinding | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
@@ -396,6 +397,7 @@ class RequestRearm:
             raise ValueError("rearm requires a captured workflow revision")
         if not isinstance(self.guidance, (KeepGuidance, ClearGuidance, SetGuidance)):
             raise ValueError("guidance edit must be typed")
+        _operator_binding(self.expected, self.expected_binding)
 
 
 @dataclass(frozen=True)
@@ -403,6 +405,7 @@ class ContinueGrantedRearm:
     request_id: str
     expected: WorkflowRevision
     stopped_request_id: str
+    expected_binding: WorkflowBinding | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
@@ -411,6 +414,7 @@ class ContinueGrantedRearm:
             raise ValueError("continuation requires a new intent identity")
         if not isinstance(self.expected, WorkflowRevision):
             raise ValueError("continuation requires a captured revision")
+        _operator_binding(self.expected, self.expected_binding)
 
 
 @dataclass(frozen=True)
@@ -419,6 +423,7 @@ class CancelRearm:
     expected: WorkflowRevision
     request_id: str
     reason: str
+    expected_binding: WorkflowBinding | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         _text(self.cancellation_id, "cancellation")
@@ -426,6 +431,7 @@ class CancelRearm:
         _text(self.reason, "cancellation reason", limit=MAX_DETAIL_CHARS)
         if not isinstance(self.expected, WorkflowRevision):
             raise ValueError("cancellation requires a captured revision")
+        _operator_binding(self.expected, self.expected_binding)
 
 
 @dataclass(frozen=True)
@@ -446,12 +452,21 @@ class AuthorizeAbsentRetry:
     command_id: CommandId
     gate_id: str
     evidence_id: str
+    expected_binding: WorkflowBinding | None = field(default=None, kw_only=True)
 
     def __post_init__(self) -> None:
         for name in ("authorization_id", "command_id", "gate_id", "evidence_id"):
             _text(getattr(self, name), name)
         if not isinstance(self.expected, WorkflowRevision):
             raise ValueError("retry authorization requires a captured revision")
+        _operator_binding(self.expected, self.expected_binding)
+
+
+def _operator_binding(expected: WorkflowRevision, binding: WorkflowBinding | None) -> None:
+    # Older resolve commands have no binding. Review acceptance requires one;
+    # retaining it on the command makes exact replay include epoch and episode.
+    if binding is not None and (not isinstance(binding, WorkflowBinding) or binding.fence != expected.fence):
+        raise ValueError("operator binding must match the captured revision")
 
 
 OperatorCommand = RequestRearm | ContinueGrantedRearm | CancelRearm | AuthorizeAbsentRetry

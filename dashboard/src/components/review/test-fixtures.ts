@@ -114,10 +114,9 @@ export function reviewControl(overrides: Partial<AvailableReviewControl> = {}): 
 
 type Variant<S extends ReviewControl["status"]> = Extract<ReviewControl, { status: S }>;
 
-export const reviewInactive: Variant<"inactive"> = { status: "inactive", repository: "o/r", pull_request: 12 };
 export const reviewAbsent: Variant<"absent"> = { status: "absent", repository: "o/r", pull_request: 12, epoch: 1 };
 export const reviewMigrationRequired: Variant<"migration_required"> = {
-  status: "migration_required", repository: "o/r", pull_request: 12, active_families: ["resolve"],
+  status: "migration_required", repository: "o/r", pull_request: 12, active_families: [],
 };
 export const reviewUnavailable: Variant<"unavailable"> = { status: "unavailable", reason: "control store unreadable" };
 

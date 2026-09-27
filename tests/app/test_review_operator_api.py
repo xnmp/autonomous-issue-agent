@@ -30,7 +30,7 @@ from issue_agent.app.review_control import open_review_operator
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_rejection import MAX_COUNTED_REVIEWS
 from issue_agent.domain.workflow_identity import WorkflowFamily
-from issue_agent.domain.world import PRView, WorldState
+from issue_agent.domain.world import IssueView, PRView, WorldState
 from tests.adapters.test_review_workflow_control import Rig
 from tests.fakes.persistent_github import PersistentGitHub
 from tests.fakes.review_workflow import HEAD
@@ -169,7 +169,8 @@ def test_an_inactive_family_offers_no_lever_and_refuses_commands(bare):
     before = dump(bare.control_path)
     response = api.get()
     assert response.status_code == 200
-    assert response.json() == {"status": "inactive", "repository": REPO, "pull_request": PR}
+    assert response.json() == {"status": "migration_required", "repository": REPO,
+                               "pull_request": PR, "active_families": []}
     body = {"operation": "request_rearm", "request_id": "r", "gate_id": "g", "guidance": {"kind": "keep"},
             "expected": {"repository": REPO, "pull_request": PR, "family": "review_rejections", "epoch": 1,
                          "generation": 0, "version": 1, "episode_id": "e"}}
@@ -701,6 +702,55 @@ def test_a_rearm_under_an_external_hold_promises_no_review(escalated):
     assert "one fresh review is owed" not in action["effect"]
 
 
+def test_linked_issue_hold_is_the_daemons_recorded_reason_and_the_rearm_keeps_it(escalated, monkeypatch):
+    escalated.remote.relabel("issue", 1, None, Label.AI_PARKED.value)
+    escalated.tick()
+    api = http(escalated.deployment)
+    control = api.read()
+    reason = "linked issue #1: ai-parked"
+    assert control["daemon"]["pull_request"]["external_holds"] == [reason]
+    (action,) = gate_of(control, "review_rejection_ceiling")["actions"]
+    assert "buys no review" in action["effect"] and reason in action["effect"]
+    paid = len(escalated.provider.tasks)
+    request = request_body(control, "linked-hold:rearm")
+    response = api.post(request)
+    assert response.status_code == 202, response.text
+    reads = []
+
+    def unavailable(self, number):
+        reads.append(number)
+        raise TimeoutError("linked issue unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(PersistentGitHub, "get_issue", unavailable)
+        replay = api.post(request)
+    assert replay.status_code == 200 and replay.json()["outcome"] == "replayed" and reads == []
+    escalated.tick(3)
+    assert len(escalated.provider.tasks) == paid
+    assert Label.AI_PARKED in escalated.remote.get_issue(1).labels
+
+
+def test_a_linked_issue_hold_is_visible_for_a_departed_pull_request(deployment):
+    daemon = ceiling_held_outside_the_review_read(deployment)
+    daemon.remote.relabel("issue", 1, None, Label.NEEDS_BUDGET_REVIEW.value)
+    daemon.tick(minutes=31)
+    control = http(deployment).read()
+    assert control["daemon"]["read"] == "departed_read"
+    assert control["daemon"]["pull_request"]["external_holds"] == ["linked issue #1: needs-budget-review"]
+
+
+def test_a_terminal_departed_pr_is_recorded_when_its_linked_issue_is_unavailable(deployment, monkeypatch):
+    daemon = ceiling_held_outside_the_review_read(deployment)
+    daemon.remote.external_pr_change(PR, state="CLOSED")
+    paid = len(daemon.provider.tasks)
+    monkeypatch.setattr(PersistentGitHub, "get_issue", _raise(TimeoutError("linked issue unavailable")))
+    daemon.tick(minutes=31)
+    recorded = http(deployment).read()["daemon"]
+    assert recorded["read"] == "departed_read"
+    assert recorded["dispatch"] == {"kind": "terminal", "state": "closed"}
+    assert len(daemon.provider.tasks) == paid
+
+
 def departed_read_journal(deployment) -> list[str]:
     with closing(sqlite3.connect(deployment.control_path)) as db:
         return [row[0] for row in db.execute(
@@ -873,6 +923,7 @@ def owed_beside_a_departing_pull_request(deployment) -> ReviewComposition:
     daemon.tick(2)
     assert len(daemon.provider.tasks) == 1
     daemon.remote.external_pr_change(PR, labels=[])
+    daemon.remote.seed(IssueView(2, title="Add other", state="open"))
     daemon.remote.seed_pr(PRView(
         OTHER_PR, head_ref_name="fix/2-other", head_ref_oid=deployment.heads[2], base_ref_oid=deployment.base,
         title="Add other", body="Adds the other thing.", labels=frozenset({Label.AI_PR_OPEN}), state="OPEN",
@@ -894,7 +945,7 @@ _RECORDING_FAULTS = {
     # Before admission: the departed pull requests' own reads.
     "departed listing": (SQLiteReviewWorkflowControl, "departed_pull_requests",
                          sqlite3.OperationalError("database is locked"), True),
-    "departed read": (review_runtime, "read_pull_request", sqlite3.OperationalError("disk I/O error"), False),
+    "departed read": (review_runtime, "read_pull_request", sqlite3.OperationalError("disk I/O error"), True),
     "departed facts": (SQLiteReviewWorkflowControl, "external_holds", RuntimeError("hold source bug"), False),
     # After admission: pure construction, then the one write.
     "construction": (review_runtime, "admitted_decision", RuntimeError("construction bug"), True),
@@ -907,7 +958,16 @@ _RECORDING_FAULTS = {
 def test_a_failure_while_recording_decisions_never_drops_or_strands_an_admitted_review(deployment, monkeypatch, fault):
     owner, name, error, reported = _RECORDING_FAULTS[fault]
     daemon = owed_beside_a_departing_pull_request(deployment)
-    monkeypatch.setattr(owner, name, _raise(error))
+    original = getattr(owner, name)
+
+    def departing_target_only(*args, **kwargs):
+        target = args[1].target if name == "read_pull_request" else args[1].key.target
+        if target.number == PR:
+            raise error
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(owner, name, departing_target_only if fault in {"departed read", "departed facts"}
+                        else _raise(error))
     daemon.tick()
     # The owed review is dispatched that tick, and its reservation is released when it finishes.
     assert len(daemon.provider.tasks) == 2 and review_claims(deployment) == ()
@@ -944,6 +1004,44 @@ def test_a_review_owed_behind_another_deployments_claim_is_recorded_withheld_res
     dispatch = http(deployment).read()["daemon"]["dispatch"]
     assert dispatch["kind"] == "withheld" and dispatch["review"] == "re_review" and dispatch["reason"] == "reserved"
     assert "already reserved" in dispatch["detail"] and len(daemon.provider.tasks) == 1
+
+
+def test_failed_batch_admission_releases_its_claims_and_the_next_tick_can_review(deployment, monkeypatch):
+    daemon = owed_beside_a_departing_pull_request(deployment)
+    daemon.remote.external_pr_change(PR, labels=[TRIGGER], head_ref_oid=deployment.heads[1])
+    original = SQLiteControlStore.claim_dispatch
+    calls = 0
+
+    def fail_second(store, *args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise sqlite3.OperationalError("database is locked")
+        return original(store, *args, **kwargs)
+
+    with monkeypatch.context() as fault:
+        fault.setattr(SQLiteControlStore, "claim_dispatch", fail_second)
+        with pytest.raises(sqlite3.OperationalError):
+            daemon.review.daemon.decide(daemon.review.daemon.observe())
+    assert review_claims(deployment) == ()
+    assert len(daemon.provider.tasks) == 1
+    daemon.tick(3)
+    assert len(daemon.provider.tasks) == 3
+    assert review_claims(deployment) == ()
+
+
+def test_local_authority_failure_does_not_back_off_a_departed_pull_request(deployment, monkeypatch):
+    daemon = owed_beside_a_departing_pull_request(deployment)
+    with monkeypatch.context() as fault:
+        fault.setattr(SQLiteReviewWorkflowControl, "external_holds", _raise(sqlite3.OperationalError("disk I/O error")))
+        daemon.tick()
+    # A healthy subsequent tick must read the departed PR immediately, without
+    # a remote-failure schedule caused by the local database outage.
+    daemon.remote.external_pr_change(PR, state="CLOSED")
+    daemon.tick()
+    decision = http(deployment).read()["daemon"]["dispatch"]
+    assert decision == {"kind": "terminal", "state": "closed"}
+    assert any("control unavailable" in line for line in daemon.log)
 
 
 def test_a_review_that_is_already_running_is_recorded_in_flight_not_withheld(deployment):

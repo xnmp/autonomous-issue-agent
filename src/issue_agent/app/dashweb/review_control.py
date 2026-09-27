@@ -17,7 +17,7 @@ from ...domain.review_dispatch_record import (
     ReviewWithheld,
 )
 from ...domain.review_rearm import (
-    AbsentReviewControl, InactiveReviewControl, MigrationRequiredReviewControl, ReviewControlView,
+    AbsentReviewControl, MigrationRequiredReviewControl, ReviewControlView,
     UnreadableHoldRestoration,
 )
 from ...domain.review_rejection import MAX_COUNTED_REVIEWS, ReviewProjectionRefused, ReviewRejectionCeiling
@@ -241,8 +241,6 @@ def read_review_control(
     result = control.review_control_view(key, request_id=request_id)
     if isinstance(result, w.WorkflowUnavailable):
         return wire.ReviewUnavailableControl(status="unavailable", reason=result.reason)
-    if isinstance(result, InactiveReviewControl):
-        return wire.ReviewInactiveControl(status="inactive", repository=key.repository, pull_request=pr)
     if isinstance(result, MigrationRequiredReviewControl):
         return wire.ReviewMigrationRequiredControl(
             status="migration_required", repository=key.repository, pull_request=pr,
@@ -289,11 +287,8 @@ def submit_review_control(
                   if isinstance(current, w.WorkflowMigrationRequired)
                   else "no review workflow is recorded for this pull request")
         return wire.ReviewCommandResult(outcome="rejected", reason=reason, control=read_review_control(control, pr))
-    # Epoch and episode are immutable for a workflow row; the revision CAS in
-    # acceptance fences generation and version.
-    if (current.authority, current.episode.episode_id) != (binding.authority, binding.episode_id):
-        return wire.ReviewCommandResult(outcome="conflict", reason="the command names another family epoch or episode",
-                                        control=read_review_control(control, pr))
+    # Acceptance validates epoch/episode inside its transaction. Exact replay
+    # may legitimately name the episode the accepted re-arm replaced.
     # This subject names the trusted local operator account, not an HTTP user
     # or User-Agent claim. The server's loopback/Origin/CSRF boundary is required.
     actor = w.OperatorActor(f"local-user:{os.getuid()}", "dashboard")

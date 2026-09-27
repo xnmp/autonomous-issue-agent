@@ -1037,7 +1037,7 @@ class GitHubGateway:
         # matches the harness pipeline; an external-repo reviewer passes "ai-review".
         self.review_pr_label = review_pr_label
         # When true, build_review_world ALSO fetches open PRs carrying no trigger
-        # label, so decide_review can adopt rogue (non-pipeline) PRs into review.
+        # label, so decide_bound_review can adopt rogue (non-pipeline) PRs into review.
         self.review_adopt_unlabeled = review_adopt_unlabeled
 
     def _gh(self, args: list[str]) -> str:
@@ -1073,6 +1073,20 @@ class GitHubGateway:
              "number,title,body,labels,comments,updatedAt,author,state,stateReason"]
         )
         return parse_issue(d)  # type: ignore[arg-type]
+
+    def get_review_linked_issue(self, number: int) -> IssueView:
+        """Review authority cannot use the legacy parser's absent-field defaults."""
+        raw = self._gh_json([
+            "issue", "view", str(number), "--repo", self.repo, "--json",
+            "number,title,body,labels,comments,updatedAt,author,state,stateReason",
+        ])
+        if (not isinstance(raw, dict) or type(raw.get("number")) is not int or raw["number"] != number
+                or not isinstance(raw.get("state"), str) or raw["state"].lower() not in {"open", "closed"}
+                or not isinstance(raw.get("labels"), list)
+                or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
+                       or not label["name"] for label in raw["labels"])):
+            raise ValueError("linked issue lifecycle fields are incomplete or malformed")
+        return parse_issue(raw)
 
     def change_signature(self) -> str:
         """Cheapest possible "did anything change?" probe: number@updated_at of
@@ -1216,6 +1230,48 @@ class GitHubGateway:
     def has_open_blocker(self, number: int) -> bool:
         """Compatibility predicate over the structured blocker query."""
         return bool(self.open_blockers(number))
+
+    def review_issue_blockers(self, number: int) -> tuple[int, ...]:
+        """Complete dependency evidence for review authority; failure is never clear.
+
+        The legacy summary shortcut defaults malformed answers to zero. Review
+        admission instead needs the paginated dependency rows, including closed
+        rows, so only a complete successful read can prove there is no hold.
+        """
+        pages = self._gh_json([
+            "api", "--paginate", "--slurp",
+            f"repos/{self.repo}/issues/{number}/dependencies/blocked_by?per_page=100",
+        ])
+        if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
+            raise ValueError("complete linked issue dependency pages are unavailable")
+        blockers: set[int] = set()
+        for page in pages:
+            for row in page:
+                if (not isinstance(row, dict) or type(row.get("number")) is not int
+                        or not 0 < row["number"] < 2**63 or row.get("state") not in {"open", "closed"}):
+                    raise ValueError("linked issue dependency row is malformed")
+                if row["state"] == "open":
+                    blockers.add(row["number"])
+        return tuple(sorted(blockers))
+
+    def get_review_pull_request(self, number: int) -> PRView:
+        """Complete hold/linkage facts before constructing a review observation."""
+        raw = self._gh_json([
+            "pr", "view", str(number), "--repo", self.repo, "--json",
+            "number,title,body,headRefName,headRefOid,baseRefName,baseRefOid,labels,"
+            "comments,reviews,state,closingIssuesReferences,files,isDraft,author",
+        ])
+        if (not isinstance(raw, dict) or type(raw.get("number")) is not int or raw["number"] != number
+                or not isinstance(raw.get("state"), str) or raw["state"].upper() not in {"OPEN", "CLOSED", "MERGED"}
+                or not isinstance(raw.get("headRefName"), str) or not raw["headRefName"]
+                or not isinstance(raw.get("closingIssuesReferences"), list)
+                or any(not isinstance(issue, dict) or type(issue.get("number")) is not int
+                       or not 0 < issue["number"] < 2**63 for issue in raw["closingIssuesReferences"])
+                or not isinstance(raw.get("labels"), list)
+                or any(not isinstance(label, dict) or not isinstance(label.get("name"), str)
+                       or not label["name"] for label in raw["labels"])):
+            raise ValueError("review pull request lifecycle/linkage fields are incomplete or malformed")
+        return replace(parse_pr(raw), checks_known=False)
 
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         """Fetch one PR. `mergeability=False` DROPS the mergeable/mergeStateStatus
@@ -1724,7 +1780,7 @@ class GitHubGateway:
                 pr_rows.setdefault(int(row["number"]), row)
         # Rogue-PR adoption: also pull EVERY open PR (no label filter) so a PR that
         # never went through the pipeline (opened directly, no trigger label) is
-        # visible to decide_review, which labels+adopts it. Draft/own-bot/opt-out
+        # visible to decide_bound_review, which labels+adopts it. Draft/own-bot/opt-out
         # filtering is the domain's job (it has the PRView fields); the adapter just
         # widens the slice. Merged/closed still come only via the label (no need to
         # adopt a closed rogue PR).

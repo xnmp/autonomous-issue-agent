@@ -1,6 +1,6 @@
 """The Action ADT.
 
-Decision functions (`decide_fix`, `decide_review`, `decide_steward`) are pure:
+Decision functions (`decide_fix`, `decide_bound_review`, `decide_steward`) are pure:
 they take a `WorldState` (plus config) and return an ordered list of `Action`s.
 The orchestration layer interprets each Action against adapters
 (GitHub, AgentRunner, worktree). Keeping the decision as data — not direct

@@ -2,7 +2,7 @@
 
 Each `build_*_daemon` binds:
   * observe  → gateway.build_world (the GitHub slice the role needs),
-  * decide   → the bound pure decision function (decide_fix / decide_review /
+  * decide   → the bound pure decision function (decide_fix / decide_bound_review /
                decide_steward-triage),
   * executor → applies the leaf Actions; its `run_agent` drives the (async)
                AgentDispatcher for RunAgent actions.
@@ -103,9 +103,7 @@ from ..domain.review import (
     FixHold,
     IdentityMode,
     ReviewConfig,
-    ReviewState,
     decide_bound_review,
-    decide_review,
     fix_hold_ceiling_seconds,
     hold_review_dispatch,
 )
@@ -1917,7 +1915,7 @@ def _fix_state(
     # SIGKILL/OOM/restart deaths come from reclaimed control-store runs through
     # ``process_deaths``. Telemetry is never queried to reconstruct authority.
     #
-    # A PR's entry SUMS both key spaces (review P1R-1, matching `_review_state`).
+    # A PR's entry SUMS both key spaces (review P1R-1, matching `_review_unproductive_rounds`).
     # When the dispatcher's pre-handler `issue_for_pr` lookup fails — and the
     # network flakiness that drops a session is exactly the flakiness that fails
     # that lookup — the death lands under `-pr` while the decide side asks for
@@ -2644,8 +2642,6 @@ def compose_fix_daemon(
         harness_root=cfg.runtime_paths.harness_root,
         log=log,
         fix_bot=fix_runtime.bot,
-        # Scope notes keep one owner; bound to the review authority below.
-        operator_guidance=Store(cfg.review_state_dir).get_operator_guidance,
         fixer_runtime=cfg.fixer_runtime,
         escalate_on_evidence=cfg.escalate_on_evidence,
         # The same ceiling `fix_cfg` escalates on, so a deterministic death can
@@ -2661,11 +2657,7 @@ def compose_fix_daemon(
     prepare_cwd = runtime_binding.prepare_cwd
 
     control = _control_store(cfg, cfg.state_dir, journal)
-    # The review role owns PR guidance: its committed episode once the review
-    # family is active (an unreadable read defers the repair), else the file.
-    dcfg = replace(dcfg, operator_guidance=review_guidance_reader(
-        control, cfg.repo, Store(cfg.review_state_dir).get_operator_guidance,
-    ))
+    dcfg = replace(dcfg, operator_guidance=review_guidance_reader(control, cfg.repo))
     owner_id = _owner_identity(cfg, "fix")
     effect_executor = _effects(
         gateway,
@@ -2982,30 +2974,6 @@ def compose_fix_daemon(
         daemon, control, journal, executor, effect_executor, dispatcher,
         workflow_control, rearm_workflow, recovery, owner_id,
     )
-
-
-def _review_state(
-    store: Store,
-    world,
-    process_deaths: Mapping[int, int] | None = None,
-) -> ReviewState:
-    """Read the per-PR state `decide_review` needs — including the ceiling
-    counter that stops the reviewer paying for a PR that never converges.
-
-    New review failures and recovered deaths use the stable `-PR` key so a
-    closing-link change cannot erase a paid round. The current issue key is
-    included only to migrate counters written before that policy. For an
-    issueless PR both keys coincide and the set deduplicates them."""
-    errors: dict[int, str] = {}
-    sessions = frozenset(p.number for p in world.prs if _control_value(errors, p.number, store.get_pr_session, ""))
-    last = {p.number: _control_value(errors, p.number, store.get_last_sha, "") for p in world.prs}
-    unproductive = _review_unproductive_rounds(store, world, process_deaths, errors)
-    return ReviewState(
-        sessions=sessions, last_sha=last, unproductive_rounds=unproductive,
-        control_errors=errors,
-    )
-
-
 def _review_unproductive_rounds(
     store: Store, world, process_deaths: Mapping[int, int] | None, errors: dict[int, str],
 ) -> dict[int, int]:
@@ -3325,8 +3293,10 @@ def compose_review_daemon(
     report_fix_holds = _fix_hold_reporter(
         journal, cfg.repo, say, control
     )
+    migration_reported_at: datetime | None = None
 
     def decide_actions(world) -> tuple[list, ReviewDispatchPlan | None]:
+        nonlocal migration_reported_at
         try:
             active = review_family_activated(control, cfg.repo)
         except WorkflowAuthorityError as exc:
@@ -3334,12 +3304,17 @@ def compose_review_daemon(
             say(f"review dispatch held: {exc}")
             return [], None
         if not active:
-            state = _review_state(
-                store, world, control.abandoned_dispatch_counts(owner_id)
-            )
-            for target, reason in state.control_errors.items():
-                say(f"PR #{target} held: {reason}")
-            return decide_review(world, rcfg, state), None
+            now = datetime.now(timezone.utc)
+            if migration_reported_at is None or now - migration_reported_at >= timedelta(minutes=15):
+                migration_reported_at = now
+                say("review dispatch held: review_migration_required")
+                if journal is not None:
+                    journal.emit(TelemetryEvent(TelemetryWarning(
+                        "review_migration_required", "review family requires explicit activation",
+                        {"repository": cfg.repo},
+                    )))
+            return [], None
+        migration_reported_at = None
         if runtime is None:
             say("review dispatch held: the review family is active but this "
                 "gateway cannot read pull request reviews")
@@ -3363,7 +3338,18 @@ def compose_review_daemon(
     def decide(world):
         actions, review_plan = decide_actions(world)
         admissions: dict[int, AdmissionOutcome] = {}
-        admitted = _admit(world, actions, admissions)
+        acquired: list[RunAgent] = []
+        try:
+            admitted = _admit(world, actions, admissions, acquired)
+        except BaseException:
+            # Nothing reaches the executor when admission fails midway. Only
+            # this batch's claims are ours to release; running work keeps its own.
+            for action in acquired:
+                try:
+                    reservations.finish(action)
+                except Exception as exc:  # noqa: BLE001 - attempt every release
+                    say(f"review admission cleanup failed for PR #{action.number}: {exc}")
+            raise
         if review_plan is not None and runtime is not None:
             # After admission, so an owed review it did not start is recorded
             # as withheld or running. `record_plan` never raises: the record
@@ -3371,7 +3357,7 @@ def compose_review_daemon(
             runtime.record_plan(review_plan, admissions)
         return admitted
 
-    def _admit(world, actions, admissions: dict[int, AdmissionOutcome]) -> list:
+    def _admit(world, actions, admissions: dict[int, AdmissionOutcome], acquired: list[RunAgent]) -> list:
         plan = hold_review_dispatch(
             actions,
             _fix_holds(control, cfg.repo, world, datetime.now(timezone.utc)),
@@ -3397,6 +3383,7 @@ def compose_review_daemon(
                 issue,
                 frozenset({f"pr:{action.number}"}),
             ):
+                acquired.append(action)
                 continue
             rejected_prs.add(action.number)
             if reservations.running(action.number):

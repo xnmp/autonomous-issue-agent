@@ -35,7 +35,7 @@ from .workflow_rows import (
     WorkflowAuthorityError, family_run_scope_bounds, family_target_kind, persist_workflow_snapshot, workflow_scope,
 )
 
-_LEGACY_NAME = re.compile(r"issue-(.+)\.(" + "|".join(re.escape(s) for s in LEGACY_SUFFIXES) + r")")
+_LEGACY_NAME = re.compile(r"issue-(.*)\.(" + "|".join(re.escape(s) for s in LEGACY_SUFFIXES) + r")", re.DOTALL)
 _ISSUE_NUMBER = re.compile(r"[1-9][0-9]{0,18}")
 _ACTIVE_RUN_STATES = ("reserved", "starting", "running")
 _TERMINAL_COMMAND_STATES = ("succeeded", "permanent_failure")
@@ -170,6 +170,20 @@ def _ours(value: object, repository: str) -> bool:
 
 def read_inventory(db: sqlite3.Connection, repository: str) -> DeploymentInventory:
     repository = canonical_workflow_repository(repository)
+    return family_inventory(db, repository, WorkflowFamily.RESOLVE, _existing_activation(db, repository))
+
+
+def family_inventory(
+    db: sqlite3.Connection, repository: str, family: WorkflowFamily, activation: ExistingActivation | None,
+) -> DeploymentInventory:
+    """Non-quiescent work of any family, and `family`'s own retained authority.
+
+    Runs, leases, claims, commands and reservations are the repository's
+    whatever their family: an activation needs every writer stopped. Only
+    `family`'s rows are its retained authority; another family's rows belong
+    to that family's activation and never block this one.
+    """
+    repository = canonical_workflow_repository(repository)
     runs = _attributed(db.execute(
         f"SELECT run_id, owner_id FROM runs WHERE state IN ({','.join('?' * len(_ACTIVE_RUN_STATES))})",
         _ACTIVE_RUN_STATES,
@@ -191,9 +205,7 @@ def read_inventory(db: sqlite3.Connection, repository: str) -> DeploymentInvento
         if (scoped := [v for v in (row["repository"], row["workload_repository"]) if v != "*"]) == []
         or any(_ours(value, repository) for value in scoped)
     }))
-    # Only resolve-family rows are retained resolve authority; a review-family
-    # PR row belongs to its own activation and never blocks this one.
-    kind = family_target_kind(WorkflowFamily.RESOLVE)
+    kind = family_target_kind(family)
     retained = {
         f"{row[0]}:{row[1]}" for table in ("workflows", "workflow_gates", "workflow_rearms")
         for row in db.execute(f"SELECT target_kind, target_number FROM {table} WHERE repository=? AND target_kind=?",
@@ -202,12 +214,11 @@ def read_inventory(db: sqlite3.Connection, repository: str) -> DeploymentInvento
     retained |= {
         f"run:{row[0]}" for row in db.execute(
             "SELECT run_id FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<?",
-            family_run_scope_bounds(repository, WorkflowFamily.RESOLVE),
+            family_run_scope_bounds(repository, family),
         )
     }
     return DeploymentInventory(
-        repository, runs, leases, claims, commands, reservations,
-        _existing_activation(db, repository), tuple(sorted(retained)),
+        repository, runs, leases, claims, commands, reservations, activation, tuple(sorted(retained)),
     )
 
 
@@ -361,6 +372,7 @@ def _overlaps(first: str, second: str) -> bool:
 
 def copy_for_rehearsal(
     control_path: str, roots: LegacyRoots, destination: str, *, protected: tuple[str, ...] = (),
+    legacy_name: re.Pattern[str] = _LEGACY_NAME,
 ) -> RehearsalCopy:
     """Isolated copy of authority and legacy resolve sources; never overwrites.
 
@@ -406,14 +418,14 @@ def copy_for_rehearsal(
     for index, (label, state_dir) in enumerate(roots):
         target_root = root / "state" / str(index)
         target_root.mkdir(mode=0o700)
-        _copy_legacy_root(state_dir, target_root)
+        _copy_legacy_root(state_dir, target_root, legacy_name)
         copied.append((label, str(target_root)))
     return RehearsalCopy(copy_path, tuple(copied))
 
 
-def _copy_legacy_root(state_dir: str, copied_state: Path) -> None:
+def _copy_legacy_root(state_dir: str, copied_state: Path, legacy_name: re.Pattern[str]) -> None:
     try:
-        names = sorted(entry.name for entry in os.scandir(state_dir) if _LEGACY_NAME.fullmatch(entry.name))
+        names = sorted(entry.name for entry in os.scandir(state_dir) if legacy_name.fullmatch(entry.name))
     except FileNotFoundError:
         names = []
     for name in names:

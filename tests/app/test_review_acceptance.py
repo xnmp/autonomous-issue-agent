@@ -10,10 +10,17 @@ provider launches, receipts and ``load_workflow``.
 import json
 import os
 import sqlite3
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
 from issue_agent.adapters.store import Store
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+from issue_agent.domain.labels import Label
+from issue_agent.domain.review import ReviewConfig
+from issue_agent.domain.review_dispatch_record import ReviewNotAdmitted
+from issue_agent.domain.world import IssueView
 from issue_agent.domain.review_workflow import (
     CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, ReviewedBaseline, ReviewRejectionCeiling,
     SupersededReviewRearm,
@@ -23,6 +30,7 @@ from issue_agent.domain.workflow import (
     WorkflowCommitted, WorkflowMigrationRequired,
 )
 from tests.app.resolve_acceptance_harness import ScriptedProvider, run_until_exit
+from tests.fakes.persistent_github import PersistentGitHub
 from tests.app.review_acceptance_harness import (
     ACTOR, BOT, KEY, NHR, PR, TRIGGER, child_environment, compose_review, create_review_deployment, diff_text,
     install_clock, isolate_authority, verdicts,
@@ -43,6 +51,168 @@ def bare(tmp_path, monkeypatch):
 def deployment(bare):
     bare.activate()
     return bare
+
+
+@pytest.mark.parametrize("label", [Label.AI_BLOCKED, Label.AI_PARKED, Label.NEEDS_HUMAN_REVIEW,
+                                    Label.NEEDS_BUDGET_REVIEW])
+def test_linked_issue_labels_hold_review_without_spend_or_issue_mutation(deployment, label):
+    remote = deployment.github()
+    remote.relabel("issue", 1, None, label.value)
+    before = remote.calls
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    client.boot()
+    client.tick(3)
+    assert client.provider.tasks == [] and client.charges() == [] and client.submissions() == []
+    assert remote.calls == before and label in remote.get_issue(1).labels
+    remote.relabel("issue", 1, label.value, None)
+    client.tick()
+    assert len(client.provider.tasks) == 1 and client.bot_reviews()[-1].state == "APPROVED"
+
+
+def test_linked_resolve_gate_holds_review_even_without_an_issue_hold_label(deployment):
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.domain.workflow import NoAuthorizedRemediation, ResolveCeiling
+    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+
+    store = SQLiteControlStore(deployment.control_path)
+    state = resolve_snapshot(1)
+    cause = ResolveCeiling(state.episode.episode_id, 3, 3)
+    install_workflow(store, replace(state, gates=(OpenGate("resolve:held", 2, cause,
+                                                         NoAuthorizedRemediation("operator decision")),)))
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    client.boot()
+    client.tick(3)
+    assert client.provider.tasks == [] and client.charges() == [] and client.submissions() == []
+
+
+def test_issue_hold_added_after_review_planning_is_rechecked_before_paid_work(deployment):
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(RC, OK)))
+    client.boot()
+    client.tick()
+    client.remote.external_pr_change(PR, head_ref_oid=deployment.heads[1])
+    runtime = client.review.runtime
+    assert runtime is not None
+    plan = runtime.plan(client.remote.build_review_world(), ReviewConfig(review_bot=BOT))
+    _, binding = plan.owed[PR]
+    client.remote.relabel("issue", 1, None, Label.AI_PARKED.value)
+    with pytest.raises(WorkflowAuthorityError, match="linked issue #1: ai-parked"):
+        runtime.begin(binding, deployment.heads[1], expected_claim_target=1)
+    assert len(client.provider.tasks) == 1 and len(client.charges()) == 1
+
+
+def test_relink_after_the_dispatch_claim_check_defers_before_any_paid_work(deployment, monkeypatch):
+    from issue_agent.app.workflows.review import ReviewWorkflow
+
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    client.remote.seed(IssueView(2, title="Another issue", state="open"))
+    original = ReviewWorkflow._claim_matches
+
+    def relink_after_claim(workflow, pr, claim_target):
+        matches = original(workflow, pr, claim_target)
+        assert matches
+        client.remote.external_pr_change(PR, closing_issue=2, head_ref_name="fix/2-relinked")
+        return matches
+
+    client.boot()
+    with monkeypatch.context() as patch:
+        patch.setattr(ReviewWorkflow, "_claim_matches", relink_after_claim)
+        client.tick()
+    assert client.provider.tasks == [] and client.charges() == [] and client.bot_reviews() == []
+    assert any("issue linkage changed during dispatch" in line for line in client.log)
+    assert Store(client.cfg.review_state_dir).get_infra_deaths(-PR) == 0
+    client.tick()
+    assert len(client.provider.tasks) == 1 and len(client.charges()) == 1
+    assert client.bot_reviews()[-1].state == "APPROVED"
+
+
+def test_an_excluded_unobserved_pr_preserves_its_basis_without_creating_a_workflow(deployment):
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    client.remote.external_pr_change(PR, labels=[Label.AI_PARKED.value])
+    client.boot()
+    runtime = client.review.runtime
+    assert runtime is not None
+    plan = runtime.plan(client.remote.build_review_world(), ReviewConfig(review_bot=BOT))
+    decision = plan.decisions[PR]
+    assert isinstance(decision.decision, ReviewNotAdmitted)
+    assert decision.basis is not None and decision.basis.external_holds == ("ai-parked",)
+    runtime.record_plan(plan)
+    client.tick()
+    assert isinstance(client.workflow.load_workflow(KEY), WorkflowAbsent)
+    assert client.provider.tasks == [] and client.charges() == []
+    assert not any("dispatch decisions not recorded" in line for line in client.log)
+
+
+def test_known_link_read_failure_is_bounded_visible_and_never_becomes_issueless(deployment, monkeypatch):
+    broken, issue_reads = [False], []
+    original = PersistentGitHub.get_issue
+
+    def read(self, number):
+        issue_reads.append(number)
+        if broken[0]:
+            raise TimeoutError("linked issue unavailable")
+        return original(self, number)
+
+    monkeypatch.setattr(PersistentGitHub, "get_issue", read)
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(RC, OK)))
+    client.boot()
+    client.tick()
+    client.remote.external_pr_change(PR, head_ref_oid=deployment.heads[1])
+    broken[0] = True
+    tick_reads = []
+    for _ in range(120):
+        before = len(issue_reads)
+        client.tick()
+        tick_reads.append(len(issue_reads) - before)
+        if any(g.gate_id.startswith("linked-issue:") for g in client.gates()):
+            break
+    assert any(isinstance(g.cause, EvidenceUnavailable) and g.gate_id.startswith("linked-issue:")
+               for g in client.gates())
+    assert 0 in tick_reads and sum(tick_reads) <= 12 < len(tick_reads)
+    assert len(client.provider.tasks) == 1 and len(client.charges()) == 1
+    broken[0] = False
+    client.remote.relabel("issue", 1, None, Label.AI_BLOCKED.value)
+    progress_until(client, lambda c: not any(g.gate_id.startswith("linked-issue:") for g in c.gates()),
+                   limit=6, minutes=31)
+    assert len(client.provider.tasks) == 1
+    client.remote.relabel("issue", 1, Label.AI_BLOCKED.value, None)
+    client.tick()
+    assert len(client.provider.tasks) == 2 and client.bot_reviews()[-1].state == "APPROVED"
+
+
+def test_explicitly_issueless_pr_needs_no_issue_read(deployment, monkeypatch):
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    client.remote.external_pr_change(PR, closing_issue=None, head_ref_name="feature/no-issue")
+
+    def unexpected(self, number):
+        raise AssertionError("an explicitly issueless PR must not fetch an issue")
+
+    monkeypatch.setattr(PersistentGitHub, "get_issue", unexpected)
+    client.boot()
+    client.tick()
+    assert len(client.provider.tasks) == 1 and client.bot_reviews()[-1].state == "APPROVED"
+
+
+def test_local_linked_authority_failure_never_advances_the_remote_read_backoff(deployment, monkeypatch):
+    from issue_agent.adapters import review_linkage
+    from issue_agent.domain.review_evidence import ReviewEvidenceKind
+
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(RC, OK)))
+    client.boot()
+    client.tick()
+    head = deployment.heads[1]
+    client.remote.external_pr_change(PR, head_ref_oid=head)
+
+    def unavailable(*args):
+        raise sqlite3.OperationalError("linked workflow storage unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(review_linkage, "linked_issue_workflow_holds", unavailable)
+        client.tick(3)
+    assert len(client.provider.tasks) == 1 and len(client.charges()) == 1
+    assert client.workflow.evidence_due(KEY, head, ReviewEvidenceKind.LINKED_ISSUE)
+    assert not any(g.gate_id.startswith("linked-issue:") for g in client.gates())
+    client.tick()
+    assert len(client.provider.tasks) == 2 and client.bot_reviews()[-1].state == "APPROVED"
 
 
 def unbound_submissions(client) -> int:
@@ -78,16 +248,16 @@ def progress_until(client, done, *, limit: int = 12, minutes: float = 1) -> None
     assert done(client), f"condition not reached within {limit} ticks: {client.log[-8:]}"
 
 
-# -- the inactive path is untouched --------------------------------------------------------------
+# -- inactive families require migration ---------------------------------------------------------
 
-def test_an_inactive_repository_keeps_the_legacy_review_path(bare):
+def test_an_inactive_repository_requires_migration_and_never_buys_a_review(bare):
     client = compose_review(bare, provider=ScriptedProvider(verdicts(RC)))
     client.boot()
     client.tick(3)
-    assert len(client.provider.tasks) == 1 and len(client.submissions()) == 1
-    assert Store(client.cfg.review_state_dir).get_last_sha(PR) == bare.heads[0]
+    assert client.provider.tasks == [] and client.submissions() == []
     assert isinstance(client.workflow.load_workflow(KEY), WorkflowMigrationRequired)
-    assert unbound_submissions(client) == 1
+    assert unbound_submissions(client) == 0
+    assert sum("review_migration_required" in line for line in client.log) == 1
 
 
 # -- the active path: baselines, patch reuse, fresh reviews -------------------------------------
@@ -102,7 +272,7 @@ def test_an_active_review_is_bound_records_its_baseline_and_is_bought_once(deplo
     assert isinstance(baseline, ReviewedBaseline) and baseline.head_sha == deployment.heads[0]
     assert unbound_submissions(client) == 0
     # The legacy head cache is not a second authority once the family is active.
-    assert Store(client.cfg.review_state_dir).get_last_sha(PR) == ""
+    assert not (Path(client.cfg.review_state_dir) / f"pr-{PR}.last-sha").exists()
 
 
 def test_an_unchanged_patch_reuses_the_same_generation_baseline_without_a_paid_leg(deployment):
@@ -288,7 +458,7 @@ def test_a_head_push_or_close_during_a_pending_rearm_supersedes_and_a_push_can_c
         return
     state = client.state()
     continued = client.workflow.continue_rearm(
-        ContinueGrantedRearm("request:continue", state.revision, "request:1"), ACTOR)
+        ContinueGrantedRearm("request:continue", state.revision, "request:1", expected_binding=state.binding), ACTOR)
     assert isinstance(continued, WorkflowCommitted), continued
     progress_until(client, lambda c: len(c.provider.tasks) == 3)
     assert rearmed(client) and client.bot_reviews()[-1].commit_id == deployment.heads[2]
@@ -457,7 +627,8 @@ def test_a_lost_submission_is_held_visibly_and_one_operator_grant_buys_exactly_o
     from issue_agent.domain.workflow import AuthorizeAbsentRetry
 
     granted = client.workflow.authorize_retry(AuthorizeAbsentRetry(
-        "grant:1", state.revision, gate.cause.command_id, gate.gate_id, gate.cause.absence_evidence_id), ACTOR)
+        "grant:1", state.revision, gate.cause.command_id, gate.gate_id, gate.cause.absence_evidence_id,
+        expected_binding=state.binding), ACTOR)
     assert isinstance(granted, WorkflowCommitted), granted
     client.tick(3)
     assert len(client.submissions()) == 1 and len(client.provider.tasks) == 1
@@ -755,7 +926,7 @@ def test_a_bound_re_review_diffs_from_its_baseline_never_the_legacy_head_cache(d
     client = compose_review(deployment, provider=ScriptedProvider(verdicts(RC, OK)))
     client.boot()
     client.tick()
-    Store(client.cfg.review_state_dir).set_last_sha(PR, deployment.heads[3])  # stale legacy cache
+    (Path(client.cfg.review_state_dir) / f"pr-{PR}.last-sha").write_text(deployment.heads[3])
     client.remote.external_pr_change(PR, head_ref_oid=deployment.heads[1])
     progress_until(client, lambda c: len(c.provider.tasks) == 2)
     prompt = client.provider.tasks[1].intent.prompt
@@ -802,7 +973,7 @@ def test_a_request_replayed_after_a_lost_reply_is_one_intent_with_no_duplicate_c
     escalate(client)
     state = client.state()
     gate_id = client.gates()[0].gate_id
-    command = RequestRearm("request:replayed", state.revision, gate_id, KeepGuidance())
+    command = RequestRearm("request:replayed", state.revision, gate_id, KeepGuidance(), expected_binding=state.binding)
 
     def rows() -> tuple:
         with sqlite3.connect(client.review.control.path) as db:

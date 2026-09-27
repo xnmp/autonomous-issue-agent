@@ -161,7 +161,7 @@ Two smaller ones worth doing whenever the files are next touched:
   review.
 
 - Legacy issue-keyed review retry counters (pre-ADR-0008 writes) are still
-  honored by `roles._review_state`'s read union. A counter written under issue
+  honored by `roles._review_unproductive_rounds`'s read union. A counter written under issue
   N for a PR that is later relinked away is never cleared by that PR's
   `_progress`, so a *different* PR later linked to issue N inherits it and its
   `unproductive_rounds` starts inflated. Pre-existing leakage; it drains as
@@ -215,6 +215,21 @@ Two smaller ones worth doing whenever the files are next touched:
   ceiling needs a new persistent counter surface. Trigger: one observed
   instance of a merge-ready PR unverifiable for more than an hour adds the
   counter + journal event per the retry-loop rule (ADR 0012 / CLAUDE.md).
+  Increment 8 retains this fix-side collector residual explicitly; the
+  review-side evidence loop already has durable backoff and a visible gate.
+
+- The unproductive-review-round breaker still reads the review role's
+  `infra-deaths` files plus recovered run deaths from SQLite. Review activation
+  imports rejection ceilings, baselines and guidance only: ADR 0015 explicitly
+  separates this breaker from the rejection family. Moving its counter alone
+  would leave resets and verdict-escalation release under another authority.
+  Its existing ceiling remains enforced and named in external holds.
+  The recovered-death query is currently owner-wide rather than bounded by a
+  productive review reset, so historical recovered deaths can outlive the
+  file-counter reset. The phase-4 migration must attribute immutable run IDs
+  to failure episodes; copying the file value alone cannot repair this.
+  Trigger: phase 4 migrates the breaker, consumed continuation state and its
+  release operation together, with shadow comparison and writer fencing.
 
 - Platform-invisible CI (2026-08-08) — the local gate runs on Linux, so
   windows-latest/macos-latest job failures can never be reproduced or fixed

@@ -68,6 +68,31 @@ def test_partially_missing_new_receipt_fields_are_not_treated_as_legacy():
         decode_workflow(json.dumps(raw), ReturnedResolve)
 
 
+@pytest.mark.parametrize("kind", ["request", "continue", "cancel", "retry"])
+def test_operator_command_codec_retains_binding_and_reads_old_resolve_audits(kind):
+    from issue_agent.domain.workflow import RequestRearm, ContinueGrantedRearm, CancelRearm, AuthorizeAbsentRetry, KeepGuidance
+
+    state = snapshot()
+    commands = {
+        "request": RequestRearm("r", state.revision, "gate", KeepGuidance()),
+        "continue": ContinueGrantedRearm("r", state.revision, "old"),
+        "cancel": CancelRearm("c", state.revision, "r", "operator stopped"),
+        "retry": AuthorizeAbsentRetry("a", state.revision, CommandId("command"), "gate", "evidence"),
+    }
+    command = commands[kind]
+    bound = replace(command, expected_binding=state.binding)
+    assert decode_workflow(encode_workflow(bound), type(command)) == bound
+    raw = json.loads(encode_workflow(command))
+    assert "expected_binding" not in raw["value"]["fields"]
+    assert decode_workflow(json.dumps(raw), type(command)) == command
+
+    wrong = replace(state.binding, fence=replace(state.binding.fence, generation=99))
+    with pytest.raises(ValueError, match="captured revision"):
+        replace(command, expected_binding=wrong)
+    with pytest.raises(ValueError, match="captured revision"):
+        replace(command, expected_binding="not a binding")
+
+
 def test_roundtrip_preserves_scope_provenance_and_multiline_guidance():
     original = snapshot()
     recovered = decode_workflow(encode_workflow(original), WorkflowSnapshot)

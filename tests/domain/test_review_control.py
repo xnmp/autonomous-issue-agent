@@ -456,8 +456,9 @@ def test_a_command_no_obligation_derives_is_labelled_unknown_not_dropped():
 # -- view invariants ---------------------------------------------------------------------------------
 
 def test_migration_required_names_only_other_active_families():
+    MigrationRequiredReviewControl(PR_KEY, ())
     MigrationRequiredReviewControl(PR_KEY, (WorkflowFamily.RESOLVE,))
-    for families in [(), (WorkflowFamily.REVIEW_REJECTIONS,), (WorkflowFamily.RESOLVE, WorkflowFamily.RESOLVE),
+    for families in [(WorkflowFamily.REVIEW_REJECTIONS,), (WorkflowFamily.RESOLVE, WorkflowFamily.RESOLVE),
                      ["resolve"], ("resolve",)]:
         with pytest.raises(ValueError):
             MigrationRequiredReviewControl(PR_KEY, families)  # type: ignore[arg-type]
@@ -524,4 +525,3 @@ def test_a_huge_counted_set_projects_every_review_and_refuses_the_request():
     assert isinstance(action, ActionRefused)
     with pytest.raises(ValueError):
         ceiling_cause(count=513, ceiling=3)
-

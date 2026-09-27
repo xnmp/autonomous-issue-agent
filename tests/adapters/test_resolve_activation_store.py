@@ -101,6 +101,17 @@ def test_absent_state_directory_has_no_legacy_sources(tmp_path):
     assert read_legacy_resolve_state(str(tmp_path / "missing")) == ()
 
 
+@pytest.mark.parametrize("name", ("issue-.resolve-retries", "issue-7\n.last-error"))
+def test_malformed_legacy_names_block_activation(state, name):
+    path = state / name
+    path.write_text("1")
+    entries = read_legacy_resolve_state(str(state))
+    assert len(entries) == 1 and isinstance(entries[0], UnmappedLegacyEntry)
+    decision = plan_resolve_activation(REPO, entries, DeploymentInventory(REPO), ceiling=3)
+    assert isinstance(decision, ActivationBlocked)
+    assert path.read_text() == "1"
+
+
 def test_legacy_reader_classifies_every_resolve_key_without_writing(state, tmp_path):
     (state / "issue-7.resolve-retries").write_bytes(b"3")
     (state / "issue-7.last-error").write_text("tests failed")

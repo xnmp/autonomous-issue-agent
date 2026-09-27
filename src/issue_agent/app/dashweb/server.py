@@ -361,17 +361,6 @@ def create_app(
     ):
         if number < 1:
             raise HTTPException(400, "issue number must be positive")
-        # Tri-state, normalized by the contract (see guidance.parse_guidance):
-        # None = leave any stored note alone, "" = clear it, text = set it.
-        # An over-long, fence-bearing or unencodable note is a 422 raised
-        # BEFORE this body runs, so it can never half-land — no counter reset,
-        # no label edit, no state file.
-        #
-        # API-only lever, deliberately: the SPA and its generated clients are
-        # unchanged, so the field is optional and every existing caller keeps
-        # working. Regenerate them (`npm run generate:api`) when the dashboard
-        # UI grows a textarea for this.
-        guidance = body.guidance if body else None
         # Which hand pulled the lever: the browser UI or a bare API caller
         # (curl, an agent). A courtesy provenance stamp, not authentication —
         # the drill-down badges API-channel unblocks so operator history and
@@ -382,7 +371,7 @@ def create_app(
         # action, never as a 500 the operator cannot read.
         try:
             ok, detail = await invoke(
-                backend.unblock, name, number, channel, guidance
+                backend.unblock, name, number, channel
             )
         except Exception as exc:  # noqa: BLE001
             ok, detail = False, f"unblock unavailable ({type(exc).__name__}: {exc})"

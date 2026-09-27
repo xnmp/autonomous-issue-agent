@@ -51,9 +51,14 @@ job someone still has to do; the same file in `history/` is a record.
   — six-phase implementation, protected deployment pause, acceptance status,
   archived review and observational baseline.
 - [2026-09-27-review-slice-handover.md](open/2026-09-27-review-slice-handover.md)
-  — current stop-state handover: review-rejection slice increments 1–7 accepted,
-  increment 8 (activation/import, legacy deletion) brief and WIP branch, then
-  phase-3 acceptance and phases 4–6.
+  — historical stop-state handover and increment-8 brief, resumed by the user.
+- [2026-09-27-review-slice-verification.md](open/2026-09-27-review-slice-verification.md)
+  — current review activation/deletion and linked-issue acceptance evidence.
+- [2026-09-27-phase-4-continuation-inventory.md](open/2026-09-27-phase-4-continuation-inventory.md)
+  — remaining authority inventory and migration constraints for phase 4.
+- [2026-09-27-phase-4-review-execution-design.md](open/2026-09-27-phase-4-review-execution-design.md)
+  — independently reviewed execution/continuation design; implementation follows
+  phase-3 acceptance, under the linked implementation conventions.
 - [issues/](open/issues/) — unresolved incident write-ups awaiting
   re-validation against the current tree.
 

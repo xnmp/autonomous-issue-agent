@@ -1,10 +1,8 @@
-"""Review-watcher decision logic — pure port of review-watcher.sh:poll_once.
+"""Pure review admission, verdict synthesis, rejection counting and patch identity.
 
-The reviewer is a DISTINCT identity from the fixer (no-self-approval). It runs
-an initial review on each ai-pr-open PR with no session yet, a re-review when
-the head SHA advances past the last reviewed SHA, and drops session state for
-merged/closed PRs. In solo identity mode the reviewer is disabled (a human
-reviews) — modelled here so the orchestration layer can honour it.
+The workflow authority supplies each owed round and its generation binding.
+Admission preserves lifecycle holds, adoption rules and the unproductive-round
+breaker. Solo identity mode leaves review to a human.
 """
 
 from __future__ import annotations
@@ -21,7 +19,7 @@ from .exemptions import AuthenticatedGrantPairs
 from .identity import IdentityMode, login_eq
 from .labels import Label
 from .lifecycle import (
-    AllowedEligibility, HeldEligibility, InvalidEligibility, LifecycleOperation, pr_eligibility, pr_escalation,
+    HeldEligibility, InvalidEligibility, LifecycleOperation, pr_eligibility, pr_escalation,
     retry_breaker,
 )
 from .world import PRView, Review, WorldState, REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED
@@ -128,63 +126,20 @@ class ReviewConfig:
     # The reviewer had NO ceiling of any kind. Every non-persisting outcome — a
     # session that died before returning a result, an is_error result, a MULTI
     # fan-out whose gate or dimension legs died so `synthesize_review` returned
-    # None — leaves `needs_initial_review`/`needs_re_review` True, so the SAME
+    # None — leaves its review obligation outstanding, so the SAME
     # dispatch (under MULTI: the whole gate + 5 dimensions + N validators
     # fan-out) is paid for again on the very next poll, forever. This is the
-    # bound. See ReviewState.unproductive_rounds for what is counted.
+    # bound. Counts include paid rounds with no verdict and recovered deaths.
     max_unproductive_rounds: int = DEFAULT_MAX_UNPRODUCTIVE_ROUNDS
     # The submission-side rejection ceiling (REVIEW_MAX_REJECTIONS), mirrored
-    # here so the decide side can recognise a PR that is PAST it. <=0 disables,
-    # like every other breaker. Only `reviewer_abandoned_at_ceiling` reads it;
-    # the ceiling is still APPLIED in `review_submission`.
+    # shared with activation shadow comparison. <=0 disables the ceiling.
     max_rejections: int = DEFAULT_MAX_REVIEW_REJECTIONS
-
-
-@dataclass(frozen=True)
-class ReviewState:
-    """Per-PR review session state (STATE_DIR files), passed in purely."""
-
-    sessions: frozenset[int] = frozenset()       # PRs already reviewed once
-    last_sha: dict[int, str] = field(default_factory=dict)  # PR → last reviewed head SHA
-    # PR number → how many review rounds were PAID FOR without advancing any
-    # state (review P0R-3/P0R-4). One counter, because both shapes cost exactly
-    # one full paid round and neither leaves a trace the round-based state
-    # machine can see:
-    #
-    #   * the session died before returning a result — the dispatcher's
-    #     `except BaseException` bump, or (when the daemon itself was killed and
-    #     could not run that bump) a journal `agent_run_start` with no settled
-    #     twin; and
-    #   * the workflow ran to completion but persisted nothing — an is_error
-    #     result, a failed submit POST, a MULTI gate/dimension leg that died so
-    #     synthesis returned None.
-    #
-    # Keyed by PR NUMBER here: the two write sides use different store keys (the
-    # linked issue number, or the negated PR number when a PR has no resolvable
-    # issue), and reconciling those key spaces is the adapter's job
-    # (`app.roles._review_state` reads their union) so the domain sees one
-    # number per PR.
-    unproductive_rounds: dict[int, int] = field(default_factory=dict)
-    control_errors: Mapping[int, str] = field(default_factory=dict)
-
-
-def needs_initial_review(pr: PRView, state: ReviewState) -> bool:
-    return pr.number not in state.sessions
-
-
-def needs_re_review(pr: PRView, state: ReviewState) -> bool:
-    """Head SHA advanced past the last reviewed SHA. Mirrors the headRefOid vs
-    pr-N.last-sha comparison in review-watcher.sh."""
-    if pr.number not in state.sessions:
-        return False
-    cur = pr.head_ref_oid
-    return bool(cur) and cur != state.last_sha.get(pr.number, "")
 
 
 # ── rebase-invariant patch identity (harness #2) ──────────────────────────────
 # A force-push moves the head SHA even when the PR's diff against its base is
 # semantically identical (a mechanical rebase, an amended commit message, a
-# reordered-but-unchanged history). `needs_re_review` can only see the SHA, so
+# reordered-but-unchanged history). Comparing only the reviewed SHA means
 # every such push used to buy a full paid re-review — three of them, ~$5 and
 # 5-10 minutes each, on one deployment. This is the cheap discriminator: hash
 # the diff after erasing exactly the parts a rebase perturbs.
@@ -288,71 +243,6 @@ class SubmittedReview:
     submitted_at: str = ""
 
 
-def stale_rejections(
-    reviews: tuple[SubmittedReview, ...],
-    review_bot: str,
-    limit: int = 0,
-    *,
-    trailing_approvals_reset: bool = True,
-) -> tuple[SubmittedReview, ...]:
-    """Exactly the reviews an operator re-arm must dismiss: the review bot's
-    CHANGES_REQUESTED verdicts that still COUNT toward the rejection ceiling.
-
-    Same suffix rule as `count_prior_rejections` by default — an APPROVE
-    satisfied every rejection before it — so dismissing this set and nothing
-    else is what makes `count_prior_rejections` read zero again. Anything
-    outside it (a human's change request, a rejection already answered by an
-    APPROVE, an already-dismissed review) is not the harness's to retract.
-
-    A PR durably attributed to a reviewer escalation may instead set
-    `trailing_approvals_reset=False`. This recovers the rejection sequence
-    preceding a trailing APPROVE that did not actually settle the PR (for
-    example, because required authenticated exemption grants were absent).
-    Retracting those resolved bot verdicts is safe only on that reviewer-held
-    operator path; the default preserves live feedback.
-
-    keifu PR #173 (2026-08-02): the dashboard unblock cleared the attention
-    labels and the retry counters but left these reviews standing, so the
-    ceiling was still tripped the instant the daemon looked again — an
-    invisible dead state no amount of unblocking could clear.
-
-    `limit` (<=0 disables) keeps only the newest `limit` of them, so a
-    pathological history cannot turn one operator click into an unbounded
-    dismissal fan-out. At the ceiling's own value this discards nothing that
-    could still be holding the breaker down.
-    """
-    # States are compared EXACTLY, like `count_prior_rejections` — the two must
-    # select the same set or the re-arm's contract ("dismiss these and the
-    # ceiling reads zero") quietly stops holding. GitHub returns them
-    # upper-case; anything else is a shape this harness does not count and must
-    # therefore not retract either.
-    mine = [
-        review
-        for review in reviews
-        if login_eq(review.author, review_bot)
-        and review.state not in {"", "PENDING", "DISMISSED"}
-    ]
-    last_rejection = max(
-        (i for i, r in enumerate(mine) if r.state == REVIEW_CHANGES_REQUESTED),
-        default=-1,
-    )
-    last_approve = max(
-        (
-            i
-            for i, r in enumerate(mine)
-            if r.state == REVIEW_APPROVED
-            and (trailing_approvals_reset or i < last_rejection)
-        ),
-        default=-1,
-    )
-    counted = tuple(
-        r for r in mine[last_approve + 1:] if r.state == REVIEW_CHANGES_REQUESTED
-    )
-    if limit > 0 and len(counted) > limit:
-        return counted[-limit:]
-    return counted
-
-
 def count_outstanding_change_requests(reviews: tuple, fix_bot: str) -> int:
     """`count_prior_rejections` read from the FIXER's side of the PR (#16).
 
@@ -420,112 +310,6 @@ def should_adopt(pr: PRView, cfg: ReviewConfig) -> bool:
 
 
 # ── circuit breaker (review P0R-3) ────────────────────────────────────────────
-def unproductive_ceiling_hit(state: ReviewState, cfg: ReviewConfig, pr: int) -> bool:
-    """This PR has burned its budget of review rounds that bought nothing.
-    Mirrors `domain.fix.infra_ceiling_hit` (same `retry_breaker` primitive,
-    same cap<=0-disables convention); separate because the reviewer's counter
-    is PR-keyed and folds in the non-dispatch-death stalls too."""
-    return retry_breaker(
-        state.unproductive_rounds.get(pr, 0), cfg.max_unproductive_rounds
-    ).tripped
-
-
-def reviewer_abandoned_at_ceiling(pr: PRView, cfg: ReviewConfig) -> bool:
-    """This PR is at the rejection ceiling, the reviewer has already given up on
-    its current head, and NOTHING now holds it on a human.
-
-    That combination is a dead state, not a hold (keifu PR #173 / issue #25,
-    2026-08-02). The ceiling escalation posts a COMMENT review and swaps the
-    trigger label for needs-human-review; a legacy/manual clear can then remove
-    needs-human-review without restoring the trigger, so the PR carries no
-    lifecycle label at all. The reviewer will not re-review (its verdict is
-    already on this head), the fixer will not dispatch address-review (the
-    latest review is a COMMENT, not CHANGES_REQUESTED), and the escalation event
-    stays frozen at the moment before the clear. Recognising it is what lets the
-    reviewer re-emit the escalation instead of going quiet forever.
-
-    The three conjuncts are what keep this from firing on a HEALTHY loop:
-
-      * the rejection sequence before the escalation reached the ceiling. A
-        trailing APPROVE is deliberately not a reset here: a mergeable approval
-        settles the workflow, so a later reviewer COMMENT on the same head is
-        durable evidence that the approval did not settle it;
-      * the reviewer's newest review is a COMMENT on the CURRENT head — only
-        the ceiling/verdict escalation posts COMMENT, and pinning it to the head
-        means a fixer push still earns a real re-review (which may APPROVE and
-        reset the count) rather than an instant re-escalation;
-      * needs-human-review is absent — its presence IS the hold, and it is also
-        what makes the re-emission self-dedup: escalating re-applies the label,
-        so this reads False again until the next operator unblock (ADR 0012:
-        one journalled re-emission per unblock generation, never per tick).
-
-    An unknown commit_id ("" — the adapter could not resolve it) fails CLOSED:
-    the unproductive-rounds breaker is the backstop, and re-escalating a PR we
-    cannot place is worse than leaving it to that bound.
-    """
-    if cfg.max_rejections <= 0 or pr.state != "OPEN":
-        return False
-    if pr.has(Label.NEEDS_HUMAN_REVIEW):
-        return False
-    # A PR that still carries the trigger label is not abandoned — the
-    # reviewer's own loop still owns it, and the labelled arm above decides
-    # whether it gets a round. Excluding it also removes the only window in
-    # which this arm and that one could act on the same PR in one tick.
-    if pr.has(cfg.trigger_label):
-        return False
-    mine = [r for r in pr.reviews if login_eq(r.author, cfg.review_bot)]
-    newest = next(
-        (r for r in reversed(mine) if r.state != REVIEW_DISMISSED),
-        None,
-    )
-    if not (
-        newest is not None
-        and newest.state == REVIEW_COMMENTED
-        and pr.head_ref_oid
-        and newest.commit_id == pr.head_ref_oid
-    ):
-        return False
-    active = [
-        review
-        for review in mine
-        if review.state not in {"", "PENDING", REVIEW_DISMISSED}
-    ]
-    last_rejection = max(
-        (
-            i
-            for i, review in enumerate(active)
-            if review.state == REVIEW_CHANGES_REQUESTED
-        ),
-        default=-1,
-    )
-    last_approve_before_rejection = max(
-        (
-            i
-            for i, review in enumerate(active)
-            if review.state == REVIEW_APPROVED and i < last_rejection
-        ),
-        default=-1,
-    )
-    prior_rejections = sum(
-        1
-        for review in active[last_approve_before_rejection + 1 :]
-        if review.state == REVIEW_CHANGES_REQUESTED
-    )
-    return prior_rejections + 1 >= cfg.max_rejections
-
-
-def abandoned_escalation_reason(cap: int) -> str:
-    """Human-facing text for the re-emitted escalation. It must say what an
-    operator has to DO differently, because the obvious move (unblock again) is
-    exactly the one that already failed: the ceiling counts GitHub review state,
-    so only dismissing the reviewer's change requests re-arms it."""
-    return (
-        f"the reviewer's rejection ceiling ({cap}) is still in force and the "
-        "attention label was cleared without its change requests being "
-        "dismissed, so no role can advance this PR."
-    )
-
-
 def unproductive_escalation_reason(cap: int) -> str:
     """Human-facing text for a reviewer ceiling escalation. Names both causes,
     because the operator's next move differs: repeated pre-result deaths point
@@ -538,97 +322,6 @@ def unproductive_escalation_reason(cap: int) -> str:
     )
 
 
-def decide_review(
-    world: WorldState, cfg: ReviewConfig, state: ReviewState
-) -> list[Action]:
-    """One review-watcher poll. In solo mode → nothing (humans review). Else:
-    initial review for un-sessioned PRs, re-review when the SHA moved. Reviews
-    are independent (no shared lock), so every eligible PR gets an action.
-
-    Rogue-PR adoption: an OPEN PR with no trigger label (opened directly, never
-    via the pipeline) is LABELLED with the trigger label AND reviewed the SAME
-    poll — the relabel records that the PR is now in-pipeline; the review runs
-    immediately so a comment lands on the first tick instead of a poll later.
-    (The review reads the diff by PR number and does not depend on the label
-    being present yet; saving the session this tick means the labelled PR is not
-    re-reviewed next poll.)
-
-    **Ceiling (review P0R-3).** Nothing here consumes a lock or a counter — one
-    RunAgent per eligible PR per poll, unconditionally — so a PR whose review
-    never persists state (session dies pre-result, agent errors, MULTI fan-out
-    synthesises nothing) is re-dispatched at FULL cost every single poll,
-    forever. `unproductive_rounds` is the bound: at the cap the dispatch is
-    withheld and the PR is handed to a human instead, through the same
-    `pr_escalation` every other breaker uses (so the Executor's funnel emits the
-    escalation event + ALERT_CMD). The escalation is edge-triggered on the
-    needs-human-review label: a PR already carrying it is silently skipped, so a
-    stuck relabel cannot turn the paid loop into a comment loop.
-
-    **Re-arm (keifu #173/#25).** A PR left at the rejection ceiling with its
-    attention label cleared belongs to nobody: see
-    `reviewer_abandoned_at_ceiling`. It is escalated again — free, no paid leg —
-    which is what puts a fresh event on the dashboard and restores the hold. The
-    escalation re-applies needs-human-review, so the arm is edge-triggered on
-    exactly the same label as every other one here."""
-    if cfg.identity_mode == IdentityMode.SOLO:
-        return []
-    actions: list[Action] = []
-    for pr in world.prs_with(cfg.trigger_label):
-        if pr.number in state.control_errors or not isinstance(
-            pr_eligibility(pr, LifecycleOperation.REVIEW), AllowedEligibility
-        ):
-            continue
-        if needs_initial_review(pr, state):
-            kind = AgentKind.REVIEW
-        elif needs_re_review(pr, state):
-            kind = AgentKind.RE_REVIEW
-        else:
-            continue  # nothing to do — the ceiling is about DISPATCHES, not PRs
-        if unproductive_ceiling_hit(state, cfg, pr.number):
-            if not pr.has(Label.NEEDS_HUMAN_REVIEW):
-                actions.extend(pr_escalation(
-                    pr.number,
-                    unproductive_escalation_reason(cfg.max_unproductive_rounds),
-                    from_label=cfg.trigger_label,
-                ).actions())
-            continue
-        actions.append(RunAgent(kind, pr.number))
-    for pr in world.prs:
-        if pr.number in state.control_errors or not isinstance(
-            pr_eligibility(pr, LifecycleOperation.REVIEW), AllowedEligibility
-        ):
-            continue
-        # Before adoption, deliberately: an abandoned-at-ceiling PR matches
-        # `should_adopt` too (no trigger label, no needs-human-review), and
-        # adopting it re-labels and re-dispatches a review that can only skip
-        # (the reviewer's verdict is already on this head) — the silent half of
-        # the keifu #173 dead state. Handing it back to a human wins.
-        if reviewer_abandoned_at_ceiling(pr, cfg):
-            actions.extend(pr_escalation(
-                pr.number,
-                abandoned_escalation_reason(cfg.max_rejections),
-                from_label=cfg.trigger_label,
-            ).actions())
-            continue
-        # A rogue PR is adopted AND reviewed the same tick, so the ceiling must be
-        # checked here too — otherwise adoption is a second, unbounded entrance to
-        # exactly the loop above. No escalation on this arm: the PR carries no
-        # trigger label to swap yet, and once adoption has labelled it (which
-        # happens on the tick BEFORE any dispatch can fail) it escalates through
-        # the labelled arm like any other.
-        if should_adopt(pr, cfg) and not unproductive_ceiling_hit(state, cfg, pr.number):
-            claim = Relabel(
-                Target.PR,
-                pr.number,
-                None,
-                cfg.trigger_label,
-                pr.head_ref_oid,
-            )
-            actions.append(claim)
-            actions.append(RunAgent(AgentKind.REVIEW, pr.number, claim))
-    return actions
-
-
 @dataclass(frozen=True)
 class BoundReviewState:
     """Per-PR dispatch facts for a repository whose review family is ACTIVE.
@@ -636,7 +329,7 @@ class BoundReviewState:
     `owed` maps a PR to the review kind its workflow owes and the binding the
     paid leg must carry; a PR absent from it is held or not owed (the
     workflow authority decided, ADR 0015). `unproductive_rounds` and
-    `control_errors` keep their `ReviewState` meaning: the unproductive-round
+    `control_errors` hold unreadable controls: the unproductive-round
     counter is not migrated in this slice.
     """
 
@@ -732,7 +425,7 @@ def review_eligibility(pr: PRView, cfg: ReviewConfig, unproductive_rounds: int) 
 def decide_bound_review(
     world: WorldState, cfg: ReviewConfig, state: BoundReviewState
 ) -> list[Action]:
-    """`decide_review` for an active review family: the workflow decides dispatch.
+    """The active workflow decides which pull requests are owed a review.
 
     Held beats owed, so only PRs in `state.owed` can dispatch, each carrying
     its captured binding. The legacy `sessions`/`last_sha` predicates and the
@@ -740,7 +433,7 @@ def decide_bound_review(
     the hold, released only by a re-arm or ceiling reconciliation, so there is
     no dead state to re-escalate. Admission is `review_eligibility`, the
     predicate the review plan records; the unproductive-round breaker and
-    rogue-PR adoption behave as in `decide_review`.
+    rogue-PR adoption remain subject to the same eligibility check.
     """
     if cfg.identity_mode == IdentityMode.SOLO:
         return []
@@ -858,7 +551,7 @@ def hold_review_dispatch(
     A forced dispatch can still lose the submit-time head race, and the next
     tick will force it again. That loop is NOT unbounded: a review round that
     fails to submit persists nothing, which is exactly what
-    `ReviewState.unproductive_rounds` counts, so `max_unproductive_rounds`
+    `BoundReviewState.unproductive_rounds` counts, so `max_unproductive_rounds`
     withholds the dispatch and hands the PR to a human. The ceiling here only
     decides who bounds a wedged claim — it never removes the bound.
     """

@@ -3402,10 +3402,21 @@ def cmd_init(args) -> int:
 
 def cmd_resolve_activation(args) -> int:
     """Offline resolve-family activation for this deployment (ADR 0015)."""
+    return _cmd_workflow_activation(args, family="resolve")
+
+
+def cmd_review_activation(args) -> int:
+    """Offline review-family activation for this deployment (ADR 0015)."""
+    return _cmd_workflow_activation(args, family="review")
+
+
+def _cmd_workflow_activation(args, *, family: str) -> int:
     import sqlite3
 
     from ..adapters.control_store import ControlStoreError
-    from . import resolve_activation as activation
+    from . import resolve_activation, review_activation
+
+    activation = resolve_activation if family == "resolve" else review_activation
 
     name = args.name or _resolve_context(args)[2]
     try:
@@ -3431,7 +3442,7 @@ def cmd_resolve_activation(args) -> int:
                 return 2
             result = activation.activate(scope, confirm_plan_digest=args.confirm_plan_digest)
     except (ValueError, OSError, ControlStoreError, sqlite3.Error) as exc:
-        err(f"resolve activation refused: {exc}")
+        err(f"{family} activation refused: {exc}")
         return 2
     print(json.dumps(result, indent=2, sort_keys=True))
     succeeded = {"activate": {"activated", "already_active_with_this_plan"}, "rehearse": {"rehearsed"}}
@@ -3573,22 +3584,23 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--branch", required=True)
     sp.set_defaults(func=cmd_publish_base_branch)
 
-    sp = sub.add_parser(
-        "resolve-activation",
-        help="inventory, shadow-compare, rehearse or activate the resolve workflow family",
-        description="Offline ADR 0015 resolve-family activation for this deployment's "
-        "active launch snapshot. inventory/shadow are read-only JSON reports; "
-        "rehearse activates an isolated copy; activate requires the reviewed "
-        "plan digest and stopped watchers.",
-    )
-    sp.add_argument("action", choices=("inventory", "shadow", "activate", "rehearse"))
-    add_context_flags(sp)
-    sp.add_argument("--confirm-plan-digest", default="",
-                    help="activate: the plan digest printed by the reviewed shadow report")
-    sp.add_argument("--legacy-state-dir", action="append", default=[], metavar="DIR",
-                    help="additional older/custom state root to import from (repeatable)")
-    sp.add_argument("--copy-to", default="", help="rehearse: new empty directory for the isolated copy")
-    sp.set_defaults(func=cmd_resolve_activation)
+    for family, handler in (("resolve", cmd_resolve_activation), ("review", cmd_review_activation)):
+        sp = sub.add_parser(
+            f"{family}-activation",
+            help=f"inventory, shadow-compare, rehearse or activate the {family} workflow family",
+            description=f"Offline ADR 0015 {family}-family activation for this deployment's "
+            "active launch snapshot. inventory/shadow are read-only JSON reports; "
+            "rehearse activates an isolated copy; activate requires the reviewed "
+            "plan digest and stopped watchers.",
+        )
+        sp.add_argument("action", choices=("inventory", "shadow", "activate", "rehearse"))
+        add_context_flags(sp)
+        sp.add_argument("--confirm-plan-digest", default="",
+                        help="activate: the plan digest printed by the reviewed shadow report")
+        sp.add_argument("--legacy-state-dir", action="append", default=[], metavar="DIR",
+                        help="additional older/custom state root to import from (repeatable)")
+        sp.add_argument("--copy-to", default="", help="rehearse: new empty directory for the isolated copy")
+        sp.set_defaults(func=handler)
 
     sp = sub.add_parser("install-service", help="install the OS service units (launchd/systemd)")
     add_context_flags(sp)

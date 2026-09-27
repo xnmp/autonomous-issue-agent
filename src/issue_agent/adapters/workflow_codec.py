@@ -94,6 +94,10 @@ _LEGACY_FIELDS = {
     "ReturnedResolve": {"split_input": None, "verdict": "", "rationale": "", "contract_revision": None},
     # Review facts observed before command markers were parsed name no command.
     "SubmittedReviewFact": {"review_command": None},
+    "RequestRearm": {"expected_binding": None},
+    "ContinueGrantedRearm": {"expected_binding": None},
+    "CancelRearm": {"expected_binding": None},
+    "AuthorizeAbsentRetry": {"expected_binding": None},
 }
 
 
@@ -112,6 +116,9 @@ def _encode(value: object, depth: int = 0) -> object:
             "fields": {
                 field.name: _encode(getattr(value, field.name), depth + 1)
                 for field in fields(value)
+                # Resolve's accepted wire format stays byte-stable. Review
+                # commands retain their required binding; legacy audits omit it.
+                if field.name != "expected_binding" or getattr(value, field.name) is not None
             },
         }
     if isinstance(value, datetime):

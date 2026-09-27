@@ -64,10 +64,10 @@ _ISSUE_SUFFIXES = (
     "steward-stalls-triage", "steward-stalls-groom",
 )
 _PR_SUFFIXES = (
-    "session", "last-sha", "round", "automerge", "patch-id", "ci-rerun-head",
+    "session", "round", "automerge", "ci-rerun-head",
     "ci-cancel-head",
     "update-branch-head", "ci-pending-escalated-head", "resumed-at",
-    "stall-sig", "operator-guidance",
+    "stall-sig",
 )
 
 # Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
@@ -130,20 +130,20 @@ class Store:
 
     # ── generic thin IO ──
     # Encoding is PINNED, never the process locale: most values here are ASCII
-    # ids and counters, but operator guidance is free text an operator typed,
+    # ids and counters, but advisory history may contain Unicode,
     # and a daemon started under a C/POSIX locale would otherwise fail to write
     # (or mis-read) the same file a UTF-8 shell wrote. `errors="replace"` on the
     # advisory reads preserve byte-damaged notes. Control records use strict
     # decoding so a damaged marker cannot grant a fresh attempt.
     def _read(self, path: str) -> str:
         advisory = path.rsplit(".", 1)[-1] in {
-            "ci-history", "operator-guidance", "jira", "jira-phase",
+            "ci-history", "jira", "jira-phase",
             "predicted-paths", "stall-sig",
         }
         if not advisory:
             raw = self._read_control(path)
             if raw == "" and path.rsplit(".", 1)[-1] in {
-                "session", "last-sha", "patch-id", "resumed-at", "at", "content",
+                "session", "resumed-at", "at", "content",
                 "ci-rerun-head", "ci-cancel-head", "update-branch-head",
                 "ci-pending-escalated-head", "self-clear-ceiling",
             }:
@@ -562,25 +562,6 @@ class Store:
         self._remove(self.issue_path(key, "ci-history"))
         return removed
 
-    # ── pr review head-sha + round ──
-    def get_last_sha(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "last-sha"))
-
-    def set_last_sha(self, pr: int, sha: str) -> None:
-        self._write(self.pr_path(pr, "last-sha"), sha)
-
-    # ── reviewed-patch identity (harness #2) ──
-    # `domain.review.patch_signature` of the diff the last RECORDED review saw.
-    # The head SHA alone cannot tell a real revision from a mechanical rebase, so
-    # `last-sha` says WHICH commit was reviewed and this says WHAT was reviewed.
-    # Absent ("" — a PR last reviewed before this existed) means "unknown", which
-    # the reader must treat as "must review", never as "unchanged".
-    def get_last_patch_id(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "patch-id"))
-
-    def set_last_patch_id(self, pr: int, patch_id: str) -> None:
-        self._write(self.pr_path(pr, "patch-id"), patch_id)
-
     # ── free CI re-run marker (#38) ──
     # The head SHA whose ONE free `gh run rerun --failed` has been spent, so a
     # second FAILURE on the same commit buys the paid FIX_CI leg instead of
@@ -659,29 +640,6 @@ class Store:
     def set_ci_pending_escalated_head(self, pr: int, sha: str) -> None:
         if sha:
             self._write(self.pr_path(pr, "ci-pending-escalated-head"), sha)
-
-    # ── operator review guidance ──
-    # Scope note the deployment operator attached when re-arming a wedged PR.
-    # Provenance (ADR 0012): the ONLY writer is the dashboard's unblock
-    # endpoint, which is loopback-only and operator-driven — harness-owned
-    # trusted context, never a claim laundered out of PR content. Without it a
-    # re-armed review loop repeats the rejection that wedged it, because the
-    # reviewer's prompt carries no channel a human can speak through (keifu
-    # 2026-08-08: reviewer demanded screenshots the environment cannot produce
-    # and rode the rejection ceiling to needs-human-review every round).
-    # "" (absent) = no guidance, the reading every fresh PR must have.
-    def get_operator_guidance(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "operator-guidance"))
-
-    def set_operator_guidance(self, pr: int, guidance: str) -> None:
-        self._write(self.pr_path(pr, "operator-guidance"), guidance)
-
-    def clear_operator_guidance(self, pr: int) -> None:
-        """Retract the note. An operator who can only ever ADD scope cannot
-        undo a mistake until the PR merges, so the retraction is a first-class
-        operation rather than a stored empty string (which the reader would
-        have to distinguish from 'never set')."""
-        self._remove(self.pr_path(pr, "operator-guidance"))
 
     def get_round(self, pr: int) -> int:
         return self._read_int(self.pr_path(pr, "round"), default=1)

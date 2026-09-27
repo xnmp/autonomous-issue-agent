@@ -2,8 +2,8 @@
 
 A repository whose review family is not activated never reaches this module's
 decisions: `ActiveReviewRuntime.active()` reads the family row every tick, so
-activation is runtime capability detection rather than launch-time config,
-and the legacy review path stays byte-for-byte the inactive behaviour.
+activation is runtime capability detection rather than launch-time config.
+Inactive repositories require explicit operator migration before dispatch.
 
 When active, the workflow authority is the only source of three things the
 legacy path kept in per-PR files: whether a review is owed (sessions/last_sha
@@ -21,8 +21,9 @@ import sqlite3
 from ..adapters.control_store import ControlStoreError, SQLiteControlStore
 from ..adapters.effects import GitHubEffectExecutor, UnknownEffectOutcome, bound_review_command_id
 from ..adapters.review_effects import (
-    BoundReviewSubmissionOp, observe_pull_request, pull_request_observation, read_pull_request,
+    BoundReviewSubmissionOp, pull_request_observation, read_pull_request,
 )
+from ..adapters.review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from ..adapters.review_workflow_control import SQLiteReviewWorkflowControl, read_review_guidance
 from ..adapters.workflow_rows import WorkflowAuthorityError
 from ..domain.actions import AgentKind
@@ -61,6 +62,10 @@ _UNRESOLVED_STATES = frozenset({"executing", "unknown_outcome", "retryable_failu
 RECORD_FAILURE_REPORT_SECONDS = 900
 
 
+class _LinkedIssueDeferred(ValueError):
+    """Linked-issue evidence is unavailable or waiting for its scheduled read."""
+
+
 def unproductive_round_keys(pr) -> frozenset[int]:
     """The counter keys one PR's unproductive review rounds are recorded under.
 
@@ -84,19 +89,20 @@ def trusted_external_holds(
 
 def review_external_holds(
     unproductive_rounds: Callable[[object], int], max_unproductive_rounds: int,
+    *, linked_holds: Callable[[ObservedPullRequest, object], tuple[str, ...]] | None = None,
 ) -> Callable[[ObservedPullRequest, object], tuple[str, ...]]:
     """Trusted holds a review re-arm must respect beside its own ceiling gate.
 
-    Sources: the harness-owned hold labels on the observed PR and the
-    unmigrated unproductive-round breaker (the review role's own counter),
-    read for the pull request view of the same harness read. A counter read
-    failure, or a read with no view, raises, which the control records as an
-    unavailable observation: never permission to clear.
+    Sources: harness-owned PR labels, the review role's unproductive-round
+    counter, and fresh linked-issue lifecycle and workflow holds. The issue
+    join uses the same PR view as the observation. An unreadable source
+    raises; unavailable evidence never authorizes a release.
     """
     def holds(observed: ObservedPullRequest, view: object) -> tuple[str, ...]:
         if getattr(view, "number", None) != observed.key.target.number:
             raise ValueError("the unproductive-round counter needs this read's pull request view")
-        return trusted_external_holds(observed.labels, unproductive_rounds(view), max_unproductive_rounds)
+        found = trusted_external_holds(observed.labels, unproductive_rounds(view), max_unproductive_rounds)
+        return found + (linked_holds(observed, view) if linked_holds is not None else ())
 
     return holds
 
@@ -131,23 +137,26 @@ def configured_review_control(
         external_holds=review_external_holds(
             unproductive_rounds_reader(store, lambda: control.abandoned_dispatch_counts(owner_id)),
             review.max_unproductive_rounds,
+            linked_holds=lambda observed, view: review_linked_issue_holds(control, gateway, observed.key, view),
         ),
         trailers=trailers if callable(trailers) else None,
     )
 
 
 def review_guidance_reader(
-    control: SQLiteControlStore, repository: str, legacy: Callable[[int], str],
+    control: SQLiteControlStore, repository: str,
 ) -> Callable[[int], str]:
     """The fix role's read-only guidance source for PR repairs.
 
     Active family: the committed review episode's guidance; an unreadable
     authority raises `WorkflowAuthorityError`, which defers the repair.
-    Inactive: the legacy per-PR record, unchanged.
+    Inactive authority defers repairs until explicit migration.
     """
     def read(pr: int) -> str:
         guidance = read_review_guidance(control, repository, pr)
-        return legacy(pr) if guidance is None else guidance
+        if guidance is None:
+            raise WorkflowAuthorityError("review_migration_required")
+        return guidance
 
     return read
 
@@ -257,15 +266,19 @@ class ActiveReviewRuntime:
         errors: dict[int, str] = {}
         held: dict[int, str] = {}
         decisions: dict[int, PlannedDecision] = {}
+        external: dict[int, tuple[str, ...]] = {}
         now = self._now()
         for pr in world.prs:
             key = self._key(pr.number)
             observed = pull_request_observation(key, pr, now, PartialReviews("world observation"))
-            basis = self._basis(observed, rounds.get(pr.number, 0), cfg)
+            basis = None
             recorded: RecordedDispatch
             try:
-                recorded = self._plan_one(pr, key, observed, cfg, rounds.get(pr.number, 0), owed, errors, held)
-            except (WorkflowAuthorityError, ControlStoreError, ValueError) as exc:
+                recorded = self._plan_one(pr, key, observed, cfg, rounds.get(pr.number, 0), owed, errors, held,
+                                          external)
+                if pr.number in external or not isinstance(recorded, ReviewDeferred):
+                    basis = self._basis(observed, rounds.get(pr.number, 0), cfg, external.get(pr.number))
+            except (sqlite3.Error, OSError, WorkflowAuthorityError, ControlStoreError, ValueError) as exc:
                 errors[pr.number] = str(exc)[:512] or type(exc).__name__
                 recorded = ReviewDeferred(errors[pr.number])
             if pr.number in unreadable and not isinstance(recorded, ReviewTerminal):
@@ -320,7 +333,7 @@ class ActiveReviewRuntime:
     def _plan_one(
         self, pr, key: WorkflowKey, observed: ObservedPullRequest | PullRequestUnavailable, cfg: ReviewConfig,
         unproductive_rounds: int, owed: dict[int, tuple[AgentKind, WorkflowBinding]], errors: dict[int, str],
-        held: dict[int, str],
+        held: dict[int, str], external: dict[int, tuple[str, ...]],
     ) -> RecordedDispatch:
         """One PR's plan entry, in the order the daemon acts on it, as the decision to record.
 
@@ -360,6 +373,10 @@ class ActiveReviewRuntime:
             if excluded is None:
                 errors[pr.number] = reason
             return ReviewDeferred(reason)
+        if not self.evidence_due(state.binding, observed.head_sha):
+            held[pr.number] = "evidence read backing off"
+            return ReviewDeferred(held[pr.number])
+        external[pr.number] = self._scheduled_external_holds(observed, pr)
         decision = self.control.dispatch_decision(observed, patch_id=None)
         if isinstance(decision, (ReviewHeld, SubmissionUnresolved, ReleaseProjectionPending)):
             if excluded is None:
@@ -367,11 +384,10 @@ class ActiveReviewRuntime:
             return decision
         if excluded is not None:
             return ReviewNotAdmitted(excluded)
+        if external[pr.number]:
+            held[pr.number] = "; ".join(external[pr.number])
+            return ReviewNotAdmitted(external[pr.number])
         if isinstance(decision, ReviewOwed):
-            if not self.evidence_due(state.binding, observed.head_sha):
-                # A backing-off read is decided by its schedule, before any read or paid leg.
-                held[pr.number] = "evidence read backing off"
-                return ReviewDeferred(held[pr.number])
             kind = AgentKind.REVIEW if decision.kind is ReviewKind.INITIAL else AgentKind.RE_REVIEW
             owed[pr.number] = (kind, state.binding)
             admission = review_eligibility(pr, cfg, unproductive_rounds)
@@ -380,11 +396,13 @@ class ActiveReviewRuntime:
 
     def _basis(
         self, observed: ObservedPullRequest | PullRequestUnavailable, unproductive_rounds: int, cfg: ReviewConfig,
+        external_holds: tuple[str, ...] | None = None,
     ) -> DecisionBasis | None:
         if not isinstance(observed, ObservedPullRequest):
             return None
         try:
             return DecisionBasis(observed.head_sha, observed.state, observed.labels,
+                                 external_holds if external_holds is not None else
                                  trusted_external_holds(observed.labels, unproductive_rounds,
                                                         cfg.max_unproductive_rounds))
         except ValueError:
@@ -397,8 +415,8 @@ class ActiveReviewRuntime:
         pull requests, so a held pull request whose trigger was swapped for a
         hold, or one closed since, leaves it. Only a read decides it is closed.
         A failed read backs off exponentially (`record_departed_read_failure`).
-        These reads feed only the operator view, so no failure here leaves
-        this method: it becomes that pull request's failed read.
+        Remote failures back off per target. Local authority failures are
+        reported separately and cannot advance the remote failure schedule.
         """
         try:
             numbers = self.control.departed_pull_requests(
@@ -411,6 +429,8 @@ class ActiveReviewRuntime:
             key = self._key(number)
             try:
                 entries.append(self._departed_entry(key, cfg))
+            except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError) as exc:
+                self._record_failed(f"departed pull request control unavailable: {type(exc).__name__}: {exc}")
             except Exception as exc:  # noqa: BLE001 - see docstring
                 entries.append(DepartedReadFailed(key, f"its facts are unavailable: {type(exc).__name__}: {exc}"[:512]))
         return tuple(entries)
@@ -421,12 +441,20 @@ class ActiveReviewRuntime:
             return DepartedReadFailed(key, (
                 f"missing from the review daemon's pull request read, and its own read failed: {observed.reason}"
             )[:512])
-        holds = self.control.external_holds(observed, view)
+        if observed.state is not PullRequestState.OPEN:
+            return DecisionUpdate(key, ReviewTerminal(observed.state),
+                                  DecisionBasis(observed.head_sha, observed.state, observed.labels, ()),
+                                  DecisionRead.DEPARTED_READ)
+        try:
+            holds = self._scheduled_external_holds(observed, view)
+        except _LinkedIssueDeferred as exc:
+            return DecisionUpdate(key, ReviewDeferred(str(exc)), None, DecisionRead.DEPARTED_READ)
         basis = DecisionBasis(observed.head_sha, observed.state, observed.labels, holds)
-        return DecisionUpdate(key, self._departed_decision(key, observed, view, cfg), basis, DecisionRead.DEPARTED_READ)
+        return DecisionUpdate(key, self._departed_decision(key, observed, view, cfg, holds), basis,
+                              DecisionRead.DEPARTED_READ)
 
     def _departed_decision(
-        self, key: WorkflowKey, observed: ObservedPullRequest, view, cfg: ReviewConfig,
+        self, key: WorkflowKey, observed: ObservedPullRequest, view, cfg: ReviewConfig, holds: tuple[str, ...],
     ) -> RecordedDispatch:
         """As `_plan_one` decides, for a PR the review read no longer lists: workflow holds before candidacy."""
         if observed.state is not PullRequestState.OPEN:
@@ -434,6 +462,8 @@ class ActiveReviewRuntime:
         decision = self.control.dispatch_decision(observed, patch_id=None)
         if isinstance(decision, (ReviewHeld, SubmissionUnresolved, ReleaseProjectionPending)):
             return decision
+        if holds:
+            return ReviewNotAdmitted(holds)
         candidacy = review_candidacy(view, cfg)
         if isinstance(candidacy, ReviewExcluded):
             return ReviewNotAdmitted(candidacy.holds)
@@ -442,17 +472,32 @@ class ActiveReviewRuntime:
 
     # -- ReviewAuthority (the dispatching review's side) -------------------------------------
 
-    def begin(self, binding: WorkflowBinding, head_sha: str) -> BoundReviewRound | None:
+    def _scheduled_external_holds(self, observed: ObservedPullRequest, view: object) -> tuple[str, ...]:
+        key, head = observed.key, observed.head_sha
+        kind = ReviewEvidenceKind.LINKED_ISSUE
+        if not self.control.evidence_due(key, head, kind):
+            raise _LinkedIssueDeferred("linked issue evidence read backing off")
+        try:
+            holds = self.control.external_holds(observed, view)
+        except ReviewLinkedIssueUnavailable as exc:
+            self.control.record_evidence(key, head, kind, error=str(exc)[:512] or "linked issue unavailable")
+            raise _LinkedIssueDeferred(f"linked issue unavailable: {exc}"[:512]) from exc
+        self.control.record_evidence(key, head, kind, error=None)
+        return holds
+
+    def begin(self, binding: WorkflowBinding, head_sha: str, *, expected_claim_target: int) -> BoundReviewRound | None:
         key = binding.fence.key
         if key.repository != self.repository or not isinstance(key.target, PullRequestRef):
             raise WorkflowAuthorityError("the review dispatch binding belongs to another repository")
-        observed = observe_pull_request(self._gateway, key, self._now(), reviews=True)
+        observed, view = read_pull_request(self._gateway, key, self._now(), reviews=True)
         if not isinstance(observed, ObservedPullRequest):
             self.control.record_evidence(key, head_sha, ReviewEvidenceKind.REVIEW_HISTORY,
                                          error=observed.reason or "pull request read unavailable")
             raise WorkflowAuthorityError(f"pull request read unavailable: {observed.reason}")
         if observed.head_sha != head_sha:
             raise WorkflowAuthorityError("the pull request head moved during dispatch")
+        if breaker_key(view) != expected_claim_target:
+            raise WorkflowAuthorityError("the pull request issue linkage changed during dispatch")
         if isinstance(observed.reviews, PartialReviews):
             # Checked before any paid leg: a partial read can neither count the
             # ceiling for the verdict nor prove the head is unreviewed. The
@@ -464,6 +509,12 @@ class ActiveReviewRuntime:
         state = self.control.load_workflow(key)
         if not isinstance(state, ReviewWorkflowSnapshot) or state.binding != binding:
             raise WorkflowAuthorityError("the review dispatch binding is no longer current")
+        try:
+            holds = self._scheduled_external_holds(observed, view)
+        except _LinkedIssueDeferred as exc:
+            raise WorkflowAuthorityError(str(exc)) from exc
+        if holds:
+            raise WorkflowAuthorityError("review dispatch held: " + "; ".join(holds))
         decision = self.control.dispatch_decision(observed, patch_id=None)
         if isinstance(decision, ReviewNotOwed):
             return None
@@ -550,4 +601,3 @@ def unproductive_rounds_reader(store, abandoned: Callable[[], Mapping[int, int]]
         return sum(store.get_infra_deaths(key) + deaths.get(key, 0) for key in unproductive_round_keys(pr))
 
     return read
-

@@ -83,6 +83,7 @@ def _workflow(gw, store, runner, wt=None, **cfg_overrides):
         fix_mcp_config="",
         harness_root="",
         log=lambda _m: None,
+        operator_guidance=lambda _pr: "",
     )
     cfg_kwargs.update(cfg_overrides)
     cfg = FixWorkflowConfig(**cfg_kwargs)
@@ -2914,9 +2915,8 @@ def test_the_repair_reads_the_committed_review_episode_guidance(tmp_path):
     from issue_agent.app.review_runtime import review_guidance_reader
 
     control, pr = _review_guidance_control(tmp_path, "Scope: the parser only")
-    legacy_reads: list[int] = []
-    reader = review_guidance_reader(control, "o/r", lambda n: legacy_reads.append(n) or "legacy note")
-    assert reader(pr) == "Scope: the parser only" and legacy_reads == []
+    reader = review_guidance_reader(control, "o/r")
+    assert reader(pr) == "Scope: the parser only"
     assert reader(pr + 1) == ""  # active but never observed: no legacy fallback
     p = PRView(pr, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
@@ -2925,10 +2925,11 @@ def test_the_repair_reads_the_committed_review_episode_guidance(tmp_path):
     assert "Scope: the parser only" in runner.tasks[0].intent.prompt
 
 
-def test_an_inactive_review_family_keeps_the_legacy_guidance_record(tmp_path):
+def test_an_inactive_review_family_defers_guidance_until_migrated(tmp_path):
     from issue_agent.app.review_runtime import review_guidance_reader
 
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
-    reader = review_guidance_reader(control, "o/r", lambda n: f"legacy {n}")
-    assert reader(9) == "legacy 9"
+    reader = review_guidance_reader(control, "o/r")
+    with pytest.raises(WorkflowAuthorityError, match="review_migration_required"):
+        reader(9)

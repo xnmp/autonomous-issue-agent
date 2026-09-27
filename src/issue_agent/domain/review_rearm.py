@@ -165,18 +165,8 @@ class ReleaseProjection:
 
 
 @dataclass(frozen=True)
-class InactiveReviewControl:
-    """The review family is not activated and no other family retired the legacy unblock."""
-    key: WorkflowKey
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.key, WorkflowKey):
-            raise ValueError("inactive review control requires a queried workflow")
-
-
-@dataclass(frozen=True)
 class MigrationRequiredReviewControl:
-    """The review family is not activated, yet another family's activation retired the legacy unblock.
+    """The review family requires explicit activation before any review work.
 
     No lever exists for this pull request's review holds until the review
     family is activated (plan decision 2: never two authorities, no fallback).
@@ -187,7 +177,7 @@ class MigrationRequiredReviewControl:
     def __post_init__(self) -> None:
         if not isinstance(self.key, WorkflowKey):
             raise ValueError("migration-required review control requires a queried workflow")
-        if (not isinstance(self.active_families, tuple) or not self.active_families
+        if (not isinstance(self.active_families, tuple)
                 or any(not isinstance(family, WorkflowFamily) or family is WorkflowFamily.REVIEW_REJECTIONS
                        for family in self.active_families)
                 or len(set(self.active_families)) != len(self.active_families)):
@@ -390,4 +380,4 @@ class ReviewControlView:
             raise ValueError("re-arm command progress follows exactly the pending intent's obligations")
 
 
-ReviewControlRead = InactiveReviewControl | MigrationRequiredReviewControl | AbsentReviewControl | ReviewControlView
+ReviewControlRead = MigrationRequiredReviewControl | AbsentReviewControl | ReviewControlView

@@ -454,9 +454,7 @@ const StepEventsPayload = z
     warnings: z.array(z.string()),
   })
   .passthrough();
-const UnblockRequest = z
-  .object({ guidance: z.union([z.string(), z.null()]) })
-  .partial();
+const UnblockRequest = z.object({}).partial();
 const api_unblock_api_repos__name__issues__number__unblock_post_Body = z.union([
   UnblockRequest,
   z.null(),
@@ -900,11 +898,6 @@ const ReviewAvailableControl = z.object({
   status: z.literal("available"),
   workflow_held: z.boolean(),
 });
-const ReviewInactiveControl = z.object({
-  pull_request: z.number().int(),
-  repository: z.string(),
-  status: z.literal("inactive"),
-});
 const ReviewMigrationRequiredControl = z.object({
   active_families: z.array(z.string()),
   pull_request: z.number().int(),
@@ -963,7 +956,6 @@ const api_review_command_api_repos__name__pulls__pr__review_control_commands_pos
 const ReviewCommandResult = z.object({
   control: z.discriminatedUnion("status", [
     ReviewAvailableControl,
-    ReviewInactiveControl,
     ReviewMigrationRequiredControl,
     ReviewAbsentControl,
     ReviewUnavailableControl,
@@ -1152,7 +1144,6 @@ export const schemas = {
   ReviewGate,
   ReviewObservation,
   ReviewAvailableControl,
-  ReviewInactiveControl,
   ReviewMigrationRequiredControl,
   ReviewAbsentControl,
   ReviewUnavailableControl,
@@ -1628,7 +1619,6 @@ const endpoints = makeApi([
     ],
     response: z.discriminatedUnion("status", [
       ReviewAvailableControl,
-      ReviewInactiveControl,
       ReviewMigrationRequiredControl,
       ReviewAbsentControl,
       ReviewUnavailableControl,

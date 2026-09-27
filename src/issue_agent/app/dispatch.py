@@ -263,7 +263,7 @@ class AgentDispatcher:
         )
         self.review_workflow = ReviewWorkflow(
             replace(cfg.review_workflow_config(), journal=journal),
-            gateway, store, runner, executor,
+            gateway, store, runner,
             self._run_logged,
             authority=review_authority,
         )
@@ -371,7 +371,7 @@ class AgentDispatcher:
           2. fall back to whatever this process last resolved for that PR;
           3. only then use `-pr`, and say so loudly, because at that point the
              counter genuinely may not be read by the fix role's `_fix_state`
-             (the review role already reads the union — see `roles._review_state`).
+             (the review role already reads the union — see `roles._review_unproductive_rounds`).
         """
         # Review retry policy is PR-keyed even when claim/spend attribution is
         # issue-keyed. A later relink must not erase a paid failed round.

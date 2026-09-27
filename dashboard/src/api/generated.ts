@@ -1468,7 +1468,7 @@ export interface components {
         /** ReviewCommandResult */
         ReviewCommandResult: {
             /** Control */
-            control: components["schemas"]["ReviewAvailableControl"] | components["schemas"]["ReviewInactiveControl"] | components["schemas"]["ReviewMigrationRequiredControl"] | components["schemas"]["ReviewAbsentControl"] | components["schemas"]["ReviewUnavailableControl"];
+            control: components["schemas"]["ReviewAvailableControl"] | components["schemas"]["ReviewMigrationRequiredControl"] | components["schemas"]["ReviewAbsentControl"] | components["schemas"]["ReviewUnavailableControl"];
             /**
              * Outcome
              * @enum {string}
@@ -1868,23 +1868,8 @@ export interface components {
             kind: "imported";
         };
         /**
-         * ReviewInactiveControl
-         * @description Not activated; the legacy unblock still owns this repository's review holds.
-         */
-        ReviewInactiveControl: {
-            /** Pull Request */
-            pull_request: number;
-            /** Repository */
-            repository: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            status: "inactive";
-        };
-        /**
          * ReviewMigrationRequiredControl
-         * @description Not activated, and another family's activation retired the legacy unblock: no lever until activation.
+         * @description Review dispatch and operator re-arm require explicit family activation.
          */
         ReviewMigrationRequiredControl: {
             /** Active Families */
@@ -2248,18 +2233,9 @@ export interface components {
         };
         /**
          * UnblockRequest
-         * @description The unblock body. `guidance` is tri-state: absent/null leaves any stored
-         *     note alone, `""` clears it, text sets it (see `guidance.parse_guidance`).
-         *
-         *     `extra="forbid"`, unlike every response contract above: a response gains
-         *     fields over time and a client must tolerate them, but a REQUEST field the
-         *     server does not know is an operator whose note went nowhere — `{"note":
-         *     ...}` must 422, not succeed silently having stored nothing.
+         * @description Legacy breaker release accepts no review guidance or re-arm authority.
          */
-        UnblockRequest: {
-            /** Guidance */
-            guidance?: string | null;
-        };
+        UnblockRequest: Record<string, never>;
         /** UsagePayload */
         UsagePayload: {
             claude: components["schemas"]["ClaudeUsage"] | null;
@@ -2788,7 +2764,7 @@ export interface operations {
                     [name: string]: unknown;
                 };
                 content: {
-                    "application/json": components["schemas"]["ReviewAvailableControl"] | components["schemas"]["ReviewInactiveControl"] | components["schemas"]["ReviewMigrationRequiredControl"] | components["schemas"]["ReviewAbsentControl"] | components["schemas"]["ReviewUnavailableControl"];
+                    "application/json": components["schemas"]["ReviewAvailableControl"] | components["schemas"]["ReviewMigrationRequiredControl"] | components["schemas"]["ReviewAbsentControl"] | components["schemas"]["ReviewUnavailableControl"];
                 };
             };
             /** @description Validation Error */

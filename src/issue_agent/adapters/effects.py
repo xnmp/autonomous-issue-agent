@@ -53,15 +53,18 @@ from ..domain.effect_retry import (
 from ..domain.events import Correlation, LevelChanged, TelemetryEvent
 from ..domain.ports import EventSink
 from .deployment_authority import DeploymentAuthority, deployment_role
+from .control_store import ControlStoreError
 from .durable_effects import DurableEffectRunner, EffectOutcome
 from .journal import alert
 from ..domain.review_workflow import PartialReviews, PullRequestState, PullRequestUnavailable, mark_review_body
 from .review_effects import (
     BoundReviewSubmissionOp, PullRequestProjectionOp, ReviewCheck, ReviewCommandCheck, ReviewDismissalOp,
     ReviewDismissals, ReviewFamilyOp, ReviewReadUnavailable, ReviewReads, bound_submission_op, check_bound_submission, check_review_op,
-    is_review_family, observe_pull_request, review_family_op,
+    is_review_family, read_pull_request, review_family_op,
 )
+from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from .workflow_codec import encode_workflow
+from .workflow_rows import WorkflowAuthorityError
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
 
@@ -427,11 +430,24 @@ class GitHubEffectExecutor:
     def _check_review(self, op: ReviewFamilyOp, command: LifecycleCommand) -> ReviewCommandCheck:
         """One fresh read of the pull request, classified against the op's accepted guard."""
         assert command.workflow is not None
-        observation = observe_pull_request(
+        observation, view = read_pull_request(
             self.gateway, command.workflow.fence.key, self.store.now(),
             reviews=isinstance(op, ReviewDismissalOp),
         )
-        return check_review_op(op, observation)
+        checked = check_review_op(op, observation)
+        if checked.check is not ReviewCheck.APPLIES or (
+            isinstance(op, PullRequestProjectionOp) and op.add is Label.NEEDS_HUMAN_REVIEW
+        ):
+            return checked
+        try:
+            holds = review_linked_issue_holds(self.store, self.gateway, command.workflow.fence.key, view)
+        except ReviewLinkedIssueUnavailable as exc:
+            return ReviewCommandCheck(ReviewCheck.UNAVAILABLE, str(exc))
+        # Dismissing the explicitly authorized counted reviews does not release
+        # the linked issue. A trigger projection must preserve its current hold.
+        if holds and isinstance(op, PullRequestProjectionOp):
+            return ReviewCommandCheck(ReviewCheck.REFUSED, "; ".join(holds))
+        return checked
 
     def _write_review(self, op: ReviewFamilyOp) -> bool:
         """The single remote write; False is GitHub's refusal of this identity's request."""
@@ -453,7 +469,9 @@ class GitHubEffectExecutor:
                 and self.store.unsettled_sibling_dismissals(command) > 0)
 
     def _execute_review(self, op: ReviewFamilyOp, pending) -> bool:
-        return self._execute_review_guarded(op, pending)
+        # The linked issue's re-arm takes all role barriers exclusively. Keep
+        # its fresh hold read in the same authority span as the guarded write.
+        return self.effects.authorized(lambda: self._execute_review_guarded(op, pending))
 
     def _signal_escalations(self) -> None:
         """The operator signal of each settled review escalation, once, on whichever path settled it.
@@ -775,6 +793,11 @@ class GitHubEffectExecutor:
         return check_bound_submission(op, reviews, command_id=str(command.command_id))
 
     def _run_bound_review_command(self, op: BoundReviewSubmissionOp, pending, *, raise_deferred: bool) -> bool:
+        return self.effects.authorized(
+            lambda: self._run_bound_review_guarded(op, pending, raise_deferred=raise_deferred),
+        )
+
+    def _run_bound_review_guarded(self, op: BoundReviewSubmissionOp, pending, *, raise_deferred: bool) -> bool:
         """Submit a bound review at most once per proven absence (ADR 0015).
 
         Its body carries a final-line marker naming this command, and only a
@@ -806,14 +829,16 @@ class GitHubEffectExecutor:
             return False
         started = self.store.now()
         try:
-            current = self._current_revision(command)
-        except sqlite3.Error:
+            applicability = self._submission_applicability(op, command)
+        except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError):
             raise
         except Exception as exc:  # noqa: BLE001 - bounded pre-write evidence
             self._defer_prewrite(pending, schedule, started, f"{type(exc).__name__}: {exc}"[:512])
-        if current != op.head:
+        if applicability.check is ReviewCheck.UNAVAILABLE:
+            self._defer_prewrite(pending, schedule, started, applicability.detail)
+        if applicability.check is ReviewCheck.REFUSED:
             return bool(self.effects.execute(command, lambda: EffectOutcome(
-                False, EffectStatus.PERMANENT_FAILURE, error="review head changed before submission")))
+                False, EffectStatus.PERMANENT_FAILURE, error=applicability.detail)))
 
         def submit_and_verify() -> EffectOutcome[bool]:
             if not self.gateway.submit_review(op.pr, op.event, mark_review_body(op.body, command.command_id), op.head):
@@ -825,6 +850,28 @@ class GitHubEffectExecutor:
                 f"{command.command_id}: submitted review is not verifiable ({after.detail or 'not yet visible'})")
 
         return bool(self.effects.execute(command, submit_and_verify))
+
+    def _submission_applicability(
+        self, op: BoundReviewSubmissionOp, command: LifecycleCommand,
+    ) -> ReviewCommandCheck:
+        """Fresh decision facts shared by ordinary writes and authorized retries."""
+        assert command.workflow is not None
+        observed, view = read_pull_request(
+            self.gateway, command.workflow.fence.key, self.store.now(), reviews=False,
+        )
+        if isinstance(observed, PullRequestUnavailable):
+            return ReviewCommandCheck(ReviewCheck.UNAVAILABLE, observed.reason)
+        if observed.head_sha != op.head:
+            return ReviewCommandCheck(ReviewCheck.REFUSED, "review head changed before submission")
+        if observed.state is not PullRequestState.OPEN:
+            return ReviewCommandCheck(ReviewCheck.REFUSED, "pull request is terminal")
+        try:
+            holds = review_linked_issue_holds(self.store, self.gateway, command.workflow.fence.key, view)
+        except ReviewLinkedIssueUnavailable as exc:
+            return ReviewCommandCheck(ReviewCheck.UNAVAILABLE, str(exc))
+        if holds:
+            return ReviewCommandCheck(ReviewCheck.REFUSED, "review held before submission: " + "; ".join(holds))
+        return ReviewCommandCheck(ReviewCheck.APPLIES)
 
     def _run_review_command(self, pending) -> bool:
         command = pending.command
@@ -1014,7 +1061,7 @@ class GitHubEffectExecutor:
                     )
                 else:
                     present = self._reconcile(action, command)
-        except sqlite3.Error:
+        except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError):
             raise
         except Exception as exc:  # noqa: BLE001 — bounded durable failed-read evidence
             return None, f"{type(exc).__name__}: {exc}", None
@@ -1066,9 +1113,20 @@ class GitHubEffectExecutor:
             if grant is None or present is not False:
                 settled = record(started, present, error, remote_object_id)
                 return False
+
+            def unavailable(exc: Exception) -> bool:
+                self.log(f"lifecycle command {command.command_id} retry spend unavailable: {type(exc).__name__}: {exc}")
+                record(started, None, f"retry spend unavailable: {type(exc).__name__}: {exc}")
+                return False
+
             try:
                 guard_holds = self._decision_applies(command)
                 revision = self._current_revision(command)
+            except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError):
+                raise
+            except Exception as exc:  # noqa: BLE001 - remote decision evidence can be unavailable
+                return unavailable(exc)
+            try:
                 outcome = self.store.begin_authorized_retry(
                     command.command_id, grant.authorization_id, expected=state, expected_attempts=attempts,
                     read=RetryAbsenceRead(started, revision, guard_holds),
@@ -1077,9 +1135,7 @@ class GitHubEffectExecutor:
             except sqlite3.Error:
                 raise
             except Exception as exc:  # noqa: BLE001 — a transient fault counts toward the grant's ceiling
-                self.log(f"lifecycle command {command.command_id} retry spend unavailable: {type(exc).__name__}: {exc}")
-                record(started, None, f"retry spend unavailable: {type(exc).__name__}: {exc}")
-                return False
+                return unavailable(exc)
             if isinstance(outcome, RetryDeclined):
                 self.log(f"lifecycle command {command.command_id} retry grant {grant.authorization_id} "
                          f"{outcome.closed.disposition.value}: {outcome.closed.reason}")
@@ -1645,11 +1701,10 @@ class GitHubEffectExecutor:
             return check.check is ReviewCheck.APPLIES
         submission = bound_submission_op(command)
         if submission is not None:
-            assert command.workflow is not None
-            observed = observe_pull_request(self.gateway, command.workflow.fence.key, self.store.now(), reviews=False)
-            if isinstance(observed, PullRequestUnavailable):
-                raise UnknownEffectOutcome(f"{command.command_id}: decision facts are unavailable ({observed.reason})")
-            return observed.state is PullRequestState.OPEN and observed.head_sha == submission.head
+            check = self._submission_applicability(submission, command)
+            if check.check is ReviewCheck.UNAVAILABLE:
+                raise UnknownEffectOutcome(f"{command.command_id}: decision facts are unavailable ({check.detail})")
+            return check.check is ReviewCheck.APPLIES
         if command.kind in {CommandKind.RELABEL, CommandKind.CLOSE_ISSUE}:
             action = action_from_command(command)
             if isinstance(action, Relabel) and action.hold_guard is not None:

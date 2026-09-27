@@ -221,8 +221,7 @@ export function ReviewControlView(props: ReviewControlViewProps) {
         {readError && <p className="resolve-error">Status unavailable: {readError}. {control ? "Showing last known data, read-only." : "Refresh to try again."}</p>}
         {props.lookupId && (readError || (control && control.status !== "available")) && <p>The lookup of <span className="mono">{props.lookupId}</span> could not be shown. <button type="button" className="btn btn-ghost" disabled={operationLocksActions(operation)} onClick={props.onClearLookup}>Clear request lookup</button></p>}
         {control?.status === "unavailable" && <p className="resolve-error">Review control unavailable: {control.reason}. No reset is available. Refresh to try again.</p>}
-        {control?.status === "inactive" && <p>Review rejection control is inactive for this repository.</p>}
-        {control?.status === "migration_required" && <p className="resolve-held"><strong>Review rejection control is not activated.</strong> The {control.active_families.join(", ")} family is active, which retired the label-based unblock: this pull request’s review holds have no operator lever until the review family is activated.</p>}
+        {control?.status === "migration_required" && <p className="resolve-held"><strong>Review rejection control is not activated.</strong> Reviews and review re-arms require activation of the review family. Inventory and inspect the activation plan before activating resolve and review control together.</p>}
         {control?.status === "absent" && <p>The review daemon has not recorded a review workflow for this pull request, so it holds no review-rejection gate and there is nothing to re-arm here. A label on GitHub is not such a hold; the daemon records the pull request when its review read first returns it.</p>}
         {control?.status === "available" && <p className={control.workflow_held ? "resolve-held" : ""}>
           <strong>{statusHeading(control)}</strong>

@@ -1,12 +1,14 @@
 """Bounded harness reads a review dispatch depends on; ADR 0012/0015 UNVERIFIABLE loops.
 
-Two reads decide what a review may do and neither may be guessed:
+These reads decide what a review may do; none may be guessed:
 
 - `EXEMPTION_TRAILERS`: the PR's commit trailers declaring gate exemptions
   (ADR 0014). Unreadable is never "no declarations".
 - `REVIEW_HISTORY`: the complete paginated review list the rejection ceiling
   is counted from, and that settling an escalation re-reads. A partial read
   can neither count nor disprove the ceiling.
+- `LINKED_ISSUE`: the linked issue's lifecycle and current workflow holds.
+  A failed known-issue read is never interpreted as an unlinked PR.
 
 An unavailable read is UNVERIFIABLE, so the review (or the settlement)
 defers without a verdict. Unbounded, that is a silent retry loop that pays a
@@ -35,17 +37,21 @@ from .workflow_identity import MAX_DETAIL_CHARS, PullRequestRef, WorkflowBinding
 class ReviewEvidenceKind(str, Enum):
     EXEMPTION_TRAILERS = "exemption-evidence"
     REVIEW_HISTORY = "review-history"
+    LINKED_ISSUE = "linked-issue"
 
 
 _SUBJECT = {
     ReviewEvidenceKind.EXEMPTION_TRAILERS: "gate-exemption declarations",
     ReviewEvidenceKind.REVIEW_HISTORY: "the complete review history",
+    ReviewEvidenceKind.LINKED_ISSUE: "the linked issue and its current holds",
 }
 _REMEDIATION = {
     ReviewEvidenceKind.EXEMPTION_TRAILERS: (
         "a scheduled harness read of the commit trailers must succeed; it never approves or grants an exemption"),
     ReviewEvidenceKind.REVIEW_HISTORY: (
         "a scheduled harness read of every review page must succeed; it never counts, clears or approves"),
+    ReviewEvidenceKind.LINKED_ISSUE: (
+        "a scheduled harness read of the linked issue and its authority must succeed; it never releases that issue"),
 }
 
 

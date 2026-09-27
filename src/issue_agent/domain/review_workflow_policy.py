@@ -436,10 +436,14 @@ def _is_decision(gate: UnresolvedGate) -> bool:
     return isinstance(gate, OpenGate) and isinstance(gate.cause, RearmNeedsDecision)
 
 
-def _ceiling_gate_for(snapshot: ReviewWorkflowSnapshot, cause: ReviewRejectionCeiling) -> OpenGate:
-    opened = _next(snapshot)
-    return OpenGate(review_ceiling_gate_id(snapshot.revision.fence.key, cause, opened), opened.fence.generation,
+def review_ceiling_gate(key: WorkflowKey, cause: ReviewRejectionCeiling, opened: WorkflowRevision) -> OpenGate:
+    """The rejection-ceiling gate opened at `opened`: the harness authorizes no remediation of its own."""
+    return OpenGate(review_ceiling_gate_id(key, cause, opened), opened.fence.generation,
                     cause, NoAuthorizedRemediation("dismissing the counted reviews requires an operator decision"))
+
+
+def _ceiling_gate_for(snapshot: ReviewWorkflowSnapshot, cause: ReviewRejectionCeiling) -> OpenGate:
+    return review_ceiling_gate(snapshot.revision.fence.key, cause, _next(snapshot))
 
 
 def _gate_change(snapshot: ReviewWorkflowSnapshot, gates: tuple[UnresolvedGate, ...],

@@ -272,48 +272,11 @@ def test_clear_retries_on_an_untouched_key_is_a_no_op_not_an_error():
     assert s.get_ci_retries(-112) == 0
 
 
-def test_last_sha_and_round():
+def test_review_round():
     s, _ = _store()
     assert s.get_round(100) == 1  # default
-    s.set_last_sha(100, "abc")
     s.set_round(100, 3)
-    assert s.get_last_sha(100) == "abc"
     assert s.get_round(100) == 3
-
-
-def test_last_patch_id_round_trips():
-    s, _ = _store()
-    s.set_last_patch_id(100, "deadbeef" * 8)
-    assert s.get_last_patch_id(100) == "deadbeef" * 8
-
-
-def test_an_unrecorded_patch_id_reads_as_unknown():
-    # "" is what the reviewer treats as "must review" — a PR reviewed before this
-    # existed must never look like an unchanged patch.
-    s, _ = _store()
-    assert s.get_last_patch_id(100) == ""
-
-
-def test_patch_id_is_per_pr():
-    s, _ = _store()
-    s.set_last_patch_id(100, "aaa")
-    s.set_last_patch_id(101, "bbb")
-    assert (s.get_last_patch_id(100), s.get_last_patch_id(101)) == ("aaa", "bbb")
-
-
-def test_patch_id_survives_the_process_that_wrote_it():
-    # It is compared against a value written by an EARLIER poll, possibly an
-    # earlier daemon process — an in-memory-only cache would silently no-op.
-    _, d = _store()
-    Store(state_dir=d).set_last_patch_id(100, "abc123")
-    assert Store(state_dir=d).get_last_patch_id(100) == "abc123"
-
-
-def test_a_merged_pr_forgets_its_reviewed_patch():
-    s, _ = _store()
-    s.set_last_patch_id(100, "abc123")
-    s.clear_pr_review(100)
-    assert s.get_last_patch_id(100) == ""
 
 
 def test_automerge_marker():
@@ -342,44 +305,6 @@ def test_ci_rerun_head_ignores_an_empty_sha():
     s.set_ci_rerun_head(100, "sha-1")
     s.set_ci_rerun_head(100, "")
     assert s.get_ci_rerun_head(100) == "sha-1"
-
-
-def test_operator_guidance_roundtrip_and_overwrite():
-    s, _ = _store()
-    assert s.get_operator_guidance(100) == ""     # default: unscoped review
-    s.set_operator_guidance(100, "accept the log as evidence")
-    assert s.get_operator_guidance(100) == "accept the log as evidence"
-    s.set_operator_guidance(100, "scope: the parser only")
-    assert s.get_operator_guidance(100) == "scope: the parser only"
-
-
-def test_operator_guidance_is_utf8_regardless_of_the_daemon_locale():
-    # It is the first free-text value in the state dir; a daemon started under a
-    # C/POSIX locale must still write and re-read exactly what was typed.
-    s, _ = _store()
-    note = "accept the log — naïve screenshots are impossible 🚫"
-    s.set_operator_guidance(100, note)
-    assert s.get_operator_guidance(100) == note
-    with open(s.pr_path(100, "operator-guidance"), "rb") as f:
-        assert f.read() == note.encode("utf-8")
-
-
-def test_a_cleared_operator_guidance_leaves_no_file_behind():
-    s, _ = _store()
-    s.set_operator_guidance(100, "accept the log")
-    s.clear_operator_guidance(100)
-    assert s.get_operator_guidance(100) == ""
-    assert not os.path.exists(s.pr_path(100, "operator-guidance"))
-    s.clear_operator_guidance(100)  # idempotent: clearing an absent note is fine
-
-
-def test_cleanup_pr_merged_clears_the_operator_guidance():
-    # A note scoped to a merged PR must not be inherited by whatever occupies
-    # that number next — the reviewer would obey a scope nobody set.
-    s, _ = _store()
-    s.set_operator_guidance(100, "accept the log as evidence")
-    s.cleanup_pr(100, 9, merged=True)
-    assert s.get_operator_guidance(100) == ""
 
 
 def test_ci_pending_escalated_head_marker_roundtrip():
@@ -487,11 +412,9 @@ def test_cleaners_retain_retired_resolve_files_as_import_evidence():
 def test_clear_pr_review():
     s, _ = _store()
     s.save_pr_session(100, "rs")
-    s.set_last_sha(100, "abc")
     s.mark_automerge(100)
     s.clear_pr_review(100)
     assert s.get_pr_session(100) == ""
-    assert s.get_last_sha(100) == ""
     assert s.automerge_enabled(100) is False  # review M4: the real marker, now cleared
 
 
@@ -760,3 +683,21 @@ def test_groom_content_digest_round_trips_and_damps_comment_only_updates():
             WorldState(issues=(issue,)), {9: "before-comment"}, True,
             {9: s.get_groom_content(9)},
         ) == []
+
+
+def test_retired_review_files_survive_cleanup_as_import_evidence():
+    s, _ = _store()
+    evidence = {"last-sha": "a" * 40, "patch-id": "b" * 64,
+                "operator-guidance": "Scope: naïve parser — preserve assertions 🚫"}
+    for suffix, value in evidence.items():
+        with open(s.pr_path(100, suffix), "w", encoding="utf-8") as stream:
+            stream.write(value)
+    s.clear_pr_review(100)
+    s.cleanup_pr(100, 9, merged=True)
+    for suffix, value in evidence.items():
+        with open(s.pr_path(100, suffix), encoding="utf-8") as stream:
+            assert stream.read() == value
+    assert not any(hasattr(s, name) for name in (
+        "get_last_sha", "set_last_sha", "get_last_patch_id", "set_last_patch_id",
+        "get_operator_guidance", "set_operator_guidance", "clear_operator_guidance",
+    ))

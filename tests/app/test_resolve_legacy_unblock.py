@@ -5,9 +5,8 @@ from dataclasses import replace
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.store import Store
 from issue_agent.domain.workflow_identity import WorkflowKey
-from tests.app.test_dashweb_actions import _active_values, _rejection, _unblock_backend
+from tests.app.test_dashweb_actions import _active_values, _unblock_backend
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 
@@ -21,7 +20,7 @@ def test_refusal_preserves_counters_guidance_and_remote_holds(monkeypatch, tmp_p
     backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
     (dirs["fix"] / "issue-7.resolve-retries").write_text("4")
     (dirs["fix"] / "issue-7.last-error").write_text("preserve failure")
-    Store(str(dirs["review"])).set_operator_guidance(12, "preserve scope")
+    (dirs["review"] / "pr-12.operator-guidance").write_text("preserve scope")
     control = SQLiteControlStore(backend.control_db_path)
     if state in {"active_target", "active_family", "missing_epoch"}:
         install_workflow(control, resolve_snapshot(99 if state == "active_family" else 7))
@@ -35,7 +34,7 @@ def test_refusal_preserves_counters_guidance_and_remote_holds(monkeypatch, tmp_p
         Path(control.path).unlink()
     before = _files(dirs)
 
-    ok, detail = backend.unblock("demo", 7, guidance="replace scope")
+    ok, detail = backend.unblock("demo", 7)
 
     assert not ok
     assert "unblock" in detail
@@ -69,16 +68,15 @@ def test_configuration_change_cannot_redirect_unblock_files_or_effects(monkeypat
     from issue_agent.app import cli
 
     backend, dirs, calls = _unblock_backend(
-        monkeypatch, tmp_path, pr_labels=("needs-human-review",),
-        reviews=(_rejection("1", state="DISMISSED"),),
+        monkeypatch, tmp_path, pr_labels=("needs-human-review",), hold_role="fix",
     )
     other_dirs = {role: tmp_path / "replacement" / role for role in dirs}
     for scope in (dirs, other_dirs):
         for directory in scope.values():
             directory.mkdir(parents=True, exist_ok=True)
         (scope["fix"] / "issue-7.resolve-retries").write_text("4")
-        Store(str(scope["review"])).set_last_sha(12, "preserve-head")
-        Store(str(scope["review"])).set_operator_guidance(12, "old scope")
+        (scope["review"] / "pr-12.last-sha").write_text("preserve-head")
+        (scope["review"] / "pr-12.operator-guidance").write_text("old scope")
     untouched = _files(other_dirs)
     factory = backend.effects_factory
     captured_dirs = []
@@ -91,14 +89,14 @@ def test_configuration_change_cannot_redirect_unblock_files_or_effects(monkeypat
         return factory(repo, state_dirs, **kwargs)
     monkeypatch.setattr(backend, "effects_factory", change_configuration)
 
-    assert backend.unblock("demo", 7, guidance="new scope") == (True, "ok")
+    assert backend.unblock("demo", 7) == (True, "ok")
 
     assert _files(other_dirs) == untouched
     assert all(paths == tuple(str(path) for path in dirs.values()) for paths in captured_dirs)
     # Retired resolve files are import evidence, never reset by an unblock.
     assert (dirs["fix"] / "issue-7.resolve-retries").read_text() == "4"
-    assert (dirs["review"] / "pr-12.last-sha").read_text() == ""
-    assert Store(str(dirs["review"])).get_operator_guidance(12) == "new scope"
+    assert (dirs["review"] / "pr-12.last-sha").read_text() == "preserve-head"
+    assert (dirs["review"] / "pr-12.operator-guidance").read_text() == "old scope"
     assert (dirs["fix"] / "events-v2.jsonl").exists()
 
 

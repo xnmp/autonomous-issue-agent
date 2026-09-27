@@ -36,6 +36,7 @@ from issue_agent.domain.world import (
 )
 from issue_agent.domain.labels import Label
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
+from tests.fakes.review_authority import with_review_authority, review_state
 from tests.fakes.accounted_dispatch import with_resolve_authority
 from tests.fakes.accounted_workflow import resolve_state
 from tests.fakes.accounted_workflow import attach_workflow_authority
@@ -294,7 +295,7 @@ def _multi_dispatcher(gw, store, runner):
         review_mode=ReviewMode.MULTI,
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return AgentDispatcher(cfg, gw, store, None, runner, executor)
+    return with_review_authority(AgentDispatcher(cfg, gw, store, None, runner, executor))
 
 
 def _dispatcher(gw, store, runner):
@@ -305,7 +306,7 @@ def _dispatcher(gw, store, runner):
         triage_cfg=TriageConfig("steward-bot", enabled=True),
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return with_resolve_authority(AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor))
+    return with_review_authority(with_resolve_authority(AgentDispatcher(cfg, gw, store, FakeWorktrees(), runner, executor)))
 
 
 def _delegated_dispatcher(gw, store, runner):
@@ -314,7 +315,7 @@ def _delegated_dispatcher(gw, store, runner):
         review_mode=ReviewMode.DELEGATED,
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return AgentDispatcher(cfg, gw, store, None, runner, executor)
+    return with_review_authority(AgentDispatcher(cfg, gw, store, None, runner, executor))
 
 
 def test_delegated_review_routes_to_workflow():
@@ -409,7 +410,7 @@ def test_review_submits_decision_from_structured():
     asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
     assert ("review", 100, "APPROVE", "lgtm") in gw.calls
     assert store.pr_sessions[100] == "rs"
-    assert store.last_sha[100] == "abc"
+    assert review_state(store).head(100) == "abc"
 
 
 # ── multi-agent review (REVIEW_MULTI_AGENT) ───────────────────────────────────
@@ -466,7 +467,7 @@ def _ci_dispatcher(
     cfg = DispatchConfig(
         fix=FixTaskConfig("o/r", agent_md="AM"),
         fix_mcp_config=fix_mcp_config, harness_root="/tmp/none",
-        operator_guidance=operator_guidance,
+        operator_guidance=operator_guidance or (lambda pr: review_state(store).guidance.get(pr, "")),
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
     return AgentDispatcher(
@@ -553,7 +554,7 @@ def _jira_dispatcher(gw, store, runner):
     )
     cfg = DispatchConfig(jira=jira)
     executor = Executor(gw)
-    return AgentDispatcher(cfg, gw, store, None, runner, executor)
+    return with_review_authority(AgentDispatcher(cfg, gw, store, None, runner, executor))
 
 
 def test_jira_dispatch_keeps_command_attribution_separate_from_authority():
@@ -700,9 +701,9 @@ def _capped_dispatcher(gw, store, runner, cap):
         review=ReviewTaskConfig("o/r", review_prompt="r"),
         max_infra_deaths=cap,
     )
-    return AgentDispatcher(
+    return with_review_authority(AgentDispatcher(
         cfg, gw, store, None, runner, Executor(gw, remove_worktree=FakeWorktrees().remove)
-    )
+    ))
 
 
 def test_a_deterministic_death_spends_the_whole_retry_budget_at_once(tmp_path):
@@ -721,10 +722,8 @@ def test_a_deterministic_death_spends_the_whole_retry_budget_at_once(tmp_path):
 
 
 def test_a_deterministic_death_reaches_the_reviewers_existing_ceiling(tmp_path):
-    """The escalation is not a new path: the saturated counter is the same one
-    `decide_review` already reads, so the PR goes to a human through the
-    unproductive-round ceiling on the next poll."""
-    from issue_agent.domain.review import ReviewState, unproductive_ceiling_hit, ReviewConfig
+    """The admission policy holds the PR after a deterministic paid failure."""
+    from issue_agent.domain.review import ReviewConfig, ReviewExcluded, review_eligibility
 
     store = Store(state_dir=str(tmp_path))
     gw = FakeGateway(prs={100: PRView(100, head_ref_name="feat/x")})
@@ -733,9 +732,9 @@ def test_a_deterministic_death_reaches_the_reviewers_existing_ceiling(tmp_path):
     with pytest.raises(RuntimeError):
         asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
 
-    state = ReviewState(unproductive_rounds={100: store.get_infra_deaths(-100)})
     cfg = ReviewConfig(review_bot="rb", max_unproductive_rounds=5)
-    assert unproductive_ceiling_hit(state, cfg, 100) is True
+    decision = review_eligibility(gw.get_pr(100), cfg, store.get_infra_deaths(-100))
+    assert isinstance(decision, ReviewExcluded) and decision.breaker
 
 
 def test_an_ordinary_transport_death_still_costs_exactly_one_life(tmp_path):
@@ -848,7 +847,7 @@ def test_review_death_needs_no_retry_lookup_to_choose_its_pr_key(tmp_path):
     logged: list[str] = []
     gw = FlakyIssueLookup(prs={100: _review_pr()}, issue=5, always=True)
     cfg = DispatchConfig(review=ReviewTaskConfig("o/r"), log=logged.append)
-    d = AgentDispatcher(cfg, gw, store, None, RaisingRunner(), Executor(gw))
+    d = with_review_authority(AgentDispatcher(cfg, gw, store, None, RaisingRunner(), Executor(gw)))
 
     with pytest.raises(RuntimeError):
         asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))

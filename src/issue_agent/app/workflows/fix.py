@@ -1782,12 +1782,12 @@ class FixWorkflow:
     def _pr_guidance(self, pr: int) -> str:
         """The operator's scope note for a PR repair, from its one owner.
 
-        The review role owns it: its committed review episode when the review
-        family is active (a read failure raises `WorkflowAuthorityError`, a
-        hold), else the legacy per-PR record.
+        The review role's committed episode owns it. Missing or unreadable
+        authority defers the repair until migration or recovery.
         """
-        read = self.cfg.operator_guidance or self.store.get_operator_guidance
-        return read(pr)
+        if self.cfg.operator_guidance is None:
+            raise WorkflowAuthorityError("review guidance authority is unavailable")
+        return self.cfg.operator_guidance(pr)
 
     async def _run_pr_logged(self, label, issue, task, p: PRView, *, kind, guidance: str, reply=None):
         current = task_builders.with_pr_repair_context(

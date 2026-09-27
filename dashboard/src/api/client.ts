@@ -196,7 +196,7 @@ const resolveWrites = Object.fromEntries(
 
 const reviewReads = {
   200: z.discriminatedUnion("status", [
-    schemas.ReviewAvailableControl, schemas.ReviewInactiveControl, schemas.ReviewMigrationRequiredControl,
+    schemas.ReviewAvailableControl, schemas.ReviewMigrationRequiredControl,
   ]),
   404: schemas.ReviewAbsentControl,
   503: schemas.ReviewUnavailableControl,

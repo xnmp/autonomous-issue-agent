@@ -1,9 +1,4 @@
-"""Operator review-guidance parsing — one rule set, two enforcement points.
-
-The note an operator attaches to an unblock is validated at the HTTP boundary
-(`contracts.UnblockRequest`) AND again in the service, which is callable
-directly. Both call `parse_guidance`, so the ceiling, the fence-marker ban and
-the encodability rule cannot drift apart between the two.
+"""Shared operator-guidance parsing for typed resolve and review commands.
 
 Pure: no I/O, no imports beyond the stdlib.
 """
@@ -31,7 +26,7 @@ class GuidanceError(ValueError):
 
 
 def parse_guidance(raw: object) -> str | None:
-    """Normalize an operator note into the three states an unblock can carry.
+    """Normalize operator guidance while preserving absent, clear and set.
 
     Returns `None` when the field was absent/null — meaning LEAVE ANY EXISTING
     NOTE ALONE — and a string otherwise: `""` is an explicit CLEAR, anything

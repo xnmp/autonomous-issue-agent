@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
@@ -7,7 +7,7 @@ import { reviewRetryKey } from "./retry-journal";
 import { ReviewControls } from "./ReviewControls";
 import {
   AS_OF, DECIDED_AT, decisionGate, pendingRearm, REVIEW_OUTCOME_STATUS, reviewAbsent, reviewBinding, reviewCeilingGate,
-  reviewControl, reviewControlResponse, reviewDaemon, reviewInactive, reviewJson, reviewMigrationRequired, reviewResult,
+  reviewControl, reviewControlResponse, reviewDaemon, reviewJson, reviewMigrationRequired, reviewResult,
   reviewRetryGate, reviewUnavailable,
 } from "./test-fixtures";
 
@@ -57,13 +57,6 @@ function show(control: ReviewControl) {
 const gateItem = (text: RegExp | string) => screen.getByText(text).closest("li") as HTMLElement;
 
 describe("statuses", () => {
-  it("stays quiet once the family reads inactive", async () => {
-    const { view } = show(reviewInactive);
-    await waitFor(() => expect(fetch).toHaveBeenCalledTimes(1));
-    await act(() => new Promise((resolve) => setTimeout(resolve, 20)));
-    expect(view.container).toBeEmptyDOMElement();
-  });
-
   it("explains an absent workflow instead of hiding the panel the legacy refusal points at", async () => {
     show(reviewAbsent);
     expect(await screen.findByRole("heading", { name: /Review control PR #12/ })).toBeVisible();
@@ -71,10 +64,10 @@ describe("statuses", () => {
     expect(screen.queryByRole("button", { name: /re-arm|Authorize|Continue/ })).not.toBeInTheDocument();
   });
 
-  it("explains that a migration-required pull request has no lever", async () => {
-    show(reviewMigrationRequired);
+  it.each([{ activeFamilies: [] }, { activeFamilies: ["resolve"] }])("requires review activation with existing families $activeFamilies", async ({ activeFamilies }) => {
+    show({ ...reviewMigrationRequired, active_families: activeFamilies });
     expect(await screen.findByText(/Review rejection control is not activated/)).toBeVisible();
-    expect(screen.getByText(/resolve family is active/)).toBeVisible();
+    expect(screen.getByText(/Reviews and review re-arms require activation/)).toBeVisible();
     expect(screen.queryByRole("button", { name: /re-arm/ })).not.toBeInTheDocument();
   });
 

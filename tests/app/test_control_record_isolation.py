@@ -5,11 +5,13 @@ from datetime import datetime, timezone
 from issue_agent.adapters.store import Store
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
-from issue_agent.app.roles import _fix_state, _review_state
+from issue_agent.app.roles import _fix_state, _review_unproductive_rounds
 from issue_agent.domain.actions import RunAgent
 from issue_agent.domain.fix import FixConfig, decide_fix
 from issue_agent.domain.labels import Label
-from issue_agent.domain.review import ReviewConfig, decide_review
+from issue_agent.domain.review import BoundReviewState, ReviewConfig, decide_bound_review
+from tests.fakes.review_authority import review_binding
+from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.world import IssueView, PRView, WorldState
 from issue_agent.domain.workflow import WorkflowAbsent, WorkflowMigrationRequired, WorkflowSnapshot, WorkflowUnavailable
 from issue_agent.domain.workflow_identity import WorkflowWriter
@@ -104,8 +106,11 @@ def test_corrupt_review_counter_holds_only_affected_pr(tmp_path):
         PRView(n, labels=frozenset({Label.AI_PR_OPEN}), head_ref_oid=f"h{n}")
         for n in (1, 2)
     ))
-    state = _review_state(store, world)
-    actions = decide_review(world, ReviewConfig(review_bot="review-bot"), state)
+    errors = {}
+    rounds = _review_unproductive_rounds(store, world, None, errors)
+    state = BoundReviewState(owed={n: (AgentKind.REVIEW, review_binding(n)) for n in (1, 2)},
+                             unproductive_rounds=rounds, control_errors=errors)
+    actions = decide_bound_review(world, ReviewConfig(review_bot="review-bot"), state)
     assert [a.number for a in actions if isinstance(a, RunAgent)] == [2]
     assert "issue--1.infra-deaths" in state.control_errors[1]
 

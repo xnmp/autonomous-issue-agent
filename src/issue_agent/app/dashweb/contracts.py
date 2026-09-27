@@ -4,11 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
-
-# The ceiling and the parse rules have ONE definition (app/dashweb/guidance.py);
-# this module only publishes them as part of the HTTP contract.
-from .guidance import GUIDANCE_MAX_CHARS, GuidanceError, parse_guidance
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class Contract(BaseModel):
@@ -421,26 +417,6 @@ class ActionResult(Contract):
 
 
 class UnblockRequest(BaseModel):
-    """The unblock body. `guidance` is tri-state: absent/null leaves any stored
-    note alone, `""` clears it, text sets it (see `guidance.parse_guidance`).
-
-    `extra="forbid"`, unlike every response contract above: a response gains
-    fields over time and a client must tolerate them, but a REQUEST field the
-    server does not know is an operator whose note went nowhere — `{"note":
-    ...}` must 422, not succeed silently having stored nothing.
-    """
+    """Legacy breaker release accepts no review guidance or re-arm authority."""
 
     model_config = ConfigDict(extra="forbid")
-
-    guidance: str | None = Field(
-        default=None,
-        max_length=GUIDANCE_MAX_CHARS,  # documents the ceiling in OpenAPI
-    )
-
-    @field_validator("guidance")
-    @classmethod
-    def _valid_guidance(cls, value: str | None) -> str | None:
-        try:
-            return parse_guidance(value)
-        except GuidanceError as exc:
-            raise ValueError(str(exc)) from None

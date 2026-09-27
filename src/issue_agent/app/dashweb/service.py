@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import os
-import subprocess
 import threading
 import time
 import uuid
@@ -33,7 +32,6 @@ from ...domain.labels import Label
 
 # (target, number, labels added, labels removed) — one applied park/unpark move.
 _ParkMove = tuple[str, int, tuple[str, ...], tuple[str, ...]]
-from ...domain import review as review_dom
 from ...domain.events import (
     ActionApplied,
     Correlation,
@@ -41,28 +39,14 @@ from ...domain.events import (
     TelemetryEvent,
 )
 from .. import cli, config
-from ..review_identity import review_identity
 from ..resolve_control import load_operator_configuration, open_resolve_operator
 from ..review_control import open_review_operator
 from . import snapshots
-from .guidance import GuidanceError, parse_guidance
 from .ports import GitHubQueries
 
 
 def _utcnow() -> datetime:
     return datetime.now(timezone.utc)
-
-
-def _positive_int(raw: str, default: int) -> int:
-    """A configured ceiling, or the domain default when the knob is absent or
-    malformed. A configured 0 is returned as 0 and means the breaker is OFF —
-    the harness-wide convention every other ceiling uses. Guessing a number
-    there would invent a breaker the daemons do not have."""
-    try:
-        value = int(str(raw).strip())
-    except (TypeError, ValueError):
-        return default
-    return max(value, 0)
 
 
 _DETAIL_CONFIG_FIELDS = (
@@ -175,22 +159,6 @@ def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
 
 def _detail(exc: BaseException) -> str:
     return f"{type(exc).__name__}: {exc}"[:400]
-
-
-def _identity_run(identity):
-    """A subprocess runner that keeps a role identity in the child env."""
-
-    def run(argv, **kwargs):
-        configured = kwargs.pop("env", None)
-        env = dict(os.environ if configured is None else configured)
-        token = identity.env_token()
-        if not token:
-            return subprocess.run(argv, env=env, **kwargs)
-        env["GH_TOKEN"] = token
-        env["GITHUB_TOKEN"] = token
-        return subprocess.run(argv, env=env, **kwargs)
-
-    return run
 
 
 class Backend:
@@ -406,7 +374,7 @@ class Backend:
         row: dash.IssueRow,
         gh_prs: Mapping[int, Mapping],
     ) -> tuple[dict[int, int | None], list[str]]:
-        """Read the same two durable sources as ``roles._review_state``.
+        """Read the same two durable sources as ``roles._review_unproductive_rounds``.
 
         File counters cover failures the process survived. Abandoned dispatches
         in the control database cover deaths it did not. Both key namespaces
@@ -761,12 +729,11 @@ class Backend:
             return unavailable_review_command(exc)
 
     def unblock(
-        self, name: str, number: int, channel: str = "api", guidance: str | None = None,
+        self, name: str, number: int, channel: str = "api",
     ) -> tuple[bool, str]:
         if not self.known(name):
             return False, f"unknown deployment '{name}'"
         try:
-            guidance = parse_guidance(guidance)
             cfg, env = load_operator_configuration(name, harness_root=self.harness_root)
             repo = cfg.repo
             state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
@@ -775,7 +742,7 @@ class Backend:
                 return False, "unblock control authority differs from the configured deployment"
             control = SQLiteControlStore(path)
             with control.legacy_resolve_authority(repo):
-                return self._legacy_unblock(name, number, channel, guidance, control=control, cfg=cfg, env=env)
+                return self._legacy_unblock(name, number, channel, control=control, cfg=cfg, env=env)
         except Exception as exc:  # noqa: BLE001 - failure cannot authorize legacy resets
             return False, f"unblock unavailable ({type(exc).__name__}: {exc})"
 
@@ -784,50 +751,16 @@ class Backend:
         name: str,
         number: int,
         channel: str = "api",
-        guidance: str | None = None,
         *, control: SQLiteControlStore, cfg: config.HarnessConfig,
         env: Mapping[str, str],
     ) -> tuple[bool, str]:
-        """Undo a hold a human is expected to clear: dismiss the reviewer's
-        standing change requests, drop the labels that stop re-dispatch, and
-        hand back the retry budget the wedge consumed. A lifecycle hold is
-        atomically replaced with the role's selectable trigger; an advisory
-        budget label on an otherwise healthy target is only removed.
+        """Release unmigrated holds only while every workflow family is inactive.
 
-        The dismissal is what makes this a RE-ARM rather than a cosmetic clear.
-        The rejection ceiling is computed from GitHub review state, not from a
-        counter, so labels-and-counters alone left it tripped: the next review
-        round was immediately at the ceiling again, and because the escalation
-        is edge-triggered on the label it had just removed, nothing was
-        journalled, relabelled or dispatched (keifu PR #173 / issue #25,
-        2026-08-02 — an invisible dead state with both clocks frozen).
-
-        Refused unless the issue is actually held. Resetting breakers is not a
-        neutral act: on a healthy issue it would silently buy retries nobody
-        asked for, so "nothing to unblock" must cost nothing.
-
-        `guidance` is the optional scope note the operator attaches to the
-        re-arm. Without it the re-armed loop can only repeat the round that
-        wedged it — the reviewer's prompt has no channel a human can speak
-        through (keifu 2026-08-08: a reviewer demanded evidence the environment
-        cannot produce, rode its rejection ceiling, and every unblock bought
-        the same four rounds again). It is stored per held PR in the review
-        role's state dir and injected into that PR's later review prompts.
-        Tri-state: `None` leaves any stored note alone, `""` clears it, text
-        sets it — a note must be retractable by the operator who wrote it, and
-        blank-as-keep would make it permanent until the PR merged.
-
-        This is an API-only lever for now (the dashboard SPA sends no body), so
-        every existing caller keeps working unchanged.
+        Review rejection holds require activated SQLite control. Refusing them
+        before any reset preserves their migration evidence and authorization.
         """
         if not self.known(name):
             return False, f"unknown deployment '{name}'"
-        try:
-            # Defense in depth: the HTTP boundary already parsed this, but the
-            # service is callable directly and a note reaches an agent prompt.
-            guidance = parse_guidance(guidance)
-        except GuidanceError as exc:
-            return False, str(exc)
         repo = cfg.repo
         state_dirs = (cfg.state_dir, cfg.review_state_dir, cfg.steward_state_dir)
         journal_paths = tuple(os.path.join(path, "journal.jsonl") for path in state_dirs)
@@ -852,13 +785,15 @@ class Backend:
             # falls back to ai-pr-open rather than creating an unreadable arm.
             review_trigger = Label.AI_PR_OPEN.value
         pr_changes: dict[int, tuple[tuple[str, ...], tuple[str, ...]]] = {}
-        pr_hold_roles: dict[int, str] = {}
         candidate_pr = 0
         try:
             for pr, labels in pr_held.items():
                 candidate_pr = pr
                 hold_role = self._pr_hold_role(row, pr)
-                pr_hold_roles[pr] = hold_role
+                if Label.NEEDS_HUMAN_REVIEW.value in labels and hold_role != "fix":
+                    reason = ("review_migration_required; activate review control before re-arming review holds"
+                              if hold_role == "review" else "hold source is unknown; cannot authorize a legacy release")
+                    return False, f"pr #{pr}: {reason}"
                 pr_changes[pr] = actions.pr_unblock_change(
                     labels,
                     review_trigger,
@@ -871,38 +806,13 @@ class Backend:
             return False, f"pr #{candidate_pr}: {exc}"
         # Counters first: a cleared counter with the labels still on holds the
         # issue exactly as before, while the reverse order would re-admit it
-        # against a breaker that is still tripped. The guidance lands in the
-        # same window and for the same reason: a PR re-armed before its scope
-        # note is durable would run one more unscoped round.
-        review_dir = next((path for role, path in zip(dash.ROLE_NAMES, state_dirs) if role == "review"), "")
-        effects = self._operator_effects(name, repo, journalled=False, control=control, state_dirs=state_dirs, env=env)
-        review_effects = self._operator_effects(name, repo, journalled=False, credential_role="review", control=control, state_dirs=state_dirs, env=env)
+        # against a breaker that is still tripped.
+        effects = self._operator_effects(name, repo, journalled=False, control=control, state_dirs=state_dirs)
         journal = self._operator_journal(name, repo, legacy_path=journal_paths[0])
         cleared = self._clear_retry_counters(state_dirs, number, prs)
-        guidance_action, guided_prs, guidance_failures = (
-            self._apply_operator_guidance(review_dir, tuple(pr_held), guidance)
-        )
         # Unjournalled effects: this flow writes its own single event below,
         # because the counter reset happened whatever GitHub then did with the
         # labels — including the no-op path, which emits nothing of its own.
-        # Before the labels, and never allowed to wedge them: the counters and
-        # labels are still worth clearing when a dismissal cannot happen. But a
-        # re-arm that failed must NOT read as a clean unblock — the whole
-        # incident was a green result over a dead PR — so its notes ride back
-        # in the operator-facing detail as well as the journal.
-        rearm_failures = self._rearm_rejections(
-            name,
-            repo,
-            number,
-            review_effects,
-            prs=prs, review_dir=review_dir, journal=journal, env=env,
-            reviewer_held_prs=frozenset(
-                pr
-                for pr, labels in pr_held.items()
-                if Label.NEEDS_HUMAN_REVIEW.value in labels
-                and pr_hold_roles.get(pr) == "review"
-            ),
-        )
         issue_applied, issue_detail = True, "ok"
         issue_actual_add: tuple[str, ...] = ()
         issue_actual_remove: tuple[str, ...] = ()
@@ -955,19 +865,8 @@ class Backend:
             pr_requested_added=pr_requested_added,
             pr_applied=pr_applied,
             channel=channel,
-            guidance_action=guidance_action,
-            guided_prs=guided_prs,
             journal=journal,
         )
-        # A guidance write that failed leaves the re-arm itself intact, so it
-        # reads like a failed dismissal: the action still happened, and the
-        # operator is told exactly what did not, rather than being handed a
-        # green "ok" over a review that will run unscoped.
-        notes = [*rearm_failures, *guidance_failures]
-        if applied and notes:
-            return True, "ok — but " + "; ".join(notes)
-        if notes:
-            return applied, "; ".join([detail, *notes])
         return applied, detail
 
     def park(
@@ -1167,292 +1066,6 @@ class Backend:
         except Exception:  # noqa: BLE001 - telemetry never fails the action
             pass
 
-    def _rearm_rejections(
-        self,
-        name: str,
-        repo: str,
-        number: int,
-        effects,
-        *,
-        prs: tuple[int, ...], review_dir: str, journal: TypedJournal | None,
-        env: Mapping[str, str],
-        reviewer_held_prs: frozenset[int] = frozenset(),
-    ) -> list[str]:
-        """Dismiss the review bot's standing change requests on this issue's
-        open PRs, but ONLY where the rejection ceiling is what is holding them.
-
-        Bounded four ways: only this issue's projected PRs, only PRs whose next
-        rejection could no longer bounce back to the fixer, only the reviews
-        `stale_rejections` says count toward that ceiling, and never more of
-        them than the ceiling itself. Every outcome — including "the review bot
-        is not configured" and "GitHub would not say" — is journalled and
-        returned; none of them may fail the unblock, because the labels and
-        counters are still worth clearing when the dismissal cannot happen.
-
-        The below-ceiling exclusion is not caution, it is correctness: a live
-        change request is the fixer's next instruction (`domain.fix` dispatches
-        ADDRESS_REVIEW off exactly that state, and reads a DISMISSED review as
-        nothing to do). Retracting one because an unrelated breaker — a rebase
-        or CI ceiling — held the same issue would destroy the feedback and
-        strand the PR in a NEW dead state of the same family as #173.
-
-        Returns one note per outcome the operator must know about — an
-        empty list means the ceiling is not what is holding anything here, or
-        it was fully re-armed.
-        """
-        review_bot = env.get("REVIEW_BOT", "")
-        ceiling = _positive_int(
-            env.get("REVIEW_MAX_REJECTIONS", ""),
-            review_dom.DEFAULT_MAX_REVIEW_REJECTIONS,
-        )
-        # A disabled ceiling (REVIEW_MAX_REJECTIONS=0, the harness-wide
-        # "breaker off" convention) can never be what holds a PR, so there is
-        # never anything here to re-arm.
-        if not prs or ceiling <= 0:
-            return []
-        message = (
-            f"Dismissed by an operator re-arm of issue #{number} from the "
-            "harness dashboard: the rejection ceiling is recomputed from "
-            "GitHub review state, so this review had to be retracted for the "
-            "review loop to resume."
-        )
-        failures: list[str] = []
-        closed = self._closed_prs(repo)
-        for pr in prs:
-            # A merged or closed PR has no live review loop to re-arm, and
-            # GitHub refuses the dismissal anyway. A PR whose state could not be
-            # read is NOT assumed closed — the dismissal attempt reports the
-            # real error instead of silently skipping.
-            if pr <= 0 or pr in closed:
-                continue
-            try:
-                reviews = effects.pr_reviews(pr)
-            except Exception as exc:  # noqa: BLE001 - operator-facing result
-                note = f"pr #{pr} reviews unreadable: {_detail(exc)}"
-                failures.append(note)
-                self._journal_rearm_failure(repo, number, pr, note, journal=journal)
-                continue
-            # A PR carrying no change request at all has no ceiling to re-arm:
-            # say nothing rather than journal a "could not dismiss" line on
-            # every unblock of a perfectly healthy issue. But if the review bot
-            # HAS reviewed and every one of its verdicts is retracted — the
-            # state a previous unblock's dismissals leave behind — the re-arm
-            # must also reset the review baseline: the copy shortcut may have
-            # bound `last-sha` to the current head, so with no live verdict and
-            # no head movement neither daemon has any signal left and the PR is
-            # stranded in a labeled-open dead state (tauri #634, 2026-08-09).
-            bot_live = [
-                r
-                for r in reviews
-                if review_bot
-                and r.author == review_bot
-                and r.state
-                in (
-                    review_dom.REVIEW_CHANGES_REQUESTED,
-                    review_dom.REVIEW_APPROVED,
-                )
-            ]
-            bot_reviewed = review_bot and any(
-                r.author == review_bot for r in reviews
-            )
-            if not any(
-                r.state == review_dom.REVIEW_CHANGES_REQUESTED for r in reviews
-            ):
-                if bot_reviewed and not bot_live:
-                    failures.extend(
-                        self._reset_review_baseline(review_dir, repo, number, pr, journal=journal)
-                    )
-                continue
-            if not review_bot:
-                note = (
-                    f"pr #{pr}: no REVIEW_BOT configured — standing change "
-                    "requests were left in place, so the rejection ceiling is "
-                    "still armed"
-                )
-                failures.append(note)
-                self._journal_rearm_failure(repo, number, pr, note, journal=journal)
-                continue
-            counted = review_dom.stale_rejections(
-                reviews,
-                review_bot,
-                limit=ceiling,
-                trailing_approvals_reset=pr not in reviewer_held_prs,
-            )
-            # The same arithmetic `review_submission` applies: this many
-            # rejections stand, so the NEXT one escalates instead of bouncing
-            # back to the fixer. Below that the loop still has a round to give
-            # and the feedback must survive.
-            if len(counted) + 1 < ceiling:
-                continue
-            dismissed_ids: set[str] = set()
-            for review in counted:
-                ok, detail = effects.dismiss_review(pr, review, message)
-                if ok:
-                    dismissed_ids.add(review.review_id)
-                else:
-                    failures.append(
-                        f"pr #{pr} review {review.review_id} not dismissed: "
-                        f"{detail}"
-                    )
-                self._journal_dismissal(
-                    repo, number, pr, review, ok, detail, journal=journal,
-                )
-            # If the dismissals just retracted the bot's LAST live verdict, the
-            # fixer has nothing to address and the reviewer thinks this head is
-            # already reviewed — reset the baseline so a fresh round dispatches
-            # (same dead state as above, reached in one unblock instead of two).
-            if dismissed_ids and not any(
-                r.review_id not in dismissed_ids for r in bot_live
-            ):
-                failures.extend(
-                    self._reset_review_baseline(review_dir, repo, number, pr, journal=journal)
-                )
-        return failures
-
-    def _reset_review_baseline(
-        self, state_dir: str, repo: str, number: int, pr: int, *, journal: TypedJournal | None,
-    ) -> list[str]:
-        """Clear the review role's `last-sha` for `pr` so `needs_re_review`
-        reads the current head as unreviewed and dispatches a fresh round.
-
-        Part of the unblock re-arm contract: dismissing the standing verdict
-        removes the fixer's signal, so the re-arm must hand the move back to
-        the reviewer. Without this, a verdict already bound to the current head
-        (e.g. by the re-review copy shortcut) left `last-sha == head` after the
-        dismissal and NOTHING could ever fire again — tauri #634 (2026-08-09)
-        sat labeled-open with operator guidance parked until hand surgery.
-
-        Returns operator-facing notes on failure; an empty list means the
-        baseline is cleared (or there was no state dir to clear it in, which is
-        itself a failure worth surfacing)."""
-        if not state_dir:
-            note = (
-                f"pr #{pr}: review state dir unresolvable — baseline not "
-                "reset, a fresh review round may not dispatch"
-            )
-            self._journal_rearm_failure(repo, number, pr, note, journal=journal)
-            return [note]
-        try:
-            Store(state_dir).set_last_sha(pr, "")
-        except Exception as exc:  # noqa: BLE001 - reported, never raised
-            note = (
-                f"pr #{pr}: review baseline not reset "
-                f"({type(exc).__name__}: {exc}) — a fresh review round may "
-                "not dispatch"
-            )
-            self._journal_rearm_failure(repo, number, pr, note, journal=journal)
-            return [note]
-        if journal is not None:
-            try:
-                journal.emit(
-                    TelemetryEvent(
-                        ActionApplied(
-                            f"operator-rearm-baseline:{uuid.uuid4().hex}",
-                            "operator_rearm_baseline",
-                            "pr",
-                            f"operator re-arm pr #{pr}: review baseline "
-                            "reset — no live reviewer verdict remains, next "
-                            "poll dispatches a fresh review round",
-                            pr,
-                            {
-                                "add": [],
-                                "remove": [],
-                                "operator": f"{repo}:dashboard",
-                            },
-                        ),
-                        Correlation(issue=number, pr=pr),
-                    )
-                )
-            except Exception:  # noqa: BLE001 - telemetry never fails the action
-                pass
-        return []
-
-    def _closed_prs(self, repo: str) -> frozenset[int]:
-        """PRs GitHub says are NOT open. An absent or unreadable state is
-        omitted deliberately: "closed" here suppresses a dismissal, and
-        suppressing one on a guess is how a re-arm silently does nothing."""
-        try:
-            payload, _error = self.gh.prs(repo)
-        except Exception:  # noqa: BLE001 - unknown state is not "closed"
-            return frozenset()
-        return frozenset(
-            number
-            for number, pr in ghdata.index_by_number(payload).items()
-            if str(pr.get("state") or "").strip() and not ghdata.is_open(pr)
-        )
-
-    def _journal_dismissal(
-        self,
-        repo: str,
-        number: int,
-        pr: int,
-        review,
-        ok: bool,
-        detail: str,
-        *, journal: TypedJournal | None,
-    ) -> None:
-        if journal is None:
-            return
-        try:
-            journal.emit(
-                TelemetryEvent(
-                    ActionApplied(
-                        f"operator-dismiss-review:{uuid.uuid4().hex}",
-                        "operator_dismiss_review",
-                        "pr",
-                        f"operator re-arm pr #{pr}: "
-                        + (
-                            f"dismissed review {review.review_id}"
-                            if ok
-                            else f"review {review.review_id} NOT dismissed "
-                            f"({detail})"
-                        ),
-                        pr,
-                        {
-                            "add": [],
-                            "remove": [],
-                            "operator": f"{repo}:dashboard",
-                            "review_id": review.review_id,
-                            "review_state": review.state,
-                            "dismissed": ok,
-                            "detail": detail,
-                        },
-                    ),
-                    Correlation(issue=number, pr=pr),
-                )
-            )
-        except Exception:  # noqa: BLE001 - telemetry never fails the action
-            pass
-
-    def _journal_rearm_failure(
-        self, repo: str, number: int, pr: int, detail: str, *, journal: TypedJournal | None,
-    ) -> None:
-        if journal is None:
-            return
-        try:
-            journal.emit(
-                TelemetryEvent(
-                    ActionApplied(
-                        f"operator-dismiss-review:{uuid.uuid4().hex}",
-                        "operator_dismiss_review",
-                        "pr" if pr else "issue",
-                        f"operator re-arm of #{number} could not dismiss "
-                        f"change requests: {detail}",
-                        pr or number,
-                        {
-                            "add": [],
-                            "remove": [],
-                            "operator": f"{repo}:dashboard",
-                            "dismissed": False,
-                            "detail": detail,
-                        },
-                    ),
-                    Correlation(issue=number, pr=pr or None),
-                )
-            )
-        except Exception:  # noqa: BLE001 - telemetry never fails the action
-            pass
-
     def _attention_labels(
         self, repo: str, number: int, prs: tuple[int, ...],
     ) -> tuple[
@@ -1581,8 +1194,6 @@ class Backend:
         pr_requested_added: dict[int, tuple[str, ...]] | None = None,
         pr_applied: dict[int, bool] | None = None,
         channel: str = "api",
-        guidance_action: str = "",
-        guided_prs: tuple[int, ...] = (),
         *, journal: TypedJournal | None,
     ) -> None:
         if journal is None:
@@ -1620,10 +1231,6 @@ class Backend:
                             "channel": channel,
                             "retries_cleared": cleared,
                             "labels_applied": issue_applied,
-                            # "set"/"cleared", absent when the re-arm left the
-                            # stored note alone — so a repeated unblock is
-                            # tellable from a rescoped one in history.
-                            **({"guidance": guidance_action} if guided_prs else {}),
                         },
                     ),
                     Correlation(issue=number),
@@ -1659,11 +1266,6 @@ class Backend:
                                 "operator": f"{repo}:dashboard",
                                 "channel": channel,
                                 "labels_applied": target_applied,
-                                **(
-                                    {"guidance": guidance_action}
-                                    if pr in guided_prs
-                                    else {}
-                                ),
                             },
                         ),
                         Correlation(issue=number, pr=pr),
@@ -1671,51 +1273,6 @@ class Backend:
                 )
         except Exception:  # noqa: BLE001 - telemetry never fails the action
             pass
-
-    def _apply_operator_guidance(
-        self, state_dir: str, prs: tuple[int, ...], guidance: str | None
-    ) -> tuple[str, tuple[int, ...], list[str]]:
-        """Set or clear the operator's scope note for each held PR, in the
-        review role's state dir (review and repairs share this authority).
-
-        `guidance` is already normalized: None = no change, "" = clear, text =
-        set (overwriting — the operator's latest word on a PR is the one the
-        next round obeys).
-
-        Returns (action, PRs touched, failures) where action is "set",
-        "cleared" or "" — what HAPPENED, not what was asked for: an issue-only
-        hold has no PR to carry a note, and the state dir may be unresolvable.
-
-        A write can fail (full disk, permissions). It must not raise: the retry
-        counters are already reset by the time this runs, so an escaping
-        exception would leave a half-applied unblock reported to the operator as
-        a generic refusal. Failures ride back in the detail like the re-arm's
-        dismissal failures do.
-        """
-        if guidance is None or not prs:
-            return "", (), []
-        if not state_dir:
-            return "", (), ["review state dir unresolvable: guidance not stored"]
-        store = Store(state_dir)
-        action = "set" if guidance else "cleared"
-        touched: list[int] = []
-        failures: list[str] = []
-        for pr in prs:
-            try:
-                if guidance:
-                    store.set_operator_guidance(pr, guidance)
-                else:
-                    store.clear_operator_guidance(pr)
-            except Exception as exc:  # noqa: BLE001 - reported, never raised
-                failures.append(
-                    f"pr #{pr}: guidance not {action} "
-                    f"({type(exc).__name__}: {exc})"
-                )
-            else:
-                touched.append(pr)
-        if not touched:
-            return "", (), failures
-        return action, tuple(touched), failures
 
     def _clear_retry_counters(self, state_dirs: tuple[str, ...], number: int, prs: tuple[int, ...]) -> int:
         """Reset the per-attempt ceilings in every role's state dir.
@@ -1762,10 +1319,8 @@ class Backend:
         repo: str,
         *,
         journalled: bool = True,
-        credential_role: str = "",
         control: SQLiteControlStore | None = None,
         state_dirs: tuple[str, ...] | None = None,
-        env: Mapping[str, str] | None = None,
     ):
         # Derived from journal_paths like _clear_retries, NOT read raw from the
         # overlay: the STATE_DIR keys are optional and standard deployments
@@ -1777,41 +1332,6 @@ class Backend:
             state_dirs = tuple(os.path.dirname(path) for path in cli.journal_paths(name))
         journal = self._operator_journal(name, repo) if journalled else None
         established = {"control": control} if control is not None else {}
-        if credential_role == "review":
-            identity_env = {
-                field: cli.deployment_env_field(name, field) if env is None else env.get(field, "")
-                for field in (
-                    "GH_APP_ID",
-                    "GH_APP_INSTALL_ID",
-                    "GH_APP_KEY_FILE",
-                    "GH_APP_TOKEN_CACHE",
-                    "REVIEW_BOT_TOKEN",
-                )
-            }
-            identity = review_identity(identity_env)
-            source = (
-                "github_app"
-                if identity.token_provider is not None
-                else "review_bot_token"
-                if identity.static_token
-                else "ambient"
-            )
-            if identity.token_provider is not None or identity.static_token:
-                return self.effects_factory(
-                    repo,
-                    state_dirs,
-                    identity=f"{repo}:dashboard:review:{source}",
-                    journal=journal,
-                    run=_identity_run(identity),
-                    **established,
-                )
-            return self.effects_factory(
-                repo,
-                state_dirs,
-                identity=f"{repo}:dashboard:review:ambient",
-                journal=journal,
-                **established,
-            )
         return self.effects_factory(
             repo,
             state_dirs,

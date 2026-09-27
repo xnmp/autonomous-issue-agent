@@ -28,7 +28,7 @@ from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
 from issue_agent.domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, RunId
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_rearm import (
-    AbsentReviewControl, InactiveReviewControl, PendingReviewRecovery, ReleaseStatus, ReviewControlView,
+    AbsentReviewControl, MigrationRequiredReviewControl, PendingReviewRecovery, ReleaseStatus, ReviewControlView,
 )
 from issue_agent.domain.review_workflow import (
     PullRequestUnavailable, CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, PullRequestState,
@@ -170,7 +170,7 @@ class Rig:
 
     def request(self, request_id="request:1", *, actor=ACTOR, guidance=None, control=None):
         state = self.workflow()
-        command = RequestRearm(request_id, state.revision, self.ceiling_gate(state).gate_id, guidance or KeepGuidance())
+        command = RequestRearm(request_id, state.revision, self.ceiling_gate(state).gate_id, guidance or KeepGuidance(), expected_binding=state.binding)
         return command, (control or self.control()).request_rearm(command, actor)
 
     def pending(self, request_id="request:1"):
@@ -223,7 +223,7 @@ def test_an_inactive_family_reads_as_migration_required_and_is_never_initialized
     control = rig.control()
     read = control.load_workflow(PR_KEY)
     assert read == WorkflowMigrationRequired(PR_KEY, WorkflowFamily.REVIEW_REJECTIONS)
-    assert isinstance(control.review_control_view(PR_KEY), InactiveReviewControl)
+    assert control.review_control_view(PR_KEY) == MigrationRequiredReviewControl(PR_KEY, ())
     with pytest.raises(WorkflowAuthorityError, match="migration"):
         control.ensure_observed_workflow(PR_KEY)
     assert rig.query("SELECT COUNT(*) FROM workflows")[0][0] == 0
@@ -398,7 +398,7 @@ def forged_request(rig, *, evidence_id=None, observed_at=None):
     observation, recorded_id = fresh_observation(rig)
     if observed_at is not None:
         observation = replace(observation, observed_at=observed_at)
-    command = RequestRearm("request:forged", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance())
+    command = RequestRearm("request:forged", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance(), expected_binding=state.binding)
     return request_review_rearm(state, command, ACTOR, observation, now=rig.clock[0], active_reviews=(),
                                 evidence_id=evidence_id or recorded_id, trigger_label=TRIGGER,
                                 executor_identity=REVIEWER)
@@ -464,11 +464,12 @@ def test_commit_workflow_refuses_every_barrier_ordered_mutation(rig):
     with pytest.raises(WorkflowAuthorityError, match="barrier-ordered"):
         commit(rig, release)
     assert rig.workflow() == state
+    pending = rig.request()[1].snapshot
     stopped = rig.control().cancel_rearm(
-        CancelRearm("cancel:1", rig.request()[1].snapshot.revision, "request:1", "x"), ACTOR).snapshot
+        CancelRearm("cancel:1", pending.revision, "request:1", "x", expected_binding=pending.binding), ACTOR).snapshot
     observation, evidence_id = fresh_observation(rig)
     from issue_agent.domain.review_workflow_policy import continue_review_rearm
-    carried = continue_review_rearm(stopped, ContinueGrantedRearm("request:2", stopped.revision, "request:1"), ACTOR,
+    carried = continue_review_rearm(stopped, ContinueGrantedRearm("request:2", stopped.revision, "request:1", expected_binding=stopped.binding), ACTOR,
                                     observation, now=rig.clock[0], active_reviews=(), evidence_id=evidence_id,
                                     trigger_label=TRIGGER, executor_identity=REVIEWER)
     assert carried.mutation is WorkflowMutation.CONTINUE_REARM
@@ -529,10 +530,10 @@ def test_request_replay_is_idempotent_without_a_read_and_reuse_conflicts(rig):
 def test_an_older_request_id_is_refused_after_a_newer_decision(rig):
     state = rig.pending()
     original = rig.control().accepted_rearm(PR_KEY, "request:1").command
-    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", state.revision, "request:1", "scope"), ACTOR)
+    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", state.revision, "request:1", "scope", expected_binding=state.binding), ACTOR)
     assert isinstance(cancelled.snapshot.intent, CancelledReviewRearm)
     continued = rig.control().continue_rearm(
-        ContinueGrantedRearm("request:2", cancelled.snapshot.revision, "request:1"), ACTOR)
+        ContinueGrantedRearm("request:2", cancelled.snapshot.revision, "request:1", expected_binding=cancelled.snapshot.binding), ACTOR)
     assert isinstance(continued, WorkflowCommitted) and continued.snapshot.intent.request_id == "request:2", continued
     older = rig.restart().request_rearm(original, ACTOR)
     assert isinstance(older, WorkflowRejected) and older.code is WorkflowRejection.INVALID_SCOPE
@@ -544,7 +545,7 @@ def test_a_stale_revision_conflicts_before_any_read(rig):
     rig.gated()
     state = rig.workflow()
     stale = RequestRearm("request:1", replace(state.revision, version=state.revision.version - 1),
-                         rig.ceiling_gate(state).gate_id, KeepGuidance())
+                         rig.ceiling_gate(state).gate_id, KeepGuidance(), expected_binding=state.binding)
     rig.points.add("read")  # a read would be unavailable; a conflict proves none happened
     assert isinstance(rig.control().request_rearm(stale, ACTOR), WorkflowConflict)
 
@@ -673,7 +674,7 @@ def later_review(rig, review_id, commit=HEAD):
 def test_cancel_takes_the_barriers_and_is_idempotent_with_reuse_conflicting(rig):
     state = rig.pending()
     calls = rig.remote.calls
-    command = CancelRearm("cancel:1", state.revision, "request:1", "scope changed")
+    command = CancelRearm("cancel:1", state.revision, "request:1", "scope changed", expected_binding=state.binding)
     first = rig.control().cancel_rearm(command, ACTOR)
     intent = first.snapshot.intent
     assert isinstance(intent, CancelledReviewRearm) and intent.retired_obligations == state.intent.required_commands
@@ -820,7 +821,7 @@ def test_cancellation_closes_prewrite_gates_in_the_same_transaction(rig):
     dismissal = rig.commands(CommandKind.DISMISS_REVIEW)[0]
     gate_prewrite(rig, dismissal)
     current = rig.workflow()
-    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", current.revision, "request:1", "stuck"), ACTOR)
+    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", current.revision, "request:1", "stuck", expected_binding=current.binding), ACTOR)
     assert all(not str(getattr(g, "gate_id", "")).startswith("prewrite-evidence:") for g in cancelled.snapshot.gates)
     assert rig.store.prewrite_read(dismissal) is None
     assert rig.query("SELECT state FROM workflow_gates WHERE gate_id=?", prewrite_evidence_gate_id(dismissal))[0][0] == "closed"
@@ -832,9 +833,9 @@ def test_a_permanently_partial_read_never_holds_a_later_rearm(rig):
     dismissal = rig.commands(CommandKind.DISMISS_REVIEW)[0]
     gate_prewrite(rig, dismissal)
     current = rig.workflow()
-    stopped = rig.control().cancel_rearm(CancelRearm("cancel:1", current.revision, "request:1", "stuck"), ACTOR)
+    stopped = rig.control().cancel_rearm(CancelRearm("cancel:1", current.revision, "request:1", "stuck", expected_binding=current.binding), ACTOR)
     continued = rig.control().continue_rearm(
-        ContinueGrantedRearm("request:2", stopped.snapshot.revision, "request:1"), ACTOR)
+        ContinueGrantedRearm("request:2", stopped.snapshot.revision, "request:1", expected_binding=stopped.snapshot.binding), ACTOR)
     assert isinstance(continued, WorkflowCommitted), continued
     assert all(not str(getattr(g, "gate_id", "")).startswith("prewrite-evidence:") for g in continued.snapshot.gates)
     rig.drain()
@@ -999,7 +1000,7 @@ def test_a_grant_for_a_verdict_superseded_by_a_landed_one_never_posts_a_second(r
     gate = expire_proven_absent(rig, first)
     current = rig.workflow()
     accepted = rig.control().authorize_retry(
-        AuthorizeAbsentRetry("grant:1", current.revision, first, gate.gate_id, gate.cause.absence_evidence_id), ACTOR)
+        AuthorizeAbsentRetry("grant:1", current.revision, first, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=current.binding), ACTOR)
     assert isinstance(accepted, WorkflowCommitted)
     for _ in range(3):
         rig.advance(1800)
@@ -1035,7 +1036,7 @@ def test_a_granted_verdict_at_a_new_head_is_still_owed_after_an_earlier_head_was
     gate = expire_proven_absent(rig, lost)
     current = rig.workflow()
     assert isinstance(rig.control().authorize_retry(
-        AuthorizeAbsentRetry("grant:1", current.revision, lost, gate.gate_id, gate.cause.absence_evidence_id), ACTOR),
+        AuthorizeAbsentRetry("grant:1", current.revision, lost, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=current.binding), ACTOR),
         WorkflowCommitted)
     rig.drain()
     assert rig.state(lost) == "succeeded"
@@ -1095,7 +1096,7 @@ def test_a_review_obligation_grant_is_offered_accepted_once_and_buys_one_write(r
     state = rig.workflow()
     view = rig.control().review_control_view(PR_KEY)
     assert view.retry_authorizable == frozenset({gate.gate_id})  # offered exactly when acceptance would admit it
-    command = AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id)
+    command = AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=state.binding)
     accepted = rig.control().authorize_retry(command, ACTOR)
     assert isinstance(accepted, WorkflowCommitted) and not accepted.idempotent
     assert accepted.snapshot.revision.version == state.revision.version + 1
@@ -1117,22 +1118,169 @@ def test_a_forged_or_mismatched_grant_is_refused_before_any_command_is_consulted
     dismissal = rig.commands(CommandKind.DISMISS_REVIEW)[0]
     gate = expire_absent(rig, dismissal)
     state = rig.workflow()
-    forged = AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, "absence:invented")
+    forged = AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, "absence:invented", expected_binding=state.binding)
     refused = rig.control().authorize_retry(forged, ACTOR)
     assert isinstance(refused, WorkflowRejected) and refused.code is WorkflowRejection.INVALID_SCOPE
     stale = AuthorizeAbsentRetry("grant:2", replace(state.revision, version=state.revision.version - 1), dismissal,
-                                 gate.gate_id, gate.cause.absence_evidence_id)
+                                 gate.gate_id, gate.cause.absence_evidence_id, expected_binding=state.binding)
     assert isinstance(rig.control().authorize_retry(stale, ACTOR), WorkflowConflict)
     assert rig.query("SELECT COUNT(*) FROM workflow_retry_authorizations")[0][0] == 0
     proposal_state = rig.workflow()
     from issue_agent.domain.workflow_retry import authorize_absent_retry
     with rig.store.transaction() as db:
         facts = rig.control()._retry_facts(db, AuthorizeAbsentRetry(
-            "grant:3", proposal_state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id))
+            "grant:3", proposal_state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=proposal_state.binding))
     direct = authorize_absent_retry(proposal_state, AuthorizeAbsentRetry(
-        "grant:3", proposal_state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id), ACTOR, facts)
+        "grant:3", proposal_state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=proposal_state.binding), ACTOR, facts)
     with pytest.raises(WorkflowAuthorityError, match="barrier-ordered"):
         commit(rig, direct)
+
+
+def operator_command(rig, operation):
+    if operation == "request_rearm":
+        state = rig.gated()
+        return RequestRearm("request:1", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance(),
+                            expected_binding=state.binding)
+    state = rig.pending()
+    if operation == "cancel_rearm":
+        return CancelRearm("cancel:1", state.revision, "request:1", "scope changed", expected_binding=state.binding)
+    if operation == "continue_rearm":
+        cancelled = rig.control().cancel_rearm(CancelRearm(
+            "cancel:1", state.revision, "request:1", "scope changed", expected_binding=state.binding), ACTOR)
+        state = cancelled.snapshot
+        return ContinueGrantedRearm("request:2", state.revision, "request:1", expected_binding=state.binding)
+    dismissal = rig.commands(CommandKind.DISMISS_REVIEW)[0]
+    gate = expire_absent(rig, dismissal)
+    state = rig.workflow()
+    return AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id,
+                                expected_binding=state.binding)
+
+
+@pytest.mark.parametrize("operation", ["request_rearm", "continue_rearm", "cancel_rearm", "authorize_retry"])
+@pytest.mark.parametrize("binding_error", ["missing", "epoch", "episode"])
+def test_review_operator_acceptance_requires_current_epoch_and_episode_before_reading(rig, operation, binding_error):
+    command = operator_command(rig, operation)
+    state = rig.workflow()
+    bindings = {
+        "missing": None,
+        "epoch": replace(command.expected_binding, authority=replace(state.authority, epoch=2)),
+        "episode": replace(command.expected_binding, episode_id="episode:another"),
+    }
+    command = replace(command, expected_binding=bindings[binding_error])
+    reads = []
+
+    class Counting:
+        def get_pr(self, number, **kwargs):
+            reads.append(number)
+            return rig.remote.get_pr(number, **kwargs)
+
+        def pull_request_reviews(self, pr):
+            reads.append(pr)
+            return rig.remote.pull_request_reviews(pr)
+
+    result = getattr(rig.control(gateway=Counting()), operation)(command, ACTOR)
+    assert isinstance(result, WorkflowConflict), result
+    assert reads == []
+    assert rig.workflow() == state
+
+
+@pytest.mark.parametrize("operation", ["request_rearm", "continue_rearm", "cancel_rearm", "authorize_retry"])
+def test_review_operator_replay_is_bound_to_the_original_activation(rig, operation):
+    from issue_agent.adapters.workflow_rows import persist_workflow_snapshot
+
+    command = operator_command(rig, operation)
+    result = getattr(rig.control(), operation)(command, ACTOR)
+    assert isinstance(result, WorkflowCommitted), result
+    replay = getattr(rig.restart(), operation)(command, ACTOR)
+    assert isinstance(replay, WorkflowCommitted) and replay.idempotent
+    # A restored/repointed fixture has the same revision and audit under a
+    # different activation. Old operator requests cannot cross that boundary.
+    state = rig.workflow()
+    restored = replace(state, authority=replace(state.authority, epoch=2))
+    with rig.store.transaction() as db:
+        db.execute("UPDATE workflow_authority_epochs SET epoch=2 WHERE repository='o/r' AND family=?",
+                   (WorkflowFamily.REVIEW_REJECTIONS.value,))
+        persist_workflow_snapshot(db, restored)
+    stale = getattr(rig.restart(), operation)(command, ACTOR)
+    assert isinstance(stale, WorkflowConflict), stale
+    assert rig.workflow() == restored
+
+
+@pytest.mark.parametrize("binding_error", ["missing", "epoch", "episode"])
+def test_a_direct_cancellation_commit_cannot_bypass_operator_binding(rig, binding_error):
+    from issue_agent.domain.review_workflow_policy import cancel_review_rearm
+
+    command = operator_command(rig, "cancel_rearm")
+    state = rig.workflow()
+    bindings = {
+        "missing": None,
+        "epoch": replace(state.binding, authority=replace(state.authority, epoch=2)),
+        "episode": replace(state.binding, episode_id="episode:another"),
+    }
+    command = replace(command, expected_binding=bindings[binding_error])
+    proposal = cancel_review_rearm(state, command, ACTOR, verified_commands=(), uncertainty=())
+    result = commit(rig, proposal)
+    assert isinstance(result, WorkflowConflict), result
+    assert rig.workflow() == state
+
+
+@pytest.mark.parametrize("binding_error", ["epoch", "episode"])
+@pytest.mark.parametrize("operation", ["request_rearm", "continue_rearm", "authorize_retry"])
+def test_review_operator_acceptance_rechecks_binding_after_its_remote_read(rig, operation, binding_error):
+    from issue_agent.adapters.workflow_rows import persist_workflow_snapshot
+
+    command = operator_command(rig, operation)
+    state = rig.workflow()
+    raced = []
+
+    class Racing:
+        def get_pr(self, number, **kwargs):
+            if not raced:
+                if binding_error == "epoch":
+                    replaced = replace(state, authority=replace(state.authority, epoch=2))
+                else:
+                    replaced = replace(state, episode=replace(state.episode, episode_id="episode:another"))
+                with rig.store.transaction() as db:
+                    db.execute("UPDATE workflow_authority_epochs SET epoch=? WHERE repository='o/r' AND family=?",
+                               (replaced.authority.epoch, WorkflowFamily.REVIEW_REJECTIONS.value))
+                    persist_workflow_snapshot(db, replaced)
+                raced.append(replaced)
+            return rig.remote.get_pr(number, **kwargs)
+
+        def pull_request_reviews(self, pr):
+            return rig.remote.pull_request_reviews(pr)
+
+    result = getattr(rig.control(gateway=Racing()), operation)(command, ACTOR)
+    assert isinstance(result, WorkflowConflict), result
+    assert rig.workflow() == raced[0]
+
+
+@pytest.mark.parametrize("request_kind", ["replay", "reused", "stale"])
+def test_retry_replay_and_revision_conflicts_do_not_read_github(rig, request_kind):
+    command = operator_command(rig, "authorize_retry")
+    if request_kind in ("replay", "reused"):
+        assert isinstance(rig.control().authorize_retry(command, ACTOR), WorkflowCommitted)
+    if request_kind == "reused":
+        command = replace(command, evidence_id="evidence:another")
+    elif request_kind == "stale":
+        command = replace(command, expected=replace(command.expected, version=command.expected.version - 1))
+    reads = []
+
+    class Unavailable:
+        def get_pr(self, number, **kwargs):
+            reads.append(number)
+            raise ConnectionError("GitHub unavailable")
+
+        def pull_request_reviews(self, pr):
+            reads.append(pr)
+            raise ConnectionError("GitHub unavailable")
+
+    result = rig.control(gateway=Unavailable()).authorize_retry(command, ACTOR)
+    if request_kind == "replay":
+        assert isinstance(result, WorkflowCommitted) and result.idempotent
+    else:
+        assert isinstance(result, WorkflowConflict)
+    assert reads == []
 
 
 def test_cancel_clears_a_proven_absent_obligation_hold(rig):
@@ -1140,7 +1288,7 @@ def test_cancel_clears_a_proven_absent_obligation_hold(rig):
     dismissal = rig.commands(CommandKind.DISMISS_REVIEW)[0]
     expire_absent(rig, dismissal)
     current = rig.workflow()
-    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", current.revision, "request:1", "stuck"), ACTOR)
+    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", current.revision, "request:1", "stuck", expected_binding=current.binding), ACTOR)
     assert isinstance(cancelled.snapshot.intent, CancelledReviewRearm)
     assert no_retry_holds(rig)
     assert isinstance(rig.store.command_reconciliation(dismissal), RetiredSettledCommand)
@@ -1260,7 +1408,7 @@ def test_a_resolved_conflicting_relabel_uncertainty_never_dead_ends_a_held_repla
     # An external hold exists at continuation: the replacement plans a HOLD, which
     # conflicts with the stopped release relabel, so that uncertainty stays independent.
     rig.holds.append("ci is red")
-    continued = rig.control().continue_rearm(ContinueGrantedRearm("request:2", stopped.revision, "request:1"), ACTOR)
+    continued = rig.control().continue_rearm(ContinueGrantedRearm("request:2", stopped.revision, "request:1", expected_binding=stopped.binding), ACTOR)
     assert isinstance(continued, WorkflowCommitted), continued
     replacement = continued.snapshot.intent
     assert replacement.projection.remove is None and replacement.projection.add is Label.NEEDS_HUMAN_REVIEW
@@ -1270,7 +1418,7 @@ def test_a_resolved_conflicting_relabel_uncertainty_never_dead_ends_a_held_repla
     assert isinstance(changed.intent, SupersededReviewRearm) and changed.intent.reason is StopReason.DECISION_CHANGED
     # Continued while the first relabel is still uncertain: that conflicting
     # uncertainty is now the only hold, so the replacement plans a HOLD again.
-    held = rig.control().continue_rearm(ContinueGrantedRearm("request:3", changed.revision, "request:2"), ACTOR)
+    held = rig.control().continue_rearm(ContinueGrantedRearm("request:3", changed.revision, "request:2", expected_binding=changed.binding), ACTOR)
     assert isinstance(held, WorkflowCommitted), held
     assert held.snapshot.intent.projection.remove is None
     assert isinstance(rig.reconcile().snapshot.intent, PendingReviewRearm)  # still right while uncertain
@@ -1285,7 +1433,7 @@ def test_a_resolved_conflicting_relabel_uncertainty_never_dead_ends_a_held_repla
     outcome = rig.reconcile().snapshot
     assert isinstance(outcome.intent, SupersededReviewRearm), outcome.intent
     assert outcome.intent.reason is StopReason.DECISION_CHANGED
-    again = rig.control().continue_rearm(ContinueGrantedRearm("request:4", outcome.revision, "request:3"), ACTOR)
+    again = rig.control().continue_rearm(ContinueGrantedRearm("request:4", outcome.revision, "request:3", expected_binding=outcome.binding), ACTOR)
     assert isinstance(again, WorkflowCommitted), again
     assert again.snapshot.intent.projection.add is TRIGGER
     rig.drain()
@@ -1313,13 +1461,13 @@ def _record(rig):
 def _request(rig):
     rig.gated()
     state = rig.workflow()
-    command = RequestRearm("request:1", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance())
+    command = RequestRearm("request:1", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance(), expected_binding=state.binding)
     return lambda control: control.request_rearm(command, ACTOR)
 
 
 def _cancel(rig):
     state = rig.pending()
-    command = CancelRearm("cancel:1", state.revision, "request:1", "scope")
+    command = CancelRearm("cancel:1", state.revision, "request:1", "scope", expected_binding=state.binding)
     return lambda control: control.cancel_rearm(command, ACTOR)
 
 
@@ -1405,7 +1553,7 @@ def test_proposed_commands_must_belong_to_the_accepting_owner(rig):
     rig.gated()
     state = rig.workflow()
     observation, evidence_id = fresh_observation(rig)
-    command = RequestRearm("request:x", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance())
+    command = RequestRearm("request:x", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance(), expected_binding=state.binding)
     foreign = request_review_rearm(state, command, ACTOR, observation, now=rig.clock[0], active_reviews=(),
                                    evidence_id=evidence_id, trigger_label=TRIGGER, executor_identity="o/r:fix:test")
     with pytest.raises(WorkflowAuthorityError):
@@ -1433,7 +1581,7 @@ def test_other_generation_moving_paths_take_the_barriers_in_order(rig, monkeypat
         state = rig.pending()
         monkeypatch.setattr(review_control_module, "deployment_effect_barrier", recording)
         if operation == "cancel":
-            result = rig.control().cancel_rearm(CancelRearm("cancel:1", state.revision, "request:1", "x"), ACTOR)
+            result = rig.control().cancel_rearm(CancelRearm("cancel:1", state.revision, "request:1", "x", expected_binding=state.binding), ACTOR)
         else:
             rig.remote.external_pr_change(PR, head_ref_oid=OTHER_HEAD)
             result = rig.reconcile()
@@ -1477,7 +1625,7 @@ def test_a_stop_cannot_invent_command_uncertainty(rig):
     state = rig.pending()
     dismissal = state.intent.required_commands[0]
     from issue_agent.domain.review_workflow_policy import cancel_review_rearm
-    forged = cancel_review_rearm(state, CancelRearm("cancel:1", state.revision, "request:1", "x"), ACTOR,
+    forged = cancel_review_rearm(state, CancelRearm("cancel:1", state.revision, "request:1", "x", expected_binding=state.binding), ACTOR,
                                  verified_commands=(), uncertainty=(
                                      RemoteOutcomeUncertain(dismissal, rig.clock[0], 0, "invented"),))
     with pytest.raises(WorkflowAuthorityError, match="uncertainty"):
@@ -1593,7 +1741,7 @@ def test_a_lost_bound_submission_is_granted_exactly_one_write_and_releases_dispa
     assert view.retry_authorizable == frozenset({gate.gate_id})
     current = rig.workflow()
     accepted = rig.control().authorize_retry(
-        AuthorizeAbsentRetry("grant:1", current.revision, submission, gate.gate_id, gate.cause.absence_evidence_id),
+        AuthorizeAbsentRetry("grant:1", current.revision, submission, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=current.binding),
         ACTOR)
     assert isinstance(accepted, WorkflowCommitted) and not accepted.idempotent
     rig.lost.clear()
@@ -1629,7 +1777,7 @@ def test_a_granted_submission_whose_guard_changed_is_inapplicable_and_never_writ
     gate = rig.gate(rig.store.command_reconciliation(submission).gate_id)
     current = rig.workflow()
     rig.control().authorize_retry(
-        AuthorizeAbsentRetry("grant:1", current.revision, submission, gate.gate_id, gate.cause.absence_evidence_id),
+        AuthorizeAbsentRetry("grant:1", current.revision, submission, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=current.binding),
         ACTOR)
     rig.lost.clear()
     rig.remote.external_pr_change(PR, **change)
@@ -1657,7 +1805,7 @@ def seed_pending_pr(rig, number, prefix):
     gated_state = control.open_ceiling(CommandId(escalation)).snapshot
     gate = next(g for g in gated_state.gates if isinstance(g.cause, ReviewRejectionCeiling))
     pending = control.request_rearm(
-        RequestRearm(f"request:{number}", gated_state.revision, gate.gate_id, KeepGuidance()), ACTOR)
+        RequestRearm(f"request:{number}", gated_state.revision, gate.gate_id, KeepGuidance(), expected_binding=gated_state.binding), ACTOR)
     assert isinstance(pending.snapshot.intent, PendingReviewRearm), pending
     return key
 
@@ -1728,29 +1876,43 @@ def test_an_older_request_proposal_replayed_at_the_boundary_conflicts(rig):
     first = inner_commit(rig, proposal)
     assert first.snapshot.intent.request_id == "request:forged"
     stopped = rig.control().cancel_rearm(
-        CancelRearm("cancel:1", first.snapshot.revision, "request:forged", "x"), ACTOR).snapshot
-    rig.control().continue_rearm(ContinueGrantedRearm("request:2", stopped.revision, "request:forged"), ACTOR)
+        CancelRearm("cancel:1", first.snapshot.revision, "request:forged", "x", expected_binding=first.snapshot.binding), ACTOR).snapshot
+    rig.control().continue_rearm(ContinueGrantedRearm("request:2", stopped.revision, "request:forged", expected_binding=stopped.binding), ACTOR)
     current = rig.workflow()
     assert isinstance(inner_commit(rig, proposal), WorkflowConflict)
     assert rig.workflow() == current
 
 
-def test_a_concurrent_identical_acceptance_is_idempotent_under_the_barriers(rig):
+@pytest.mark.parametrize("race_point", ["barrier", "remote_read"])
+def test_a_concurrent_identical_acceptance_is_idempotent_under_the_barriers(rig, monkeypatch, race_point):
     """The second request replay inside the barriers: another acceptance won between the two checks."""
     state = rig.gated()
-    command = RequestRearm("request:1", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance())
+    command = RequestRearm("request:1", state.revision, rig.ceiling_gate(state).gate_id, KeepGuidance(), expected_binding=state.binding)
     raced = []
+
+    def accept_competing_request():
+        raced.append(True)
+        observation, evidence_id = fresh_observation(rig)
+        winner = request_review_rearm(
+            rig.workflow(), command, ACTOR, observation, now=rig.clock[0], active_reviews=(),
+            evidence_id=evidence_id, trigger_label=TRIGGER, executor_identity=REVIEWER)
+        inner_commit(rig, winner)
+
+    original_barriers = SQLiteReviewWorkflowControl._barriers
+
+    @contextmanager
+    def racing_barriers(control):
+        with original_barriers(control):
+            if race_point == "barrier" and not raced:
+                accept_competing_request()
+            yield
+
+    monkeypatch.setattr(SQLiteReviewWorkflowControl, "_barriers", racing_barriers)
 
     class Racing:
         def get_pr(self, number, **kwargs):
-            if not raced:
-                raced.append(True)
-                # Another process's identical acceptance commits first.
-                observation, evidence_id = fresh_observation(rig)
-                winner = request_review_rearm(
-                    rig.workflow(), command, ACTOR, observation, now=rig.clock[0], active_reviews=(),
-                    evidence_id=evidence_id, trigger_label=TRIGGER, executor_identity=REVIEWER)
-                inner_commit(rig, winner)
+            if race_point == "remote_read" and not raced:
+                accept_competing_request()
             return rig.remote.get_pr(number, **kwargs)
 
         def pull_request_reviews(self, pr):
@@ -1968,7 +2130,7 @@ def test_an_inactive_review_family_beside_an_active_resolve_family_reads_migrati
 def test_the_view_stays_readable_after_a_stop_records_its_retirement_evidence(rig):
     state = rig.pending()
     rig.advance(60)
-    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", state.revision, "request:1", "stop"), ACTOR)
+    cancelled = rig.control().cancel_rearm(CancelRearm("cancel:1", state.revision, "request:1", "stop", expected_binding=state.binding), ACTOR)
     assert isinstance(cancelled, WorkflowCommitted)
     view = rig.control().review_control_view(PR_KEY)
     assert isinstance(view, ReviewControlView), view
@@ -1997,7 +2159,7 @@ def test_an_accepted_grant_is_shown_waiting_and_is_never_offered_again(rig):
     dismissal = rig.commands(CommandKind.DISMISS_REVIEW)[0]
     gate = expire_absent(rig, dismissal)
     state = rig.workflow()
-    command = AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id)
+    command = AuthorizeAbsentRetry("grant:1", state.revision, dismissal, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=state.binding)
     assert isinstance(rig.control().authorize_retry(command, ACTOR), WorkflowCommitted)
     view = rig.control().review_control_view(PR_KEY)
     assert view.retry_pending == (PendingRetry(gate.gate_id, "grant:1", str(dismissal)),)
@@ -2237,7 +2399,7 @@ def test_duplicate_open_grants_on_one_gate_degrade_that_gate_and_leave_the_view_
     first, second = rig.commands(CommandKind.DISMISS_REVIEW)[:2]
     gate = expire_absent(rig, first)
     state = rig.workflow()
-    command = AuthorizeAbsentRetry("grant:1", state.revision, first, gate.gate_id, gate.cause.absence_evidence_id)
+    command = AuthorizeAbsentRetry("grant:1", state.revision, first, gate.gate_id, gate.cause.absence_evidence_id, expected_binding=state.binding)
     assert isinstance(rig.control().authorize_retry(command, ACTOR), WorkflowCommitted)
     with rig.store.transaction() as db:
         db.execute("DROP TRIGGER IF EXISTS workflow_retry_grant_insert")

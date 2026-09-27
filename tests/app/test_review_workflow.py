@@ -6,6 +6,8 @@ from dataclasses import replace
 
 import pytest
 
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+from tests.fakes.review_authority import BoundFixtureReviewWorkflow, FixtureReviewAuthority, review_state, review_binding
 from tests.fakes.legacy_journal import Journal
 from issue_agent.adapters.journal import (
     JournalingRuntime,
@@ -32,8 +34,6 @@ from issue_agent.app.workflows.review import ReviewWorkflow, ReviewWorkflowConfi
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.review import (
     ReviewMode,
-    ReviewState,
-    needs_re_review,
     patch_signature,
 )
 from issue_agent.app.planners.tasks import ReviewTaskConfig
@@ -71,33 +71,44 @@ def _workflow(gw, store, runner, journal=None, **cfg_overrides):
         cfg_kwargs.setdefault("execution_cwd", "/configured-review-checkout")
         cfg_kwargs.setdefault("prepare_cwd", lambda _cwd: None)
     cfg = ReviewWorkflowConfig(**cfg_kwargs)
-    # The REAL Executor, not a spy: M10's whole point is that escalation must
-    # travel the same funnel every other write does (journal event + ALERT_CMD
-    # come from the funnel, not from the workflow).
-    return ReviewWorkflow(cfg, gw, store, runner, Executor(gw, journal=journal))
+    executor = Executor(gw, journal=journal)
+    return BoundFixtureReviewWorkflow(cfg, gw, store, runner,
+        authority=FixtureReviewAuthority(gw, store, executor, cfg.review_bot))
 
 
-def test_initial_review_skips_when_our_verdict_already_targets_head():
-    review = Review(
-        "APPROVED", "review-bot[bot]", "t1", commit_id="abc",
-    )
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", reviews=(review,))})
-    store = FakeStore()
-    runner = FakeRunner(AgentResult(is_error=False))
-    journal = FakeJournal()
+def test_unbound_review_refuses_before_any_read_or_paid_leg():
+    gw, store, runner = FakeGateway(), FakeStore(), FakeRunner(AgentResult(is_error=False))
+    workflow = _workflow(gw, store, runner)
+    for method in (ReviewWorkflow.review, ReviewWorkflow.re_review):
+        with pytest.raises(WorkflowAuthorityError, match="review_migration_required"):
+            asyncio.run(method(workflow, 100))
+    assert runner.tasks == [] and gw.calls == []
 
-    asyncio.run(_workflow(gw, store, runner, journal=journal).review(100))
 
-    assert runner.tasks == []
-    assert gw.calls == []
-    assert store.get_last_sha(100) == "abc"
-    assert store.get_pr_session(100) == "github-review"
-    assert ("review_skip", {
-        "pr": 100,
-        "reviewer": "review-bot",
-        "head_sha": "abc",
-        "reason": "reviewer-verdict-on-head",
-    }) in journal.events
+def test_missing_review_authority_refuses_even_with_a_binding():
+    gw, store, runner = FakeGateway(), FakeStore(), FakeRunner(AgentResult(is_error=False))
+    workflow = _workflow(gw, store, runner)
+    workflow.authority = None
+    with pytest.raises(WorkflowAuthorityError, match="review_migration_required"):
+        asyncio.run(workflow.review(100))
+    assert runner.tasks == [] and gw.calls == []
+
+
+def test_another_pull_requests_binding_cannot_authorize_review():
+    gw, store, runner = FakeGateway(), FakeStore(), FakeRunner(AgentResult(is_error=False))
+    workflow = _workflow(gw, store, runner)
+    for method in (workflow.review, workflow.re_review):
+        with pytest.raises(WorkflowAuthorityError, match="another workflow"):
+            asyncio.run(method(100, binding=review_binding(101)))
+    assert runner.tasks == [] and gw.calls == []
+
+
+def test_authority_covered_head_skips_without_paying_or_submitting():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc")})
+    store, runner = FakeStore(), FakeRunner(AgentResult(is_error=False))
+    review_state(store).set_head(100, "abc")
+    asyncio.run(_workflow(gw, store, runner).review(100))
+    assert runner.tasks == [] and gw.calls == []
 
 
 def test_the_pr_conversation_reaches_every_review_round_as_untrusted_data():
@@ -114,7 +125,7 @@ def test_the_pr_conversation_reaches_every_review_round_as_untrusted_data():
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     store.save_pr_session(100, "rs")
-    store.set_last_sha(100, "old")
+    review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "APPROVE", "body": "ok"},
     ))
@@ -140,16 +151,14 @@ def test_a_pr_with_no_comments_gets_no_discussion_section():
     assert "pr_discussion" not in runner.tasks[0].prompt
 
 
-def test_stored_operator_guidance_reaches_the_review_and_re_review_prompts():
-    # The end of the operator's unblock path: the dashboard wrote the note into
-    # the review role's state dir, so every later round of THAT PR must carry
-    # it — otherwise the re-armed loop repeats the round that wedged it.
+def test_episode_guidance_reaches_the_review_and_re_review_prompts():
+    # Accepted operator guidance belongs to the workflow episode.
     prior = Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old")
     gw = FakeGateway(prs={100: PRView(100, head_ref_oid="new", reviews=(prior,))})
     store = FakeStore()
-    store.set_operator_guidance(100, "native screenshots are impossible here")
+    review_state(store).set_guidance(100, "native screenshots are impossible here")
     store.save_pr_session(100, "rs")
-    store.set_last_sha(100, "old")
+    review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "APPROVE", "body": "fixed"},
     ))
@@ -168,7 +177,7 @@ def test_re_review_skips_same_head_but_reviews_a_genuinely_new_head():
     })
     store = FakeStore()
     store.save_pr_session(100, "rs")
-    store.set_last_sha(100, "old")
+    review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False,
         structured={"decision": "APPROVE", "body": "fixed"},
@@ -192,8 +201,8 @@ def test_external_review_marker_never_becomes_a_resume_session():
         ),
     })
     store = FakeStore()
-    first_runner = FakeRunner(AgentResult(is_error=False))
-    asyncio.run(_workflow(gw, store, first_runner).review(100))
+    review_state(store).set_head(100, "old")
+    store.save_pr_session(100, "github-review")
 
     gw.diff_text = "genuinely changed diff"
     gw._prs[100] = PRView(
@@ -296,7 +305,7 @@ def test_single_review_submits_before_persisting_state():
 
     assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
     assert store.pr_sessions[100] == "rs"
-    assert store.last_sha[100] == "abc"
+    assert review_state(store).heads[100] == "abc"
     assert store.rounds[100] == 1
 
 
@@ -374,7 +383,7 @@ def test_single_review_failed_submit_does_not_persist_state():
 
     assert any(c[0] == "review" for c in gw.calls)
     assert 100 not in store.pr_sessions
-    assert 100 not in store.last_sha
+    assert 100 not in review_state(store).heads
 
 
 def test_single_review_never_submits_stale_verdict_to_new_head():
@@ -405,7 +414,7 @@ def test_single_review_never_submits_stale_verdict_to_new_head():
 
     assert not any(call[0] == "review" for call in gw.calls)
     assert 100 not in store.pr_sessions
-    assert 100 not in store.last_sha
+    assert 100 not in review_state(store).heads
     assert 100 not in store.rounds
 
 
@@ -455,7 +464,7 @@ def test_delegated_re_review_uses_prior_review_without_session_resume():
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     store.set_round(100, 1)
-    store.set_last_sha(100, "old")
+    review_state(store).set_head(100, "old")
     store.save_pr_session(100, "old-session")
     runner = FakeRunner(AgentResult(
         is_error=False,
@@ -467,7 +476,7 @@ def test_delegated_re_review_uses_prior_review_without_session_resume():
 
     assert runner.tasks[0].resume is None
     assert "fix this" in runner.tasks[0].prompt
-    assert store.last_sha[100] == "new"
+    assert review_state(store).heads[100] == "new"
     assert store.rounds[100] == 2
 
 
@@ -477,7 +486,7 @@ def test_re_review_failed_submit_does_not_advance_round():
     store = FakeStore()
     store.set_round(100, 2)
     store.save_pr_session(100, "rs")
-    store.set_last_sha(100, "old")
+    review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False,
         structured={"decision": "REQUEST_CHANGES", "body": "x"},
@@ -485,14 +494,12 @@ def test_re_review_failed_submit_does_not_advance_round():
 
     asyncio.run(_workflow(gw, store, runner).re_review(100))
 
-    assert store.last_sha[100] == "old"
+    assert review_state(store).heads[100] == "old"
     assert store.rounds[100] == 2
 
 
-def test_re_review_escalation_uses_configured_trigger_label():
-    # review M10: the removed label follows REVIEW_TRIGGER_LABEL (ai-review on a
-    # repo where another bot owns ai-pr-open) — removing the wrong one leaves the
-    # PR in the reviewer's pickable set forever.
+def test_re_review_passes_escalation_to_authority_without_relabelling():
+    # The authority owns label projection even with a custom trigger label.
     pr = PRView(815, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={815: pr})
     store = FakeStore()
@@ -512,17 +519,13 @@ def test_re_review_escalation_uses_configured_trigger_label():
     ).re_review(815))
 
     assert any(c[0] == "review" and c[2] == "COMMENT" for c in gw.calls)
-    assert ("relabel", "pr", 815, "ai-review", "needs-human-review") in gw.calls
+    assert review_state(store).submissions[-1][2] == "verdict"
+    assert not any(call[0] == "relabel" for call in gw.calls)
 
 
-# ── review M10: escalations travel the write funnel ───────────────────────────
-def test_review_escalation_emits_an_escalation_event_through_the_funnel():
-    """M10: the reviewer giving up is the state change an operator most needs to
-    hear about, and it was the ONE escalation that bypassed the funnel — a raw
-    `gateway.relabel(..., "needs-human-review")`, so no `escalation` journal
-    event and no ALERT_CMD, while the spend-cap escalation on the same daemon
-    alerted. Emitted by Executor, so asserting on the journal proves the write
-    actually went through it."""
+# ── escalation causes flow through bound submissions ─────────────────────────
+def test_review_ceiling_is_reported_to_authority_for_receipt_settlement():
+    """Submission carries the cause; durable settlement owns its consequences."""
     prior = tuple(
         Review("CHANGES_REQUESTED", "review-bot", f"t{i}", body="fix") for i in range(3)
     )
@@ -538,13 +541,11 @@ def test_review_escalation_emits_an_escalation_event_through_the_funnel():
 
     asyncio.run(_workflow(gw, store, runner, journal=journal).re_review(100))
 
-    assert ("relabel", "pr", 100, "ai-pr-open", "needs-human-review") in gw.calls
-    assert ("escalation", {"target": "pr", "number": 100}) in journal.events
-    # …and the funnel's comment explains WHY, so the human arrives informed.
-    assert any(c[0] == "comment" and "Circuit breaker" in c[3] for c in gw.calls)
-    # A ceiling trip names the ceiling, in the breaker comment itself.
-    breaker = [c[3] for c in gw.calls if c[0] == "comment" and "Circuit breaker" in c[3]]
-    assert breaker and "requested changes" in breaker[0] and "ceiling 4" in breaker[0]
+    assert review_state(store).submissions[-1][2] in {"ceiling", "verdict"}
+    assert not any(call[0] == "relabel" for call in gw.calls)
+    assert not any(event == "escalation" for event, _fields in journal.events)
+    assert review_state(store).submissions[-1][2] == "ceiling"
+    assert any(c[0] == "review" and "4 rounds" in c[3] for c in gw.calls)
 
 
 def test_verdict_escalation_reason_names_the_verdict_not_the_ceiling():
@@ -563,10 +564,11 @@ def test_verdict_escalation_reason_names_the_verdict_not_the_ceiling():
 
     asyncio.run(_workflow(gw, store, runner).re_review(100))
 
-    assert ("relabel", "pr", 100, "ai-pr-open", "needs-human-review") in gw.calls
-    breaker = [c[3] for c in gw.calls if c[0] == "comment" and "Circuit breaker" in c[3]]
-    assert breaker and "returned ESCALATE" in breaker[0]
-    assert "requested changes" not in breaker[0]
+    assert review_state(store).submissions[-1][2] in {"ceiling", "verdict"}
+    assert not any(call[0] == "relabel" for call in gw.calls)
+    assert review_state(store).submissions[-1][2] == "verdict"
+    body = next(c[3] for c in gw.calls if c[0] == "review")
+    assert "returned ESCALATE" in body
 
 
 def test_ordinary_rejection_does_not_escalate():
@@ -589,9 +591,8 @@ def test_ordinary_rejection_does_not_escalate():
     assert [e for e, _ in journal.events if e == "escalation"] == []
 
 
-def test_multi_review_escalation_also_goes_through_the_funnel():
-    """The multi-agent path had its own copy of the raw relabel (review.py:240)
-    — both had to move, or the leak survives behind REVIEW_MODE."""
+def test_multi_review_reports_its_ceiling_to_authority_for_receipt_settlement():
+    """Multi review uses the same authority contract as single review."""
     prior = tuple(
         Review("CHANGES_REQUESTED", "review-bot", f"t{i}", body="fix") for i in range(3)
     )
@@ -611,29 +612,23 @@ def test_multi_review_escalation_also_goes_through_the_funnel():
     asyncio.run(_workflow(gw, store, runner, journal=journal,
                           review_mode=ReviewMode.MULTI).re_review(100))
 
-    assert ("relabel", "pr", 100, "ai-pr-open", "needs-human-review") in gw.calls
-    assert ("escalation", {"target": "pr", "number": 100}) in journal.events
+    assert review_state(store).submissions[-1][2] in {"ceiling", "verdict"}
+    assert not any(call[0] == "relabel" for call in gw.calls)
+    assert not any(event == "escalation" for event, _fields in journal.events)
 
 
-def test_unknown_trigger_label_falls_back_instead_of_stranding_the_pr():
-    """A misconfigured REVIEW_TRIGGER_LABEL must not raise AFTER the verdict has
-    been POSTed — that would strand the PR mid-escalation (submitted, unlabelled,
-    and re-picked next poll). Fall back loudly to ai-pr-open."""
-    pr = PRView(815, head_ref_oid="abc", title="t", body="b")
-    gw = FakeGateway(prs={815: pr})
-    store = FakeStore()
-    store.set_round(815, 5)
-    store.save_pr_session(815, "rs")
-    logs: list[str] = []
-    runner = FakeRunner(AgentResult(
-        is_error=False, structured={"decision": "ESCALATE", "body": "stuck"},
-    ))
-
-    asyncio.run(_workflow(gw, store, runner, review_trigger_label="not-a-label",
-                          log=logs.append).re_review(815))
-
-    assert ("relabel", "pr", 815, "ai-pr-open", "needs-human-review") in gw.calls
-    assert any("not a known lifecycle label" in m for m in logs)
+def test_failed_authority_submission_never_updates_the_reviewed_baseline():
+    class RefusingGateway(FakeGateway):
+        def submit_review(self, *args, **kwargs):
+            return False
+    gw = RefusingGateway(prs={100: PRView(100, head_ref_oid="head")})
+    store, runner = FakeStore(), FakeRunner(_approved())
+    workflow = _workflow(gw, store, runner)
+    workflow.authority.submit = lambda *args, **kwargs: False
+    asyncio.run(workflow.review(100))
+    assert len(runner.tasks) == 1
+    assert review_state(store).head(100) == ""
+    assert store.get_pr_session(100) == ""
 
 
 def test_multi_review_confirmed_blocking_finding_requests_changes_and_persists():
@@ -650,7 +645,7 @@ def test_multi_review_confirmed_blocking_finding_requests_changes_and_persists()
 
     assert any(c[0] == "review" and c[2] == "REQUEST_CHANGES" for c in gw.calls)
     assert store.pr_sessions[100] == "multi"
-    assert store.last_sha[100] == "abc"
+    assert review_state(store).heads[100] == "abc"
 
 
 def test_multi_review_carries_the_operator_guidance_to_gate_and_dimensions():
@@ -660,7 +655,7 @@ def test_multi_review_carries_the_operator_guidance_to_gate_and_dimensions():
     pr = PRView(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
-    store.set_operator_guidance(100, "accept the recorded log as visual evidence")
+    review_state(store).set_guidance(100, "accept the recorded log as visual evidence")
     runner = SchemaRunner(
         gate=_gate(),
         dimension=lambda t: _dim([{"location": "a.py:1", "claim": "bug", "severity": "blocking"}]),
@@ -716,7 +711,7 @@ def test_multi_review_gate_short_circuits_non_reviewable_diff_to_approve():
 
     assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
     assert len(runner.tasks) == 1
-    assert store.last_sha[100] == "abc"
+    assert review_state(store).heads[100] == "abc"
 
 
 def test_multi_review_degenerate_gate_runs_full_review_not_approve():
@@ -779,7 +774,7 @@ def test_multi_review_gate_error_persists_nothing():
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
 
     assert gw.calls == []
-    assert 100 not in store.last_sha
+    assert 100 not in review_state(store).heads
 
 
 def test_multi_review_failed_submit_does_not_persist():
@@ -795,7 +790,7 @@ def test_multi_review_failed_submit_does_not_persist():
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
 
     assert any(c[0] == "review" for c in gw.calls)
-    assert 100 not in store.last_sha
+    assert 100 not in review_state(store).heads
 
 
 def test_multi_review_incomplete_no_finding_submits_nothing():
@@ -815,7 +810,7 @@ def test_multi_review_incomplete_no_finding_submits_nothing():
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
 
     assert gw.calls == []
-    assert 100 not in store.last_sha
+    assert 100 not in review_state(store).heads
 
 
 def test_multi_review_incomplete_but_blocking_still_requests_changes():
@@ -858,7 +853,7 @@ def test_multi_review_validator_error_marks_incomplete():
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
 
     assert gw.calls == []
-    assert 100 not in store.last_sha
+    assert 100 not in review_state(store).heads
 
 
 def test_multi_review_leg_that_raises_does_not_abort_review():
@@ -878,7 +873,7 @@ def test_multi_review_leg_that_raises_does_not_abort_review():
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
 
     assert gw.calls == []
-    assert 100 not in store.last_sha
+    assert 100 not in review_state(store).heads
 
 
 def test_multi_re_review_at_ceiling_escalates():
@@ -906,12 +901,13 @@ def test_multi_re_review_at_ceiling_escalates():
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).re_review(100))
 
     assert any(c[0] == "review" and c[2] == "COMMENT" for c in gw.calls)
-    assert ("relabel", "pr", 100, "ai-pr-open", "needs-human-review") in gw.calls
+    assert review_state(store).submissions[-1][2] in {"ceiling", "verdict"}
+    assert not any(call[0] == "relabel" for call in gw.calls)
     assert store.rounds[100] == 5
 
 
 # ── the no-progress counter (review P0R-3) ────────────────────────────────────
-# Every `return` above that skips save_pr_session/set_last_sha leaves
+# Every `return` above that leaves a submission unsettled leaves
 # `needs_initial_review`/`needs_re_review` True, so the IDENTICAL dispatch is
 # bought again next poll — under MULTI that is a gate + 5 dimensions + N
 # validators re-run on a RESULT the workflow chose not to use. None of them
@@ -979,11 +975,11 @@ def test_an_errored_re_review_counts_one_unproductive_round():
     gw = FakeGateway(prs={100: PRView(100, head_ref_oid="def")})
     store = FakeStore()
     store.save_pr_session(100, "rs")
-    store.set_last_sha(100, "abc")
+    review_state(store).set_head(100, "abc")
 
     asyncio.run(_workflow(gw, store, FakeRunner(AgentResult(is_error=True))).re_review(100))
 
-    assert store.last_sha[100] == "abc" and _counter(store) == 1
+    assert review_state(store).heads[100] == "abc" and _counter(store) == 1
 
 
 def test_a_multi_review_gate_error_counts_one_unproductive_round():
@@ -1123,17 +1119,7 @@ def test_a_productive_round_clears_the_orphaned_half_too():
 
 
 class PatchStore(FakeStore):
-    """FakeStore + the reviewed-patch accessors the real `Store` grew for #2."""
-
-    def __init__(self):
-        super().__init__()
-        self.patch_ids = {}
-
-    def get_last_patch_id(self, p):
-        return self.patch_ids.get(p, "")
-
-    def set_last_patch_id(self, p, s):
-        self.patch_ids[p] = s
+    """Session metadata; baseline fixtures live in review_state."""
 
 
 class DiffGateway(FakeGateway):
@@ -1185,9 +1171,9 @@ def _reviewed_pr(store, diff, head="old-sha"):
     """A PR that has ALREADY been reviewed once at `diff` — the state an initial
     review leaves behind."""
     store.save_pr_session(100, "rs")
-    store.set_last_sha(100, head)
+    review_state(store).set_head(100, head)
     store.set_round(100, 1)
-    store.set_last_patch_id(100, patch_signature(diff))
+    review_state(store).set_patch(100, patch_signature(diff))
 
 
 def _rebased_pr(head: str = "new-sha", prior_head: str = "old-sha"):
@@ -1248,24 +1234,20 @@ def test_revision_mismatched_diff_never_runs_or_submits_review():
 
     assert runner.tasks == []
     assert not any(call[0] == "review" for call in gw.calls)
-    assert store.get_last_sha(100) == ""
+    assert review_state(store).head(100) == ""
 
 
 def test_the_carried_forward_skip_happens_once_not_every_poll():
-    """`decide_review` re-emits RE_REVIEW for as long as `needs_re_review` is
-    true, and that predicate reads the same `last-sha` the skip advances. Without
-    this write the daemon would re-enter the skip on every single poll forever."""
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
     gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
-
-    asyncio.run(_workflow(gw, store, FakeRunner(_approved())).re_review(100))
-
-    assert store.get_last_sha(100) == "new-sha"
-    # needs_re_review's exact predicate: head == last_sha → nothing dispatched.
-    assert needs_re_review(PRView(100, head_ref_oid="new-sha"),
-                           ReviewState(sessions=frozenset({100}),
-                                       last_sha={100: store.get_last_sha(100)})) is False
+    runner = FakeRunner(_approved())
+    workflow = _workflow(gw, store, runner)
+    asyncio.run(workflow.re_review(100))
+    asyncio.run(workflow.re_review(100))
+    assert review_state(store).head(100) == "new-sha"
+    assert len(review_state(store).submissions) == 1
+    assert runner.tasks == []
 
 
 def test_the_skip_does_not_consume_a_review_round():
@@ -1291,9 +1273,9 @@ def test_a_rebase_that_changes_the_patch_still_runs_the_review_agent():
 
     assert len(runner.tasks) == 1
     assert any(c[0] == "review" for c in gw.calls)
-    assert store.get_last_sha(100) == "new-sha"
+    assert review_state(store).head(100) == "new-sha"
     assert store.get_round(100) == 2
-    assert store.get_last_patch_id(100) == patch_signature(_REVISED), \
+    assert review_state(store).patch(100) == patch_signature(_REVISED), \
         "the newly reviewed patch becomes the baseline for the NEXT rebase"
 
 
@@ -1368,7 +1350,7 @@ def test_a_pr_with_no_recorded_patch_is_always_reviewed():
     unknown must mean 'review it', never 'unchanged'."""
     store = PatchStore()
     store.save_pr_session(100, "rs")
-    store.set_last_sha(100, "old-sha")
+    review_state(store).set_head(100, "old-sha")
     store.set_round(100, 1)
     gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
     runner = FakeRunner(_approved())
@@ -1376,7 +1358,7 @@ def test_a_pr_with_no_recorded_patch_is_always_reviewed():
     asyncio.run(_workflow(gw, store, runner).re_review(100))
 
     assert len(runner.tasks) == 1
-    assert store.get_last_patch_id(100) == patch_signature(_REBASED)
+    assert review_state(store).patch(100) == patch_signature(_REBASED)
 
 
 def test_an_initial_review_records_the_patch_it_reviewed():
@@ -1387,7 +1369,7 @@ def test_an_initial_review_records_the_patch_it_reviewed():
 
     asyncio.run(_workflow(gw, store, FakeRunner(_approved())).review(100))
 
-    assert store.get_last_patch_id(100) == patch_signature(_REVIEWED)
+    assert review_state(store).patch(100) == patch_signature(_REVIEWED)
 
     # …and the rebase that follows costs nothing.
     gw2 = DiffGateway(
@@ -1408,7 +1390,7 @@ def test_a_review_that_never_submitted_records_no_patch_baseline():
 
     asyncio.run(_workflow(gw, store, FakeRunner(_approved())).review(100))
 
-    assert store.get_last_patch_id(100) == ""
+    assert review_state(store).patch(100) == ""
 
 
 def test_a_multi_agent_re_review_also_skips_an_unchanged_patch():
@@ -1425,7 +1407,7 @@ def test_a_multi_agent_re_review_also_skips_an_unchanged_patch():
 
     assert runner.tasks == []
     assert any(call[0] == "review" for call in gw.calls)
-    assert store.get_last_sha(100) == "new-sha"
+    assert review_state(store).head(100) == "new-sha"
 
 
 def test_a_multi_agent_review_records_the_patch_it_reviewed():
@@ -1436,7 +1418,7 @@ def test_a_multi_agent_review_records_the_patch_it_reviewed():
 
     asyncio.run(_workflow(gw, store, runner, review_mode=ReviewMode.MULTI).review(100))
 
-    assert store.get_last_patch_id(100) == patch_signature(_REVIEWED)
+    assert review_state(store).patch(100) == patch_signature(_REVIEWED)
 
 
 def test_a_delegated_re_review_also_skips_an_unchanged_patch():
@@ -1466,41 +1448,24 @@ def test_the_skip_costs_exactly_one_diff_fetch_no_matter_the_mode():
     assert gw.diffs_fetched == 1
 
 
-def test_an_unreadable_patch_baseline_reviews_rather_than_skips():
-    """Fail-safe: a store that cannot answer must never be read as 'unchanged'."""
-    class BrokenStore(PatchStore):
-        def get_last_patch_id(self, p):
-            raise OSError("state dir gone")
-
-    store = BrokenStore()
+def test_unavailable_review_authority_never_buys_a_fallback_review():
+    store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
-    runner = FakeRunner(_approved())
-
-    asyncio.run(_workflow(gw, store, runner).re_review(100))
-
-    assert len(runner.tasks) == 1
-
-
-def test_rebound_verdict_prevents_paid_review_when_cache_write_fails():
-    """Once GitHub has the new-head verdict, a cache failure must not buy a
-    duplicate paid review; the next poll reconciles the remote review."""
-    class UnwritableSha(PatchStore):
-        def set_last_sha(self, p, s):
-            raise OSError("read-only state dir")
-
-    store = UnwritableSha()
-    store.patch_ids[100] = patch_signature(_REVIEWED)
-    store.pr_sessions[100] = "rs"
-    store.rounds[100] = 1
-    store.last_sha[100] = "old-sha"
+    review_state(store).unavailable = True
     gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
     runner = FakeRunner(_approved())
+    with pytest.raises(WorkflowAuthorityError, match="unavailable"):
+        asyncio.run(_workflow(gw, store, runner).re_review(100))
+    assert runner.tasks == [] and gw.calls == []
 
+
+def test_a_fresh_generation_never_reuses_an_old_remote_approval():
+    store = PatchStore()
+    gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
+    runner = FakeRunner(_approved())
     asyncio.run(_workflow(gw, store, runner).re_review(100))
-
-    assert runner.tasks == []
-    assert any(call[0] == "review" for call in gw.calls)
+    assert len(runner.tasks) == 1
+    assert review_state(store).head(100) == "new-sha"
 
 
 class RecordingJournal:
@@ -1607,7 +1572,7 @@ def test_review_defers_when_the_pinned_checkout_is_unavailable():
     asyncio.run(wf.review(100))
 
     assert runner.tasks == []
-    assert not store.get_last_sha(100)
+    assert not review_state(store).head(100)
     assert not store.get_pr_session(100)
     # 0d2e295 H3: a deferral paid for nothing — it must NOT feed the
     # unproductive-round counter, or five free deferrals escalate the PR.
@@ -1818,10 +1783,12 @@ def _review_with(structured, gw=None, **cfg_overrides):
     gw = gw or _DeclaringGateway(prs={100: _declaring_pr()})
     runner = FakeRunner(AgentResult(is_error=False, structured=structured))
     cfg_overrides.setdefault("exemption_mac_key", _MAC_KEY)
+    store = FakeStore()
     asyncio.run(
-        _workflow(gw, FakeStore(), runner, **cfg_overrides).review(100)
+        _workflow(gw, store, runner, **cfg_overrides).review(100)
     )
     gw.dispatched_tasks = runner.tasks
+    gw.review_submissions = review_state(store).submissions
     return gw
 
 
@@ -1940,7 +1907,7 @@ def test_existing_incomplete_approval_is_reviewed_instead_of_reconciled():
     assert any(call[:3] == ("review", 100, "REQUEST_CHANGES") for call in gw.calls)
 
 
-def test_existing_complete_approval_reconciles_without_an_agent_run():
+def test_a_complete_remote_approval_does_not_discharge_a_fresh_review_obligation():
     existing = Review(
         "APPROVED",
         "review-bot",
@@ -1951,15 +1918,15 @@ def test_existing_complete_approval_reconciles_without_an_agent_run():
     current = replace(_declaring_pr(), reviews=(existing,))
     gw = _DeclaringGateway(prs={100: current})
     store = FakeStore()
-    runner = FakeRunner(AgentResult(is_error=False))
+    runner = FakeRunner(_approved())
 
     asyncio.run(
         _workflow(gw, store, runner, exemption_mac_key=_MAC_KEY).review(100)
     )
 
-    assert runner.tasks == []
-    assert store.get_pr_session(100) == "github-review"
-    assert store.get_last_patch_id(100) == patch_signature(_MODIFYING_DIFF)
+    assert len(runner.tasks) == 1
+    assert any(c[:3] == ("review", 100, "APPROVE") for c in gw.calls)
+    assert review_state(store).patch(100) == patch_signature(_MODIFYING_DIFF)
 
 
 def test_later_approval_omission_does_not_revoke_prior_patch_grant():
@@ -1982,14 +1949,14 @@ def test_later_approval_omission_does_not_revoke_prior_patch_grant():
     current = replace(_declaring_pr(), reviews=reviews)
     gw = _DeclaringGateway(prs={100: current})
     store = FakeStore()
-    runner = FakeRunner(AgentResult(is_error=False))
+    runner = FakeRunner(_approved())
 
     asyncio.run(
         _workflow(gw, store, runner, exemption_mac_key=_MAC_KEY).review(100)
     )
 
-    assert runner.tasks == []
-    assert store.get_pr_session(100) == "github-review"
+    assert len(runner.tasks) == 1
+    assert any(c[:3] == ("review", 100, "APPROVE") for c in gw.calls)
 
 
 def test_new_approval_can_reuse_prior_grant_for_identical_patch_content():
@@ -2040,13 +2007,7 @@ def test_incomplete_current_approval_does_not_reset_the_live_ceiling():
     )
 
     assert any(call[:3] == ("review", 100, "COMMENT") for call in gw.calls)
-    assert (
-        "relabel",
-        "pr",
-        100,
-        "ai-pr-open",
-        "needs-human-review",
-    ) in gw.calls
+    assert gw.review_submissions[-1][2:] == ("ceiling", frozenset({"head-1"}))
 
 
 def test_unchanged_patch_does_not_copy_an_incomplete_prior_approval():
@@ -2065,8 +2026,8 @@ def test_unchanged_patch_does_not_copy_an_incomplete_prior_approval():
     gw = _DeclaringGateway(prs={100: current})
     store = FakeStore()
     store.save_pr_session(100, "github-review")
-    store.set_last_sha(100, "old-head")
-    store.set_last_patch_id(100, patch_signature(_MODIFYING_DIFF))
+    review_state(store).set_head(100, "old-head")
+    review_state(store).set_patch(100, patch_signature(_MODIFYING_DIFF))
     runner = FakeRunner(
         AgentResult(
             is_error=False,
@@ -2109,8 +2070,8 @@ def test_mechanical_rebase_preserves_incomplete_approval_ceiling_accounting():
     gw = _DeclaringGateway(prs={100: current})
     store = FakeStore()
     store.save_pr_session(100, "github-review")
-    store.set_last_sha(100, "old-head")
-    store.set_last_patch_id(100, patch_signature(_MODIFYING_DIFF))
+    review_state(store).set_head(100, "old-head")
+    review_state(store).set_patch(100, patch_signature(_MODIFYING_DIFF))
     runner = FakeRunner(
         AgentResult(
             is_error=False,
@@ -2124,13 +2085,7 @@ def test_mechanical_rebase_preserves_incomplete_approval_ceiling_accounting():
 
     assert len(runner.tasks) == 1
     assert any(call[:3] == ("review", 100, "COMMENT") for call in gw.calls)
-    assert (
-        "relabel",
-        "pr",
-        100,
-        "ai-pr-open",
-        "needs-human-review",
-    ) in gw.calls
+    assert review_state(store).submissions[-1][2:] == ("ceiling", frozenset({"old-head"}))
 
 
 def test_an_approved_structured_grant_is_rendered_as_the_canonical_line():
@@ -2453,58 +2408,28 @@ def test_an_unreadable_commit_log_defers_without_a_verdict_or_paid_leg():
     assert runner.tasks == []
     assert not any(call[0] == "review" for call in gw.calls)
     assert store.get_infra_deaths(-100) == 0
-    assert any(
-        event == "telemetry_warning"
-        and "exemption declarations unreadable" in str(fields.get("warning"))
-        for event, fields in journal.events
-    )
+    assert "exemption declarations unreadable" in review_state(store).evidence[-1][1]
 
 
-def test_persistently_unreadable_commit_log_enters_the_bounded_breaker():
-    gw = _DeclaringGateway(
-        raises=RuntimeError("gh exploded"), prs={100: _declaring_pr()}
-    )
-    store = FakeStore()
-    runner = FakeRunner(AgentResult(is_error=False))
+def test_evidence_backoff_prevents_another_paid_leg_or_trailer_read():
+    gw = _DeclaringGateway(raises=RuntimeError("gh exploded"), prs={100: _declaring_pr()})
+    store, runner = FakeStore(), FakeRunner(_approved())
     workflow = _workflow(gw, store, runner)
-
+    asyncio.run(workflow.review(100))
+    assert len(review_state(store).evidence) == 1
+    review_state(store).evidence_ready = False
     for _ in range(6):
         asyncio.run(workflow.review(100))
+    assert len(review_state(store).evidence) == 1
+    assert runner.tasks == [] and store.get_infra_deaths(-100) == 0
 
-    assert runner.tasks == []
-    assert store.get_infra_deaths(-100) == 1
 
-
-def test_reconciled_external_verdict_resets_the_evidence_deferral_episode():
-    gw = _DeclaringGateway(
-        raises=RuntimeError("gh exploded"), prs={100: _declaring_pr()}
-    )
-    store = FakeStore()
-    runner = FakeRunner(AgentResult(is_error=False))
-    workflow = _workflow(gw, store, runner)
-    for _ in range(5):
-        asyncio.run(workflow.review(100))
-    assert store.get_infra_deaths(-100) == 0
-
-    settled = Review(
-        "CHANGES_REQUESTED",
-        "review-bot",
-        "t1",
-        body="fix it",
-        commit_id="head-1",
-    )
-    gw.raises = None
-    gw._prs[100] = replace(_declaring_pr(), reviews=(settled,))
-    asyncio.run(workflow.review(100))
-
-    gw.raises = RuntimeError("gh exploded again")
-    gw._prs[100] = replace(
-        _declaring_pr(), head_ref_oid="head-2", reviews=(settled,)
-    )
-    asyncio.run(workflow.re_review(100))
-
-    assert runner.tasks == []
-    assert store.get_infra_deaths(-100) == 0
+def test_readable_evidence_is_reported_to_the_authority_before_review():
+    gw = _DeclaringGateway(prs={100: _declaring_pr()})
+    store, runner = FakeStore(), FakeRunner(_approved())
+    asyncio.run(_workflow(gw, store, runner).review(100))
+    assert review_state(store).evidence == [("head-1", None)]
+    assert len(runner.tasks) == 1
 
 
 def test_a_required_test_trailer_still_reaches_the_reviewer():

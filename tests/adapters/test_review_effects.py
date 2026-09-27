@@ -33,7 +33,7 @@ from issue_agent.domain.workflow import (
     RetryAuthorizationRequired, WorkflowChanged,
 )
 from issue_agent.domain.workflow_reconciliation import prewrite_evidence_gate_id
-from issue_agent.domain.world import PRView
+from issue_agent.domain.world import IssueView, PRView
 from tests.domain.test_review_workflow_policy import BOT, TRIGGER, dismissed, gated, observe, rejections, request_for
 from tests.fakes.persistent_github import PersistentGitHub
 from tests.fakes.review_workflow import ACTOR, HEAD, NOW, OTHER_HEAD, PATCH, PR_KEY
@@ -241,6 +241,99 @@ def test_a_partial_review_read_never_succeeds_and_writes_nothing(tmp_path):
         assert rig.store.prewrite_read(command.command_id).failed_reads == 1
     assert rig.calls("dismiss_review") == []
     assert any("pre-write observation unavailable (partial review read" in line for line in rig.logs)
+
+
+@pytest.mark.parametrize("sql_hold", [False, True])
+def test_linked_issue_hold_arriving_after_acceptance_preserves_hold_and_refuses_trigger(rig, rearm, sql_hold):
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    if sql_hold:
+        from tests.adapters.test_review_linkage import held_issue
+        install_workflow(rig.store, held_issue())
+        rig.remote.seed(IssueView(7))
+    else:
+        rig.remote.seed(IssueView(7, labels=frozenset({Label.AI_BLOCKED})))
+    rig.drain()
+    # The selected review dismissals remain authorized; releasing the PR does not.
+    assert rig.remote.review_state("r0") == rig.remote.review_state("r1") == "DISMISSED"
+    projection = by_kind(rearm, CommandKind.RELABEL)[0]
+    assert rig.receipt(projection.command_id)[0] == "permanent_failure"
+    assert "linked issue #7" in rig.receipt(projection.command_id)[1]
+    assert rig.remote.get_pr(PR).labels == frozenset({Label.NEEDS_HUMAN_REVIEW})
+    assert all(call[0] == "dismiss_review" for call in rig.remote.calls)
+
+
+@pytest.mark.parametrize("operation", ["submission", "projection"])
+def test_linked_issue_guard_and_review_write_exclude_concurrent_operator_barrier(rig, monkeypatch, operation):
+    from issue_agent.adapters.deployment_authority import _deployment_effect_lock
+    from tests.domain.test_review_workflow_policy import fresh
+
+    state = fresh()
+    if operation == "submission":
+        install_workflow(rig.store, state)
+    else:
+        commit_rearm(rig.store, accepted_rearm())
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    rig.remote.seed(IssueView(7))
+    blocked = set()
+
+    def operator_cannot_enter(phase):
+        with pytest.raises(BlockingIOError):
+            with _deployment_effect_lock(rig.store.path, "o/r", "review", exclusive=True, blocking=False):
+                pass
+        blocked.add(phase)
+
+    issue_read = rig.remote.get_issue
+
+    def guarded_issue(number):
+        operator_cannot_enter("issue hold read")
+        return issue_read(number)
+
+    monkeypatch.setattr(rig.remote, "get_issue", guarded_issue)
+    if operation == "submission":
+        submit = rig.remote.submit_review
+
+        def guarded_submission(*args, **kwargs):
+            operator_cannot_enter("submission write")
+            return submit(*args, **kwargs)
+
+        monkeypatch.setattr(rig.remote, "submit_review", guarded_submission)
+        assert rig.executor().submit_bound_review(PR, "APPROVE", "approved", HEAD,
+                                                  workflow=state.binding, reviewer=BOT, patch_id=PATCH)
+        assert rig.remote.review_state("submitted-2") == "APPROVED"
+    else:
+        relabel = rig.remote.relabel
+
+        def guarded_projection(*args, **kwargs):
+            operator_cannot_enter("projection write")
+            return relabel(*args, **kwargs)
+
+        monkeypatch.setattr(rig.remote, "relabel", guarded_projection)
+        rig.drain()
+        assert TRIGGER in rig.remote.get_pr(PR).labels
+    assert {"issue hold read", f"{operation} write"} <= blocked
+    # The operator's exclusive barrier becomes available once the operation has ended.
+    with _deployment_effect_lock(rig.store.path, "o/r", "review", exclusive=True, blocking=False):
+        pass
+
+
+def test_unreadable_linked_issue_defers_dismissals_and_projection_with_bounded_evidence(rig, rearm):
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    for _ in range(200):
+        rig.drain()
+        rig.advance(60)
+    for command in rearm.commands:
+        assert rig.state(command.command_id) == "pending"
+        schedule = rig.store.prewrite_read(command.command_id)
+        assert 5 <= schedule.failed_reads <= 13
+        gate = rig.gate(prewrite_evidence_gate_id(command.command_id))
+        assert isinstance(gate.cause, EvidenceUnavailable)
+        assert "linked issue unavailable" in gate.cause.last_error
+    assert rig.remote.calls == []
+    rig.remote.seed(IssueView(7))
+    rig.advance(1800)
+    rig.drain()
+    assert rig.remote.review_state("r0") == rig.remote.review_state("r1") == "DISMISSED"
+    assert TRIGGER in rig.remote.get_pr(PR).labels
 
 
 def test_a_permanently_unreadable_pull_request_backs_off_to_a_visible_evidence_gate(tmp_path):
@@ -525,6 +618,60 @@ def test_a_review_family_grant_buys_exactly_one_guarded_dismissal(rig, rearm):
     assert len([c for c in rig.calls("dismiss_review") if c[2] == "r0"]) == 1
 
 
+def authorized_submission_retry(rig):
+    from issue_agent.adapters.effects import bound_review_command_id
+    from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
+    from tests.domain.test_review_workflow_policy import fresh
+
+    state = fresh()
+    install_workflow(rig.store, state)
+    op = BoundReviewSubmissionOp(PR, "APPROVE", "approved", HEAD, BOT, PATCH, None)
+    command_id = bound_review_command_id(op, state.binding)
+    command = LifecycleCommand(command_id, f"github:{command_id}", CommandKind.SUBMIT_REVIEW,
+                               f"pr:{PR}", HEAD, op.payload(), repository="o/r", executor_identity=REVIEWER,
+                               workflow=state.binding)
+    rig.store.enqueue_command(command)
+    _, gate = _absent_after_expiry(rig, command)
+    grant(rig, command, gate)
+    return command
+
+
+@pytest.mark.parametrize("unavailable", [False, True])
+def test_authorized_submission_retry_still_requires_current_linked_issue_evidence(rig, unavailable):
+    authorized_submission_retry(rig)
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    if not unavailable:
+        rig.remote.seed(IssueView(7, labels=frozenset({Label.AI_BLOCKED})))
+    rig.drain()
+    assert rig.calls("submit_review") == []
+    if unavailable:
+        assert grant_row(rig)[0] is None
+        rig.remote.seed(IssueView(7))
+        rig.advance(1800)
+        rig.drain()
+        assert len(rig.calls("submit_review")) == 1
+        assert grant_row(rig)[0] == "consumed"
+    else:
+        assert grant_row(rig)[0] == "inapplicable"
+
+
+def test_local_authority_corruption_during_submission_retry_does_not_become_remote_uncertainty(rig):
+    from tests.adapters.test_review_linkage import held_issue
+
+    command = authorized_submission_retry(rig)
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    rig.remote.seed(IssueView(7))
+    install_workflow(rig.store, held_issue())
+    with rig.store.transaction() as db:
+        db.execute("DELETE FROM workflow_authority_epochs WHERE family='resolve'")
+    before = rig.store.command_reconciliation(command.command_id)
+    rig.drain()
+    assert rig.calls("submit_review") == []
+    assert grant_row(rig)[0] is None
+    assert rig.store.command_reconciliation(command.command_id) == before
+    assert any("retained" in line for line in rig.logs)
+
+
 def test_a_review_family_grant_whose_guard_changed_ends_inapplicable_without_a_write(rig, rearm):
     command = by_kind(rearm, CommandKind.DISMISS_REVIEW)[0]
     _, gate = _absent_after_expiry(rig, command)
@@ -727,6 +874,71 @@ def lost(point_names, *, once=True):
 def submit_verdict(rig, change, body="fix"):
     return rig.executor().submit_bound_review(PR, "REQUEST_CHANGES", body, HEAD, workflow=change.snapshot.binding,
                                               reviewer=BOT, patch_id=PATCH)
+
+
+@pytest.mark.parametrize("sql_hold", [False, True])
+def test_linked_issue_hold_arriving_after_submission_acceptance_refuses_write(rig, rearm, sql_hold):
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    # Unreadable linkage journals the command before any hold has been observed.
+    with pytest.raises(Exception, match="pre-write observation unavailable"):
+        submit_verdict(rig, rearm)
+    command_id = rig.submission_id()
+    if sql_hold:
+        from tests.adapters.test_review_linkage import held_issue
+        install_workflow(rig.store, held_issue())
+        rig.remote.seed(IssueView(7))
+    else:
+        rig.remote.seed(IssueView(7, labels=frozenset({Label.NEEDS_BUDGET_REVIEW})))
+    rig.advance(1800)
+    rig.drain()
+    assert rig.state(command_id) == "permanent_failure"
+    assert "linked issue #7" in rig.receipt(command_id)[1]
+    assert rig.calls("submit_review") == []
+
+
+def test_unreadable_linked_issue_bounds_submission_reads_and_exposes_evidence_gate(rig, rearm):
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    with pytest.raises(Exception, match="pre-write observation unavailable"):
+        submit_verdict(rig, rearm)
+    command_id = rig.submission_id()
+    for _ in range(200):
+        rig.advance(60)
+        rig.drain()
+    assert 5 <= rig.store.prewrite_read(command_id).failed_reads <= 13
+    gate = rig.gate(prewrite_evidence_gate_id(command_id))
+    assert isinstance(gate.cause, EvidenceUnavailable)
+    assert "linked issue unavailable" in gate.cause.last_error
+    assert rig.state(command_id) == "pending" and rig.calls("submit_review") == []
+
+
+def test_lost_submission_present_receipt_settles_without_reading_new_unavailable_linkage(tmp_path):
+    rig = Rig(tmp_path, fault=lost({"review_submitted"}))
+    change = accepted_rearm()
+    commit_rearm(rig.store, change)
+    with pytest.raises(TimeoutError):
+        submit_verdict(rig, change)
+    command_id = rig.submission_id()
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    rig.advance(1800)
+    rig.drain()
+    assert rig.state(command_id) == "succeeded"
+    assert rig.receipt_object(command_id) == "submitted-2"
+    assert len(rig.calls("submit_review")) == 1
+
+
+def test_local_linkage_database_failure_is_not_submission_remote_read_backoff(rig, rearm):
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    rig.remote.seed(IssueView(7))
+    from tests.adapters.test_review_linkage import held_issue
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+    install_workflow(rig.store, held_issue())
+    with rig.store.transaction() as db:
+        db.execute("DELETE FROM workflow_authority_epochs WHERE family='resolve'")
+    with pytest.raises(WorkflowAuthorityError, match="retained"):
+        submit_verdict(rig, rearm)
+    command_id = rig.submission_id()
+    assert rig.store.prewrite_read(command_id) is None
+    assert rig.calls("submit_review") == []
 
 
 def test_a_bound_submission_receipt_names_its_own_marked_review(rig, rearm):

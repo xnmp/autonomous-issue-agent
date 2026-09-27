@@ -21,7 +21,7 @@ function ReviewControlsForPullRequest({ deployment, pr }: ReviewControlsProps) {
   // Absent still renders: with the family active, the legacy refusal points here,
   // so this panel says why there is nothing to re-arm.
   const quiet = operation.kind === "idle" && !readError && !controller.actionError && !controller.lookupId
-    && (control === null || control.status === "inactive");
+    && control === null;
   if (quiet) return null;
   return <ReviewControlView
     pr={pr}

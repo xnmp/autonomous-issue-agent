@@ -1,5 +1,10 @@
 # Review-rejection slice — handover (increments 1–7 accepted, 8 in progress)
 
+**Historical stop state; resumed by the user on 2026-09-27.** Current work and
+verification are recorded in
+[review slice verification](2026-09-27-review-slice-verification.md). The
+standing deployment restrictions below remain in force.
+
 Date: 2026-09-27. Repository: `/home/chong/Repos/autonomous-issue-agent`.
 Branch `dev` at the commit that adds this document; last feature commit
 **`1cdc834`** (`feat: PR review-control API and dashboard review panel`).

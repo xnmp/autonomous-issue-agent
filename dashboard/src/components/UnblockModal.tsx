@@ -1,12 +1,7 @@
 import { ConfirmModal } from "./ui/Modal";
 
 /**
- * Confirmation for the one operator write that resumes a held issue.
- *
- * It removes the labels that hold the issue for a human (`needs-human-review`,
- * `needs-budget-review`, `ai-blocked`) and nothing else, so the daemons
- * re-derive the stage on their next tick. Shared by the board row and the issue
- * page so both spell out the same consequence before firing.
+ * Confirmation for legacy breaker recovery while workflow families are inactive.
  */
 export function UnblockModal({
   issue,
@@ -38,9 +33,9 @@ export function UnblockModal({
             <span className="mono">ai-blocked</span>?
           </p>
           <p className="muted">
-            The harness picks the issue back up on its next tick and will start
-            spending again. If it escalated with a question, answer the question
-            on GitHub first.
+            This resets legacy retry breakers and may allow paid work to resume.
+            Review rejection holds require review control activation. If the
+            issue escalated with a question, answer it on GitHub first.
           </p>
         </>
       }

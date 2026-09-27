@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
@@ -35,15 +36,20 @@ from issue_agent.adapters.journal import (
     unsettled_starts,
 )
 from issue_agent.adapters.store import Store
+from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.dispatch import AgentDispatcher, DispatchConfig
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.planners.tasks import FixTaskConfig, ReviewTaskConfig
+from issue_agent.app.review_runtime import review_guidance_reader
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.adapters.runtime_plan import AgentRuntime, RuntimePlan
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.world import IssueView, PRView
+from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
+from tests.fakes.review_workflow import held as held_review
+from tests.fakes.workflow_authority import install_workflow
 
 NOW = datetime(2026, 7, 25, 12, 0, 0, tzinfo=timezone.utc)
 
@@ -1130,7 +1136,11 @@ def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
         prs={100: PRView(100)},
     )
     gw.pr_issues[100] = 5
-    cfg = DispatchConfig(fix=FixTaskConfig("o/r", agent_md="AM"), role="fix", repo="o/r")
+    control = SQLiteControlStore(str(tmp_path / "control.sqlite"))
+    control.initialize()
+    install_workflow(control, replace(held_review(key=WorkflowKey("o/r", PullRequestRef(100))), gates=()))
+    cfg = DispatchConfig(fix=FixTaskConfig("o/r", agent_md="AM"), role="fix", repo="o/r",
+                         operator_guidance=review_guidance_reader(control, "o/r"))
 
     class _WT:
         def ensure(self, issue, branch):
