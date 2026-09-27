@@ -50,6 +50,10 @@ job someone still has to do; the same file in `history/` is a record.
 - [2026-09-14-architecture-implementation.md](open/2026-09-14-architecture-implementation.md)
   — six-phase implementation, protected deployment pause, acceptance status,
   archived review and observational baseline.
+- [2026-09-27-review-slice-handover.md](open/2026-09-27-review-slice-handover.md)
+  — current stop-state handover: review-rejection slice increments 1–7 accepted,
+  increment 8 (activation/import, legacy deletion) brief and WIP branch, then
+  phase-3 acceptance and phases 4–6.
 - [issues/](open/issues/) — unresolved incident write-ups awaiting
   re-validation against the current tree.
 

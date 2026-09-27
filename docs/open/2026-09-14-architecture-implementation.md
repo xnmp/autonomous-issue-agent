@@ -363,7 +363,11 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
    inactive-family legacy path is preserved, not claimed deleted.
 5. **Resolve slice accepted** at `6905184` with independent review and full
    composed failure coverage. Next: implement/accept the review-rejection slice
-   ([plan](2026-09-25-phase-3-review-slice-plan.md)).
+   ([plan](2026-09-25-phase-3-review-slice-plan.md)). Review-slice increments
+   1–7 are accepted and committed (`282c320`…`1cdc834`); increment 8
+   (activation/import, legacy deletion) is in progress on branch
+   `wip/review-inc8-activation`. Current stop state:
+   [review slice handover](2026-09-27-review-slice-handover.md).
 6. Only then accept phase 3 and start phase 4. Live activation and soak remain
    separately blocked by the deployment pause, not simulated as completed.
 
