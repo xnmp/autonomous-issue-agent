@@ -91,7 +91,8 @@ _VALUES = (
     rx.ReviewAdmissionRefused, rx.ReviewReservationReleased, rx.ReviewUnlaunchedRound,
     rx.ReviewPreparationFailure, rx.ReviewPreparationDeferred,
     rx.ReviewRoundCancelled, rx.ReviewRoundOutcome, rx.ReviewExecutionPolicy,
-    rx.ReviewExecutionState, rx.ReviewExecutionCheckpoint, rx.ReviewExecutionGenerationBoundary,
+    rx.ReviewExecutionState, rx.ReviewExecutionBoundaryCursor, rx.ReviewExecutionCheckpoint,
+    rx.ReviewExecutionGenerationBoundary,
     rx.ReviewExecutionOrigin, rx.ExecutionNotActivated, rx.ActivatedReviewExecution,
     rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,
     rr.ReviewChildPending, rr.ReviewChildRefused, rr.ReviewChildReleased,
@@ -128,6 +129,8 @@ _CURRENT_ACTIVATED_EXECUTION_TAG = "ActivatedReviewExecutionV2"
 _LEGACY_ACTIVATED_EXECUTION_FIELDS = frozenset({
     "origin", "checkpoint", "state", "last_sequence", "checkpoint_receipt",
 })
+_CURRENT_EXECUTION_CHECKPOINT_TAG = "ReviewExecutionCheckpointV2"
+_LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "policy"})
 
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
@@ -160,6 +163,7 @@ def _encode(value: object, depth: int = 0) -> object:
         return {
             "type": (_CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
                      else _CURRENT_ACTIVATED_EXECUTION_TAG if type(value) is rx.ActivatedReviewExecution
+                     else _CURRENT_EXECUTION_CHECKPOINT_TAG if type(value) is rx.ReviewExecutionCheckpoint
                      else type(value).__name__),
             "fields": {
                 field.name: _encode(getattr(value, field.name), depth + 1)
@@ -223,10 +227,19 @@ def _decode(value: object, depth: int = 0) -> object:
             raise WorkflowEncodingError("wrong fields for legacy activated execution")
         decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
         return rx.ActivatedReviewExecution(**decoded, boundaries=())
+    if tag == "ReviewExecutionCheckpoint":
+        payload = value.get("fields")
+        if (set(value) != {"type", "fields"} or not isinstance(payload, dict)
+                or set(payload) != _LEGACY_EXECUTION_CHECKPOINT_FIELDS):
+            raise WorkflowEncodingError("wrong fields for legacy execution checkpoint")
+        decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
+        return rx.ReviewExecutionCheckpoint(**decoded, boundary_cursor=None)
     if tag == _CURRENT_REVIEW_SNAPSHOT_TAG:
         tag = "ReviewWorkflowSnapshot"
     if tag == _CURRENT_ACTIVATED_EXECUTION_TAG:
         tag = "ActivatedReviewExecution"
+    if tag == _CURRENT_EXECUTION_CHECKPOINT_TAG:
+        tag = "ReviewExecutionCheckpoint"
     constructor = _TAGS.get(tag)
     if constructor is None:
         raise WorkflowEncodingError(f"unknown workflow variant: {tag}")

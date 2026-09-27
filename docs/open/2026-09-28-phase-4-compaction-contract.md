@@ -1,7 +1,9 @@
 # Phase 4 — execution origin and bounded compaction contract
 
-Date: 2026-09-28 Australia/Sydney. Design for the next offline checkpoint;
-execution authority is not activated. Read with the
+Date: 2026-09-28 Australia/Sydney. Contract for offline implementation;
+the pure prefix planner and checkpoint cursor are implemented, while adapter
+receipts, bounded reads and audit remain pending. Execution authority is not
+activated. Read with the
 [execution design](2026-09-27-phase-4-review-execution-design.md),
 [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md), and
 [phase 4 progress](2026-09-27-phase-4-progress.md).

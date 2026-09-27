@@ -94,6 +94,26 @@ plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten accepted strict xfails remained expected. Log:
 `/tmp/phase4-generation-adapter-gate.log` (ephemeral).
 
+## Checkpoint 29 — compaction frontier model
+
+The [compaction contract](2026-09-28-phase-4-compaction-contract.md) defines
+source-backed origins for activation and renewed episodes, a boundary-aware
+checkpoint frontier, bounded canonical reads, and cyclic archived-source
+audit. The pure planner now finds a contiguous finalized prefix even when a
+later boundary covers an open round. It keeps late old-generation outcomes in
+the retired source set while excluding their allowance effect, carries the
+last retired boundary cursor into later checkpoints, and verifies replay from
+the candidate checkpoint. The codec has an exact legacy checkpoint read rule.
+Focused tests cover partial and zero-round compaction, late outcomes,
+malformed/duplicate/future sources, and delivery-order independence. Sol's
+final pure-scope review found no medium or high issue. The adapter still needs
+the origin and checkpoint receipts, bounded hot reads, and archived-source
+audit; execution remains inactive.
+Full `make test` passed: 3,136 domain, 2,838 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten accepted strict xfails remained expected. Log:
+`/tmp/phase4-compaction-model-gate.log` (ephemeral).
+
 ## Next implementation boundaries
 
 1. Implement the [source-backed origin and compaction contract](2026-09-28-phase-4-compaction-contract.md)

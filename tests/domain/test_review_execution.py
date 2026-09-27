@@ -19,7 +19,7 @@ from issue_agent.domain.review_execution import (
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
     SetDisplayedRound, advance_review_execution_generation, carry_review_execution_generation,
     compatible_review_session,
-    project_review_execution, replay_review_execution_generations,
+    plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
 from issue_agent.domain.workflow import WorkflowMutation
@@ -237,6 +237,107 @@ def test_active_generation_advance_preserves_imported_allowance_without_rounds()
     assert replay_review_execution_generations(
         advanced.checkpoint, (), advanced.boundaries,
     ) == advanced.state
+
+
+def test_compaction_after_late_old_round_preserves_carried_state_and_new_suffix():
+    initial = checkpoint(failures=2)
+    first = failed(1)
+    productive_old = copied(2)
+    before = project_review_execution(initial, (productive_old,)).state
+    after = carry_review_execution_generation(before, binding(1), 2)
+    boundary = generation_boundary(before, after, 2, (2,), "boundary:late")
+    new_failure = failed(3, captured=binding(1))
+    outcomes = (first, productive_old, new_failure)
+    current_state = replay_review_execution_generations(initial, outcomes, (boundary,))
+    component = ActivatedReviewExecution(
+        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:late"),
+        initial, current_state, 3, boundaries=(boundary,),
+    )
+
+    with pytest.raises(ValueError, match="open or missing"):
+        plan_review_execution_compaction(component, (productive_old, new_failure), 2)
+    plan = plan_review_execution_compaction(component, outcomes, 2)
+
+    assert plan.checkpoint.through_sequence == 2
+    assert plan.checkpoint.state == after
+    assert plan.last_boundary_receipt == "boundary:late"
+    assert plan.retired_outcomes == (first, productive_old)
+    assert plan.remaining_outcomes == (new_failure,)
+    assert project_review_execution(plan.checkpoint, plan.remaining_outcomes).state == current_state
+    assert plan_review_execution_compaction(component, tuple(reversed(outcomes)), 2) == plan
+
+
+def test_zero_round_advances_compact_at_same_sequence_with_distinct_boundary_frontiers():
+    initial = checkpoint()
+    first_after = carry_review_execution_generation(initial.state, binding(1), 0)
+    first = generation_boundary(initial.state, first_after, 0, (), "boundary:zero:1")
+    second_after = carry_review_execution_generation(first_after, binding(2), 0)
+    second = generation_boundary(first_after, second_after, 0, (), "boundary:zero:2")
+    component = ActivatedReviewExecution(
+        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:zero"),
+        initial, second_after, 0, boundaries=(first, second),
+    )
+
+    plan = plan_review_execution_compaction(component, (), 0)
+
+    assert plan.checkpoint.state == second_after
+    assert plan.last_boundary_receipt == "boundary:zero:2"
+    assert plan.last_boundary_revision == second.to_revision
+    assert plan.retired_boundaries == (first, second)
+    assert plan.remaining_outcomes == ()
+    next_outcome = failed(1, captured=binding(2))
+    next_state = project_review_execution(plan.checkpoint, (next_outcome,)).state
+    later = ActivatedReviewExecution(component.origin, plan.checkpoint, next_state, 1)
+    later_plan = plan_review_execution_compaction(later, (next_outcome,), 1)
+    assert later_plan.retired_boundaries == ()
+    assert later_plan.last_boundary_receipt == "boundary:zero:2"
+    assert later_plan.last_boundary_revision == second.to_revision
+    with pytest.raises(ValueError, match="new finalized frontier"):
+        plan_review_execution_compaction(activated(), (), 0)
+
+
+def test_partial_compaction_keeps_a_later_boundary_and_ignores_late_old_outcome():
+    initial = checkpoint()
+    settled = (failed(1), failed(2))
+    before = project_review_execution(initial, (failed(2),)).state
+    after = carry_review_execution_generation(before, binding(1), 3)
+    boundary = generation_boundary(before, after, 3, (2,), "boundary:open-third")
+    component = ActivatedReviewExecution(
+        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:partial"),
+        initial, after, 3, boundaries=(boundary,),
+    )
+
+    plan = plan_review_execution_compaction(component, settled, 2)
+
+    assert plan.checkpoint.through_sequence == 2
+    assert plan.checkpoint.state == before
+    assert plan.retired_boundaries == ()
+    assert plan.retired_outcomes == settled
+    assert plan.remaining_boundaries == (boundary,)
+    assert replay_review_execution_generations(plan.checkpoint, (failed(3),),
+                                               plan.remaining_boundaries) == after
+
+
+@pytest.mark.parametrize("outcomes", [(None,), (failed(1), failed(1)), (failed(2),)])
+def test_compaction_refuses_invalid_or_noncontiguous_source_sets(outcomes):
+    component = replace(activated(), state=replace(activated().state, failures=1), last_sequence=2)
+    with pytest.raises(ValueError, match="invalid outcome|open or missing|exact allocated"):
+        plan_review_execution_compaction(component, outcomes, 2)
+
+
+def test_compaction_refuses_future_or_duplicated_state_neutral_outcomes():
+    neutral = ReviewRoundOutcome(
+        round_id(1), ReviewRoundCancelled(ReviewCancellationReason.SHUTDOWN, "shutdown:1"),
+    )
+    future = ReviewRoundOutcome(
+        round_id(2), ReviewRoundCancelled(ReviewCancellationReason.SHUTDOWN, "shutdown:2"),
+    )
+    component = replace(activated(), last_sequence=1)
+
+    with pytest.raises(ValueError, match="exact allocated"):
+        plan_review_execution_compaction(component, (neutral, future), 1)
+    with pytest.raises(ValueError, match="exact allocated"):
+        plan_review_execution_compaction(component, (neutral, neutral), 1)
 
 
 def test_a_gap_is_not_compacted_and_filling_it_does_not_charge_later_rounds_twice():

@@ -308,6 +308,29 @@ def test_legacy_activated_execution_tag_decodes_only_its_exact_pre_boundary_fiel
         }}}), ActivatedReviewExecution)
 
 
+def test_execution_checkpoint_tag_requires_explicit_boundary_cursor_evolution():
+    from issue_agent.domain.review_execution import ReviewExecutionBoundaryCursor, ReviewExecutionCheckpoint
+
+    _, proposal = review_v24_proposal()
+    checkpoint = activated_review_execution(proposal.snapshot).checkpoint
+    current = json.loads(encode_workflow(checkpoint))
+    assert current["value"]["type"] == "ReviewExecutionCheckpointV2"
+    old = json.loads(json.dumps(current))
+    old["value"]["type"] = "ReviewExecutionCheckpoint"
+    del old["value"]["fields"]["boundary_cursor"]
+
+    assert decode_workflow(json.dumps(old), ReviewExecutionCheckpoint) == checkpoint
+    cursor = ReviewExecutionBoundaryCursor("boundary:codec-frontier", WorkflowRevision(
+        checkpoint.state.binding.rejection.fence, 8,
+    ))
+    assert decode_workflow(encode_workflow(replace(checkpoint, boundary_cursor=cursor)),
+                           ReviewExecutionCheckpoint).boundary_cursor == cursor
+    with pytest.raises(WorkflowEncodingError, match="legacy execution checkpoint"):
+        decode_workflow(json.dumps({**old, "value": {**old["value"], "fields": {
+            **old["value"]["fields"], "boundary_cursor": None,
+        }}}), ReviewExecutionCheckpoint)
+
+
 def test_current_review_snapshot_has_a_distinct_tag_and_required_inactive_component():
     from issue_agent.domain.review_execution import ExecutionNotActivated
     from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot

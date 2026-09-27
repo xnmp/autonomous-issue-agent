@@ -546,7 +546,7 @@ def _check_execution_projection(
             encode_workflow(boundary.from_revision).encode(),
         ).hexdigest()):
             raise WorkflowAuthorityError("review generation boundary release identity changed")
-    if execution.checkpoint.through_sequence:
+    if execution.checkpoint.through_sequence or execution.checkpoint.boundary_cursor is not None:
         if execution.checkpoint_receipt is None:
             raise WorkflowAuthorityError("review execution checkpoint lacks its compaction receipt")
         compacted = db.execute(

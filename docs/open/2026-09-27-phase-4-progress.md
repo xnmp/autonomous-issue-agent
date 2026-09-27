@@ -806,3 +806,30 @@ Full `make test` passed: 3,129 domain, 2,837 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten accepted strict xfails remained expected. Log:
 `/tmp/phase4-generation-adapter-gate.log` (ephemeral).
+
+## Checkpoint 29 — pure compaction frontier (offline)
+
+The [source-backed compaction contract](2026-09-28-phase-4-compaction-contract.md)
+now defines an activation or renewed-episode origin, a checkpoint frontier
+that distinguishes same-sequence generation advances, bounded hot reads, and
+a separate cyclic audit of archived sources. Independent Sol review tightened
+the contract around lifetime SQL scans, large accepted snapshots, renewed
+origins, audit freshness, and a late old-round cutoff.
+
+The domain can now plan a compaction at a contiguous finalized prefix while
+retaining a later boundary over an open round. It exposes all retired round
+sources separately from the subset applied to the state, verifies that replay
+from the proposed checkpoint matches the active projection, and carries the
+last retired boundary cursor through later round-only checkpoints. Exact
+allocated-sequence and duplicate validation bounds untrusted input before
+range construction. The closed codec has an explicit old checkpoint read rule
+and a new cursor-bearing write tag. Tests cover late outcomes, partial
+compaction, repeated zero-round advances, cursor preservation, malformed
+sources, and delivery-order independence. Sol's final pure-scope pass found no
+remaining medium or high issue. This is a pure planner and codec checkpoint:
+the adapter does not yet mint origin/compaction proofs, retire active suffixes,
+or run the archived-source audit. No live authority was activated.
+Full `make test` passed: 3,136 domain, 2,838 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten accepted strict xfails remained expected. Log:
+`/tmp/phase4-compaction-model-gate.log` (ephemeral).

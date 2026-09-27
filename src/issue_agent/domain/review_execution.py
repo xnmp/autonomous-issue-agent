@@ -536,10 +536,22 @@ class ReviewExecutionState:
 
 
 @dataclass(frozen=True)
+class ReviewExecutionBoundaryCursor:
+    receipt_id: str
+    revision: WorkflowRevision
+
+    def __post_init__(self) -> None:
+        identifier(self.receipt_id, "compacted generation boundary")
+        if not isinstance(self.revision, WorkflowRevision):
+            raise ValueError("compacted generation boundary requires its revision")
+
+
+@dataclass(frozen=True)
 class ReviewExecutionCheckpoint:
     through_sequence: int
     state: ReviewExecutionState
     policy: ReviewExecutionPolicy = ReviewExecutionPolicy()
+    boundary_cursor: ReviewExecutionBoundaryCursor | None = None
 
     def __post_init__(self) -> None:
         integer(self.through_sequence, "execution checkpoint sequence")
@@ -547,6 +559,10 @@ class ReviewExecutionCheckpoint:
             raise ValueError("execution checkpoint requires a validated projection")
         if not isinstance(self.policy, ReviewExecutionPolicy):
             raise ValueError("execution checkpoint requires its captured episode policy")
+        if (self.boundary_cursor is not None
+                and (not isinstance(self.boundary_cursor, ReviewExecutionBoundaryCursor)
+                     or self.boundary_cursor.revision.fence != self.state.binding.rejection.fence)):
+            raise ValueError("execution checkpoint boundary cursor disagrees with its state")
         if max(self.state.session_sequence, self.state.display_sequence, self.state.productive_sequence) > self.through_sequence:
             raise ValueError("execution checkpoint cannot contain a future outcome")
 
@@ -603,7 +619,8 @@ class ActivatedReviewExecution:
             raise ValueError("execution checkpoint exceeds allocated rounds")
         if self.checkpoint_receipt is not None:
             identifier(self.checkpoint_receipt, "execution checkpoint receipt")
-        if self.checkpoint.through_sequence == 0 and self.checkpoint_receipt is not None:
+        if (self.checkpoint.through_sequence == 0 and self.checkpoint.boundary_cursor is None
+                and self.checkpoint_receipt is not None):
             raise ValueError("initial execution checkpoint has no compaction receipt")
         if max(self.state.session_sequence, self.state.display_sequence, self.state.productive_sequence) > self.last_sequence:
             raise ValueError("execution state contains a future outcome")
@@ -630,6 +647,25 @@ class ReviewExecutionProjection:
     state: ReviewExecutionState
     checkpoint: ReviewExecutionCheckpoint
     latest_sequence: int
+
+
+@dataclass(frozen=True)
+class ReviewExecutionCompactionPlan:
+    checkpoint: ReviewExecutionCheckpoint
+    retired_boundaries: tuple[ReviewExecutionGenerationBoundary, ...]
+    retired_outcomes: tuple[ReviewRoundOutcome, ...]
+    remaining_boundaries: tuple[ReviewExecutionGenerationBoundary, ...]
+    remaining_outcomes: tuple[ReviewRoundOutcome, ...]
+
+    @property
+    def last_boundary_receipt(self) -> str | None:
+        cursor = self.checkpoint.boundary_cursor
+        return cursor.receipt_id if cursor is not None else None
+
+    @property
+    def last_boundary_revision(self) -> WorkflowRevision | None:
+        cursor = self.checkpoint.boundary_cursor
+        return cursor.revision if cursor is not None else None
 
 
 def same_execution_episode(current: ReviewExecutionBinding, observed: ReviewExecutionBinding) -> bool:
@@ -775,7 +811,7 @@ def project_review_execution(
     for sequence, outcome in sorted(ordered.items()):
         state = _apply(state, outcome, checkpoint.policy)
         if sequence == prefix.through_sequence + 1:
-            prefix = ReviewExecutionCheckpoint(sequence, state, checkpoint.policy)
+            prefix = ReviewExecutionCheckpoint(sequence, state, checkpoint.policy, checkpoint.boundary_cursor)
     return ReviewExecutionProjection(state, prefix, max(ordered, default=checkpoint.through_sequence))
 
 
@@ -811,7 +847,7 @@ def replay_review_execution_generations(
     state, cutoff = checkpoint.state, checkpoint.through_sequence
     by_sequence = sorted(ordered.items())
     cursor = 0
-    previous_revision: WorkflowRevision | None = None
+    previous_revision = checkpoint.boundary_cursor.revision if checkpoint.boundary_cursor is not None else None
     for index, boundary in enumerate(boundaries):
         if (not isinstance(boundary, ReviewExecutionGenerationBoundary)
                 or boundary.before.binding != state.binding
@@ -873,3 +909,62 @@ def advance_review_execution_generation(
         receipt_id, from_revision, to_revision, mutation,
     )
     return replace(execution, state=after, boundaries=execution.boundaries + (boundary,))
+
+
+def plan_review_execution_compaction(
+    execution: ActivatedReviewExecution, outcomes: tuple[ReviewRoundOutcome, ...],
+    through_sequence: int,
+) -> ReviewExecutionCompactionPlan:
+    """Find a finalized frontier whose retired boundaries preserve full replay."""
+    if not isinstance(execution, ActivatedReviewExecution):
+        raise ValueError("execution compaction requires an active episode")
+    integer(through_sequence, "execution compaction sequence")
+    if through_sequence < execution.checkpoint.through_sequence or through_sequence > execution.last_sequence:
+        raise ValueError("execution compaction frontier exceeds allocated rounds")
+    if not isinstance(outcomes, tuple) or len(outcomes) > MAX_EXECUTION_SUFFIX:
+        raise ValueError("execution compaction requires a bounded outcome suffix")
+    if any(not isinstance(outcome, ReviewRoundOutcome) for outcome in outcomes):
+        raise ValueError("execution compaction contains an invalid outcome")
+    sequences = tuple(outcome.round.sequence for outcome in outcomes)
+    if (any(sequence <= execution.checkpoint.through_sequence or sequence > execution.last_sequence
+            for sequence in sequences) or len(set(sequences)) != len(sequences)):
+        raise ValueError("execution compaction requires exact allocated outcome identities")
+    prefix = tuple(sorted(
+        (outcome for outcome in outcomes if outcome.round.sequence <= through_sequence),
+        key=lambda outcome: outcome.round.sequence,
+    ))
+    expected = through_sequence - execution.checkpoint.through_sequence
+    if expected > len(outcomes) or expected > MAX_EXECUTION_SUFFIX or (
+        tuple(sorted(outcome.round.sequence for outcome in prefix))
+        != tuple(range(execution.checkpoint.through_sequence + 1, through_sequence + 1))
+    ):
+        raise ValueError("execution compaction cannot cross an open or missing round")
+    retired = tuple(boundary for boundary in execution.boundaries if boundary.through_sequence <= through_sequence)
+    remaining_boundaries = execution.boundaries[len(retired):]
+    if not retired and through_sequence == execution.checkpoint.through_sequence:
+        raise ValueError("execution compaction requires a new finalized frontier")
+    if remaining_boundaries:
+        cutoff = retired[-1].through_sequence if retired else execution.checkpoint.through_sequence
+        applied = frozenset(remaining_boundaries[0].applied_sequences)
+        projected_prefix = tuple(
+            outcome for outcome in prefix
+            if outcome.round.sequence <= cutoff or outcome.round.sequence in applied
+        )
+    else:
+        projected_prefix = prefix
+    state = replay_review_execution_generations(execution.checkpoint, projected_prefix, retired)
+    cursor = (
+        ReviewExecutionBoundaryCursor(retired[-1].receipt_id, retired[-1].to_revision)
+        if retired else execution.checkpoint.boundary_cursor
+    )
+    checkpoint = ReviewExecutionCheckpoint(through_sequence, state, execution.checkpoint.policy, cursor)
+    remaining = tuple(sorted(
+        (outcome for outcome in outcomes if outcome.round.sequence > through_sequence),
+        key=lambda outcome: outcome.round.sequence,
+    ))
+    if (replay_review_execution_generations(execution.checkpoint, outcomes, execution.boundaries)
+            != execution.state
+            or replay_review_execution_generations(checkpoint, remaining, remaining_boundaries)
+            != execution.state):
+        raise ValueError("execution compaction changed the active projection")
+    return ReviewExecutionCompactionPlan(checkpoint, retired, prefix, remaining_boundaries, remaining)
