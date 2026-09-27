@@ -854,3 +854,24 @@ authority is still inactive. Full `make test` passed: 3,149 domain, 2,843
 adapter and 2,866 app tests, plus hooks, governor, gate parity, four import
 contracts and both Pyrefly checks. Ten accepted strict xfails remained
 expected. Log: `/tmp/phase4-execution-source-inventory-gate.log` (ephemeral).
+
+## Checkpoint 31 — paged review owner run evidence (offline)
+
+The execution activation reader now scans one review owner's `runs` history
+under an explicit SQL snapshot in bounded pages. It retains terminal and
+unfinished runs, dispatch IDs, outcome and receipt fields, workflow bindings,
+episode keys, and execution round/child attachments without interpreting
+their death or reset effect. Each valid row has a digest independent of its
+SQLite page cursor; oversized, non-text or undecodable fields remain explicit
+unreadable records. The first page includes SQLite's negative and zero
+rowids. The reader makes no eligibility or import decision.
+
+Independent Sol review reproduced a silent negative/zero-rowid omission and
+an invalid-UTF-8 fetch failure; both were fixed and its final pass found no
+remaining medium or high issue in this reader. Activation still needs
+authorized predecessor-owner discovery, complete submission and hold
+receipts, exact issue-counter attribution, and a source-backed origin.
+Execution authority remains inactive. Full `make test` passed: 3,156 domain,
+2,848 adapter and 2,866 app tests, plus hooks, governor, gate parity, four
+import contracts and both Pyrefly checks. Ten accepted strict xfails remained
+expected. Log: `/tmp/phase4-execution-run-inventory-gate.log` (ephemeral).
