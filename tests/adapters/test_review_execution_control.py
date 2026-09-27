@@ -366,22 +366,41 @@ def test_review_opt_out_and_parked_labels_hold_even_when_trigger_remains(rig, la
 
 
 @pytest.mark.parametrize("status", ["executing", "unknown_outcome", "succeeded"])
-def test_unresolved_or_landed_unapplied_submission_prevents_another_preflight(rig, status):
+def test_unresolved_or_landed_unapplied_submission_prevents_another_preflight(tmp_path, status):
     from issue_agent.adapters.effects import bound_review_command_id
     from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
     from issue_agent.domain.contracts import CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
+    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
 
-    store, snapshot, _, selection, control = rig
+    store = _store(tmp_path)
+    _seed_v24_workflow_history(store)
+    store.initialize()
+    with store.transaction() as db:
+        before_activation = load_review_workflow_row(db, WorkflowKey("o/r", PullRequestRef(9)))
+    assert before_activation is not None
     op = BoundReviewSubmissionOp(9, "APPROVE", "approved", "b" * 40, "review-bot", "c" * 64, None)
-    command_id = bound_review_command_id(op, snapshot.binding)
+    command_id = bound_review_command_id(op, before_activation.binding)
     command = LifecycleCommand(command_id, f"github:{command_id}", CommandKind.SUBMIT_REVIEW, "pr:9", "b" * 40,
-                               op.payload(), repository="o/r", executor_identity=OWNER, workflow=snapshot.binding)
+                               op.payload(), repository="o/r", executor_identity=OWNER, workflow=before_activation.binding)
     store.enqueue_command(command)
     store.begin_command(command_id)
     if status != "executing":
         assert store.record_effect(EffectReceipt(command_id, OWNER, store.now(), store.now(), EffectStatus(status),
                                                 remote_object_id="landed-review" if status == "succeeded" else None,
                                                 error=None if status == "succeeded" else "lost response"))
+    with store.transaction() as db:
+        snapshot = _activate_execution_fixture(db)
+    assert store.release_dispatch_claim("o/r", "review", -9, "legacy-owner")
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    occurrence = store.active_dispatch_claims("o/r", "review")[0].claim_key
+    gateway = Gateway()
+    selection = ReviewPreflightSelection(
+        "preflight:1", snapshot.revision, snapshot.execution.binding, occurrence, -9,
+        ObservedPullRequest(snapshot.revision.fence.key, gateway.view.head_ref_oid,
+                            PullRequestState.OPEN, gateway.view.labels, gateway.reviews, store.now()),
+        Label.AI_PR_OPEN, ReviewMode.SINGLE, RuntimeName.CLAUDE, 5,
+    )
+    control = SQLiteReviewExecutionControl(store, WorkflowWriter("o/r", "review", OWNER), gateway)
     before = dump(store)
     with pytest.raises(WorkflowAuthorityError):
         control.preflight(selection)

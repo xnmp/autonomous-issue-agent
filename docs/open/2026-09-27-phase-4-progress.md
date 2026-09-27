@@ -434,6 +434,36 @@ hooks, governor, parity, four import contracts and both Pyrefly checks.
 Log: `/tmp/phase4-budget-outcome-final-full.log` (ephemeral). No live
 activation, target mutation, service restart or paid harness run occurred.
 
+## Checkpoint 16 — source-backed parent abandonment fence (accepted)
+
+`seal_abandoned_planning` now moves an open round to `ReviewParentAbandoned`
+only after the exact parent dispatch claim occurrence is absent and has one
+matching creation and released/reclaimed terminal receipt. The fence digest
+binds the original owner, occurrence, terminal event, claim facts and evolved
+plan. The round update and immutable fence receipt commit together; exact
+replay is inert. The canonical loader rechecks the source and refuses a
+missing, orphan or altered fence. A successor review owner can seal its
+predecessor's round through the existing durable owner lineage.
+
+The abandoned planning state refuses later stage registration and child
+admission, including a replacement parent claim. Active execution now
+refuses bound `SUBMIT_REVIEW` at command enqueue and begin until command and
+round registration can commit atomically. Unbound submissions remain fenced
+by the existing active review-family rule. This checkpoint does not call the
+abandonment writer from daemon recovery and does not lift the temporary
+submission guard.
+
+Behavioral tests cover live and merely missing claims, released and reclaimed
+source receipts, successor ownership, replacement claims, late paid admission,
+submission enqueue, receipt corruption, exact replay and write rollback.
+The historical unresolved-submission hold tests now create their commands
+before the offline activation fixture. Independent Sol review found the
+successor and submission gaps; re-review found no supported write path around
+the guard. Final `make test` passed: 3,121 domain, 2,747 adapter and 2,863
+app tests; hooks, governor, parity, four import contracts and both Pyrefly
+checks. Log: `/tmp/phase4-abandonment-final-full.log` (ephemeral). No live
+activation, target mutation, service restart or paid harness run occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,

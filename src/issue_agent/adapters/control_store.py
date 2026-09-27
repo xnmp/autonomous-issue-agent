@@ -6029,7 +6029,12 @@ class SQLiteControlStore:
                 # unrepresentable in the outbox, not merely skipped by the executor.
                 review_family_op(command)
                 bound_submission_op(command)
-                require_review_binding(db, binding, allow_gated=True)
+                review_snapshot = require_review_binding(db, binding, allow_gated=True)
+                if (command.kind is CommandKind.SUBMIT_REVIEW
+                        and isinstance(review_snapshot.execution, ActivatedReviewExecution)):
+                    raise WorkflowAuthorityError(
+                        "active review execution submission requires atomic round registration"
+                    )
                 if command.target != f"pr:{binding.fence.key.target.number}":
                     raise WorkflowAuthorityError("review rejection command target disagrees with its pull request")
                 return

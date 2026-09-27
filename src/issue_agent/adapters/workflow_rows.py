@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sqlite3
 import json
+from dataclasses import replace
 from typing import TypeVar
 
 from ..domain.resolve_workspace import EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
@@ -21,6 +22,7 @@ from ..domain.review_rounds import (
     MAX_REVIEW_STAGES, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     finalize_review_round,
 )
+from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.workflow import (
     CancelledRearm, CompletedRearm, OpenGate, PendingRearm, RearmIntent, RearmingGate,
     ResolveEpisode, SupersededRearm, WorkflowAbsent, WorkflowMigrationRequired, WorkflowSnapshot,
@@ -45,6 +47,83 @@ class WorkflowRevisionConflict(WorkflowAuthorityError):
 WORKSPACE_ACK_NAMESPACE = "workflow-workspace-completed"
 REVIEW_STAGE_NAMESPACE = "review-round-stage"
 REVIEW_SEAL_NAMESPACE = "review-round-seal"
+REVIEW_ABANDONMENT_NAMESPACE = "review-round-abandonment"
+
+
+def review_parent_abandonment(
+    db: sqlite3.Connection, repository: str, owner_id: str, claim_occurrence_id: str,
+    claim_target: int, plan: ReviewRoundPlan,
+) -> ReviewParentAbandoned:
+    """Derive a fence from the exact terminated parent claim occurrence."""
+    if db.execute(
+        "SELECT 1 FROM dispatch_claims WHERE repository=? AND role='review' AND occurrence_id=?",
+        (repository, claim_occurrence_id),
+    ).fetchone() is not None:
+        raise WorkflowAuthorityError("review parent claim is still present")
+    receipts = {
+        event: db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='dispatch-claim-lifecycle' "
+            "AND scope=? AND key=?",
+            (repository, f"{claim_occurrence_id}:{event}"),
+        ).fetchone()
+        for event in ("created", "released", "reclaimed")
+    }
+    terminal = tuple(event for event in ("released", "reclaimed") if receipts[event] is not None)
+    if receipts["created"] is None or len(terminal) != 1:
+        raise WorkflowAuthorityError("review parent lacks one exact creation and terminal claim receipt")
+    try:
+        created = json.loads(receipts["created"]["payload_json"])
+        ended = json.loads(receipts[terminal[0]]["payload_json"])
+    except (TypeError, ValueError) as exc:
+        raise WorkflowAuthorityError("review parent claim lifecycle receipt is unreadable") from exc
+    target = f"issue:{claim_target}" if claim_target > 0 else f"pr:{-claim_target}"
+    if (not isinstance(created, dict) or not isinstance(ended, dict)
+            or set(created) != {"role", "target", "leg", "owner_id", "owner_pid",
+                                "owner_start_ticks", "claimed_at", "source"}
+            or created["role"] != "review" or created["target"] != target
+            or created["leg"] not in ("REVIEW", "RE_REVIEW")
+            or created["owner_id"] != owner_id
+            or type(created["owner_pid"]) is not int or created["owner_pid"] <= 0
+            or type(created["owner_start_ticks"]) is not int or created["owner_start_ticks"] <= 0
+            or not isinstance(created["claimed_at"], str) or not created["claimed_at"]
+            or created["source"] not in ("admission", "v24-migration")
+            or ended != {key: value for key, value in created.items() if key != "source"}):
+        raise WorkflowAuthorityError("review parent terminal receipt disagrees with its creation")
+    payload = encode_workflow((
+        plan.round.round_id, owner_id, claim_occurrence_id, terminal[0],
+        json.dumps(created, sort_keys=True, separators=(",", ":")),
+        json.dumps(ended, sort_keys=True, separators=(",", ":")), plan,
+    ))
+    digest = hashlib.sha256(payload.encode()).hexdigest()
+    return ReviewParentAbandoned(
+        f"dispatch-claim-lifecycle:{claim_occurrence_id}:{terminal[0]}",
+        f"review-round-abandonment:{digest}",
+    )
+
+
+def verified_review_parent_abandonment(
+    db: sqlite3.Connection, repository: str, owner_id: str, claim_occurrence_id: str,
+    claim_target: int, plan: ReviewRoundPlan,
+    planning: ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+) -> ReviewParentAbandoned | None:
+    row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (REVIEW_ABANDONMENT_NAMESPACE, repository, plan.round.round_id),
+    ).fetchone()
+    if not isinstance(planning, ReviewParentAbandoned):
+        if row is not None:
+            raise WorkflowAuthorityError("review planning contradicts its abandonment fence")
+        return None
+    if row is None:
+        raise WorkflowAuthorityError("abandoned review planning lacks its immutable fence")
+    expected = review_parent_abandonment(
+        db, repository, owner_id, claim_occurrence_id, claim_target, plan,
+    )
+    recorded = decode_workflow(row["payload_json"], tuple)
+    if (planning != expected
+            or recorded != (plan.round.round_id, owner_id, claim_occurrence_id, plan, expected)):
+        raise WorkflowAuthorityError("abandoned review planning disagrees with its claim fence")
+    return planning
 
 
 def verified_review_completed_seal(
@@ -359,6 +438,30 @@ def _check_execution_projection(
                 raise WorkflowAuthorityError("review planning seal revision is not applicable")
         elif seal_row is not None:
             raise WorkflowAuthorityError("review planning state contradicts its completed seal receipt")
+        if not isinstance(planning, ReviewParentAbandoned) and db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_ABANDONMENT_NAMESPACE, scope[0], identity.round_id),
+        ).fetchone() is not None:
+            raise WorkflowAuthorityError("review planning has a contradictory abandonment fence")
+        if isinstance(planning, ReviewParentAbandoned):
+            preflight_row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-preflight' "
+                "AND scope=? AND key=?", (scope[0], identity.round_id),
+            ).fetchone()
+            if preflight_row is None:
+                raise WorkflowAuthorityError("abandoned review round lacks its exact preflight")
+            preflight = decode_workflow(preflight_row["payload_json"], tuple)
+            if (len(preflight) != 3 or not isinstance(preflight[0], ReviewPreflightSelection)
+                    or not isinstance(preflight[1], str) or not preflight[1]
+                    or not isinstance(preflight[2], ReviewRoundPlan)
+                    or preflight[0].request_id != identity.round_id
+                    or preflight[0].claim_occurrence_id != row["claim_occurrence_id"]
+                    or replace(preflight[2], stages=plan.stages, submissions=plan.submissions) != plan):
+                raise WorkflowAuthorityError("abandoned review round preflight disagrees with its plan")
+            verified_review_parent_abandonment(
+                db, scope[0], preflight[1], row["claim_occurrence_id"],
+                preflight[0].claim_target, plan, planning,
+            )
         expected_sequence += 1
         if row["outcome_json"] is None:
             if row["closure_json"] is not None:

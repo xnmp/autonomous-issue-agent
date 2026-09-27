@@ -27,9 +27,11 @@ from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_ho
 from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
-    REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict,
+    REVIEW_ABANDONMENT_NAMESPACE, REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
+    WorkflowAuthorityError, WorkflowRevisionConflict,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
-    review_stage_receipt_key, verified_review_completed_seal,
+    review_parent_abandonment, review_stage_receipt_key, verified_review_completed_seal,
+    verified_review_parent_abandonment,
 )
 
 
@@ -51,6 +53,27 @@ class SQLiteReviewExecutionControl:
         self, db: sqlite3.Connection, request_id: str,
     ) -> tuple[ReviewPreflightSelection, ReviewRoundPlan, ReviewRoundPlan, sqlite3.Row] | None:
         return load_review_preflight_record(db, self._writer.repository, self._writer.owner_id, request_id)
+
+    def _abandonment_round(
+        self, db: sqlite3.Connection, round_id: str,
+    ) -> tuple[str, ReviewPreflightSelection, ReviewRoundPlan, sqlite3.Row] | None:
+        receipt = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (PREFLIGHT_NAMESPACE, self._writer.repository, round_id),
+        ).fetchone()
+        if receipt is None:
+            return None
+        captured = decode_workflow(receipt["payload_json"], tuple)
+        if len(captured) != 3 or not isinstance(captured[1], str) or not captured[1]:
+            raise WorkflowAuthorityError("review abandonment preflight has no captured owner")
+        owner_id = captured[1]
+        if owner_id not in self._control._owner_lineage(db, self._writer.repository, self._writer.owner_id):
+            raise WorkflowAuthorityError("review abandonment owner is outside this deployment lineage")
+        stored = load_review_preflight_record(db, self._writer.repository, owner_id, round_id)
+        if stored is None:
+            raise WorkflowAuthorityError("review abandonment lost its preflight")
+        selection, _, plan, row = stored
+        return owner_id, selection, plan, row
 
     def _receipt(self, db: sqlite3.Connection, selection: ReviewPreflightSelection) -> ReviewRoundPlan | None:
         stored = self._stored_round(db, selection.request_id)
@@ -341,3 +364,48 @@ class SQLiteReviewExecutionControl:
                 "seal_receipt": sealed.seal_receipt,
             })
             return sealed
+
+    def seal_abandoned_planning(self, round_id: str) -> ReviewParentAbandoned:
+        """Fence a round after the exact parent claim occurrence terminates."""
+        validate_workflow_identifier(round_id, "review round")
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._abandonment_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review abandonment lacks its preflight")
+            parent_owner, selection, plan, row = stored
+            planning = decode_workflow(
+                row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+            )
+            prior = verified_review_parent_abandonment(
+                db, self._writer.repository, parent_owner,
+                selection.claim_occurrence_id, selection.claim_target, plan, planning,
+            )
+            if prior is not None:
+                return prior
+            if (not isinstance(planning, ReviewPlanningOpen)
+                    or row["closure_json"] is not None or row["outcome_json"] is not None):
+                raise WorkflowAuthorityError("review planning already has a conclusion")
+            abandoned = review_parent_abandonment(
+                db, self._writer.repository, parent_owner,
+                selection.claim_occurrence_id, selection.claim_target, plan,
+            )
+            changed = db.execute(
+                "UPDATE review_execution_rounds SET planning_json=? WHERE round_id=? "
+                "AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
+                (encode_workflow(abandoned), round_id, row["planning_json"]),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("review round changed during abandonment fence")
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_ABANDONMENT_NAMESPACE, self._writer.repository, round_id,
+                 _stamp(self._control.now()), encode_workflow((
+                     round_id, parent_owner, selection.claim_occurrence_id, plan, abandoned,
+                 ))),
+            )
+            self._control._transition(db, "review_round", round_id, "planning_abandoned", {
+                "claim_occurrence_id": selection.claim_occurrence_id,
+                "abandonment_receipt": abandoned.abandonment_receipt,
+            })
+            return abandoned
