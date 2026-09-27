@@ -637,25 +637,40 @@ history fixtures now test the pure projection contract; real writer tests
 exercise canonical source-backed reload. No live activation, paid run,
 migration or push occurred.
 
-A sealed parent that disappears before admitting a planned child still lacks
-terminal non-admission proof. Reconciliation keeps its round open and surfaces
-a bounded evidence wait. A post-seal abandonment fence must establish that
-proof before activation. Ordered and compacted synthetic suffix tests now
+A sealed parent that disappeared before admitting a planned child lacked
+terminal non-admission proof at this checkpoint; checkpoint 24 adds it.
+Ordered and compacted synthetic suffix tests now
 exercise the pure projection contract; composed canonical coverage belongs
 with the productive and checkpoint writers.
 Independent Sol review identified the missing composed caller and synthetic
 fixture incompatibility; both were corrected. Its final pass found the
-post-seal liveness gap above. Full `make test` passed: 3,122 domain, 2,795
+post-seal liveness gap addressed by checkpoint 24. Full `make test` passed: 3,122 domain, 2,795
 adapter and 2,866 app tests, plus hooks, governor, parity, four import
 contracts and both Pyrefly checks. Log:
 `/tmp/phase4-completed-rounds-full.log` (ephemeral).
+
+## Checkpoint 24 — post-seal parent abandonment proof (offline)
+
+The abandoned-parent variant now has an explicit sealed subtype that carries
+the prior completed planning seal. A terminated exact parent claim can fence
+late admission after that seal; the fence receipt binds both the claim
+lifecycle and the completed seal. Canonical reads verify each source before
+constructing unadmitted child evidence. The bounded round sweep converts a
+sealed round only after its parent claim is gone, and then finalizes a round
+whose children were never admitted without a paid strike. Missing terminal
+claim or seal receipts refuse the transition. Confirmed productive submissions
+remain open until the joint rejection/execution settlement path exists.
+Independent Sol review found no introduced blocker; focused domain and adapter
+tests pass. Full `make test` passed: 3,123 domain, 2,797 adapter and 2,866
+app tests, plus hooks, governor, parity, four import contracts and both
+Pyrefly checks. Log: `/tmp/phase4-post-seal-abandonment-full.log` (ephemeral).
+No live activation or paid run occurred.
 
 ## Required subsequent work
 
 - Finalize completed and abandoned rounds with preparation failures. Preserve
   actual accounting and bind preparation faults to bounded evidence holds
-  before committing their outer outcomes. Capture post-seal parent
-  abandonment so unadmitted children can terminalize safely.
+  before committing their outer outcomes.
 - Pass an execution round through the production review workflow so copied
   and paid verdicts use atomic registration; terminalize fenced abandoned
   rounds from complete evidence before execution activation.

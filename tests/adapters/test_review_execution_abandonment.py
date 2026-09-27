@@ -10,13 +10,17 @@ from issue_agent.adapters.control_store import ControlStoreError
 from issue_agent.adapters.effects import bound_review_command_id
 from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
 from issue_agent.adapters.workflow_codec import decode_workflow
-from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
-from issue_agent.domain.review_rounds import ReviewParentAbandoned
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
+from issue_agent.domain.review_rounds import (
+    ReviewChildNotAdmitted, ReviewParentAbandoned, ReviewPlanningSealed,
+    ReviewSealedParentAbandoned,
+)
+from issue_agent.domain.review_execution import ReviewCancellationReason, ReviewRoundCancelled
 from issue_agent.domain.contracts import CommandKind, LifecycleCommand
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from tests.adapters.test_review_execution_control import OWNER, current, dump, rig
-from tests.adapters.test_review_execution_admission import request
+from tests.adapters.test_review_execution_admission import planned, request
 from tests.adapters.test_review_execution_stage import stage
 
 
@@ -53,6 +57,50 @@ def test_exact_released_parent_seals_empty_round_and_fences_late_stage(rig):
     with pytest.raises(WorkflowAuthorityError, match="claim"):
         control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
     assert dump(store) == before
+
+
+def test_sealed_parent_loss_keeps_completed_seal_and_terminalizes_unadmitted_child(planned):
+    store, selection, control, child = planned
+    sealed = control.seal_completed_planning(child.round.round_id, current(store, selection).revision)
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+
+    sweep = control.reconcile_review_rounds()
+
+    assert sweep.sealed == sweep.finalized == (child.round.round_id,)
+    assert sweep.blocked == ()
+    facts = control.read_round_facts(child.round.round_id)
+    assert isinstance(facts.planning, ReviewSealedParentAbandoned)
+    assert facts.planning.completed_seal == sealed
+    assert facts.children == (ReviewChildNotAdmitted(child, facts.planning.abandonment_receipt),)
+    result = control.finalize_abandoned_round(child.round.round_id)
+    assert result.outcome.disposition == ReviewRoundCancelled(
+        ReviewCancellationReason.UNPAID_ABANDONMENT, facts.closure_receipt,
+    )
+    assert current(store, selection).execution.state.failures == 3
+    before = dump(store)
+    assert not store.reserve(request(child)).admitted
+    assert control.reconcile_review_rounds().finalized == ()
+    assert dump(store) == before
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-seal'")
+        with pytest.raises(WorkflowAuthorityError):
+            load_review_workflow_row(db, selection.expected.fence.key)
+
+
+def test_sealed_parent_without_terminal_claim_receipt_stays_open(planned):
+    store, selection, control, child = planned
+    sealed = control.seal_completed_planning(child.round.round_id, current(store, selection).revision)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dispatch_claims WHERE occurrence_id=?", (selection.claim_occurrence_id,))
+
+    sweep = control.reconcile_review_rounds()
+
+    assert sweep.sealed == sweep.finalized == ()
+    assert sweep.blocked and "terminal claim receipt" in sweep.blocked[0][1]
+    with store.transaction() as db:
+        row = db.execute("SELECT planning_json,closure_json,outcome_json FROM review_execution_rounds").fetchone()
+        assert decode_workflow(row["planning_json"], ReviewPlanningSealed) == sealed
+        assert row["closure_json"] is row["outcome_json"] is None
 
 
 def test_recovery_sweep_fences_only_exact_terminal_parent_occurrences(rig):

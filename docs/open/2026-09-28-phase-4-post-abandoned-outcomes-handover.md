@@ -63,15 +63,19 @@ passed: 3,122 domain, 2,795 adapter and 2,866 app tests, plus hooks,
 governor, parity, architecture and Pyrefly. Log:
 `/tmp/phase4-completed-rounds-full.log` (ephemeral). Independent Sol review
 found and verified fixes for the missing composed caller and synthetic
-fixture incompatibility. A sealed parent that disappears before
-child admission still lacks terminal non-admission proof, so its round stays
-open with a bounded evidence wait. Restore composed ordered/compacted suffix
-coverage alongside the productive and checkpoint writers.
+fixture incompatibility. The subsequent post-seal abandonment checkpoint
+adds terminal non-admission proof for children whose sealed parent departs;
+independent Sol review found no introduced blocker, while confirmed productive
+submissions still need joint settlement. Full `make test` passed: 3,123
+domain, 2,797 adapter and 2,866 app tests, plus hooks, governor, parity,
+architecture and Pyrefly. Log: `/tmp/phase4-post-seal-abandonment-full.log`
+(ephemeral). Restore composed ordered/compacted suffix coverage alongside
+the productive and checkpoint writers.
 
 1. Add the bounded preparation-failure schedule and hold in the same
    transaction as `DeferredReviewPreparation` outcomes. Reuse existing
    rejection-family gate/hold machinery where applicable; do not invent a
-   second queue. Complete post-seal parent abandonment proof.
+   second queue.
 2. Settle confirmed paid/copied submissions jointly with the existing
    `record_review` rejection baseline or `open_ceiling` transaction before
    their later marker. Capture its canonical round outcome and execution reset

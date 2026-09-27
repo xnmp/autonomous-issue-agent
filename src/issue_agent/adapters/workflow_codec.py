@@ -102,7 +102,8 @@ _VALUES = (
     rr.ReviewSubmissionConfirmed, rr.ReviewSubmissionRefused,
     rr.ReviewSubmissionEvidence, rr.ReviewPlanningOpen,
     rr.ReviewPlanningComplete, rr.ReviewPlanningRefused, rr.ReviewPlanningSealed,
-    rr.ReviewParentAbandoned, rr.ReviewRoundFacts, rr.ReviewRoundAwaitingEvidence,
+    rr.ReviewParentAbandoned, rr.ReviewSealedParentAbandoned,
+    rr.ReviewRoundFacts, rr.ReviewRoundAwaitingEvidence,
     rr.FinalizedReviewRound, rr.DeferredReviewPreparation,
     preflight.ReviewPreflightSelection,
 )

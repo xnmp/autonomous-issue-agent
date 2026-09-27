@@ -446,6 +446,17 @@ class ReviewParentAbandoned:
 
 
 @dataclass(frozen=True)
+class ReviewSealedParentAbandoned(ReviewParentAbandoned):
+    completed_seal: ReviewPlanningSealed
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (not isinstance(self.completed_seal, ReviewPlanningSealed)
+                or not isinstance(self.completed_seal.conclusion, ReviewPlanningComplete)):
+            raise ValueError("post-seal abandonment requires completed planning proof")
+
+
+@dataclass(frozen=True)
 class ReviewRoundFacts:
     closure_receipt: str
     plan: ReviewRoundPlan

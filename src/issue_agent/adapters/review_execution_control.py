@@ -43,7 +43,8 @@ from .workflow_rows import (
     WorkflowAuthorityError, WorkflowRevisionConflict,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
     read_review_submission_registration, require_review_submission_receipts,
-    review_parent_abandonment, review_stage_receipt_key, review_submission_receipt_key,
+    review_parent_abandonment, review_sealed_parent_abandonment,
+    review_stage_receipt_key, review_submission_receipt_key,
     verified_review_completed_seal,
     verified_review_parent_abandonment,
 )
@@ -114,8 +115,8 @@ class SQLiteReviewExecutionControl:
                         row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
                     )
                 )
-                if open_planning:
-                    self.seal_abandoned_planning(round_id)
+                if open_planning or (isinstance(planning, ReviewPlanningSealed) and row["live_claim"] is None):
+                    planning = self.seal_abandoned_planning(round_id)
                     sealed.append(round_id)
                 result = (
                     self.finalize_completed_round(round_id)
@@ -839,12 +840,19 @@ class SQLiteReviewExecutionControl:
             )
             if prior is not None:
                 return prior
-            if (not isinstance(planning, ReviewPlanningOpen)
+            if (not isinstance(planning, (ReviewPlanningOpen, ReviewPlanningSealed))
                     or row["closure_json"] is not None or row["outcome_json"] is not None):
                 raise WorkflowAuthorityError("review planning already has a conclusion")
-            abandoned = review_parent_abandonment(
-                db, self._writer.repository, parent_owner,
-                selection.claim_occurrence_id, selection.claim_target, plan,
+            abandoned = (
+                review_sealed_parent_abandonment(
+                    db, self._writer.repository, parent_owner,
+                    selection.claim_occurrence_id, selection.claim_target, plan, planning,
+                )
+                if isinstance(planning, ReviewPlanningSealed)
+                else review_parent_abandonment(
+                    db, self._writer.repository, parent_owner,
+                    selection.claim_occurrence_id, selection.claim_target, plan,
+                )
             )
             changed = db.execute(
                 "UPDATE review_execution_rounds SET planning_json=? WHERE round_id=? "

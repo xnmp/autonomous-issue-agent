@@ -455,6 +455,27 @@ def test_abandonment_requires_explicit_late_admission_fence_and_each_unadmitted_
         rounds.ReviewParentAbandoned("parent:dead", "")
 
 
+def test_post_seal_parent_loss_retains_completed_decision_and_exact_absence_proof():
+    planned = plan()
+    sealed = rounds.ReviewPlanningSealed("seal:completed", rounds.ReviewPlanningComplete())
+    abandoned = rounds.ReviewSealedParentAbandoned("parent:dead", "late:fenced", sealed)
+    child = rounds.ReviewChildNotAdmitted(planned.children[0], abandoned.abandonment_receipt)
+
+    outcome = finalized(facts(planned, children=(child,), planning=abandoned))
+
+    assert outcome.disposition == execution.ReviewRoundCancelled(
+        execution.ReviewCancellationReason.UNPAID_ABANDONMENT, "complete-closure",
+    )
+    with pytest.raises(ValueError, match="completed planning"):
+        rounds.ReviewSealedParentAbandoned(
+            "parent:dead", "late:fenced",
+            rounds.ReviewPlanningSealed("seal:refused", rounds.ReviewPlanningRefused("refused")),
+        )
+    with pytest.raises(ValueError, match="exact abandoned parent"):
+        facts(planned, children=(rounds.ReviewChildNotAdmitted(planned.children[0], "another-parent"),),
+              planning=abandoned)
+
+
 def test_paid_gate_before_parent_death_is_one_failure_only_after_proven_abandonment():
     planned = plan(mode=ReviewMode.MULTI)
     planned = replace(planned, stages=planned.stages[:1])

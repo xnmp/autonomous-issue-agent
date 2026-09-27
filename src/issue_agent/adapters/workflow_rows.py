@@ -19,6 +19,7 @@ from ..domain.review_execution import (
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
+    ReviewSealedParentAbandoned,
     MAX_REVIEW_STAGES, MAX_ROUND_SUBMISSIONS, ReviewPlanningComplete, ReviewPlanningOpen,
     ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     ReviewSubmissionRegistration,
@@ -197,6 +198,23 @@ def review_parent_abandonment(
     )
 
 
+def review_sealed_parent_abandonment(
+    db: sqlite3.Connection, repository: str, owner_id: str, claim_occurrence_id: str,
+    claim_target: int, plan: ReviewRoundPlan, seal: ReviewPlanningSealed,
+) -> ReviewSealedParentAbandoned:
+    """Retain the completed seal while fencing a departed parent's unadmitted children."""
+    if not isinstance(seal, ReviewPlanningSealed):
+        raise ValueError("post-seal abandonment requires completed planning")
+    verified_review_completed_seal(db, repository, owner_id, claim_occurrence_id, plan, seal)
+    parent = review_parent_abandonment(
+        db, repository, owner_id, claim_occurrence_id, claim_target, plan,
+    )
+    digest = hashlib.sha256(encode_workflow((parent.admission_fence_receipt, seal)).encode()).hexdigest()
+    return ReviewSealedParentAbandoned(
+        parent.abandonment_receipt, f"review-round-abandonment:{digest}", seal,
+    )
+
+
 def verified_review_parent_abandonment(
     db: sqlite3.Connection, repository: str, owner_id: str, claim_occurrence_id: str,
     claim_target: int, plan: ReviewRoundPlan,
@@ -212,8 +230,15 @@ def verified_review_parent_abandonment(
         return None
     if row is None:
         raise WorkflowAuthorityError("abandoned review planning lacks its immutable fence")
-    expected = review_parent_abandonment(
-        db, repository, owner_id, claim_occurrence_id, claim_target, plan,
+    expected = (
+        review_sealed_parent_abandonment(
+            db, repository, owner_id, claim_occurrence_id, claim_target, plan,
+            planning.completed_seal,
+        )
+        if isinstance(planning, ReviewSealedParentAbandoned)
+        else review_parent_abandonment(
+            db, repository, owner_id, claim_occurrence_id, claim_target, plan,
+        )
     )
     recorded = decode_workflow(row["payload_json"], tuple)
     if (planning != expected
@@ -227,6 +252,8 @@ def verified_review_completed_seal(
     plan: ReviewRoundPlan, planning: ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
 ) -> WorkflowRevision | None:
     """Match a completed parent decision to its immutable round receipt."""
+    if isinstance(planning, ReviewSealedParentAbandoned):
+        planning = planning.completed_seal
     row = db.execute(
         "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
         (REVIEW_SEAL_NAMESPACE, repository, plan.round.round_id),
@@ -521,7 +548,10 @@ def _check_execution_projection(
             "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
             (REVIEW_SEAL_NAMESPACE, scope[0], identity.round_id),
         ).fetchone()
-        if isinstance(planning, ReviewPlanningSealed) and isinstance(planning.conclusion, ReviewPlanningComplete):
+        completed_planning = (
+            planning.completed_seal if isinstance(planning, ReviewSealedParentAbandoned) else planning
+        )
+        if isinstance(completed_planning, ReviewPlanningSealed) and isinstance(completed_planning.conclusion, ReviewPlanningComplete):
             if seal_row is None:
                 raise WorkflowAuthorityError("sealed review round lacks its immutable planning receipt")
             seal_record = decode_workflow(seal_row["payload_json"], tuple)
