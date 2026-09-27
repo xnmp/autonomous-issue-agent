@@ -7,6 +7,7 @@ import os
 import pytest
 
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
+from issue_agent.adapters.codex_runner import CodexRunner
 from issue_agent.adapters.control_store import AccountingDisposition, ReservationResult
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
@@ -16,6 +17,8 @@ from issue_agent.domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATU
 from issue_agent.domain.pricing import BudgetPolicy
 from tests.adapters.test_review_execution_admission import planned, refusal_receipt
 from tests.adapters.test_review_execution_control import OWNER, rig
+from tests.adapters.test_review_preflight_stop import codex_planned
+from tests.adapters.test_accounting_runtime import _rates
 from tests.fakes.legacy_journal import Journal
 
 
@@ -163,3 +166,52 @@ def test_invalid_provider_cost_still_retains_launched_review_output(planned_chil
     captured = store.returned_review_child("o/r", RunId(run["run_id"]))
     assert captured is not None and captured.result.summary == "finding"
     assert captured.result.structured_json == '{"decision":"changes"}'
+
+
+@pytest.mark.parametrize("failure", ["stream_drop", "rate_limit"])
+def test_codex_transport_failure_keeps_one_review_launch_and_raw_return(codex_planned, tmp_path, failure):
+    store, _, child = codex_planned
+    attempts = tmp_path / "attempts"
+    message = (
+        "stream disconnected before completion"
+        if failure == "stream_drop"
+        else "azure-openai error: exceeded rate limit"
+    )
+    cli = tmp_path / "codex"
+    cli.write_text(
+        f'#!/bin/sh\necho attempt >> "{attempts}"\necho "{message}" >&2\nexit 1\n'
+    )
+    cli.chmod(0o700)
+    runner = CodexRunner(
+        codex_bin=str(cli), env={"OPENAI_API_KEY": "test-key"},
+        process_supervisor=ProcessSupervisor(str(tmp_path / "supervision")),
+        transport_retries=3, max_rate_limit_retries=3,
+        backoff_base=0.01, rate_limit_backoff_base=0.01,
+    )
+    accounting = AccountingRuntime(
+        runner, store, "o/r", "review", Money("USD", 5_000_000), None, None,
+        "cfg", "codex", BudgetPolicy({("review", "REVIEW"): Money("USD", 2_000_000)}),
+        _rates(), owner_id=OWNER,
+    )
+    journal = JournalingRuntime(
+        accounting, Journal(str(tmp_path / "journal.jsonl")), repo="o/r", role="review",
+    )
+    journal.set_context(
+        "review", "REVIEW", 9, None, claim_target=-9,
+        workflow=child.round.binding.rejection, review_child=child,
+    )
+
+    result = asyncio.run(journal.run(RuntimePlan("review", model="model-a", max_budget_usd=2)))
+
+    assert result.is_error and result.status == "timeout"
+    assert result.exit_reason is ExitReason.TRANSPORT_DEATH
+    assert attempts.read_text().splitlines() == ["attempt"]
+    with store.transaction() as db:
+        run = db.execute("SELECT run_id,state,outcome FROM runs").fetchone()
+        assert run is not None and tuple(run)[1:] == ("completed", "spend_unreconciled")
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-execution-launch'").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
+    captured = store.returned_review_child("o/r", RunId(run["run_id"]))
+    assert captured is not None and captured.child == child
+    assert captured.result.exit_reason is ExitReason.TRANSPORT_DEATH

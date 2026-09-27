@@ -1114,6 +1114,33 @@ def test_run_exhausted_transport_retries_is_infra_death():
     assert infra_death(r.exit_reason) is True
 
 
+@pytest.mark.parametrize("failure", ["stream_drop", "rate_limit"])
+def test_attached_review_child_returns_after_one_transport_failure(tmp_path, failure):
+    counter = tmp_path / "attempts"
+    message = (
+        "stream disconnected before completion"
+        if failure == "stream_drop"
+        else "azure-openai error: exceeded rate limit"
+    )
+    codex = _fake_codex(
+        str(tmp_path),
+        f'echo attempt >> "{counter}"\necho "{message}" >&2\nexit 1\n',
+    )
+    runner = CodexRunner(
+        codex_bin=codex, env={"OPENAI_API_KEY": "k"},
+        transport_retries=3, max_rate_limit_retries=3,
+        backoff_base=0.01, rate_limit_backoff_base=0.01,
+    )
+
+    result = asyncio.run(runner.run(RuntimePlan(
+        prompt="review", env={"ISSUE_AGENT_REVIEW_CHILD": "1"},
+    )))
+
+    assert result.is_error and result.status == "timeout"
+    assert result.exit_reason is ExitReason.TRANSPORT_DEATH
+    assert counter.read_text().splitlines() == ["attempt"]
+
+
 def test_run_process_killed_by_signal_is_infra_death_not_an_attempt():
     """FAILURE-MODES #58: codex died `exit -9` six times on one PR (suspected macOS
     jetsam during the Playwright RSS burst) and each death marched the breaker to

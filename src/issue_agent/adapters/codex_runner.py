@@ -1538,6 +1538,11 @@ class CodexRunner(AgentRuntime):
         )
         net_attempts = 0
         rl_attempts = 0
+        # An attached review child has one immutable launch receipt per run.
+        # A second supervised exec under that run cannot register a process.
+        attached_review_child = task.env.get("ISSUE_AGENT_REVIEW_CHILD") == "1"
+        transport_retries = 0 if attached_review_child else self.transport_retries
+        rate_limit_retries = 0 if attached_review_child else self.max_rate_limit_retries
         while True:
             # Review M17: truncate the envelope BEFORE each attempt. Codex writes
             # `-o` only when a turn completes, so a retry after a mid-turn drop
@@ -1624,7 +1629,7 @@ class CodexRunner(AgentRuntime):
                 # Honour a parsed Retry-After; else back off aligned to the window
                 # (rate_limit_backoff_base * (attempt+1)), capped. Does NOT consume
                 # the network-drop budget.
-                if rl_attempts >= self.max_rate_limit_retries:
+                if rl_attempts >= rate_limit_retries:
                     self._log(
                         f"codex: rate limit (429) persisted after "
                         f"{rl_attempts + 1} attempt(s) — giving up (retryable timeout)"
@@ -1648,7 +1653,7 @@ class CodexRunner(AgentRuntime):
                 rl_attempts += 1
                 self._log(
                     f"codex: rate limited (429) — attempt {rl_attempts}/"
-                    f"{self.max_rate_limit_retries}; "
+                    f"{rate_limit_retries}; "
                     f"{'resuming ' + resume_id if resume_id else 'restarting'} in "
                     f"{delay:.1f}s{' (Retry-After)' if hinted is not None else ' (window-aligned)'}"
                 )
@@ -1656,7 +1661,7 @@ class CodexRunner(AgentRuntime):
                 continue
 
             # Plain network drop: short jittered exponential backoff, fresh connection.
-            if net_attempts >= self.transport_retries:
+            if net_attempts >= transport_retries:
                 self._log(
                     f"codex: gateway stream-drop persisted after "
                     f"{net_attempts + 1} attempt(s) — giving up (retryable timeout)"
@@ -1676,7 +1681,7 @@ class CodexRunner(AgentRuntime):
             net_attempts += 1
             self._log(
                 f"codex: gateway stream-drop (attempt {net_attempts}/"
-                f"{self.transport_retries + 1}); "
+                f"{transport_retries + 1}); "
                 f"{'resuming ' + resume_id if resume_id else 'restarting'} "
                 f"in {delay:.1f}s"
             )

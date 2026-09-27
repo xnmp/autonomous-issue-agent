@@ -602,6 +602,23 @@ hooks, governor, parity, four import contracts and both Pyrefly checks. Log:
 `/tmp/phase4-transport-return-final-full.log` (ephemeral). Independent Sol
 review found no blocker.
 
+## Checkpoint 22 — one supervised Codex launch per attached review child (offline)
+
+An attached review child now returns after its first Codex stream drop or
+provider rate limit, even when the runner's ordinary retry budgets are
+positive. The accounting run has one immutable launch receipt; a retry in the
+same child would start another supervised process that cannot register against
+that receipt. The returned `TRANSPORT_DEATH` result can be classified by the
+non-striking child evidence path from checkpoint 21 after accounting
+reconciliation. Unattached Codex legs keep their existing transport retry
+policy. Fake-CLI tests assert one process invocation for each failure class;
+composed tests also verify one guarded launch receipt, durable raw return and
+retained reservation when trusted usage is absent. Independent Sol review found
+no blocker. Full `make test` passed: 3,122 domain, 2,790 adapter and 2,866
+app tests, plus hooks, governor, parity, four import contracts and both
+Pyrefly checks. Log: `/tmp/phase4-codex-child-retry-full.log` (ephemeral).
+No live activation or paid run occurred.
+
 ## Required subsequent work
 
 - Finalize completed-planning rounds and source-backed abandoned rounds with

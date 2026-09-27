@@ -47,6 +47,15 @@ composition work. The transport checkpoint passed the full gate: 3,122
 domain, 2,788 adapter and 2,864 app tests, plus hooks, governor, parity,
 architecture and Pyrefly. Independent Sol review found no blocker.
 
+The following offline Codex checkpoint limits attached review children to
+one supervised process for both stream drops and 429 returns. Focused and
+composed fake-CLI tests show one launch receipt and durable raw return; a
+child with no trusted usage retains its reservation until reconciliation.
+Unattached Codex legs keep their retry budgets. Independent Sol review found
+no blocker. Full `make test` passed: 3,122 domain, 2,790 adapter and 2,866
+app tests, plus hooks, governor, parity, four import contracts and both
+Pyrefly checks. Log: `/tmp/phase4-codex-child-retry-full.log` (ephemeral).
+
 1. Add the bounded preparation-failure schedule and hold in the same
    transaction as `DeferredReviewPreparation` outcomes. Reuse existing
    rejection-family gate/hold machinery where applicable; do not invent a
