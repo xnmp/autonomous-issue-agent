@@ -833,3 +833,24 @@ Full `make test` passed: 3,136 domain, 2,838 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten accepted strict xfails remained expected. Log:
 `/tmp/phase4-compaction-model-gate.log` (ephemeral).
+
+## Checkpoint 30 — legacy execution file inventory (offline)
+
+The read-only execution source reader records `pr-N.session`,
+`pr-N.round`, and both `issue-N.infra-deaths` and
+`issue--N.infra-deaths` across supplied state roots. It retains
+raw runtime-tagged session bytes, absent versus unreadable files, malformed
+names, and duplicate targets in different physical roots. It reuses the
+bounded, no-follow file reader from resolve activation and makes no import or
+eligibility decision. Typed records keep the signed legacy counter key until
+issue-to-PR attribution can be proven from fresh linked-issue observations.
+
+Tests cover normal and malformed names, UTF-8 and size failures, nonregular
+files, symlinks, root aliases, cross-root duplicates and read-only behavior.
+Independent Sol review found no medium or high defect in this file slice and
+confirmed that SQL abandoned-run deaths, submission receipts, and verdict
+hold provenance remain separate required activation evidence. Execution
+authority is still inactive. Full `make test` passed: 3,149 domain, 2,843
+adapter and 2,866 app tests, plus hooks, governor, gate parity, four import
+contracts and both Pyrefly checks. Ten accepted strict xfails remained
+expected. Log: `/tmp/phase4-execution-source-inventory-gate.log` (ephemeral).

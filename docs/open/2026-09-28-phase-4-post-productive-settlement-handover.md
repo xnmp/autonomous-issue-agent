@@ -116,15 +116,19 @@ checks. Ten accepted strict xfails remained expected. Log:
 
 ## Next implementation boundaries
 
-1. Implement the [source-backed origin and compaction contract](2026-09-28-phase-4-compaction-contract.md)
+1. Complete execution activation source inventory: SQL run/death and
+   submission receipts, hold provenance, and explicit issue-counter mapping.
+   The legacy file inventory is in checkpoint 30 of the
+   [progress record](2026-09-27-phase-4-progress.md).
+2. Implement the [source-backed origin and compaction contract](2026-09-28-phase-4-compaction-contract.md)
    with bounded canonical reads and an archived-source audit. The current
    4,096-round and boundary suffix limits remain activation gates.
-2. Add source-specific bounded rereads for `REVISION_DIFF` and `CONTAINMENT`
+3. Add source-specific bounded rereads for `REVISION_DIFF` and `CONTAINMENT`
    preparation outcomes after their adapter sources are minted.
-3. Wire real round identity through production review dispatch, child
+4. Wire real round identity through production review dispatch, child
    reservations and verdict registration. Resolve SDK exception transport
    classification and run composed recovery tests.
-4. Complete offline migration, shadow, rehearsal and execution-family
+5. Complete offline migration, shadow, rehearsal and execution-family
    activation. Phases 5–6 follow; live phase-5 windows require explicit user
    authorization.
 
