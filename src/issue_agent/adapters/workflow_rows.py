@@ -19,7 +19,9 @@ from ..domain.review_execution import (
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
-    MAX_REVIEW_STAGES, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
+    MAX_REVIEW_STAGES, MAX_ROUND_SUBMISSIONS, ReviewPlanningComplete, ReviewPlanningOpen,
+    ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
+    ReviewSubmissionRegistration,
     finalize_review_round,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
@@ -48,6 +50,99 @@ WORKSPACE_ACK_NAMESPACE = "workflow-workspace-completed"
 REVIEW_STAGE_NAMESPACE = "review-round-stage"
 REVIEW_SEAL_NAMESPACE = "review-round-seal"
 REVIEW_ABANDONMENT_NAMESPACE = "review-round-abandonment"
+REVIEW_SUBMISSION_NAMESPACE = "review-round-submission"
+REVIEW_SUBMISSION_INDEX_NAMESPACE = "review-round-submission-index"
+
+
+def review_submission_receipt_prefix(round_id: str) -> str:
+    return hashlib.sha256(encode_workflow(round_id).encode()).hexdigest() + ":"
+
+
+def review_submission_receipt_key(round_id: str, command_id: str) -> str:
+    return review_submission_receipt_prefix(round_id) + hashlib.sha256(encode_workflow(command_id).encode()).hexdigest()
+
+
+def read_review_submission_registration(
+    db: sqlite3.Connection, repository: str, command_id: str,
+) -> ReviewSubmissionRegistration | None:
+    row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (REVIEW_SUBMISSION_NAMESPACE, repository, command_id),
+    ).fetchone()
+    return decode_workflow(row["payload_json"], ReviewSubmissionRegistration) if row is not None else None
+
+
+def require_review_submission_receipts(
+    db: sqlite3.Connection, repository: str, plan: ReviewRoundPlan,
+    claim_occurrence_id: str, revision: WorkflowRevision,
+) -> None:
+    """Check the command and round indices against the immutable plan."""
+    prefix = review_submission_receipt_prefix(plan.round.round_id)
+    rows = db.execute(
+        "SELECT key,payload_json FROM dedupe_keys WHERE namespace=? AND scope=? "
+        "AND key>=? AND key<? LIMIT ?",
+        (REVIEW_SUBMISSION_INDEX_NAMESPACE, repository, prefix, prefix[:-1] + ";",
+         MAX_ROUND_SUBMISSIONS + 1),
+    ).fetchall()
+    if len(rows) != len(plan.submissions):
+        raise WorkflowAuthorityError("review submission receipts disagree with its round plan")
+    if not plan.submissions:
+        return
+    indexed = {row["key"]: row["payload_json"] for row in rows}
+    preflight_row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-preflight' "
+        "AND scope=? AND key=?", (repository, plan.round.round_id),
+    ).fetchone()
+    if preflight_row is None:
+        raise WorkflowAuthorityError("review submission plan lacks its preflight owner")
+    preflight = decode_workflow(preflight_row["payload_json"], tuple)
+    if (len(preflight) != 3 or not isinstance(preflight[0], ReviewPreflightSelection)
+            or not isinstance(preflight[1], str) or not preflight[1]
+            or not isinstance(preflight[2], ReviewRoundPlan)
+            or preflight[0].claim_occurrence_id != claim_occurrence_id
+            or preflight[0].request_id != plan.round.round_id
+            or preflight[0].binding != plan.round.binding
+            or replace(preflight[2], stages=plan.stages, submissions=plan.submissions) != plan):
+        raise WorkflowAuthorityError("review submission plan disagrees with its preflight")
+    for submission in plan.submissions:
+        key = review_submission_receipt_key(plan.round.round_id, submission.command_id)
+        payload = indexed.get(key)
+        if payload is None:
+            raise WorkflowAuthorityError("planned review submission lacks its round index")
+        registration = decode_workflow(payload, ReviewSubmissionRegistration)
+        command_registration = read_review_submission_registration(db, repository, submission.command_id)
+        if (command_registration != registration or registration.round != plan.round
+                or registration.submission != submission
+                or registration.claim_occurrence_id != claim_occurrence_id
+                or registration.owner_id != preflight[1]
+                or registration.registered_revision.fence != plan.round.binding.rejection.fence
+                or (registration.registered_revision.fence == revision.fence
+                    and registration.registered_revision.version > revision.version)):
+            raise WorkflowAuthorityError("review submission registration disagrees with its round")
+        command = db.execute(
+            "SELECT repository,target,kind,expected_revision,config_version,executor_identity,"
+            "idempotency_key,payload_json,payload_digest,workflow_binding_json FROM lifecycle_commands "
+            "WHERE command_id=?", (submission.command_id,),
+        ).fetchone()
+        if (command is None or command["repository"] != repository
+                or command["target"] != f"pr:{plan.round.binding.rejection.fence.key.target.number}"
+                or command["kind"] != "submit_review"
+                or command["expected_revision"] != plan.head_sha
+                or command["config_version"] != registration.config_version
+                or command["executor_identity"] != registration.owner_id
+                or command["idempotency_key"] != registration.idempotency_key
+                or command["payload_digest"] != registration.command_digest
+                or command["workflow_binding_json"] != encode_workflow(plan.round.binding.rejection)):
+            raise WorkflowAuthorityError("review submission command disagrees with its round receipt")
+        try:
+            payload_value = json.loads(command["payload_json"])
+        except (TypeError, ValueError) as exc:
+            raise WorkflowAuthorityError("review submission command payload is unreadable") from exc
+        if (not isinstance(payload_value, dict) or payload_value.get("head") != plan.head_sha
+                or payload_value.get("pr") != plan.round.binding.rejection.fence.key.target.number
+                or hashlib.sha256((command["payload_json"] + "\n" + command["workflow_binding_json"]).encode()).hexdigest()
+                   != command["payload_digest"]):
+            raise WorkflowAuthorityError("review submission command payload disagrees with its round")
 
 
 def review_parent_abandonment(
@@ -401,6 +496,7 @@ def _check_execution_projection(
     for row in rows:
         plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
         require_review_stage_receipts(db, scope[0], plan)
+        require_review_submission_receipts(db, scope[0], plan, row["claim_occurrence_id"], revision)
         planning = decode_workflow(
             row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
         )

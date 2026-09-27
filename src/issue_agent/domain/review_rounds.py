@@ -23,7 +23,7 @@ from .review_execution import (
 from .review_rejection import validate_commit_sha
 from .review_return import ReviewReturnedEnvelope
 from .workflow_identity import (
-    validate_workflow_identifier as identifier,
+    WorkflowRevision, validate_workflow_identifier as identifier,
     validate_workflow_integer as integer,
 )
 
@@ -71,6 +71,35 @@ class ReviewSubmissionPlan:
         identifier(self.command_id, "planned review submission")
         if not isinstance(self.kind, ReviewSubmissionKind):
             raise ValueError("submission plan requires its paid/copy provenance")
+
+
+@dataclass(frozen=True)
+class ReviewSubmissionRegistration:
+    """Exact pre-write link between a planned submission and its outbox command."""
+
+    round: ReviewRoundIdentity
+    submission: ReviewSubmissionPlan
+    claim_occurrence_id: str
+    owner_id: str
+    registered_revision: WorkflowRevision
+    command_digest: str
+    idempotency_key: str
+    config_version: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.round, ReviewRoundIdentity) or not isinstance(self.submission, ReviewSubmissionPlan):
+            raise ValueError("submission registration requires a round and typed plan")
+        identifier(self.claim_occurrence_id, "submission parent claim")
+        identifier(self.owner_id, "submission owner")
+        if (not isinstance(self.registered_revision, WorkflowRevision)
+                or self.registered_revision.fence != self.round.binding.rejection.fence):
+            raise ValueError("submission registration revision disagrees with its round")
+        if (not isinstance(self.command_digest, str) or len(self.command_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.command_digest)):
+            raise ValueError("submission registration requires a SHA-256 command digest")
+        identifier(self.idempotency_key, "submission idempotency key")
+        if not isinstance(self.config_version, str):
+            raise ValueError("submission configuration version must be text")
 
 
 class ReviewSessionReuse(str, Enum):

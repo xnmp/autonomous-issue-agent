@@ -99,7 +99,7 @@ from .deployment_authority import (
 from .review_effects import bound_submission_op, review_family_op
 from .review_execution_claims import load_review_preflight_record, require_review_parent_claim
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 25
 
@@ -5913,13 +5913,18 @@ class SQLiteControlStore:
         with self.transaction() as db:
             return self._enqueue_command(db, command)
 
-    def _enqueue_command(self, db: sqlite3.Connection, command: LifecycleCommand) -> PendingCommand:
+    def _enqueue_command(
+        self, db: sqlite3.Connection, command: LifecycleCommand, *,
+        registering_review_submission: bool = False,
+    ) -> PendingCommand:
         """Use the existing outbox inside either a command or workflow transaction."""
         payload = _json(command.payload)
         digest = _command_payload_digest(command, payload)
         now = _stamp(self._now())
         self._assert_owner_active(db, command.executor_identity)
-        self._validate_workflow_command(db, command)
+        self._validate_workflow_command(
+            db, command, registering_review_submission=registering_review_submission,
+        )
         row = db.execute(
             "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
             (command.idempotency_key,),
@@ -5984,7 +5989,10 @@ class SQLiteControlStore:
         )
         return PendingCommand(command, "pending", 0)
 
-    def _validate_workflow_command(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
+    def _validate_workflow_command(
+        self, db: sqlite3.Connection, command: LifecycleCommand, *,
+        registering_review_submission: bool = False,
+    ) -> None:
         binding = command.workflow
         publication = command.kind in {CommandKind.PUBLISH_BRANCH, CommandKind.OPEN_PULL_REQUEST, CommandKind.UPDATE_PULL_REQUEST_BODY}
         captured_run = self._publication_command_run(db, command) if publication else None
@@ -6032,9 +6040,21 @@ class SQLiteControlStore:
                 review_snapshot = require_review_binding(db, binding, allow_gated=True)
                 if (command.kind is CommandKind.SUBMIT_REVIEW
                         and isinstance(review_snapshot.execution, ActivatedReviewExecution)):
-                    raise WorkflowAuthorityError(
-                        "active review execution submission requires atomic round registration"
-                    )
+                    if not registering_review_submission:
+                        registration = read_review_submission_registration(
+                            db, command.repository, str(command.command_id),
+                        )
+                        if (registration is None
+                                or registration.round.binding != review_snapshot.execution.binding
+                                or registration.round.binding.rejection != binding
+                                or registration.submission.command_id != str(command.command_id)
+                                or registration.owner_id != command.executor_identity
+                                or registration.command_digest != _command_payload_digest(command, _json(command.payload))
+                                or registration.idempotency_key != command.idempotency_key
+                                or registration.config_version != command.config_version):
+                            raise WorkflowAuthorityError(
+                                "active review execution submission requires atomic round registration"
+                            )
                 if command.target != f"pr:{binding.fence.key.target.number}":
                     raise WorkflowAuthorityError("review rejection command target disagrees with its pull request")
                 return

@@ -5,20 +5,24 @@ import hashlib
 import sqlite3
 
 from ..domain.fix import breaker_key
+from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import ActivatedReviewExecution
 from ..domain.review_rounds import (
     ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan,
-    ReviewStagePlan,
+    ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionPlan, ReviewSubmissionRegistration,
 )
 from ..domain.review_workflow import ObservedPullRequest
+from ..domain.review_workflow_policy import review_owed
 from ..domain.review_rearm import ReleaseStatus
 from ..domain.workflow_identity import (
-    IssueRef, WorkflowKey, WorkflowRevision, WorkflowWriter, validate_workflow_identifier,
+    IssueRef, WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowWriter, validate_workflow_identifier,
 )
-from .control_store import SQLiteControlStore, _stamp
+from .control_store import (
+    PendingCommand, SQLiteControlStore, _command_from_row, _command_payload_digest, _json, _stamp,
+)
 from .deployment_authority import deployment_role
-from .review_effects import ReviewReads, read_pull_request
+from .review_effects import ReviewReads, bound_submission_op, read_pull_request
 from .review_dispatch_holds import review_release_projection, unresolved_review_submissions
 from .review_execution_claims import (
     PREFLIGHT_NAMESPACE, load_review_preflight_record, require_review_parent_claim,
@@ -28,9 +32,12 @@ from .process_supervisor import ProcessSupervisor
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
     REVIEW_ABANDONMENT_NAMESPACE, REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
+    REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
     WorkflowAuthorityError, WorkflowRevisionConflict,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
-    review_parent_abandonment, review_stage_receipt_key, verified_review_completed_seal,
+    read_review_submission_registration, require_review_submission_receipts,
+    review_parent_abandonment, review_stage_receipt_key, review_submission_receipt_key,
+    verified_review_completed_seal,
     verified_review_parent_abandonment,
 )
 
@@ -102,6 +109,23 @@ class SQLiteReviewExecutionControl:
         if recorded != (round_id, stage) or existing != stage:
             raise WorkflowAuthorityError("review stage receipt conflicts with its canonical plan")
         return True
+
+    @staticmethod
+    def _require_refused_submissions(db: sqlite3.Connection, plan: ReviewRoundPlan) -> None:
+        """A fallback branch needs definitive non-submission of earlier commands."""
+        for submission in plan.submissions:
+            row = db.execute(
+                "SELECT state,attempts FROM lifecycle_commands WHERE command_id=?",
+                (submission.command_id,),
+            ).fetchone()
+            receipt = db.execute(
+                "SELECT status,remote_object_id FROM effect_receipts WHERE command_id=?",
+                (submission.command_id,),
+            ).fetchone()
+            if (row is None or row["state"] != "permanent_failure" or row["attempts"] < 1
+                    or receipt is None or receipt["status"] != "permanent_failure"
+                    or receipt["remote_object_id"] is not None):
+                raise WorkflowAuthorityError("review fallback awaits definitive submission refusal")
 
     def preflight(self, selection: ReviewPreflightSelection) -> ReviewRoundPlan:
         """Mint one free round after a fresh gateway read; replay is exact and inert."""
@@ -239,6 +263,7 @@ class SQLiteReviewExecutionControl:
                                ReviewPlanningOpen)
                     or row["closure_json"] is not None or row["outcome_json"] is not None):
                 raise WorkflowAuthorityError("review round planning is already sealed")
+            self._require_refused_submissions(db, current)
             snapshot = load_review_workflow_row(db, expected.fence.key)
             if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
                 raise WorkflowAuthorityError("review execution workflow is absent or inactive")
@@ -286,6 +311,149 @@ class SQLiteReviewExecutionControl:
         if captured != expected or not isinstance(planning, ReviewPlanningSealed):
             raise WorkflowAuthorityError("review planning seal has conflicting revision")
         return planning
+
+    def register_submission(
+        self, round_id: str, expected: WorkflowRevision, command: LifecycleCommand,
+        kind: ReviewSubmissionKind,
+    ) -> PendingCommand:
+        """Append the command-to-round link and enqueue the remote effect atomically."""
+        validate_workflow_identifier(round_id, "review round")
+        if not isinstance(expected, WorkflowRevision) or not isinstance(command, LifecycleCommand):
+            raise ValueError("submission registration requires a revision and typed command")
+        if not isinstance(kind, ReviewSubmissionKind) or command.kind is not CommandKind.SUBMIT_REVIEW:
+            raise ValueError("submission registration requires a paid or copied review command")
+        submission = ReviewSubmissionPlan(str(command.command_id), kind)
+        digest = _command_payload_digest(command, _json(command.payload))
+
+        def replay(db: sqlite3.Connection, plan: ReviewRoundPlan, claim_occurrence_id: str) -> PendingCommand | None:
+            registration = read_review_submission_registration(db, self._writer.repository, submission.command_id)
+            if registration is None:
+                return None
+            expected_registration = ReviewSubmissionRegistration(
+                plan.round, submission, claim_occurrence_id, self._writer.owner_id,
+                expected, digest, command.idempotency_key, command.config_version,
+            )
+            if registration != expected_registration or submission not in plan.submissions:
+                raise WorkflowAuthorityError("review submission identity has conflicting round facts")
+            with_row = db.execute(
+                "SELECT * FROM lifecycle_commands WHERE command_id=?", (submission.command_id,),
+            ).fetchone()
+            if with_row is None or _command_from_row(with_row) != command:
+                raise WorkflowAuthorityError("review submission receipt lacks its exact command")
+            current_revision_row = db.execute(
+                "SELECT generation,version FROM workflows WHERE repository=? AND target_kind='pr' "
+                "AND target_number=?",
+                (self._writer.repository, plan.round.binding.rejection.fence.key.target.number),
+            ).fetchone()
+            if current_revision_row is None:
+                raise WorkflowAuthorityError("review submission lost its aggregate")
+            current_revision = WorkflowRevision(
+                WorkflowFence(plan.round.binding.rejection.fence.key, current_revision_row["generation"]),
+                current_revision_row["version"],
+            )
+            require_review_submission_receipts(
+                db, self._writer.repository, plan, claim_occurrence_id, current_revision,
+            )
+            return PendingCommand(_command_from_row(with_row), with_row["state"],
+                                  with_row["attempts"], int(with_row["refusals"]))
+
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._stored_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review submission lacks its exact preflight")
+            selection, _, plan, _ = stored
+            prior = replay(db, plan, selection.claim_occurrence_id)
+            if prior is not None:
+                return prior
+            claim = db.execute(
+                "SELECT owner_pid,owner_start_ticks FROM dispatch_claims "
+                "WHERE repository=? AND role='review' AND occurrence_id=?",
+                (self._writer.repository, selection.claim_occurrence_id),
+            ).fetchone()
+            if claim is None:
+                raise WorkflowAuthorityError("review parent claim occurrence is absent")
+            parent_identity = claim["owner_pid"], claim["owner_start_ticks"]
+
+        if not ProcessSupervisor.matches_identity(*parent_identity):
+            raise WorkflowAuthorityError("review parent claim process is no longer live")
+
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            stored = self._stored_round(db, round_id)
+            if stored is None:
+                raise WorkflowAuthorityError("review submission lost its preflight")
+            selection, _, plan, row = stored
+            prior = replay(db, plan, selection.claim_occurrence_id)
+            if prior is not None:
+                return prior
+            require_review_parent_claim(
+                db, self._writer.repository, self._writer.owner_id,
+                selection.claim_occurrence_id, selection.claim_target,
+                probed_identity=parent_identity,
+            )
+            planning = decode_workflow(
+                row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+            )
+            if (not isinstance(planning, ReviewPlanningOpen)
+                    or row["closure_json"] is not None or row["outcome_json"] is not None):
+                raise WorkflowAuthorityError("review submission planning is already sealed")
+            self._require_refused_submissions(db, plan)
+            if (kind is ReviewSubmissionKind.COPIED and plan.stages
+                    or kind is ReviewSubmissionKind.PAID and not plan.stages):
+                raise WorkflowAuthorityError("review submission kind disagrees with planned work")
+            snapshot = load_review_workflow_row(db, expected.fence.key)
+            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+                raise WorkflowAuthorityError("review execution workflow is absent or inactive")
+            if snapshot.revision != expected:
+                raise WorkflowRevisionConflict(snapshot.revision, "review submission aggregate version changed")
+            if (snapshot.execution.binding != plan.round.binding
+                    or snapshot.binding != plan.round.binding.rejection):
+                raise WorkflowAuthorityError("review submission captured a stale dual binding")
+            op = bound_submission_op(command)
+            if (op is None or op.head != plan.head_sha
+                    or command.workflow != plan.round.binding.rejection
+                    or command.repository != self._writer.repository
+                    or command.executor_identity != self._writer.owner_id
+                    or command.target != f"pr:{expected.fence.key.target.number}"):
+                raise WorkflowAuthorityError("review submission command disagrees with its round")
+            if kind is ReviewSubmissionKind.COPIED and review_owed(snapshot, op.head, op.patch_id):
+                raise WorkflowAuthorityError("copied review submission lacks a same-generation covered patch")
+            if db.execute(
+                "SELECT 1 FROM lifecycle_commands WHERE command_id=? OR idempotency_key=?",
+                (submission.command_id, command.idempotency_key),
+            ).fetchone() is not None:
+                raise WorkflowAuthorityError("review submission command exists without its round registration")
+            pending = self._control._enqueue_command(
+                db, command, registering_review_submission=True,
+            )
+            updated = replace(plan, submissions=plan.submissions + (submission,))
+            changed = db.execute(
+                "UPDATE review_execution_rounds SET plan_json=? WHERE round_id=? "
+                "AND plan_json=? AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
+                (encode_workflow(updated), round_id, row["plan_json"], row["planning_json"]),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("review round changed during submission planning")
+            registration = ReviewSubmissionRegistration(
+                plan.round, submission, selection.claim_occurrence_id, self._writer.owner_id,
+                expected, digest, command.idempotency_key, command.config_version,
+            )
+            now = _stamp(self._control.now())
+            for namespace, key in (
+                (REVIEW_SUBMISSION_NAMESPACE, submission.command_id),
+                (REVIEW_SUBMISSION_INDEX_NAMESPACE, review_submission_receipt_key(round_id, submission.command_id)),
+            ):
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (namespace, self._writer.repository, key, now, encode_workflow(registration)),
+                )
+            after = replace(snapshot, revision=WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1))
+            persist_workflow_snapshot(db, after)
+            self._control._transition(db, "review_round", round_id, "submission_registered", {
+                "command_id": submission.command_id, "kind": kind.value,
+            })
+            return pending
 
     def seal_completed_planning(
         self, round_id: str, expected: WorkflowRevision,

@@ -92,7 +92,7 @@ _VALUES = (
     rx.ReviewRoundCancelled, rx.ReviewRoundOutcome, rx.ReviewExecutionPolicy,
     rx.ReviewExecutionState, rx.ReviewExecutionCheckpoint,
     rx.ReviewExecutionOrigin, rx.ExecutionNotActivated, rx.ActivatedReviewExecution,
-    rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewRoundPlan,
+    rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,
     rr.ReviewChildPending, rr.ReviewChildRefused, rr.ReviewChildReleased,
     rr.ReviewChildSettledWithoutLaunch, rr.ReviewChildNotAdmitted,
     rr.ReviewChildPinDeferred, rr.ReviewChildSucceeded, rr.OrdinaryReviewFailure,

@@ -5,18 +5,26 @@ production admission and provenance minting remain a later checkpoint.
 """
 
 from dataclasses import replace
+from datetime import datetime, timezone
 import hashlib
 
 import pytest
 
 from issue_agent.adapters.workflow_codec import encode_workflow
+from issue_agent.adapters.control_store import _command_payload_digest, _json
+from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
 from issue_agent.adapters.workflow_rows import (
-    REVIEW_STAGE_NAMESPACE, WorkflowAuthorityError, encode_workflow_episodes,
-    load_review_workflow_row, review_stage_receipt_key,
+    REVIEW_STAGE_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
+    WorkflowAuthorityError, encode_workflow_episodes, load_review_workflow_row,
+    review_stage_receipt_key, review_submission_receipt_key,
 )
+from issue_agent.domain.contracts import CommandKind, LifecycleCommand
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.outcome import ExitReason
 from issue_agent.domain.review import ReviewMode
+from issue_agent.domain.labels import Label
+from issue_agent.domain.review_preflight import ReviewPreflightSelection
+from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState
 from issue_agent.domain import review_execution as execution
 from issue_agent.domain import review_rounds as rounds
 from issue_agent.domain.workflow_identity import WorkflowRevision
@@ -89,8 +97,61 @@ def insert_round(db, facts, outcome=None, *, index_sequence=None):
             "VALUES (?,?,?,'2026-09-27T00:00:00+00:00',?)",
             (REVIEW_STAGE_NAMESPACE, binding.rejection.fence.key.repository,
              review_stage_receipt_key(identity.round_id, stage.stage_id),
-             encode_workflow((identity.round_id, stage))),
+            encode_workflow((identity.round_id, stage))),
         )
+    if facts.plan.submissions:
+        initial = replace(facts.plan, stages=(), submissions=())
+        selection = ReviewPreflightSelection(
+            identity.round_id, WorkflowRevision(binding.rejection.fence, 0), binding,
+            "claim:fixture", -binding.rejection.fence.key.target.number,
+            ObservedPullRequest(binding.rejection.fence.key, facts.plan.head_sha,
+                                PullRequestState.OPEN, frozenset({Label.AI_PR_OPEN}),
+                                CompleteReviews(()), datetime(2026, 9, 27, tzinfo=timezone.utc)),
+            Label.AI_PR_OPEN, facts.plan.mode, facts.plan.runtime, facts.plan.failure_ceiling,
+        )
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-round-preflight',?,?,'2026-09-27T00:00:00+00:00',?)",
+            (binding.rejection.fence.key.repository, identity.round_id,
+             encode_workflow((selection, "fixture-owner", initial))),
+        )
+    for submission in facts.plan.submissions:
+        op = BoundReviewSubmissionOp(
+            identity.binding.rejection.fence.key.target.number, "APPROVE", "copied verdict",
+            facts.plan.head_sha, "review-bot", "0" * 64, None,
+        )
+        command = LifecycleCommand(
+            submission.command_id, f"github:{submission.command_id}", CommandKind.SUBMIT_REVIEW,
+            f"pr:{op.pr}", op.head, op.payload(), "fixture", binding.rejection.fence.key.repository,
+            "fixture-owner", workflow=binding.rejection,
+        )
+        payload = _json(command.payload)
+        digest = _command_payload_digest(command, payload)
+        db.execute(
+            "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
+            "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
+            "state,created_at,updated_at,workflow_binding_json) "
+            "VALUES (?,?,?,0,?,?,?,?,?,?,?,?,'succeeded','2026-09-27T00:00:00+00:00',"
+            "'2026-09-27T00:00:00+00:00',?)",
+            (submission.command_id, command.idempotency_key, command.idempotency_key,
+             command.kind.value, command.target, command.expected_revision, command.config_version,
+             command.repository, command.executor_identity, payload, digest, encode_workflow(command.workflow)),
+        )
+        registration = rounds.ReviewSubmissionRegistration(
+            identity, submission, "claim:fixture", "fixture-owner",
+            WorkflowRevision(binding.rejection.fence, 0), digest,
+            command.idempotency_key, command.config_version,
+        )
+        for namespace, key in (
+            (REVIEW_SUBMISSION_NAMESPACE, submission.command_id),
+            (REVIEW_SUBMISSION_INDEX_NAMESPACE,
+             review_submission_receipt_key(identity.round_id, submission.command_id)),
+        ):
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,?,?,'2026-09-27T00:00:00+00:00',?)",
+                (namespace, binding.rejection.fence.key.repository, key, encode_workflow(registration)),
+            )
     if outcome is not None:
         insert_seal_receipt(db, facts)
 

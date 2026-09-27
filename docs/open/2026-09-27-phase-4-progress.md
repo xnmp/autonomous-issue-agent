@@ -6,7 +6,7 @@ Phase 4 follows the [review execution design](2026-09-27-phase-4-review-executio
 [persistence map](2026-09-27-phase-4-persistence-map.md).
 The [post-stage handover](2026-09-27-phase-4-post-stage-handover.md)
 records the next transaction boundary and standing restrictions.
-The latest [post-abandonment handover](2026-09-27-phase-4-post-abandonment-handover.md)
+The latest [post-submission handover](2026-09-27-phase-4-post-submission-handover.md)
 records the current boundary and remaining work.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
@@ -466,12 +466,42 @@ app tests; hooks, governor, parity, four import contracts and both Pyrefly
 checks. Log: `/tmp/phase4-abandonment-final-full.log` (ephemeral). No live
 activation, target mutation, service restart or paid harness run occurred.
 
+## Checkpoint 17 — atomic review submission registration (accepted offline)
+
+`SQLiteReviewExecutionControl.register_submission` now appends a copied or
+paid submission to the immutable round plan, enqueues its exact bound
+`SUBMIT_REVIEW` command, writes command and round-index receipts, and advances
+the aggregate version in one transaction. The command is invisible to the
+executor until that transaction commits. Enqueue, begin and retry require the
+registration for active execution. Copied submissions require the canonical
+same-generation baseline to cover their patch; paid submissions require a
+planned stage. A second stage or submission waits for a prior submission's
+terminal refusal receipt. Exact replay is inert even after the parent claim
+has been released or a paid fallback has been planned.
+
+The canonical loader joins the bounded submission index to its preflight,
+owner claim, plan, command row, binding and payload digest. Tests cover
+transaction rollback, replay, copy-to-paid fallback, pending-command holds,
+unregistered commands, patch mismatch and missing or altered source rows.
+Independent Sol review identified that the production verdict caller still
+uses ordinary enqueue. The execution-family activation command and round
+runtime cutover are not yet implemented, so this checkpoint is **offline
+plumbing only**; the guard fails closed if an execution-active row is somehow
+present. The production caller must use this registration API before real
+activation. `make test` passed: 3,121 domain, 2,760 adapter and 2,863 app
+tests; hooks, governor, parity, four import contracts and both Pyrefly checks.
+Log: `/tmp/phase4-submission-final-full.log` (ephemeral). No live activation,
+target mutation, service restart or paid harness run occurred.
+
 ## Required subsequent work
 
 - Seal outer outcomes and finalize them from receipt-backed child evidence,
   including parent/claim abandonment, released-before-launch and
   settled-without-launch outcomes. Preserve actual accounting and bound unpaid
   preparation faults through evidence holds.
+- Call the abandonment writer from production recovery for exact terminated
+  parent occurrences, and pass an execution round through the production
+  review workflow so copied and paid verdicts use atomic registration.
 - Project finalized rounds transactionally over the canonical v25 component;
   settle productive submissions, recover real multi-child execution, and
   capture free copied verdicts.
