@@ -130,6 +130,30 @@ No runtime cutover or selected file-API removal precedes composed acceptance.
 
 ## Migration and codec acceptance checklist
 
+### Historical snapshot receipts
+
+Use a new current snapshot tag with a required execution component. The old
+`ReviewWorkflowSnapshot` tag decodes only its exact original five fields into
+explicit inactive execution. Do not add an execution default to the generic
+legacy-field mechanism: an incomplete new payload must refuse. Historical
+inactive audit values never authorize replacing an active canonical component.
+
+`workflow_commit.accepted_proposal` embeds the encoded snapshot, while
+non-operator `same_receipt` compares its entire stored string. Its dedupe key
+hashes only the expected revision. Therefore the wire evolution needs a narrow
+historical replay rule at this seam: validate the exact old snapshot variant,
+require inactive execution and equality of every other receipt field and
+command, and retain the original stored bytes. Do not broadly normalize JSON
+or weaken non-operator identity reuse checks. Add a frozen pre-v25 receipt
+fixture proving exact replay is inert and any changed accepted fact conflicts.
+
+Operator replay compares authenticated subject and exact command. Operator
+digests, effect command IDs, retry authorizations and reservation replay encode
+commands/bindings rather than full snapshots; preserve those byte contracts.
+Resolve accepted-proposal, episode and snapshot byte goldens remain unchanged.
+
+### Required cases
+
 - **Mixed v24 history:** migrate resolve and review rows with baselines,
   guidance, gates/intents, historical runs/commands and activation evidence.
   Resolve payload bytes remain identical. PR rejection authority, episode,

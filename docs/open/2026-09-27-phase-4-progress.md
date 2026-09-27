@@ -41,6 +41,24 @@ submissions or returned child evidence. The next boundary must validate actual
 receipt provenance before minting these finalized values, including eligible
 reviewer returns for session changes; launch alone does not establish eligibility.
 
+## Checkpoint 2 — pure round finalization (accepted)
+
+`domain/review_rounds.py` defines immutable stage and
+submission plans, explicit launch/return/refusal/release/no-launch-settlement
+facts, planning seals and abandoned-parent fences, and pure finalization.
+Independent review reproduced loss of configuration evidence in mixed paid
+and unlaunched rounds; the correction retains bounded preparation follow-up
+alongside the one outer outcome. Independent re-review accepted the corrected
+classifier and its tests. All 180 focused projection/finalization tests pass.
+Final `make test` passed with 3,049 domain, 2,401 adapter and 2,861 app tests,
+plus hooks, governor, configuration/environment/parity, all four import
+contracts and both Pyrefly passes. Ten pre-existing strict-xfail residuals
+remained expected. Local log: `/tmp/phase4-review-rounds-full.log` (ephemeral).
+
+This checkpoint remains pure construction: schema v24 and existing runtime
+execution authority are unchanged. The next persistence checkpoint must re-derive outcomes from retained
+closure facts, never accept a caller-constructed outcome as authority.
+
 ## Required subsequent work
 
 - Planned immutable child stages and sealed outer outcomes; evidence-based

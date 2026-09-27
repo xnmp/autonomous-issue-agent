@@ -12,7 +12,8 @@ from issue_agent.domain.review_execution import (
     PaidReviewProgress, PreserveDisplayedRound, PreserveReviewSession, ReplaceReviewSession,
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
-    ReviewExecutionState, ReviewPinDeferred, ReviewReservationReleased, ReviewRoundCancelled,
+    ReviewExecutionState, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
+    ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
     SetDisplayedRound, compatible_review_session, project_review_execution,
 )
@@ -175,6 +176,8 @@ def test_counters_saturate_at_the_integer_bound_instead_of_wrapping_or_refusing_
 
 @pytest.mark.parametrize("disposition", [
     ReviewAdmissionRefused("budget-refusal"), ReviewReservationReleased("reservation", "never-launched"),
+    ReviewUnlaunchedRound("complete-closure"),
+    ReviewPreparationDeferred(ReviewPreparationFailure(ReviewPreparationKind.RUNTIME, "preflight-failed")),
     *(ReviewRoundCancelled(reason, f"cancel:{reason.value}") for reason in ReviewCancellationReason),
 ])
 def test_refusal_never_launched_release_and_operator_cancellation_preserve_the_allowance(disposition):
@@ -326,11 +329,25 @@ def test_session_update_requires_this_rounds_exact_launched_producer():
 
 
 @pytest.mark.parametrize("outcome", [copied(1), pin(1), ReviewRoundOutcome(round_id(1), ReviewAdmissionRefused("refusal"))])
-def test_unpaid_outcomes_cannot_change_reviewer_session_or_display_number(outcome):
-    with pytest.raises(ValueError, match="unpaid"):
+def test_copy_pin_and_refusal_preserve_reviewer_session_and_display_number(outcome):
+    with pytest.raises(ValueError, match="productive reviewer"):
         replace(outcome, session=ClearReviewSession(launched(outcome.round)))
     with pytest.raises(ValueError, match="only paid productive"):
         replace(outcome, display=SetDisplayedRound(3))
+
+
+def test_failed_paid_reviewer_preserves_the_last_productive_session():
+    prior = productive(1, handle="last-confirmed", display=1)
+    round_ = round_id(2)
+    child = launched(round_)
+    failure = ReviewRoundOutcome(round_, ReviewRoundFailure((child,), "refused-submission"))
+    for session in (ClearReviewSession(child),
+                    ReplaceReviewSession(ReusableReviewSession(RuntimeName.CLAUDE, "unconfirmed", child))):
+        with pytest.raises(ValueError, match="productive reviewer"):
+            replace(failure, session=session)
+    result = project_review_execution(checkpoint(), (failure, prior)).state
+    assert result.session.handle == "last-confirmed" and result.session_sequence == 1
+    assert result.displayed_round == 1 and result.failures == 1
 
 
 @pytest.mark.parametrize("bad", ["empty", "list", "untyped", "duplicate_run", "duplicate_child", "different_round", "huge"])

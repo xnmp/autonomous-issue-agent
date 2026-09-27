@@ -67,6 +67,14 @@ Record that branch decision before admitting its children.
    bounded preflight evidence.
    Never synthesize paid-failure evidence from a free refusal.
 
+Verified preparation failures remain a separate bounded evidence obligation
+alongside any nonproductive outcome, including paid failure, pin deferral or
+cancellation. They do not add a second allowance strike. A mixed paid gate
+and unlaunched runtime failure must retain both the outer-round classification
+and its configuration evidence. Confirmed productive progress has precedence;
+failed sibling evidence remains in the closure audit without opening a new
+preparation schedule for that completed round.
+
 Finalization and exact replay must be idempotent. Conflicting final outcomes
 for one round refuse rather than replacing accepted history. A verified
 productive receipt cannot be overwritten by a later cancellation notification.

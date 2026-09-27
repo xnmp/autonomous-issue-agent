@@ -254,6 +254,42 @@ class ReviewReservationReleased:
         identifier(self.release_receipt, "never-launched release receipt")
 
 
+@dataclass(frozen=True)
+class ReviewUnlaunchedRound:
+    """The closure receipt retains every refusal/release/no-launch settlement."""
+
+    closure_receipt: str
+
+    def __post_init__(self) -> None:
+        identifier(self.closure_receipt, "unlaunched round closure receipt")
+
+
+class ReviewPreparationKind(str, Enum):
+    REVISION_DIFF = "revision_diff"
+    CONTAINMENT = "containment"
+    RUNTIME = "runtime"
+
+
+@dataclass(frozen=True)
+class ReviewPreparationFailure:
+    kind: ReviewPreparationKind
+    evidence_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.kind, ReviewPreparationKind):
+            raise ValueError("preparation failure requires a typed evidence kind")
+        identifier(self.evidence_id, "preparation failure evidence")
+
+
+@dataclass(frozen=True)
+class ReviewPreparationDeferred:
+    failure: ReviewPreparationFailure
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.failure, ReviewPreparationFailure):
+            raise ValueError("preparation deferral requires verified failure evidence")
+
+
 class ReviewCancellationReason(str, Enum):
     OPERATOR = "operator"
     SHUTDOWN = "shutdown"
@@ -274,10 +310,12 @@ class ReviewRoundCancelled:
 ReviewExecutionDisposition = (
     PaidReviewProgress | CopiedReviewProgress | ReviewRoundFailure | ReviewPinDeferred
     | ReviewAdmissionRefused | ReviewReservationReleased | ReviewRoundCancelled
+    | ReviewUnlaunchedRound | ReviewPreparationDeferred
 )
 _DISPOSITIONS = (
     PaidReviewProgress, CopiedReviewProgress, ReviewRoundFailure, ReviewPinDeferred,
     ReviewAdmissionRefused, ReviewReservationReleased, ReviewRoundCancelled,
+    ReviewUnlaunchedRound, ReviewPreparationDeferred,
 )
 
 
@@ -301,8 +339,8 @@ class ReviewRoundOutcome:
         if paid:
             if any(value.child.round != self.round for value in self.disposition.launched):
                 raise ValueError("outcome launch evidence belongs to another round")
-        elif not isinstance(self.session, PreserveReviewSession):
-            raise ValueError("an unpaid outcome preserves the reviewer session")
+        if not isinstance(self.disposition, PaidReviewProgress) and not isinstance(self.session, PreserveReviewSession):
+            raise ValueError("only productive reviewer work may update the session")
         if not isinstance(self.disposition, PaidReviewProgress) and not isinstance(self.display, PreserveDisplayedRound):
             raise ValueError("only paid productive review changes its displayed round")
         producer = (
