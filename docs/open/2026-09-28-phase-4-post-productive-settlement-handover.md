@@ -96,10 +96,9 @@ checks. Ten accepted strict xfails remained expected. Log:
 
 ## Next implementation boundaries
 
-1. Design source-backed checkpoint and boundary compaction with an
-   activation/import anchor, an archived-source audit contract and bounded
-   canonical reads. The current 4,096-round and boundary suffix limits remain
-   activation gates.
+1. Implement the [source-backed origin and compaction contract](2026-09-28-phase-4-compaction-contract.md)
+   with bounded canonical reads and an archived-source audit. The current
+   4,096-round and boundary suffix limits remain activation gates.
 2. Add source-specific bounded rereads for `REVISION_DIFF` and `CONTAINMENT`
    preparation outcomes after their adapter sources are minted.
 3. Wire real round identity through production review dispatch, child
