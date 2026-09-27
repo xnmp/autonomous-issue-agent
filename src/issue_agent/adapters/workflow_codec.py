@@ -17,6 +17,7 @@ from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
 from ..domain import review_execution as rx
 from ..domain import review_rounds as rr
+from ..domain import review_preflight as preflight
 from ..domain.agent_task import RuntimeName
 from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
@@ -98,6 +99,7 @@ _VALUES = (
     rr.ReviewPlanningComplete, rr.ReviewPlanningRefused, rr.ReviewPlanningSealed,
     rr.ReviewParentAbandoned, rr.ReviewRoundFacts, rr.ReviewRoundAwaitingEvidence,
     rr.FinalizedReviewRound, rr.DeferredReviewPreparation,
+    preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
     ExitReason, Adjudication, Effort,

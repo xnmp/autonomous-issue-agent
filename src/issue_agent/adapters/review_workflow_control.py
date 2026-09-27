@@ -78,6 +78,12 @@ from .review_effects import (
     PullRequestProjectionOp, ReviewCheck, ReviewReads, check_review_op, observe_pull_request, read_pull_request,
     review_family_op,
 )
+from .review_dispatch_holds import (
+    RECORDED_REVIEW_NAMESPACE as _RECORDED_REVIEW_NAMESPACE,
+    RELEASE_RESOLVED_NAMESPACE as _RELEASE_RESOLVED_NAMESPACE,
+    SETTLED_SUBMISSION_NAMESPACE as _SETTLED_SUBMISSION_NAMESPACE,
+    review_release_projection, review_submission_settled, unresolved_review_submissions,
+)
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_commit import (
     insert_pending_rearm, intent_state, owns_command, persist_retry_authorization, record_commit,
@@ -93,9 +99,6 @@ from .workflow_rows import (
 # Deployment barriers are always taken in this order (ADR 0015 acceptance).
 BARRIER_ROLES = ("fix", "review", "steward")
 _OBSERVATION_NAMESPACE = "workflow-rearm-observation"
-_RECORDED_REVIEW_NAMESPACE = "review-recorded-submission"
-_RELEASE_RESOLVED_NAMESPACE = "review-release-resolved"
-_SETTLED_SUBMISSION_NAMESPACE = "review-submission-settled"
 _HOLD_OBSERVATION_NAMESPACE = "review-hold-observation"
 _FIRST_OBSERVATION_NAMESPACE = "review-first-observation"
 # Content-addressed harness pull request reads (`RecordedPullRequest`).
@@ -421,30 +424,7 @@ class SQLiteReviewWorkflowControl:
             raise WorkflowAuthorityError("invalid pending review re-arm observation") from exc
 
     def _release_projection(self, db: sqlite3.Connection, state: ReviewWorkflowSnapshot) -> ReleaseProjection | None:
-        """The current generation's ceiling-release relabel and whether it is verified (harness receipts only)."""
-        generation = state.revision.fence.generation
-        if generation < 1:
-            return None
-        command_id = review_release_command_id(state.revision.fence.key, generation)
-        row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
-        if row is None:
-            return None
-        command = _command_from_row(row)
-        if command.workflow is None or command.workflow.fence != state.revision.fence or not owns_command(
-            db, self._writer, command.executor_identity
-        ):
-            raise WorkflowAuthorityError("release projection belongs to another workflow authority")
-        receipt = db.execute("SELECT status FROM effect_receipts WHERE command_id=?", (str(command_id),)).fetchone()
-        status = receipt["status"] if receipt is not None and receipt["status"] == row["state"] else None
-        resolved = db.execute(
-            f"SELECT 1 FROM dedupe_keys WHERE namespace='{_RELEASE_RESOLVED_NAMESPACE}' AND scope=? AND key=?",
-            (self._writer.repository, str(command_id)),
-        ).fetchone() is not None
-        if status == EffectStatus.SUCCEEDED.value or resolved:
-            return ReleaseProjection(command_id, ReleaseStatus.VERIFIED)
-        if status == EffectStatus.PERMANENT_FAILURE.value:
-            return ReleaseProjection(command_id, ReleaseStatus.REFUSED)
-        return ReleaseProjection(command_id, ReleaseStatus.PENDING)
+        return review_release_projection(db, self._writer, state)
 
     def release_projection(self, key: WorkflowKey) -> ReleaseProjection | None:
         """The harness-owned "release projection verified" fact that holds review dispatch."""
@@ -472,34 +452,7 @@ class SQLiteReviewWorkflowControl:
                                         unresolved_submissions=unresolved)
 
     def _unresolved_submissions(self, db: sqlite3.Connection, binding: WorkflowBinding) -> tuple[CommandId, ...]:
-        """The binding's bound review submissions whose outcome is not yet known.
-
-        Unknown, executing (a crashed attempt) or proven absent and awaiting
-        re-execution, before or after expiry; a retired command has its own
-        gate. A succeeded submission not yet applied to the workflow (its
-        baseline or ceiling unrecorded) also holds: dispatching then would buy
-        a second review of the head the landed verdict already covers.
-        Harness-owned: the dispatch hold's only input.
-        """
-        key = binding.fence.key
-        unresolved: list[CommandId] = []
-        for row in db.execute(
-            "SELECT * FROM lifecycle_commands WHERE repository=? AND target=? AND kind=? "
-            "AND state IN ('executing','unknown_outcome','retryable_failure','succeeded') "
-            "ORDER BY created_at, command_id",
-            (key.repository, f"pr:{key.target.number}", CommandKind.SUBMIT_REVIEW.value),
-        ).fetchall():
-            command = _command_from_row(row)
-            if command.workflow != binding:
-                continue
-            if row["state"] == EffectStatus.SUCCEEDED.value:
-                if not self._submission_settled(db, str(command.command_id)):
-                    unresolved.append(command.command_id)
-            elif not isinstance(
-                self._control._command_reconciliation(row), (RetiredSettledCommand, RetiredUncertainCommand)
-            ):
-                unresolved.append(command.command_id)
-        return tuple(unresolved)
+        return unresolved_review_submissions(db, self._control, binding)
 
     def review_control_view(
         self, key: WorkflowKey, *, request_id: str | None = None,
@@ -2147,10 +2100,7 @@ class SQLiteReviewWorkflowControl:
             return load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, self._writer.repository) is not None
 
     def _submission_settled(self, db: sqlite3.Connection, command_id: str) -> bool:
-        return db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace IN (?, ?) AND scope=? AND key=?",
-            (_SETTLED_SUBMISSION_NAMESPACE, _RECORDED_REVIEW_NAMESPACE, self._writer.repository, command_id),
-        ).fetchone() is not None
+        return review_submission_settled(db, self._writer.repository, command_id)
 
     def settle_submission(
         self, submission: CommandId,

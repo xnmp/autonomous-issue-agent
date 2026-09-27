@@ -87,6 +87,35 @@ Local log: `/tmp/phase4-persistence-final-full.log` (ephemeral). Runtime round a
 settlement and real execution activation are later checkpoints; no execution
 authority has been activated.
 
+## Checkpoint 4 — unpaid round preflight (accepted)
+
+`domain/review_preflight.py` selects one bounded round from the active dual
+binding, complete fresh PR observation, captured failure ceiling, session
+capability and current review holds. `adapters/review_execution_control.py`
+reads the PR and linked issue outside SQLite's write lock, proves the exact
+live parent claim occurrence and creation receipt, then rechecks current
+binding, aggregate version, linked issue SQL holds, unresolved submissions and
+release projection in one transaction. That transaction allocates one round
+sequence, stores its initial plan and planning state, advances the aggregate
+version, and records an exact replay receipt. No run, lease or budget
+reservation is created. Exact replay remains inert after later child-stage
+planning or claim release.
+
+The existing dispatch and the new preflight use one transaction-local source
+for unresolved-submission and release holds. Independent review reproduced
+uppercase production claim-leg mismatch, missing lifecycle holds, a dead
+parent process accepted from a retained claim row, and replay conflict after
+stage planning. Each has a behavioral regression; re-review found no remaining
+blocker in this unpaid boundary. Final `make test` passed with 3,093 domain,
+2,521 adapter and 2,863 app tests, plus hooks, governor, gate parity,
+four import contracts and both Pyrefly passes. Ten pre-existing strict xfails
+remained expected. Local log: `/tmp/phase4-preflight-final-full.log`
+(ephemeral). The first two full runs caught missing architecture-manifest and
+test-tier layout entries; the corrected run was green.
+
+This checkpoint does not register child stages, admit paid work, prove launch
+or return, seal rounds, activate the execution family or cut over the daemon.
+
 ## Required subsequent work
 
 - Planned immutable child stages and sealed outer outcomes; evidence-based
