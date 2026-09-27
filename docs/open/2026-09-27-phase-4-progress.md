@@ -6,7 +6,7 @@ Phase 4 follows the [review execution design](2026-09-27-phase-4-review-executio
 [persistence map](2026-09-27-phase-4-persistence-map.md).
 The [post-stage handover](2026-09-27-phase-4-post-stage-handover.md)
 records the next transaction boundary and standing restrictions.
-The latest [post-recovery handover](2026-09-27-phase-4-post-recovery-handover.md)
+The latest [post-facts handover](2026-09-27-phase-4-post-facts-handover.md)
 records the current boundary and remaining work.
 Next-checkpoint preparation is recorded in the
 [outer-round finalization design](2026-09-27-phase-4-round-finalization-design.md)
@@ -520,6 +520,31 @@ projection; both are required before real execution activation. Final
 governor, parity, four import contracts and both Pyrefly checks. Log:
 `/tmp/phase4-abandonment-recovery-final-full.log` (ephemeral). No live
 activation, target mutation, service restart or paid harness run occurred.
+
+## Checkpoint 19 — transaction-local round facts reader (accepted offline)
+
+`SQLiteReviewExecutionControl.read_round_facts` now reconstructs one round's
+planning, child and submission evidence under one SQLite transaction. It
+reuses the existing source-backed child reader through an internal
+transaction-local entry point. The planning seal or exact parent-abandonment
+fence is verified before an unadmitted planned child can become
+`ReviewChildNotAdmitted`; an admitted or otherwise pending child remains
+pending. Each submission joins its registered command to the effect receipt,
+attempt owner, terminal status, remote review identity and recomputed receipt
+digest. Confirmed/refused receipt identities are bounded hashes of the
+command and receipt digest. Missing or changed source rows fail closed.
+
+The reader returns validated `ReviewRoundFacts` with a deterministic closure
+identity but does **not** persist closure or outcome. Pure finalization can
+therefore distinguish an empty abandoned round from one still waiting on an
+uncertain command. Focused tests cover open planning, abandoned unadmitted
+children, pending/confirmed/refused submissions, absent remote identity and
+receipt/owner/digest corruption. Sol review found and fixed two unreachable
+terminal result branches; a fresh pass found no remaining material issue.
+Final `make test` passed: 3,121 domain, 2,774 adapter and 2,864 app tests;
+hooks, governor, parity, four import contracts and both Pyrefly checks. Log:
+`/tmp/phase4-round-facts-final-full.log` (ephemeral). No live activation,
+target mutation, service restart or paid harness run occurred.
 
 ## Required subsequent work
 

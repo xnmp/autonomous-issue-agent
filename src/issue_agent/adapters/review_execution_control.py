@@ -5,12 +5,14 @@ import hashlib
 import sqlite3
 
 from ..domain.fix import breaker_key
-from ..domain.contracts import CommandKind, LifecycleCommand
+from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import ActivatedReviewExecution
 from ..domain.review_rounds import (
-    ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan,
-    ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionPlan, ReviewSubmissionRegistration,
+    ReviewChildNotAdmitted, ReviewChildPending, ReviewParentAbandoned, ReviewPlanningComplete,
+    ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
+    ReviewSubmissionConfirmed, ReviewSubmissionEvidence, ReviewSubmissionKind, ReviewSubmissionPending,
+    ReviewSubmissionPlan, ReviewSubmissionRefused, ReviewSubmissionRegistration,
 )
 from ..domain.review_workflow import ObservedPullRequest
 from ..domain.review_workflow_policy import review_owed
@@ -19,7 +21,8 @@ from ..domain.workflow_identity import (
     IssueRef, WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowWriter, validate_workflow_identifier,
 )
 from .control_store import (
-    PendingCommand, SQLiteControlStore, _command_from_row, _command_payload_digest, _json, _stamp,
+    PendingCommand, SQLiteControlStore, _command_from_row, _command_payload_digest,
+    _indexed_review_child_admission, _json, _parse_stamp, _receipt_digest, _stamp,
 )
 from .deployment_authority import deployment_role
 from .review_effects import ReviewReads, bound_submission_op, read_pull_request
@@ -44,6 +47,12 @@ from .workflow_rows import (
 
 MAX_ABANDONMENT_SWEEP = 64
 _START_CURSOR = (0, 0, "", 0)
+
+
+def _review_effect_receipt_id(command_id: str, receipt_digest: str) -> str:
+    return "effect-receipt:" + hashlib.sha256(
+        encode_workflow((command_id, receipt_digest)).encode(),
+    ).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -101,6 +110,98 @@ class SQLiteReviewExecutionControl:
             if len(rows) > MAX_ABANDONMENT_SWEEP else _START_CURSOR
         )
         return ReviewAbandonmentSweep(tuple(sealed), tuple(blocked), len(rows) > MAX_ABANDONMENT_SWEEP)
+
+    def read_round_facts(self, round_id: str) -> ReviewRoundFacts:
+        """Join one round's source receipts under a single SQLite snapshot."""
+        validate_workflow_identifier(round_id, "review round")
+        with self._control.transaction() as db:
+            return self._read_round_facts(db, round_id)
+
+    def _read_round_facts(self, db: sqlite3.Connection, round_id: str) -> ReviewRoundFacts:
+        stored = self._abandonment_round(db, round_id)
+        if stored is None:
+            raise WorkflowAuthorityError("review round lacks its preflight")
+        parent_owner, selection, plan, row = stored
+        planning = decode_workflow(
+            row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+        )
+        verified_review_completed_seal(
+            db, self._writer.repository, parent_owner,
+            selection.claim_occurrence_id, plan, planning,
+        )
+        verified_review_parent_abandonment(
+            db, self._writer.repository, parent_owner,
+            selection.claim_occurrence_id, selection.claim_target, plan, planning,
+        )
+        if (isinstance(planning, ReviewPlanningSealed)
+                and not isinstance(planning.conclusion, ReviewPlanningComplete)):
+            raise WorkflowAuthorityError("review planning conclusion lacks a source-backed writer")
+        snapshot = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
+        if snapshot is None:
+            raise WorkflowAuthorityError("review round lost its aggregate")
+        require_review_submission_receipts(
+            db, self._writer.repository, plan, selection.claim_occurrence_id, snapshot.revision,
+        )
+        children = self._control._read_review_child_evidence(
+            db, self._writer.repository, parent_owner, round_id,
+        )
+        if isinstance(planning, ReviewParentAbandoned):
+            children = tuple(
+                ReviewChildNotAdmitted(item.child, planning.abandonment_receipt)
+                if isinstance(item, ReviewChildPending) and _indexed_review_child_admission(
+                    db, self._writer.repository, item.child,
+                ) is None else item
+                for item in children
+            )
+        submissions: list[ReviewSubmissionEvidence] = []
+        for submission in plan.submissions:
+            command = db.execute(
+                "SELECT state,attempts,attempt_owner FROM lifecycle_commands WHERE command_id=?",
+                (submission.command_id,),
+            ).fetchone()
+            receipt = db.execute(
+                "SELECT * FROM effect_receipts WHERE command_id=?",
+                (submission.command_id,),
+            ).fetchone()
+            if command is None:
+                raise WorkflowAuthorityError("planned review submission lost its command")
+            if receipt is not None:
+                try:
+                    source_receipt = EffectReceipt(
+                        CommandId(submission.command_id), receipt["executor_identity"],
+                        _parse_stamp(receipt["started_at"]), _parse_stamp(receipt["completed_at"]),
+                        EffectStatus(receipt["status"]), receipt["remote_object_id"],
+                        receipt["remote_revision"], receipt["error"],
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise WorkflowAuthorityError("review submission effect receipt is malformed") from exc
+                if (command["attempt_owner"] != source_receipt.executor_identity
+                        or _receipt_digest(source_receipt) != receipt["receipt_digest"]):
+                    raise WorkflowAuthorityError("review submission effect receipt changed after settlement")
+            state = command["state"]
+            if state == EffectStatus.SUCCEEDED.value:
+                if (receipt is None or receipt["status"] != state
+                        or not receipt["remote_object_id"] or command["attempts"] < 1):
+                    raise WorkflowAuthorityError("confirmed review submission lacks its effect receipt")
+                result = ReviewSubmissionConfirmed(
+                    _review_effect_receipt_id(submission.command_id, receipt["receipt_digest"]),
+                )
+            elif state == EffectStatus.PERMANENT_FAILURE.value:
+                if (receipt is None or receipt["status"] != state
+                        or receipt["remote_object_id"] is not None or command["attempts"] < 1):
+                    raise WorkflowAuthorityError("refused review submission lacks its effect receipt")
+                result = ReviewSubmissionRefused(
+                    _review_effect_receipt_id(submission.command_id, receipt["receipt_digest"]),
+                )
+            else:
+                if (receipt is not None and receipt["status"] in (
+                        EffectStatus.SUCCEEDED.value, EffectStatus.PERMANENT_FAILURE.value)):
+                    raise WorkflowAuthorityError("pending review submission contradicts its effect receipt")
+                result = ReviewSubmissionPending()
+            submissions.append(ReviewSubmissionEvidence(submission, result))
+        source = (plan, planning, children, tuple(submissions))
+        closure_receipt = "review-round-closure:" + hashlib.sha256(encode_workflow(source).encode()).hexdigest()
+        return ReviewRoundFacts(closure_receipt, plan, planning, children, tuple(submissions))
 
     def _stored_round(
         self, db: sqlite3.Connection, request_id: str,

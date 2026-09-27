@@ -5142,192 +5142,197 @@ class SQLiteControlStore:
         validate_workflow_identifier(round_id, "review round")
         validate_workflow_identifier(owner_id, "review owner")
         with self.transaction() as db:
-            stored = load_review_preflight_record(db, repository, owner_id, round_id)
-            if stored is None:
-                raise ControlStoreError("review child evidence lacks its canonical preflight")
-            selection, _, plan, _ = stored
-            revision_row = db.execute(
-                "SELECT generation,version FROM workflows WHERE repository=? AND target_kind=? AND target_number=?",
-                workflow_scope(plan.round.binding.rejection.fence.key),
+            return self._read_review_child_evidence(db, repository, owner_id, round_id)
+
+    def _read_review_child_evidence(
+        self, db: sqlite3.Connection, repository: str, owner_id: str, round_id: str,
+    ) -> tuple[ReviewChildEvidence, ...]:
+        stored = load_review_preflight_record(db, repository, owner_id, round_id)
+        if stored is None:
+            raise ControlStoreError("review child evidence lacks its canonical preflight")
+        selection, _, plan, _ = stored
+        revision_row = db.execute(
+            "SELECT generation,version FROM workflows WHERE repository=? AND target_kind=? AND target_number=?",
+            workflow_scope(plan.round.binding.rejection.fence.key),
+        ).fetchone()
+        if revision_row is None:
+            raise ControlStoreError("review child evidence lost its workflow aggregate")
+
+        def revision_recorded(revision: WorkflowRevision) -> bool:
+            return (revision.fence.generation < revision_row["generation"]
+                    or (revision.fence.generation == revision_row["generation"]
+                        and revision.version <= revision_row["version"]))
+
+        runs = db.execute(
+            "SELECT r.*,b.workload_repository,b.state AS budget_state,b.currency AS budget_currency,b.release_reason,"
+            "rr.policy AS recovery_policy FROM runs r "
+            "JOIN budget_reservations b USING(run_id) "
+            "JOIN reservation_recovery rr USING(run_id) "
+            "WHERE r.review_round_id=?", (round_id,),
+        ).fetchall()
+        planned = {child.child_id: child for child in plan.children}
+        indexed_runs = {run["review_child_id"]: run for run in runs}
+        if (len(runs) > len(plan.children) or len(indexed_runs) != len(runs)
+                or any(child_id not in planned for child_id in indexed_runs)):
+            raise ControlStoreError("review round contains an unplanned or duplicate paid child")
+        evidence: list[ReviewChildEvidence] = []
+        for child in plan.children:
+            refusal_row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-refusal' "
+                "AND scope=? AND key=?", (repository, _review_child_key(child)),
             ).fetchone()
-            if revision_row is None:
-                raise ControlStoreError("review child evidence lost its workflow aggregate")
-
-            def revision_recorded(revision: WorkflowRevision) -> bool:
-                return (revision.fence.generation < revision_row["generation"]
-                        or (revision.fence.generation == revision_row["generation"]
-                            and revision.version <= revision_row["version"]))
-
-            runs = db.execute(
-                "SELECT r.*,b.workload_repository,b.state AS budget_state,b.currency AS budget_currency,b.release_reason,"
-                "rr.policy AS recovery_policy FROM runs r "
-                "JOIN budget_reservations b USING(run_id) "
-                "JOIN reservation_recovery rr USING(run_id) "
-                "WHERE r.review_round_id=?", (round_id,),
-            ).fetchall()
-            planned = {child.child_id: child for child in plan.children}
-            indexed_runs = {run["review_child_id"]: run for run in runs}
-            if (len(runs) > len(plan.children) or len(indexed_runs) != len(runs)
-                    or any(child_id not in planned for child_id in indexed_runs)):
-                raise ControlStoreError("review round contains an unplanned or duplicate paid child")
-            evidence: list[ReviewChildEvidence] = []
-            for child in plan.children:
-                refusal_row = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-refusal' "
-                    "AND scope=? AND key=?", (repository, _review_child_key(child)),
-                ).fetchone()
-                indexed = _indexed_review_child_admission(db, repository, child)
-                run = indexed_runs.get(child.child_id)
-                if refusal_row is not None:
-                    refusal = decode_workflow(refusal_row["payload_json"], ReviewChildAdmissionRefusal)
-                    if (indexed is not None or run is not None or refusal.child != child
-                            or refusal.owner_id != owner_id
-                            or refusal.claim_occurrence_id != selection.claim_occurrence_id
-                            or not revision_recorded(refusal.refused_revision)
-                            or refusal.receipt_id != _review_refusal_receipt_id(refusal)
-                            or db.execute("SELECT 1 FROM runs WHERE run_id=?", (refusal.run_id,)).fetchone()):
-                        raise ControlStoreError("review refusal conflicts with this planned child")
-                    evidence.append(ReviewChildRefused(child, refusal.receipt_id))
-                    continue
-                if indexed is None:
-                    if run is not None:
-                        raise ControlStoreError("review paid child lost its admission index")
-                    evidence.append(ReviewChildPending(child))
-                    continue
-                if (run is None or run["run_id"] != indexed.run_id
-                        or indexed.claim_occurrence_id != selection.claim_occurrence_id
-                        or indexed.owner_id != owner_id or not revision_recorded(indexed.admitted_revision)):
-                    raise ControlStoreError("review child admission disagrees with its round")
-                admission = self._load_review_launch_admission(db, RunId(indexed.run_id), repository, run)
-                if admission != indexed:
-                    raise ControlStoreError("review child admission changed during evidence read")
-                release_row = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-release' "
-                    "AND scope=? AND key=?", (repository, indexed.run_id),
-                ).fetchone()
-                released = proven_unlaunched_run(db, RunId(indexed.run_id))
-                if release_row is not None or released:
-                    if release_row is None or not released:
-                        raise ControlStoreError("review unlaunched release lacks matching durable proof")
-                    proof = decode_workflow(release_row["payload_json"], ReviewUnlaunchedRelease)
-                    release_reason = run["release_reason"]
-                    if (proof.admission != indexed or not isinstance(release_reason, str)
-                            or proof.reason_digest != hashlib.sha256(release_reason.encode()).hexdigest()
-                            or _stamp(proof.released_at) != run["completed_at"]
-                            or db.execute(
-                                "SELECT 1 FROM dedupe_keys WHERE namespace IN ('review-execution-launch',"
-                                "'review-execution-preflight-stop','review-execution-return') "
-                                "AND scope=? AND key=?", (repository, indexed.run_id),
-                            ).fetchone() is not None):
-                        raise ControlStoreError("review release contradicts its admitted child")
-                    evidence.append(ReviewChildReleased(child, indexed.run_id, proof.receipt_id))
-                    continue
-                stop_row = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-preflight-stop' "
-                    "AND scope=? AND key=?", (repository, indexed.run_id),
-                ).fetchone()
-                if stop_row is not None:
-                    stopped = decode_workflow(stop_row["payload_json"], ReviewRuntimePreflightStop)
-                    if (stopped.admission != indexed or plan.runtime is not RuntimeName.CODEX
-                            or run["started_at"] is not None
-                            or db.execute(
-                                "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-launch' "
-                                "AND scope=? AND key=?", (repository, indexed.run_id),
-                            ).fetchone() is not None
-                            or db.execute("SELECT 1 FROM leases WHERE run_id=?", (indexed.run_id,)).fetchone()):
-                        raise ControlStoreError("review preflight stop disagrees with planned child")
-                    return_row = db.execute(
-                        "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
-                        "AND scope=? AND key=?", (repository, indexed.run_id),
-                    ).fetchone()
-                    if return_row is None:
-                        if (run["state"] != "reserved" or run["budget_state"] != "active"
-                                or run["recovery_policy"] != "spawn_pending"
-                                or run["provider_receipt_id"] is not None
-                                or db.execute("SELECT 1 FROM charges WHERE run_id=?", (indexed.run_id,)).fetchone()):
-                            raise ControlStoreError("pending review stop has contradictory accounting state")
-                        evidence.append(ReviewChildPending(child))
-                        continue
-                    returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
-                    if self._review_return_authority(db, returned) != (repository, True):
-                        raise ControlStoreError("review stop return disagrees with its admission")
-                    charge = db.execute(
-                        "SELECT provider_receipt_id,amount_micros,currency,basis,usage_json,"
-                        "rate_card_id,rate_card_version FROM charges WHERE run_id=?", (indexed.run_id,),
-                    ).fetchone()
-                    receipt_id = f"codex:preflight-stop:{indexed.run_id}"
-                    if (run["state"] != "completed" or run["outcome"] != "settled"
-                            or run["budget_state"] != "settled" or run["provider_receipt_id"] != receipt_id
-                            or charge is None or tuple(charge) != (receipt_id, 0, "USD", PricingBasis.SYNTHETIC.value,
-                                                               None, None, None)
-                            or returned.result != stopped.result or returned.returned_at != stopped.stopped_at):
-                        raise ControlStoreError("review preflight stop lacks its exact zero settlement")
-                    evidence.append(ReviewChildSettledWithoutLaunch(
-                        child, indexed.run_id, receipt_id, stopped.receipt_id,
-                        ReviewPreparationFailure(ReviewPreparationKind.RUNTIME, stopped.receipt_id),
-                    ))
-                    continue
-                launch_row = db.execute(
-                    "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-launch' "
-                    "AND scope=? AND key=?", (repository, indexed.run_id),
-                ).fetchone()
+            indexed = _indexed_review_child_admission(db, repository, child)
+            run = indexed_runs.get(child.child_id)
+            if refusal_row is not None:
+                refusal = decode_workflow(refusal_row["payload_json"], ReviewChildAdmissionRefusal)
+                if (indexed is not None or run is not None or refusal.child != child
+                        or refusal.owner_id != owner_id
+                        or refusal.claim_occurrence_id != selection.claim_occurrence_id
+                        or not revision_recorded(refusal.refused_revision)
+                        or refusal.receipt_id != _review_refusal_receipt_id(refusal)
+                        or db.execute("SELECT 1 FROM runs WHERE run_id=?", (refusal.run_id,)).fetchone()):
+                    raise ControlStoreError("review refusal conflicts with this planned child")
+                evidence.append(ReviewChildRefused(child, refusal.receipt_id))
+                continue
+            if indexed is None:
+                if run is not None:
+                    raise ControlStoreError("review paid child lost its admission index")
+                evidence.append(ReviewChildPending(child))
+                continue
+            if (run is None or run["run_id"] != indexed.run_id
+                    or indexed.claim_occurrence_id != selection.claim_occurrence_id
+                    or indexed.owner_id != owner_id or not revision_recorded(indexed.admitted_revision)):
+                raise ControlStoreError("review child admission disagrees with its round")
+            admission = self._load_review_launch_admission(db, RunId(indexed.run_id), repository, run)
+            if admission != indexed:
+                raise ControlStoreError("review child admission changed during evidence read")
+            release_row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-release' "
+                "AND scope=? AND key=?", (repository, indexed.run_id),
+            ).fetchone()
+            released = proven_unlaunched_run(db, RunId(indexed.run_id))
+            if release_row is not None or released:
+                if release_row is None or not released:
+                    raise ControlStoreError("review unlaunched release lacks matching durable proof")
+                proof = decode_workflow(release_row["payload_json"], ReviewUnlaunchedRelease)
+                release_reason = run["release_reason"]
+                if (proof.admission != indexed or not isinstance(release_reason, str)
+                        or proof.reason_digest != hashlib.sha256(release_reason.encode()).hexdigest()
+                        or _stamp(proof.released_at) != run["completed_at"]
+                        or db.execute(
+                            "SELECT 1 FROM dedupe_keys WHERE namespace IN ('review-execution-launch',"
+                            "'review-execution-preflight-stop','review-execution-return') "
+                            "AND scope=? AND key=?", (repository, indexed.run_id),
+                        ).fetchone() is not None):
+                    raise ControlStoreError("review release contradicts its admitted child")
+                evidence.append(ReviewChildReleased(child, indexed.run_id, proof.receipt_id))
+                continue
+            stop_row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-preflight-stop' "
+                "AND scope=? AND key=?", (repository, indexed.run_id),
+            ).fetchone()
+            if stop_row is not None:
+                stopped = decode_workflow(stop_row["payload_json"], ReviewRuntimePreflightStop)
+                if (stopped.admission != indexed or plan.runtime is not RuntimeName.CODEX
+                        or run["started_at"] is not None
+                        or db.execute(
+                            "SELECT 1 FROM dedupe_keys WHERE namespace='review-execution-launch' "
+                            "AND scope=? AND key=?", (repository, indexed.run_id),
+                        ).fetchone() is not None
+                        or db.execute("SELECT 1 FROM leases WHERE run_id=?", (indexed.run_id,)).fetchone()):
+                    raise ControlStoreError("review preflight stop disagrees with planned child")
                 return_row = db.execute(
                     "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
                     "AND scope=? AND key=?", (repository, indexed.run_id),
                 ).fetchone()
-                if launch_row is None:
-                    if return_row is not None or run["started_at"] is not None or run["state"] == "running":
-                        raise ControlStoreError("review child has execution evidence without guarded launch")
-                else:
-                    launch = decode_workflow(launch_row["payload_json"], ReviewChildLaunchRegistration)
-                    if (launch.admission != indexed or launch.dispatch_id != run["dispatch_id"]
-                            or run["started_at"] is None
-                            or launch.registered_at != _parse_stamp(run["started_at"])):
-                        raise ControlStoreError("review child launch disagrees with its admitted run")
-                    if return_row is not None:
-                        returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
-                        if self._review_return_authority(db, returned) != (repository, True):
-                            raise ControlStoreError("review child return disagrees with its guarded launch")
-                        charge = db.execute(
-                            "SELECT provider_receipt_id,amount_micros,currency,basis FROM charges WHERE run_id=?",
-                            (indexed.run_id,),
-                        ).fetchone()
-                        if (charge is None) != (run["budget_state"] != "settled"):
-                            raise ControlStoreError("review return and budget disagree with settled charge")
-                        if charge is not None:
-                            if (run["provider_receipt_id"] != charge["provider_receipt_id"]
-                                    or charge["currency"] != run["budget_currency"]
-                                    or type(charge["amount_micros"]) is not int or charge["amount_micros"] < 0):
-                                raise ControlStoreError("review return charge disagrees with its admitted run")
-                            try:
-                                PricingBasis(charge["basis"])
-                            except ValueError as exc:
-                                raise ControlStoreError("review return has an invalid charge basis") from exc
-                            if (run["state"] == "completed" and run["outcome"] in
-                                    ("settled", "spend_unreconciled")):
-                                launched = LaunchedReviewChild(child, indexed.run_id, launch.receipt_id)
-                                result = classify_normal_review_return(launched, plan.runtime, returned.result)
-                                if returned.result.exit_reason is ExitReason.OPERATOR_CANCELLED:
-                                    intent = db.execute(
-                                        "SELECT dispatch_id,kind,reason FROM run_cancellation_intents WHERE run_id=?",
-                                        (indexed.run_id,),
-                                    ).fetchone()
-                                    if intent is not None:
-                                        if intent["dispatch_id"] != run["dispatch_id"] or intent["kind"] != run["kind"]:
-                                            raise ControlStoreError("review cancellation intent disagrees with its run")
-                                        if (intent["reason"] == "shutdown_deadline_spend_unknown"
-                                                and returned.result.is_error):
-                                            result = ReviewChildCancelled(
-                                                ReviewCancellationReason.SHUTDOWN,
-                                                f"run-cancellation-intent:{indexed.run_id}",
-                                            )
-                                if result is not None:
-                                    evidence.append(ReviewChildReturned(
-                                        launched, f"review-execution-return:{indexed.run_id}", result,
-                                    ))
-                                    continue
-                evidence.append(ReviewChildPending(child))
-            return tuple(evidence)
+                if return_row is None:
+                    if (run["state"] != "reserved" or run["budget_state"] != "active"
+                            or run["recovery_policy"] != "spawn_pending"
+                            or run["provider_receipt_id"] is not None
+                            or db.execute("SELECT 1 FROM charges WHERE run_id=?", (indexed.run_id,)).fetchone()):
+                        raise ControlStoreError("pending review stop has contradictory accounting state")
+                    evidence.append(ReviewChildPending(child))
+                    continue
+                returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
+                if self._review_return_authority(db, returned) != (repository, True):
+                    raise ControlStoreError("review stop return disagrees with its admission")
+                charge = db.execute(
+                    "SELECT provider_receipt_id,amount_micros,currency,basis,usage_json,"
+                    "rate_card_id,rate_card_version FROM charges WHERE run_id=?", (indexed.run_id,),
+                ).fetchone()
+                receipt_id = f"codex:preflight-stop:{indexed.run_id}"
+                if (run["state"] != "completed" or run["outcome"] != "settled"
+                        or run["budget_state"] != "settled" or run["provider_receipt_id"] != receipt_id
+                        or charge is None or tuple(charge) != (receipt_id, 0, "USD", PricingBasis.SYNTHETIC.value,
+                                                           None, None, None)
+                        or returned.result != stopped.result or returned.returned_at != stopped.stopped_at):
+                    raise ControlStoreError("review preflight stop lacks its exact zero settlement")
+                evidence.append(ReviewChildSettledWithoutLaunch(
+                    child, indexed.run_id, receipt_id, stopped.receipt_id,
+                    ReviewPreparationFailure(ReviewPreparationKind.RUNTIME, stopped.receipt_id),
+                ))
+                continue
+            launch_row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-launch' "
+                "AND scope=? AND key=?", (repository, indexed.run_id),
+            ).fetchone()
+            return_row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-return' "
+                "AND scope=? AND key=?", (repository, indexed.run_id),
+            ).fetchone()
+            if launch_row is None:
+                if return_row is not None or run["started_at"] is not None or run["state"] == "running":
+                    raise ControlStoreError("review child has execution evidence without guarded launch")
+            else:
+                launch = decode_workflow(launch_row["payload_json"], ReviewChildLaunchRegistration)
+                if (launch.admission != indexed or launch.dispatch_id != run["dispatch_id"]
+                        or run["started_at"] is None
+                        or launch.registered_at != _parse_stamp(run["started_at"])):
+                    raise ControlStoreError("review child launch disagrees with its admitted run")
+                if return_row is not None:
+                    returned = decode_workflow(return_row["payload_json"], ReturnedReviewChild)
+                    if self._review_return_authority(db, returned) != (repository, True):
+                        raise ControlStoreError("review child return disagrees with its guarded launch")
+                    charge = db.execute(
+                        "SELECT provider_receipt_id,amount_micros,currency,basis FROM charges WHERE run_id=?",
+                        (indexed.run_id,),
+                    ).fetchone()
+                    if (charge is None) != (run["budget_state"] != "settled"):
+                        raise ControlStoreError("review return and budget disagree with settled charge")
+                    if charge is not None:
+                        if (run["provider_receipt_id"] != charge["provider_receipt_id"]
+                                or charge["currency"] != run["budget_currency"]
+                                or type(charge["amount_micros"]) is not int or charge["amount_micros"] < 0):
+                            raise ControlStoreError("review return charge disagrees with its admitted run")
+                        try:
+                            PricingBasis(charge["basis"])
+                        except ValueError as exc:
+                            raise ControlStoreError("review return has an invalid charge basis") from exc
+                        if (run["state"] == "completed" and run["outcome"] in
+                                ("settled", "spend_unreconciled")):
+                            launched = LaunchedReviewChild(child, indexed.run_id, launch.receipt_id)
+                            result = classify_normal_review_return(launched, plan.runtime, returned.result)
+                            if returned.result.exit_reason is ExitReason.OPERATOR_CANCELLED:
+                                intent = db.execute(
+                                    "SELECT dispatch_id,kind,reason FROM run_cancellation_intents WHERE run_id=?",
+                                    (indexed.run_id,),
+                                ).fetchone()
+                                if intent is not None:
+                                    if intent["dispatch_id"] != run["dispatch_id"] or intent["kind"] != run["kind"]:
+                                        raise ControlStoreError("review cancellation intent disagrees with its run")
+                                    if (intent["reason"] == "shutdown_deadline_spend_unknown"
+                                            and returned.result.is_error):
+                                        result = ReviewChildCancelled(
+                                            ReviewCancellationReason.SHUTDOWN,
+                                            f"run-cancellation-intent:{indexed.run_id}",
+                                        )
+                            if result is not None:
+                                evidence.append(ReviewChildReturned(
+                                    launched, f"review-execution-return:{indexed.run_id}", result,
+                                ))
+                                continue
+            evidence.append(ReviewChildPending(child))
+        return tuple(evidence)
 
     def _review_return_authority(
         self, db: sqlite3.Connection, returned: ReturnedReviewChild,
