@@ -91,10 +91,12 @@ model this distinction without making an open prefix into a checkpoint. Tests
 cover prior debits, late old outcomes, multiple advances, session clearing,
 malformed sources, and replay from a verified prefix inside a boundary. The
 closed workflow codec also round-trips the boundary and rejects missing
-transition fields. This is a model-and-codec checkpoint: adapters do not mint boundary receipts or attach
-them to the active aggregate yet. Generation-aware compaction, source-set
-completeness, activation/import anchoring, and the three advancing transitions
-remain implementation work.
+transition fields. The SQLite adapter now captures the complete finalized
+suffix at each of the three advancing transitions, persists a boundary receipt
+with the accepted workflow transition, verifies that receipt on reload, and
+uses generation-aware projection for later outcomes. Public-control regressions
+cover the three advances and late old-round settlement. Generation-aware
+compaction and activation/import anchoring remain implementation work.
 
 Independent GPT-6 Sol review confirmed that rebinding alone loses prior debits
 or admits late old-generation effects. Its first code pass found a compacted
@@ -102,3 +104,10 @@ replay bug and future-binding omission; both have regressions. A later pass
 identified revision provenance and quadratic interval checks, now addressed
 in the pure model. Final re-review found no remaining medium or high defect
 in this model scope.
+
+An independent Sol review of the adapter wiring found one medium operational
+issue: every accepted transition retains its earlier boundaries, so stored
+history and canonical reads grow quadratically across repeated advances. The
+4,096-boundary limit can also halt rearm or release with no new rounds. A
+source-backed compacted prefix and bounded hot-read contract must replace this
+retention before activation.

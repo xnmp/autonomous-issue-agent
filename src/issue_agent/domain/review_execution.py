@@ -5,9 +5,12 @@ constructing these facts. Model output cannot mint them. This module supplies
 no runtime authority until the execution family is explicitly activated.
 """
 
+from __future__ import annotations
+
 from dataclasses import dataclass, replace
 from datetime import datetime
 from enum import Enum
+import hashlib
 
 from .agent_task import RuntimeCapabilities, RuntimeName
 from .workflow import WorkflowMutation
@@ -577,13 +580,23 @@ class ActivatedReviewExecution:
     state: ReviewExecutionState
     last_sequence: int
     checkpoint_receipt: str | None = None
+    boundaries: tuple[ReviewExecutionGenerationBoundary, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.origin, ReviewExecutionOrigin):
             raise ValueError("activated execution requires its origin evidence")
         if not isinstance(self.checkpoint, ReviewExecutionCheckpoint) or not isinstance(self.state, ReviewExecutionState):
             raise ValueError("activated execution requires its checkpoint and current state")
-        if self.checkpoint.state.binding != self.state.binding:
+        if not isinstance(self.boundaries, tuple) or len(self.boundaries) > MAX_EXECUTION_SUFFIX or any(
+            not isinstance(boundary, ReviewExecutionGenerationBoundary) for boundary in self.boundaries
+        ):
+            raise ValueError("activated execution requires bounded generation boundaries")
+        if self.boundaries:
+            if (self.checkpoint.state.binding != self.boundaries[0].before.binding
+                    or self.boundaries[-1].after.binding != self.state.binding
+                    or self.boundaries[-1].through_sequence > self.last_sequence):
+                raise ValueError("generation boundaries disagree with active execution")
+        elif self.checkpoint.state.binding != self.state.binding:
             raise ValueError("execution checkpoint and state belong to different bindings")
         integer(self.last_sequence, "last allocated review round")
         if self.checkpoint.through_sequence > self.last_sequence:
@@ -594,7 +607,8 @@ class ActivatedReviewExecution:
             raise ValueError("initial execution checkpoint has no compaction receipt")
         if max(self.state.session_sequence, self.state.display_sequence, self.state.productive_sequence) > self.last_sequence:
             raise ValueError("execution state contains a future outcome")
-        if self.checkpoint.through_sequence == self.last_sequence and self.checkpoint.state != self.state:
+        if (not self.boundaries and self.checkpoint.through_sequence == self.last_sequence
+                and self.checkpoint.state != self.state):
             raise ValueError("execution state disagrees with its completed checkpoint")
         if isinstance(self.state.session, ReusableReviewSession) and isinstance(self.state.session.source, ImportedReviewSession):
             if self.origin.kind is not ReviewExecutionOriginKind.IMPORTED:
@@ -825,3 +839,37 @@ def replay_review_execution_generations(
             raise ValueError("generation replay contains an outcome beyond its binding boundary")
         state = _apply(state, outcome, checkpoint.policy)
     return state
+
+
+def advance_review_execution_generation(
+    execution: ActivatedReviewExecution, from_revision: WorkflowRevision,
+    to_revision: WorkflowRevision, mutation: WorkflowMutation,
+    applied_sequences: tuple[int, ...],
+) -> ActivatedReviewExecution:
+    """Bind a rejection advance to a source-captured execution boundary."""
+    if not isinstance(execution, ActivatedReviewExecution) or not isinstance(from_revision, WorkflowRevision):
+        raise ValueError("generation advance requires active execution and its captured revision")
+    if (execution.binding.rejection.fence != from_revision.fence
+            or not isinstance(to_revision, WorkflowRevision)):
+        raise ValueError("generation advance disagrees with the active rejection revision")
+    lower = (execution.boundaries[-1].through_sequence if execution.boundaries
+             else execution.checkpoint.through_sequence)
+    if (not isinstance(applied_sequences, tuple)
+            or any(type(sequence) is not int or sequence <= lower or sequence > execution.last_sequence
+                   for sequence in applied_sequences)):
+        raise ValueError("generation advance requires captured finalized suffix outcomes")
+    next_binding = replace(
+        execution.binding, rejection=replace(execution.binding.rejection, fence=to_revision.fence),
+    )
+    after = carry_review_execution_generation(execution.state, next_binding, execution.last_sequence)
+    identity = (
+        f"{from_revision.fence.key.repository}:{from_revision.fence.key.target.number}:"
+        f"{execution.binding.execution_epoch}:{execution.binding.execution_episode}:"
+        f"{to_revision.fence.generation}"
+    )
+    receipt_id = "review-generation:" + hashlib.sha256(identity.encode()).hexdigest()
+    boundary = ReviewExecutionGenerationBoundary(
+        execution.state, after, execution.last_sequence, applied_sequences,
+        receipt_id, from_revision, to_revision, mutation,
+    )
+    return replace(execution, state=after, boundaries=execution.boundaries + (boundary,))

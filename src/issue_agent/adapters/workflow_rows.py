@@ -17,7 +17,8 @@ from ..domain.review_workflow import (
 )
 from ..domain.review_execution import (
     MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
-    ReviewExecutionCheckpoint, ReviewRoundOutcome, project_review_execution,
+    ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary, ReviewRoundOutcome,
+    replay_review_execution_generations,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
@@ -32,9 +33,11 @@ from ..domain.review_workflow_policy import (
     OBSERVATION_MAX_AGE_SECONDS, CeilingProductivityDecision, open_review_ceiling,
 )
 from ..domain.workflow import (
-    CancelledRearm, CompletedRearm, OpenGate, PendingRearm, RearmIntent, RearmingGate,
+    AuthorizedOperatorCommand, CancelledRearm, CompletedRearm, ContinueGrantedRearm, OpenGate,
+    PendingRearm, RequestRearm,
+    RearmIntent, RearmingGate,
     ResolveEpisode, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowMigrationRequired,
-    WorkflowRejected, WorkflowSnapshot, WorkflowUnchanged,
+    WorkflowMutation, WorkflowRejected, WorkflowSnapshot, WorkflowUnchanged,
 )
 from ..domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence,
@@ -501,6 +504,48 @@ def _check_execution_projection(
     ).fetchone()["total"]
     if count != execution.last_sequence:
         raise WorkflowAuthorityError("review execution rounds disagree with allocated sequence")
+    for boundary in execution.boundaries:
+        receipt = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation' "
+            "AND scope=? AND key=?", (scope[0], boundary.receipt_id),
+        ).fetchone()
+        if receipt is None:
+            raise WorkflowAuthorityError("review generation boundary lacks its accepted receipt")
+        captured = decode_workflow(receipt["payload_json"], tuple)
+        if (len(captured) != 4 or captured[0] != boundary
+                or not all(isinstance(item, str) for item in captured[1:])):
+            raise WorkflowAuthorityError("review generation boundary receipt changed")
+        namespace, key, accepted = captured[1:]
+        committed = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (namespace, scope[0], key),
+        ).fetchone()
+        if committed is None or committed["payload_json"] != accepted:
+            raise WorkflowAuthorityError("review generation boundary lost its accepted transition")
+        try:
+            payload = json.loads(accepted)
+            observed = decode_workflow(payload["snapshot"], ReviewWorkflowSnapshot)
+            expected = decode_workflow(payload["expected"], WorkflowRevision)
+            audit = decode_workflow(payload["audit"], AuthorizedOperatorCommand) if (
+                boundary.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM)
+            ) else None
+        except (ValueError, TypeError, KeyError) as exc:
+            raise WorkflowAuthorityError("review generation boundary has invalid transition facts") from exc
+        if (payload.get("mutation") != boundary.mutation.value or expected != boundary.from_revision
+                or observed.revision != boundary.to_revision
+                or not isinstance(observed.execution, ActivatedReviewExecution)
+                or not observed.execution.boundaries
+                or observed.execution.boundaries[-1] != boundary):
+            raise WorkflowAuthorityError("review generation boundary disagrees with accepted transition")
+        if audit is not None:
+            if (not isinstance(audit.command, (RequestRearm, ContinueGrantedRearm))
+                    or namespace != "workflow-request" or key != audit.command.request_id
+                    or audit.command.expected != boundary.from_revision):
+                raise WorkflowAuthorityError("review generation boundary request identity changed")
+        elif (namespace != "workflow-transition" or key != hashlib.sha256(
+            encode_workflow(boundary.from_revision).encode(),
+        ).hexdigest()):
+            raise WorkflowAuthorityError("review generation boundary release identity changed")
     if execution.checkpoint.through_sequence:
         if execution.checkpoint_receipt is None:
             raise WorkflowAuthorityError("review execution checkpoint lacks its compaction receipt")
@@ -765,8 +810,10 @@ def _check_execution_projection(
         outcomes.append(outcome)
     if expected_sequence != execution.last_sequence + 1:
         raise WorkflowAuthorityError("review execution round suffix has a gap")
-    projected = project_review_execution(execution.checkpoint, tuple(outcomes))
-    if projected.state != execution.state:
+    projected = replay_review_execution_generations(
+        execution.checkpoint, tuple(outcomes), execution.boundaries,
+    )
+    if projected != execution.state:
         raise WorkflowAuthorityError("review execution state disagrees with ordered outcomes")
 
 

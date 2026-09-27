@@ -16,13 +16,17 @@ from issue_agent.adapters.workflow_rows import (
 from issue_agent.adapters.control_store import load_bound_review_submission
 from issue_agent.domain.contracts import CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from issue_agent.domain.labels import Label
-from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress
+from issue_agent.domain.outcome import AgentResult, ExitReason
+from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress, ReviewRoundFailure
 from issue_agent.domain.review_evidence import ReviewEvidenceKind
 from issue_agent.domain.review_rejection import CountingRule
 from issue_agent.domain.review_rounds import ReviewSubmissionKind
 from issue_agent.domain.review_workflow import FreshReviewRequired
 from issue_agent.domain.review_workflow_policy import record_review
-from issue_agent.domain.workflow import WorkflowChanged, WorkflowCommitted, WorkflowRejected, WorkflowRejection
+from issue_agent.domain.workflow import (
+    CancelRearm, ContinueGrantedRearm, KeepGuidance, OperatorActor, RequestRearm,
+    WorkflowChanged, WorkflowCommitted, WorkflowRejected, WorkflowRejection,
+)
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from tests.adapters.test_review_execution_admission import request
 from tests.adapters.test_review_execution_control import OWNER, current, dump, rig
@@ -412,6 +416,229 @@ def test_ceiling_marker_failure_replays_without_a_second_gate(rig):
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-submission-settled' "
                           "AND key=?", (str(command.command_id),)).fetchone()[0] == 1
+
+
+def test_rejection_rearm_preserves_active_execution_boundary_and_reloads(rig):
+    store, gateway, selection, _, plan, command = confirmed_escalation(rig, cause="ceiling")
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    request = RequestRearm("rearm:active-execution", before.revision, before.gates[0].gate_id,
+                           KeepGuidance(), expected_binding=before.binding)
+
+    result = workflow.request_rearm(request, OperatorActor("operator", "test"))
+
+    assert isinstance(result, WorkflowCommitted)
+    after = current(store, selection)
+    assert after.revision.fence.generation == before.revision.fence.generation + 1
+    assert after.execution.state.failures == before.execution.state.failures
+    assert after.execution.state.pin_deferrals == before.execution.state.pin_deferrals
+    assert after.execution.binding.rejection == after.binding
+    assert after.execution.state.productive_sequence == plan.round.sequence
+    assert after.execution.boundaries[-1].applied_sequences == (plan.round.sequence,)
+    before_replay = dump(store)
+    assert workflow.request_rearm(request, OperatorActor("operator", "test")).idempotent
+    assert dump(store) == before_replay
+
+
+def test_old_open_round_closes_as_audit_after_rearm(rig):
+    store, snapshot, gateway, selection, control = rig
+    old = control.preflight(selection)
+    later_selection = replace(selection, request_id="preflight:after-open",
+                              expected=current(store, selection).revision)
+    later_rig = (store, snapshot, gateway, later_selection, control)
+    _, _, _, _, productive, command = confirmed_escalation(later_rig, cause="ceiling")
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    request = RequestRearm("rearm:with-open-round", before.revision, before.gates[0].gate_id,
+                           KeepGuidance(), expected_binding=before.binding)
+    assert isinstance(workflow.request_rearm(request, OperatorActor("operator", "test")), WorkflowCommitted)
+    advanced = current(store, selection)
+    assert advanced.execution.boundaries[-1].through_sequence == productive.round.sequence
+    assert advanced.execution.boundaries[-1].applied_sequences == (productive.round.sequence,)
+
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    control.seal_abandoned_planning(old.round.round_id)
+    result = control.finalize_abandoned_round(old.round.round_id)
+
+    assert result.outcome.round == old.round
+    assert current(store, selection).execution.state == advanced.execution.state
+
+
+def test_late_old_paid_failure_does_not_debit_rearmed_execution(rig):
+    store, snapshot, gateway, selection, control = rig
+    old = control.preflight(selection)
+    planned = stage(old)
+    control.register_stage(old.round.round_id, current(store, selection).revision, planned)
+    child = planned.children[0]
+    control.seal_completed_planning(old.round.round_id, current(store, selection).revision)
+    proposed = request(child)
+    assert store.reserve(proposed).admitted
+    register(store, proposed)
+    raw = returned(store, proposed, result=AgentResult(
+        True, status="error", exit_reason=ExitReason.AGENT_ERROR,
+    ))
+    store.settle_review_return(settlement(proposed), raw)
+    later_selection = replace(selection, request_id="preflight:after-paid-failure",
+                              expected=current(store, selection).revision)
+    _, _, _, _, productive, command = confirmed_escalation(
+        (store, snapshot, gateway, later_selection, control), cause="ceiling",
+    )
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    request_rearm = RequestRearm("rearm:late-failure", before.revision, before.gates[0].gate_id,
+                                 KeepGuidance(), expected_binding=before.binding)
+    assert isinstance(workflow.request_rearm(request_rearm, OperatorActor("operator", "test")),
+                      WorkflowCommitted)
+    advanced = current(store, selection)
+    assert advanced.execution.boundaries[-1].applied_sequences == (productive.round.sequence,)
+
+    result = control.finalize_completed_round(old.round.round_id)
+
+    assert isinstance(result.outcome.disposition, ReviewRoundFailure)
+    assert current(store, selection).execution.state == advanced.execution.state
+
+
+def test_boundary_captures_state_neutral_outcome_settled_before_rearm(rig):
+    store, snapshot, gateway, selection, control = rig
+    old = control.preflight(selection)
+    planned = stage(old)
+    control.register_stage(old.round.round_id, current(store, selection).revision, planned)
+    assert store.record_review_admission_refusal(request(planned.children[0], cap=59)) is not None
+    control.seal_completed_planning(old.round.round_id, current(store, selection).revision)
+    control.finalize_completed_round(old.round.round_id)
+    later_selection = replace(selection, request_id="preflight:after-neutral",
+                              expected=current(store, selection).revision)
+    _, _, _, _, productive, command = confirmed_escalation(
+        (store, snapshot, gateway, later_selection, control), cause="ceiling",
+    )
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    rearm = RequestRearm("rearm:after-neutral", before.revision, before.gates[0].gate_id,
+                         KeepGuidance(), expected_binding=before.binding)
+
+    assert isinstance(workflow.request_rearm(rearm, OperatorActor("operator", "test")), WorkflowCommitted)
+    assert current(store, selection).execution.boundaries[-1].applied_sequences == (
+        old.round.sequence, productive.round.sequence,
+    )
+
+
+def test_stopped_rearm_continuation_preserves_execution_across_second_advance(rig):
+    store, gateway, selection, _, plan, command = confirmed_escalation(rig, cause="ceiling")
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    first = current(store, selection)
+    actor = OperatorActor("operator", "test")
+    assert isinstance(workflow.request_rearm(
+        RequestRearm("rearm:first", first.revision, first.gates[0].gate_id,
+                     KeepGuidance(), expected_binding=first.binding), actor,
+    ), WorkflowCommitted)
+    pending = current(store, selection)
+    cancelled = workflow.cancel_rearm(
+        CancelRearm("cancel:first", pending.revision, "rearm:first", "stop",
+                    expected_binding=pending.binding), actor,
+    )
+    assert isinstance(cancelled, WorkflowCommitted)
+    stopped = current(store, selection)
+
+    result = workflow.continue_rearm(
+        ContinueGrantedRearm("rearm:second", stopped.revision, "rearm:first",
+                              expected_binding=stopped.binding), actor,
+    )
+
+    assert isinstance(result, WorkflowCommitted)
+    after = current(store, selection)
+    assert after.revision.fence.generation == first.revision.fence.generation + 2
+    assert len(after.execution.boundaries) == 2
+    assert after.execution.boundaries[1].applied_sequences == ()
+    assert after.execution.state.productive_sequence == plan.round.sequence
+
+
+def test_ceiling_release_advances_active_execution_with_verified_boundary(rig):
+    store, gateway, selection, _, plan, command = confirmed_escalation(rig, cause="ceiling")
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    released = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=0,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+
+    result = released.reconcile_ceiling(selection.expected.fence.key)
+
+    assert isinstance(result, WorkflowCommitted)
+    after = current(store, selection)
+    assert after.revision.fence.generation == before.revision.fence.generation + 1
+    assert after.execution.binding.rejection == after.binding
+    assert after.execution.state.productive_sequence == plan.round.sequence
+    assert after.execution.boundaries[-1].applied_sequences == (plan.round.sequence,)
+
+
+@pytest.mark.parametrize("corruption", ["boundary", "transition"])
+def test_active_generation_boundary_requires_its_accepted_receipts(rig, corruption):
+    store, gateway, selection, _, _, command = confirmed_escalation(rig, cause="ceiling")
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    request = RequestRearm("rearm:receipt-check", before.revision, before.gates[0].gate_id,
+                           KeepGuidance(), expected_binding=before.binding)
+    assert isinstance(workflow.request_rearm(request, OperatorActor("operator", "test")), WorkflowCommitted)
+    with store.transaction() as db:
+        if corruption == "boundary":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-generation'")
+        else:
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-request' AND key=?",
+                       (request.request_id,))
+
+    with pytest.raises(WorkflowAuthorityError, match="boundary"):
+        current(store, selection)
+
+
+def test_generation_receipt_failure_rolls_back_rearm_and_accepted_transition(rig):
+    store, gateway, selection, _, _, command = confirmed_escalation(rig, cause="ceiling")
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    rearm = RequestRearm("rearm:rollback", before.revision, before.gates[0].gate_id,
+                         KeepGuidance(), expected_binding=before.binding)
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_generation BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='review-execution-generation' "
+                   "BEGIN SELECT RAISE(ABORT,'boundary refused'); END")
+    baseline = dump(store)
+
+    with pytest.raises(sqlite3.IntegrityError, match="boundary refused"):
+        workflow.request_rearm(rearm, OperatorActor("operator", "test"))
+
+    assert dump(store) == baseline
+    assert current(store, selection) == before
 
 
 def test_ceiling_waits_for_parent_seal_before_opening_gate(rig):

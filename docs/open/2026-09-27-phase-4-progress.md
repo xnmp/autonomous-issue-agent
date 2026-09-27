@@ -780,3 +780,29 @@ gate; no live authority was activated. Full `make test` passed: 3,128 domain,
 2,827 adapter and 2,866 app tests, plus hooks, governor, gate parity, four
 import contracts and both Pyrefly checks. Ten accepted strict xfails remained
 expected. Log: `/tmp/phase4-generation-boundary-final-gate.log` (ephemeral).
+
+## Checkpoint 28 — active execution generation wiring (offline)
+
+The three rejection generation advances now carry active execution through a
+typed boundary. The SQLite writer captures the complete finalized suffix at
+acceptance, commits the boundary with the accepted workflow transition, and
+re-derives those facts when validating the proposal. Canonical reload verifies
+each boundary receipt against that accepted transition and replays the round
+suffix in allocation order. An older round that closes after rearm retains its
+source and charge receipts but cannot change the carried allowance. The old
+active-component codec tag has an explicit exact-field read rule; new writes
+use the boundary-bearing tag.
+
+Public-control tests cover request rearm, stopped continuation, ceiling
+release, old open rounds, late paid failures, state-neutral outcomes captured
+before rearm, idempotent replay, missing boundary/transition receipts, and
+transaction rollback. An independent Sol review found no separate high
+severity correctness defect. It identified quadratic stored and hot-read
+history from accepted snapshots embedding all earlier boundaries; the
+4,096-boundary limit also eventually stops repeated recovery with zero new
+rounds. Source-backed boundary compaction and bounded canonical reads are
+required before execution-family activation. No live authority was activated.
+Full `make test` passed: 3,129 domain, 2,837 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten accepted strict xfails remained expected. Log:
+`/tmp/phase4-generation-adapter-gate.log` (ephemeral).

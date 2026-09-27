@@ -69,20 +69,43 @@ regression remains uncommitted until that complete change is implemented.
 No live execution-family activation, migration, service restart, target
 mutation, paid run or push occurred.
 
+## Checkpoint 28 — generation boundary persistence
+
+The SQLite adapter now wires all three advancing transitions to the active
+execution component. It captures every finalized suffix outcome at acceptance,
+stores a boundary receipt tied to the accepted workflow transition, and
+verifies both receipts and the ordered source projection on canonical reload.
+Late old-generation outcomes retain their audit and charge evidence without
+changing the new allowance. Public-control regressions cover the three
+advances, old open rounds, late paid failures, state-neutral outcomes, exact
+replay and rollback. The codec explicitly distinguishes the old active
+component tag from the new boundary-bearing tag.
+
+Independent Sol review found no separate high correctness defect. It found
+that repeated advances produce quadratic accepted snapshot history and
+canonical read work, and the 4,096-boundary cap eventually blocks recovery
+even with no new rounds. This remains a hard activation gate alongside the
+4,096-round suffix limit. The next compaction design needs a verified
+activation/import anchor, an archived-source audit contract, and bounded hot
+reads. No execution-family activation, migration, service restart, target
+mutation, paid run or push occurred.
+Full `make test` passed: 3,129 domain, 2,837 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten accepted strict xfails remained expected. Log:
+`/tmp/phase4-generation-adapter-gate.log` (ephemeral).
+
 ## Next implementation boundaries
 
-1. Implement the [generation-boundary design](2026-09-28-phase-4-generation-boundary.md)
-   before rejection rearm or ceiling release can operate on active execution.
-   The public control path currently raises on its old execution binding.
-2. Design source-backed checkpoint compaction with an activation/import anchor,
-   an archived-source audit contract and bounded canonical reads. The current
-   4,096-round suffix limit remains an activation gate.
-3. Add source-specific bounded rereads for `REVISION_DIFF` and `CONTAINMENT`
+1. Design source-backed checkpoint and boundary compaction with an
+   activation/import anchor, an archived-source audit contract and bounded
+   canonical reads. The current 4,096-round and boundary suffix limits remain
+   activation gates.
+2. Add source-specific bounded rereads for `REVISION_DIFF` and `CONTAINMENT`
    preparation outcomes after their adapter sources are minted.
-4. Wire real round identity through production review dispatch, child
+3. Wire real round identity through production review dispatch, child
    reservations and verdict registration. Resolve SDK exception transport
    classification and run composed recovery tests.
-5. Complete offline migration, shadow, rehearsal and execution-family
+4. Complete offline migration, shadow, rehearsal and execution-family
    activation. Phases 5–6 follow; live phase-5 windows require explicit user
    authorization.
 

@@ -124,6 +124,10 @@ if len(_TAGS) != len(_VALUES) + len(_ENUMS):
 
 _CURRENT_REVIEW_SNAPSHOT_TAG = "ReviewWorkflowSnapshotV2"
 _LEGACY_REVIEW_SNAPSHOT_FIELDS = frozenset({"revision", "authority", "episode", "gates", "intent"})
+_CURRENT_ACTIVATED_EXECUTION_TAG = "ActivatedReviewExecutionV2"
+_LEGACY_ACTIVATED_EXECUTION_FIELDS = frozenset({
+    "origin", "checkpoint", "state", "last_sequence", "checkpoint_receipt",
+})
 
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
@@ -155,6 +159,7 @@ def _encode(value: object, depth: int = 0) -> object:
     if type(value) in _VALUES and is_dataclass(value):
         return {
             "type": (_CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
+                     else _CURRENT_ACTIVATED_EXECUTION_TAG if type(value) is rx.ActivatedReviewExecution
                      else type(value).__name__),
             "fields": {
                 field.name: _encode(getattr(value, field.name), depth + 1)
@@ -211,8 +216,17 @@ def _decode(value: object, depth: int = 0) -> object:
             raise WorkflowEncodingError("wrong fields for legacy review snapshot")
         decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
         return rw.ReviewWorkflowSnapshot(**decoded, execution=rx.ExecutionNotActivated())
+    if tag == "ActivatedReviewExecution":
+        payload = value.get("fields")
+        if (set(value) != {"type", "fields"} or not isinstance(payload, dict)
+                or set(payload) != _LEGACY_ACTIVATED_EXECUTION_FIELDS):
+            raise WorkflowEncodingError("wrong fields for legacy activated execution")
+        decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
+        return rx.ActivatedReviewExecution(**decoded, boundaries=())
     if tag == _CURRENT_REVIEW_SNAPSHOT_TAG:
         tag = "ReviewWorkflowSnapshot"
+    if tag == _CURRENT_ACTIVATED_EXECUTION_TAG:
+        tag = "ActivatedReviewExecution"
     constructor = _TAGS.get(tag)
     if constructor is None:
         raise WorkflowEncodingError(f"unknown workflow variant: {tag}")

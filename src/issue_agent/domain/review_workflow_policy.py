@@ -23,6 +23,7 @@ from .identity import login_eq
 from .labels import LIFECYCLE_LABELS, Label
 from .review import EscalationCause
 from .review_rejection import validate_commit_sha
+from .review_execution import ActivatedReviewExecution, advance_review_execution_generation
 from .review_workflow import (
     MAX_COUNTED_REVIEWS, BoundReviewSubmission, CancelledReviewRearm, CompleteReviews, CompletedReviewRearm,
     CountedReview, CountingRule, DismissCountedReview, EnsureReviewProjection, FreshReviewRequired,
@@ -392,6 +393,18 @@ def _next(snapshot: ReviewWorkflowSnapshot, *, advance_generation: bool = False)
     )
 
 
+def _advanced_execution(
+    snapshot: ReviewWorkflowSnapshot, revision: WorkflowRevision, mutation: WorkflowMutation,
+    applied_sequences: tuple[int, ...],
+):
+    execution = snapshot.execution
+    return (
+        advance_review_execution_generation(
+            execution, snapshot.revision, revision, mutation, applied_sequences,
+        ) if isinstance(execution, ActivatedReviewExecution) else execution
+    )
+
+
 def _review_snapshot(snapshot: object) -> ReviewWorkflowSnapshot:
     if not isinstance(snapshot, ReviewWorkflowSnapshot):
         raise ValueError("review policy requires a review-rejection workflow snapshot")
@@ -557,6 +570,7 @@ def reconcile_review_ceiling(
     snapshot: ReviewWorkflowSnapshot, pr: PullRequestObservation, *, now: datetime, ceiling: int,
     evidence_ids: tuple[str, ...], trigger_label: Label, executor_identity: str,
     external_holds: tuple[str, ...] = (),
+    applied_sequences: tuple[int, ...] = (),
 ) -> WorkflowTransition:
     """Re-evaluate this episode's ceiling from fresh complete reviews under the captured rule.
 
@@ -593,7 +607,8 @@ def reconcile_review_ceiling(
         if not existing:
             return WorkflowUnchanged(snapshot)
         return _release(snapshot, pr, kept, evidence_ids, holds,
-                        trigger_label=trigger_label, executor_identity=executor_identity)
+                        trigger_label=trigger_label, executor_identity=executor_identity,
+                        applied_sequences=applied_sequences)
     if len(existing) == 1 and existing[0].cause == cause:
         return WorkflowUnchanged(snapshot)
     return _gate_change(snapshot, kept + (_ceiling_gate_for(snapshot, cause),), evidence_ids)
@@ -601,14 +616,19 @@ def reconcile_review_ceiling(
 
 def _release(
     snapshot: ReviewWorkflowSnapshot, pr: ObservedPullRequest, kept: tuple[UnresolvedGate, ...],
-    evidence_ids: tuple[str, ...], external_holds: tuple[str, ...], *, trigger_label: Label, executor_identity: str,
+    evidence_ids: tuple[str, ...], external_holds: tuple[str, ...], *, trigger_label: Label,
+    executor_identity: str, applied_sequences: tuple[int, ...],
 ) -> WorkflowChanged:
     revision = _next(snapshot, advance_generation=True)
     episode = replace(snapshot.episode, continuation=FreshReviewRequired(revision.fence.generation))
     # The advance fences every command of the old generation: none can begin,
     # so no pre-write evidence hold of one may outlive it.
     kept = tuple(g for g in kept if not ends_with_advance(g))
-    after = replace(snapshot, revision=revision, episode=episode, gates=kept)
+    after = replace(
+        snapshot, revision=revision, episode=episode, gates=kept,
+        execution=_advanced_execution(snapshot, revision, WorkflowMutation.RELEASE_CEILING,
+                                      applied_sequences),
+    )
     key = revision.fence.key
     plan = _plan(review_release_command_id(key, revision.fence.generation), bool(kept) or bool(external_holds),
                  trigger_label)
@@ -1351,6 +1371,7 @@ def request_review_rearm(
     *, now: datetime, active_reviews: tuple[WorkflowAttemptIdentity, ...], evidence_id: str,
     trigger_label: Label, executor_identity: str, external_holds: tuple[str, ...] = (),
     prior_request: RequestRearm | None = None,
+    applied_sequences: tuple[int, ...] = (),
 ) -> WorkflowTransition:
     """Authorize dismissal of exactly the gate's observed counted set.
 
@@ -1406,7 +1427,11 @@ def request_review_rearm(
                              projection, kept.covered)
     episode = replace(snapshot.episode, guidance=_guidance(snapshot, command),
                       continuation=FreshReviewRequired(revision.fence.generation))
-    after = replace(snapshot, revision=revision, episode=episode, intent=intent, gates=gates)
+    after = replace(
+        snapshot, revision=revision, episode=episode, intent=intent, gates=gates,
+        execution=_advanced_execution(snapshot, revision, WorkflowMutation.REQUEST_REARM,
+                                      applied_sequences),
+    )
     commands = _rearm_commands(after, preflight, executor_identity=executor_identity)
     return WorkflowChanged(snapshot.revision, WorkflowMutation.REQUEST_REARM, after,
                            AuthorizedOperatorCommand(actor, command, preflight), commands, prior=snapshot)
@@ -1578,6 +1603,7 @@ def continue_review_rearm(
     snapshot: ReviewWorkflowSnapshot, command: ContinueGrantedRearm, actor: OperatorActor, pr: PullRequestObservation,
     *, now: datetime, active_reviews: tuple[WorkflowAttemptIdentity, ...], evidence_id: str, trigger_label: Label,
     executor_identity: str, external_holds: tuple[str, ...] = (),
+    applied_sequences: tuple[int, ...] = (),
 ) -> WorkflowTransition:
     """Re-plan the stopped intent's remaining authorized scope against fresh facts, under its rule."""
     if not isinstance(snapshot, ReviewWorkflowSnapshot):
@@ -1620,6 +1646,8 @@ def continue_review_rearm(
     after = replace(
         snapshot, revision=revision, intent=intent,
         episode=replace(snapshot.episode, continuation=FreshReviewRequired(revision.fence.generation)), gates=gates,
+        execution=_advanced_execution(snapshot, revision, WorkflowMutation.CONTINUE_REARM,
+                                      applied_sequences),
     )
     commands = _rearm_commands(after, preflight, executor_identity=executor_identity)
     return WorkflowChanged(snapshot.revision, WorkflowMutation.CONTINUE_REARM, after,
@@ -1694,6 +1722,7 @@ class ReviewTransitionFacts:
     # The shared retry-grant facts (`load_retry_authorization_facts`) an
     # AUTHORIZE_RETRY is re-derived from; minted by the store, never wire input.
     retry: RetryAuthorizationFacts | None = None
+    applied_sequences: tuple[int, ...] = ()
 
 
 def _by_identity(commands: tuple[LifecycleCommand, ...]) -> list[LifecycleCommand]:
@@ -1754,6 +1783,7 @@ def _reconciled(
         before, _observation(facts), now=facts.now, ceiling=facts.ceiling, evidence_ids=audit.evidence_ids,
         trigger_label=facts.trigger_label, executor_identity=facts.executor_identity,
         external_holds=facts.external_holds,
+        applied_sequences=facts.applied_sequences,
     )
 
 
@@ -1808,12 +1838,14 @@ def validate_review_transition(
                 before, audit.command, audit.actor, _observation(facts), now=facts.now, active_reviews=(),
                 evidence_id=evidence_id, trigger_label=facts.trigger_label,
                 executor_identity=facts.executor_identity, external_holds=facts.external_holds,
+                applied_sequences=facts.applied_sequences,
             )
         elif mutation is WorkflowMutation.CONTINUE_REARM and isinstance(audit.command, ContinueGrantedRearm):
             expected = continue_review_rearm(
                 before, audit.command, audit.actor, _observation(facts), now=facts.now, active_reviews=(),
                 evidence_id=evidence_id, trigger_label=facts.trigger_label,
                 executor_identity=facts.executor_identity, external_holds=facts.external_holds,
+                applied_sequences=facts.applied_sequences,
             )
         else:
             raise ValueError("review re-arm does not carry its operator command")

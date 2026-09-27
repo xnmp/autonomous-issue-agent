@@ -290,6 +290,24 @@ def test_generation_boundary_codec_retains_exact_transition_and_rejects_missing_
         decode_workflow(json.dumps(malformed), ReviewExecutionGenerationBoundary)
 
 
+def test_legacy_activated_execution_tag_decodes_only_its_exact_pre_boundary_fields():
+    from issue_agent.domain.review_execution import ActivatedReviewExecution
+
+    _, proposal = review_v24_proposal()
+    active = activated_review_execution(proposal.snapshot)
+    current = json.loads(encode_workflow(active))
+    assert current["value"]["type"] == "ActivatedReviewExecutionV2"
+    old = json.loads(json.dumps(current))
+    old["value"]["type"] = "ActivatedReviewExecution"
+    del old["value"]["fields"]["boundaries"]
+
+    assert decode_workflow(json.dumps(old), ActivatedReviewExecution) == active
+    with pytest.raises(WorkflowEncodingError, match="legacy activated execution"):
+        decode_workflow(json.dumps({**old, "value": {**old["value"], "fields": {
+            **old["value"]["fields"], "boundaries": [],
+        }}}), ActivatedReviewExecution)
+
+
 def test_current_review_snapshot_has_a_distinct_tag_and_required_inactive_component():
     from issue_agent.domain.review_execution import ExecutionNotActivated
     from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot

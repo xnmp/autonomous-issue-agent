@@ -893,6 +893,9 @@ class SQLiteReviewWorkflowControl:
         except ValueError as exc:
             raise WorkflowAuthorityError(f"review proposal refused: {exc}") from exc
         self._validate_receipts(db, prior, transition, facts)
+        # Enqueued commands load the new aggregate before this transaction ends;
+        # its generation boundary requires the accepted transition receipt.
+        committed = record_commit(db, self._control, self._writer.repository, transition, encoded)
         self._persist(db, prior, transition, encoded)
         if (transition.mutation is WorkflowMutation.RECORD_REVIEW
                 and isinstance(prior.execution, ActivatedReviewExecution)):
@@ -907,7 +910,6 @@ class SQLiteReviewWorkflowControl:
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                        (_RECORDED_REVIEW_NAMESPACE, self._writer.repository, self._recorded_submission(transition),
                         self._now().isoformat(), encode_workflow(transition.snapshot.revision)))
-        committed = record_commit(db, self._control, self._writer.repository, transition, encoded)
         # Retiring an uncertain older-generation command opens its gate in this
         # transaction: the caller receives the stored row, never a stale one.
         stored = self._load(db, key)
@@ -995,7 +997,28 @@ class SQLiteReviewWorkflowControl:
             now, self._ceiling, self._trigger, self._writer.owner_id, rule=self._rule, observation=observation,
             accepted_preflight=accepted, external_holds=holds, escalation=escalation, submission=submission,
             retry=retry,
+            applied_sequences=self._generation_applied_sequences(db, prior) if (
+                transition.snapshot.revision.fence.generation > prior.revision.fence.generation
+            ) else (),
         )
+
+    def _generation_applied_sequences(
+        self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot,
+    ) -> tuple[int, ...]:
+        execution = snapshot.execution
+        if not isinstance(execution, ActivatedReviewExecution):
+            return ()
+        lower = (execution.boundaries[-1].through_sequence if execution.boundaries
+                 else execution.checkpoint.through_sequence)
+        rows = db.execute(
+            "SELECT sequence FROM review_execution_rounds WHERE repository=? AND target_number=? "
+            "AND execution_epoch=? AND execution_episode=? AND sequence>? AND sequence<=? "
+            "AND outcome_json IS NOT NULL ORDER BY sequence",
+            (self._writer.repository, snapshot.revision.fence.key.target.number,
+             execution.binding.execution_epoch, execution.binding.execution_episode,
+             lower, execution.last_sequence),
+        ).fetchall()
+        return tuple(row["sequence"] for row in rows)
 
     def _retry_facts(self, db: sqlite3.Connection, command: AuthorizeAbsentRetry) -> RetryAuthorizationFacts:
         """The shared grant facts, scoped to this review owner's own command of this workflow."""
@@ -1186,6 +1209,19 @@ class SQLiteReviewWorkflowControl:
         key = after.revision.fence.key
         scope = workflow_scope(key)
         persist_workflow_snapshot(db, after)
+        if (after.revision.fence.generation != prior.revision.fence.generation
+                and isinstance(prior.execution, ActivatedReviewExecution)):
+            if (not isinstance(after.execution, ActivatedReviewExecution)
+                    or len(after.execution.boundaries) != len(prior.execution.boundaries) + 1
+                    or after.execution.boundaries[:-1] != prior.execution.boundaries):
+                raise WorkflowAuthorityError("generation advance lost its execution boundary")
+            boundary = after.execution.boundaries[-1]
+            namespace, dedupe = transition_dedupe_key(transition)
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                ("review-execution-generation", self._writer.repository, boundary.receipt_id,
+                 self._now().isoformat(), encode_workflow((boundary, namespace, dedupe, encoded))),
+            )
         intent = after.intent
         if intent is not None and intent != prior.intent:
             if isinstance(intent, PendingReviewRearm):
@@ -1397,6 +1433,7 @@ class SQLiteReviewWorkflowControl:
                     prior, recorded.observation, now=self._now(), ceiling=self._ceiling,
                     evidence_ids=(self._evidence_id(recorded),), trigger_label=self._trigger,
                     executor_identity=self._writer.owner_id, external_holds=recorded.external_holds,
+                    applied_sequences=self._generation_applied_sequences(db, prior),
                 )
                 result = self._apply(db, prior, key, recorded, proposal)
                 if not isinstance(result, WorkflowCommitted):
@@ -1779,7 +1816,8 @@ class SQLiteReviewWorkflowControl:
                 evidence_id = self._evidence_id(recorded)
                 common = dict(now=self._now(), active_reviews=(), evidence_id=evidence_id,
                               trigger_label=self._trigger, executor_identity=self._writer.owner_id,
-                              external_holds=recorded.external_holds)
+                              external_holds=recorded.external_holds,
+                              applied_sequences=self._generation_applied_sequences(db, prior))
                 if isinstance(command, RequestRearm):
                     proposal = request_review_rearm(prior, command, actor, recorded.observation, **common)  # type: ignore[arg-type]
                 else:

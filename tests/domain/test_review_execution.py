@@ -17,7 +17,8 @@ from issue_agent.domain.review_execution import (
     ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
-    SetDisplayedRound, carry_review_execution_generation, compatible_review_session,
+    SetDisplayedRound, advance_review_execution_generation, carry_review_execution_generation,
+    compatible_review_session,
     project_review_execution, replay_review_execution_generations,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
@@ -219,6 +220,23 @@ def test_generation_boundary_refuses_missing_source_and_changed_carry():
         replace(boundary, to_revision=WorkflowRevision(binding(1).rejection.fence, 100))
     with pytest.raises(ValueError, match="exact advancing transition"):
         replace(boundary, mutation="request_rearm")
+
+
+def test_active_generation_advance_preserves_imported_allowance_without_rounds():
+    component = activated(origin=ReviewExecutionOriginKind.IMPORTED, failures=3, pin_deferrals=2)
+    from_revision = WorkflowRevision(component.binding.rejection.fence, 7)
+    to_revision = WorkflowRevision(binding(1).rejection.fence, 8)
+
+    advanced = advance_review_execution_generation(
+        component, from_revision, to_revision, WorkflowMutation.REQUEST_REARM, (),
+    )
+
+    assert advanced.binding == binding(1)
+    assert (advanced.state.failures, advanced.state.pin_deferrals) == (3, 2)
+    assert advanced.checkpoint == component.checkpoint and advanced.last_sequence == 0
+    assert replay_review_execution_generations(
+        advanced.checkpoint, (), advanced.boundaries,
+    ) == advanced.state
 
 
 def test_a_gap_is_not_compacted_and_filling_it_does_not_charge_later_rounds_twice():

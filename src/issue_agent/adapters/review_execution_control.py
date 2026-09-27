@@ -10,7 +10,7 @@ from ..domain.review_preflight import ReviewPreflightSelection, plan_review_pref
 from ..domain.review_execution import (
     ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress,
     ReviewPreparationKind,
-    ReviewRoundOutcome, project_review_execution, same_execution_episode,
+    ReviewRoundOutcome, replay_review_execution_generations, same_execution_episode,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningComplete,
@@ -402,8 +402,10 @@ class SQLiteReviewExecutionControl:
              execution.checkpoint.through_sequence),
         ).fetchall()
         outcomes = tuple(decode_workflow(item["outcome_json"], ReviewRoundOutcome) for item in rows)
-        projected = project_review_execution(execution.checkpoint, outcomes)
-        return replace(execution, state=projected.state)
+        projected = replay_review_execution_generations(
+            execution.checkpoint, outcomes, execution.boundaries,
+        )
+        return replace(execution, state=projected)
 
     def _settle_productive_in_tx(
         self, db: sqlite3.Connection, command_id: str, after_rejection: ReviewWorkflowSnapshot,
