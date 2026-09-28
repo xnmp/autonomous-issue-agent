@@ -40,9 +40,10 @@ from ..domain.review_execution_activation import (
     MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS, MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES,
     VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
     CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
+    VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
-from ..domain.review_execution import ExecutionNotActivated, ReviewRoundOutcome
+from ..domain.review_execution import ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome
 from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import ReviewSubmissionReceipt, CeilingProductivityDecision
 from ..domain.review_rounds import (
@@ -55,6 +56,7 @@ from ..domain.workflow import ObservedTransition, WorkflowMutation
 from ..domain.workflow_identity import WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier
 from .control_store import CorruptControlStore, _encoded_payload_digest, _parse_stamp, _receipt_digest, load_bound_review_submission
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
+from .review_round_sources import _effect_receipt_id
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_commit import _unique_receipt_object
 from .workflow_rows import (
@@ -1157,6 +1159,12 @@ def read_legacy_recorded_review(
         transition_fields, transition_digest = _read_recording_source(
             db, "workflow-transition", lineage.repository, transition_key,
         )
+        for namespace, fields in (("review-recorded-submission", recorded_fields),
+                                  ("workflow-transition", transition_fields)):
+            receipt_fields = dict(fields)
+            if receipt_fields["reusable_after"] is not None:
+                raise ValueError(f"{namespace} baseline receipt is reclaimable")
+            _parse_stamp(receipt_fields["claimed_at"])
         accepted = json.loads(dict(transition_fields)["payload_json"],
                               object_pairs_hook=_unique_receipt_object, parse_constant=_reject_nonfinite)
         if (not isinstance(accepted, dict)
@@ -1170,14 +1178,18 @@ def read_legacy_recorded_review(
         if accepted_expected != expected:
             raise ValueError("accepted transition expected revision changed")
         if (after.revision != recorded or after.binding != bound.submission.binding
-                or not isinstance(after.execution, ExecutionNotActivated)):
-            raise ValueError("accepted transition is not an inactive review baseline")
+                or (not isinstance(after.execution, ExecutionNotActivated)
+                    and (not isinstance(after.execution, ActivatedReviewExecution)
+                         or after.execution.binding.rejection != bound.submission.binding))):
+            raise ValueError("accepted transition is not a bound review baseline")
         return VerifiedLegacyRecordedReview(source, lineage, bound, expected, recorded,
                                             after.episode.continuation, audit,
-                                            recorded_digest, transition_digest)
+                                            recorded_digest, transition_digest,
+                                            after.execution.binding if isinstance(after.execution, ActivatedReviewExecution)
+                                            else None)
     except (KeyError, TypeError, ValueError, UnicodeError, sqlite3.Error,
             WorkflowAuthorityError, CorruptControlStore) as exc:
-        return UnverifiedLegacyRecordedReview(command_id, str(exc)[:512] or "recorded review source is unreadable")
+        return UnverifiedLegacyRecordedReview(command_id, _printable(str(exc)))
 
 
 def read_review_submission_round_link(
@@ -1311,4 +1323,39 @@ def read_review_submission_round_link(
                                                  preflight_digest, stage_digest, round_digest)
     except (KeyError, TypeError, ValueError, UnicodeError, sqlite3.Error,
             WorkflowAuthorityError, CorruptControlStore) as exc:
-        return UnverifiedReviewSubmissionRoundLink(command_id, str(exc)[:512] or "review round link is unreadable")
+        return UnverifiedReviewSubmissionRoundLink(command_id, _printable(str(exc)))
+
+
+def verify_legacy_plain_productive_round(
+    db: sqlite3.Connection, observed_storage: CompleteLegacyRoundOutcomeStorage,
+    source: LegacyReviewSubmissionSource, lineage: LegacyReviewOwnerLineage,
+) -> VerifiedLegacyPlainProductiveRound | UnverifiedLegacyPlainProductiveRound:
+    """Join one confirmed plain verdict, sealed outcome and recorded baseline."""
+    if (not isinstance(observed_storage, CompleteLegacyRoundOutcomeStorage)
+            or not isinstance(source, LegacyReviewSubmissionSource)
+            or not isinstance(lineage, LegacyReviewOwnerLineage)):
+        raise ValueError("plain productive round proof requires typed source observations")
+    command_id = dict(source.command_fields)["command_id"]
+    if observed_storage.repository != lineage.repository:
+        return UnverifiedLegacyPlainProductiveRound(command_id, "productive round repositories disagree")
+    current = verify_complete_legacy_round_outcome_storage(db, observed_storage.rounds, observed_storage.receipts)
+    if isinstance(current, BlockedLegacyRoundOutcomeStorage):
+        return UnverifiedLegacyPlainProductiveRound(command_id, current.reason)
+    link = read_review_submission_round_link(db, source, lineage)
+    if isinstance(link, UnverifiedReviewSubmissionRoundLink):
+        return UnverifiedLegacyPlainProductiveRound(command_id, link.reason)
+    storage = next((entry for entry in current.sealed if entry.outcome.round == link.round), None)
+    if storage is None:
+        return UnverifiedLegacyPlainProductiveRound(command_id, "linked review round lacks a sealed outcome")
+    baseline = read_legacy_recorded_review(db, source, lineage)
+    if isinstance(baseline, UnverifiedLegacyRecordedReview):
+        return UnverifiedLegacyPlainProductiveRound(command_id, baseline.reason)
+    try:
+        effect = dict(source.receipt_fields) if source.receipt_fields is not None else None
+        if effect is None:
+            raise ValueError("productive round lacks its effect receipt")
+        return VerifiedLegacyPlainProductiveRound(
+            current, storage, link, baseline, _effect_receipt_id(command_id, effect["receipt_digest"]),
+        )
+    except ValueError as exc:
+        return UnverifiedLegacyPlainProductiveRound(command_id, _printable(str(exc)))

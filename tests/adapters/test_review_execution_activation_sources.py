@@ -9,6 +9,7 @@ import pytest
 
 import issue_agent.adapters.review_execution_activation as review_activation
 from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.domain.contracts import EffectReceipt, EffectStatus
 from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
     read_complete_legacy_review_runs, read_legacy_review_run_page, read_legacy_review_submission_page,
@@ -21,11 +22,13 @@ from issue_agent.adapters.review_execution_activation import (
     read_complete_legacy_review_outcome_receipts, revalidate_complete_legacy_review_outcome_receipts,
     verify_legacy_round_outcome_storage,
     verify_complete_legacy_round_outcome_storage,
+    read_legacy_recorded_review, read_review_submission_round_link,
+    verify_legacy_plain_productive_round,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
-from issue_agent.domain.review_execution import CopiedReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome
+from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome
 from issue_agent.domain.review_rounds import ReviewRoundFacts
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.domain.review_execution_activation import (
@@ -42,10 +45,18 @@ from issue_agent.domain.review_execution_activation import (
     CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
     VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
     CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
+    VerifiedLegacyRecordedReview, VerifiedReviewSubmissionRoundLink,
+    VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
 )
-from tests.adapters.test_review_execution_control import rig
+from tests.adapters.test_review_execution_control import rig, current, OWNER as CONTROL_OWNER
 from tests.adapters.test_review_productive_settlement import confirmed_copy, workflow_for
 from tests.adapters.test_review_preparation_finalization import stopped_round
+from tests.adapters.test_review_execution_admission import request
+from tests.adapters.test_review_execution_launch import register
+from tests.adapters.test_review_execution_return import returned, settlement
+from tests.adapters.test_review_execution_stage import stage
+from tests.adapters.test_review_execution_submission import command_for
+from issue_agent.domain.review_rounds import ReviewSubmissionKind
 
 
 def test_inventory_keeps_both_counter_namespaces_and_runtime_session_bytes(tmp_path):
@@ -805,6 +816,139 @@ def test_complete_round_outcome_storage_blocks_unaccounted_evidence(rig, damage)
         db.rollback()
 
     assert isinstance(result, BlockedLegacyRoundOutcomeStorage)
+
+
+def test_active_plain_recording_can_join_its_exact_productive_round(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_page(db, "o/r")
+        source = next(entry for entry in page.entries if isinstance(entry, LegacyReviewSubmissionSource)
+                      and dict(entry.command_fields)["command_id"] == str(command.command_id))
+        lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        baseline = read_legacy_recorded_review(db, source, lineage)
+        link = read_review_submission_round_link(db, source, lineage)
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        storage = verify_complete_legacy_round_outcome_storage(db, rounds, receipts)
+        assert isinstance(storage, CompleteLegacyRoundOutcomeStorage)
+        proof = verify_legacy_plain_productive_round(db, storage, source, lineage)
+        db.rollback()
+
+    assert isinstance(baseline, VerifiedLegacyRecordedReview)
+    assert isinstance(link, VerifiedReviewSubmissionRoundLink)
+    assert link.round == plan.round
+    assert isinstance(proof, VerifiedLegacyPlainProductiveRound)
+    assert proof.storage.outcome.round == plan.round
+    with pytest.raises(ValueError, match="contradictory"):
+        replace(proof, effect_receipt_id="effect-receipt:wrong")
+    assert proof.baseline.execution_binding == plan.round.binding
+    alternate = replace(proof.baseline.execution_binding, execution_episode="different-episode")
+    with pytest.raises(ValueError, match="contradictory"):
+        replace(proof, baseline=replace(proof.baseline, execution_binding=alternate))
+    with pytest.raises(ValueError, match="contradictory"):
+        replace(proof, baseline=replace(proof.baseline, execution_binding=None))
+
+
+def test_paid_plain_recording_can_join_its_confirmed_round(rig):
+    store, _, gateway, selection, control = rig
+    plan = control.preflight(selection)
+    planned = stage(plan)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, planned)
+    proposed = request(planned.children[0])
+    assert store.reserve(proposed).admitted
+    register(store, proposed)
+    store.settle_review_return(settlement(proposed), returned(store, proposed))
+    command = command_for(current(store, selection), patch_id="0" * 64)
+    control.register_submission(plan.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.PAID)
+    control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+    store.begin_command(command.command_id)
+    store.record_effect(EffectReceipt(command.command_id, CONTROL_OWNER, store.now(), store.now(),
+                                      EffectStatus.SUCCEEDED, remote_object_id="review:paid"))
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_page(db, "o/r")
+        source = next(entry for entry in page.entries if isinstance(entry, LegacyReviewSubmissionSource)
+                      and dict(entry.command_fields)["command_id"] == str(command.command_id))
+        lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        storage = verify_complete_legacy_round_outcome_storage(db, rounds, receipts)
+        assert isinstance(storage, CompleteLegacyRoundOutcomeStorage)
+        proof = verify_legacy_plain_productive_round(db, storage, source, lineage)
+        db.rollback()
+
+    assert isinstance(proof, VerifiedLegacyPlainProductiveRound)
+    assert isinstance(proof.storage.outcome.disposition, PaidReviewProgress)
+    assert proof.storage.outcome.round == plan.round
+
+
+@pytest.mark.parametrize("damage", [
+    "recording_marker", "recording_reusable", "recording_claimed", "transition_reusable",
+    "transition_claimed", "effect_receipt", "round_outcome", "stale_productivity",
+])
+def test_plain_productive_round_rejects_changed_bound_sources(rig, damage):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_page(db, "o/r")
+        source = next(entry for entry in page.entries if isinstance(entry, LegacyReviewSubmissionSource)
+                      and dict(entry.command_fields)["command_id"] == str(command.command_id))
+        lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        storage = verify_complete_legacy_round_outcome_storage(db, rounds, receipts)
+        assert isinstance(storage, CompleteLegacyRoundOutcomeStorage)
+        db.rollback()
+    with store.transaction() as db:
+        if damage == "recording_marker":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-recorded-submission'")
+        elif damage in {"recording_reusable", "transition_reusable"}:
+            namespace = "review-recorded-submission" if damage == "recording_reusable" else "workflow-transition"
+            db.execute("UPDATE dedupe_keys SET reusable_after=? WHERE namespace=? AND scope=?",
+                       ("2026-09-29T00:00:00+00:00", namespace, "o/r"))
+        elif damage in {"recording_claimed", "transition_claimed"}:
+            namespace = "review-recorded-submission" if damage == "recording_claimed" else "workflow-transition"
+            db.execute("UPDATE dedupe_keys SET claimed_at=? WHERE namespace=? AND scope=?",
+                       ("not-a-timestamp", namespace, "o/r"))
+        elif damage == "effect_receipt":
+            db.execute("UPDATE effect_receipts SET remote_object_id='changed' WHERE command_id=?",
+                       (str(command.command_id),))
+        elif damage == "stale_productivity":
+            row = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-outcome' AND key=?",
+                (plan.round.round_id,),
+            ).fetchone()
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                ("review-round-stale-productivity", "o/r", plan.round.round_id,
+                 "2026-09-28T00:00:00+00:00", row["payload_json"]),
+            )
+        else:
+            db.execute("UPDATE review_execution_rounds SET outcome_json='{}' WHERE round_id=?",
+                       (plan.round.round_id,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = verify_legacy_plain_productive_round(db, storage, source, lineage)
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyPlainProductiveRound)
 
 
 def _control(tmp_path):

@@ -79,6 +79,13 @@ with `CLAUDE.md`, `AGENTS.md`, the
   and stale receipts must match exact closure facts; superseded/ceiling tuples
   must be canonical and typed. Contradictory or orphaned auxiliary receipts
   block. Their external authority, baseline and reset order remain unproved.
+- Checkpoint 45 joins one confirmed plain verdict to its exact sealed
+  productive round and accepted recorded baseline. It requires the active
+  execution epoch/episode, effect receipt identity, round disposition and
+  rejection fence to agree, requires permanent baseline receipts with valid
+  claim times, and rejects stale, superseded or ceiling
+  productivity receipts for that round. This does not account for every
+  command or prove ordered resets.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -142,6 +149,15 @@ and both Pyrefly checks. Ten strict xfails remained expected. Log:
 review found an auxiliary receipt gap; the outcome-specific constraints and
 regressions address it, and its second pass found no medium or high issue.
 
+Independent Sol review of checkpoint 45 found that an initial plain verdict
+join omitted the active execution episode, tolerated contradictory
+productivity receipts and accepted reclaimable baseline receipts. The typed
+join and source-level regressions address all three;
+the final pass found no remaining medium or high issue. The full gate log is
+`/tmp/phase4-plain-productivity-gate.log` (ephemeral): 3,198 domain, 2,958
+adapter and 2,866 app tests passed, plus hooks, governor, gate parity, four
+import contracts and both Pyrefly checks. Ten strict xfails remained expected.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -155,11 +171,10 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Join the complete outcome storage set with verified command-to-round links
-   and plain recorded baselines to prove
-   confirmed productive outcomes and ordered resets. Verify escalated verdict
-   hold provenance and classify unrecorded or stale successful commands
-   separately. A completed
+2. Extend the single plain productive round proof across the complete command
+   and round sets to establish ordered resets. Verify escalated verdict hold
+   provenance and classify unrecorded or stale successful commands separately.
+   A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
 3. Join positive issue-keyed file counters to PRs with fresh complete

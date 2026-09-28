@@ -1130,3 +1130,24 @@ Full `make test` passed: 3,198 domain, 2,948 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-whole-outcome-storage-gate.log` (ephemeral).
+
+## Checkpoint 45 — one plain productive round and baseline join (offline)
+
+A read-only verifier now revalidates complete round and outcome receipt storage,
+joins one registered submission command to its exact sealed round, and joins
+that command's successful effect to its accepted plain recorded-review
+transition. The typed proof requires the confirmed submission, paid or copied
+disposition, effect receipt identity, rejection fence and active execution
+epoch/episode to agree. A stale, superseded or ceiling productivity receipt for
+that round conflicts with a plain baseline and blocks the proof. Changed
+source rows and reclaimable or malformed baseline receipts also return an
+explicit unverified result. This is a single-round
+proof; complete command accounting, outer-round order, productive reset and
+escalated hold provenance still require separate joins. Independent Sol review
+found the initial execution episode, contradictory auxiliary receipt and
+reclaimable baseline receipt gaps; all are fixed, with regressions. Its final
+pass found no remaining medium or high issue.
+Full `make test` passed: 3,198 domain, 2,958 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-plain-productivity-gate.log` (ephemeral).

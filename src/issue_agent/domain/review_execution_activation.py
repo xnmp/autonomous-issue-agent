@@ -10,8 +10,13 @@ import json
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from .review_workflow import ReviewedBaseline
 from .review_workflow_policy import ReviewSubmissionReceipt
-from .review_execution import ReviewRoundIdentity, ReviewRoundOutcome, PaidReviewProgress, CopiedReviewProgress
-from .review_rounds import ReviewRoundFacts, FinalizedReviewRound, DeferredReviewPreparation, finalize_review_round
+from .review_execution import (
+    ReviewExecutionBinding, ReviewRoundIdentity, ReviewRoundOutcome, PaidReviewProgress, CopiedReviewProgress,
+)
+from .review_rounds import (
+    ReviewRoundFacts, ReviewSubmissionConfirmed, ReviewSubmissionKind,
+    FinalizedReviewRound, DeferredReviewPreparation, finalize_review_round,
+)
 from .workflow import ObservedTransition
 from .workflow_identity import (
     PullRequestRef, WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
@@ -883,6 +888,7 @@ class VerifiedLegacyRecordedReview:
     audit: ObservedTransition
     recorded_source_digest: str
     transition_source_digest: str
+    execution_binding: ReviewExecutionBinding | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.source, LegacyReviewSubmissionSource)
@@ -895,6 +901,8 @@ class VerifiedLegacyRecordedReview:
             raise ValueError("verified recorded review requires typed sources")
         for name in ("recorded_source_digest", "transition_source_digest"):
             _source_digest(getattr(self, name), name)
+        if self.execution_binding is not None and not isinstance(self.execution_binding, ReviewExecutionBinding):
+            raise ValueError("recorded review execution binding must be typed")
         command = dict(self.source.command_fields)
         effect = dict(self.source.receipt_fields) if self.source.receipt_fields is not None else None
         binding = self.submission.submission.binding
@@ -913,6 +921,8 @@ class VerifiedLegacyRecordedReview:
                 or self.baseline.source != self.submission.submission
                 or self.baseline.head_sha != self.submission.head_sha
                 or self.baseline.patch_id != self.submission.patch_id
+                or (self.execution_binding is not None
+                    and self.execution_binding.rejection != self.submission.submission.binding)
                 or self.audit.evidence_ids != (str(self.submission.submission.command_id), self.submission.receipt_id)):
             raise ValueError("legacy sources do not prove one plain recorded baseline")
 
@@ -979,6 +989,66 @@ class UnverifiedReviewSubmissionRoundLink:
     def __post_init__(self) -> None:
         validate_workflow_identifier(self.command_id, "unverified review command")
         validate_workflow_text(self.reason, "unverified review round link reason")
+
+
+@dataclass(frozen=True)
+class VerifiedLegacyPlainProductiveRound:
+    """One confirmed plain verdict has a sealed outcome and recorded baseline."""
+
+    complete_storage: CompleteLegacyRoundOutcomeStorage
+    storage: VerifiedLegacyRoundOutcomeStorage
+    link: VerifiedReviewSubmissionRoundLink
+    baseline: VerifiedLegacyRecordedReview
+    effect_receipt_id: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.complete_storage, CompleteLegacyRoundOutcomeStorage)
+                or not isinstance(self.storage, VerifiedLegacyRoundOutcomeStorage)
+                or not isinstance(self.link, VerifiedReviewSubmissionRoundLink)
+                or not isinstance(self.baseline, VerifiedLegacyRecordedReview)):
+            raise ValueError("plain productive round requires typed source proofs")
+        validate_workflow_identifier(self.effect_receipt_id, "productive effect receipt identity")
+        round_id = self.storage.outcome.round.round_id
+        auxiliary = {"review-round-stale-productivity", "review-round-superseded-productivity",
+                     "review-round-ceiling-productivity"}
+        conflicting_receipts = any(
+            dict(receipt.fields)["namespace"] in auxiliary and dict(receipt.fields)["key"] == round_id
+            for receipt in self.complete_storage.receipts.receipts
+        )
+        confirmed = tuple(item for item in self.storage.facts.submissions
+                          if isinstance(item.result, ReviewSubmissionConfirmed))
+        disposition = self.storage.outcome.disposition
+        if (self.storage not in self.complete_storage.sealed or conflicting_receipts
+                or len(confirmed) != 1 or not isinstance(disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or self.storage.outcome.round != self.link.round
+                or self.link.source != self.baseline.source or self.link.lineage != self.baseline.lineage
+                or str(confirmed[0].plan.command_id) != dict(self.link.source.command_fields)["command_id"]
+                or confirmed[0].result.receipt_id != disposition.submission_receipt
+                or confirmed[0].result.receipt_id != self.effect_receipt_id
+                or confirmed[0].plan.kind is not (
+                    ReviewSubmissionKind.PAID if isinstance(disposition, PaidReviewProgress)
+                    else ReviewSubmissionKind.COPIED
+                )
+                or self.baseline.recorded_revision.fence != self.link.round.binding.rejection.fence
+                or self.baseline.execution_binding != self.link.round.binding):
+            raise ValueError("plain productive round has contradictory submission evidence")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.complete_storage.source_digest, self.storage.source_digest,
+                 self.link.source_digest, self.baseline.source_digest,
+                 self.effect_receipt_id)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnverifiedLegacyPlainProductiveRound:
+    command_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "unverified productive review command")
+        validate_workflow_text(self.reason, "unverified productive review reason")
 
 
 @dataclass(frozen=True)
