@@ -11,6 +11,7 @@ import re
 import sqlite3
 import hashlib
 import json
+from bisect import bisect_left
 from dataclasses import dataclass, replace
 
 from ..domain.resolve_activation import LegacyAbsent, LegacyFile, UnmappedLegacyEntry
@@ -54,6 +55,7 @@ from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStat
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionGenerationBoundary,
+    MAX_EXECUTION_SUFFIX, review_generation_chain_digest, same_execution_episode,
 )
 from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import ReviewSubmissionReceipt, CeilingProductivityDecision
@@ -78,7 +80,7 @@ from .review_round_sources import _effect_receipt_id
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_commit import _unique_receipt_object
 from .workflow_rows import (
-    WorkflowAuthorityError, review_stage_receipt_key, review_stage_receipt_prefix,
+    WorkflowAuthorityError, load_review_workflow_row, review_stage_receipt_key, review_stage_receipt_prefix,
     review_submission_receipt_key,
 )
 
@@ -2047,10 +2049,15 @@ class MatchedLegacyReviewGenerationBoundarySources:
     accepted_fields: tuple[tuple[str, str | None], ...]
 
     def __post_init__(self) -> None:
+        receipts = self.complete_receipts.receipts if isinstance(
+            self.complete_receipts, CompleteLegacyReviewGenerationReceipts
+        ) else ()
+        receipt_index = bisect_left(receipts, self.receipt_source.source_rowid, key=lambda item: item.source_rowid) \
+            if isinstance(self.receipt_source, LegacyReviewGenerationReceiptSource) else len(receipts)
         if (not isinstance(self.complete_receipts, CompleteLegacyReviewGenerationReceipts)
                 or not isinstance(self.receipt_source, LegacyReviewGenerationReceiptSource)
                 or not isinstance(self.boundary, ReviewExecutionGenerationBoundary)
-                or self.receipt_source not in self.complete_receipts.receipts
+                or receipt_index == len(receipts) or receipts[receipt_index] != self.receipt_source
                 or type(self.accepted_rowid) is not int
                 or not MIN_SQL_ROWID <= self.accepted_rowid <= MAX_SQL_ROWID
                 or not isinstance(self.accepted_fields, tuple)
@@ -2230,3 +2237,194 @@ def match_legacy_review_generation_boundary_sources(
         )
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, WorkflowAuthorityError) as exc:
         return UnmatchedLegacyReviewGenerationBoundarySources(receipt_id, _printable(str(exc)))
+
+
+@dataclass(frozen=True)
+class MatchedLegacyStaleProductivityGenerationSources:
+    """Observed stale path and its complete accepted generation crossing.
+
+    SQL provenance must be rechecked before this observation grants authority.
+    """
+
+    stale_path: VerifiedLegacyStaleProductivityReceiptPath
+    settlement: StaleReviewProductivitySettlement
+    complete_receipts: CompleteLegacyReviewGenerationReceipts
+    boundaries: tuple[MatchedLegacyReviewGenerationBoundarySources, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.stale_path, VerifiedLegacyStaleProductivityReceiptPath)
+                or not isinstance(self.settlement, StaleReviewProductivitySettlement)
+                or not isinstance(self.complete_receipts, CompleteLegacyReviewGenerationReceipts)
+                or not isinstance(self.boundaries, tuple) or not self.boundaries
+                or len(self.boundaries) > MAX_EXECUTION_SUFFIX
+                or any(not isinstance(item, MatchedLegacyReviewGenerationBoundarySources)
+                       or item.complete_receipts != self.complete_receipts for item in self.boundaries)):
+            raise ValueError("stale generation crossing requires complete typed sources")
+        round_id = self.stale_path.registered.plan.round
+        stale = dict(self.stale_path.stale_receipt.fields)
+        if (self.stale_path.complete_storage.repository != self.complete_receipts.repository
+                or self.settlement.facts != self.stale_path.sealed.facts
+                or self.settlement.outcome != self.stale_path.sealed.outcome
+                or stale["payload_json"] != encode_workflow(self.settlement)):
+            raise ValueError("stale generation crossing disagrees with its round receipt")
+        generation = round_id.binding.rejection.fence.generation
+        previous_version = -1
+        for item in self.boundaries:
+            boundary = item.boundary
+            if (not same_execution_episode(round_id.binding, boundary.before.binding)
+                    or not same_execution_episode(round_id.binding, boundary.after.binding)
+                    or boundary.from_revision.fence.generation != generation
+                    or boundary.to_revision.fence.generation != generation + 1
+                    or boundary.from_revision.version <= previous_version
+                    or boundary.to_revision.version > self.settlement.settled_revision.version):
+                raise ValueError("stale generation crossing has a missing or unordered boundary")
+            previous_version = boundary.to_revision.version
+            generation += 1
+        if (generation != self.settlement.settled_revision.fence.generation
+                or self.boundaries[-1].boundary.after.binding != self.settlement.settled_binding
+                or review_generation_chain_digest(tuple(item.boundary.receipt_id for item in self.boundaries))
+                != self.settlement.crossing_digest):
+            raise ValueError("stale generation crossing disagrees with the writer's witness")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (
+            self.stale_path.source_digest, self.complete_receipts.source_digest,
+            tuple((item.receipt_source.source_digest, item.accepted_rowid, item.accepted_fields)
+                  for item in self.boundaries),
+        )
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnmatchedLegacyStaleProductivityGenerationSources:
+    command_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "unmatched stale generation command")
+        if not self.reason:
+            raise ValueError("unmatched stale generation requires a reason")
+
+
+def _accepted_generation_rows(
+    db: sqlite3.Connection, repository: str, targets: set[tuple[bytes, bytes]],
+) -> dict[tuple[bytes, bytes], int]:
+    """Resolve text and BLOB aliases with bounded indexed candidate reads."""
+    rows_by_target: dict[tuple[bytes, bytes], int] = {}
+    repository_bytes = repository.encode()
+    scope_limit = max(len(repository_bytes) + 64, 64)
+    candidates = 0
+    for namespace in (b"workflow-request", b"workflow-transition"):
+        keys = sorted(key for target_namespace, key in targets if target_namespace == namespace)
+        for offset in range(0, len(keys), 400):
+            batch = keys[offset:offset + 400]
+            key_variants = tuple(value for key in batch for value in (key.decode("utf-8"), key))
+            marks = ",".join("?" for _ in key_variants)
+            cursor = db.execute(
+                "SELECT rowid,"
+                "CAST(namespace AS BLOB) AS namespace_bytes,"
+                "CAST(key AS BLOB) AS key_bytes,"
+                "CASE WHEN length(CAST(scope AS BLOB))<=? THEN CAST(scope AS BLOB) END AS scope_bytes "
+                f"FROM dedupe_keys WHERE namespace IN (?,?) AND key IN ({marks})",
+                (scope_limit, namespace.decode(), namespace, *key_variants),
+            )
+            while rows := cursor.fetchmany(64):
+                candidates += len(rows)
+                if candidates > MAX_LEGACY_GENERATION_RECEIPT_SCAN_ROWS:
+                    raise ValueError("accepted generation transitions exceed their candidate bound")
+                for row in rows:
+                    target = (row["namespace_bytes"], row["key_bytes"])
+                    if target not in targets:
+                        continue
+                    scope = row["scope_bytes"]
+                    if scope is None:
+                        raise ValueError("accepted generation transition scope exceeds its attribution bound")
+                    if scope == repository_bytes:
+                        if target in rows_by_target:
+                            raise ValueError("generation boundary has multiple accepted transitions")
+                        rows_by_target[target] = row["rowid"]
+                        continue
+                    try:
+                        alias = canonical_workflow_repository(scope.decode("utf-8"))
+                    except (UnicodeError, ValueError):
+                        continue
+                    if alias == repository:
+                        raise ValueError("accepted generation transition uses a repository alias")
+    if set(rows_by_target) != targets:
+        raise ValueError("generation boundary lacks one exact accepted transition")
+    return rows_by_target
+
+
+def match_legacy_stale_productivity_generation_sources(
+    db: sqlite3.Connection, observed_storage: CompleteLegacySubmissionSettlementStorage,
+    observed_generation: CompleteLegacyReviewGenerationReceipts, command_id: str,
+) -> MatchedLegacyStaleProductivityGenerationSources | UnmatchedLegacyStaleProductivityGenerationSources:
+    """Recheck settlement and generation sets in one snapshot, then join the crossing."""
+    validate_workflow_identifier(command_id, "stale generation command")
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("stale generation join requires an explicit SQL transaction")
+    if (not isinstance(observed_storage, CompleteLegacySubmissionSettlementStorage)
+            or not isinstance(observed_generation, CompleteLegacyReviewGenerationReceipts)):
+        raise ValueError("stale generation join requires complete typed observations")
+    if observed_storage.repository != observed_generation.repository:
+        return UnmatchedLegacyStaleProductivityGenerationSources(command_id, "generation repository disagrees")
+    stale_path = verify_legacy_stale_productivity_receipt_path(db, observed_storage, command_id)
+    if isinstance(stale_path, UnverifiedLegacyStaleProductivityReceiptPath):
+        return UnmatchedLegacyStaleProductivityGenerationSources(command_id, stale_path.reason)
+    complete = revalidate_complete_legacy_review_generation_receipts(db, observed_generation)
+    if isinstance(complete, BlockedLegacyReviewGenerationReceipts):
+        return UnmatchedLegacyStaleProductivityGenerationSources(command_id, complete.reason)
+    try:
+        settlement = decode_workflow(dict(stale_path.stale_receipt.fields)["payload_json"],
+                                     tuple | StaleReviewProductivitySettlement)
+        if not isinstance(settlement, StaleReviewProductivitySettlement):
+            raise ValueError("legacy stale receipt has no generation crossing witness")
+        round_id = stale_path.registered.plan.round
+        current = load_review_workflow_row(db, round_id.binding.rejection.fence.key)
+        if (current is None or not isinstance(current.execution, ActivatedReviewExecution)
+                or not same_execution_episode(round_id.binding, current.execution.binding)
+                or settlement.settled_revision.version > current.revision.version
+                or settlement.settled_revision.fence.generation > current.revision.fence.generation):
+            raise ValueError("stale generation witness exceeds current workflow authority")
+        first = round_id.binding.rejection.fence.generation
+        last = settlement.settled_revision.fence.generation
+        if last - first > MAX_EXECUTION_SUFFIX:
+            raise ValueError("stale generation crossing exceeds its suffix bound")
+        selected: dict[int, tuple[LegacyReviewGenerationReceiptSource, ReviewExecutionGenerationBoundary,
+                                  str, str, str]] = {}
+        for source in complete.receipts:
+            captured = decode_workflow(dict(source.fields)["payload_json"], tuple)
+            if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
+                    or any(not isinstance(value, str) for value in captured[1:])):
+                raise ValueError("generation receipt has malformed accepted transition fields")
+            boundary, namespace, key, accepted_payload = captured
+            if (not same_execution_episode(round_id.binding, boundary.before.binding)
+                    or not first <= boundary.from_revision.fence.generation < last):
+                continue
+            generation = boundary.from_revision.fence.generation
+            if generation in selected:
+                raise ValueError("stale generation crossing repeats a boundary")
+            selected[generation] = (source, boundary, namespace, key, accepted_payload)
+        if len(selected) != last - first:
+            raise ValueError("stale generation crossing lacks an intervening boundary")
+        ordered = tuple(selected[generation] for generation in range(first, last))
+        if any(namespace not in {"workflow-request", "workflow-transition"}
+               for _, _, namespace, _, _ in ordered):
+            raise ValueError("generation receipt lacks an accepted transition namespace")
+        targets = {(namespace.encode(), key.encode()) for _, _, namespace, key, _ in ordered}
+        if len(targets) != len(ordered):
+            raise ValueError("stale generation crossing repeats an accepted transition")
+        accepted_rowids = _accepted_generation_rows(db, complete.repository, targets)
+        matched: list[MatchedLegacyReviewGenerationBoundarySources] = []
+        for source, boundary, namespace, key, accepted_payload in ordered:
+            accepted_fields, _ = _read_recording_source(db, namespace, complete.repository, key)
+            if dict(accepted_fields)["payload_json"] != accepted_payload:
+                raise ValueError("accepted generation transition changed")
+            matched.append(MatchedLegacyReviewGenerationBoundarySources(
+                complete, source, boundary, accepted_rowids[(namespace.encode(), key.encode())],
+                accepted_fields,
+            ))
+        return MatchedLegacyStaleProductivityGenerationSources(stale_path, settlement, complete, tuple(matched))
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, WorkflowAuthorityError) as exc:
+        return UnmatchedLegacyStaleProductivityGenerationSources(command_id, _printable(str(exc)))

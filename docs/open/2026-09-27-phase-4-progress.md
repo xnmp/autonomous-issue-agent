@@ -1292,3 +1292,31 @@ Full `make test` passed: 3,199 domain, 3,031 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-stale-generation-witness-gate.log` (ephemeral).
+
+## Checkpoint 52 — complete stale generation source join (offline)
+
+The read-only join revalidates complete submission settlement and generation
+receipt inventories in one SQL transaction, verifies the successful command's
+stale receipt path, and matches each intervening generation boundary to its
+accepted transition. It requires contiguous generations in the same execution
+episode, increasing workflow revisions, the writer's full crossing digest,
+the final settled binding and a current workflow revision at least as new as
+the settlement witness. Indexed namespace/key candidate reads include TEXT
+and BLOB aliases and enforce a cumulative scan bound.
+
+Real one- and two-advance fixtures pass. Removing an intermediate receipt,
+changing an accepted transition, adding a canonical scope or BLOB alias,
+forging a future settlement revision, or replacing the typed receipt with an
+old two-field receipt blocks the join. Zero and negative imported rowids still
+work; their numeric order is not used as chronology. The joined value remains
+an observation and must be rechecked in SQL at authority use. Complete
+command classification, escalated hold provenance and ordered productivity
+reset replay remain open; this checkpoint does not activate execution.
+
+Independent Sol review found an extra whole-table accepted-row scan. Indexed
+candidate reads with a total bound replaced it; the second pass found no
+remaining medium or high issue.
+Full `make test` passed: 3,199 domain, 3,045 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-stale-crossing-join-gate.log` (ephemeral).

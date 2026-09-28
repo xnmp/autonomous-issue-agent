@@ -31,6 +31,8 @@ from issue_agent.adapters.review_execution_activation import (
     read_complete_legacy_review_generation_receipts, revalidate_complete_legacy_review_generation_receipts,
     match_legacy_review_generation_boundary_sources,
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
+    match_legacy_stale_productivity_generation_sources,
+    MatchedLegacyStaleProductivityGenerationSources, UnmatchedLegacyStaleProductivityGenerationSources,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -74,7 +76,7 @@ from tests.adapters.test_review_productive_settlement import (
 from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.workflow import (
-    RequestRearm, ContinueGrantedRearm, AuthorizedOperatorCommand,
+    RequestRearm, ContinueGrantedRearm, CancelRearm, AuthorizedOperatorCommand,
     ObservedTransition, OperatorActor, KeepGuidance, WorkflowCommitted, WorkflowRejected,
 )
 from issue_agent.domain.review_rejection import CountingRule
@@ -1211,6 +1213,199 @@ def _stale_settlement(rig):
         db.rollback()
     assert isinstance(complete, CompleteLegacySubmissionSettlementStorage)
     return store, plan, command, complete
+
+
+def _stale_generation_sources(db):
+    storage = verify_complete_legacy_submission_settlement_storage(
+        db, *_complete_settlement_observations(db),
+    )
+    generation = read_complete_legacy_review_generation_receipts(db, "o/r")
+    assert isinstance(storage, CompleteLegacySubmissionSettlementStorage)
+    assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
+    return storage, generation
+
+
+def test_stale_generation_join_proves_real_accepted_crossing_without_writes(rig):
+    store, plan, command, _ = _stale_settlement(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        storage, generation = _stale_generation_sources(db)
+        before = db.total_changes
+        matched = match_legacy_stale_productivity_generation_sources(
+            db, storage, generation, str(command.command_id),
+        )
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(matched, MatchedLegacyStaleProductivityGenerationSources)
+    assert matched.settlement.outcome.round == plan.round
+    assert len(matched.boundaries) == 1
+    assert matched.boundaries[0].boundary.to_revision == matched.settlement.settled_revision
+    assert len(matched.source_digest) == 64
+
+
+def test_stale_generation_join_uses_revisions_not_sql_rowid_order(rig):
+    store, _, command, _ = _stale_settlement(rig)
+    with store.transaction() as db:
+        for namespace, new_rowid in (("review-execution-generation", -1), ("workflow-request", 0)):
+            row = db.execute(
+                "SELECT namespace,scope,key,claimed_at,reusable_after,payload_json "
+                "FROM dedupe_keys WHERE namespace=? AND scope='o/r' "
+                "AND (namespace!='workflow-request' OR key='rearm:with-older-submission')",
+                (namespace,),
+            ).fetchone()
+            assert row is not None
+            db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                       (row["namespace"], row["scope"], row["key"]))
+            db.execute("INSERT INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,reusable_after,payload_json) "
+                       "VALUES (?,?,?,?,?,?,?)", (new_rowid, *tuple(row)))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        storage, generation = _stale_generation_sources(db)
+        result = match_legacy_stale_productivity_generation_sources(
+            db, storage, generation, str(command.command_id),
+        )
+        db.rollback()
+    assert isinstance(result, MatchedLegacyStaleProductivityGenerationSources)
+    assert result.boundaries[0].receipt_source.source_rowid == -1
+    assert result.boundaries[0].accepted_rowid == 0
+
+
+def test_stale_generation_join_ignores_large_unrelated_dedupe_history(rig):
+    store, _, command, _ = _stale_settlement(rig)
+    with store.transaction() as db:
+        db.executemany(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+            (("workflow-request" if index % 2 else "unrelated-history",
+              "other/repo", f"event:{index}", "now", "{}")
+             for index in range(1500)),
+        )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        storage, generation = _stale_generation_sources(db)
+        result = match_legacy_stale_productivity_generation_sources(
+            db, storage, generation, str(command.command_id),
+        )
+        db.rollback()
+    assert isinstance(result, MatchedLegacyStaleProductivityGenerationSources)
+
+
+def test_stale_generation_join_requires_each_boundary_in_two_advance_crossing(rig):
+    store, _, selection, _, plan, command, workflow = accepted_generation_with_open_submission(rig)
+    first = current(store, selection)
+    actor = OperatorActor("operator", "test")
+    assert isinstance(workflow.cancel_rearm(
+        CancelRearm("cancel:stale-crossing", first.revision, "rearm:with-older-submission", "stop",
+                    expected_binding=first.binding), actor,
+    ), WorkflowCommitted)
+    stopped = current(store, selection)
+    assert isinstance(workflow.continue_rearm(
+        ContinueGrantedRearm("rearm:stale-crossing", stopped.revision, "rearm:with-older-submission",
+                             expected_binding=stopped.binding), actor,
+    ), WorkflowCommitted)
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        storage, generation = _stale_generation_sources(db)
+        matched = match_legacy_stale_productivity_generation_sources(
+            db, storage, generation, str(command.command_id),
+        )
+        db.rollback()
+    assert isinstance(matched, MatchedLegacyStaleProductivityGenerationSources)
+    original_generation = plan.round.binding.rejection.fence.generation
+    assert [item.boundary.from_revision.fence.generation for item in matched.boundaries] == [
+        original_generation, original_generation + 1,
+    ]
+    assert matched.settlement.outcome.round == plan.round
+
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-generation' AND key=?",
+                   (matched.boundaries[0].boundary.receipt_id,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        storage, generation = _stale_generation_sources(db)
+        missing = match_legacy_stale_productivity_generation_sources(
+            db, storage, generation, str(command.command_id),
+        )
+        db.rollback()
+    assert isinstance(missing, UnmatchedLegacyStaleProductivityGenerationSources)
+    assert "generation boundary" in missing.reason
+
+
+@pytest.mark.parametrize("damage", [
+    "legacy_receipt", "wrong_digest", "future_revision", "accepted_removed",
+    "accepted_payload", "accepted_alias", "accepted_blob_alias", "generation_removed",
+    "generation_payload",
+])
+def test_stale_generation_join_blocks_missing_changed_and_legacy_sources(rig, damage):
+    store, plan, command, _ = _stale_settlement(rig)
+    with store.transaction() as db:
+        stale = db.execute("SELECT payload_json FROM dedupe_keys "
+                           "WHERE namespace='review-round-stale-productivity' AND key=?",
+                           (plan.round.round_id,)).fetchone()
+        captured = decode_workflow(stale["payload_json"], StaleReviewProductivitySettlement)
+        if damage in {"legacy_receipt", "wrong_digest", "future_revision"}:
+            if damage == "legacy_receipt":
+                changed = (captured.facts, captured.outcome)
+            elif damage == "wrong_digest":
+                changed = replace(captured, crossing_digest="0" * 64)
+            else:
+                changed = replace(captured, settled_revision=replace(
+                    captured.settled_revision, version=captured.settled_revision.version + 1,
+                ))
+            db.execute("UPDATE dedupe_keys SET payload_json=? "
+                       "WHERE namespace='review-round-stale-productivity' AND key=?",
+                       (encode_workflow(changed), plan.round.round_id))
+        elif damage == "accepted_removed":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-request' "
+                       "AND key='rearm:with-older-submission'")
+        elif damage == "accepted_payload":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='workflow-request' "
+                       "AND key='rearm:with-older-submission'")
+        elif damage == "accepted_alias":
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       "VALUES (?,?,?,?,?)",
+                       ("workflow-request", "O/R", "rearm:with-older-submission", "now", "{}"))
+        elif damage == "accepted_blob_alias":
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       "VALUES (?,?,?,?,?)",
+                       (b"workflow-request", "o/r", b"rearm:with-older-submission", "now", "{}"))
+        elif damage == "generation_removed":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-generation'")
+        else:
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' "
+                       "WHERE namespace='review-execution-generation'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        storage, generation = _stale_generation_sources(db)
+        before = db.total_changes
+        result = match_legacy_stale_productivity_generation_sources(
+            db, storage, generation, str(command.command_id),
+        )
+        assert db.total_changes == before
+        db.rollback()
+    assert isinstance(result, UnmatchedLegacyStaleProductivityGenerationSources)
+
+
+def test_stale_generation_join_rechecks_both_complete_sets(rig):
+    store, plan, command, _ = _stale_settlement(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        storage, generation = _stale_generation_sources(db)
+        db.rollback()
+    with store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00+00:00' "
+                   "WHERE namespace='review-round-stale-productivity' AND key=?",
+                   (plan.round.round_id,))
+        db.execute("UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00+00:00' "
+                   "WHERE namespace='review-execution-generation'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = match_legacy_stale_productivity_generation_sources(
+            db, storage, generation, str(command.command_id),
+        )
+        db.rollback()
+    assert isinstance(result, UnmatchedLegacyStaleProductivityGenerationSources)
 
 
 def test_older_successful_submission_can_settle_after_accepted_generation_advance(rig):

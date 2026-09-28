@@ -127,6 +127,15 @@ with `CLAUDE.md`, `AGENTS.md`, the
   receipts remain readable but have no historical crossing proof. The
   generation source matcher accepts zero/negative SQL rowids and makes no
   chronological claim from their order.
+- Checkpoint 52 revalidates complete submission settlement storage and
+  generation receipts in one explicit SQL transaction, then joins a typed
+  stale receipt to every intervening accepted generation boundary. The join
+  checks the ordered generation chain, writer digest, final binding and
+  current workflow authority; missing or changed rows, aliases and historical
+  two-field receipts block. Accepted-row candidates use bounded indexed
+  namespace/key reads that include TEXT and BLOB aliases. The matched value
+  remains an observation and needs this SQL recheck at authority use. It
+  neither classifies all successful commands nor proves ordered resets.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -255,6 +264,17 @@ rollback. Full gate log: `/tmp/phase4-stale-generation-witness-gate.log`
 tests, plus hooks, governor, gate parity, four import contracts and both
 Pyrefly checks. Ten strict xfails remained expected.
 
+Independent Sol review of checkpoint 52 found that the initial join repeated
+a whole-table accepted-row scan. Indexed namespace/key batches now retain
+TEXT/BLOB alias detection with a total candidate bound; its second pass found
+no remaining medium or high issue. Real one- and two-advance fixtures cover
+the full chain, missing intermediate receipt, changed transition, forged
+future revision, legacy two-field receipt and arbitrary imported rowids. The
+full gate log is `/tmp/phase4-stale-crossing-join-gate.log` (ephemeral):
+3,199 domain, 3,045 adapter and 2,866 app tests passed, plus hooks, governor,
+gate parity, four import contracts and both Pyrefly checks. Ten strict xfails
+remained expected.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -263,9 +283,7 @@ occurred.
 
 ## Next required boundary
 
-The next proof must join the stale receipt path to the now inventoried
-generation transition and source-backed settlement ordering, classify each
-successful command against its bound
+The next proof must classify each successful command against its bound
 effect, recorded baseline, sealed outcome and productivity path, then replay
 ordered outcomes for each execution episode. Raw recorded markers and completed
 agent runs are observations, not reset authority. Keep unregistered historical
@@ -273,14 +291,13 @@ commands explicit until their legacy provenance is resolved.
 
 Legacy stale receipts store only `(facts, outcome)` and the writer's claim
 time; they remain unknown for historical crossing. New typed receipts capture
-the settlement revision and full crossing-chain digest. The regression fixture
-now uses two preflighted rounds, a later ceiling escalation and a public
-accepted rearm before settling the older successful submission. The next
-activation join must revalidate the complete generation and settlement source
-sets together and match every intervening accepted boundary. Missing or
-changed source rows, old two-field receipts and unclassified commands block
-authority. [SQLite's rowid rules](https://www.sqlite.org/autoinc.html) do not
-make rowid order a durable clock.
+the settlement revision and full crossing-chain digest. The offline join now
+revalidates complete generation and settlement source sets together and
+matches every intervening accepted boundary. A two-advance fixture proves the
+whole chain; removing either source blocks it. Missing or changed source rows,
+old two-field receipts and unclassified commands block activation authority.
+[SQLite's rowid rules](https://www.sqlite.org/autoinc.html) do not make rowid
+order a durable clock.
 
 1. Revalidate the bounded owner closure and run inventory under activation
    barriers before any import commit. Daemon boot's `adopt_legacy_owner`
