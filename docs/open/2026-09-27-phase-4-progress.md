@@ -875,3 +875,24 @@ Execution authority remains inactive. Full `make test` passed: 3,156 domain,
 2,848 adapter and 2,866 app tests, plus hooks, governor, gate parity, four
 import contracts and both Pyrefly checks. Ten accepted strict xfails remained
 expected. Log: `/tmp/phase4-execution-run-inventory-gate.log` (ephemeral).
+
+## Checkpoint 32 — abandoned review run attribution (offline)
+
+A pure classifier now separates non-abandoned runs from attributable review
+deaths and explicit unknown-attribution blockers. It parses the retained
+dispatch identity without accepting duplicate or nonfinite JSON fields,
+requires the run and dispatch kinds to agree, and retains the exact PR and
+signed counter key. A historical positive issue key must match the producer's
+`issue` field; a negative key must name that PR. The attributed variant
+revalidates its own source, so callers cannot construct a trusted fact for a
+different PR or counter. Classification does not import a debit, infer a
+productive reset, or authorize a repository lineage; those decisions still
+require complete submission and owner evidence.
+Independent Sol review reproduced and verified fixes for unhashable dispatch
+`kind`, a constructible source-inconsistent attributed variant, and a
+historical positive key that disagreed with its recorded issue. Its final pass
+found no remaining medium or high classifier defect. Full `make test` passed:
+3,176 domain, 2,848 adapter and 2,866 app tests, plus hooks, governor, gate
+parity, four import contracts and both Pyrefly checks. Ten accepted strict
+xfails remained expected. Log: `/tmp/phase4-review-death-classifier-gate.log`
+(ephemeral).

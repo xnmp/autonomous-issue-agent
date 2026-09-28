@@ -8,7 +8,7 @@ import hashlib
 import json
 
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
-from .workflow_identity import validate_workflow_integer, validate_workflow_text
+from .workflow_identity import canonical_workflow_repository, validate_workflow_integer, validate_workflow_text
 
 
 def _files(*values: LegacyFile) -> None:
@@ -148,3 +148,108 @@ class LegacyExecutionRunPage:
             raise ValueError("legacy run page must advance through unique rowids")
         if self.has_more and not rowids:
             raise ValueError("legacy run page cannot continue without a cursor")
+
+
+@dataclass(frozen=True)
+class LegacyReviewRunNoDeath:
+    source: LegacyExecutionRunRecord
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, LegacyExecutionRunRecord) or self.source.state is LegacyReviewRunState.ABANDONED:
+            raise ValueError("a non-death run requires a non-abandoned source")
+
+
+@dataclass(frozen=True)
+class AttributedLegacyReviewDeath:
+    source: LegacyExecutionRunRecord
+    repository: str
+    pr: int
+    counter_key: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, LegacyExecutionRunRecord) or self.source.state is not LegacyReviewRunState.ABANDONED:
+            raise ValueError("a review death requires an abandoned source")
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("review death repository must be canonical")
+        validate_workflow_integer(self.pr, "review death PR", minimum=1)
+        if type(self.counter_key) is not int or self.counter_key == 0 or abs(self.counter_key) > MAX_SQL_ROWID:
+            raise ValueError("review death requires a valid signed counter key")
+        if self.counter_key < 0 and self.counter_key != -self.pr:
+            raise ValueError("negative review death counter must name its PR")
+        if _dispatch_identity(self.source) != (self.repository, self.pr, self.counter_key):
+            raise ValueError("review death attribution disagrees with its source")
+
+
+@dataclass(frozen=True)
+class UnattributedLegacyReviewDeath:
+    source: LegacyExecutionRunRecord
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, LegacyExecutionRunRecord) or self.source.state is not LegacyReviewRunState.ABANDONED:
+            raise ValueError("unattributed review death requires an abandoned source")
+        validate_workflow_text(self.reason, "unattributed review death reason")
+
+
+LegacyReviewDeathClassification = LegacyReviewRunNoDeath | AttributedLegacyReviewDeath | UnattributedLegacyReviewDeath
+
+
+def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError("duplicate dispatch field")
+        result[key] = value
+    return result
+
+
+def _reject_nonfinite(value: str) -> object:
+    raise ValueError(f"nonfinite dispatch value: {value}")
+
+
+def _dispatch_identity(source: LegacyExecutionRunRecord) -> tuple[str, int, int] | str:
+    try:
+        payload = json.loads(
+            source.dispatch_id, object_pairs_hook=_unique_object,
+            parse_constant=_reject_nonfinite,
+        )
+    except (ValueError, TypeError, RecursionError):
+        return "dispatch identity is not unambiguous JSON"
+    if not isinstance(payload, dict):
+        return "dispatch identity is not an object"
+    repository = payload.get("repository")
+    try:
+        if not isinstance(repository, str) or canonical_workflow_repository(repository) != repository:
+            raise ValueError("repository")
+    except ValueError:
+        return "dispatch repository is not canonical"
+    kind = payload.get("kind")
+    if payload.get("role") != "review" or not isinstance(kind, str) or kind not in {"REVIEW", "RE_REVIEW"}:
+        return "dispatch is not an identified review leg"
+    if source.kind != kind:
+        return "dispatch kind disagrees with its run"
+    pr, key = payload.get("number"), payload.get("breaker_key")
+    if type(pr) is not int or not 1 <= pr <= MAX_SQL_ROWID:
+        return "dispatch pull request number is invalid"
+    if type(key) is not int or key == 0 or abs(key) > MAX_SQL_ROWID or (key < 0 and key != -pr):
+        return "dispatch counter key is invalid or names another PR"
+    if key > 0 and (type(payload.get("issue")) is not int or payload["issue"] != key):
+        return "positive dispatch counter lacks its matching issue provenance"
+    return repository, pr, key
+
+
+def classify_legacy_review_death(source: LegacyExecutionRunRecord) -> LegacyReviewDeathClassification:
+    """Classify only an abandoned run with exact PR and counter provenance.
+
+    A positive issue counter still requires separate issue-to-PR mapping;
+    the caller must verify the parsed repository against authorized owner
+    lineage. This fact never imports a debit or treats completion as a reset.
+    """
+    if not isinstance(source, LegacyExecutionRunRecord):
+        raise ValueError("review death classification requires a typed run source")
+    if source.state is not LegacyReviewRunState.ABANDONED:
+        return LegacyReviewRunNoDeath(source)
+    identity = _dispatch_identity(source)
+    if isinstance(identity, str):
+        return UnattributedLegacyReviewDeath(source, identity)
+    return AttributedLegacyReviewDeath(source, *identity)

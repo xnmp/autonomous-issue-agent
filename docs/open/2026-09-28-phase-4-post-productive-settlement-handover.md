@@ -118,7 +118,8 @@ checks. Ten accepted strict xfails remained expected. Log:
 
 1. Complete execution activation source inventory: predecessor-owner
    discovery, submission receipts, hold provenance, and explicit issue-counter
-   mapping. Legacy files and paged SQL run sources are in checkpoints 30–31 of the
+   mapping. Legacy files, paged SQL run sources and strict run attribution are
+   in checkpoints 30–32 of the
    [progress record](2026-09-27-phase-4-progress.md).
 2. Implement the [source-backed origin and compaction contract](2026-09-28-phase-4-compaction-contract.md)
    with bounded canonical reads and an archived-source audit. The current

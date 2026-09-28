@@ -2,11 +2,13 @@
 
 import pytest
 from dataclasses import replace
+import json
 
 from issue_agent.domain.resolve_activation import LegacyAbsent
 from issue_agent.domain.review_execution_activation import (
-    LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunPage, LegacyExecutionRunRecord,
-    LegacyReviewRunState, UnreadableLegacyExecutionRun,
+    AttributedLegacyReviewDeath, LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunPage,
+    LegacyExecutionRunRecord, LegacyReviewRunNoDeath, LegacyReviewRunState, UnattributedLegacyReviewDeath,
+    UnreadableLegacyExecutionRun, classify_legacy_review_death,
 )
 
 
@@ -65,3 +67,56 @@ def test_run_pages_require_monotonic_bounded_source_cursors():
         LegacyExecutionRunPage((source, source), 1, False)
     with pytest.raises(ValueError):
         LegacyExecutionRunPage((source,), 2, False)
+
+
+def review_dispatch(**changes):
+    payload = {"repository": "o/r", "role": "review", "kind": "REVIEW", "number": 7,
+               "breaker_key": -7, "issue": None, "claim_target": 99}
+    payload.update(changes)
+    return json.dumps(payload, sort_keys=True, separators=(",", ":"))
+
+
+def test_review_death_attribution_retains_pr_and_both_legacy_counter_namespaces():
+    negative = classify_legacy_review_death(run_source(dispatch_id=review_dispatch()))
+    positive = classify_legacy_review_death(run_source(dispatch_id=review_dispatch(breaker_key=99, issue=99)))
+    assert isinstance(negative, AttributedLegacyReviewDeath)
+    assert (negative.repository, negative.pr, negative.counter_key) == ("o/r", 7, -7)
+    assert isinstance(positive, AttributedLegacyReviewDeath)
+    assert (positive.pr, positive.counter_key) == (7, 99)
+    assert positive.source.source_digest != negative.source.source_digest
+
+
+def test_completed_run_does_not_become_a_death_even_with_opaque_dispatch():
+    result = classify_legacy_review_death(run_source(state=LegacyReviewRunState.COMPLETED,
+                                                     dispatch_id="opaque historical id"))
+    assert isinstance(result, LegacyReviewRunNoDeath)
+
+
+@pytest.mark.parametrize("dispatch", [
+    "opaque historical id", "[]", '{"breaker_key":-7,"breaker_key":99}',
+    '{"repository":"o/r","role":"review","kind":"REVIEW","number":7,"breaker_key":NaN}',
+    review_dispatch(role="fix"), review_dispatch(kind="FIX"), review_dispatch(kind=[]),
+    review_dispatch(kind={}), review_dispatch(number=True),
+    review_dispatch(number=0), review_dispatch(breaker_key=True), review_dispatch(breaker_key=0),
+    review_dispatch(breaker_key=-8), review_dispatch(repository="other"),
+    review_dispatch(breaker_key=99, issue=42), review_dispatch(breaker_key=99),
+])
+def test_ambiguous_or_foreign_review_death_is_an_explicit_refusal(dispatch):
+    result = classify_legacy_review_death(run_source(dispatch_id=dispatch))
+    assert isinstance(result, UnattributedLegacyReviewDeath)
+    assert result.source.run_id == "run-1" and result.reason
+
+
+def test_review_death_kind_must_agree_with_the_run_receipt():
+    result = classify_legacy_review_death(run_source(dispatch_id=review_dispatch(kind="RE_REVIEW")))
+    assert isinstance(result, UnattributedLegacyReviewDeath)
+
+
+def test_attributed_variant_cannot_claim_facts_that_disagree_with_its_source():
+    source = run_source(dispatch_id=review_dispatch())
+    with pytest.raises(ValueError, match="source"):
+        AttributedLegacyReviewDeath(source, "o/r", 8, -8)
+    with pytest.raises(ValueError, match="source"):
+        AttributedLegacyReviewDeath(source, "other/r", 7, -7)
+    with pytest.raises(ValueError, match="source"):
+        AttributedLegacyReviewDeath(run_source(dispatch_id=review_dispatch(kind=[])), "o/r", 7, -7)
