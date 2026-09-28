@@ -480,6 +480,23 @@ parity, four import contracts and both Pyrefly checks. Ten strict xfails
 remained expected. Log: `/tmp/phase4-checkpoint-round-archive-page-gate.log`
 (ephemeral).
 
+- Checkpoint 86 adds a read-only transaction-local checkpoint manifest
+  observation. It starts from the canonical active execution, replays a
+  finalized prefix, reads expected retired round and generation sources in
+  order, compares their full outcomes and boundaries with the plan, and
+  constructs the typed source-digest receipt. A retained-field byte ceiling
+  rejects oversized proposals; it is an accounting ceiling, not a bound on
+  the existing canonical loader's reads or peak memory. Missing, aliased and
+  changed round receipt sources block. This proposal grants no compaction
+  authority: unclaimed archived rows, retired receipt payload semantics and
+  the durable audit gate remain unproved. The canonical loader still refuses
+  every compacted component.
+
+Independent Sol review found no replay-order error and identified the
+accounting limit and missing archive census as explicit constraints. The
+reader documents them; malformed-source and byte-limit regressions pass.
+Full-gate results are recorded in the progress board after acceptance.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -487,14 +504,13 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoint 85, the writer can enumerate a retired round range from
-stored sequence keys without accepting a caller-supplied source list. Next,
-assemble the entire bounded retired round and generation streams inside one
-write transaction, set an explicit cumulative byte budget, and compare them
-to a fresh canonical replay before minting a checkpoint receipt. This must
-handle generation-only advances and later checkpoints as well as an initial
-round prefix. The audit still needs a separate sweep of unclaimed round rows,
-including noncanonical BLOB numeric encodings that no point lookup can find.
+With checkpoint 86, a transaction can assemble the expected retired streams
+without accepting a caller-supplied source list. Before a writer can use
+this proposal, establish a true cumulative read bound around canonical load
+and each source reader; prove generation-only and later-checkpoint paths;
+verify every retired receipt payload; and census unclaimed round rows and
+receipts, including noncanonical BLOB numeric encodings that point lookups
+cannot find. Publish the checkpoint and initialized audit gate atomically.
 
 The intended read metric is bytes and latency per canonical load as archived
 generations grow; the guardrail is refusal on changed immediate sources. The

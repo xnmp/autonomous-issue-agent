@@ -56,6 +56,7 @@ from issue_agent.adapters.review_execution_activation import (
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
+from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
@@ -1405,6 +1406,65 @@ def test_checkpoint_generation_anchor_matches_retained_pair_without_writes(rig):
         with pytest.raises(WorkflowAuthorityError, match="checkpoint generation anchor"):
             verify_checkpoint_generation_anchor(db, binding, fingerprint)
         db.rollback()
+
+
+def test_checkpoint_manifest_observes_real_round_and_generation_sources(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        before = db.total_changes
+        observed = observe_review_checkpoint_manifest(db, key, 1)
+        assert observed.plan.checkpoint.through_sequence == 1
+        assert len(observed.plan.retired_outcomes) == 1
+        assert len(observed.plan.retired_boundaries) == 1
+        assert observed.receipt.last_round_source is not None
+        assert observed.receipt.last_generation_source is not None
+        assert observed.receipt.last_round_source.round == observed.plan.retired_outcomes[0].round
+        assert observed.receipt.last_generation_source.cursor.receipt_id == (
+            observed.plan.retired_boundaries[0].receipt_id
+        )
+        assert observed.source_bytes > 0
+        assert db.total_changes == before
+        assert observe_review_checkpoint_manifest(
+            db, key, 1, max_source_bytes=observed.source_bytes,
+        ).receipt == observed.receipt
+        with pytest.raises(WorkflowAuthorityError, match="byte bound"):
+            observe_review_checkpoint_manifest(
+                db, key, 1, max_source_bytes=observed.source_bytes - 1,
+            )
+
+
+@pytest.mark.parametrize("mutation", ("missing", "aliased", "changed"))
+def test_checkpoint_manifest_refuses_corrupt_retired_outcome_source(rig, mutation):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT scope,key,claimed_at,payload_json FROM dedupe_keys "
+            "WHERE namespace='review-round-outcome' AND scope='o/r'",
+        ).fetchone()
+        assert row is not None
+        if mutation == "missing":
+            db.execute(
+                "DELETE FROM dedupe_keys WHERE namespace='review-round-outcome' "
+                "AND scope=? AND key=?",
+                (row["scope"], row["key"]),
+            )
+        elif mutation == "aliased":
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (CAST(? AS BLOB),?,?,?,?)",
+                ("review-round-outcome", row["scope"], row["key"],
+                 row["claimed_at"], row["payload_json"]),
+            )
+        else:
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json='{}' "
+                "WHERE namespace='review-round-outcome' AND scope=? AND key=?",
+                (row["scope"], row["key"]),
+            )
+        with pytest.raises(WorkflowAuthorityError):
+            observe_review_checkpoint_manifest(db, key, 1)
 
 
 def test_staged_checkpoint_load_checks_generation_anchor_before_global_refusal(rig):

@@ -1553,9 +1553,9 @@ def _checkpoint_prefixed_receipts(
     return keys
 
 
-def read_checkpoint_round_receipt_source(
+def _read_checkpoint_round_receipt_observation(
     db: sqlite3.Connection, round_id: ReviewRoundIdentity,
-) -> ReviewExecutionCompactionRoundSource:
+) -> tuple[ReviewExecutionCompactionRoundSource, int]:
     """Observe one finalized round's exact bounded receipt membership and fields."""
     row = read_checkpoint_round_row_source(db, round_id)
     values = dict(row.fields)
@@ -1642,10 +1642,23 @@ def read_checkpoint_round_receipt_source(
         receipt_digest = hashlib.sha256(json.dumps(
             members, separators=(",", ":"), ensure_ascii=True,
         ).encode()).hexdigest()
-        return ReviewExecutionCompactionRoundSource(round_id, row.source_digest, receipt_digest)
+        row_bytes = sum(
+            len(str(value).encode()) if isinstance(value, int)
+            else len(value.encode("utf-8", "surrogatepass"))
+            for _, value in row.fields if value is not None
+        )
+        return (ReviewExecutionCompactionRoundSource(round_id, row.source_digest, receipt_digest),
+                row_bytes + source_bytes)
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error, WorkflowEncodingError) as exc:
         raise WorkflowAuthorityError("review execution checkpoint round receipt set is unreadable") from exc
+
+
+def read_checkpoint_round_receipt_source(
+    db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+) -> ReviewExecutionCompactionRoundSource:
+    """Point-read the final retired round's source fingerprint for a hot anchor."""
+    return _read_checkpoint_round_receipt_observation(db, round_id)[0]
 
 
 @dataclass(frozen=True)
@@ -1654,11 +1667,15 @@ class ObservedReviewCheckpointRound:
 
     outcome: ReviewRoundOutcome
     source: ReviewExecutionCompactionRoundSource
+    source_bytes: int
 
     def __post_init__(self) -> None:
         if (not isinstance(self.outcome, ReviewRoundOutcome)
                 or not isinstance(self.source, ReviewExecutionCompactionRoundSource)
-                or self.outcome.round != self.source.round):
+                or self.outcome.round != self.source.round
+                or type(self.source_bytes) is not int
+                or not 0 < self.source_bytes <= MAX_LEGACY_ROUND_PAGE_BYTES
+                + MAX_CHECKPOINT_ROUND_RECEIPT_BYTES):
             raise ValueError("checkpoint round observation requires one exact outcome source")
 
 
@@ -1710,9 +1727,8 @@ def read_checkpoint_round_by_sequence(
         if (outcome.round.round_id != row["round_id"] or outcome.round.sequence != sequence
                 or not same_execution_episode(binding, outcome.round.binding)):
             raise ValueError("checkpoint round outcome has a foreign indexed identity")
-        return ObservedReviewCheckpointRound(
-            outcome, read_checkpoint_round_receipt_source(db, outcome.round),
-        )
+        source, source_bytes = _read_checkpoint_round_receipt_observation(db, outcome.round)
+        return ObservedReviewCheckpointRound(outcome, source, source_bytes)
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error, WorkflowEncodingError) as exc:
         raise WorkflowAuthorityError("review execution checkpoint round sequence is unreadable") from exc
@@ -3197,6 +3213,7 @@ class ObservedReviewGenerationArchiveSource:
     accepted_key: str
     receipt_digest: str
     accepted_digest: str
+    source_bytes: int
 
     def __post_init__(self) -> None:
         if (type(self.generation) is not int or self.generation < 1
@@ -3209,6 +3226,8 @@ class ObservedReviewGenerationArchiveSource:
             if (not isinstance(digest, str) or len(digest) != 64
                     or any(char not in "0123456789abcdef" for char in digest)):
                 raise ValueError("archived generation source requires SHA-256 source digests")
+        if type(self.source_bytes) is not int or not 0 < self.source_bytes <= MAX_GENERATION_ARCHIVE_PAGE_BYTES:
+            raise ValueError("archived generation source exceeds its byte bound")
 
 
 @dataclass(frozen=True)
@@ -3383,7 +3402,7 @@ def read_review_generation_archive_page(
             if source_bytes != receipt_size + accepted_size:
                 raise ValueError("generation source pair changed during its bounded read")
             sources.append(ObservedReviewGenerationArchiveSource(
-                generation, boundary, namespace, key, receipt_digest, accepted_digest,
+                generation, boundary, namespace, key, receipt_digest, accepted_digest, source_bytes,
             ))
             bytes_read += source_bytes
             previous_revision = boundary.to_revision

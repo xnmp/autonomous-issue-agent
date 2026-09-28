@@ -26,6 +26,11 @@ writer and audit gate are installed.
 A bounded transaction-local archive page now observes expected finalized round
 sequences and their row/receipt fingerprints for future writer and audit joins;
 an independent unclaimed-row census remains necessary.
+A read-only transaction-local manifest observer now joins expected retired
+round and generation sources to a canonical prefix replay and proposes a
+typed checkpoint receipt. Its byte ceiling accounts for retained fields after
+reads; the writer still needs a true cumulative read bound, an unclaimed-row
+and receipt census, payload audit and atomic audit gate.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

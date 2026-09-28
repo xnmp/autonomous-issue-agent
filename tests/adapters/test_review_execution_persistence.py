@@ -16,6 +16,7 @@ from issue_agent.adapters.review_execution_activation import (
     read_checkpoint_round_archive_page, read_checkpoint_round_by_sequence,
     read_checkpoint_round_receipt_source, read_checkpoint_round_row_source,
 )
+from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.domain.review_execution_activation import MAX_LEGACY_ROUND_JSON_BYTES
 from issue_agent.adapters.control_store import _command_payload_digest, _json
 from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
@@ -634,6 +635,16 @@ def test_checkpoint_sequence_read_rejects_duplicate_numeric_blob_alias(active, a
         with pytest.raises(WorkflowAuthorityError, match="checkpoint round sequence"):
             read_checkpoint_round_by_sequence(db, snapshot.execution.binding, 1)
         assert tuple(db.iterdump()) == before
+
+
+def test_checkpoint_manifest_refuses_an_open_retired_round(active):
+    store, snapshot = active
+    facts, _ = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts)
+        set_projection(db, snapshot, (), 1)
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint manifest"):
+            observe_review_checkpoint_manifest(db, snapshot.revision.fence.key, 1)
 
 
 def test_indexed_round_high_water_does_not_hide_a_missing_suffix_middle(active):

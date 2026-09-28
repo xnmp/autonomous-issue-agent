@@ -5,8 +5,14 @@ the pure prefix planner, checkpoint cursor, imported-origin read prerequisite,
 fresh first-observation origin, digest-bound generation receipts and typed
 checkpoint source manifest are implemented. The canonical reader verifies
 checkpoint row identity, one predecessor, the final retired generation source
-pair and the final retired round row, but refuses every compacted component
-until the round receipt set and audit gate can be verified.
+pair, and the final retired round row and receipt set, but refuses every
+compacted component until complete archive membership and the audit gate
+can be verified.
+The transaction-local manifest observer now reconstructs expected retired
+round and generation streams and a candidate receipt. Its retained-field byte
+limit is an accounting ceiling after source reads, not a canonical-load or
+peak-memory bound. It neither surveys unclaimed archive rows nor certifies
+every retired receipt payload, so it cannot authorize a checkpoint write.
 Production import and renewal writers, the checkpoint writer, bounded
 compacted hot reads and the complete audit remain pending. A durable offline
 cursor now scans expected generation sources and the retained receipt
@@ -141,8 +147,10 @@ reject a missing, repeated or foreign boundary.
 The checkpoint writer, typed checkpoint reader and durable paged audit gate
 must be installed before any production compaction can commit. The writer
 verifies the newly retired source stream and initializes its audit state in
-the same transaction as the checkpoint and active-suffix update. Subsequent
-audit pages verify retained membership and payloads, including full historical
+the same transaction as the checkpoint and active-suffix update. The writer
+must make the cumulative source budget an actual read bound and cover
+generation-only and later-checkpoint proposals. Audit pages verify retained
+membership and payloads, including full historical
 accepted transitions, and persist a cursor, rolling digest, due state and any
 discrepancy. The current loader checks typed checkpoint ancestry, the last
 retired generation source pair, and the last retired round row and receipt
