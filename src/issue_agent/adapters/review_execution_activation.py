@@ -12,7 +12,9 @@ import sqlite3
 import hashlib
 import json
 from bisect import bisect_left
-from dataclasses import dataclass, replace
+from collections.abc import Mapping
+from dataclasses import dataclass, field, replace
+from types import MappingProxyType
 
 from ..domain.resolve_activation import LegacyAbsent, LegacyFile, UnmappedLegacyEntry
 from ..domain.review_execution_activation import (
@@ -23,6 +25,7 @@ from ..domain.review_execution_activation import (
     MAX_LEGACY_RUN_INVENTORY_ROWS, MAX_LEGACY_RUN_INVENTORY_BYTES,
     LEGACY_SUBMISSION_COMMAND_COLUMNS, LEGACY_SUBMISSION_RECEIPT_COLUMNS,
     LegacyReviewSubmissionPage, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
+    potentially_successful_review_submission,
     CompleteLegacyReviewSubmissions, BlockedLegacyReviewSubmissions,
     MAX_LEGACY_SUBMISSION_INVENTORY_ROWS, MAX_LEGACY_SUBMISSION_INVENTORY_BYTES,
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
@@ -54,7 +57,7 @@ from ..domain.review_execution_activation import (
 from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome,
-    PaidReviewProgress, CopiedReviewProgress, ReviewExecutionGenerationBoundary,
+    PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
     MAX_EXECUTION_SUFFIX, review_generation_chain_digest, same_execution_episode,
 )
 from ..domain.review_workflow import ReviewWorkflowSnapshot
@@ -71,8 +74,8 @@ from ..domain.workflow import (
     RequestRearm, ContinueGrantedRearm,
 )
 from ..domain.workflow_identity import (
-    PullRequestRef, WorkflowBinding, WorkflowRevision, MAX_REARM_COMMANDS,
-    canonical_workflow_repository, validate_workflow_identifier,
+    PullRequestRef, WorkflowBinding, WorkflowRevision, WorkflowKey, FamilyAuthority, MAX_REARM_COMMANDS,
+    canonical_workflow_repository, validate_workflow_identifier, validate_workflow_text,
 )
 from .control_store import CorruptControlStore, _encoded_payload_digest, _parse_stamp, _receipt_digest, load_bound_review_submission
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
@@ -1252,6 +1255,13 @@ def read_legacy_recorded_review(
     This does not certify a productive execution round or reset. Escalated
     verdicts need a separate hold proof; missing recording remains unresolved.
     """
+    return _read_legacy_recorded_review(db, source, lineage, None)
+
+
+def _read_legacy_recorded_review(
+    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
+    lineage: LegacyReviewOwnerLineage, unique_remote_ids: frozenset[str] | None,
+) -> VerifiedLegacyRecordedReview | UnverifiedLegacyRecordedReview:
     if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
         raise ValueError("recorded review proof requires an explicit SQL transaction")
     if not isinstance(source, LegacyReviewSubmissionSource) or not isinstance(lineage, LegacyReviewOwnerLineage):
@@ -1280,12 +1290,15 @@ def read_legacy_recorded_review(
         if (command["attempt_owner"] != receipt.executor_identity
                 or effect["receipt_digest"] != _receipt_digest(receipt)):
             raise ValueError("submission effect digest or attempt owner disagrees")
-        duplicate_review = db.execute(
-            "SELECT e.command_id FROM effect_receipts e JOIN lifecycle_commands c USING(command_id) "
-            "WHERE e.remote_object_id=? AND c.kind='submit_review' AND c.repository=? LIMIT 2",
-            (receipt.remote_object_id, lineage.repository),
-        ).fetchall()
-        if len(duplicate_review) != 1 or duplicate_review[0]["command_id"] != command_id:
+        if unique_remote_ids is None:
+            duplicate_review = db.execute(
+                "SELECT e.command_id FROM effect_receipts e JOIN lifecycle_commands c USING(command_id) "
+                "WHERE e.remote_object_id=? AND c.kind='submit_review' AND c.repository=? LIMIT 2",
+                (receipt.remote_object_id, lineage.repository),
+            ).fetchall()
+            if len(duplicate_review) != 1 or duplicate_review[0]["command_id"] != command_id:
+                raise ValueError("submission review identity is shared by another command")
+        elif receipt.remote_object_id not in unique_remote_ids:
             raise ValueError("submission review identity is shared by another command")
         bound = load_bound_review_submission(db, CommandId(command_id))
         if not isinstance(bound, ReviewSubmissionReceipt) or bound.escalated:
@@ -1583,6 +1596,11 @@ class CompleteLegacySubmissionSettlementStorage:
     registered: tuple[VerifiedLegacySubmissionRegistrationStorage, ...]
     unregistered: tuple[LegacyReviewSubmissionSource, ...]
     recorded_markers: tuple[LegacyReviewSubmissionReceiptSource, ...]
+    _registered_by_id: Mapping[str, VerifiedLegacySubmissionRegistrationStorage] = field(
+        init=False, repr=False, compare=False,
+    )
+    _recorded_marker_ids: frozenset[str] = field(init=False, repr=False, compare=False)
+    _unique_remote_review_ids: frozenset[str] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.commands, CompleteLegacyReviewSubmissions)
@@ -1653,6 +1671,17 @@ class CompleteLegacySubmissionSettlementStorage:
         marker_receipt_keys = {("review-recorded-submission", command_id) for command_id in marker_keys}
         if len(index_keys) != len(self.registered) or set(receipt_by_key) != registration_keys | index_keys | marker_receipt_keys:
             raise ValueError("settlement storage leaves a receipt unaccounted for")
+        remote_counts: dict[str, int] = {}
+        for source in self.commands.submissions:
+            effect = dict(source.receipt_fields) if source.receipt_fields is not None else {}
+            remote_id = effect.get("remote_object_id")
+            if isinstance(remote_id, str):
+                remote_counts[remote_id] = remote_counts.get(remote_id, 0) + 1
+        object.__setattr__(self, "_registered_by_id", MappingProxyType(registered_by_id))
+        object.__setattr__(self, "_recorded_marker_ids", frozenset(marker_keys))
+        object.__setattr__(self, "_unique_remote_review_ids", frozenset(
+            remote_id for remote_id, count in remote_counts.items() if count == 1
+        ))
 
     @property
     def repository(self) -> str:
@@ -1830,22 +1859,21 @@ class VerifiedLegacyStaleProductivityReceiptPath:
         except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
             raise ValueError("stale settlement has malformed receipt evidence") from exc
         auxiliary = {"review-round-superseded-productivity", "review-round-ceiling-productivity"}
-        if (self.registered not in self.complete_storage.registered
-                or self.sealed not in self.complete_storage.round_storage.sealed
-                or self.stale_receipt not in self.complete_storage.round_storage.receipts.receipts
-                or any(dict(marker.fields)["key"] == command_id
-                       for marker in self.complete_storage.recorded_markers)
-                or any(dict(source.fields)["namespace"] in auxiliary
-                       and dict(source.fields)["key"] == round_id
-                       for source in self.complete_storage.round_storage.receipts.receipts)
+        if (self.complete_storage._registered_by_id.get(command_id) != self.registered
+                or self.complete_storage.round_storage._sealed_by_id.get(round_id) != self.sealed
+                or self.complete_storage.round_storage._receipt_by_key.get(
+                    ("review-round-stale-productivity", round_id),
+                ) != self.stale_receipt
+                or command_id in self.complete_storage._recorded_marker_ids
+                or bool(self.complete_storage.round_storage._receipt_names_by_round.get(
+                    round_id, frozenset(),
+                ) & auxiliary)
                 or command["state"] != "succeeded" or command["attempts"] < 1
                 or command["attempt_owner"] != receipt.executor_identity
                 or receipt.executor_identity != command["executor_identity"]
                 or receipt.status is not EffectStatus.SUCCEEDED
                 or not isinstance(receipt.remote_object_id, str) or not receipt.remote_object_id
-                or sum(1 for source in self.complete_storage.commands.submissions
-                       if source.receipt_fields is not None
-                       and dict(source.receipt_fields)["remote_object_id"] == receipt.remote_object_id) != 1
+                or receipt.remote_object_id not in self.complete_storage._unique_remote_review_ids
                 or effect["receipt_digest"] != _receipt_digest(receipt)
                 or len(confirmed) != 1 or confirmed[0].plan.command_id != command_id
                 or not isinstance(disposition, (PaidReviewProgress, CopiedReviewProgress))
@@ -1897,16 +1925,18 @@ def verify_legacy_stale_productivity_receipt_path(
     )
     if isinstance(current, BlockedLegacySubmissionSettlementStorage):
         return UnverifiedLegacyStaleProductivityReceiptPath(command_id, current.reason)
-    registered = next((item for item in current.registered
-                       if dict(item.command_source.command_fields)["command_id"] == command_id), None)
+    return _stale_productivity_path_from_storage(current, command_id)
+
+
+def _stale_productivity_path_from_storage(
+    current: CompleteLegacySubmissionSettlementStorage, command_id: str,
+) -> VerifiedLegacyStaleProductivityReceiptPath | UnverifiedLegacyStaleProductivityReceiptPath:
+    registered = current._registered_by_id.get(command_id)
     if registered is None:
         return UnverifiedLegacyStaleProductivityReceiptPath(command_id, "submission lacks registered round storage")
     round_id = registered.plan.round.round_id
-    sealed = next((item for item in current.round_storage.sealed
-                   if item.outcome.round.round_id == round_id), None)
-    stale = next((item for item in current.round_storage.receipts.receipts
-                  if dict(item.fields)["namespace"] == "review-round-stale-productivity"
-                  and dict(item.fields)["key"] == round_id), None)
+    sealed = current.round_storage._sealed_by_id.get(round_id)
+    stale = current.round_storage._receipt_by_key.get(("review-round-stale-productivity", round_id))
     if sealed is None or stale is None:
         return UnverifiedLegacyStaleProductivityReceiptPath(command_id, "sealed stale settlement receipt is absent")
     try:
@@ -2356,6 +2386,29 @@ def _accepted_generation_rows(
     return rows_by_target
 
 
+_GenerationEpisodeKey = tuple[int, str, FamilyAuthority, str, WorkflowKey, int]
+
+
+def _generation_episode_key(binding: ReviewExecutionBinding, generation: int) -> _GenerationEpisodeKey:
+    return (binding.execution_epoch, binding.execution_episode, binding.rejection.authority,
+            binding.rejection.episode_id, binding.rejection.fence.key, generation)
+
+
+def _indexed_generation_sources(
+    complete: CompleteLegacyReviewGenerationReceipts,
+) -> dict[_GenerationEpisodeKey, tuple[LegacyReviewGenerationReceiptSource, ...]]:
+    indexed: dict[_GenerationEpisodeKey, list[LegacyReviewGenerationReceiptSource]] = {}
+    for source in complete.receipts:
+        captured = decode_workflow(dict(source.fields)["payload_json"], tuple)
+        if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
+                or any(not isinstance(value, str) for value in captured[1:])):
+            raise ValueError("generation receipt has malformed accepted transition fields")
+        boundary = captured[0]
+        key = _generation_episode_key(boundary.before.binding, boundary.from_revision.fence.generation)
+        indexed.setdefault(key, []).append(source)
+    return {key: tuple(sources) for key, sources in indexed.items()}
+
+
 def match_legacy_stale_productivity_generation_sources(
     db: sqlite3.Connection, observed_storage: CompleteLegacySubmissionSettlementStorage,
     observed_generation: CompleteLegacyReviewGenerationReceipts, command_id: str,
@@ -2375,13 +2428,30 @@ def match_legacy_stale_productivity_generation_sources(
     complete = revalidate_complete_legacy_review_generation_receipts(db, observed_generation)
     if isinstance(complete, BlockedLegacyReviewGenerationReceipts):
         return UnmatchedLegacyStaleProductivityGenerationSources(command_id, complete.reason)
+    return _match_stale_productivity_generation_from_sources(db, stale_path, complete)
+
+
+def _match_stale_productivity_generation_from_sources(
+    db: sqlite3.Connection, stale_path: VerifiedLegacyStaleProductivityReceiptPath,
+    complete: CompleteLegacyReviewGenerationReceipts,
+    *, generation_index: Mapping[_GenerationEpisodeKey, tuple[LegacyReviewGenerationReceiptSource, ...]] | None = None,
+    accepted_cache: dict[str, MatchedLegacyReviewGenerationBoundarySources] | None = None,
+    workflow_cache: dict[WorkflowKey, ReviewWorkflowSnapshot | None] | None = None,
+) -> MatchedLegacyStaleProductivityGenerationSources | UnmatchedLegacyStaleProductivityGenerationSources:
+    command_id = dict(stale_path.registered.command_source.command_fields)["command_id"]
     try:
         settlement = decode_workflow(dict(stale_path.stale_receipt.fields)["payload_json"],
                                      tuple | StaleReviewProductivitySettlement)
         if not isinstance(settlement, StaleReviewProductivitySettlement):
             raise ValueError("legacy stale receipt has no generation crossing witness")
         round_id = stale_path.registered.plan.round
-        current = load_review_workflow_row(db, round_id.binding.rejection.fence.key)
+        workflow_key = round_id.binding.rejection.fence.key
+        if workflow_cache is None:
+            current = load_review_workflow_row(db, workflow_key)
+        else:
+            if workflow_key not in workflow_cache:
+                workflow_cache[workflow_key] = load_review_workflow_row(db, workflow_key)
+            current = workflow_cache[workflow_key]
         if (current is None or not isinstance(current.execution, ActivatedReviewExecution)
                 or not same_execution_episode(round_id.binding, current.execution.binding)
                 or settlement.settled_revision.version > current.revision.version
@@ -2393,7 +2463,11 @@ def match_legacy_stale_productivity_generation_sources(
             raise ValueError("stale generation crossing exceeds its suffix bound")
         selected: dict[int, tuple[LegacyReviewGenerationReceiptSource, ReviewExecutionGenerationBoundary,
                                   str, str, str]] = {}
-        for source in complete.receipts:
+        sources = complete.receipts if generation_index is None else tuple(
+            source for generation in range(first, last)
+            for source in generation_index.get(_generation_episode_key(round_id.binding, generation), ())
+        )
+        for source in sources:
             captured = decode_workflow(dict(source.fields)["payload_json"], tuple)
             if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
                     or any(not isinstance(value, str) for value in captured[1:])):
@@ -2412,19 +2486,225 @@ def match_legacy_stale_productivity_generation_sources(
         if any(namespace not in {"workflow-request", "workflow-transition"}
                for _, _, namespace, _, _ in ordered):
             raise ValueError("generation receipt lacks an accepted transition namespace")
-        targets = {(namespace.encode(), key.encode()) for _, _, namespace, key, _ in ordered}
-        if len(targets) != len(ordered):
+        all_targets = {(namespace.encode(), key.encode()) for _, _, namespace, key, _ in ordered}
+        if len(all_targets) != len(ordered):
             raise ValueError("stale generation crossing repeats an accepted transition")
-        accepted_rowids = _accepted_generation_rows(db, complete.repository, targets)
+        targets = {(namespace.encode(), key.encode()) for _, boundary, namespace, key, _ in ordered
+                   if accepted_cache is None or boundary.receipt_id not in accepted_cache}
+        accepted_rowids = _accepted_generation_rows(db, complete.repository, targets) if targets else {}
         matched: list[MatchedLegacyReviewGenerationBoundarySources] = []
         for source, boundary, namespace, key, accepted_payload in ordered:
+            cached = accepted_cache.get(boundary.receipt_id) if accepted_cache is not None else None
+            if cached is not None:
+                if (cached.complete_receipts != complete or cached.receipt_source != source
+                        or cached.boundary != boundary
+                        or dict(cached.accepted_fields)["payload_json"] != accepted_payload):
+                    raise ValueError("cached generation boundary disagrees with current sources")
+                matched.append(cached)
+                continue
             accepted_fields, _ = _read_recording_source(db, namespace, complete.repository, key)
             if dict(accepted_fields)["payload_json"] != accepted_payload:
                 raise ValueError("accepted generation transition changed")
-            matched.append(MatchedLegacyReviewGenerationBoundarySources(
+            proof = MatchedLegacyReviewGenerationBoundarySources(
                 complete, source, boundary, accepted_rowids[(namespace.encode(), key.encode())],
                 accepted_fields,
-            ))
+            )
+            matched.append(proof)
+            if accepted_cache is not None:
+                accepted_cache[boundary.receipt_id] = proof
         return MatchedLegacyStaleProductivityGenerationSources(stale_path, settlement, complete, tuple(matched))
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, WorkflowAuthorityError) as exc:
         return UnmatchedLegacyStaleProductivityGenerationSources(command_id, _printable(str(exc)))
+
+
+@dataclass(frozen=True)
+class ClassifiedLegacyPlainReviewSuccess:
+    source: LegacyReviewSubmissionSource
+    proof: VerifiedLegacyPlainProductiveRound
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyReviewSubmissionSource)
+                or not isinstance(self.proof, VerifiedLegacyPlainProductiveRound)
+                or self.proof.link.source != self.source):
+            raise ValueError("plain review classification requires its exact command proof")
+
+
+@dataclass(frozen=True)
+class ClassifiedLegacyStaleReviewSuccess:
+    source: LegacyReviewSubmissionSource
+    proof: MatchedLegacyStaleProductivityGenerationSources
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyReviewSubmissionSource)
+                or not isinstance(self.proof, MatchedLegacyStaleProductivityGenerationSources)
+                or self.proof.stale_path.registered.command_source != self.source):
+            raise ValueError("stale review classification requires its exact command proof")
+
+
+@dataclass(frozen=True)
+class UnresolvedLegacyReviewSuccess:
+    source: LegacyReviewSubmissionSource
+    reason: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, LegacyReviewSubmissionSource):
+            raise ValueError("unresolved review classification requires a command source")
+        validate_workflow_text(self.reason, "unresolved successful review reason")
+
+
+LegacyReviewSuccessClassification = (
+    ClassifiedLegacyPlainReviewSuccess | ClassifiedLegacyStaleReviewSuccess | UnresolvedLegacyReviewSuccess
+)
+
+
+@dataclass(frozen=True)
+class CompleteLegacyReviewSuccessClassifications:
+    """Every potentially successful command has one observational disposition."""
+
+    storage: CompleteLegacySubmissionSettlementStorage
+    generation: CompleteLegacyReviewGenerationReceipts
+    lineage: LegacyReviewOwnerLineage
+    results: tuple[LegacyReviewSuccessClassification, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.storage, CompleteLegacySubmissionSettlementStorage)
+                or not isinstance(self.generation, CompleteLegacyReviewGenerationReceipts)
+                or not isinstance(self.lineage, LegacyReviewOwnerLineage)
+                or not isinstance(self.results, tuple)
+                or self.storage.repository != self.generation.repository
+                or self.storage.repository != self.lineage.repository):
+            raise ValueError("complete review classification requires matching typed source sets")
+        candidates = tuple(source for source in self.storage.commands.submissions
+                           if potentially_successful_review_submission(source))
+        if (len(self.results) != len(candidates)
+                or any(not isinstance(result, (
+                    ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyStaleReviewSuccess,
+                    UnresolvedLegacyReviewSuccess,
+                )) or result.source != source
+                       for result, source in zip(self.results, candidates, strict=True))):
+            raise ValueError("successful review classification leaves a command unaccounted for")
+        registered_ids = {dict(item.command_source.command_fields)["command_id"] for item in self.storage.registered}
+        marker_ids = {dict(item.fields)["key"] for item in self.storage.recorded_markers}
+        for result in self.results:
+            command = dict(result.source.command_fields)
+            effect = dict(result.source.receipt_fields) if result.source.receipt_fields is not None else {}
+            command_id = command["command_id"]
+            if (not isinstance(result, UnresolvedLegacyReviewSuccess)
+                    and (command["state"] != "succeeded" or effect.get("status") != "succeeded"
+                         or command["executor_identity"] not in self.lineage.owners)):
+                raise ValueError("proven review success disagrees with its command, effect or owner")
+            if isinstance(result, ClassifiedLegacyPlainReviewSuccess):
+                if (command_id not in registered_ids or command_id not in marker_ids
+                        or result.proof.complete_storage != self.storage.round_storage
+                        or result.proof.link.lineage != self.lineage):
+                    raise ValueError("plain review classification lacks complete source membership")
+            elif isinstance(result, ClassifiedLegacyStaleReviewSuccess):
+                if (command_id not in registered_ids or command_id in marker_ids
+                        or result.proof.stale_path.complete_storage != self.storage
+                        or result.proof.complete_receipts != self.generation):
+                    raise ValueError("stale review classification lacks complete source membership")
+
+    @property
+    def unresolved(self) -> tuple[UnresolvedLegacyReviewSuccess, ...]:
+        return tuple(result for result in self.results if isinstance(result, UnresolvedLegacyReviewSuccess))
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewSuccessClassifications:
+    repository: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked review classification requires a canonical repository")
+        validate_workflow_text(self.reason, "blocked review classification reason")
+
+
+def classify_complete_legacy_review_successes(
+    db: sqlite3.Connection, observed_storage: CompleteLegacySubmissionSettlementStorage,
+    observed_generation: CompleteLegacyReviewGenerationReceipts, observed_lineage: LegacyReviewOwnerLineage,
+) -> CompleteLegacyReviewSuccessClassifications | BlockedLegacyReviewSuccessClassifications:
+    """Account for every success claim after rechecking all source sets in one snapshot."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("review classification requires an explicit SQL transaction")
+    if (not isinstance(observed_storage, CompleteLegacySubmissionSettlementStorage)
+            or not isinstance(observed_generation, CompleteLegacyReviewGenerationReceipts)
+            or not isinstance(observed_lineage, LegacyReviewOwnerLineage)):
+        raise ValueError("review classification requires complete typed observations")
+    repository = observed_storage.repository
+    if repository != observed_generation.repository or repository != observed_lineage.repository:
+        return BlockedLegacyReviewSuccessClassifications(repository, "review classification repositories disagree")
+    storage = verify_complete_legacy_submission_settlement_storage(
+        db, observed_storage.commands, observed_storage.receipts, observed_storage.round_storage,
+    )
+    if isinstance(storage, BlockedLegacySubmissionSettlementStorage):
+        return BlockedLegacyReviewSuccessClassifications(repository, storage.reason)
+    generation = revalidate_complete_legacy_review_generation_receipts(db, observed_generation)
+    if isinstance(generation, BlockedLegacyReviewGenerationReceipts):
+        return BlockedLegacyReviewSuccessClassifications(repository, generation.reason)
+    lineage = read_legacy_review_owner_lineage(
+        db, repository, observed_lineage.current_owner,
+        configured_prior_owners=observed_lineage.configured_prior_owners,
+    )
+    if lineage != observed_lineage:
+        return BlockedLegacyReviewSuccessClassifications(repository, "review owner lineage changed after inventory")
+    generation_index: dict[_GenerationEpisodeKey, tuple[LegacyReviewGenerationReceiptSource, ...]] | None = None
+    accepted_cache: dict[str, MatchedLegacyReviewGenerationBoundarySources] = {}
+    workflow_cache: dict[WorkflowKey, ReviewWorkflowSnapshot | None] = {}
+    results: list[LegacyReviewSuccessClassification] = []
+    for source in storage.commands.submissions:
+        if not potentially_successful_review_submission(source):
+            continue
+        command = dict(source.command_fields)
+        command_id = command["command_id"]
+        effect = dict(source.receipt_fields) if source.receipt_fields is not None else {}
+        registration = storage._registered_by_id.get(command_id)
+        if command["state"] != "succeeded" or effect.get("status") != "succeeded":
+            results.append(UnresolvedLegacyReviewSuccess(source, "command and effect do not both confirm success"))
+        elif registration is None:
+            results.append(UnresolvedLegacyReviewSuccess(source, "successful historical command lacks a round registration"))
+        elif command["executor_identity"] not in lineage.owners:
+            results.append(UnresolvedLegacyReviewSuccess(source, "successful command owner is outside the review lineage"))
+        elif command_id in storage._recorded_marker_ids:
+            link = read_review_submission_round_link(db, source, lineage)
+            baseline = _read_legacy_recorded_review(db, source, lineage, storage._unique_remote_review_ids)
+            if isinstance(link, UnverifiedReviewSubmissionRoundLink):
+                results.append(UnresolvedLegacyReviewSuccess(source, link.reason))
+                continue
+            if isinstance(baseline, UnverifiedLegacyRecordedReview):
+                results.append(UnresolvedLegacyReviewSuccess(source, baseline.reason))
+                continue
+            round_storage = storage.round_storage._sealed_by_id.get(registration.plan.round.round_id)
+            if round_storage is None:
+                results.append(UnresolvedLegacyReviewSuccess(source, "recorded review lacks a sealed round"))
+                continue
+            try:
+                proof = VerifiedLegacyPlainProductiveRound(
+                    storage.round_storage, round_storage, link, baseline,
+                    _effect_receipt_id(command_id, effect["receipt_digest"]),
+                )
+                results.append(ClassifiedLegacyPlainReviewSuccess(source, proof))
+            except (KeyError, TypeError, ValueError) as exc:
+                results.append(UnresolvedLegacyReviewSuccess(source, _printable(str(exc))))
+        else:
+            path = _stale_productivity_path_from_storage(storage, command_id)
+            if isinstance(path, UnverifiedLegacyStaleProductivityReceiptPath):
+                results.append(UnresolvedLegacyReviewSuccess(source, path.reason))
+                continue
+            if generation_index is None:
+                try:
+                    generation_index = _indexed_generation_sources(generation)
+                except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
+                    return BlockedLegacyReviewSuccessClassifications(repository, _printable(str(exc)))
+            matched = _match_stale_productivity_generation_from_sources(
+                db, path, generation, generation_index=generation_index,
+                accepted_cache=accepted_cache, workflow_cache=workflow_cache,
+            )
+            if isinstance(matched, UnmatchedLegacyStaleProductivityGenerationSources):
+                results.append(UnresolvedLegacyReviewSuccess(source, matched.reason))
+                continue
+            results.append(ClassifiedLegacyStaleReviewSuccess(source, matched))
+    try:
+        return CompleteLegacyReviewSuccessClassifications(storage, generation, lineage, tuple(results))
+    except ValueError as exc:
+        return BlockedLegacyReviewSuccessClassifications(repository, _printable(str(exc)))

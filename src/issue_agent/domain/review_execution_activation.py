@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
+from collections.abc import Mapping
+from types import MappingProxyType
 import hashlib
 import json
 
@@ -280,6 +282,15 @@ class LegacyReviewSubmissionSource:
         fields = (*self.command_fields, *(self.receipt_fields or ()))
         return sum(len(value.encode("utf-8", "surrogatepass")) if isinstance(value, str)
                    else 8 if type(value) is int else 0 for _, value in fields)
+
+
+def potentially_successful_review_submission(source: LegacyReviewSubmissionSource) -> bool:
+    """Either durable side claiming success requires an explicit classification."""
+    if not isinstance(source, LegacyReviewSubmissionSource):
+        raise ValueError("successful review classification requires a typed command source")
+    command = dict(source.command_fields)
+    effect = dict(source.receipt_fields) if source.receipt_fields is not None else {}
+    return command["state"] == "succeeded" or effect.get("status") == "succeeded"
 
 
 @dataclass(frozen=True)
@@ -893,6 +904,11 @@ class CompleteLegacyRoundOutcomeStorage:
     rounds: CompleteLegacyReviewRounds
     receipts: CompleteLegacyReviewOutcomeReceipts
     sealed: tuple[VerifiedLegacyRoundOutcomeStorage, ...]
+    _sealed_by_id: Mapping[str, VerifiedLegacyRoundOutcomeStorage] = field(init=False, repr=False, compare=False)
+    _receipt_by_key: Mapping[tuple[str, str], LegacyReviewOutcomeReceiptSource] = field(
+        init=False, repr=False, compare=False,
+    )
+    _receipt_names_by_round: Mapping[str, frozenset[str]] = field(init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.rounds, CompleteLegacyReviewRounds)
@@ -934,6 +950,11 @@ class CompleteLegacyRoundOutcomeStorage:
                     or len(names & productivity_names) > 1
                     or (not productive and bool(names & productivity_names))):
                 raise ValueError("complete outcome storage has contradictory auxiliary receipts")
+        object.__setattr__(self, "_sealed_by_id", MappingProxyType(dict(zip(proof_ids, self.sealed, strict=True))))
+        object.__setattr__(self, "_receipt_by_key", MappingProxyType(receipt_sources))
+        object.__setattr__(self, "_receipt_names_by_round", MappingProxyType(
+            {round_id: frozenset(names) for round_id, names in names_by_round.items()},
+        ))
 
     @property
     def repository(self) -> str:
@@ -1110,7 +1131,8 @@ class VerifiedLegacyRecordedReview:
                 or command["repository"] != key.repository
                 or command["executor_identity"] not in self.lineage.owners
                 or effect is None or effect["status"] != "succeeded"
-                or effect["executor_identity"] not in self.lineage.owners
+                or effect["executor_identity"] != command["executor_identity"]
+                or command["attempt_owner"] != effect["executor_identity"]
                 or effect["remote_object_id"] != self.submission.receipt_id.removeprefix("github-review:")
                 or self.expected_revision.fence != self.recorded_revision.fence
                 or self.expected_revision.version + 1 != self.recorded_revision.version
@@ -1208,14 +1230,12 @@ class VerifiedLegacyPlainProductiveRound:
         round_id = self.storage.outcome.round.round_id
         auxiliary = {"review-round-stale-productivity", "review-round-superseded-productivity",
                      "review-round-ceiling-productivity"}
-        conflicting_receipts = any(
-            dict(receipt.fields)["namespace"] in auxiliary and dict(receipt.fields)["key"] == round_id
-            for receipt in self.complete_storage.receipts.receipts
-        )
+        conflicting_receipts = bool(self.complete_storage._receipt_names_by_round.get(round_id, frozenset())
+                                    & auxiliary)
         confirmed = tuple(item for item in self.storage.facts.submissions
                           if isinstance(item.result, ReviewSubmissionConfirmed))
         disposition = self.storage.outcome.disposition
-        if (self.storage not in self.complete_storage.sealed or conflicting_receipts
+        if (self.complete_storage._sealed_by_id.get(round_id) != self.storage or conflicting_receipts
                 or len(confirmed) != 1 or not isinstance(disposition, (PaidReviewProgress, CopiedReviewProgress))
                 or self.storage.outcome.round != self.link.round
                 or self.link.source != self.baseline.source or self.link.lineage != self.baseline.lineage

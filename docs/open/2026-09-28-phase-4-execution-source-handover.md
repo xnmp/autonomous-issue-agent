@@ -136,6 +136,14 @@ with `CLAUDE.md`, `AGENTS.md`, the
   namespace/key reads that include TEXT and BLOB aliases. The matched value
   remains an observation and needs this SQL recheck at authority use. It
   neither classifies all successful commands nor proves ordered resets.
+- Checkpoint 53 revalidates complete settlement, generation and owner-lineage
+  sources in one SQL snapshot, then classifies every submission with either a
+  successful command state or effect status. Exact plain and typed stale
+  proofs are retained; contradictory, unregistered, escalated and old
+  two-field stale cases remain explicitly unresolved. The complete result
+  validates candidate coverage, but is observational and cannot reset or
+  activate an execution. Immutable indexes and snapshot-local caches keep
+  repeated classifications bounded by their relevant sources.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -275,7 +283,19 @@ full gate log is `/tmp/phase4-stale-crossing-join-gate.log` (ephemeral):
 gate parity, four import contracts and both Pyrefly checks. Ten strict xfails
 remained expected.
 
-These are offline source readers and a classifier. None creates an execution
+Independent Sol review of checkpoint 53 found a crossed-owner plain proof
+gap and repeated full-set work. The owner equality requirement, immutable
+source indexes and transaction-local caches address both; the final review
+found no remaining medium or high issue. Tests cover a crossed owner, a
+shared remote review ID, partial or changed source sets, contradictory
+success claims, unregistered historical commands, escalated verdicts, old
+stale receipts and multiple typed stale paths. Full gate evidence follows.
+The log is `/tmp/phase4-success-classification-gate.log` (ephemeral):
+3,200 domain, 3,056 adapter and 2,866 app tests passed, plus hooks,
+governor, gate parity, four import contracts and both Pyrefly checks. Ten
+strict xfails remained expected.
+
+These are offline source readers and classifiers. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
 activation, live migration, target mutation, service restart, paid run or push
@@ -283,11 +303,12 @@ occurred.
 
 ## Next required boundary
 
-The next proof must classify each successful command against its bound
-effect, recorded baseline, sealed outcome and productivity path, then replay
-ordered outcomes for each execution episode. Raw recorded markers and completed
-agent runs are observations, not reset authority. Keep unregistered historical
-commands explicit until their legacy provenance is resolved.
+The next proof must replay ordered outcomes for each execution episode, with
+escalated verdict hold provenance and unresolved historical submissions kept
+explicit. Every potentially successful submission now has an observational
+classification against its bound effect, recorded baseline, sealed outcome
+and productivity path. Raw recorded markers and completed agent runs are
+observations, not reset authority.
 
 Legacy stale receipts store only `(facts, outcome)` and the writer's claim
 time; they remain unknown for historical crossing. New typed receipts capture
@@ -304,11 +325,10 @@ order a durable clock.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Extend the single plain productive round proof across the complete
-   accounting set to establish ordered resets. Verify escalated verdict hold
-   provenance and classify unrecorded or stale successful commands separately,
-   including the historical generation crossing behind a stale receipt.
-   A completed
+2. Replay the complete successful-submission classifications and sealed
+   outcomes in execution order to establish resets. Verify escalated verdict
+   hold provenance and resolve or block historical unregistered and old stale
+   submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
 3. Join positive issue-keyed file counters to PRs with fresh complete

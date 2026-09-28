@@ -10,7 +10,7 @@ from issue_agent.domain.review_execution_activation import (
     LegacyExecutionRunRecord, LegacyReviewRunNoDeath, LegacyReviewRunState, UnattributedLegacyReviewDeath,
     UnreadableLegacyExecutionRun, classify_legacy_review_death, LEGACY_SUBMISSION_COMMAND_COLUMNS,
     LEGACY_SUBMISSION_RECEIPT_COLUMNS, LegacyReviewSubmissionPage, LegacyReviewSubmissionSource,
-    UnreadableLegacyReviewSubmission,
+    UnreadableLegacyReviewSubmission, potentially_successful_review_submission,
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LegacyReviewSubmissionReceiptPage,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
     LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
@@ -151,6 +151,31 @@ def submission_source(**changes):
     receipt = dict.fromkeys(LEGACY_SUBMISSION_RECEIPT_COLUMNS, "value")
     receipt.update(command_id="command-7", remote_revision=None, error=None)
     return LegacyReviewSubmissionSource(7, tuple(command.items()), tuple(receipt.items()))
+
+
+def test_success_claim_candidate_includes_either_durable_side():
+    source = submission_source(state="succeeded")
+    failed_effect = replace(source, receipt_fields=tuple(
+        (name, "retryable_failure" if name == "status" else value)
+        for name, value in source.receipt_fields
+    ))
+    assert potentially_successful_review_submission(failed_effect)
+    effect_only = replace(source, command_fields=tuple(
+        (name, "pending" if name == "state" else value)
+        for name, value in source.command_fields
+    ), receipt_fields=tuple(
+        (name, "succeeded" if name == "status" else value)
+        for name, value in source.receipt_fields
+    ))
+    assert potentially_successful_review_submission(effect_only)
+    neither = replace(effect_only, receipt_fields=tuple(
+        (name, "retryable_failure" if name == "status" else value)
+        for name, value in effect_only.receipt_fields
+    ))
+    assert not potentially_successful_review_submission(neither)
+    assert potentially_successful_review_submission(replace(source, receipt_fields=None))
+    with pytest.raises(ValueError, match="typed"):
+        potentially_successful_review_submission(None)
 
 
 def test_submission_source_digest_covers_command_and_receipt_without_sql_cursor():

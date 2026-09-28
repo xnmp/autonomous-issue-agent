@@ -1320,3 +1320,32 @@ Full `make test` passed: 3,199 domain, 3,045 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-stale-crossing-join-gate.log` (ephemeral).
+
+## Checkpoint 53 — complete successful submission classification (offline)
+
+A read-only classifier revalidates complete submission settlement, generation
+receipt and owner-lineage sources in one SQL transaction. It accounts for every
+submission whose command or effect claims success. Each receives an exact plain
+productive-round proof, a typed stale productivity and complete generation
+crossing proof, or an explicit unresolved result. An unregistered historical
+command, missing or contradictory effect, escalated verdict without hold
+provenance, and old two-field stale receipt remain unresolved. The complete
+result verifies exact candidate coverage and source membership; it is an
+observation and grants no activation or reset authority.
+
+The plain proof now requires the command executor, attempt owner and effect
+executor to agree. A crossed-owner SQL regression rebuilds otherwise valid
+receipt and outcome evidence and confirms it remains unresolved. A shared
+remote review ID also remains unresolved. Immutable indexes over already
+validated complete sets and transaction-local generation caches avoid repeated
+whole-set scans when many successful commands are classified.
+
+Independent Sol review found the crossed-owner gap and repeated full-set
+work; both were fixed and covered by regressions. Its final review found no
+remaining medium or high issue, including in the complete-inventory review-ID
+lookup. Ordered outcome replay, escalated hold provenance and unresolved
+historical submissions still block activation.
+Full `make test` passed: 3,200 domain, 3,056 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-success-classification-gate.log` (ephemeral).

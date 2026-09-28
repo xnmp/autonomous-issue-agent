@@ -33,6 +33,9 @@ from issue_agent.adapters.review_execution_activation import (
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     match_legacy_stale_productivity_generation_sources,
     MatchedLegacyStaleProductivityGenerationSources, UnmatchedLegacyStaleProductivityGenerationSources,
+    classify_complete_legacy_review_successes,
+    CompleteLegacyReviewSuccessClassifications, BlockedLegacyReviewSuccessClassifications,
+    ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyStaleReviewSuccess, UnresolvedLegacyReviewSuccess,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -1223,6 +1226,258 @@ def _stale_generation_sources(db):
     assert isinstance(storage, CompleteLegacySubmissionSettlementStorage)
     assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
     return storage, generation
+
+
+def _classification_observations(db):
+    storage, generation = _stale_generation_sources(db)
+    lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
+    assert isinstance(lineage, LegacyReviewOwnerLineage)
+    return storage, generation, lineage
+
+
+def test_complete_success_classification_proves_plain_round_and_keeps_historical_unknown(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        _submission(db, 42)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _classification_observations(db)
+        before = db.total_changes
+        classified = classify_complete_legacy_review_successes(db, *observations)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    assert len(classified.results) == 2
+    plain = next(result for result in classified.results if isinstance(result, ClassifiedLegacyPlainReviewSuccess))
+    unknown = classified.unresolved[0]
+    assert plain.proof.storage.outcome.round == plan.round
+    assert plain.source == plain.proof.link.source
+    assert isinstance(unknown, UnresolvedLegacyReviewSuccess)
+    assert dict(unknown.source.command_fields)["command_id"] == "cmd-42"
+    assert "lacks a round registration" in unknown.reason
+    with pytest.raises(ValueError, match="unaccounted"):
+        replace(classified, results=(plain,))
+
+
+def test_complete_success_classification_proves_stale_path_and_keeps_escalated_unknown(rig):
+    store, plan, command, _ = _stale_settlement(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _classification_observations(db)
+        classified = classify_complete_legacy_review_successes(db, *observations)
+        db.rollback()
+
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    stale = next(result for result in classified.results if isinstance(result, ClassifiedLegacyStaleReviewSuccess))
+    assert stale.proof.settlement.outcome.round == plan.round
+    assert stale.source == stale.proof.stale_path.registered.command_source
+    assert any("stale settlement receipt is absent" in result.reason for result in classified.unresolved)
+    assert len(classified.results) == 2
+
+
+def test_complete_success_classification_accounts_many_stale_review_commands(rig):
+    store, snapshot, gateway, selection, control = rig
+    old_plans = []
+    for index in range(12):
+        planned_selection = replace(
+            selection, request_id=f"preflight:many-stale:{index}", expected=current(store, selection).revision,
+        )
+        old_plans.append(control.preflight(planned_selection))
+    later_selection = replace(
+        selection, request_id="preflight:many-stale:ceiling", expected=current(store, selection).revision,
+    )
+    _, _, _, _, _, escalation = confirmed_escalation(
+        (store, snapshot, gateway, later_selection, control), cause="ceiling",
+    )
+    old_commands = []
+    for index, plan in enumerate(old_plans):
+        command = command_for(current(store, selection), body=f"approved historical {index}")
+        control.register_submission(plan.round.round_id, current(store, selection).revision,
+                                    command, ReviewSubmissionKind.COPIED)
+        control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+        store.begin_command(command.command_id)
+        store.record_effect(EffectReceipt(
+            command.command_id, CONTROL_OWNER, store.now(), store.now(),
+            EffectStatus.SUCCEEDED, remote_object_id=f"review:historical:{index}",
+        ))
+        old_commands.append(command)
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", CONTROL_OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(escalation.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    assert isinstance(workflow.request_rearm(
+        RequestRearm("rearm:many-stale", before.revision, before.gates[0].gate_id,
+                     KeepGuidance(), expected_binding=before.binding),
+        OperatorActor("operator", "test"),
+    ), WorkflowCommitted)
+    for command in old_commands:
+        assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        db.rollback()
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    stale = [result for result in classified.results if isinstance(result, ClassifiedLegacyStaleReviewSuccess)]
+    assert {dict(result.source.command_fields)["command_id"] for result in stale} == {
+        str(command.command_id) for command in old_commands
+    }
+    assert len(classified.unresolved) == 1
+
+
+def test_complete_success_classification_keeps_legacy_stale_receipt_unknown(rig):
+    store, plan, command, _ = _stale_settlement(rig)
+    with store.transaction() as db:
+        row = db.execute("SELECT payload_json FROM dedupe_keys "
+                         "WHERE namespace='review-round-stale-productivity' AND key=?",
+                         (plan.round.round_id,)).fetchone()
+        recorded = decode_workflow(row["payload_json"], StaleReviewProductivitySettlement)
+        db.execute("UPDATE dedupe_keys SET payload_json=? "
+                   "WHERE namespace='review-round-stale-productivity' AND key=?",
+                   (encode_workflow((recorded.facts, recorded.outcome)), plan.round.round_id))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        db.rollback()
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    older = next(result for result in classified.unresolved
+                 if dict(result.source.command_fields)["command_id"] == str(command.command_id))
+    assert "legacy stale receipt" in older.reason
+
+
+@pytest.mark.parametrize("damage", ["missing_effect", "effect_disagrees", "command_disagrees"])
+def test_complete_success_classification_keeps_mismatched_success_claim_unresolved(rig, damage):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        if damage == "missing_effect":
+            db.execute("DELETE FROM effect_receipts WHERE command_id=?", (str(command.command_id),))
+        elif damage == "effect_disagrees":
+            db.execute("UPDATE effect_receipts SET status='retryable_failure' WHERE command_id=?",
+                       (str(command.command_id),))
+        else:
+            db.execute("UPDATE lifecycle_commands SET state='pending' WHERE command_id=?",
+                       (str(command.command_id),))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        db.rollback()
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    assert len(classified.unresolved) == 1
+    assert "do not both confirm success" in classified.unresolved[0].reason
+
+
+def test_complete_success_classification_blocks_changed_complete_source(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _classification_observations(db)
+        db.rollback()
+    with store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00+00:00' "
+                   "WHERE namespace='review-recorded-submission' AND key=?",
+                   (str(command.command_id),))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *observations)
+        db.rollback()
+    assert isinstance(classified, BlockedLegacyReviewSuccessClassifications)
+
+
+def test_complete_success_classification_rechecks_owner_lineage(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _classification_observations(db)
+        db.rollback()
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO retired_owners(owner_id,successor_owner_id,repository,role,retired_at) "
+            "VALUES (?,?,?,?,?)",
+            ("o/r:review:older", CONTROL_OWNER, "o/r", "review", "2026-09-28T00:00:00+00:00"),
+        )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *observations)
+        db.rollback()
+    assert isinstance(classified, BlockedLegacyReviewSuccessClassifications)
+    assert "lineage changed" in classified.reason
+
+
+def test_complete_success_classification_rejects_crossed_command_and_effect_owners(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    retired_owner = "o/r:review:retired"
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO retired_owners(owner_id,successor_owner_id,repository,role,retired_at) "
+            "VALUES (?,?,?,?,?)",
+            (retired_owner, CONTROL_OWNER, "o/r", "review", "2026-09-28T00:00:00+00:00"),
+        )
+        original = db.execute("SELECT * FROM effect_receipts WHERE command_id=?",
+                              (str(command.command_id),)).fetchone()
+        changed_receipt = EffectReceipt(
+            command.command_id, retired_owner,
+            review_activation._parse_stamp(original["started_at"]),
+            review_activation._parse_stamp(original["completed_at"]),
+            EffectStatus.SUCCEEDED, original["remote_object_id"],
+            original["remote_revision"], original["error"],
+        )
+        changed_digest = review_activation._receipt_digest(changed_receipt)
+        changed_id = review_activation._effect_receipt_id(str(command.command_id), changed_digest)
+        db.execute("UPDATE effect_receipts SET executor_identity=?,receipt_digest=? WHERE command_id=?",
+                   (retired_owner, changed_digest, str(command.command_id)))
+        db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?",
+                   (retired_owner, str(command.command_id)))
+        row = db.execute("SELECT closure_json FROM review_execution_rounds WHERE round_id=?",
+                         (plan.round.round_id,)).fetchone()
+        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
+        changed_facts = replace(facts, submissions=tuple(
+            replace(item, result=review_activation.ReviewSubmissionConfirmed(changed_id))
+            if item.plan.command_id == command.command_id else item
+            for item in facts.submissions
+        ))
+        outcome = review_activation.finalize_review_round(changed_facts).outcome
+        db.execute("UPDATE review_execution_rounds SET closure_json=?,outcome_json=? WHERE round_id=?",
+                   (encode_workflow(changed_facts), encode_workflow(outcome), plan.round.round_id))
+        db.execute("UPDATE dedupe_keys SET payload_json=? "
+                   "WHERE namespace='review-round-outcome' AND key=?",
+                   (encode_workflow((changed_facts, outcome)), plan.round.round_id))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        db.rollback()
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    assert len(classified.unresolved) == 1
+    assert "plain recorded baseline" in classified.unresolved[0].reason
+
+
+def test_complete_success_classification_rejects_shared_remote_review_identity(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        remote_id = db.execute("SELECT remote_object_id FROM effect_receipts WHERE command_id=?",
+                               (str(command.command_id),)).fetchone()["remote_object_id"]
+        _submission(db, 42)
+        db.execute("UPDATE effect_receipts SET remote_object_id=? WHERE command_id='cmd-42'", (remote_id,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        db.rollback()
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    assert not any(isinstance(result, ClassifiedLegacyPlainReviewSuccess) for result in classified.results)
+    assert any("shared by another command" in result.reason for result in classified.unresolved)
 
 
 def test_stale_generation_join_proves_real_accepted_crossing_without_writes(rig):
