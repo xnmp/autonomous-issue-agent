@@ -10,6 +10,7 @@ from issue_agent.domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from issue_agent.domain.review_execution import (
     MAX_EXECUTION_SUFFIX, MAX_ROUND_CHILDREN, ActivatedReviewExecution, AddReviewStrike, ClearReviewSession,
     CopiedReviewProgress, ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
+    InitializedReviewExecutionOriginReceipt, initialized_review_execution,
     ImportedReviewSession, LaunchedReviewChild, NoReviewSession,
     PaidReviewProgress, PreserveDisplayedRound, PreserveReviewSession, ReplaceReviewSession,
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
@@ -65,6 +66,23 @@ def binding(generation=0):
     parent = WorkflowBinding(WorkflowFence(WorkflowKey("o/r", PullRequestRef(9)), generation),
                              FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1), "rejections:1")
     return ReviewExecutionBinding(parent, 2, "execution:1")
+
+
+def test_initialized_origin_derives_fresh_state_and_requires_typed_activation_source():
+    parent = binding().rejection
+    activated_at = datetime(2026, 9, 28, tzinfo=timezone.utc)
+    execution, receipt = initialized_review_execution(
+        parent, 3, "pr-observation:one", "a" * 64, "b" * 64, "c" * 64, activated_at,
+    )
+    assert isinstance(receipt, InitializedReviewExecutionOriginReceipt)
+    assert receipt.checkpoint == execution.checkpoint
+    assert execution.state == ReviewExecutionState(execution.binding)
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(receipt, source_digest="invalid")
+    with pytest.raises(ValueError, match="aware activation time"):
+        replace(receipt, activated_at=activated_at.replace(tzinfo=None))
+    with pytest.raises(ValueError, match="fresh sequence-zero"):
+        replace(receipt, checkpoint=replace(receipt.checkpoint, state=replace(execution.state, failures=1)))
 
 
 def round_id(sequence, *, captured=None):

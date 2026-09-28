@@ -622,6 +622,65 @@ class ImportedReviewExecutionOriginReceipt:
 
 
 @dataclass(frozen=True)
+class InitializedReviewExecutionOriginReceipt:
+    """A fresh episode bound to the first harness observation of its PR."""
+
+    origin: ReviewExecutionOrigin
+    checkpoint: ReviewExecutionCheckpoint
+    observation_evidence_id: str
+    activation_plan_digest: str
+    source_digest: str
+    inventory_digest: str
+    activated_at: datetime
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionOrigin)
+                or self.origin.kind is not ReviewExecutionOriginKind.INITIALIZED
+                or not isinstance(self.checkpoint, ReviewExecutionCheckpoint)
+                or self.checkpoint.through_sequence != 0
+                or self.checkpoint.boundary_cursor is not None
+                or self.checkpoint.state != ReviewExecutionState(self.checkpoint.state.binding)):
+            raise ValueError("initialized execution origin requires a fresh sequence-zero checkpoint")
+        identifier(self.observation_evidence_id, "initialized execution observation")
+        for name in ("activation_plan_digest", "source_digest", "inventory_digest"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"initialized execution origin {name} requires a SHA-256 digest")
+        if (not isinstance(self.activated_at, datetime) or self.activated_at.tzinfo is None
+                or self.activated_at.utcoffset() is None):
+            raise ValueError("initialized execution origin requires an aware activation time")
+
+
+def initialized_review_execution(
+    rejection: WorkflowBinding, execution_epoch: int, observation_evidence_id: str,
+    activation_plan_digest: str, source_digest: str, inventory_digest: str,
+    activated_at: datetime,
+) -> tuple[ActivatedReviewExecution, InitializedReviewExecutionOriginReceipt]:
+    """Derive the one fresh episode for a first observed PR and authority pair."""
+    integer(execution_epoch, "execution epoch", minimum=1)
+    identifier(observation_evidence_id, "initialized execution observation")
+    if (not isinstance(rejection, WorkflowBinding)
+            or rejection.authority.family is not WorkflowFamily.REVIEW_REJECTIONS
+            or not isinstance(rejection.fence.key.target, PullRequestRef)):
+        raise ValueError("initialized execution requires a review rejection binding")
+    parts = (rejection.fence.key.repository, str(rejection.fence.key.target.number),
+             str(rejection.authority.epoch), rejection.episode_id, str(execution_epoch))
+    episode = "review-execution-initial:" + hashlib.sha256("\0".join(parts).encode()).hexdigest()
+    origin_id = "review-execution-origin:" + hashlib.sha256(
+        (episode + "\0" + observation_evidence_id).encode(),
+    ).hexdigest()
+    binding = ReviewExecutionBinding(rejection, execution_epoch, episode)
+    state = ReviewExecutionState(binding)
+    checkpoint = ReviewExecutionCheckpoint(0, state)
+    origin = ReviewExecutionOrigin(ReviewExecutionOriginKind.INITIALIZED, origin_id)
+    receipt = InitializedReviewExecutionOriginReceipt(
+        origin, checkpoint, observation_evidence_id,
+        activation_plan_digest, source_digest, inventory_digest, activated_at,
+    )
+    return ActivatedReviewExecution(origin, checkpoint, state, 0), receipt
+
+
+@dataclass(frozen=True)
 class ImportedReviewExecutionDecision:
     """The activation plan's selected imported execution starting state."""
 

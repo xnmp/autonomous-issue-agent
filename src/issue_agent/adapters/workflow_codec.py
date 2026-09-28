@@ -94,6 +94,7 @@ _VALUES = (
     rx.ReviewExecutionState, rx.ReviewExecutionBoundaryCursor, rx.ReviewExecutionCheckpoint,
     rx.ReviewExecutionGenerationBoundary,
     rx.ReviewExecutionOrigin, rx.ImportedReviewExecutionOriginReceipt,
+    rx.InitializedReviewExecutionOriginReceipt,
     rx.ImportedReviewExecutionDecision,
     rx.ExecutionNotActivated, rx.ActivatedReviewExecution,
     rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,

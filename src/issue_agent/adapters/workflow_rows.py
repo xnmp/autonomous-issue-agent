@@ -11,13 +11,14 @@ from typing import TypeVar
 
 from ..domain.resolve_workspace import EpisodeWorkspaceHandoff, EpisodeWorkspacePrepared
 from ..domain.review_workflow import (
-    AnyWorkflowSnapshot, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, PullRequestState,
+    AnyWorkflowSnapshot, CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, PendingReviewRearm, PullRequestState,
     RecordedPullRequest, ReviewEpisode,
     ReviewFamilyEpisodes, ReviewRearmIntent, ReviewWorkflowSnapshot, SupersededReviewRearm,
 )
 from ..domain.review_execution import (
     MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
     ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
+    InitializedReviewExecutionOriginReceipt, initialized_review_execution,
     ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary,
     ReviewExecutionOriginKind, ReviewRoundOutcome,
     replay_review_execution_generations, review_generation_chain_digest, same_execution_episode,
@@ -32,7 +33,7 @@ from ..domain.review_rounds import (
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.review_workflow_policy import (
-    OBSERVATION_MAX_AGE_SECONDS, CeilingProductivityDecision, open_review_ceiling,
+    OBSERVATION_MAX_AGE_SECONDS, CeilingProductivityDecision, initial_review_workflow, open_review_ceiling,
 )
 from ..domain.workflow import (
     AuthorizedOperatorCommand, CancelledRearm, CompletedRearm, ContinueGrantedRearm, OpenGate,
@@ -42,7 +43,7 @@ from ..domain.workflow import (
     WorkflowMutation, WorkflowRejected, WorkflowSnapshot, WorkflowUnchanged,
 )
 from ..domain.workflow_identity import (
-    FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence,
+    FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence,
     WorkflowKey, WorkflowRevision, target_family,
 )
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
@@ -513,6 +514,23 @@ def insert_imported_review_execution_origin(
     )
 
 
+def insert_initialized_review_execution_origin(
+    db: sqlite3.Connection, repository: str, receipt: InitializedReviewExecutionOriginReceipt,
+    *, claimed_at: datetime,
+) -> None:
+    """Publish first-observation ancestry with the newly created component."""
+    if (not isinstance(receipt, InitializedReviewExecutionOriginReceipt)
+            or receipt.checkpoint.state.binding.rejection.fence.key.repository != repository
+            or not isinstance(claimed_at, datetime) or claimed_at.tzinfo is None
+            or claimed_at.utcoffset() is None):
+        raise ValueError("initialized origin requires matching typed observation evidence")
+    db.execute(
+        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+        (REVIEW_EXECUTION_ORIGIN_NAMESPACE, repository, receipt.origin.evidence_id,
+         claimed_at.isoformat(), encode_workflow(receipt)),
+    )
+
+
 def _unique_text_identity_rowid(
     db: sqlite3.Connection, table: str, text_fields: tuple[tuple[str, str], ...],
     integer_fields: tuple[tuple[str, int], ...] = (),
@@ -533,11 +551,9 @@ def _unique_text_identity_rowid(
     return rows[0]["rowid"]
 
 
-def _check_imported_execution_origin(
+def _read_execution_origin(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
-) -> None:
-    if execution.origin.kind is not ReviewExecutionOriginKind.IMPORTED:
-        raise WorkflowAuthorityError("review execution origin requires a supported durable cause")
+) -> tuple[ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt, datetime]:
     origin_id = execution.origin.evidence_id
     origin_rowid = _unique_text_identity_rowid(
         db, "dedupe_keys", (("namespace", REVIEW_EXECUTION_ORIGIN_NAMESPACE),
@@ -566,7 +582,13 @@ def _check_imported_execution_origin(
         claimed = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
         if claimed.tzinfo is None or claimed.utcoffset() is None:
             raise ValueError("origin claim has no timezone")
-        captured = decode_workflow(row["payload_json"], ImportedReviewExecutionOriginReceipt)
+        receipt_type = (ImportedReviewExecutionOriginReceipt
+                        if execution.origin.kind is ReviewExecutionOriginKind.IMPORTED
+                        else InitializedReviewExecutionOriginReceipt
+                        if execution.origin.kind is ReviewExecutionOriginKind.INITIALIZED else None)
+        if receipt_type is None:
+            raise ValueError("unsupported execution origin cause")
+        captured = decode_workflow(row["payload_json"], receipt_type)
         if encode_workflow(captured) != row["payload_json"]:
             raise ValueError("origin receipt is not canonical")
     except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
@@ -580,6 +602,105 @@ def _check_imported_execution_origin(
                 and execution.checkpoint.boundary_cursor is None
                 and execution.checkpoint != captured.checkpoint)):
         raise WorkflowAuthorityError("review execution origin disagrees with its component")
+    return captured, claimed
+
+
+def _check_initialized_execution_origin(
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+    captured: InitializedReviewExecutionOriginReceipt, claimed: datetime,
+) -> None:
+    key = WorkflowKey(scope[0], PullRequestRef(scope[2]))
+    rejection_authority = load_family_authority(db, WorkflowFamily.REVIEW_REJECTIONS, scope[0])
+    if rejection_authority is None:
+        raise WorkflowAuthorityError("initialized execution origin lost rejection authority")
+    initial = initial_review_workflow(key, rejection_authority)
+    expected, receipt = initialized_review_execution(
+        initial.binding, execution.binding.execution_epoch, captured.observation_evidence_id,
+        captured.activation_plan_digest, captured.source_digest, captured.inventory_digest,
+        captured.activated_at,
+    )
+    if captured != receipt or not same_execution_episode(expected.binding, execution.binding):
+        raise WorkflowAuthorityError("initialized execution origin disagrees with first observation")
+    family = WorkflowFamily.REVIEW_EXECUTION.value
+    activation_rowid = _unique_text_identity_rowid(
+        db, "workflow_authority_epochs", (("repository", scope[0]), ("family", family)),
+    )
+    evidence_rowid = _unique_text_identity_rowid(
+        db, "workflow_activation_evidence", (("repository", scope[0]), ("family", family)),
+        (("epoch", execution.binding.execution_epoch),),
+    )
+    activation = db.execute(
+        "SELECT epoch,activated_at,source_digest,inventory_digest FROM workflow_authority_epochs "
+        "WHERE rowid=? AND repository=? AND family=? "
+        "AND length(CAST(activated_at AS BLOB))<=64 "
+        "AND length(CAST(source_digest AS BLOB))<=64 "
+        "AND length(CAST(inventory_digest AS BLOB))<=64",
+        (activation_rowid, scope[0], family),
+    ).fetchone()
+    evidence = db.execute(
+        "SELECT plan_digest FROM workflow_activation_evidence "
+        "WHERE rowid=? AND repository=? AND family=? AND epoch=? "
+        "AND length(CAST(plan_digest AS BLOB))<=64",
+        (evidence_rowid, scope[0], family, execution.binding.execution_epoch),
+    ).fetchone()
+    if activation is None or evidence is None:
+        raise WorkflowAuthorityError("initialized execution origin lost activation evidence")
+    try:
+        activated = datetime.fromisoformat(activation["activated_at"].replace("Z", "+00:00"))
+        digests = (activation["source_digest"], activation["inventory_digest"], evidence["plan_digest"])
+        if (activated.tzinfo is None or activated.utcoffset() is None
+                or type(activation["epoch"]) is not int
+                or activation["epoch"] != execution.binding.execution_epoch
+                or digests != (captured.source_digest, captured.inventory_digest,
+                               captured.activation_plan_digest)
+                or activated != captured.activated_at
+                or any(type(value) is not str or len(value) != 64
+                       or any(char not in "0123456789abcdef" for char in value) for value in digests)
+                or activated > claimed):
+            raise ValueError("activation source or time is malformed")
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise WorkflowAuthorityError("initialized execution origin activation is unreadable") from exc
+    import_rows = db.execute(
+        "SELECT rowid FROM workflow_activation_imports WHERE repository IN (?,CAST(? AS BLOB)) "
+        "AND family IN (?,CAST(? AS BLOB)) AND target_kind IN (?,CAST(? AS BLOB)) "
+        "AND target_number IN (?,CAST(? AS BLOB)) LIMIT 1",
+        (scope[0], scope[0], family, family, scope[1], scope[1], scope[2], scope[2]),
+    ).fetchone()
+    if import_rows is not None:
+        raise WorkflowAuthorityError("initialized execution origin conflicts with an import")
+    observation_rowid = _unique_text_identity_rowid(
+        db, "workflow_evidence", (("evidence_id", captured.observation_evidence_id),),
+    )
+    row = db.execute(
+        "SELECT repository,target_kind,target_number,command_id,kind,payload_json,"
+        "typeof(repository) AS repository_type,typeof(target_kind) AS target_kind_type,"
+        "typeof(target_number) AS target_number_type,typeof(payload_json) AS payload_type "
+        "FROM workflow_evidence WHERE rowid=? AND length(CAST(payload_json AS BLOB))<=?",
+        (observation_rowid, MAX_WORKFLOW_PAYLOAD_BYTES),
+    ).fetchone()
+    if (row is None or row["repository_type"] != "text" or row["target_kind_type"] != "text"
+            or row["target_number_type"] != "integer" or row["payload_type"] != "text"
+            or (row["repository"], row["target_kind"], row["target_number"]) != scope
+            or row["kind"] != "observation" or row["command_id"] is not None):
+        raise WorkflowAuthorityError("initialized execution origin observation is absent or malformed")
+    try:
+        recorded = decode_workflow(row["payload_json"], RecordedPullRequest)
+        if (encode_workflow(recorded) != row["payload_json"] or recorded.observation.key != key
+                or not isinstance(recorded.observation.reviews, CompleteReviews)
+                or "pr-observation:" + hashlib.sha256(row["payload_json"].encode()).hexdigest()
+                != captured.observation_evidence_id
+                or recorded.observation.observed_at < activated
+                or not (0 <= (claimed - recorded.observation.observed_at).total_seconds()
+                        <= OBSERVATION_MAX_AGE_SECONDS)):
+            raise ValueError("observation does not prove fresh first discovery")
+    except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
+        raise WorkflowAuthorityError("initialized execution origin observation is unreadable") from exc
+
+
+def _check_imported_execution_origin(
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+    captured: ImportedReviewExecutionOriginReceipt, claimed: datetime,
+) -> None:
     family = WorkflowFamily.REVIEW_EXECUTION.value
     activation_rowid = _unique_text_identity_rowid(
         db, "workflow_authority_epochs", (("repository", scope[0]), ("family", family)),
@@ -644,7 +765,11 @@ def _check_execution_projection(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
     revision: WorkflowRevision,
 ) -> None:
-    _check_imported_execution_origin(db, scope, execution)
+    origin, claimed = _read_execution_origin(db, scope, execution)
+    if isinstance(origin, ImportedReviewExecutionOriginReceipt):
+        _check_imported_execution_origin(db, scope, execution, origin, claimed)
+    else:
+        _check_initialized_execution_origin(db, scope, execution, origin, claimed)
     episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
     count = db.execute(
         "SELECT COUNT(*) AS total FROM review_execution_rounds WHERE repository=? AND target_number=? "

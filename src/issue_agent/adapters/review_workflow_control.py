@@ -41,7 +41,7 @@ from ..domain.review_evidence import (
     EvidenceSchedule, ReviewEvidenceKind, evidence_due, evidence_gate_id, review_evidence_gate_kind,
     unavailable_evidence, unavailable_first_observation,
 )
-from ..domain.review_execution import ActivatedReviewExecution
+from ..domain.review_execution import ActivatedReviewExecution, initialized_review_execution
 from ..domain.review_rounds import (
     FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed,
 )
@@ -99,7 +99,7 @@ from .workflow_rows import (
     WorkflowAuthorityError, active_families, load_family_authority, load_review_workflow_row, load_workflow_read,
     persist_workflow_snapshot, read_review_submission_registration, workflow_run_scope_bounds, workflow_scope,
     REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
-    insert_workflow_component, encode_workflow_episodes,
+    insert_initialized_review_execution_origin, insert_workflow_component, encode_workflow_episodes,
 )
 
 # Deployment barriers are always taken in this order (ADR 0015 acceptance).
@@ -779,13 +779,70 @@ class SQLiteReviewWorkflowControl:
             prior = load_review_workflow_row(db, key)
             if prior is not None:
                 return WorkflowCommitted(prior, idempotent=True)
-            if load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository) is not None:
-                raise WorkflowAuthorityError("activated review execution requires explicit composed initialization")
+            execution_authority = load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository)
             snapshot = initial_review_workflow(key, authority)
+            origin_receipt = None
+            origin_claimed_at = None
+            if execution_authority is not None:
+                origin_claimed_at = self._now()
+                if not isinstance(recorded.observation.reviews, CompleteReviews):
+                    raise WorkflowAuthorityError("execution initialization requires a complete first observation")
+                age = (origin_claimed_at - recorded.observation.observed_at).total_seconds()
+                if age < 0 or age > OBSERVATION_MAX_AGE_SECONDS:
+                    raise WorkflowAuthorityError("execution initialization requires a fresh first observation")
+                activation = db.execute(
+                    "SELECT source_digest,inventory_digest,activated_at FROM workflow_authority_epochs "
+                    "WHERE repository=? AND family=? AND epoch=? "
+                    "AND length(CAST(source_digest AS BLOB))<=64 "
+                    "AND length(CAST(inventory_digest AS BLOB))<=64 "
+                    "AND length(CAST(activated_at AS BLOB))<=64",
+                    (key.repository, WorkflowFamily.REVIEW_EXECUTION.value, execution_authority.epoch),
+                ).fetchone()
+                evidence = db.execute(
+                    "SELECT plan_digest FROM workflow_activation_evidence "
+                    "WHERE repository=? AND family=? AND epoch=? "
+                    "AND length(CAST(plan_digest AS BLOB))<=64",
+                    (key.repository, WorkflowFamily.REVIEW_EXECUTION.value, execution_authority.epoch),
+                ).fetchone()
+                if activation is None or evidence is None:
+                    raise WorkflowAuthorityError("execution initialization requires complete activation evidence")
+                try:
+                    activated_at = datetime.fromisoformat(activation["activated_at"].replace("Z", "+00:00"))
+                    if (activated_at.tzinfo is None or activated_at.utcoffset() is None
+                            or activated_at > origin_claimed_at):
+                        raise ValueError("activation time is not established")
+                except (TypeError, ValueError, AttributeError) as exc:
+                    raise WorkflowAuthorityError("execution initialization activation time is unreadable") from exc
+                if recorded.observation.observed_at < activated_at:
+                    raise WorkflowAuthorityError("execution activated after first observation; retry the read")
+                evidence_id = self._evidence_id(recorded)
+                try:
+                    execution, origin_receipt = initialized_review_execution(
+                        snapshot.binding, execution_authority.epoch, evidence_id,
+                        evidence["plan_digest"], activation["source_digest"], activation["inventory_digest"],
+                        activated_at,
+                    )
+                except (TypeError, ValueError) as exc:
+                    raise WorkflowAuthorityError("execution initialization activation digests are unreadable") from exc
+                snapshot = replace(snapshot, execution=execution)
             db.execute("INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
                        (*workflow_scope(key), encode_workflow_episodes(snapshot)))
             insert_workflow_component(db, key, authority, snapshot.episode.episode_id)
-            self._insert_evidence(db, key, recorded)
+            observed_id = self._insert_evidence(db, key, recorded)
+            if execution_authority is not None:
+                if origin_receipt is None or origin_claimed_at is None:
+                    raise WorkflowAuthorityError("execution initialization lost its origin evidence")
+                if observed_id != origin_receipt.observation_evidence_id:
+                    raise WorkflowAuthorityError("first observation identity changed during initialization")
+                insert_workflow_component(
+                    db, key, execution_authority,
+                    origin_receipt.checkpoint.state.binding.execution_episode,
+                )
+                insert_initialized_review_execution_origin(
+                    db, key.repository, origin_receipt, claimed_at=origin_claimed_at,
+                )
+                if load_review_workflow_row(db, key) != snapshot:
+                    raise WorkflowAuthorityError("initialized execution failed canonical readback")
             self._control._transition(db, "workflow", encode_workflow(key), "discovered",
                                       {"generation": 0, "version": 0, "epoch": authority.epoch})
             return WorkflowCommitted(snapshot)

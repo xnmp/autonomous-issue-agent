@@ -9,6 +9,7 @@ review executor after acceptance has released the deployment barriers.
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from datetime import timedelta
+import hashlib
 import json
 
 import pytest
@@ -254,6 +255,148 @@ def test_an_unreadable_pull_request_is_never_initialized(rig):
     result = rig.control().ensure_observed_workflow(PR_KEY)
     assert result.__class__.__name__ == "PullRequestUnavailable"
     assert rig.control().load_workflow(PR_KEY) == WorkflowAbsent(PR_KEY)
+
+
+def _activate_execution_family(rig):
+    source = hashlib.sha256(b"execution source").hexdigest()
+    inventory = hashlib.sha256(b"execution inventory").hexdigest()
+    plan = hashlib.sha256(b"execution plan").hexdigest()
+    with rig.store.transaction() as db:
+        db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
+                   ("o/r", WorkflowFamily.REVIEW_EXECUTION.value, 3, source, inventory, rig.clock[0].isoformat()))
+        db.execute("INSERT INTO workflow_activation_evidence VALUES (?,?,?,?,?)",
+                   ("o/r", WorkflowFamily.REVIEW_EXECUTION.value, 3, 0, plan))
+
+
+def test_first_observation_after_execution_activation_mints_durable_origin(rig):
+    from issue_agent.domain.review_execution import ActivatedReviewExecution, ReviewExecutionOriginKind
+
+    rig.activate()
+    _activate_execution_family(rig)
+    first = rig.control().ensure_observed_workflow(PR_KEY)
+    assert isinstance(first, WorkflowCommitted)
+    assert isinstance(first.snapshot.execution, ActivatedReviewExecution)
+    assert first.snapshot.execution.origin.kind is ReviewExecutionOriginKind.INITIALIZED
+    assert first.snapshot.execution.last_sequence == 0
+    assert first.snapshot.execution.state.failures == 0
+    assert rig.restart().load_workflow(PR_KEY) == first.snapshot
+    assert rig.control().ensure_observed_workflow(PR_KEY) == WorkflowCommitted(first.snapshot, idempotent=True)
+    assert rig.query("SELECT COUNT(*) FROM workflow_components WHERE family='review_execution'")[0][0] == 1
+    assert rig.query("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-execution-origin'")[0][0] == 1
+    assert rig.query("SELECT COUNT(*) FROM workflow_activation_imports WHERE family='review_execution'")[0][0] == 0
+
+
+def test_initialized_origin_uses_one_claim_time_at_freshness_boundary(rig):
+    rig.activate()
+    _activate_execution_family(rig)
+    control = rig.control()
+    observed_then_claimed = iter((NOW, NOW + timedelta(seconds=300)))
+    control._now = lambda: next(observed_then_claimed, NOW + timedelta(seconds=301))
+    first = control.ensure_observed_workflow(PR_KEY)
+    assert isinstance(first, WorkflowCommitted)
+    assert rig.restart().load_workflow(PR_KEY) == first.snapshot
+    with rig.store.transaction() as db:
+        db.execute("UPDATE workflow_authority_epochs SET activated_at=? WHERE family='review_execution'",
+                   ((NOW + timedelta(seconds=1)).isoformat(),))
+    with pytest.raises(WorkflowAuthorityError):
+        rig.restart().load_workflow(PR_KEY)
+
+
+def test_first_observation_retries_when_execution_activates_during_remote_read(rig):
+    rig.activate()
+    control = rig.control()
+    read = control._observe
+
+    def activate_after_read(key):
+        recorded = read(key)
+        rig.advance(1)
+        _activate_execution_family(rig)
+        return recorded
+
+    control._observe = activate_after_read
+    with pytest.raises(WorkflowAuthorityError, match="retry the read"):
+        control.ensure_observed_workflow(PR_KEY)
+    assert rig.query("SELECT COUNT(*) FROM workflows")[0][0] == 0
+    retried = rig.restart().ensure_observed_workflow(PR_KEY)
+    assert isinstance(retried, WorkflowCommitted)
+    assert rig.restart().load_workflow(PR_KEY) == retried.snapshot
+
+
+def test_execution_initialization_refuses_oversized_activation_source_before_writing(rig):
+    rig.activate()
+    _activate_execution_family(rig)
+    with rig.store.transaction() as db:
+        db.execute("UPDATE workflow_authority_epochs SET source_digest=? WHERE family='review_execution'",
+                   ("x" * 262145,))
+    with pytest.raises(WorkflowAuthorityError, match="activation evidence"):
+        rig.control().ensure_observed_workflow(PR_KEY)
+    assert rig.query("SELECT COUNT(*) FROM workflows")[0][0] == 0
+
+
+def test_execution_initialization_rolls_back_if_activation_is_aliased(rig):
+    rig.activate()
+    _activate_execution_family(rig)
+    with rig.store.transaction() as db:
+        db.execute("INSERT INTO workflow_authority_epochs "
+                   "SELECT CAST(repository AS BLOB),family,epoch,source_digest,inventory_digest,activated_at "
+                   "FROM workflow_authority_epochs WHERE family='review_execution'")
+    with pytest.raises(WorkflowAuthorityError, match="aliased"):
+        rig.control().ensure_observed_workflow(PR_KEY)
+    assert rig.query("SELECT COUNT(*) FROM workflows")[0][0] == 0
+    assert rig.query("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-execution-origin'")[0][0] == 0
+
+
+@pytest.mark.parametrize("corruption", (
+    "missing_origin", "changed_origin", "aliased_origin", "missing_observation",
+    "changed_observation", "aliased_observation", "missing_plan", "changed_plan",
+    "changed_source", "changed_inventory", "oversized_source", "changed_epoch",
+    "changed_early_activation", "import_conflict",
+))
+def test_initialized_execution_read_refuses_broken_ancestry(rig, corruption):
+    rig.activate()
+    _activate_execution_family(rig)
+    assert isinstance(rig.control().ensure_observed_workflow(PR_KEY), WorkflowCommitted)
+    with rig.store.transaction() as db:
+        if corruption == "missing_origin":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-origin'")
+        elif corruption == "changed_origin":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='review-execution-origin'")
+        elif corruption == "aliased_origin":
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       "SELECT CAST(namespace AS BLOB),scope,key,claimed_at,payload_json FROM dedupe_keys "
+                       "WHERE namespace='review-execution-origin'")
+        elif corruption == "missing_observation":
+            db.execute("DELETE FROM workflow_evidence WHERE kind='observation'")
+        elif corruption == "changed_observation":
+            db.execute("UPDATE workflow_evidence SET payload_json='{}' WHERE kind='observation'")
+        elif corruption == "aliased_observation":
+            db.execute("INSERT INTO workflow_evidence "
+                       "SELECT CAST(evidence_id AS BLOB),repository,target_kind,target_number,command_id,kind,payload_json "
+                       "FROM workflow_evidence WHERE kind='observation'")
+        elif corruption == "missing_plan":
+            db.execute("DELETE FROM workflow_activation_evidence WHERE family='review_execution'")
+        elif corruption == "changed_plan":
+            db.execute("UPDATE workflow_activation_evidence SET plan_digest=? WHERE family='review_execution'",
+                       ("f" * 64,))
+        elif corruption == "changed_source":
+            db.execute("UPDATE workflow_authority_epochs SET source_digest=? WHERE family='review_execution'",
+                       ("f" * 64,))
+        elif corruption == "changed_inventory":
+            db.execute("UPDATE workflow_authority_epochs SET inventory_digest=? WHERE family='review_execution'",
+                       ("f" * 64,))
+        elif corruption == "oversized_source":
+            db.execute("UPDATE workflow_authority_epochs SET source_digest=? WHERE family='review_execution'",
+                       ("x" * 262145,))
+        elif corruption == "changed_epoch":
+            db.execute("UPDATE workflow_authority_epochs SET epoch=4 WHERE family='review_execution'")
+        elif corruption == "changed_early_activation":
+            db.execute("UPDATE workflow_authority_epochs SET activated_at=? WHERE family='review_execution'",
+                       ((NOW - timedelta(seconds=1)).isoformat(),))
+        else:
+            db.execute("INSERT INTO workflow_activation_imports VALUES (?,?,?,?,?,?,?)",
+                       ("o/r", "review_execution", 3, "pr", PR, "source", "{}"))
+    with pytest.raises(WorkflowAuthorityError):
+        rig.restart().load_workflow(PR_KEY)
 
 
 @pytest.mark.parametrize("writer", [

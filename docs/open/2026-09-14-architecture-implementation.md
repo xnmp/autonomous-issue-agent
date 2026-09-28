@@ -12,7 +12,10 @@ phase 4 under the [review execution design](2026-09-27-phase-4-review-execution-
 The current offline source checkpoints inventory durable generation receipts,
 match complete accepted transition chains to typed stale-settlement witnesses,
 and classify every potentially successful review submission against complete
-settlement and owner sources; see the
+settlement and owner sources. A fresh PR first observed after execution
+activation now gets a source-checked initialized execution origin in the same
+transaction as its workflow; imported and renewed episodes still need their
+production writers and archived audit. See the
 [phase-4 source handover](2026-09-28-phase-4-execution-source-handover.md).
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.

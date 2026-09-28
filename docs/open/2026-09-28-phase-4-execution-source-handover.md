@@ -245,6 +245,27 @@ with `CLAUDE.md`, `AGENTS.md`, the
   known mode markers produce no reusable session. Session admission remains
   blocked until a durable producer can be joined; the observational reader
   does not authorize activation.
+- Checkpoint 65 composes first observation of a newly discovered PR with a
+  fresh review-execution episode when that family is already active. One
+  transaction writes the rejection workflow, execution component, harness
+  observation and immutable initialized-origin receipt. The receipt binds the
+  initial rejection and execution identities, captured policy, activation
+  epoch, plan/source/inventory digests and activation time, observation ID and
+  sequence-zero state. Hot reads require exact canonical origin, activation
+  and observation sources, a complete postactivation observation within the
+  freshness bound, and no conflicting import. An activation crossing the
+  remote read refuses creation so the next read can retry. This path does not
+  activate the family, import an existing PR or prove archived compaction.
+
+Independent Sol review of checkpoint 65 found missing activation digest and
+time bindings, a two-clock freshness race, the activation/read crossing, and
+the corresponding hot-read fence. Each was fixed with a behavioral regression.
+Canonical readback inside the write transaction also rolls back a preexisting
+activation alias. The final review found no remaining concrete issue. Full
+`make test` passed: 3,258 domain, 3,154 adapter and 2,866 app tests, hooks,
+governor, gate parity, four import contracts and both Pyrefly checks; 10
+strict xfails remained expected. The gate log is
+`/tmp/phase4-initialized-origin-gate.log` (ephemeral).
 
 Independent Sol review of checkpoint 64 found the stale-handle case in both
 multi review and sessionless re-review, plus an initial evidence-ID binding
@@ -537,12 +558,13 @@ order a durable clock.
    explicit unproven source blocker. Even a current reviewed baseline cannot
    certify it because newer legacy reviews could retain an older handle.
 4. Build the production import writer from revalidated legacy sources and
-   activation decisions, then mint initialized/renewed origin variants,
+   activation decisions, then mint renewed origin variants,
    checkpoint receipts and the archived-source audit required by the
    compaction contract. The new imported-origin hot read is a prerequisite;
    it does not certify synthetic or unverified source digests. The 4,096-round
    and generation-boundary suffix limits remain activation gates until that
-   work passes.
+   work passes. The initialized-origin path applies only to a PR first
+   observed after execution activation.
 5. Wire active round identity through production dispatch, child reservation
    and verdict registration; complete composed fault/recovery tests, offline
    shadow, rehearsal and activation. Phase-5 live windows require explicit
