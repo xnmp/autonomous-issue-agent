@@ -22,6 +22,8 @@ from ..domain.review_execution_activation import (
     MAX_LEGACY_RUN_INVENTORY_ROWS, MAX_LEGACY_RUN_INVENTORY_BYTES,
     LEGACY_SUBMISSION_COMMAND_COLUMNS, LEGACY_SUBMISSION_RECEIPT_COLUMNS,
     LegacyReviewSubmissionPage, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
+    CompleteLegacyReviewSubmissions, BlockedLegacyReviewSubmissions,
+    MAX_LEGACY_SUBMISSION_INVENTORY_ROWS, MAX_LEGACY_SUBMISSION_INVENTORY_BYTES,
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
     LegacyReviewSubmissionReceiptPage, LegacyReviewSubmissionReceiptSource,
     UnreadableLegacyReviewSubmissionReceipt,
@@ -73,6 +75,7 @@ MAX_RUN_SOURCE_PAGE = 256
 MAX_LEGACY_RUN_SCAN_ROWS = 1_000_000
 MAX_LEGACY_ROUND_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_SOURCE_PAGE = 64
+MAX_LEGACY_SUBMISSION_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
 MAX_REVIEW_ROUND_SOURCE_PAGE = 16
 MAX_OUTCOME_RECEIPT_SOURCE_PAGE = 16
@@ -342,13 +345,15 @@ def read_legacy_review_submission_page(
     command_sizes = [f"ifnull(length(CAST(c.{column} AS BLOB)),0)" for column in LEGACY_SUBMISSION_COMMAND_COLUMNS]
     receipt_sizes = [f"ifnull(length(CAST(e.{column} AS BLOB)),0)" for column in LEGACY_SUBMISSION_RECEIPT_COLUMNS]
     sizes = ",".join((*command_sizes, *receipt_sizes))
-    predicate = "WHERE c.repository=? AND c.kind='submit_review'" + (
+    predicate = "WHERE c.repository IN (?,?) AND c.kind IN (?,?)" + (
         " AND c.rowid>?" if after_rowid is not None else ""
     )
-    params = (repository,) if after_rowid is None else (repository, after_rowid)
+    params = (repository, repository.encode("utf-8"), "submit_review", b"submit_review")
+    if after_rowid is not None:
+        params = (*params, after_rowid)
     metadata = db.execute(
         f"SELECT c.rowid AS source_rowid,max({sizes}) AS largest_value "
-        "FROM lifecycle_commands c LEFT JOIN effect_receipts e ON e.command_id=c.command_id "
+        "FROM lifecycle_commands c NOT INDEXED LEFT JOIN effect_receipts e ON e.command_id=c.command_id "
         f"{predicate} ORDER BY c.rowid LIMIT ?",
         (*params, MAX_SUBMISSION_SOURCE_PAGE + 1),
     ).fetchall()
@@ -368,8 +373,8 @@ def read_legacy_review_submission_page(
         values = {row["source_rowid"]: row for row in db.execute(
             f"SELECT c.rowid AS source_rowid,{command_fields},{receipt_fields} "
             "FROM lifecycle_commands c LEFT JOIN effect_receipts e ON e.command_id=c.command_id "
-            f"WHERE c.repository=? AND c.kind='submit_review' AND c.rowid IN ({placeholders})",
-            (repository, *safe_ids),
+            f"WHERE c.repository IN (?,?) AND c.kind IN (?,?) AND c.rowid IN ({placeholders})",
+            (repository, repository.encode("utf-8"), "submit_review", b"submit_review", *safe_ids),
         )}
     entries: list[LegacyReviewSubmissionSource | UnreadableLegacyReviewSubmission] = []
     for row in page:
@@ -397,6 +402,57 @@ def read_legacy_review_submission_page(
             entries.append(UnreadableLegacyReviewSubmission(rowid, "submission source has malformed fields"))
     return LegacyReviewSubmissionPage(tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
                                       len(metadata) > MAX_SUBMISSION_SOURCE_PAGE)
+
+
+def read_complete_legacy_review_submissions(
+    db: sqlite3.Connection, repository: str,
+) -> CompleteLegacyReviewSubmissions | BlockedLegacyReviewSubmissions:
+    """Scan every review submission command; partial pages cannot authorize import."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("complete submission scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("complete submission scan requires a canonical repository")
+    if db.execute(
+        "SELECT rowid FROM lifecycle_commands NOT INDEXED ORDER BY rowid LIMIT 1 OFFSET ?",
+        (MAX_LEGACY_SUBMISSION_SCAN_ROWS,),
+    ).fetchone() is not None:
+        return BlockedLegacyReviewSubmissions(repository, "lifecycle command table exceeds its total scan bound")
+    submissions: list[LegacyReviewSubmissionSource] = []
+    source_bytes = 0
+    cursor = None
+    while True:
+        page = read_legacy_review_submission_page(db, repository, after_rowid=cursor)
+        for entry in page.entries:
+            if isinstance(entry, UnreadableLegacyReviewSubmission):
+                return BlockedLegacyReviewSubmissions(repository, entry.reason, entry.source_rowid)
+            source_bytes += entry.source_bytes
+            if (len(submissions) >= MAX_LEGACY_SUBMISSION_INVENTORY_ROWS
+                    or source_bytes > MAX_LEGACY_SUBMISSION_INVENTORY_BYTES):
+                return BlockedLegacyReviewSubmissions(
+                    repository, "review submission inventory exceeds its total bound", entry.source_rowid,
+                )
+            submissions.append(entry)
+        if not page.has_more:
+            break
+        cursor = page.next_rowid
+    try:
+        return CompleteLegacyReviewSubmissions(repository, tuple(submissions))
+    except ValueError as exc:
+        return BlockedLegacyReviewSubmissions(repository, _printable(str(exc)))
+
+
+def revalidate_complete_legacy_review_submissions(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewSubmissions,
+) -> CompleteLegacyReviewSubmissions | BlockedLegacyReviewSubmissions:
+    """Re-read the whole command source set before using a caller-held inventory."""
+    if not isinstance(observed, CompleteLegacyReviewSubmissions):
+        raise ValueError("submission revalidation requires a complete observed inventory")
+    current = read_complete_legacy_review_submissions(db, observed.repository)
+    if isinstance(current, BlockedLegacyReviewSubmissions):
+        return current
+    if current.source_digest != observed.source_digest:
+        return BlockedLegacyReviewSubmissions(observed.repository, "review submission sources changed after inventory")
+    return current
 
 
 def read_legacy_review_submission_receipt_page(

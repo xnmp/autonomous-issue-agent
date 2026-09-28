@@ -1151,3 +1151,22 @@ Full `make test` passed: 3,198 domain, 2,958 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-plain-productivity-gate.log` (ephemeral).
+
+## Checkpoint 46 — complete review submission command inventory (offline)
+
+The read-only submission scanner now exhausts command/effect pages for one
+repository under an explicit SQL snapshot. It retains text and BLOB aliases
+for the matching repository and `submit_review` kind, so malformed aliases
+block rather than disappear. The complete value requires readable unique
+commands, at most 65,536 matching rows and 64 MiB of source fields, and a
+one-million-row bound on the shared lifecycle-command table, including foreign
+repositories and command kinds. Revalidation reads SQL again and rejects
+partial or changed caller-held inventories. This establishes complete command
+sources within those bounds; submission receipt completeness, outcome joins,
+stale and escalated verdict classification, and ordered resets remain open.
+Independent Sol review found no medium or high issue; focused tests cover
+alias, malformed, partial, changed and bound cases.
+Full `make test` passed: 3,198 domain, 2,965 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-complete-submissions-gate.log` (ephemeral).

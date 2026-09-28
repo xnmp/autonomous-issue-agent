@@ -275,6 +275,12 @@ class LegacyReviewSubmissionSource:
         payload = {"command": self.command_fields, "receipt": self.receipt_fields}
         return hashlib.sha256(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
+    @property
+    def source_bytes(self) -> int:
+        fields = (*self.command_fields, *(self.receipt_fields or ()))
+        return sum(len(value.encode("utf-8", "surrogatepass")) if isinstance(value, str)
+                   else 8 if type(value) is int else 0 for _, value in fields)
+
 
 @dataclass(frozen=True)
 class UnreadableLegacyReviewSubmission:
@@ -310,6 +316,50 @@ class LegacyReviewSubmissionPage:
             raise ValueError("submission page must advance through unique rowids")
         if self.has_more and not rowids:
             raise ValueError("submission page cannot continue without a cursor")
+
+
+MAX_LEGACY_SUBMISSION_INVENTORY_ROWS = 65536
+MAX_LEGACY_SUBMISSION_INVENTORY_BYTES = 2**26
+
+
+@dataclass(frozen=True)
+class CompleteLegacyReviewSubmissions:
+    """A bounded whole-repository command observation; activation must recheck SQL."""
+
+    repository: str
+    submissions: tuple[LegacyReviewSubmissionSource, ...]
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository or not isinstance(self.submissions, tuple):
+            raise ValueError("complete review submissions require a canonical repository and tuple")
+        if (len(self.submissions) > MAX_LEGACY_SUBMISSION_INVENTORY_ROWS
+                or any(not isinstance(source, LegacyReviewSubmissionSource)
+                       or dict(source.command_fields)["repository"] != self.repository for source in self.submissions)
+                or sum(source.source_bytes for source in self.submissions) > MAX_LEGACY_SUBMISSION_INVENTORY_BYTES):
+            raise ValueError("complete review submissions require bounded readable repository sources")
+        identities = [dict(source.command_fields)["command_id"] for source in self.submissions]
+        if len(set(identities)) != len(identities):
+            raise ValueError("complete review submissions require unique command identities")
+
+    @property
+    def source_digest(self) -> str:
+        parts = tuple(sorted((dict(source.command_fields)["command_id"], source.source_digest)
+                             for source in self.submissions))
+        return hashlib.sha256(json.dumps((self.repository, parts), separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewSubmissions:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked review submissions require a canonical repository")
+        validate_workflow_text(self.reason, "blocked review submission reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked review submission cursor")
 
 
 LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES = frozenset({

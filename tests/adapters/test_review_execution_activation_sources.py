@@ -13,6 +13,7 @@ from issue_agent.domain.contracts import EffectReceipt, EffectStatus
 from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
     read_complete_legacy_review_runs, read_legacy_review_run_page, read_legacy_review_submission_page,
+    read_complete_legacy_review_submissions, revalidate_complete_legacy_review_submissions,
     revalidate_complete_legacy_review_runs,
     read_legacy_review_submission_receipt_page, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
     read_legacy_review_owner_lineage,
@@ -34,6 +35,7 @@ from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
+    CompleteLegacyReviewSubmissions, BlockedLegacyReviewSubmissions,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
     LegacyReviewOwnerLineage, UnreadableLegacyReviewOwnerLineage,
     CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
@@ -1142,6 +1144,96 @@ def test_submission_scan_requires_explicit_snapshot_and_canonical_scope(tmp_path
         with pytest.raises(ValueError, match="repository"):
             read_legacy_review_submission_page(db, "Other/R")
         db.rollback()
+
+
+def test_complete_submission_inventory_covers_exact_commands_and_rechecks_sql(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission(db, 1, rowid=-3)
+        _submission(db, 2, receipt=False, rowid=0)
+        _submission(db, 3, repository="other/r")
+        _submission(db, 4, kind="relabel")
+        db.execute("BEGIN")
+        before = db.total_changes
+        observed = read_complete_legacy_review_submissions(db, "o/r")
+        assert db.total_changes == before
+        assert isinstance(observed, CompleteLegacyReviewSubmissions)
+        same = revalidate_complete_legacy_review_submissions(db, observed)
+        assert same == observed
+        partial = CompleteLegacyReviewSubmissions("o/r", observed.submissions[:1])
+        assert isinstance(revalidate_complete_legacy_review_submissions(db, partial), BlockedLegacyReviewSubmissions)
+        with pytest.raises(ValueError, match="unique command"):
+            CompleteLegacyReviewSubmissions("o/r", (observed.submissions[0], observed.submissions[0]))
+        db.rollback()
+        db.execute("UPDATE lifecycle_commands SET payload_json='changed' WHERE command_id='cmd-1'")
+        db.execute("BEGIN")
+        changed = revalidate_complete_legacy_review_submissions(db, observed)
+        db.rollback()
+
+    assert [dict(source.command_fields)["command_id"] for source in observed.submissions] == ["cmd-1", "cmd-2"]
+    assert isinstance(changed, BlockedLegacyReviewSubmissions)
+
+
+@pytest.mark.parametrize("alias", ["repository", "kind"])
+def test_complete_submission_inventory_blocks_matching_blob_alias(tmp_path, alias):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission(db, 1, repository=b"o/r" if alias == "repository" else "o/r",
+                    kind=b"submit_review" if alias == "kind" else "submit_review", receipt=False)
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_page(db, "o/r")
+        result = read_complete_legacy_review_submissions(db, "o/r")
+        db.rollback()
+
+    assert isinstance(page.entries[0], UnreadableLegacyReviewSubmission)
+    assert isinstance(result, BlockedLegacyReviewSubmissions)
+
+
+def test_complete_submission_inventory_blocks_foreign_row_scan_excess(tmp_path, monkeypatch):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        for number in range(3):
+            _submission(db, number, repository="other/r", receipt=False)
+        db.execute("BEGIN")
+        monkeypatch.setattr(review_activation, "MAX_LEGACY_SUBMISSION_SCAN_ROWS", 2)
+        result = read_complete_legacy_review_submissions(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewSubmissions)
+    assert "total scan bound" in result.reason
+
+
+def test_complete_submission_inventory_blocks_unreadable_source(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission(db, 1)
+        db.execute("UPDATE lifecycle_commands SET payload_json=? WHERE command_id='cmd-1'", ("x" * 65537,))
+        db.execute("BEGIN")
+        result = read_complete_legacy_review_submissions(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewSubmissions)
+
+
+@pytest.mark.parametrize("bound", ["rows", "bytes"])
+def test_complete_submission_inventory_blocks_total_source_excess(tmp_path, monkeypatch, bound):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission(db, 1)
+        _submission(db, 2)
+        db.execute("BEGIN")
+        if bound == "rows":
+            monkeypatch.setattr(review_activation, "MAX_LEGACY_SUBMISSION_INVENTORY_ROWS", 1)
+        else:
+            page = read_legacy_review_submission_page(db, "o/r")
+            assert isinstance(page.entries[0], LegacyReviewSubmissionSource)
+            monkeypatch.setattr(review_activation, "MAX_LEGACY_SUBMISSION_INVENTORY_BYTES",
+                                page.entries[0].source_bytes - 1)
+        result = read_complete_legacy_review_submissions(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewSubmissions)
+    assert "total bound" in result.reason
 
 
 def _submission_receipt(db, number, *, namespace="review-round-submission-index", scope="o/r", rowid=None):

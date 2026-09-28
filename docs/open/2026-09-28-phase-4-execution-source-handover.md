@@ -86,6 +86,12 @@ with `CLAUDE.md`, `AGENTS.md`, the
   claim times, and rejects stale, superseded or ceiling
   productivity receipts for that round. This does not account for every
   command or prove ordered resets.
+- Checkpoint 46 exhausts the review submission command pages within a
+  one-million-row shared-table scan ceiling, 65,536 matching commands and
+  64 MiB of source fields. Matching BLOB repository/kind aliases block as
+  malformed evidence. A second SQL read rejects partial or changed
+  caller-held inventories. Submission receipt completeness and outcome joins
+  remain separate.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -158,6 +164,14 @@ the final pass found no remaining medium or high issue. The full gate log is
 adapter and 2,866 app tests passed, plus hooks, governor, gate parity, four
 import contracts and both Pyrefly checks. Ten strict xfails remained expected.
 
+Independent Sol review of checkpoint 46 found no medium or high issue in the
+complete command inventory or page query. Focused tests cover changed and
+partial source sets, BLOB aliases, malformed rows and scan bounds. The full
+gate log is `/tmp/phase4-complete-submissions-gate.log` (ephemeral): 3,198
+domain, 2,965 adapter and 2,866 app tests passed, plus hooks, governor, gate
+parity, four import contracts and both Pyrefly checks. Ten strict xfails
+remained expected.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -171,8 +185,9 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Extend the single plain productive round proof across the complete command
-   and round sets to establish ordered resets. Verify escalated verdict hold
+2. Complete the bounded submission settlement receipt inventory. Then extend
+   the single plain productive round proof across the complete command,
+   receipt and round sets to establish ordered resets. Verify escalated verdict hold
    provenance and classify unrecorded or stale successful commands separately.
    A completed
    agent run is not itself a productive review; unknown death or reset
