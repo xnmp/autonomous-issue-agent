@@ -550,6 +550,20 @@ the complete audit benchmark.
   namespace-specific payload proof. Full-gate results are recorded in the
   progress board after acceptance.
 
+- Checkpoint 91 decodes each indexed receipt page through the closed workflow
+  codec, requires permanent aware claims and canonical payloads, and classifies
+  all twelve namespaces into typed bound-round, named-round or command
+  references. It checks local payload shape, derived stage and submission-index
+  keys, source repository where the payload carries one, and facts-derived
+  outcome and stale-productivity dispositions. Historical two-field stale
+  receipts block because they lack the generation crossing witness. Malformed rows block with a
+  source rowid; the page remains read-only. This is local attribution only:
+  named productivity receipts, command markers, claim provenance,
+  checkpoint ancestry and the full namespace census still need source-backed
+  joins. Sol review found stale-outcome, missing-witness and embedded-repository
+  gaps; all have focused regressions. Full-gate results are recorded in the progress
+  board after acceptance.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -557,11 +571,12 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–90, the durable round cursor completes a bounded row
+With checkpoints 88–91, the durable round cursor completes a bounded row
 sweep, and separate reads expose both expected finalized-round receipt
-members and raw namespace sources. Next, reconcile round members against
-checkpoint ancestry and expected source digests, then persist and reconcile
-a complete receipt-namespace pass to find unclaimed receipts. Before a writer
+members and locally classified namespace sources. Next, reconcile round
+members against checkpoint ancestry and expected source digests, then persist
+and reconcile a complete receipt-namespace pass to find unclaimed receipts.
+Before a writer
 can use the checkpoint-86
 proposal, establish a true cumulative read bound around canonical load and
 each source reader; prove generation-only and later-checkpoint paths; verify

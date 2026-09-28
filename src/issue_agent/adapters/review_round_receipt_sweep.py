@@ -5,28 +5,26 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from ..domain.review_receipt_attribution import (
+    BoundReviewRoundReceipt, CommandReviewRoundReceipt, NamedReviewRoundReceipt,
+    ReviewRoundReceiptNamespace, ReviewRoundReceiptReference,
+    classify_review_round_receipt,
+)
+from ..domain.review_rounds import ReviewSubmissionRegistration, StaleReviewProductivitySettlement
+from ..domain.workflow_identity import WorkflowRevision
 from ..domain.workflow_identity import canonical_workflow_repository, validate_workflow_identifier
 from .review_execution_activation import (
     MAX_LEGACY_RECORDING_BYTES, _DEDUPE_SOURCE_COLUMNS, _printable,
     _read_recording_source,
 )
+from .control_store import _parse_stamp
+from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
-    RECORDED_REVIEW_NAMESPACE, REVIEW_ABANDONMENT_NAMESPACE,
-    REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_OUTCOME_NAMESPACE,
-    REVIEW_PREPARATION_NAMESPACE, REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
-    REVIEW_STALE_PRODUCTIVITY_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE,
-    REVIEW_SUBMISSION_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
+    review_stage_receipt_key, review_submission_receipt_key,
 )
 
 
-ROUND_RECEIPT_NAMESPACES = tuple(sorted((
-    RECORDED_REVIEW_NAMESPACE, REVIEW_ABANDONMENT_NAMESPACE,
-    REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_OUTCOME_NAMESPACE,
-    "review-round-preflight", REVIEW_PREPARATION_NAMESPACE, REVIEW_SEAL_NAMESPACE,
-    REVIEW_STAGE_NAMESPACE, REVIEW_STALE_PRODUCTIVITY_NAMESPACE,
-    REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
-    REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
-)))
+ROUND_RECEIPT_NAMESPACES = tuple(sorted(item.value for item in ReviewRoundReceiptNamespace))
 MAX_ROUND_RECEIPT_SWEEP_PAGE = 16
 MAX_ROUND_RECEIPT_SWEEP_BYTES = 2**24
 MAX_ROUND_RECEIPT_IDENTITY_BYTES = 512
@@ -51,13 +49,19 @@ class ObservedReviewRoundReceiptSweepSource:
     source_rowid: int
     cursor: ReviewRoundReceiptSweepCursor
     source_sha256: str
+    claimed_at: str
+    reusable_after: str | None
+    payload_json: str
 
     def __post_init__(self) -> None:
         if (type(self.source_rowid) is not int
                 or not isinstance(self.cursor, ReviewRoundReceiptSweepCursor)
                 or not isinstance(self.source_sha256, str)
                 or len(self.source_sha256) != 64
-                or any(char not in "0123456789abcdef" for char in self.source_sha256)):
+                or any(char not in "0123456789abcdef" for char in self.source_sha256)
+                or not isinstance(self.claimed_at, str)
+                or self.reusable_after is not None and not isinstance(self.reusable_after, str)
+                or not isinstance(self.payload_json, str)):
             raise ValueError("round receipt sweep source requires a typed source fingerprint")
 
 
@@ -198,11 +202,13 @@ def read_review_round_receipt_sweep_page(
             source_cursor = ReviewRoundReceiptSweepCursor(
                 row["namespace"], row["scope_value"], row["key_value"],
             )
-            _, digest = _read_recording_source(
+            fields, digest = _read_recording_source(
                 db, source_cursor.namespace, source_cursor.scope, source_cursor.key,
             )
+            values = dict(fields)
             sources.append(ObservedReviewRoundReceiptSweepSource(
                 current_rowid, source_cursor, digest,
+                values["claimed_at"], values["reusable_after"], values["payload_json"],
             ))
             source_bytes += row["source_bytes"]
             cursor = source_cursor
@@ -212,4 +218,110 @@ def read_review_round_receipt_sweep_page(
         )
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error) as exc:
+        return BlockedReviewRoundReceiptSweepPage(_printable(str(exc))[:512], current_rowid)
+
+
+@dataclass(frozen=True)
+class ClassifiedReviewRoundReceiptSweepSource:
+    source: ObservedReviewRoundReceiptSweepSource
+    reference: ReviewRoundReceiptReference
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, ObservedReviewRoundReceiptSweepSource)
+                or not isinstance(self.reference, (
+                    BoundReviewRoundReceipt, NamedReviewRoundReceipt,
+                    CommandReviewRoundReceipt,
+                ))):
+            raise ValueError("classified round receipt requires source and typed reference")
+
+
+@dataclass(frozen=True)
+class ClassifiedReviewRoundReceiptSweepPage:
+    sources: tuple[ClassifiedReviewRoundReceiptSweepSource, ...]
+    next_cursor: ReviewRoundReceiptSweepCursor | None
+    upper_cursor: ReviewRoundReceiptSweepCursor | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.sources, tuple)
+                or len(self.sources) > MAX_ROUND_RECEIPT_SWEEP_PAGE
+                or any(not isinstance(source, ClassifiedReviewRoundReceiptSweepSource)
+                       for source in self.sources)
+                or self.next_cursor is not None and not isinstance(
+                    self.next_cursor, ReviewRoundReceiptSweepCursor)
+                or self.upper_cursor is not None and not isinstance(
+                    self.upper_cursor, ReviewRoundReceiptSweepCursor)
+                or type(self.has_more) is not bool
+                or self.upper_cursor is None and (self.sources or self.next_cursor or self.has_more)
+                or self.sources and self.next_cursor != self.sources[-1].source.cursor
+                or self.has_more and self.next_cursor is None):
+            raise ValueError("classified round receipt page requires bounded typed observations")
+
+
+def read_classified_review_round_receipt_sweep_page(
+    db: sqlite3.Connection,
+    *, after: ReviewRoundReceiptSweepCursor | None = None,
+    upper: ReviewRoundReceiptSweepCursor | None = None,
+) -> ClassifiedReviewRoundReceiptSweepPage | BlockedReviewRoundReceiptSweepPage:
+    """Decode each bounded source and identify its local round or command reference.
+
+    The reference has no episode or checkpoint authority until joined to
+    canonical round, command and accepted-transition sources.
+    """
+    page = read_review_round_receipt_sweep_page(db, after=after, upper=upper)
+    if isinstance(page, BlockedReviewRoundReceiptSweepPage):
+        return page
+    classified: list[ClassifiedReviewRoundReceiptSweepSource] = []
+    current_rowid: int | None = None
+    try:
+        for source in page.sources:
+            current_rowid = source.source_rowid
+            if source.reusable_after is not None:
+                raise ValueError("round receipt has a reusable source")
+            _parse_stamp(source.claimed_at)
+            decoded = decode_workflow(
+                source.payload_json,
+                tuple | ReviewSubmissionRegistration | StaleReviewProductivitySettlement
+                | WorkflowRevision,
+            )
+            if encode_workflow(decoded) != source.payload_json:
+                raise ValueError("round receipt has a noncanonical payload")
+            namespace = ReviewRoundReceiptNamespace(source.cursor.namespace)
+            reference = classify_review_round_receipt(
+                namespace, source.cursor.key, decoded,
+            )
+            if (isinstance(reference, BoundReviewRoundReceipt)
+                    and reference.round.binding.rejection.fence.key.repository
+                    != source.cursor.scope):
+                raise ValueError("round receipt has a foreign repository")
+            if namespace is ReviewRoundReceiptNamespace.RECORDED:
+                if decoded.fence.key.repository != source.cursor.scope:
+                    raise ValueError("recorded review receipt has a foreign repository")
+            elif namespace in (
+                ReviewRoundReceiptNamespace.SUPERSEDED_PRODUCTIVITY,
+                ReviewRoundReceiptNamespace.CEILING_PRODUCTIVITY,
+            ):
+                if decoded[1].fence.key.repository != source.cursor.scope:
+                    raise ValueError("productive review receipt has a foreign repository")
+                if namespace is ReviewRoundReceiptNamespace.CEILING_PRODUCTIVITY:
+                    decision = decoded[0]
+                    if (decision.prior.revision.fence.key.repository != source.cursor.scope
+                            or decision.escalation.submission.binding.fence.key.repository
+                            != source.cursor.scope):
+                        raise ValueError("ceiling review receipt has a foreign repository")
+            if namespace is ReviewRoundReceiptNamespace.STAGE:
+                round_id, stage = decoded
+                if source.cursor.key != review_stage_receipt_key(round_id, stage.stage_id):
+                    raise ValueError("round stage receipt has a foreign derived key")
+            elif namespace is ReviewRoundReceiptNamespace.SUBMISSION_INDEX:
+                if source.cursor.key != review_submission_receipt_key(
+                    decoded.round.round_id, decoded.submission.command_id,
+                ):
+                    raise ValueError("round submission index has a foreign derived key")
+            classified.append(ClassifiedReviewRoundReceiptSweepSource(source, reference))
+        return ClassifiedReviewRoundReceiptSweepPage(
+            tuple(classified), page.next_cursor, page.upper_cursor, page.has_more,
+        )
+    except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
+            RecursionError, sqlite3.Error) as exc:
         return BlockedReviewRoundReceiptSweepPage(_printable(str(exc))[:512], current_rowid)
