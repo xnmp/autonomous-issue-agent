@@ -29,6 +29,8 @@ from ..domain.review_execution_activation import (
     UnreadableLegacyReviewOwnerLineage,
     VerifiedLegacyRecordedReview, UnverifiedLegacyRecordedReview,
     VerifiedReviewSubmissionRoundLink, UnverifiedReviewSubmissionRoundLink,
+    LEGACY_REVIEW_ROUND_COLUMNS, MAX_LEGACY_ROUND_JSON_BYTES, MAX_LEGACY_ROUND_PAGE_BYTES,
+    LegacyReviewRoundPage, LegacyReviewRoundSource, UnreadableLegacyReviewRound,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
 from ..domain.review_execution import ExecutionNotActivated
@@ -58,6 +60,7 @@ MAX_RUN_SOURCE_PAGE = 256
 MAX_LEGACY_RUN_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_SOURCE_PAGE = 64
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
+MAX_REVIEW_ROUND_SOURCE_PAGE = 16
 _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
 _DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json")
 MAX_LEGACY_RECORDING_BYTES = 2**21
@@ -439,6 +442,85 @@ def read_legacy_review_submission_receipt_page(
     return LegacyReviewSubmissionReceiptPage(
         tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
         len(metadata) > MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
+    )
+
+
+def read_legacy_review_round_page(
+    db: sqlite3.Connection, repository: str, *, after_rowid: int | None = None,
+) -> LegacyReviewRoundPage:
+    """Inventory every round row for a repository without interpreting outcomes."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("review round scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("review round scan requires a canonical repository")
+    if after_rowid is not None and (type(after_rowid) is not int or not MIN_SQL_ROWID <= after_rowid <= MAX_SQL_ROWID):
+        raise ValueError("review round scan requires a valid cursor")
+    json_columns = ("plan_json", "planning_json", "closure_json", "outcome_json")
+    other_columns = tuple(column for column in LEGACY_REVIEW_ROUND_COLUMNS if column not in json_columns)
+    json_sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in json_columns]
+    other_sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in other_columns]
+    predicate = "WHERE repository IN (?,?)" + (" AND rowid>?" if after_rowid is not None else "")
+    params = (repository, repository.encode("utf-8")) if after_rowid is None else (
+        repository, repository.encode("utf-8"), after_rowid,
+    )
+    metadata = db.execute(
+        f"SELECT rowid AS source_rowid,max({','.join(json_sizes)}) AS largest_json,"
+        f"max({','.join(other_sizes)}) AS largest_other,"
+        f"{'+'.join(json_sizes + other_sizes)} AS total_bytes "
+        f"FROM review_execution_rounds {predicate} ORDER BY rowid LIMIT ?",
+        (*params, MAX_REVIEW_ROUND_SOURCE_PAGE + 1),
+    ).fetchall()
+    selected: list[sqlite3.Row] = []
+    retained_bytes = 0
+    for row in metadata[:MAX_REVIEW_ROUND_SOURCE_PAGE]:
+        safe = (row["largest_json"] <= MAX_LEGACY_ROUND_JSON_BYTES
+                and row["largest_other"] <= MAX_LEGACY_SQL_TEXT_BYTES)
+        if safe and selected and retained_bytes + row["total_bytes"] > MAX_LEGACY_ROUND_PAGE_BYTES:
+            break
+        selected.append(row)
+        if safe:
+            retained_bytes += row["total_bytes"]
+    safe_ids = [row["source_rowid"] for row in selected if (
+        row["largest_json"] <= MAX_LEGACY_ROUND_JSON_BYTES
+        and row["largest_other"] <= MAX_LEGACY_SQL_TEXT_BYTES
+        and row["total_bytes"] <= MAX_LEGACY_ROUND_PAGE_BYTES
+    )]
+    values = {}
+    if safe_ids:
+        ids = ",".join("?" for _ in safe_ids)
+        fields = ",".join(
+            f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+            for column in LEGACY_REVIEW_ROUND_COLUMNS
+        )
+        values = {row["source_rowid"]: row for row in db.execute(
+            f"SELECT rowid AS source_rowid,{fields} FROM review_execution_rounds "
+            f"WHERE repository IN (?,?) AND rowid IN ({ids})",
+            (repository, repository.encode("utf-8"), *safe_ids),
+        )}
+    integer_columns = {"target_number", "execution_epoch", "generation", "sequence"}
+    entries: list[LegacyReviewRoundSource | UnreadableLegacyReviewRound] = []
+    for row in selected:
+        rowid = row["source_rowid"]
+        if (row["largest_json"] > MAX_LEGACY_ROUND_JSON_BYTES
+                or row["largest_other"] > MAX_LEGACY_SQL_TEXT_BYTES
+                or row["total_bytes"] > MAX_LEGACY_ROUND_PAGE_BYTES):
+            entries.append(UnreadableLegacyReviewRound(rowid, "review round exceeds its SQL source bound"))
+            continue
+        source = values.get(rowid)
+        if source is None:
+            entries.append(UnreadableLegacyReviewRound(rowid, "review round changed during its read"))
+            continue
+        try:
+            fields = tuple((column, (
+                _sql_integer(source[f"type_{column}"], source[f"raw_{column}"])
+                if column in integer_columns else _sql_text(source[f"type_{column}"], source[f"raw_{column}"])
+            )) for column in LEGACY_REVIEW_ROUND_COLUMNS)
+            entries.append(LegacyReviewRoundSource(rowid, fields))
+        except (TypeError, ValueError, UnicodeError):
+            entries.append(UnreadableLegacyReviewRound(rowid, "review round has malformed fields"))
+    return LegacyReviewRoundPage(
+        tuple(entries), selected[-1]["source_rowid"] if selected else after_rowid,
+        len(metadata) > len(selected),
     )
 
 

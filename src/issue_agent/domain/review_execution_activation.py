@@ -378,6 +378,93 @@ class LegacyReviewSubmissionReceiptPage:
             raise ValueError("submission receipt page cannot continue without a cursor")
 
 
+LEGACY_REVIEW_ROUND_COLUMNS = (
+    "round_id", "repository", "target_kind", "target_number", "execution_epoch",
+    "execution_episode", "generation", "sequence", "claim_occurrence_id",
+    "plan_json", "planning_json", "closure_json", "outcome_json",
+)
+_ROUND_INTEGER_COLUMNS = frozenset({"target_number", "execution_epoch", "generation", "sequence"})
+_ROUND_JSON_COLUMNS = frozenset({"plan_json", "planning_json", "closure_json", "outcome_json"})
+MAX_LEGACY_ROUND_JSON_BYTES = 2**21
+MAX_LEGACY_ROUND_PAGE_BYTES = 2**24
+
+
+@dataclass(frozen=True)
+class LegacyReviewRoundSource:
+    """Uninterpreted, bounded SQL round row; cursor is not source identity."""
+
+    source_rowid: int
+    fields: tuple[tuple[str, str | int | None], ...]
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "review round cursor")
+        if (not isinstance(self.fields, tuple)
+                or any(not isinstance(field, tuple) or len(field) != 2 for field in self.fields)
+                or tuple(name for name, _ in self.fields) != LEGACY_REVIEW_ROUND_COLUMNS):
+            raise ValueError("review round source requires exact fields and order")
+        for name, value in self.fields:
+            if name in _ROUND_INTEGER_COLUMNS:
+                if type(value) is not int or value < 0 or value > MAX_SQL_ROWID:
+                    raise ValueError(f"review round {name} must be a bounded integer")
+            elif value is None:
+                if name not in {"closure_json", "outcome_json"}:
+                    raise ValueError(f"review round {name} is absent")
+            elif (not isinstance(value, str)
+                  or len(value.encode("utf-8", "surrogatepass")) > (
+                      MAX_LEGACY_ROUND_JSON_BYTES if name in _ROUND_JSON_COLUMNS else MAX_LEGACY_SQL_TEXT_BYTES
+                  )):
+                raise ValueError(f"review round {name} must be bounded text")
+        values = dict(self.fields)
+        if (not values["round_id"] or canonical_workflow_repository(values["repository"]) != values["repository"]
+                or values["target_kind"] != "pr" or values["target_number"] < 1
+                or values["execution_epoch"] < 1 or values["sequence"] < 1):
+            raise ValueError("review round source lacks its canonical SQL identity")
+
+    @property
+    def source_bytes(self) -> int:
+        return sum(len(value.encode("utf-8", "surrogatepass")) if isinstance(value, str) else 8
+                   for _, value in self.fields if value is not None)
+
+    @property
+    def source_digest(self) -> str:
+        return hashlib.sha256(json.dumps(self.fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnreadableLegacyReviewRound:
+    source_rowid: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "unreadable review round cursor")
+        validate_workflow_text(self.reason, "unreadable review round reason")
+
+
+LegacyReviewRoundEntry = LegacyReviewRoundSource | UnreadableLegacyReviewRound
+
+
+@dataclass(frozen=True)
+class LegacyReviewRoundPage:
+    entries: tuple[LegacyReviewRoundEntry, ...]
+    next_rowid: int | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.entries, tuple)
+                or any(not isinstance(entry, (LegacyReviewRoundSource, UnreadableLegacyReviewRound))
+                       for entry in self.entries)):
+            raise ValueError("review round page requires typed entries")
+        if self.next_rowid is not None:
+            _rowid(self.next_rowid, "review round page cursor")
+        if type(self.has_more) is not bool:
+            raise ValueError("review round page continuation must be boolean")
+        rowids = [entry.source_rowid for entry in self.entries]
+        if rowids != sorted(set(rowids)) or (rowids and rowids[-1] != self.next_rowid):
+            raise ValueError("review round page must advance through unique rowids")
+        if self.has_more and not rowids:
+            raise ValueError("review round page cannot continue without a cursor")
+
+
 MAX_LEGACY_REVIEW_OWNERS = 64
 
 

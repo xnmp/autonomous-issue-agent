@@ -1015,3 +1015,20 @@ Full `make test` passed: 3,192 domain, 2,902 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-round-link-gate.log` (ephemeral).
+
+## Checkpoint 39 — bounded review round row inventory (offline)
+
+The execution activation reader now pages all `review_execution_rounds` rows
+for one repository under an explicit SQL snapshot. A typed source retains all
+13 schema columns, including planning, closure and outcome JSON, with a digest
+independent of the SQLite cursor. The scan includes negative and zero rowids
+and matching BLOB repository aliases. It limits pages to 16 rows or 16 MiB of
+retained source data, with separate 2 MiB JSON and 64 KiB identity-field
+bounds. Invalid UTF-8, malformed SQL types, oversized rows and source changes
+remain explicit unreadable entries. It does not interpret an outcome as
+productive, assert a complete inventory, or activate execution authority.
+Independent Sol review found no medium or high issue in this reader.
+Full `make test` passed: 3,192 domain, 2,908 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-round-source-gate.log` (ephemeral).

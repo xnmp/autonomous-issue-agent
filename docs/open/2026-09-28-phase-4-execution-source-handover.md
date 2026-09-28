@@ -51,6 +51,10 @@ with `CLAUDE.md`, `AGENTS.md`, the
   round plan and stage receipts. It rechecks lineage and bounded command/effect
   rows. The verified value contains only the round identity and source digests;
   kind, productivity and reset still need separate proof.
+- Checkpoint 39 adds a bounded SQL page scan of every review round row for one
+  repository. It preserves all 13 columns, malformed and oversized rows,
+  negative/zero rowids and matching BLOB aliases. A page is an observation,
+  not a complete round inventory or a productive-outcome proof.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -69,6 +73,12 @@ and both Pyrefly checks. Ten strict xfails remained expected. The log is
 unbounded re-reads and a missing exact command comparison; both were fixed,
 and the final pass found no remaining medium or high issue.
 
+The checkpoint-39 full `make test` gate passed: 3,192 domain, 2,908 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-round-source-gate.log` (ephemeral). Independent Sol review found
+no medium or high issue in the bounded round row reader.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -82,8 +92,9 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Use verified command-to-round links with plain recorded baselines to prove
-   confirmed productive outcomes and ordered resets. Verify escalated verdict
+2. Complete and revalidate the round page scan, join bounded outcome receipts,
+   then use verified command-to-round links with plain recorded baselines to
+   prove confirmed productive outcomes and ordered resets. Verify escalated verdict
    hold provenance and classify unrecorded or stale successful commands
    separately. A completed
    agent run is not itself a productive review; unknown death or reset

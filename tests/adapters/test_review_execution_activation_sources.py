@@ -11,6 +11,7 @@ from issue_agent.adapters.review_execution_activation import (
     revalidate_complete_legacy_review_runs,
     read_legacy_review_submission_receipt_page, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
     read_legacy_review_owner_lineage,
+    read_legacy_review_round_page, MAX_REVIEW_ROUND_SOURCE_PAGE,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
@@ -21,7 +22,9 @@ from issue_agent.domain.review_execution_activation import (
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
     LegacyReviewOwnerLineage, UnreadableLegacyReviewOwnerLineage,
     CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
+    LegacyReviewRoundSource, UnreadableLegacyReviewRound, MAX_LEGACY_ROUND_JSON_BYTES,
 )
+from tests.adapters.test_review_execution_control import rig
 
 
 def test_inventory_keeps_both_counter_namespaces_and_runtime_session_bytes(tmp_path):
@@ -121,6 +124,117 @@ def test_missing_and_non_directory_roots_are_explicit(tmp_path):
 
 
 OWNER = "o/r:review:owner"
+
+
+def test_round_inventory_includes_negative_zero_and_positive_rowids_without_writes(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    with store.transaction() as db:
+        for rowid, sequence in ((-1, 2), (0, 3)):
+            db.execute(
+                "INSERT INTO review_execution_rounds "
+                "(rowid,round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
+                "generation,sequence,claim_occurrence_id,plan_json,planning_json,closure_json,outcome_json) "
+                "SELECT ?,?,repository,target_kind,target_number,execution_epoch,execution_episode,"
+                "generation,?,claim_occurrence_id,plan_json,planning_json,closure_json,outcome_json "
+                "FROM review_execution_rounds WHERE round_id=?",
+                (rowid, f"inventory-round-{sequence}", sequence, plan.round.round_id),
+            )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        first = read_legacy_review_round_page(db, "o/r", after_rowid=-2)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert [entry.source_rowid for entry in first.entries] == [-1, 0, 1]
+    assert not first.has_more
+    assert all(isinstance(entry, LegacyReviewRoundSource) for entry in first.entries)
+    assert dict(first.entries[-1].fields)["round_id"] == plan.round.round_id
+    assert first.entries[-1].source_digest == LegacyReviewRoundSource(
+        -9, first.entries[-1].fields,
+    ).source_digest
+
+
+@pytest.mark.parametrize("damage", ["oversized", "invalid_utf8", "blob_repository"])
+def test_round_inventory_keeps_unreadable_rows_visible(rig, damage):
+    store, _, _, selection, control = rig
+    control.preflight(selection)
+    if damage == "blob_repository":
+        with closing(store._connect()) as db:
+            db.execute("PRAGMA foreign_keys=OFF")
+            db.execute("BEGIN")
+            db.execute("UPDATE review_execution_rounds SET repository=?", (b"o/r",))
+            db.commit()
+    else:
+        with store.transaction() as db:
+            if damage == "oversized":
+                db.execute("UPDATE review_execution_rounds SET plan_json=?",
+                           ("x" * (MAX_LEGACY_ROUND_JSON_BYTES + 1),))
+            else:
+                db.execute("UPDATE review_execution_rounds SET planning_json=CAST(x'FF' AS TEXT)")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        page = read_legacy_review_round_page(db, "o/r")
+        assert db.total_changes == before
+        db.rollback()
+
+    assert len(page.entries) == 1
+    assert isinstance(page.entries[0], UnreadableLegacyReviewRound)
+    assert not page.has_more
+
+
+def test_round_inventory_pages_at_bounded_row_count(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    with store.transaction() as db:
+        for index in range(2, MAX_REVIEW_ROUND_SOURCE_PAGE + 3):
+            db.execute(
+                "INSERT INTO review_execution_rounds "
+                "(round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
+                "generation,sequence,claim_occurrence_id,plan_json,planning_json) "
+                "SELECT ?,repository,target_kind,target_number,execution_epoch,execution_episode,"
+                "generation,?,claim_occurrence_id,plan_json,planning_json "
+                "FROM review_execution_rounds WHERE round_id=?",
+                (f"inventory-round-{index}", index, plan.round.round_id),
+            )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        first = read_legacy_review_round_page(db, "o/r")
+        second = read_legacy_review_round_page(db, "o/r", after_rowid=first.next_rowid)
+        db.rollback()
+
+    assert len(first.entries) == MAX_REVIEW_ROUND_SOURCE_PAGE and first.has_more
+    assert len(second.entries) == 2 and not second.has_more
+    assert first.next_rowid < second.entries[0].source_rowid
+
+
+def test_round_inventory_pages_before_exceeding_retained_byte_budget(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO review_execution_rounds "
+            "(round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
+            "generation,sequence,claim_occurrence_id,plan_json,planning_json) "
+            "SELECT 'second-inventory-round',repository,target_kind,target_number,execution_epoch,"
+            "execution_episode,generation,2,claim_occurrence_id,plan_json,planning_json "
+            "FROM review_execution_rounds WHERE round_id=?", (plan.round.round_id,),
+        )
+        large = "x" * MAX_LEGACY_ROUND_JSON_BYTES
+        db.execute("UPDATE review_execution_rounds SET plan_json=?,planning_json=?,closure_json=?,outcome_json=?",
+                   (large, large, large, large))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        first = read_legacy_review_round_page(db, "o/r")
+        second = read_legacy_review_round_page(db, "o/r", after_rowid=first.next_rowid)
+        db.rollback()
+
+    assert len(first.entries) == 1 and first.has_more
+    assert len(second.entries) == 1 and not second.has_more
+    assert isinstance(first.entries[0], LegacyReviewRoundSource)
+    assert isinstance(second.entries[0], LegacyReviewRoundSource)
 
 
 def _control(tmp_path):
