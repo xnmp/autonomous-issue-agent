@@ -530,6 +530,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/repository_guidance.py`, `adapters/resolve_activation.py`, `adapters/review_activation.py`, `adapters/review_linkage.py`,
 `adapters/review_execution_activation.py` (bounded read-only execution file and SQL sources, owner lineage, complete round, run, submission command, submission settlement receipt and outcome receipt scans/revalidation, whole-set outcome and submission settlement storage accounting, plain recorded-review baseline verification, exact command-to-round registration joins, single plain productive-round proof and scoped stale-productivity receipt-path proof),
 `adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
+`adapters/review_execution_import_sources.py` (barrier-held revalidation of configured legacy execution files and complete PR linkage before counter attribution),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),

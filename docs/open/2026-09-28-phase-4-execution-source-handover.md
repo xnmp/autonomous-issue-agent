@@ -256,6 +256,22 @@ with `CLAUDE.md`, `AGENTS.md`, the
   freshness bound, and no conflicting import. An activation crossing the
   remote read refuses creation so the next read can retry. This path does not
   activate the family, import an existing PR or prove archived compaction.
+- Checkpoint 66 adds a barrier-held, read-only source scope for review
+  execution counter import. It reacquires all three deployment effect barriers
+  in the established order, revalidates every configured legacy file root and
+  the repository-bound complete open-PR linkage, then attributes every parsed
+  positive issue and negative PR counter under those barriers. A typed result
+  binds the configured-root identities to the mapping digest; changed files,
+  changed or foreign PR linkage and ambiguous issue attribution block. The
+  context stays open for a future import transaction, but does not authorize
+  any inherited debit or reset without SQL owner/run/settlement revalidation.
+
+Independent Sol review of checkpoint 66 found no concrete defect. Focused
+tests cover attribution, changed source refusal, all three lock lifetimes and
+read-only SQL scope. Full `make test` passed: 3,258 domain, 3,159 adapter and
+2,866 app tests, hooks, governor, gate parity, four import contracts and both
+Pyrefly checks; 10 strict xfails remained expected. The gate log is
+`/tmp/phase4-import-source-scope-gate.log` (ephemeral).
 
 Independent Sol review of checkpoint 65 found missing activation digest and
 time bindings, a two-clock freshness race, the activation/read crossing, and
@@ -549,11 +565,11 @@ order a durable clock.
    block historical unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
-3. Join the complete configured-root file and repository-bound open-PR
-   linkage revalidation readers inside the activation barriers. The pure
-   mapper retains unassigned historical counters and refuses a positive issue
-   key shared by open PRs, but it has not established historical deaths or
-   resets. The typed session/round/counter parser keeps malformed values and
+3. Use the barrier-held file/linkage/counter scope in the production import
+   writer and revalidate SQL owner/run/settlement sources in its transaction.
+   The pure mapper retains unassigned historical counters and refuses a
+   positive issue key shared by open PRs, but it has not established
+   historical deaths or resets. The typed session/round/counter parser keeps malformed values and
    mode markers explicit; a syntactically valid session candidate is now an
    explicit unproven source blocker. Even a current reviewed baseline cannot
    certify it because newer legacy reviews could retain an older handle.
