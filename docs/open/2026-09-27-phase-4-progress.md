@@ -1433,3 +1433,33 @@ Full `make test` passed: 3,201 domain, 3,078 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-allocation-generation-gate.log` (ephemeral).
+
+## Checkpoint 57 — observed ordered replay from the persisted checkpoint (offline)
+
+A read-only join now revalidates complete successful-submission
+classifications and accepted allocation-generation sources in one SQL
+transaction. It pairs every open, unproductive and productive round with its
+source-backed allocation, replays the sealed outcomes in generation order from
+the persisted uncompacted checkpoint, and compares the result with the current
+execution state. Real fixtures cover plain and escalated productive reviews,
+an unproductive preparation stop, and a later productive round while an
+earlier round remains open. An unresolved historical ceiling submission blocks
+the join.
+
+This is explicitly an **observation**. The persisted checkpoint's initial
+state and execution origin do not yet have source-backed receipts, so matching
+that checkpoint cannot certify inherited failures, an imported reset or
+activation authority. Accepted historical generation assignment is available,
+but a complete historical replay still needs classification of successful
+ceiling submissions and other unresolved old commands. Source-backed origin,
+checkpoint and compaction proofs remain separate work.
+
+Independent Sol review identified the unproved checkpoint authority boundary.
+The result and API now name the observation explicitly and state that it
+cannot authorize activation. The final review found no remaining medium or
+high issue within that contract.
+
+Full `make test` passed: 3,201 domain, 3,083 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-observed-checkpoint-replay-gate.log` (ephemeral).

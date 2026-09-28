@@ -60,7 +60,8 @@ from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStat
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
-    MAX_EXECUTION_SUFFIX, review_generation_chain_digest, same_execution_episode,
+    MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
+    review_generation_chain_digest, same_execution_episode,
 )
 from ..domain.review_workflow import (
     ReviewWorkflowSnapshot, RecordedPullRequest, ReviewedBaseline, PullRequestState,
@@ -3265,7 +3266,7 @@ def _classified_productive_storage(
 
 @dataclass(frozen=True)
 class CompleteLegacyOrderedOutcomeCoverage:
-    """Current-generation rounds are ordered and productive outcomes have proofs."""
+    """Every allocated round is ordered and productive outcomes have proofs."""
 
     classifications: CompleteLegacyReviewSuccessClassifications
     episodes: tuple[LegacyOrderedExecutionEpisode, ...]
@@ -3326,6 +3327,46 @@ class BlockedLegacyOrderedOutcomeCoverage:
         validate_workflow_text(self.reason, "blocked ordered outcome reason")
 
 
+def _complete_legacy_ordered_outcomes(
+    current: CompleteLegacyReviewSuccessClassifications,
+) -> CompleteLegacyOrderedOutcomeCoverage:
+    if current.unresolved:
+        command_id = dict(current.unresolved[0].source.command_fields)["command_id"]
+        raise ValueError(f"successful command {command_id} remains unresolved: {current.unresolved[0].reason}")
+    proven: dict[str, tuple[str, VerifiedLegacyRoundOutcomeStorage]] = {}
+    for result in current.results:
+        round_storage = _classified_productive_storage(result)
+        round_id = round_storage.outcome.round.round_id
+        command_id = dict(result.source.command_fields)["command_id"]
+        if round_id in proven:
+            raise ValueError("two successful commands claim one productive round")
+        proven[round_id] = (command_id, round_storage)
+    grouped: dict[_ExecutionEpisodeKey, list[
+        OpenLegacyOrderedRound | FinalizedLegacyUnproductiveRound | FinalizedLegacyProductiveRound,
+    ]] = {}
+    for _, plan in current.storage.round_plans:
+        identity = plan.round
+        sealed = current.storage.round_storage._sealed_by_id.get(identity.round_id)
+        if sealed is None:
+            entry = OpenLegacyOrderedRound(identity)
+        elif isinstance(sealed.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+            matched = proven.pop(identity.round_id, None)
+            if matched is None or matched[1] != sealed:
+                raise ValueError("productive sealed round lacks one classified successful submission")
+            entry = FinalizedLegacyProductiveRound(sealed.outcome, CommandId(matched[0]))
+        else:
+            entry = FinalizedLegacyUnproductiveRound(sealed.outcome)
+        grouped.setdefault(_execution_episode_key(identity.binding), []).append(entry)
+    if proven:
+        raise ValueError("classified success has no productive sealed round")
+    episodes = tuple(LegacyOrderedExecutionEpisode(tuple(sorted(
+        entries, key=lambda item: item.round.sequence,
+    ))) for _, entries in sorted(grouped.items(), key=lambda pair: (
+        pair[0][0].repository, pair[0][0].target.number, pair[0][1], pair[0][2],
+    )))
+    return CompleteLegacyOrderedOutcomeCoverage(current, episodes)
+
+
 def verify_complete_legacy_ordered_outcome_coverage(
     db: sqlite3.Connection, observed: CompleteLegacyReviewSuccessClassifications,
 ) -> CompleteLegacyOrderedOutcomeCoverage | BlockedLegacyOrderedOutcomeCoverage:
@@ -3339,58 +3380,101 @@ def verify_complete_legacy_ordered_outcome_coverage(
     )
     if isinstance(current, BlockedLegacyReviewSuccessClassifications):
         return BlockedLegacyOrderedOutcomeCoverage(observed.storage.repository, current.reason)
-    if current.unresolved:
-        command_id = dict(current.unresolved[0].source.command_fields)["command_id"]
-        return BlockedLegacyOrderedOutcomeCoverage(
-            current.storage.repository, f"successful command {command_id} remains unresolved: {current.unresolved[0].reason}",
-        )
-    proven: dict[str, tuple[str, VerifiedLegacyRoundOutcomeStorage]] = {}
-    for result in current.results:
-        round_storage = _classified_productive_storage(result)
-        round_id = round_storage.outcome.round.round_id
-        command_id = dict(result.source.command_fields)["command_id"]
-        if round_id in proven:
-            return BlockedLegacyOrderedOutcomeCoverage(current.storage.repository,
-                                                       "two successful commands claim one productive round")
-        proven[round_id] = (command_id, round_storage)
-    grouped: dict[_ExecutionEpisodeKey, list[
-        OpenLegacyOrderedRound | FinalizedLegacyUnproductiveRound | FinalizedLegacyProductiveRound,
-    ]] = {}
     try:
-        for _, plan in current.storage.round_plans:
-            identity = plan.round
-            sealed = current.storage.round_storage._sealed_by_id.get(identity.round_id)
-            if sealed is None:
-                entry = OpenLegacyOrderedRound(identity)
-            elif isinstance(sealed.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
-                matched = proven.pop(identity.round_id, None)
-                if matched is None or matched[1] != sealed:
-                    raise ValueError("productive sealed round lacks one classified successful submission")
-                entry = FinalizedLegacyProductiveRound(sealed.outcome, CommandId(matched[0]))
-            else:
-                entry = FinalizedLegacyUnproductiveRound(sealed.outcome)
-            grouped.setdefault(_execution_episode_key(identity.binding), []).append(entry)
-        if proven:
-            raise ValueError("classified success has no productive sealed round")
-        episodes_list: list[LegacyOrderedExecutionEpisode] = []
-        for (workflow_key, execution_epoch, execution_episode), entries in sorted(
-            grouped.items(), key=lambda pair: (
-                pair[0][0].repository, pair[0][0].target.number, pair[0][1], pair[0][2],
-            ),
-        ):
-            episode = LegacyOrderedExecutionEpisode(tuple(sorted(
-                entries, key=lambda item: item.round.sequence,
-            )))
+        coverage = _complete_legacy_ordered_outcomes(current)
+        for episode in coverage.episodes:
+            first = episode.rounds[0].round.binding
+            workflow_key, execution_epoch, execution_episode = _execution_episode_key(first)
             current_workflow = load_review_workflow_row(db, workflow_key)
             if (current_workflow is None
                     or not isinstance(current_workflow.execution, ActivatedReviewExecution)
-                    or current_workflow.execution.binding != episode.rounds[0].round.binding
+                    or current_workflow.execution.binding != first
                     or any(item.round.binding != current_workflow.execution.binding for item in episode.rounds)):
                 raise ValueError(
                     f"execution {execution_epoch}:{execution_episode} requires accepted historical generation proof"
                 )
-            episodes_list.append(episode)
-        episodes = tuple(episodes_list)
-        return CompleteLegacyOrderedOutcomeCoverage(current, episodes)
+        return coverage
     except (TypeError, ValueError, KeyError, WorkflowAuthorityError, CorruptControlStore) as exc:
         return BlockedLegacyOrderedOutcomeCoverage(current.storage.repository, _printable(str(exc)))
+
+
+@dataclass(frozen=True)
+class ObservedLegacyOrderedCheckpointReplay:
+    """Suffix replay matches persisted state, starting from an unproved checkpoint.
+
+    This observation cannot certify the checkpoint/origin or authorize activation.
+    """
+
+    coverage: CompleteLegacyOrderedOutcomeCoverage
+    allocations: CompleteLegacyAllocationGenerationSources
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.coverage, CompleteLegacyOrderedOutcomeCoverage)
+                or not isinstance(self.allocations, CompleteLegacyAllocationGenerationSources)
+                or self.coverage.classifications.storage.round_storage != self.allocations.round_storage
+                or self.coverage.classifications.generation != self.allocations.generation
+                or len(self.coverage.episodes) != len(self.allocations.episodes)):
+            raise ValueError("ordered replay requires matching complete source proofs")
+        by_key = {_execution_episode_key(item.rounds[0].binding): item
+                  for item in self.allocations.episodes}
+        if len(by_key) != len(self.allocations.episodes):
+            raise ValueError("ordered replay repeats an execution allocation")
+        for episode in self.coverage.episodes:
+            allocation = by_key.get(_execution_episode_key(episode.rounds[0].round.binding))
+            if (allocation is None
+                    or tuple(item.round for item in episode.rounds) != allocation.rounds):
+                raise ValueError("ordered replay lacks exact allocation generation proof")
+            execution = allocation.workflow.execution
+            if not isinstance(execution, ActivatedReviewExecution):
+                raise ValueError("ordered replay requires activated execution")
+            replayed = replay_review_execution_generations(
+                execution.checkpoint, episode.outcomes,
+                tuple(item.boundary for item in allocation.boundaries),
+            )
+            if replayed != execution.state:
+                raise ValueError("ordered replay disagrees with current execution projection")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.coverage.source_digest, self.allocations.source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyOrderedCheckpointReplay:
+    repository: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked ordered replay requires a canonical repository")
+        validate_workflow_text(self.reason, "blocked ordered replay reason")
+
+
+def observe_legacy_ordered_checkpoint_replay(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewSuccessClassifications,
+    observed_allocations: CompleteLegacyAllocationGenerationSources,
+) -> ObservedLegacyOrderedCheckpointReplay | BlockedLegacyOrderedCheckpointReplay:
+    """Recheck sources and compare outcomes with persisted state from its unverified checkpoint."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("ordered replay requires an explicit SQL transaction")
+    if (not isinstance(observed, CompleteLegacyReviewSuccessClassifications)
+            or not isinstance(observed_allocations, CompleteLegacyAllocationGenerationSources)):
+        raise ValueError("ordered replay requires complete typed observations")
+    repository = observed.storage.repository
+    if repository != observed_allocations.round_storage.repository:
+        return BlockedLegacyOrderedCheckpointReplay(repository, "ordered replay repositories disagree")
+    current = classify_complete_legacy_review_successes(
+        db, observed.storage, observed.generation, observed.lineage,
+    )
+    if isinstance(current, BlockedLegacyReviewSuccessClassifications):
+        return BlockedLegacyOrderedCheckpointReplay(repository, current.reason)
+    allocations = verify_complete_legacy_allocation_generation_sources(
+        db, observed_allocations.round_storage, observed_allocations.generation,
+    )
+    if isinstance(allocations, BlockedLegacyAllocationGenerationSources):
+        return BlockedLegacyOrderedCheckpointReplay(repository, allocations.reason)
+    try:
+        return ObservedLegacyOrderedCheckpointReplay(_complete_legacy_ordered_outcomes(current), allocations)
+    except (KeyError, TypeError, ValueError) as exc:
+        return BlockedLegacyOrderedCheckpointReplay(repository, _printable(str(exc)))

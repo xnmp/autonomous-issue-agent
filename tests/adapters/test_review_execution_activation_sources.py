@@ -43,6 +43,8 @@ from issue_agent.adapters.review_execution_activation import (
     CompleteLegacyOrderedOutcomeCoverage, BlockedLegacyOrderedOutcomeCoverage,
     verify_complete_legacy_allocation_generation_sources,
     CompleteLegacyAllocationGenerationSources, BlockedLegacyAllocationGenerationSources,
+    observe_legacy_ordered_checkpoint_replay,
+    ObservedLegacyOrderedCheckpointReplay, BlockedLegacyOrderedCheckpointReplay,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -1265,6 +1267,79 @@ def _allocation_generation_coverage(store):
         assert db.total_changes == before
         db.rollback()
     return matched
+
+
+def _ordered_replay(store):
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+        allocations = verify_complete_legacy_allocation_generation_sources(
+            db, classified.storage.round_storage, classified.generation,
+        )
+        assert isinstance(allocations, CompleteLegacyAllocationGenerationSources)
+        before = db.total_changes
+        replayed = observe_legacy_ordered_checkpoint_replay(db, classified, allocations)
+        assert db.total_changes == before
+        db.rollback()
+    return replayed
+
+
+@pytest.mark.parametrize("escalated", [False, True])
+def test_ordered_outcome_replay_matches_current_productive_execution(rig, escalated):
+    store, gateway, _, control, plan, command = (
+        confirmed_escalation(rig) if escalated else confirmed_copy(rig)
+    )
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    control.finalize_completed_round(plan.round.round_id)
+
+    replayed = _ordered_replay(store)
+
+    assert isinstance(replayed, ObservedLegacyOrderedCheckpointReplay)
+    assert replayed.coverage.episodes[0].outcomes[0].round == plan.round
+    assert len(replayed.source_digest) == 64
+
+
+def test_ordered_outcome_replay_keeps_unproductive_finalization(stopped_round):
+    store, _, control, _, child, _, _ = stopped_round
+    finalized = control.finalize_completed_round(child.round.round_id)
+
+    replayed = _ordered_replay(store)
+
+    assert isinstance(replayed, ObservedLegacyOrderedCheckpointReplay)
+    assert replayed.coverage.episodes[0].outcomes == (finalized.outcome,)
+
+
+def test_ordered_outcome_replay_keeps_earlier_open_gap_before_productive_round(rig):
+    store, _, gateway, selection, control = rig
+    first = control.preflight(selection)
+    later = control.preflight(replace(
+        selection, request_id="preflight:replay-later", expected=current(store, selection).revision,
+    ))
+    command = command_for(current(store, selection))
+    control.register_submission(later.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.COPIED)
+    control.seal_completed_planning(later.round.round_id, current(store, selection).revision)
+    store.begin_command(command.command_id)
+    store.record_effect(EffectReceipt(command.command_id, CONTROL_OWNER, store.now(), store.now(),
+                                      EffectStatus.SUCCEEDED, remote_object_id="review:replay-later"))
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    finalized = control.finalize_completed_round(later.round.round_id)
+
+    replayed = _ordered_replay(store)
+
+    assert isinstance(replayed, ObservedLegacyOrderedCheckpointReplay)
+    assert [entry.round for entry in replayed.coverage.episodes[0].rounds] == [first.round, later.round]
+    assert replayed.coverage.episodes[0].outcomes == (finalized.outcome,)
+
+
+def test_ordered_outcome_replay_blocks_unresolved_historical_success(rig):
+    store, _, _, _, _, _, _ = accepted_generation_with_open_submission(rig)
+
+    replayed = _ordered_replay(store)
+
+    assert isinstance(replayed, BlockedLegacyOrderedCheckpointReplay)
+    assert "unresolved" in replayed.reason
 
 
 def test_allocation_generation_sources_assign_current_open_round(rig):

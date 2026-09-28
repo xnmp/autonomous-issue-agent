@@ -168,6 +168,14 @@ with `CLAUDE.md`, `AGENTS.md`, the
   proof must still be joined to checkpoint-55 productivity coverage and
   replayed against the execution checkpoint. Compacted and retired episodes
   await source-backed origin/checkpoint receipts and archived audit.
+- Checkpoint 57 joins complete success classification, ordered outcome
+  coverage and accepted allocation generations in one SQL snapshot, then
+  replays the outcomes from the persisted uncompacted checkpoint and compares
+  the current execution state. Plain/escalated productive, unproductive and
+  open-gap fixtures pass; unresolved historical ceiling submissions block.
+  The result is an observation only: no source-backed initial checkpoint or
+  origin receipt exists yet, so it cannot certify imported state or activate
+  execution.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -362,12 +370,11 @@ order a durable clock.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Join the accepted allocation-generation proof for each current,
-   uncompacted episode to complete successful-submission classifications, then
-   replay sealed outcomes in
-   execution order to establish resets. Verify delivered escalated
-   holds or their current observed state, and resolve or block historical
-   unregistered and old stale submissions. A completed
+2. Classify successful ceiling submissions and other unresolved historical
+   commands, then replay every eligible older-generation outcome against a
+   source-backed execution origin/checkpoint to establish resets. Verify
+   delivered escalated holds or their current observed state, and resolve or
+   block historical unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
 3. Join positive issue-keyed file counters to PRs with fresh complete
