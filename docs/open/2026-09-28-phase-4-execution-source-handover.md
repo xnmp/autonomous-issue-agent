@@ -185,6 +185,19 @@ with `CLAUDE.md`, `AGENTS.md`, the
   remain unresolved until their prior workflow state has independent source
   proof. This is still observational; it does not make a ceiling escalation a
   reviewed baseline or prove remote hold delivery.
+- Checkpoint 59 hardens the shared accepted-source reader. Each receipt lookup
+  checks all eight TEXT/BLOB variants of its namespace, scope and key through
+  the composite SQLite index, requiring exactly one canonical TEXT identity.
+  A matching BLOB alias cannot coexist unnoticed with a valid accepted gate,
+  registration, stage, baseline or generation source. Focused ceiling-gate
+  regressions cover aliases in all three identity columns. This closes source
+  ambiguity; it does not establish an execution origin or archived audit.
+
+The checkpoint-59 full `make test` gate passed: 3,201 domain, 3,092 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-source-alias-gate.log` (ephemeral). Independent Sol review
+confirmed the bounded composite-index lookup and found no blocking issue.
 
 The checkpoint-58 full `make test` gate passed: 3,201 domain, 3,089 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts

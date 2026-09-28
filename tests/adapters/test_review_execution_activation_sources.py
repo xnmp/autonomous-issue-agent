@@ -1583,7 +1583,8 @@ def test_ordered_outcome_replay_includes_accepted_ceiling_and_stale_round(rig):
 
 
 @pytest.mark.parametrize("damage", (
-    "transition", "transition_claim", "observation", "projection", "outbox_identity",
+    "transition", "transition_alias_namespace", "transition_alias_scope",
+    "transition_alias_key", "transition_claim", "observation", "projection", "outbox_identity",
 ))
 def test_ceiling_success_requires_independent_gate_sources(rig, damage):
     store, _, _, _, _, _, _ = accepted_generation_with_open_submission(rig)
@@ -1591,6 +1592,16 @@ def test_ceiling_success_requires_independent_gate_sources(rig, damage):
         if damage == "transition":
             db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-transition' "
                        "AND payload_json LIKE '%open_gate%'")
+        elif damage.startswith("transition_alias_"):
+            column = damage.removeprefix("transition_alias_")
+            assert column in {"namespace", "scope", "key"}
+            selected = ",".join(
+                f"CAST({name} AS BLOB)" if name == column else name
+                for name in ("namespace", "scope", "key")
+            )
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       f"SELECT {selected},claimed_at,payload_json FROM dedupe_keys "
+                       "WHERE namespace='workflow-transition' AND payload_json LIKE '%open_gate%'")
         elif damage == "transition_claim":
             db.execute("UPDATE dedupe_keys SET claimed_at='invalid' "
                        "WHERE namespace='workflow-transition' AND payload_json LIKE '%open_gate%'")

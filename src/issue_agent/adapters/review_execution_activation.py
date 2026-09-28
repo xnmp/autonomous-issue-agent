@@ -1166,13 +1166,23 @@ def read_legacy_review_owner_lineage(
 def _read_recording_source(
     db: sqlite3.Connection, namespace: str, repository: str, key: str,
 ) -> tuple[tuple[tuple[str, str | None], ...], str]:
+    aliases = db.execute(
+        "SELECT rowid,typeof(namespace) AS namespace_type,typeof(scope) AS scope_type,"
+        "typeof(key) AS key_type FROM dedupe_keys "
+        "WHERE namespace IN (?,CAST(? AS BLOB)) AND scope IN (?,CAST(? AS BLOB)) "
+        "AND key IN (?,CAST(? AS BLOB)) LIMIT 2",
+        (namespace, namespace, repository, repository, key, key),
+    ).fetchall()
+    if len(aliases) != 1 or any(aliases[0][f"{name}_type"] != "text"
+                                for name in ("namespace", "scope", "key")):
+        raise ValueError(f"{namespace} source has absent or aliased identity")
     sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in _DEDUPE_SOURCE_COLUMNS)
     metadata = db.execute(
         f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM dedupe_keys "
         "WHERE namespace=? AND scope=? AND key=?", (namespace, repository, key),
     ).fetchone()
-    if metadata is None:
-        raise ValueError(f"{namespace} source is absent")
+    if metadata is None or metadata["source_rowid"] != aliases[0]["rowid"]:
+        raise ValueError(f"{namespace} source changed during its read")
     if metadata["largest_value"] > MAX_LEGACY_RECORDING_BYTES:
         raise ValueError(f"{namespace} source exceeds its byte bound")
     columns = ",".join(
