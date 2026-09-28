@@ -84,7 +84,7 @@ from issue_agent.domain.review_execution_activation import (
 from tests.adapters.test_review_execution_control import rig, current, OWNER as CONTROL_OWNER
 from tests.adapters.test_review_productive_settlement import (
     accepted_generation_with_open_submission,
-    confirmed_copy, confirmed_escalation, workflow_for, _advance_generation_with_open_round,
+    confirmed_copy, confirmed_escalation, workflow_for, _forge_generation_with_open_round,
 )
 from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.domain.workflow_identity import WorkflowWriter
@@ -1413,15 +1413,15 @@ def test_allocation_generation_sources_block_accepted_transition_alias(rig):
     assert "repository alias" in matched.reason
 
 
-def test_allocation_generation_sources_block_unaccepted_old_open_round(rig):
+def test_allocation_generation_sources_block_forged_checkpoint_before_classification(rig):
     store, _, _, selection, control = rig
     control.preflight(selection)
-    _advance_generation_with_open_round(store, selection)
+    _forge_generation_with_open_round(store, selection)
 
     matched = _allocation_generation_coverage(store)
 
     assert isinstance(matched, BlockedLegacyAllocationGenerationSources)
-    assert "unaccepted generation" in matched.reason
+    assert "origin" in matched.reason
 
 
 @pytest.mark.parametrize("escalated", [False, True])
@@ -1491,15 +1491,15 @@ def test_ordered_outcome_coverage_blocks_unresolved_productive_round(rig):
     assert "unresolved" in ordered.reason
 
 
-def test_ordered_outcome_coverage_blocks_unaccepted_open_generation(rig):
+def test_ordered_outcome_coverage_blocks_forged_checkpoint_before_classification(rig):
     store, _, _, selection, control = rig
     control.preflight(selection)
-    _advance_generation_with_open_round(store, selection)
+    _forge_generation_with_open_round(store, selection)
 
     ordered = _ordered_coverage(store)
 
     assert isinstance(ordered, BlockedLegacyOrderedOutcomeCoverage)
-    assert "accepted historical generation proof" in ordered.reason
+    assert "origin" in ordered.reason
 
 
 def test_ordered_outcome_coverage_blocks_split_execution_identity(rig):

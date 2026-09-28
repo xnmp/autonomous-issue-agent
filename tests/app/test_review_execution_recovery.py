@@ -1,16 +1,19 @@
 """The composed review daemon finalizes an abandoned execution round during recovery."""
 
+import hashlib
+
 from issue_agent.adapters.review_effects import read_pull_request
 from issue_agent.adapters.review_execution_control import SQLiteReviewExecutionControl
 from issue_agent.adapters.workflow_codec import encode_workflow, decode_workflow
-from issue_agent.adapters.workflow_rows import load_review_workflow_row
+from issue_agent.adapters.workflow_rows import insert_imported_review_execution_origin, load_review_workflow_row
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.labels import Label
 from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.review_execution import (
-    ActivatedReviewExecution, ReviewExecutionBinding, ReviewExecutionCheckpoint,
+    ActivatedReviewExecution, ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
+    ReviewExecutionBinding, ReviewExecutionCheckpoint,
     ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionPolicy, ReviewExecutionState,
 )
 from issue_agent.domain.review_preflight import ReviewPreflightSelection
@@ -40,10 +43,28 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
         )
         db.execute("UPDATE workflows SET episode_json=? WHERE repository=? AND target_kind='pr' AND target_number=?",
                    (encode_workflow(ReviewFamilyEpisodes(prior.authority, prior.episode, execution)), REPO, PR))
+        source_digest = hashlib.sha256(b"fixture:recovery:sources").hexdigest()
+        inventory_digest = hashlib.sha256(b"fixture:recovery:inventory").hexdigest()
+        plan_digest = hashlib.sha256(b"fixture:recovery:plan").hexdigest()
+        imported = encode_workflow(ImportedReviewExecutionDecision(
+            execution.origin, execution.checkpoint, plan_digest, source_digest,
+        ))
+        activated_at = deployment.clock.now()
         db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
-                   (REPO, "review_execution", 1, "test", "test", deployment.clock.now().isoformat()))
+                   (REPO, "review_execution", 1, source_digest, inventory_digest,
+                    activated_at.isoformat()))
+        db.execute("INSERT INTO workflow_activation_evidence VALUES (?,?,?,?,?)",
+                   (REPO, "review_execution", 1, 0, plan_digest))
         db.execute("INSERT INTO workflow_components VALUES (?,?,?,?,?,?)",
                    (REPO, "pr", PR, "review_execution", 1, "execution:recovery"))
+        db.execute("INSERT INTO workflow_activation_imports VALUES (?,?,?,?,?,?,?)",
+                   (REPO, "review_execution", 1, "pr", PR, source_digest, imported))
+        insert_imported_review_execution_origin(
+            db, REPO, ImportedReviewExecutionOriginReceipt(
+                execution.origin, execution.checkpoint, plan_digest, source_digest,
+                inventory_digest, hashlib.sha256(imported.encode()).hexdigest(),
+            ), claimed_at=activated_at,
+        )
         snapshot = load_review_workflow_row(db, KEY)
         assert snapshot is not None
     assert review.control.claim_dispatch(REPO, "review", 1, AgentKind.REVIEW.name,

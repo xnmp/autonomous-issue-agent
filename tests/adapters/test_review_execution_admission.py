@@ -324,22 +324,33 @@ def test_inactive_execution_cannot_accept_a_child_captured_from_another_authorit
     assert_unpaid(inactive)
 
 
-@pytest.mark.parametrize("current_hold", ["failure_ceiling", "already_reviewed"])
-def test_progression_after_planning_can_make_new_child_money_ineligible(planned, current_hold):
+def test_reviewed_head_after_planning_makes_new_child_money_ineligible(planned):
     store, selection, _, child = planned
     snapshot = current(store, selection)
-    if current_hold == "failure_ceiling":
-        state = replace(snapshot.execution.state, failures=selection.failure_ceiling)
-        updated = replace(snapshot, execution=replace(snapshot.execution, state=state,
-                          checkpoint=replace(snapshot.execution.checkpoint, state=state)))
-    else:
-        updated = replace(snapshot, episode=replace(snapshot.episode,
-                          continuation=replace(snapshot.episode.continuation, head_sha=selection.observation.head_sha)))
+    updated = replace(snapshot, episode=replace(snapshot.episode,
+                      continuation=replace(snapshot.episode.continuation, head_sha=selection.observation.head_sha)))
     with store.transaction() as db:
         db.execute("UPDATE workflows SET episode_json=?,version=version+1 WHERE target_kind='pr'",
                    (encode_workflow_episodes(updated),))
     assert current(store, selection).execution.state == updated.execution.state
     assert current(store, selection).episode == updated.episode
+    before = dump(store)
+    assert not store.reserve(request(child)).admitted
+    assert receipt(store) is None and dump(store) == before
+    assert_unpaid(store)
+
+
+def test_changed_initial_failure_count_after_planning_blocks_paid_admission(planned):
+    store, selection, _, child = planned
+    snapshot = current(store, selection)
+    state = replace(snapshot.execution.state, failures=selection.failure_ceiling)
+    changed = replace(snapshot, execution=replace(snapshot.execution, state=state,
+                      checkpoint=replace(snapshot.execution.checkpoint, state=state)))
+    with store.transaction() as db:
+        db.execute("UPDATE workflows SET episode_json=?,version=version+1 WHERE target_kind='pr'",
+                   (encode_workflow_episodes(changed),))
+    with pytest.raises(WorkflowAuthorityError, match="origin"):
+        current(store, selection)
     before = dump(store)
     assert not store.reserve(request(child)).admitted
     assert receipt(store) is None and dump(store) == before
@@ -352,6 +363,9 @@ def test_missing_epochs_cannot_restore_unbound_paid_review_with_authority_retain
     proposed = replace(request(child), workflow=None, review_child=None)
     with store.transaction() as db:
         for family in missing_epochs:
+            if family == "review_execution":
+                db.execute("DELETE FROM workflow_activation_imports WHERE family=?", (family,))
+                db.execute("DELETE FROM workflow_activation_evidence WHERE family=?", (family,))
             db.execute("DELETE FROM workflow_authority_epochs WHERE family=?", (family,))
     before = dump(store)
     assert not store.reserve(proposed).admitted

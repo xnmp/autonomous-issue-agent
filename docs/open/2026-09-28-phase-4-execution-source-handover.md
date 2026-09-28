@@ -192,6 +192,29 @@ with `CLAUDE.md`, `AGENTS.md`, the
   registration, stage, baseline or generation source. Focused ceiling-gate
   regressions cover aliases in all three identity columns. This closes source
   ambiguity; it does not establish an execution origin or archived audit.
+- Checkpoint 60 adds a typed imported-origin receipt and selected import
+  decision. The receipt records the sequence-zero checkpoint, activation-plan
+  digest, source and inventory digests, and decision digest. A fixture writes
+  the receipt with its execution component in one transaction. Active hot
+  reads require the canonical, nonreclaimable receipt and exact activation
+  epoch, plan, import decision and claim time; missing, changed, oversized or
+  TEXT/BLOB-aliased ancestry blocks. This is a fail-closed read prerequisite,
+  not a production activation writer: the fixture's source digests are
+  synthetic, and no complete legacy file/run/counter replay yet mints this
+  evidence. Initialized and renewed origins remain unsupported. Hot reads do
+  not replay retired prefixes after compaction; that requires archived-source
+  audit and durable checkpoint receipts.
+
+The checkpoint-60 full `make test` gate passed: 3,202 domain, 3,105 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-imported-origin-final-gate.log` (ephemeral). Independent Sol
+review found and verified fixes for decision-semantic, activation-time and
+TEXT/BLOB integer-alias gaps. The full gate also exposed older fixtures that
+changed initial checkpoints or forged generation without source evidence;
+their tests now assert the earlier origin refusal or use an accepted source
+transition. The composed recovery fixture now mints its synthetic origin in
+the same transaction as its component.
 
 The checkpoint-59 full `make test` gate passed: 3,201 domain, 3,092 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -411,10 +434,13 @@ order a durable clock.
    linked-issue observations. Shared or ambiguous issue counters cannot be
    copied to multiple PRs. Parse runtime-tagged session and round values,
    preserving real session provenance or blocking an unproved handle.
-4. Mint activation/renewal origin receipts, checkpoint receipts, bounded hot
-   reads and the archived-source audit required by the compaction contract.
-   The 4,096-round and generation-boundary suffix limits remain activation
-   gates until that work passes.
+4. Build the production import writer from revalidated legacy sources and
+   activation decisions, then mint initialized/renewed origin variants,
+   checkpoint receipts and the archived-source audit required by the
+   compaction contract. The new imported-origin hot read is a prerequisite;
+   it does not certify synthetic or unverified source digests. The 4,096-round
+   and generation-boundary suffix limits remain activation gates until that
+   work passes.
 5. Wire active round identity through production dispatch, child reservation
    and verdict registration; complete composed fault/recovery tests, offline
    shadow, rehearsal and activation. Phase-5 live windows require explicit

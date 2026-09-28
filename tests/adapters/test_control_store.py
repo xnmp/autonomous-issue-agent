@@ -3006,10 +3006,14 @@ def test_v25_inactive_review_cannot_load_with_retained_execution_authority(tmp_p
 
 def _activate_execution_fixture(db):
     from issue_agent.adapters.workflow_codec import encode_workflow
-    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    from issue_agent.adapters.workflow_rows import (
+        insert_imported_review_execution_origin, load_review_workflow_row,
+    )
     from issue_agent.domain.review_execution import (
-        ActivatedReviewExecution, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionOrigin,
-        ReviewExecutionOriginKind, ReviewExecutionPolicy, ReviewExecutionState,
+        ActivatedReviewExecution, ImportedReviewExecutionDecision,
+        ImportedReviewExecutionOriginReceipt, ReviewExecutionBinding,
+        ReviewExecutionCheckpoint, ReviewExecutionOrigin, ReviewExecutionOriginKind,
+        ReviewExecutionPolicy, ReviewExecutionState,
     )
     from issue_agent.domain.review_workflow import ReviewFamilyEpisodes
     from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
@@ -3023,9 +3027,25 @@ def _activate_execution_fixture(db):
     snapshot = dataclasses.replace(prior, execution=execution)
     db.execute("UPDATE workflows SET episode_json=? WHERE target_kind='pr'",
                (encode_workflow(ReviewFamilyEpisodes(prior.authority, prior.episode, execution)),))
-    db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_execution',5,'source','inventory',?)",
-               (NOW.isoformat(),))
+    source_digest = hashlib.sha256(b"fixture:execution:sources").hexdigest()
+    inventory_digest = hashlib.sha256(b"fixture:execution:inventory").hexdigest()
+    plan_digest = hashlib.sha256(b"fixture:execution:plan").hexdigest()
+    import_json = encode_workflow(ImportedReviewExecutionDecision(
+        execution.origin, execution.checkpoint, plan_digest, source_digest,
+    ))
+    db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_execution',5,?,?,?)",
+               (source_digest, inventory_digest, NOW.isoformat()))
+    db.execute("INSERT INTO workflow_activation_evidence VALUES ('o/r','review_execution',5,0,?)",
+               (plan_digest,))
     db.execute("INSERT INTO workflow_components VALUES ('o/r','pr',9,'review_execution',5,'execution:legacy')")
+    db.execute("INSERT INTO workflow_activation_imports VALUES ('o/r','review_execution',5,'pr',9,?,?)",
+               (source_digest, import_json))
+    insert_imported_review_execution_origin(
+        db, "o/r", ImportedReviewExecutionOriginReceipt(
+            execution.origin, execution.checkpoint, plan_digest, source_digest,
+            inventory_digest, hashlib.sha256(import_json.encode()).hexdigest(),
+        ), claimed_at=NOW,
+    )
     assert load_review_workflow_row(db, key) == snapshot
     return snapshot
 
@@ -3043,6 +3063,8 @@ def test_v25_active_execution_requires_matching_canonical_index_and_activation(t
         if corruption in {"missing_index", "missing_index_and_activation"}:
             db.execute("DELETE FROM workflow_components WHERE family='review_execution'")
         if corruption in {"missing_activation", "missing_index_and_activation"}:
+            db.execute("DELETE FROM workflow_activation_imports WHERE family='review_execution'")
+            db.execute("DELETE FROM workflow_activation_evidence WHERE family='review_execution'")
             db.execute("DELETE FROM workflow_authority_epochs WHERE family='review_execution'")
         if corruption == "index_epoch":
             db.execute("UPDATE workflow_components SET epoch=6 WHERE family='review_execution'")
@@ -3055,6 +3077,97 @@ def test_v25_active_execution_requires_matching_canonical_index_and_activation(t
         before = tuple(db.iterdump())
         with pytest.raises(WorkflowAuthorityError):
             load_review_workflow_row(db, original.revision.fence.key)
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("corruption", (
+    "missing_origin", "changed_origin", "oversized_origin", "aliased_origin", "aliased_activation",
+    "aliased_activation_epoch",
+    "malformed_claim", "different_claim", "changed_plan", "changed_import",
+    "forged_decision", "missing_import", "foreign_episode",
+))
+def test_active_execution_requires_exact_imported_origin_sources(tmp_path, corruption):
+    from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
+    from issue_agent.domain.review_execution import (
+        ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
+    )
+
+    store = _store(tmp_path)
+    _seed_v24_workflow_history(store)
+    store.initialize()
+    with store.transaction() as db:
+        snapshot = _activate_execution_fixture(db)
+        if corruption == "missing_origin":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-origin'")
+        elif corruption == "changed_origin":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='review-execution-origin'")
+        elif corruption == "oversized_origin":
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-origin'",
+                       ("x" * 262145,))
+        elif corruption == "aliased_origin":
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       "SELECT CAST(namespace AS BLOB),scope,key,claimed_at,payload_json FROM dedupe_keys "
+                       "WHERE namespace='review-execution-origin'")
+        elif corruption == "aliased_activation":
+            db.execute("INSERT INTO workflow_authority_epochs "
+                       "SELECT CAST(repository AS BLOB),family,epoch,source_digest,inventory_digest,activated_at "
+                       "FROM workflow_authority_epochs WHERE family='review_execution'")
+        elif corruption == "aliased_activation_epoch":
+            db.execute("INSERT INTO workflow_activation_evidence "
+                       "SELECT repository,family,CAST(epoch AS BLOB),ceiling,plan_digest "
+                       "FROM workflow_activation_evidence WHERE family='review_execution'")
+        elif corruption == "malformed_claim":
+            db.execute("UPDATE dedupe_keys SET claimed_at='invalid' WHERE namespace='review-execution-origin'")
+        elif corruption == "different_claim":
+            db.execute("UPDATE dedupe_keys SET claimed_at=? WHERE namespace='review-execution-origin'",
+                       ((NOW + timedelta(seconds=1)).isoformat(),))
+        elif corruption == "changed_plan":
+            db.execute("UPDATE workflow_activation_evidence SET plan_digest=? WHERE family='review_execution'",
+                       ("f" * 64,))
+        elif corruption == "changed_import":
+            db.execute("UPDATE workflow_activation_imports SET decision_json='{}' WHERE family='review_execution'")
+        elif corruption == "forged_decision":
+            raw = db.execute("SELECT decision_json FROM workflow_activation_imports "
+                             "WHERE family='review_execution'").fetchone()["decision_json"]
+            decision = decode_workflow(raw, ImportedReviewExecutionDecision)
+            changed_decision = dataclasses.replace(
+                decision, checkpoint=dataclasses.replace(
+                    decision.checkpoint, state=dataclasses.replace(
+                        decision.checkpoint.state, failures=decision.checkpoint.state.failures + 1,
+                    ),
+                ),
+            )
+            forged_json = encode_workflow(changed_decision)
+            db.execute("UPDATE workflow_activation_imports SET decision_json=? "
+                       "WHERE family='review_execution'", (forged_json,))
+            receipt_row = db.execute("SELECT payload_json FROM dedupe_keys "
+                                     "WHERE namespace='review-execution-origin'").fetchone()
+            receipt = decode_workflow(receipt_row["payload_json"], ImportedReviewExecutionOriginReceipt)
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-origin'",
+                       (encode_workflow(dataclasses.replace(
+                           receipt, import_decision_digest=hashlib.sha256(forged_json.encode()).hexdigest(),
+                       )),))
+        elif corruption == "missing_import":
+            db.execute("DELETE FROM workflow_activation_imports WHERE family='review_execution'")
+        else:
+            source = db.execute("SELECT payload_json FROM dedupe_keys "
+                                "WHERE namespace='review-execution-origin'").fetchone()
+            receipt = decode_workflow(source["payload_json"], ImportedReviewExecutionOriginReceipt)
+            initial = receipt.checkpoint.state
+            foreign = dataclasses.replace(
+                initial.binding, execution_episode="execution:foreign",
+            )
+            changed = dataclasses.replace(
+                receipt, checkpoint=dataclasses.replace(
+                    receipt.checkpoint, state=dataclasses.replace(initial, binding=foreign),
+                ),
+            )
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-origin'",
+                       (encode_workflow(changed),))
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="origin"):
+            load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before
 
 

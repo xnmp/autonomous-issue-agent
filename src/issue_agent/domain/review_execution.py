@@ -585,6 +585,53 @@ class ReviewExecutionOrigin:
 
 
 @dataclass(frozen=True)
+class ImportedReviewExecutionOriginReceipt:
+    """Immutable activation ancestry for an imported sequence-zero checkpoint."""
+
+    origin: ReviewExecutionOrigin
+    checkpoint: ReviewExecutionCheckpoint
+    activation_plan_digest: str
+    source_digest: str
+    inventory_digest: str
+    import_decision_digest: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionOrigin)
+                or self.origin.kind is not ReviewExecutionOriginKind.IMPORTED):
+            raise ValueError("imported execution origin requires an imported cause")
+        if (not isinstance(self.checkpoint, ReviewExecutionCheckpoint)
+                or self.checkpoint.through_sequence != 0
+                or self.checkpoint.boundary_cursor is not None):
+            raise ValueError("imported execution origin requires its initial checkpoint")
+        for name in ("activation_plan_digest", "source_digest", "inventory_digest", "import_decision_digest"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"imported execution origin {name} requires a SHA-256 digest")
+
+
+@dataclass(frozen=True)
+class ImportedReviewExecutionDecision:
+    """The activation plan's selected imported execution starting state."""
+
+    origin: ReviewExecutionOrigin
+    checkpoint: ReviewExecutionCheckpoint
+    activation_plan_digest: str
+    source_digest: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionOrigin)
+                or self.origin.kind is not ReviewExecutionOriginKind.IMPORTED
+                or not isinstance(self.checkpoint, ReviewExecutionCheckpoint)
+                or self.checkpoint.through_sequence != 0
+                or self.checkpoint.boundary_cursor is not None):
+            raise ValueError("imported execution decision requires its initial origin and checkpoint")
+        for name in ("activation_plan_digest", "source_digest"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+                raise ValueError(f"imported execution decision {name} requires a SHA-256 digest")
+
+
+@dataclass(frozen=True)
 class ExecutionNotActivated:
     pass
 

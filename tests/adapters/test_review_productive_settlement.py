@@ -443,7 +443,7 @@ def test_recovery_repairs_a_pre_joint_commit_with_a_recorded_baseline(rig):
     assert dump(store) == before
 
 
-def _advance_generation_with_open_round(store, selection):
+def _forge_generation_with_open_round(store, selection):
     with store.transaction() as db:
         prior = load_review_workflow_row(db, selection.expected.fence.key)
         fence = replace(prior.revision.fence, generation=prior.revision.fence.generation + 1)
@@ -545,8 +545,6 @@ def test_superseded_escalated_verdict_closes_productive_round_without_a_baseline
     before = dump(store)
     assert workflow.settle_submission(command.command_id) is None
     assert dump(store) == before
-    _advance_generation_with_open_round(store, selection)
-    assert current(store, selection).execution.state.productive_sequence == 0
 
 
 def test_expired_supersession_observation_cannot_retire_a_verdict(rig):
@@ -914,7 +912,6 @@ def test_refused_ceiling_replays_the_refusal_after_marker_failure(rig):
     with store.transaction() as db:
         db.execute("DROP TRIGGER refuse_settled")
     assert current(store, selection).execution.state.productive_sequence == plan.round.sequence
-    _advance_generation_with_open_round(store, selection)
 
     result = workflow.settle_submission(command.command_id)
 

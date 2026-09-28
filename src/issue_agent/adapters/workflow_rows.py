@@ -17,7 +17,9 @@ from ..domain.review_workflow import (
 )
 from ..domain.review_execution import (
     MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
-    ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary, ReviewRoundOutcome,
+    ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
+    ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary,
+    ReviewExecutionOriginKind, ReviewRoundOutcome,
     replay_review_execution_generations, review_generation_chain_digest, same_execution_episode,
 )
 from ..domain.review_rounds import (
@@ -43,7 +45,7 @@ from ..domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowFence,
     WorkflowKey, WorkflowRevision, target_family,
 )
-from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
+from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 
 
 class WorkflowAuthorityError(ValueError):
@@ -67,6 +69,7 @@ REVIEW_PREPARATION_NAMESPACE = "review-round-preparation"
 REVIEW_STALE_PRODUCTIVITY_NAMESPACE = "review-round-stale-productivity"
 REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE = "review-round-superseded-productivity"
 REVIEW_CEILING_PRODUCTIVITY_NAMESPACE = "review-round-ceiling-productivity"
+REVIEW_EXECUTION_ORIGIN_NAMESPACE = "review-execution-origin"
 RECORDED_REVIEW_NAMESPACE = "review-recorded-submission"
 
 
@@ -493,10 +496,155 @@ def _check_intent_index(intent_row: sqlite3.Row, intent: RearmIntent | ReviewRea
         raise WorkflowEncodingError("rearm index disagrees with its validated payload")
 
 
+def insert_imported_review_execution_origin(
+    db: sqlite3.Connection, repository: str, receipt: ImportedReviewExecutionOriginReceipt,
+    *, claimed_at: datetime,
+) -> None:
+    """Publish an imported origin in the transaction that publishes its component."""
+    if (not isinstance(receipt, ImportedReviewExecutionOriginReceipt)
+            or receipt.checkpoint.state.binding.rejection.fence.key.repository != repository
+            or not isinstance(claimed_at, datetime) or claimed_at.tzinfo is None
+            or claimed_at.utcoffset() is None):
+        raise ValueError("imported origin requires matching typed activation evidence")
+    db.execute(
+        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+        (REVIEW_EXECUTION_ORIGIN_NAMESPACE, repository, receipt.origin.evidence_id,
+         claimed_at.isoformat(), encode_workflow(receipt)),
+    )
+
+
+def _unique_text_identity_rowid(
+    db: sqlite3.Connection, table: str, text_fields: tuple[tuple[str, str], ...],
+    integer_fields: tuple[tuple[str, int], ...] = (),
+) -> int:
+    predicates = [f"{name} IN (?,CAST(? AS BLOB))" for name, _ in text_fields]
+    predicates.extend(f"{name} IN (?,CAST(? AS BLOB))" for name, _ in integer_fields)
+    columns = ",".join(f"typeof({name}) AS {name}_type" for name, _ in (*text_fields, *integer_fields))
+    params = (*tuple(value for _, value in text_fields for _ in range(2)),
+              *tuple(value for _, value in integer_fields for _ in range(2)))
+    rows = db.execute(
+        f"SELECT rowid,{columns} FROM {table} WHERE {' AND '.join(predicates)} LIMIT 2",
+        params,
+    ).fetchall()
+    if (len(rows) != 1
+            or any(rows[0][f"{name}_type"] != "text" for name, _ in text_fields)
+            or any(rows[0][f"{name}_type"] != "integer" for name, _ in integer_fields)):
+        raise WorkflowAuthorityError(f"review execution origin {table} source is absent or aliased")
+    return rows[0]["rowid"]
+
+
+def _check_imported_execution_origin(
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+) -> None:
+    if execution.origin.kind is not ReviewExecutionOriginKind.IMPORTED:
+        raise WorkflowAuthorityError("review execution origin requires a supported durable cause")
+    origin_id = execution.origin.evidence_id
+    origin_rowid = _unique_text_identity_rowid(
+        db, "dedupe_keys", (("namespace", REVIEW_EXECUTION_ORIGIN_NAMESPACE),
+                            ("scope", scope[0]), ("key", origin_id)),
+    )
+    metadata = db.execute(
+        "SELECT rowid,max(ifnull(length(CAST(claimed_at AS BLOB)),0),"
+        "ifnull(length(CAST(payload_json AS BLOB)),0)) AS largest "
+        "FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (REVIEW_EXECUTION_ORIGIN_NAMESPACE, scope[0], origin_id),
+    ).fetchone()
+    if (metadata is None or metadata["rowid"] != origin_rowid
+            or metadata["largest"] > MAX_WORKFLOW_PAYLOAD_BYTES):
+        raise WorkflowAuthorityError("review execution origin source exceeds its bound")
+    row = db.execute(
+        "SELECT rowid,claimed_at,reusable_after,payload_json,"
+        "typeof(claimed_at) AS claimed_type,typeof(payload_json) AS payload_type "
+        "FROM dedupe_keys WHERE rowid=? AND namespace=? AND scope=? AND key=?",
+        (metadata["rowid"], REVIEW_EXECUTION_ORIGIN_NAMESPACE, scope[0], origin_id),
+    ).fetchone()
+    if (row is None or row["rowid"] != origin_rowid
+            or row["reusable_after"] is not None or row["claimed_type"] != "text"
+            or row["payload_type"] != "text"):
+        raise WorkflowAuthorityError("review execution origin source changed or is malformed")
+    try:
+        claimed = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
+        if claimed.tzinfo is None or claimed.utcoffset() is None:
+            raise ValueError("origin claim has no timezone")
+        captured = decode_workflow(row["payload_json"], ImportedReviewExecutionOriginReceipt)
+        if encode_workflow(captured) != row["payload_json"]:
+            raise ValueError("origin receipt is not canonical")
+    except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
+        raise WorkflowAuthorityError("review execution origin receipt is unreadable") from exc
+    origin_binding = captured.checkpoint.state.binding
+    if (captured.origin != execution.origin
+            or not same_execution_episode(origin_binding, execution.binding)
+            or origin_binding.execution_epoch != execution.binding.execution_epoch
+            or captured.checkpoint.policy != execution.checkpoint.policy
+            or (execution.checkpoint.through_sequence == 0
+                and execution.checkpoint.boundary_cursor is None
+                and execution.checkpoint != captured.checkpoint)):
+        raise WorkflowAuthorityError("review execution origin disagrees with its component")
+    family = WorkflowFamily.REVIEW_EXECUTION.value
+    activation_rowid = _unique_text_identity_rowid(
+        db, "workflow_authority_epochs", (("repository", scope[0]), ("family", family)),
+    )
+    evidence_rowid = _unique_text_identity_rowid(
+        db, "workflow_activation_evidence", (("repository", scope[0]), ("family", family)),
+        (("epoch", execution.binding.execution_epoch),),
+    )
+    import_rowid = _unique_text_identity_rowid(
+        db, "workflow_activation_imports",
+        (("repository", scope[0]), ("family", family), ("target_kind", scope[1])),
+        (("target_number", scope[2]),),
+    )
+    activation = db.execute(
+        "SELECT epoch,source_digest,inventory_digest,activated_at FROM workflow_authority_epochs "
+        "WHERE rowid=? AND repository=? AND family=? AND length(CAST(source_digest AS BLOB))<=64 "
+        "AND length(CAST(inventory_digest AS BLOB))<=64 "
+        "AND length(CAST(activated_at AS BLOB))<=64",
+        (activation_rowid, scope[0], family),
+    ).fetchone()
+    evidence = db.execute(
+        "SELECT plan_digest FROM workflow_activation_evidence "
+        "WHERE rowid=? AND repository=? AND family=? AND epoch=?",
+        (evidence_rowid, scope[0], family, execution.binding.execution_epoch),
+    ).fetchone()
+    imported = db.execute(
+        "SELECT epoch,source_digest,decision_json FROM workflow_activation_imports "
+        "WHERE rowid=? AND repository=? AND family=? AND target_kind=? AND target_number=? "
+        "AND length(CAST(source_digest AS BLOB))<=64 "
+        "AND length(CAST(decision_json AS BLOB))<=?",
+        (import_rowid, scope[0], family, scope[1], scope[2], MAX_WORKFLOW_PAYLOAD_BYTES),
+    ).fetchone()
+    if activation is None or evidence is None or imported is None:
+        raise WorkflowAuthorityError("review execution origin lost its activation or import source")
+    try:
+        activated = datetime.fromisoformat(activation["activated_at"].replace("Z", "+00:00"))
+        decision = decode_workflow(imported["decision_json"], ImportedReviewExecutionDecision)
+        if (activated.tzinfo is None or activated.utcoffset() is None
+                or encode_workflow(decision) != imported["decision_json"]):
+            raise ValueError("origin activation decision or time is not canonical")
+    except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
+        raise WorkflowAuthorityError("review execution origin activation decision is unreadable") from exc
+    if (claimed != activated
+            or type(activation["epoch"]) is not int
+            or activation["epoch"] != execution.binding.execution_epoch
+            or activation["source_digest"] != captured.source_digest
+            or activation["inventory_digest"] != captured.inventory_digest
+            or evidence["plan_digest"] != captured.activation_plan_digest
+            or imported["epoch"] != execution.binding.execution_epoch
+            or imported["source_digest"] != captured.source_digest
+            or type(imported["decision_json"]) is not str
+            or decision.origin != captured.origin
+            or decision.checkpoint != captured.checkpoint
+            or decision.activation_plan_digest != captured.activation_plan_digest
+            or decision.source_digest != captured.source_digest
+            or hashlib.sha256(imported["decision_json"].encode()).hexdigest()
+            != captured.import_decision_digest):
+        raise WorkflowAuthorityError("review execution origin lost its activation or import source")
+
+
 def _check_execution_projection(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
     revision: WorkflowRevision,
 ) -> None:
+    _check_imported_execution_origin(db, scope, execution)
     episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
     count = db.execute(
         "SELECT COUNT(*) AS total FROM review_execution_rounds WHERE repository=? AND target_number=? "

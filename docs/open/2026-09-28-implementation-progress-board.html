@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 28 Sep 2026, 19:38 AEST · Latest accepted checkpoint: phase 4 source alias hardening</p>
+      <p class="meta">Updated 28 Sep 2026, 20:22 AEST · Latest accepted checkpoint: imported execution origin prerequisite</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Source inventories, accepted ceiling productivity, generation assignment and persisted checkpoint replay are available offline. Next: resolve refused ceiling decisions, prove the initial checkpoint and delivered hold state, then map issue counters and complete source-backed compaction. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Offline source replay and an imported-origin hot-read prerequisite are in place. Next: build the production source-backed import writer, resolve refused ceilings and remote holds, map issue counters, and complete compaction audit. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -120,6 +120,7 @@
           <li><time datetime="2026-09-28T19:01:00+10:00">28 Sep 2026, 19:01 AEST</time><strong>Observed checkpoint replay accepted offline · 3 of 6 accepted</strong><p>Complete classifications and accepted allocations now replay outcomes from the persisted uncompacted checkpoint and match current state. Current-generation productive, unproductive and open-gap fixtures pass; unresolved historical ceiling submissions block. The initial checkpoint and origin remain unproved. Sol review and the full gate passed: 3,201 domain, 3,083 adapter and 2,866 app tests. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T19:23:00+10:00">28 Sep 2026, 19:23 AEST</time><strong>Accepted ceiling productivity proof · 3 of 6 accepted</strong><p>A successful ceiling escalation now joins its productive round, fresh observation, accepted gate transition and exact durable hold command. Historical ceiling plus stale verdict replay passes. Refused decisions, checkpoint origin and remote hold delivery remain open. Independent Sol review found two source gaps; both were fixed and regression-tested. Full gate passed: 3,201 domain, 3,089 adapter and 2,866 app tests. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T19:38:00+10:00">28 Sep 2026, 19:38 AEST</time><strong>Source alias hardening accepted offline · 3 of 6 accepted</strong><p>The shared receipt reader now rejects matching BLOB aliases in namespace, scope or key through bounded composite-index seeks. Ceiling-gate mutations in all three columns block classification. Sol review and the full gate passed: 3,201 domain, 3,092 adapter and 2,866 app tests. Origin, compaction and remote hold evidence remain open. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-28T20:22:00+10:00">28 Sep 2026, 20:22 AEST</time><strong>Imported origin read prerequisite accepted offline · 3 of 6 accepted</strong><p>A typed sequence-zero receipt and import decision now bind active execution hot reads to canonical activation ancestry. Missing, changed, oversized or aliased sources block. This is a read prerequisite; the production source-backed import writer and retired-prefix audit remain open. Sol review and the full gate passed: 3,202 domain, 3,105 adapter and 2,866 app tests. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

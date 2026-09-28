@@ -9,7 +9,8 @@ import pytest
 from issue_agent.domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from issue_agent.domain.review_execution import (
     MAX_EXECUTION_SUFFIX, MAX_ROUND_CHILDREN, ActivatedReviewExecution, AddReviewStrike, ClearReviewSession,
-    CopiedReviewProgress, ImportedReviewSession, LaunchedReviewChild, NoReviewSession,
+    CopiedReviewProgress, ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
+    ImportedReviewSession, LaunchedReviewChild, NoReviewSession,
     PaidReviewProgress, PreserveDisplayedRound, PreserveReviewSession, ReplaceReviewSession,
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
@@ -30,6 +31,24 @@ from issue_agent.domain.workflow_identity import (
 
 
 MAX_INTEGER = 2**63 - 1
+
+
+def test_imported_origin_contract_rejects_noninitial_or_malformed_activation_evidence():
+    origin = ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:1")
+    initial = checkpoint()
+    receipt = ImportedReviewExecutionOriginReceipt(
+        origin, initial, "a" * 64, "b" * 64, "c" * 64, "d" * 64,
+    )
+    decision = ImportedReviewExecutionDecision(origin, initial, "a" * 64, "b" * 64)
+    assert receipt.checkpoint == decision.checkpoint
+    with pytest.raises(ValueError, match="initial checkpoint"):
+        replace(receipt, checkpoint=checkpoint(through=1))
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(receipt, inventory_digest="x" * 64)
+    with pytest.raises(ValueError, match="initial origin and checkpoint"):
+        replace(decision, origin=ReviewExecutionOrigin(ReviewExecutionOriginKind.RENEWED, "origin:2"))
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(decision, source_digest="")
 
 
 def test_generation_chain_digest_binds_order_and_rejects_malformed_receipts():
