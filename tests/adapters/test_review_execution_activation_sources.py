@@ -7,7 +7,8 @@ import pytest
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
-    read_legacy_review_run_page, read_legacy_review_submission_page,
+    read_complete_legacy_review_runs, read_legacy_review_run_page, read_legacy_review_submission_page,
+    revalidate_complete_legacy_review_runs,
     read_legacy_review_submission_receipt_page, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
     read_legacy_review_owner_lineage,
 )
@@ -19,6 +20,7 @@ from issue_agent.domain.review_execution_activation import (
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
     LegacyReviewOwnerLineage, UnreadableLegacyReviewOwnerLineage,
+    CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
 )
 
 
@@ -424,6 +426,90 @@ def test_owner_lineage_includes_implicit_legacy_owner_without_config(tmp_path):
         db.rollback()
     assert isinstance(source, LegacyReviewOwnerLineage)
     assert source.owners == ("o/r:review:new", "o/r:review")
+
+
+def test_complete_owner_run_scan_covers_all_pages_and_implicit_legacy_owner_without_writes(tmp_path):
+    control = _control(tmp_path)
+    current = "o/r:review:new"
+    with closing(control._connect()) as db:
+        for number in range(MAX_RUN_SOURCE_PAGE + 3):
+            _run(db, number, owner="o/r:review")
+        _run(db, 999, owner=current)
+        _run(db, 1000, owner="other/r:review")
+        db.commit()
+        db.execute("BEGIN")
+        lineage = read_legacy_review_owner_lineage(db, "o/r", current)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        before = db.total_changes
+        result = read_complete_legacy_review_runs(db, lineage)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(result, CompleteLegacyReviewRuns)
+    assert len(result.runs) == MAX_RUN_SOURCE_PAGE + 4
+    assert {run.run_id for run in result.runs} == {f"run-{number}" for number in (*range(MAX_RUN_SOURCE_PAGE + 3), 999)}
+    assert len(result.source_digest) == 64
+
+
+@pytest.mark.parametrize("damage", ["blob_owner", "oversized", "changed_lineage", "too_many", "scan_bound"])
+def test_complete_owner_run_scan_blocks_unreadable_incomplete_or_changed_sources(tmp_path, monkeypatch, damage):
+    control = _control(tmp_path)
+    current = "o/r:review:new"
+    with closing(control._connect()) as db:
+        _run(db, 1, owner="o/r:review")
+        db.commit()
+        db.execute("BEGIN")
+        lineage = read_legacy_review_owner_lineage(db, "o/r", current)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        db.rollback()
+        if damage == "blob_owner":
+            db.execute("UPDATE runs SET owner_id=CAST(owner_id AS BLOB) WHERE run_id='run-1'")
+        elif damage == "oversized":
+            db.execute("UPDATE runs SET outcome=? WHERE run_id='run-1'", ("x" * 65537,))
+        elif damage == "changed_lineage":
+            _retired_review_owner(db, "o/r:review:old", current)
+        else:
+            _run(db, 2, owner=current if damage == "too_many" else "other/r:review")
+            if damage == "too_many":
+                monkeypatch.setattr("issue_agent.adapters.review_execution_activation.MAX_LEGACY_RUN_INVENTORY_ROWS", 1)
+            else:
+                monkeypatch.setattr("issue_agent.adapters.review_execution_activation.MAX_LEGACY_RUN_SCAN_ROWS", 1)
+        db.commit()
+        db.execute("BEGIN")
+        before = db.total_changes
+        result = read_complete_legacy_review_runs(db, lineage)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewRuns)
+    if damage == "changed_lineage":
+        assert "lineage" in result.reason
+    elif damage == "scan_bound":
+        assert "scan bound" in result.reason
+    else:
+        assert result.owner_id in lineage.owners
+        assert result.source_rowid is not None
+
+
+def test_run_inventory_revalidation_rejects_partial_or_changed_caller_evidence(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _run(db, 1, owner=OWNER)
+        db.commit()
+        db.execute("BEGIN")
+        lineage = read_legacy_review_owner_lineage(db, "o/r", OWNER)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        observed = read_complete_legacy_review_runs(db, lineage)
+        assert isinstance(observed, CompleteLegacyReviewRuns)
+        partial = CompleteLegacyReviewRuns(lineage, ())
+        assert isinstance(revalidate_complete_legacy_review_runs(db, partial), BlockedLegacyReviewRuns)
+        assert revalidate_complete_legacy_review_runs(db, observed) == observed
+        db.rollback()
+        db.execute("UPDATE runs SET outcome='changed' WHERE run_id='run-1'")
+        db.commit()
+        db.execute("BEGIN")
+        assert isinstance(revalidate_complete_legacy_review_runs(db, observed), BlockedLegacyReviewRuns)
+        db.rollback()
 
 
 @pytest.mark.parametrize("anomaly", [

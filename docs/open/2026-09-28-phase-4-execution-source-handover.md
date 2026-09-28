@@ -42,16 +42,20 @@ with `CLAUDE.md`, `AGENTS.md`, the
   result proves a recorded baseline for that command only. It does not certify
   the full historical snapshot, execution productivity or a reset. Escalated
   verdict holds and outer-round ordering remain separate obligations.
+- Checkpoint 37 adds a one-pass, bounded, read-only run scan across the
+  rechecked owner closure. It blocks unreadable owner sources, changed lineage,
+  oversize retained sources or total scan excess. A caller-held complete
+  result must be revalidated against SQL under activation barriers before use.
 
-The checkpoint-36 full `make test` gate passed: 3,191 domain, 2,878 adapter
+The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
 and both Pyrefly checks. Ten strict xfails remained expected. The log is
-`/tmp/phase4-recorded-review-gate.log` (ephemeral). Independent Sol review
-found the reset/productivity overclaim, exposed unverifiable snapshot, forged
-source cursor and duplicate review receipt gap. The proof now exposes only the
-baseline, revision pair and audit, and it rejects forged cursors or duplicate
-review identities. Exact historical snapshots are not certified from these
-sources.
+`/tmp/phase4-complete-runs-gate.log` (ephemeral). Independent Sol review
+found the initial per-owner scan repeated full table scans and that a
+caller-held complete value could be partial. A one-pass total scan limit and
+SQL revalidation address both; the second pass found no remaining medium or
+high issue. Exact historical workflow snapshots and productive execution
+resets remain unproved by the current source readers.
 
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
@@ -61,11 +65,11 @@ occurred.
 
 ## Next required boundary
 
-1. Complete every paged run scan for the inventoried owner closure under the
-   same SQL snapshot, then revalidate the closure and runs under activation
-   barriers before commit. Daemon boot's `adopt_legacy_owner` rewrites some
-   prior run owners, so neither the current owner nor configured owners alone
-   establish complete historical run evidence.
+1. Revalidate the bounded owner closure and run inventory under activation
+   barriers before any import commit. Daemon boot's `adopt_legacy_owner`
+   rewrites some prior run owners, so neither the current owner nor configured
+   owners alone establish complete historical run evidence. Caller-held
+   complete values are observational until this SQL recheck succeeds.
 2. Join verified plain recorded baselines and the inventoried registration/index
    rows to bounded round plans. Verify escalated verdict hold provenance and
    classify unrecorded or stale successful commands separately. A completed

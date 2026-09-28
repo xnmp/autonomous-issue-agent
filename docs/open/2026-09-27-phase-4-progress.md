@@ -966,8 +966,8 @@ activation revalidation. The verifier rechecks the inventoried command rowid
 and the producer's unique GitHub review identity rule. It does not certify the
 full historical workflow snapshot, execution productivity, a reset, or
 outer-round ordering. Missing or contradictory facts return an explicit
-unverified variant; an unrecorded
-successful command does not prove the absence of a reset. Escalated verdicts
+unverified variant; an unrecorded successful command does not prove the
+absence of a reset. Escalated verdicts
 remain blocked until their hold provenance is separately verified. Independent
 Sol review found the initial reset/productivity overclaim, an exposed
 unverifiable snapshot, a forged source cursor and a duplicate review receipt
@@ -975,3 +975,23 @@ gap; the proof was narrowed and regression cases were added. Full `make test`
 passed: 3,191 domain, 2,878 adapter and 2,866 app tests, plus hooks, governor,
 gate parity, four import contracts and both Pyrefly checks. Ten strict xfails
 remained expected. Log: `/tmp/phase4-recorded-review-gate.log` (ephemeral).
+
+## Checkpoint 37 — complete bounded owner-run inventory (offline)
+
+The execution activation reader now scans `runs` once by rowid under an
+explicit SQL snapshot and retains every source owned by the rechecked review
+owner lineage, including the implicit legacy owner. It visits at most one
+million total rows and retains at most 8,192 matching rows or 16 MiB of
+source text; exceeding a bound returns a blocker. Matching BLOB owner IDs,
+unreadable rows and changed lineage also block. A complete result contains
+only readable, unique owner sources and a digest independent of SQLite page
+cursors. A separate revalidation call rescans SQL and refuses a caller-held
+partial or changed result. Activation must use that call under deployment
+barriers before committing any import; this offline reader activates nothing.
+Independent Sol review found the initial per-owner scan could repeatedly
+traverse unrelated rows and that a caller could construct a partial complete
+value. The one-pass bound and revalidation address those findings; its second
+pass found no remaining medium or high issue. Full `make test` passed: 3,192
+domain, 2,885 adapter and 2,866 app tests, plus hooks, governor, gate parity,
+four import contracts and both Pyrefly checks. Ten strict xfails remained
+expected. Log: `/tmp/phase4-complete-runs-gate.log` (ephemeral).

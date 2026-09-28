@@ -17,6 +17,8 @@ from ..domain.review_execution_activation import (
     MAX_LEGACY_SQL_TEXT_BYTES, MAX_SQL_ROWID, MIN_SQL_ROWID, LegacyExecutionCounterRecord,
     LegacyExecutionEntry, LegacyExecutionPRRecord,
     LegacyExecutionRunPage, LegacyExecutionRunRecord, LegacyReviewRunState, UnreadableLegacyExecutionRun,
+    CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
+    MAX_LEGACY_RUN_INVENTORY_ROWS, MAX_LEGACY_RUN_INVENTORY_BYTES,
     LEGACY_SUBMISSION_COMMAND_COLUMNS, LEGACY_SUBMISSION_RECEIPT_COLUMNS,
     LegacyReviewSubmissionPage, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
@@ -44,6 +46,7 @@ _POSITIVE = re.compile(r"[1-9][0-9]{0,18}")
 _SIGNED = re.compile(r"-?[1-9][0-9]{0,18}")
 _MAX_NUMBER = 2**63 - 1
 MAX_RUN_SOURCE_PAGE = 256
+MAX_LEGACY_RUN_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_SOURCE_PAGE = 64
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
 _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
@@ -116,6 +119,46 @@ def read_legacy_execution_roots(roots: LegacyRoots) -> tuple[LegacyExecutionEntr
     return tuple(entry for label, path in distinct_roots(roots) for entry in read_legacy_execution_state(path, label))
 
 
+def _decode_run_source(
+    owner_id: str, rowid: int, source: sqlite3.Row,
+) -> LegacyExecutionRunRecord | UnreadableLegacyExecutionRun:
+    if source["type_owner_id"] != "text" or source["raw_owner_id"] != owner_id.encode("utf-8"):
+        return UnreadableLegacyExecutionRun(rowid, "run owner has a non-text or changed SQL identity")
+    try:
+        fields = {column: _sql_text(source[f"type_{column}"], source[f"raw_{column}"])
+                  for column in _RUN_COLUMNS}
+        state = LegacyReviewRunState(fields["state"])
+        return LegacyExecutionRunRecord(
+            rowid, owner_id, fields["run_id"], fields["dispatch_id"], fields["kind"], state,
+            fields["config_version"], fields["started_at"], fields["completed_at"], fields["outcome"],
+            fields["provider_receipt_id"], fields["workflow_binding_json"], fields["workflow_episode_key"],
+            fields["review_round_id"], fields["review_child_id"],
+        )
+    except (TypeError, ValueError, UnicodeError):
+        return UnreadableLegacyExecutionRun(rowid, "run source has malformed fields")
+
+
+def _run_source_at_rowid(
+    db: sqlite3.Connection, rowid: int, owner_id: str,
+) -> LegacyExecutionRunRecord | UnreadableLegacyExecutionRun:
+    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in ("owner_id", *_RUN_COLUMNS))
+    metadata = db.execute(
+        f"SELECT max({sizes}) AS largest_value FROM runs WHERE rowid=?", (rowid,),
+    ).fetchone()
+    if metadata is None or metadata["largest_value"] is None:
+        return UnreadableLegacyExecutionRun(rowid, "run source changed during its read")
+    if metadata["largest_value"] > MAX_LEGACY_SQL_TEXT_BYTES:
+        return UnreadableLegacyExecutionRun(rowid, "run source field exceeds the SQL text bound")
+    fields = "typeof(owner_id) AS type_owner_id,CAST(owner_id AS BLOB) AS raw_owner_id," + ",".join(
+        f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+        for column in _RUN_COLUMNS
+    )
+    source = db.execute(f"SELECT {fields} FROM runs WHERE rowid=?", (rowid,)).fetchone()
+    if source is None:
+        return UnreadableLegacyExecutionRun(rowid, "run source changed during its read")
+    return _decode_run_source(owner_id, rowid, source)
+
+
 def read_legacy_review_run_page(
     db: sqlite3.Connection, owner_id: str, *, after_rowid: int | None = None,
 ) -> LegacyExecutionRunPage:
@@ -130,12 +173,18 @@ def read_legacy_review_run_page(
         raise ValueError("legacy run scan requires an explicit SQL transaction")
     if not isinstance(owner_id, str) or not owner_id or len(owner_id) > 512:
         raise ValueError("legacy run scan requires a bounded owner identity")
+    try:
+        owner_bytes = owner_id.encode("utf-8")
+    except UnicodeError as exc:
+        raise ValueError("legacy run scan requires a UTF-8 owner identity") from exc
     if after_rowid is not None and (type(after_rowid) is not int or not MIN_SQL_ROWID <= after_rowid <= MAX_SQL_ROWID):
         raise ValueError("legacy run scan requires a valid cursor")
 
-    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in _RUN_COLUMNS)
-    predicate = "WHERE owner_id=?" + (" AND rowid>?" if after_rowid is not None else "")
-    params = (owner_id,) if after_rowid is None else (owner_id, after_rowid)
+    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in ("owner_id", *_RUN_COLUMNS))
+    predicate = "WHERE owner_id IN (?,?)" + (" AND rowid>?" if after_rowid is not None else "")
+    params = (owner_id, owner_bytes) if after_rowid is None else (
+        owner_id, owner_bytes, after_rowid,
+    )
     metadata = db.execute(
         f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM runs "
         f"{predicate} ORDER BY rowid LIMIT ?",
@@ -146,14 +195,14 @@ def read_legacy_review_run_page(
     values = {}
     if safe_ids:
         placeholders = ",".join("?" for _ in safe_ids)
-        fields = ",".join(
+        fields = "typeof(owner_id) AS type_owner_id,CAST(owner_id AS BLOB) AS raw_owner_id," + ",".join(
             f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
             for column in _RUN_COLUMNS
         )
         values = {row["source_rowid"]: row for row in db.execute(
             f"SELECT rowid AS source_rowid,{fields} FROM runs "
-            f"WHERE owner_id=? AND rowid IN ({placeholders})",
-            (owner_id, *safe_ids),
+            f"WHERE owner_id IN (?,?) AND rowid IN ({placeholders})",
+            (owner_id, owner_bytes, *safe_ids),
         )}
     entries: list[LegacyExecutionRunRecord | UnreadableLegacyExecutionRun] = []
     for row in page:
@@ -165,20 +214,83 @@ def read_legacy_review_run_page(
         if source is None:
             entries.append(UnreadableLegacyExecutionRun(rowid, "run source changed during its read"))
             continue
-        try:
-            fields = {column: _sql_text(source[f"type_{column}"], source[f"raw_{column}"])
-                      for column in _RUN_COLUMNS}
-            state = LegacyReviewRunState(fields["state"])
-            entries.append(LegacyExecutionRunRecord(
-                rowid, owner_id, fields["run_id"], fields["dispatch_id"], fields["kind"], state,
-                fields["config_version"], fields["started_at"], fields["completed_at"], fields["outcome"],
-                fields["provider_receipt_id"], fields["workflow_binding_json"], fields["workflow_episode_key"],
-                fields["review_round_id"], fields["review_child_id"],
-            ))
-        except (TypeError, ValueError, UnicodeError):
-            entries.append(UnreadableLegacyExecutionRun(rowid, "run source has malformed fields"))
+        entries.append(_decode_run_source(owner_id, rowid, source))
     return LegacyExecutionRunPage(tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
                                   len(metadata) > MAX_RUN_SOURCE_PAGE)
+
+
+def read_complete_legacy_review_runs(
+    db: sqlite3.Connection, lineage: LegacyReviewOwnerLineage,
+) -> CompleteLegacyReviewRuns | BlockedLegacyReviewRuns:
+    """Inspect bounded run rows once in a read snapshot, or return a blocker.
+
+    Activation must re-run this scan under its deployment barriers and compare
+    source digests. No partial result is eligible for import.
+    """
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("complete legacy run scan requires an explicit SQL transaction")
+    if not isinstance(lineage, LegacyReviewOwnerLineage):
+        raise ValueError("complete legacy run scan requires a typed owner lineage")
+    current = read_legacy_review_owner_lineage(
+        db, lineage.repository, lineage.current_owner,
+        configured_prior_owners=lineage.configured_prior_owners,
+    )
+    if current != lineage:
+        return BlockedLegacyReviewRuns(lineage, "owner lineage changed after inventory")
+    owner_by_bytes = {owner.encode("utf-8"): owner for owner in lineage.owners}
+    if any(len(owner) > 512 for owner in owner_by_bytes):
+        return BlockedLegacyReviewRuns(lineage, "review owner identity exceeds the scan byte bound")
+    runs: list[LegacyExecutionRunRecord] = []
+    source_bytes = 0
+    examined = 0
+    cursor = None
+    while True:
+        predicate = "" if cursor is None else "WHERE rowid>?"
+        params = () if cursor is None else (cursor,)
+        metadata = db.execute(
+            "SELECT rowid AS source_rowid, "
+            "CASE WHEN length(CAST(owner_id AS BLOB))<=512 THEN CAST(owner_id AS BLOB) END AS owner_bytes "
+            f"FROM runs {predicate} ORDER BY rowid LIMIT ?",
+            (*params, MAX_RUN_SOURCE_PAGE + 1),
+        ).fetchall()
+        page = metadata[:MAX_RUN_SOURCE_PAGE]
+        if examined + len(page) > MAX_LEGACY_RUN_SCAN_ROWS:
+            return BlockedLegacyReviewRuns(lineage, "review run table exceeds its scan bound",
+                                           source_rowid=page[0]["source_rowid"])
+        examined += len(page)
+        for row in page:
+            owner = owner_by_bytes.get(row["owner_bytes"])
+            if owner is None:
+                continue
+            entry = _run_source_at_rowid(db, row["source_rowid"], owner)
+            if isinstance(entry, UnreadableLegacyExecutionRun):
+                return BlockedLegacyReviewRuns(lineage, entry.reason, owner, entry.source_rowid)
+            source_bytes += entry.source_bytes
+            if len(runs) >= MAX_LEGACY_RUN_INVENTORY_ROWS or source_bytes > MAX_LEGACY_RUN_INVENTORY_BYTES:
+                return BlockedLegacyReviewRuns(lineage, "review run inventory exceeds its total bound",
+                                               owner, entry.source_rowid)
+            runs.append(entry)
+        if len(metadata) <= MAX_RUN_SOURCE_PAGE:
+            break
+        cursor = page[-1]["source_rowid"]
+    try:
+        return CompleteLegacyReviewRuns(lineage, tuple(runs))
+    except ValueError as exc:
+        return BlockedLegacyReviewRuns(lineage, str(exc)[:512])
+
+
+def revalidate_complete_legacy_review_runs(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewRuns,
+) -> CompleteLegacyReviewRuns | BlockedLegacyReviewRuns:
+    """Recheck a caller-held inventory against SQL before activation accepts it."""
+    if not isinstance(observed, CompleteLegacyReviewRuns):
+        raise ValueError("run revalidation requires a complete observed inventory")
+    current = read_complete_legacy_review_runs(db, observed.lineage)
+    if isinstance(current, BlockedLegacyReviewRuns):
+        return current
+    if current.source_digest != observed.source_digest:
+        return BlockedLegacyReviewRuns(observed.lineage, "review run sources changed after inventory")
+    return current
 
 
 def read_legacy_review_submission_page(

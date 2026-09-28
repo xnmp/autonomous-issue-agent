@@ -14,6 +14,7 @@ from issue_agent.domain.review_execution_activation import (
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LegacyReviewSubmissionReceiptPage,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
     LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
+    CompleteLegacyReviewRuns,
 )
 
 
@@ -72,6 +73,19 @@ def test_run_pages_require_monotonic_bounded_source_cursors():
         LegacyExecutionRunPage((source, source), 1, False)
     with pytest.raises(ValueError):
         LegacyExecutionRunPage((source,), 2, False)
+
+
+def test_complete_run_inventory_requires_unique_authorized_sources():
+    lineage = LegacyReviewOwnerLineage("o/r", "o/r:review:owner", (),
+                                       ("o/r:review:owner", "o/r:review"), ())
+    source = run_source()
+    complete = CompleteLegacyReviewRuns(lineage, (source,))
+
+    assert len(complete.source_digest) == 64
+    with pytest.raises(ValueError, match="unique owner"):
+        CompleteLegacyReviewRuns(lineage, (source, replace(source, source_rowid=2)))
+    with pytest.raises(ValueError, match="unique owner"):
+        CompleteLegacyReviewRuns(lineage, (replace(source, owner_id="other/r:review"),))
 
 
 def review_dispatch(**changes):

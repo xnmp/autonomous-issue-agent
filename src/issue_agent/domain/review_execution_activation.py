@@ -120,6 +120,14 @@ class LegacyExecutionRunRecord:
         )}
         return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
+    @property
+    def source_bytes(self) -> int:
+        return sum(len(value.encode("utf-8", "surrogatepass")) for value in (
+            self.owner_id, self.run_id, self.dispatch_id, self.kind, self.config_version,
+            self.started_at, self.completed_at, self.outcome, self.provider_receipt_id,
+            self.workflow_binding_json, self.workflow_episode_key, self.review_round_id, self.review_child_id,
+        ) if value is not None)
+
 
 @dataclass(frozen=True)
 class UnreadableLegacyExecutionRun:
@@ -154,6 +162,51 @@ class LegacyExecutionRunPage:
             raise ValueError("legacy run page must advance through unique rowids")
         if self.has_more and not rowids:
             raise ValueError("legacy run page cannot continue without a cursor")
+
+
+MAX_LEGACY_RUN_INVENTORY_ROWS = 8192
+MAX_LEGACY_RUN_INVENTORY_BYTES = 2**24
+
+
+@dataclass(frozen=True)
+class CompleteLegacyReviewRuns:
+    """Adapter scan output; activation must revalidate caller-held values in SQL."""
+
+    lineage: LegacyReviewOwnerLineage
+    runs: tuple[LegacyExecutionRunRecord, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lineage, LegacyReviewOwnerLineage) or not isinstance(self.runs, tuple):
+            raise ValueError("complete review runs require typed lineage and sources")
+        if (len(self.runs) > MAX_LEGACY_RUN_INVENTORY_ROWS
+                or any(not isinstance(run, LegacyExecutionRunRecord) or run.owner_id not in self.lineage.owners
+                       for run in self.runs)
+                or len({run.run_id for run in self.runs}) != len(self.runs)
+                or sum(run.source_bytes for run in self.runs) > MAX_LEGACY_RUN_INVENTORY_BYTES):
+            raise ValueError("complete review runs require bounded unique owner sources")
+
+    @property
+    def source_digest(self) -> str:
+        sources = tuple(sorted((run.run_id, run.source_digest) for run in self.runs))
+        return hashlib.sha256(json.dumps((self.lineage.source_digest, sources),
+                                         separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewRuns:
+    lineage: LegacyReviewOwnerLineage
+    reason: str
+    owner_id: str | None = None
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.lineage, LegacyReviewOwnerLineage):
+            raise ValueError("blocked review runs require typed lineage")
+        validate_workflow_text(self.reason, "blocked review run reason")
+        if self.owner_id is not None and self.owner_id not in self.lineage.owners:
+            raise ValueError("blocked review run owner is outside the lineage")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked review run cursor")
 
 
 LEGACY_SUBMISSION_COMMAND_COLUMNS = (
