@@ -41,6 +41,8 @@ from issue_agent.adapters.review_execution_activation import (
     MatchedLegacyEscalatedReviewHoldPlan, UnmatchedLegacyEscalatedReviewHoldPlan,
     verify_complete_legacy_ordered_outcome_coverage,
     CompleteLegacyOrderedOutcomeCoverage, BlockedLegacyOrderedOutcomeCoverage,
+    verify_complete_legacy_allocation_generation_sources,
+    CompleteLegacyAllocationGenerationSources, BlockedLegacyAllocationGenerationSources,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -1250,6 +1252,100 @@ def _ordered_coverage(store):
         assert db.total_changes == before
         db.rollback()
     return ordered
+
+
+def _allocation_generation_coverage(store):
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        _, _, storage = _complete_settlement_observations(db)
+        generation = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
+        before = db.total_changes
+        matched = verify_complete_legacy_allocation_generation_sources(db, storage, generation)
+        assert db.total_changes == before
+        db.rollback()
+    return matched
+
+
+def test_allocation_generation_sources_assign_current_open_round(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+
+    matched = _allocation_generation_coverage(store)
+
+    assert isinstance(matched, CompleteLegacyAllocationGenerationSources)
+    assert matched.episodes[0].rounds == (plan.round,)
+    assert matched.episodes[0].boundaries == ()
+    assert len(matched.source_digest) == 64
+
+
+def test_allocation_generation_sources_assign_old_open_round_across_accepted_boundary(rig):
+    store, _, _, _, old, _, _ = accepted_generation_with_open_submission(rig)
+
+    matched = _allocation_generation_coverage(store)
+
+    assert isinstance(matched, CompleteLegacyAllocationGenerationSources)
+    assert [round_.sequence for round_ in matched.episodes[0].rounds] == [1, 2]
+    assert matched.episodes[0].rounds[0] == old.round
+    assert len(matched.episodes[0].boundaries) == 1
+    assert matched.episodes[0].boundaries[0].boundary.through_sequence == 2
+
+
+def test_allocation_generation_sources_keep_two_boundary_advances_at_one_sequence(rig):
+    store, _, selection, _, old, _, workflow = accepted_generation_with_open_submission(rig)
+    first = current(store, selection)
+    actor = OperatorActor("operator", "test")
+    assert isinstance(workflow.cancel_rearm(
+        CancelRearm("cancel:allocation-generation", first.revision, "rearm:with-older-submission", "stop",
+                    expected_binding=first.binding), actor,
+    ), WorkflowCommitted)
+    stopped = current(store, selection)
+    assert isinstance(workflow.continue_rearm(
+        ContinueGrantedRearm("rearm:allocation-generation", stopped.revision,
+                             "rearm:with-older-submission", expected_binding=stopped.binding), actor,
+    ), WorkflowCommitted)
+
+    matched = _allocation_generation_coverage(store)
+
+    assert isinstance(matched, CompleteLegacyAllocationGenerationSources)
+    assert matched.episodes[0].rounds[0] == old.round
+    assert [item.boundary.through_sequence for item in matched.episodes[0].boundaries] == [2, 2]
+
+
+def test_allocation_generation_sources_block_missing_accepted_boundary(rig):
+    store, _, _, _, _, _, _ = accepted_generation_with_open_submission(rig)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-generation'")
+
+    matched = _allocation_generation_coverage(store)
+
+    assert isinstance(matched, BlockedLegacyAllocationGenerationSources)
+    assert "generation boundary lacks its accepted receipt" in matched.reason
+
+
+def test_allocation_generation_sources_block_accepted_transition_alias(rig):
+    store, _, _, _, _, _, _ = accepted_generation_with_open_submission(rig)
+    with store.transaction() as db:
+        original = db.execute("SELECT key,claimed_at,payload_json FROM dedupe_keys "
+                              "WHERE namespace='workflow-request' AND key='rearm:with-older-submission'").fetchone()
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                   "VALUES (?,?,?,?,?)", ("workflow-request", "O/R", *original))
+
+    matched = _allocation_generation_coverage(store)
+
+    assert isinstance(matched, BlockedLegacyAllocationGenerationSources)
+    assert "repository alias" in matched.reason
+
+
+def test_allocation_generation_sources_block_unaccepted_old_open_round(rig):
+    store, _, _, selection, control = rig
+    control.preflight(selection)
+    _advance_generation_with_open_round(store, selection)
+
+    matched = _allocation_generation_coverage(store)
+
+    assert isinstance(matched, BlockedLegacyAllocationGenerationSources)
+    assert "unaccepted generation" in matched.reason
 
 
 @pytest.mark.parametrize("escalated", [False, True])

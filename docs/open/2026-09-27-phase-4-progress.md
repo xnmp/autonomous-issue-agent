@@ -1405,3 +1405,31 @@ Full `make test` passed: 3,201 domain, 3,072 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-ordered-coverage-final-gate.log` (ephemeral).
+
+## Checkpoint 56 — accepted generation assignment for allocated rounds (offline)
+
+A read-only verifier now rechecks the complete round/outcome and generation
+receipt inventories in one SQL transaction. For each current, uncompacted
+execution episode, it requires contiguous round allocation, the current
+activated workflow, and an exact source match for every retained generation
+boundary and its accepted transition. It assigns each round to the binding
+active at its sequence. Multiple accepted generation advances at the same
+final sequence remain ordered and must all be present. Missing receipts,
+repository aliases and an open round under an unaccepted generation block.
+
+This proof covers allocation lineage only. It does not pair productive
+submissions, replay reset state, establish a delivered escalated hold or
+activate execution. Compacted prefixes and retired episodes still require the
+source-backed origin, checkpoint and archived audit contract before they can
+pass. The next join must combine this allocation proof with complete ordered
+outcome coverage and replay against the checkpoint.
+
+Independent Sol review found repeated full generation receipt decoding and
+repeated whole-inventory hashing in the first implementation. The verifier now
+indexes the complete receipts once and computes each inventory digest once;
+the final review found no remaining medium or high issue.
+
+Full `make test` passed: 3,201 domain, 3,078 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-allocation-generation-gate.log` (ephemeral).

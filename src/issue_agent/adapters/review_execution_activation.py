@@ -58,7 +58,7 @@ from ..domain.review_execution_activation import (
 )
 from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from ..domain.review_execution import (
-    ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome,
+    ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
     MAX_EXECUTION_SUFFIX, review_generation_chain_digest, same_execution_episode,
 )
@@ -3055,6 +3055,204 @@ _ExecutionEpisodeKey = tuple[WorkflowKey, int, str]
 
 def _execution_episode_key(binding: ReviewExecutionBinding) -> _ExecutionEpisodeKey:
     return (binding.rejection.fence.key, binding.execution_epoch, binding.execution_episode)
+
+
+@dataclass(frozen=True)
+class MatchedLegacyAllocationGenerationSources:
+    """Accepted generation boundaries assign every allocated round a binding."""
+
+    round_storage: CompleteLegacyRoundOutcomeStorage
+    generation: CompleteLegacyReviewGenerationReceipts
+    workflow: ReviewWorkflowSnapshot
+    rounds: tuple[ReviewRoundIdentity, ...]
+    boundaries: tuple[MatchedLegacyReviewGenerationBoundarySources, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.round_storage, CompleteLegacyRoundOutcomeStorage)
+                or not isinstance(self.generation, CompleteLegacyReviewGenerationReceipts)
+                or not isinstance(self.workflow, ReviewWorkflowSnapshot)
+                or not isinstance(self.workflow.execution, ActivatedReviewExecution)
+                or not isinstance(self.rounds, tuple) or not self.rounds
+                or len(self.rounds) > MAX_EXECUTION_SUFFIX
+                or any(not isinstance(round_, ReviewRoundIdentity) for round_ in self.rounds)
+                or not isinstance(self.boundaries, tuple)
+                or any(not isinstance(item, MatchedLegacyReviewGenerationBoundarySources)
+                       for item in self.boundaries)):
+            raise ValueError("allocation generation proof requires bounded typed sources")
+        execution = self.workflow.execution
+        first = self.rounds[0]
+        if (self.round_storage.repository != self.generation.repository
+                or self.round_storage.repository != first.binding.rejection.fence.key.repository
+                or self.workflow.revision.fence.key != first.binding.rejection.fence.key
+                or not same_execution_episode(first.binding, execution.binding)
+                or execution.checkpoint.through_sequence != 0
+                or execution.checkpoint.boundary_cursor is not None
+                or execution.last_sequence != len(self.rounds)
+                or tuple(round_.sequence for round_ in self.rounds) != tuple(range(1, len(self.rounds) + 1))
+                or len({round_.round_id for round_ in self.rounds}) != len(self.rounds)
+                or any(not same_execution_episode(first.binding, round_.binding) for round_ in self.rounds)
+                or tuple(item.boundary for item in self.boundaries) != execution.boundaries
+                or any(item.complete_receipts is not self.generation for item in self.boundaries)):
+            raise ValueError("allocation generations have a gap or crossed execution")
+        active = execution.checkpoint.state.binding
+        boundary_index = 0
+        for round_ in self.rounds:
+            while (boundary_index < len(execution.boundaries)
+                   and round_.sequence > execution.boundaries[boundary_index].through_sequence):
+                boundary = execution.boundaries[boundary_index]
+                if boundary.before.binding != active:
+                    raise ValueError("allocation generation chain disagrees with its predecessor")
+                active = boundary.after.binding
+                boundary_index += 1
+            if round_.binding != active:
+                raise ValueError("allocated review round uses an unaccepted generation")
+        while boundary_index < len(execution.boundaries):
+            boundary = execution.boundaries[boundary_index]
+            if boundary.through_sequence != len(self.rounds) or boundary.before.binding != active:
+                raise ValueError("allocation generation chain disagrees with its final boundary")
+            active = boundary.after.binding
+            boundary_index += 1
+        if boundary_index != len(execution.boundaries) or active != execution.binding:
+            raise ValueError("allocation generation chain does not reach the current binding")
+
+@dataclass(frozen=True)
+class CompleteLegacyAllocationGenerationSources:
+    round_storage: CompleteLegacyRoundOutcomeStorage
+    generation: CompleteLegacyReviewGenerationReceipts
+    episodes: tuple[MatchedLegacyAllocationGenerationSources, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.round_storage, CompleteLegacyRoundOutcomeStorage)
+                or not isinstance(self.generation, CompleteLegacyReviewGenerationReceipts)
+                or not isinstance(self.episodes, tuple)
+                or any(not isinstance(item, MatchedLegacyAllocationGenerationSources)
+                       or item.round_storage is not self.round_storage or item.generation is not self.generation
+                       for item in self.episodes)):
+            raise ValueError("complete allocation generations require matching typed sources")
+        planned = tuple(_stored_review_round_plan(source).round for source in self.round_storage.rounds.rounds)
+        accounted = tuple(round_ for episode in self.episodes for round_ in episode.rounds)
+        if (len(accounted) != len(planned)
+                or len({round_.round_id for round_ in accounted}) != len(accounted)
+                or set(accounted) != set(planned)):
+            raise ValueError("allocation generation proof leaves a round unaccounted for")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.round_storage.source_digest, self.generation.source_digest,
+                 tuple((encode_workflow(episode.workflow),
+                        tuple(round_.round_id for round_ in episode.rounds),
+                        tuple((boundary.receipt_source.source_digest, boundary.accepted_rowid,
+                               boundary.accepted_fields) for boundary in episode.boundaries))
+                       for episode in self.episodes))
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyAllocationGenerationSources:
+    repository: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked allocation generations require a canonical repository")
+        validate_workflow_text(self.reason, "blocked allocation generation reason")
+
+
+_IndexedAllocationBoundary = tuple[
+    LegacyReviewGenerationReceiptSource, ReviewExecutionGenerationBoundary, str, str, str,
+]
+
+
+def _indexed_allocation_generation_boundaries(
+    complete: CompleteLegacyReviewGenerationReceipts,
+) -> dict[_ExecutionEpisodeKey, dict[str, _IndexedAllocationBoundary]]:
+    indexed: dict[_ExecutionEpisodeKey, dict[str, _IndexedAllocationBoundary]] = {}
+    for source in complete.receipts:
+        captured = decode_workflow(dict(source.fields)["payload_json"], tuple)
+        if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
+                or any(not isinstance(value, str) for value in captured[1:])):
+            raise ValueError("generation receipt has malformed accepted transition fields")
+        boundary, namespace, key, accepted_payload = captured
+        related = indexed.setdefault(_execution_episode_key(boundary.before.binding), {})
+        if boundary.receipt_id in related:
+            raise ValueError("execution generation receipt repeats a boundary")
+        related[boundary.receipt_id] = (source, boundary, namespace, key, accepted_payload)
+    return indexed
+
+
+def _matched_allocation_generation_boundaries(
+    db: sqlite3.Connection, complete: CompleteLegacyReviewGenerationReceipts,
+    execution: ActivatedReviewExecution,
+    indexed: Mapping[_ExecutionEpisodeKey, Mapping[str, _IndexedAllocationBoundary]],
+) -> tuple[MatchedLegacyReviewGenerationBoundarySources, ...]:
+    """Batch accepted-row reads after a complete receipt inventory was rechecked."""
+    related = indexed.get(_execution_episode_key(execution.binding), {})
+    if set(related) != {boundary.receipt_id for boundary in execution.boundaries}:
+        raise ValueError("execution generation receipts disagree with current boundaries")
+    selected = tuple(related[boundary.receipt_id] for boundary in execution.boundaries)
+    targets = {(namespace.encode(), key.encode()) for _, _, namespace, key, _ in selected}
+    if (len(targets) != len(selected)
+            or any(namespace not in {"workflow-request", "workflow-transition"}
+                   for _, _, namespace, _, _ in selected)):
+        raise ValueError("execution generation receipts repeat an accepted transition")
+    accepted_rowids = _accepted_generation_rows(db, complete.repository, targets) if targets else {}
+    matched: list[MatchedLegacyReviewGenerationBoundarySources] = []
+    for source, boundary, namespace, key, accepted_payload in selected:
+        accepted_fields, _ = _read_recording_source(db, namespace, complete.repository, key)
+        if dict(accepted_fields)["payload_json"] != accepted_payload:
+            raise ValueError("accepted generation transition changed")
+        matched.append(MatchedLegacyReviewGenerationBoundarySources(
+            complete, source, boundary, accepted_rowids[(namespace.encode(), key.encode())],
+            accepted_fields,
+        ))
+    return tuple(matched)
+
+
+def verify_complete_legacy_allocation_generation_sources(
+    db: sqlite3.Connection, observed_round_storage: CompleteLegacyRoundOutcomeStorage,
+    observed_generation: CompleteLegacyReviewGenerationReceipts,
+) -> CompleteLegacyAllocationGenerationSources | BlockedLegacyAllocationGenerationSources:
+    """Recheck complete SQL sets and assign uncompacted rounds to accepted generations."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("allocation generation verification requires an explicit SQL transaction")
+    if (not isinstance(observed_round_storage, CompleteLegacyRoundOutcomeStorage)
+            or not isinstance(observed_generation, CompleteLegacyReviewGenerationReceipts)):
+        raise ValueError("allocation generation verification requires complete typed observations")
+    repository = observed_round_storage.repository
+    if repository != observed_generation.repository:
+        return BlockedLegacyAllocationGenerationSources(repository, "allocation generation repositories disagree")
+    storage = verify_complete_legacy_round_outcome_storage(
+        db, observed_round_storage.rounds, observed_round_storage.receipts,
+    )
+    if isinstance(storage, BlockedLegacyRoundOutcomeStorage):
+        return BlockedLegacyAllocationGenerationSources(repository, storage.reason)
+    generation = revalidate_complete_legacy_review_generation_receipts(db, observed_generation)
+    if isinstance(generation, BlockedLegacyReviewGenerationReceipts):
+        return BlockedLegacyAllocationGenerationSources(repository, generation.reason)
+    grouped: dict[_ExecutionEpisodeKey, list[ReviewRoundIdentity]] = {}
+    try:
+        generation_index = _indexed_allocation_generation_boundaries(generation)
+        for source in storage.rounds.rounds:
+            identity = _stored_review_round_plan(source).round
+            grouped.setdefault(_execution_episode_key(identity.binding), []).append(identity)
+        episodes: list[MatchedLegacyAllocationGenerationSources] = []
+        for (workflow_key, _, _), identities in sorted(grouped.items(), key=lambda pair: (
+            pair[0][0].repository, pair[0][0].target.number, pair[0][1], pair[0][2],
+        )):
+            workflow = load_review_workflow_row(db, workflow_key)
+            if workflow is None or not isinstance(workflow.execution, ActivatedReviewExecution):
+                raise ValueError("allocated review episode lacks current activated workflow")
+            matched = _matched_allocation_generation_boundaries(
+                db, generation, workflow.execution, generation_index,
+            )
+            episodes.append(MatchedLegacyAllocationGenerationSources(
+                storage, generation, workflow,
+                tuple(sorted(identities, key=lambda item: item.sequence)), matched,
+            ))
+        return CompleteLegacyAllocationGenerationSources(storage, generation, tuple(episodes))
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            WorkflowAuthorityError, CorruptControlStore) as exc:
+        return BlockedLegacyAllocationGenerationSources(repository, _printable(str(exc)))
 
 
 def _classified_productive_storage(

@@ -159,6 +159,15 @@ with `CLAUDE.md`, `AGENTS.md`, the
   binding exactly matches the current activated workflow binding can produce
   complete coverage. Older generations require a complete accepted-boundary
   join before replay or import. The result proves coverage, not reset order.
+- Checkpoint 56 separately revalidates complete round/outcome and generation
+  inventories in one SQL snapshot, matches each retained boundary to its
+  accepted transition, and assigns every allocated round in a current,
+  uncompacted episode to the binding active at its sequence. It handles
+  repeated advances at the final sequence, and blocks missing receipts,
+  accepted-row aliases and unaccepted round generations. This allocation
+  proof must still be joined to checkpoint-55 productivity coverage and
+  replayed against the execution checkpoint. Compacted and retired episodes
+  await source-backed origin/checkpoint receipts and archived audit.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -353,9 +362,9 @@ order a durable clock.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Join every historical round, including open and unproductive rounds, to
-   its accepted generation boundary and current workflow authority. Replay
-   the complete successful-submission classifications and sealed outcomes in
+2. Join the accepted allocation-generation proof for each current,
+   uncompacted episode to complete successful-submission classifications, then
+   replay sealed outcomes in
    execution order to establish resets. Verify delivered escalated
    holds or their current observed state, and resolve or block historical
    unregistered and old stale submissions. A completed
