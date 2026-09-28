@@ -8,7 +8,7 @@ from dataclasses import replace
 import pytest
 
 import issue_agent.adapters.review_execution_activation as review_activation
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import SQLiteControlStore, _encoded_payload_digest
 from issue_agent.domain.contracts import EffectReceipt, EffectStatus
 from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
@@ -26,6 +26,8 @@ from issue_agent.adapters.review_execution_activation import (
     verify_complete_legacy_round_outcome_storage,
     verify_complete_legacy_submission_settlement_storage,
     VerifiedLegacySubmissionRegistrationStorage, CompleteLegacySubmissionSettlementStorage,
+    verify_legacy_stale_productivity_receipt_path,
+    VerifiedLegacyStaleProductivityReceiptPath, UnverifiedLegacyStaleProductivityReceiptPath,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -56,7 +58,9 @@ from issue_agent.domain.review_execution_activation import (
     VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
 )
 from tests.adapters.test_review_execution_control import rig, current, OWNER as CONTROL_OWNER
-from tests.adapters.test_review_productive_settlement import confirmed_copy, workflow_for
+from tests.adapters.test_review_productive_settlement import (
+    confirmed_copy, workflow_for, _advance_generation_with_open_round,
+)
 from tests.adapters.test_review_preparation_finalization import stopped_round
 from tests.adapters.test_review_execution_admission import request
 from tests.adapters.test_review_execution_launch import register
@@ -913,6 +917,192 @@ def _complete_settlement_observations(db):
     storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcome_receipts)
     assert isinstance(storage, CompleteLegacyRoundOutcomeStorage)
     return commands, receipts, storage
+
+
+def _stale_settlement(rig):
+    store, gateway, selection, _, plan, command = confirmed_copy(rig)
+    _advance_generation_with_open_round(store, selection)
+    workflow_for(store, gateway).settle_submission(command.command_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        complete = verify_complete_legacy_submission_settlement_storage(
+            db, *_complete_settlement_observations(db),
+        )
+        db.rollback()
+    assert isinstance(complete, CompleteLegacySubmissionSettlementStorage)
+    return store, plan, command, complete
+
+
+def test_stale_successful_submission_has_sealed_round_without_recorded_baseline(rig):
+    store, plan, command, complete = _stale_settlement(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        proof = verify_legacy_stale_productivity_receipt_path(db, complete, str(command.command_id))
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(proof, VerifiedLegacyStaleProductivityReceiptPath)
+    assert proof.sealed.outcome.round == plan.round
+    assert proof.registered.registration.submission.command_id == command.command_id
+    assert complete.recorded_markers == ()
+    assert len(proof.source_digest) == 64
+    with pytest.raises(ValueError, match="lacks a confirmed effect"):
+        replace(proof, registered=replace(
+            proof.registered, command_source=replace(
+                proof.registered.command_source, receipt_fields=None,
+            ),
+        ))
+
+
+@pytest.mark.parametrize("damage", [
+    "stale_removed", "stale_payload", "recorded_marker", "effect_changed",
+    "effect_missing", "round_outcome", "superseded_receipt", "ceiling_receipt",
+])
+def test_stale_successful_submission_rejects_changed_or_conflicting_sources(rig, damage):
+    store, plan, command, complete = _stale_settlement(rig)
+    with store.transaction() as db:
+        if damage == "stale_removed":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-stale-productivity' AND key=?",
+                       (plan.round.round_id,))
+        elif damage == "stale_payload":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' "
+                       "WHERE namespace='review-round-stale-productivity' AND key=?",
+                       (plan.round.round_id,))
+        elif damage == "recorded_marker":
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       ("review-recorded-submission", "o/r", str(command.command_id),
+                        "2026-09-28T00:00:00+00:00", "{}"))
+        elif damage == "effect_changed":
+            db.execute("UPDATE effect_receipts SET remote_object_id='changed' WHERE command_id=?",
+                       (str(command.command_id),))
+        elif damage == "effect_missing":
+            db.execute("DELETE FROM effect_receipts WHERE command_id=?", (str(command.command_id),))
+        elif damage == "round_outcome":
+            db.execute("UPDATE review_execution_rounds SET outcome_json='{}' WHERE round_id=?",
+                       (plan.round.round_id,))
+        else:
+            namespace = ("review-round-superseded-productivity" if damage == "superseded_receipt"
+                         else "review-round-ceiling-productivity")
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       (namespace, "o/r", plan.round.round_id,
+                        "2026-09-28T00:00:00+00:00", "{}"))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = verify_legacy_stale_productivity_receipt_path(db, complete, str(command.command_id))
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyStaleProductivityReceiptPath)
+
+
+def test_stale_receipt_path_rejects_freshly_observed_claim_time_mismatch(rig):
+    store, plan, command, _ = _stale_settlement(rig)
+    with store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00+00:00' "
+                   "WHERE namespace='review-round-stale-productivity' AND key=?",
+                   (plan.round.round_id,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        complete = verify_complete_legacy_submission_settlement_storage(
+            db, *_complete_settlement_observations(db),
+        )
+        assert isinstance(complete, CompleteLegacySubmissionSettlementStorage)
+        result = verify_legacy_stale_productivity_receipt_path(db, complete, str(command.command_id))
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyStaleProductivityReceiptPath)
+
+
+@pytest.mark.parametrize("damage", ["wrong_pr", "deep_json"])
+def test_complete_settlement_storage_rejects_self_consistent_invalid_command_payload(rig, damage):
+    store, _, _, _, plan, command = confirmed_copy(rig)
+    with store.transaction() as db:
+        row = db.execute("SELECT payload_json,workflow_binding_json FROM lifecycle_commands WHERE command_id=?",
+                         (str(command.command_id),)).fetchone()
+        if damage == "wrong_pr":
+            payload = json.loads(row["payload_json"])
+            payload["pr"] = plan.round.binding.rejection.fence.key.target.number + 1
+            changed_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        else:
+            changed_payload = row["payload_json"][:-1] + ',"extra":' + '[' * 10_000 + '0' + ']' * 10_000 + '}'
+        changed_digest = _encoded_payload_digest(changed_payload, row["workflow_binding_json"])
+        db.execute("UPDATE lifecycle_commands SET payload_json=?,payload_digest=? WHERE command_id=?",
+                   (changed_payload, changed_digest, str(command.command_id)))
+        source = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-submission' "
+                            "AND key=?", (str(command.command_id),)).fetchone()
+        registration = decode_workflow(source["payload_json"], review_activation.ReviewSubmissionRegistration)
+        changed_registration = encode_workflow(replace(registration, command_digest=changed_digest))
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace IN "
+                   "('review-round-submission','review-round-submission-index') AND scope='o/r'",
+                   (changed_registration,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = verify_complete_legacy_submission_settlement_storage(
+            db, *_complete_settlement_observations(db),
+        )
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
+
+
+def test_stale_receipt_path_requires_named_remote_review_even_with_consistent_effect(rig):
+    store, plan, command, _ = _stale_settlement(rig)
+    with store.transaction() as db:
+        effect = db.execute("SELECT * FROM effect_receipts WHERE command_id=?",
+                            (str(command.command_id),)).fetchone()
+        missing_remote = EffectReceipt(
+            command.command_id, effect["executor_identity"],
+            review_activation._parse_stamp(effect["started_at"]),
+            review_activation._parse_stamp(effect["completed_at"]),
+            EffectStatus.SUCCEEDED,
+        )
+        digest = review_activation._receipt_digest(missing_remote)
+        receipt_id = review_activation._effect_receipt_id(str(command.command_id), digest)
+        db.execute("UPDATE effect_receipts SET remote_object_id=NULL,receipt_digest=? WHERE command_id=?",
+                   (digest, str(command.command_id)))
+        row = db.execute("SELECT closure_json FROM review_execution_rounds WHERE round_id=?",
+                         (plan.round.round_id,)).fetchone()
+        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
+        changed_facts = replace(facts, submissions=tuple(
+            replace(item, result=review_activation.ReviewSubmissionConfirmed(receipt_id))
+            if item.plan.command_id == command.command_id else item
+            for item in facts.submissions
+        ))
+        final = review_activation.finalize_review_round(changed_facts)
+        db.execute("UPDATE review_execution_rounds SET closure_json=?,outcome_json=? WHERE round_id=?",
+                   (encode_workflow(changed_facts), encode_workflow(final.outcome), plan.round.round_id))
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace IN "
+                   "('review-round-outcome','review-round-stale-productivity') AND scope='o/r' AND key=?",
+                   (encode_workflow((changed_facts, final.outcome)), plan.round.round_id))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        complete = verify_complete_legacy_submission_settlement_storage(
+            db, *_complete_settlement_observations(db),
+        )
+        assert isinstance(complete, CompleteLegacySubmissionSettlementStorage)
+        result = verify_legacy_stale_productivity_receipt_path(db, complete, str(command.command_id))
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyStaleProductivityReceiptPath)
+
+
+def test_stale_receipt_path_rejects_a_shared_remote_review_id(rig):
+    store, _, command, _ = _stale_settlement(rig)
+    with store.transaction() as db:
+        remote = db.execute("SELECT remote_object_id FROM effect_receipts WHERE command_id=?",
+                            (str(command.command_id),)).fetchone()["remote_object_id"]
+        _submission(db, 42)
+        db.execute("UPDATE effect_receipts SET remote_object_id=? WHERE command_id='cmd-42'", (remote,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        complete = verify_complete_legacy_submission_settlement_storage(
+            db, *_complete_settlement_observations(db),
+        )
+        assert isinstance(complete, CompleteLegacySubmissionSettlementStorage)
+        result = verify_legacy_stale_productivity_receipt_path(db, complete, str(command.command_id))
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyStaleProductivityReceiptPath)
 
 
 def test_complete_settlement_storage_accounts_registered_and_historical_commands(rig):

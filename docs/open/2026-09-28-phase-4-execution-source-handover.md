@@ -103,6 +103,14 @@ with `CLAUDE.md`, `AGENTS.md`, the
   every planned submission and marker is accounted for. Historical commands
   without registration remain explicit. This is storage accounting, not a
   baseline, productivity or reset proof.
+- Checkpoint 49 revalidates those complete sets before joining one succeeded
+  registered command, digest-checked effect, confirmed sealed outcome and
+  exact stale-productivity receipt, with no recorded marker or conflicting
+  productivity receipt. It requires a unique remote review ID and verifies the
+  command payload's PR/head and matching outcome/stale claim times. The typed
+  result proves a recorded receipt path;
+  historical generation ordering and reset order remain separate source-backed
+  obligations.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -200,6 +208,16 @@ parity, four import contracts and both Pyrefly checks. Ten strict xfails
 remained expected. Log:
 `/tmp/phase4-submission-settlement-storage-gate.log` (ephemeral).
 
+Independent Sol review of checkpoint 49 found that a stale receipt does not
+itself prove the generation crossing, plus gaps in command payload decoding,
+remote review ID uniqueness and deeply nested JSON handling. The typed claim
+is now limited to receipt-path evidence, the joined sources are checked, and
+targeted regressions cover each gap. The final pass found no medium or high
+issue. Full gate log: `/tmp/phase4-stale-receipt-path-gate.log` (ephemeral).
+The gate passed: 3,198 domain, 3,000 adapter and 2,866 app tests, plus hooks,
+governor, gate parity, four import contracts and both Pyrefly checks. Ten
+strict xfails remained expected.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -208,8 +226,9 @@ occurred.
 
 ## Next required boundary
 
-The next proof must classify each successful command against its bound effect,
-recorded baseline, sealed outcome and productivity settlement path, then replay
+The next proof must join the stale receipt path to source-backed generation
+ordering at settlement, classify each successful command against its bound
+effect, recorded baseline, sealed outcome and productivity path, then replay
 ordered outcomes for each execution episode. Raw recorded markers and completed
 agent runs are observations, not reset authority. Keep unregistered historical
 commands explicit until their legacy provenance is resolved.
@@ -221,7 +240,8 @@ commands explicit until their legacy provenance is resolved.
    complete values are observational until this SQL recheck succeeds.
 2. Extend the single plain productive round proof across the complete
    accounting set to establish ordered resets. Verify escalated verdict hold
-   provenance and classify unrecorded or stale successful commands separately.
+   provenance and classify unrecorded or stale successful commands separately,
+   including the historical generation crossing behind a stale receipt.
    A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.

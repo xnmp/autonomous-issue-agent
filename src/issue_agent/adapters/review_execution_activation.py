@@ -48,13 +48,16 @@ from ..domain.review_execution_activation import (
     BlockedLegacySubmissionSettlementStorage,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
-from ..domain.review_execution import ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome
+from ..domain.review_execution import (
+    ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome,
+    PaidReviewProgress, CopiedReviewProgress,
+)
 from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import ReviewSubmissionReceipt, CeilingProductivityDecision
 from ..domain.review_rounds import (
     MAX_REVIEW_STAGES, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionRegistration,
     ReviewRoundFacts,
-    DeferredReviewPreparation, finalize_review_round,
+    DeferredReviewPreparation, ReviewSubmissionConfirmed, finalize_review_round,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.workflow import ObservedTransition, WorkflowMutation
@@ -1501,6 +1504,11 @@ class VerifiedLegacySubmissionRegistrationStorage:
         receipt = dict(self.registration_source.fields)
         index = dict(self.index_source.fields)
         round_row = dict(self.round_source.fields)
+        try:
+            payload = json.loads(command["payload_json"], object_pairs_hook=_unique_receipt_object,
+                                 parse_constant=_reject_nonfinite)
+        except (TypeError, ValueError, RecursionError) as exc:
+            raise ValueError("registered submission has malformed command payload") from exc
         if (receipt["namespace"] != "review-round-submission"
                 or index["namespace"] != "review-round-submission-index"
                 or receipt["scope"] != command["repository"] or index["scope"] != command["repository"]
@@ -1527,6 +1535,10 @@ class VerifiedLegacySubmissionRegistrationStorage:
                 or command["payload_digest"] != _encoded_payload_digest(
                     command["payload_json"], command["workflow_binding_json"],
                 )
+                or not isinstance(payload, dict)
+                or payload.get("head") != self.plan.head_sha
+                or type(payload.get("pr")) is not int
+                or payload.get("pr") != self.plan.round.binding.rejection.fence.key.target.number
                 or _stored_review_round_plan(self.round_source) != self.plan):
             raise ValueError("registered submission storage has contradictory identities")
         _parse_stamp(receipt["claimed_at"])
@@ -1746,3 +1758,126 @@ def verify_complete_legacy_submission_settlement_storage(
         )
     except ValueError as exc:
         return BlockedLegacySubmissionSettlementStorage(repository, _printable(str(exc)))
+
+
+@dataclass(frozen=True)
+class VerifiedLegacyStaleProductivityReceiptPath:
+    """A successful command has the writer's stale receipt shape and no baseline marker.
+
+    Historical generation ordering at settlement is not established by this receipt.
+    """
+
+    complete_storage: CompleteLegacySubmissionSettlementStorage
+    registered: VerifiedLegacySubmissionRegistrationStorage
+    sealed: VerifiedLegacyRoundOutcomeStorage
+    stale_receipt: LegacyReviewOutcomeReceiptSource
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.complete_storage, CompleteLegacySubmissionSettlementStorage)
+                or not isinstance(self.registered, VerifiedLegacySubmissionRegistrationStorage)
+                or not isinstance(self.sealed, VerifiedLegacyRoundOutcomeStorage)
+                or not isinstance(self.stale_receipt, LegacyReviewOutcomeReceiptSource)):
+            raise ValueError("stale settlement requires typed complete storage")
+        command = dict(self.registered.command_source.command_fields)
+        command_id = command["command_id"]
+        round_id = self.registered.plan.round.round_id
+        effect_fields = self.registered.command_source.receipt_fields
+        if effect_fields is None:
+            raise ValueError("stale settlement lacks a confirmed effect")
+        effect = dict(effect_fields)
+        try:
+            receipt = EffectReceipt(
+                CommandId(command_id), effect["executor_identity"],
+                _parse_stamp(effect["started_at"]), _parse_stamp(effect["completed_at"]),
+                EffectStatus(effect["status"]), effect["remote_object_id"], effect["remote_revision"], effect["error"],
+            )
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise ValueError("stale settlement has malformed effect evidence") from exc
+        confirmed = tuple(item for item in self.sealed.facts.submissions
+                          if isinstance(item.result, ReviewSubmissionConfirmed))
+        disposition = self.sealed.outcome.disposition
+        stale = dict(self.stale_receipt.fields)
+        auxiliary = {"review-round-superseded-productivity", "review-round-ceiling-productivity"}
+        if (self.registered not in self.complete_storage.registered
+                or self.sealed not in self.complete_storage.round_storage.sealed
+                or self.stale_receipt not in self.complete_storage.round_storage.receipts.receipts
+                or any(dict(marker.fields)["key"] == command_id
+                       for marker in self.complete_storage.recorded_markers)
+                or any(dict(source.fields)["namespace"] in auxiliary
+                       and dict(source.fields)["key"] == round_id
+                       for source in self.complete_storage.round_storage.receipts.receipts)
+                or command["state"] != "succeeded" or command["attempts"] < 1
+                or command["attempt_owner"] != receipt.executor_identity
+                or receipt.executor_identity != command["executor_identity"]
+                or receipt.status is not EffectStatus.SUCCEEDED
+                or not isinstance(receipt.remote_object_id, str) or not receipt.remote_object_id
+                or sum(1 for source in self.complete_storage.commands.submissions
+                       if source.receipt_fields is not None
+                       and dict(source.receipt_fields)["remote_object_id"] == receipt.remote_object_id) != 1
+                or effect["receipt_digest"] != _receipt_digest(receipt)
+                or len(confirmed) != 1 or confirmed[0].plan.command_id != command_id
+                or not isinstance(disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or confirmed[0].plan.kind is not (
+                    ReviewSubmissionKind.PAID if isinstance(disposition, PaidReviewProgress)
+                    else ReviewSubmissionKind.COPIED
+                )
+                or self.sealed.outcome.round != self.registered.plan.round
+                or confirmed[0].result.receipt_id != disposition.submission_receipt
+                or confirmed[0].result.receipt_id != _effect_receipt_id(
+                    command_id, effect["receipt_digest"],
+                )
+                or stale["namespace"] != "review-round-stale-productivity"
+                or stale["scope"] != self.complete_storage.repository
+                or stale["key"] != round_id
+                or stale["reusable_after"] is not None
+                or stale["claimed_at"] != dict(self.sealed.receipt_source.fields)["claimed_at"]
+                or stale["payload_json"] != encode_workflow((self.sealed.facts, self.sealed.outcome))):
+            raise ValueError("stale settlement has contradictory command or round evidence")
+        _parse_stamp(stale["claimed_at"])
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.complete_storage.source_digest, self.registered.source_digest,
+                 self.sealed.source_digest, self.stale_receipt.source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnverifiedLegacyStaleProductivityReceiptPath:
+    command_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "unverified stale submission command")
+        if not self.reason:
+            raise ValueError("unverified stale submission requires a reason")
+
+
+def verify_legacy_stale_productivity_receipt_path(
+    db: sqlite3.Connection, observed_storage: CompleteLegacySubmissionSettlementStorage, command_id: str,
+) -> VerifiedLegacyStaleProductivityReceiptPath | UnverifiedLegacyStaleProductivityReceiptPath:
+    """Recheck complete SQL sets before classifying one recorded stale receipt path."""
+    validate_workflow_identifier(command_id, "stale submission command")
+    if not isinstance(observed_storage, CompleteLegacySubmissionSettlementStorage):
+        raise ValueError("stale settlement requires complete typed storage")
+    current = verify_complete_legacy_submission_settlement_storage(
+        db, observed_storage.commands, observed_storage.receipts, observed_storage.round_storage,
+    )
+    if isinstance(current, BlockedLegacySubmissionSettlementStorage):
+        return UnverifiedLegacyStaleProductivityReceiptPath(command_id, current.reason)
+    registered = next((item for item in current.registered
+                       if dict(item.command_source.command_fields)["command_id"] == command_id), None)
+    if registered is None:
+        return UnverifiedLegacyStaleProductivityReceiptPath(command_id, "submission lacks registered round storage")
+    round_id = registered.plan.round.round_id
+    sealed = next((item for item in current.round_storage.sealed
+                   if item.outcome.round.round_id == round_id), None)
+    stale = next((item for item in current.round_storage.receipts.receipts
+                  if dict(item.fields)["namespace"] == "review-round-stale-productivity"
+                  and dict(item.fields)["key"] == round_id), None)
+    if sealed is None or stale is None:
+        return UnverifiedLegacyStaleProductivityReceiptPath(command_id, "sealed stale settlement receipt is absent")
+    try:
+        return VerifiedLegacyStaleProductivityReceiptPath(current, registered, sealed, stale)
+    except ValueError as exc:
+        return UnverifiedLegacyStaleProductivityReceiptPath(command_id, _printable(str(exc)))

@@ -1208,3 +1208,31 @@ Full `make test` passed: 3,198 domain, 2,986 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-submission-settlement-storage-gate.log` (ephemeral).
+
+## Checkpoint 49 — successful submission stale-receipt path (offline)
+
+A read-only verifier revalidates the complete submission and round storage
+sets in one SQL snapshot, then joins one registered succeeded command to its
+digest-checked effect, confirmed sealed productive outcome, and exact
+`review-round-stale-productivity` receipt. It requires the writer's matching
+outcome/stale claim time, no recorded-review marker for that command and no
+same-round superseded or ceiling productivity receipt. The effect must name a
+remote review ID unique among all inventoried repository submissions. The
+registered command payload is decoded with duplicate/nonfinite rejection and checked against the
+planned PR and head, closing a gap in the shared storage proof. Freshly
+observed contradictory payloads and claim times block.
+
+This classifies the **recorded stale receipt path** only. The receipt does not
+prove that the current generation had advanced when it was written; a
+source-backed settlement revision join remains necessary before an activation
+plan can certify stale-generation history or ordered resets. It grants no
+baseline, reset or execution authority.
+
+Independent Sol review found gaps in generation claim scope, bound payload,
+remote review identity and deeply nested JSON handling. Narrowing the proof,
+validating the payload and review ID, and converting malformed JSON to a
+blocked result addressed them; the final pass found no medium or high issue.
+Full `make test` passed: 3,198 domain, 3,000 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-stale-receipt-path-gate.log` (ephemeral).
