@@ -995,3 +995,23 @@ pass found no remaining medium or high issue. Full `make test` passed: 3,192
 domain, 2,885 adapter and 2,866 app tests, plus hooks, governor, gate parity,
 four import contracts and both Pyrefly checks. Ten strict xfails remained
 expected. Log: `/tmp/phase4-complete-runs-gate.log` (ephemeral).
+
+## Checkpoint 38 — registered review command-to-round link (offline)
+
+A read-only verifier now joins one inventoried review submission command to
+its exact registration, round submission index, preflight receipt, evolved
+round plan and bounded stage receipts under one explicit SQL snapshot. It
+rechecks owner lineage and the inventoried command/effect rows, validates the
+registration's command ID, digest, idempotency key, configuration version and
+owner, and checks the plan, binding, head and PR target. Changed, oversized,
+missing or contradictory sources return an explicit unverified result. The
+verified value exposes the round identity and source digests; registration
+kind, productive settlement and execution reset remain unproved. A copied
+submission can acquire later paid stages only after its definitive refusal.
+This reader does not activate execution authority or mutate SQL. Independent
+Sol review found and drove fixes for unbounded re-reads and an omitted exact
+command comparison; its final pass found no remaining medium or high issue.
+Full `make test` passed: 3,192 domain, 2,902 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-round-link-gate.log` (ephemeral).

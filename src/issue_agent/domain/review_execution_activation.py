@@ -10,6 +10,7 @@ import json
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from .review_workflow import ReviewedBaseline
 from .review_workflow_policy import ReviewSubmissionReceipt
+from .review_execution import ReviewRoundIdentity
 from .workflow import ObservedTransition
 from .workflow_identity import (
     PullRequestRef, WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
@@ -537,6 +538,54 @@ class UnverifiedLegacyRecordedReview:
     def __post_init__(self) -> None:
         validate_workflow_identifier(self.command_id, "unverified review command")
         validate_workflow_text(self.reason, "unverified recorded review reason")
+
+
+@dataclass(frozen=True)
+class VerifiedReviewSubmissionRoundLink:
+    """One SQL-backed command-to-round link; kind and productivity remain unproved."""
+
+    source: LegacyReviewSubmissionSource
+    lineage: LegacyReviewOwnerLineage
+    round: ReviewRoundIdentity
+    registration_source_digest: str
+    index_source_digest: str
+    preflight_source_digest: str
+    stage_sources_digest: str
+    round_source_digest: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyReviewSubmissionSource)
+                or not isinstance(self.lineage, LegacyReviewOwnerLineage)
+                or not isinstance(self.round, ReviewRoundIdentity)):
+            raise ValueError("verified review round link requires typed sources")
+        for name in ("registration_source_digest", "index_source_digest",
+                     "preflight_source_digest", "stage_sources_digest", "round_source_digest"):
+            _source_digest(getattr(self, name), name)
+        command = dict(self.source.command_fields)
+        key = self.round.binding.rejection.fence.key
+        if (command["repository"] != self.lineage.repository
+                or key.repository != self.lineage.repository
+                or not isinstance(key.target, PullRequestRef)
+                or command["target"] != f"pr:{key.target.number}"
+                or command["executor_identity"] not in self.lineage.owners):
+            raise ValueError("review submission sources do not prove one round link")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.source.source_digest, self.lineage.source_digest,
+                 self.registration_source_digest, self.index_source_digest,
+                 self.preflight_source_digest, self.stage_sources_digest, self.round_source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnverifiedReviewSubmissionRoundLink:
+    command_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "unverified review command")
+        validate_workflow_text(self.reason, "unverified review round link reason")
 
 
 @dataclass(frozen=True)

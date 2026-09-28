@@ -46,6 +46,11 @@ with `CLAUDE.md`, `AGENTS.md`, the
   rechecked owner closure. It blocks unreadable owner sources, changed lineage,
   oversize retained sources or total scan excess. A caller-held complete
   result must be revalidated against SQL under activation barriers before use.
+- Checkpoint 38 adds a read-only, source-backed link from an inventoried
+  submission command to its exact registration, index, preflight, evolved
+  round plan and stage receipts. It rechecks lineage and bounded command/effect
+  rows. The verified value contains only the round identity and source digests;
+  kind, productivity and reset still need separate proof.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -56,6 +61,13 @@ caller-held complete value could be partial. A one-pass total scan limit and
 SQL revalidation address both; the second pass found no remaining medium or
 high issue. Exact historical workflow snapshots and productive execution
 resets remain unproved by the current source readers.
+
+The checkpoint-38 full `make test` gate passed: 3,192 domain, 2,902 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-round-link-gate.log` (ephemeral). Independent Sol review found
+unbounded re-reads and a missing exact command comparison; both were fixed,
+and the final pass found no remaining medium or high issue.
 
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
@@ -70,9 +82,10 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Join verified plain recorded baselines and the inventoried registration/index
-   rows to bounded round plans. Verify escalated verdict hold provenance and
-   classify unrecorded or stale successful commands separately. A completed
+2. Use verified command-to-round links with plain recorded baselines to prove
+   confirmed productive outcomes and ordered resets. Verify escalated verdict
+   hold provenance and classify unrecorded or stale successful commands
+   separately. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
 3. Join positive issue-keyed file counters to PRs with fresh complete

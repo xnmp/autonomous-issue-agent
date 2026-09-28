@@ -11,6 +11,7 @@ import re
 import sqlite3
 import hashlib
 import json
+from dataclasses import replace
 
 from ..domain.resolve_activation import LegacyAbsent, LegacyFile, UnmappedLegacyEntry
 from ..domain.review_execution_activation import (
@@ -27,18 +28,26 @@ from ..domain.review_execution_activation import (
     MAX_LEGACY_REVIEW_OWNERS, LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
     UnreadableLegacyReviewOwnerLineage,
     VerifiedLegacyRecordedReview, UnverifiedLegacyRecordedReview,
+    VerifiedReviewSubmissionRoundLink, UnverifiedReviewSubmissionRoundLink,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
 from ..domain.review_execution import ExecutionNotActivated
 from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import ReviewSubmissionReceipt
+from ..domain.review_rounds import (
+    MAX_REVIEW_STAGES, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionRegistration,
+)
+from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.workflow import ObservedTransition, WorkflowMutation
 from ..domain.workflow_identity import WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier
 from .control_store import CorruptControlStore, _encoded_payload_digest, _parse_stamp, _receipt_digest, load_bound_review_submission
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_commit import _unique_receipt_object
-from .workflow_rows import WorkflowAuthorityError
+from .workflow_rows import (
+    WorkflowAuthorityError, review_stage_receipt_key, review_stage_receipt_prefix,
+    review_submission_receipt_key,
+)
 
 _PR_NAME = re.compile(r"pr-(.*)\.(session|round)", re.DOTALL)
 _COUNTER_NAME = re.compile(r"issue-(.*)\.infra-deaths", re.DOTALL)
@@ -586,6 +595,64 @@ def _reject_nonfinite(value: str) -> None:
     raise ValueError(f"accepted review transition contains {value}")
 
 
+def _verified_review_stage_sources(db: sqlite3.Connection, repository: str, plan: ReviewRoundPlan) -> str:
+    prefix = review_stage_receipt_prefix(plan.round.round_id)
+    rows = db.execute(
+        "SELECT rowid AS source_rowid,typeof(key) AS key_type,length(CAST(key AS BLOB)) AS key_bytes,"
+        "ifnull(length(CAST(payload_json AS BLOB)),0) AS payload_bytes "
+        "FROM dedupe_keys WHERE namespace='review-round-stage' AND scope=? "
+        "AND key>=? AND key<? ORDER BY key LIMIT ?",
+        (repository, prefix, prefix[:-1] + ";", MAX_REVIEW_STAGES + 1),
+    ).fetchall()
+    if len(rows) != len(plan.stages):
+        raise ValueError("review stages disagree with their bounded receipt index")
+    planned = {stage.stage_id: stage for stage in plan.stages}
+    digests: list[tuple[str, str]] = []
+    for row in rows:
+        if (row["key_type"] != "text" or row["key_bytes"] > 512
+                or row["payload_bytes"] > MAX_LEGACY_SQL_TEXT_BYTES):
+            raise ValueError("review stage receipt exceeds its SQL source bound")
+        key_row = db.execute("SELECT key FROM dedupe_keys WHERE rowid=?", (row["source_rowid"],)).fetchone()
+        if key_row is None:
+            raise ValueError("review stage receipt changed during its read")
+        stage_key = key_row["key"]
+        fields, digest = _read_recording_source(db, "review-round-stage", repository, stage_key)
+        recorded = decode_workflow(dict(fields)["payload_json"], tuple)
+        if (len(recorded) != 2 or recorded[0] != plan.round.round_id
+                or not isinstance(recorded[1], ReviewStagePlan)
+                or stage_key != review_stage_receipt_key(plan.round.round_id, recorded[1].stage_id)
+                or planned.get(recorded[1].stage_id) != recorded[1]):
+            raise ValueError("review stage receipt disagrees with its round")
+        digests.append((stage_key, digest))
+    return hashlib.sha256(json.dumps(digests, separators=(",", ":")).encode()).hexdigest()
+
+
+def _recheck_submission_source(db: sqlite3.Connection, source: LegacyReviewSubmissionSource) -> None:
+    command_id = dict(source.command_fields)["command_id"]
+    for table, columns, required in (
+        ("lifecycle_commands", LEGACY_SUBMISSION_COMMAND_COLUMNS, True),
+        ("effect_receipts", LEGACY_SUBMISSION_RECEIPT_COLUMNS, source.receipt_fields is not None),
+    ):
+        sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in columns)
+        metadata = db.execute(
+            f"SELECT max({sizes}) AS largest_value FROM {table} WHERE command_id=?", (command_id,),
+        ).fetchone()
+        if (metadata is None) != (not required):
+            raise ValueError("submission command or effect changed after inventory")
+        if metadata is not None and metadata["largest_value"] > MAX_LEGACY_SQL_TEXT_BYTES:
+            raise ValueError("submission command or effect exceeds its SQL source bound")
+    command_row = db.execute(
+        "SELECT rowid AS source_rowid,* FROM lifecycle_commands WHERE command_id=?", (command_id,),
+    ).fetchone()
+    effect_row = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (command_id,)).fetchone()
+    if (command_row is None or command_row["source_rowid"] != source.source_rowid
+            or any(command_row[name] != value for name, value in source.command_fields)
+            or (effect_row is None) != (source.receipt_fields is None)
+            or (effect_row is not None and source.receipt_fields is not None
+                and any(effect_row[name] != value for name, value in source.receipt_fields))):
+        raise ValueError("submission command or effect changed after inventory")
+
+
 def read_legacy_recorded_review(
     db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
     lineage: LegacyReviewOwnerLineage,
@@ -607,12 +674,7 @@ def read_legacy_recorded_review(
         return UnverifiedLegacyRecordedReview(command_id, "submission effect receipt is absent")
     effect = dict(source.receipt_fields)
     try:
-        command_row = db.execute("SELECT rowid AS source_rowid,* FROM lifecycle_commands WHERE command_id=?", (command_id,)).fetchone()
-        effect_row = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (command_id,)).fetchone()
-        if (command_row is None or effect_row is None or command_row["source_rowid"] != source.source_rowid
-                or any(command_row[name] != value for name, value in source.command_fields)
-                or any(effect_row[name] != value for name, value in source.receipt_fields)):
-            raise ValueError("submission command or effect changed after inventory")
+        _recheck_submission_source(db, source)
         if command["state"] != "succeeded" or effect["status"] != "succeeded":
             raise ValueError("submission lacks a successful effect")
         if (command["attempts"] < 1 or command["workflow_binding_json"] is None
@@ -670,3 +732,137 @@ def read_legacy_recorded_review(
     except (KeyError, TypeError, ValueError, UnicodeError, sqlite3.Error,
             WorkflowAuthorityError, CorruptControlStore) as exc:
         return UnverifiedLegacyRecordedReview(command_id, str(exc)[:512] or "recorded review source is unreadable")
+
+
+def read_review_submission_round_link(
+    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
+    lineage: LegacyReviewOwnerLineage,
+) -> VerifiedReviewSubmissionRoundLink | UnverifiedReviewSubmissionRoundLink:
+    """Join a registered review command to its exact round plan in one SQL snapshot.
+
+    Registration proves planning provenance only. A confirmed productive
+    outcome still needs a sealed round, effect and recorded baseline receipt.
+    """
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("review round link requires an explicit SQL transaction")
+    if not isinstance(source, LegacyReviewSubmissionSource) or not isinstance(lineage, LegacyReviewOwnerLineage):
+        raise ValueError("review round link requires typed command and lineage sources")
+    command = dict(source.command_fields)
+    command_id = command["command_id"]
+    if command["repository"] != lineage.repository:
+        return UnverifiedReviewSubmissionRoundLink(command_id, "submission belongs to another repository")
+    try:
+        current_lineage = read_legacy_review_owner_lineage(
+            db, lineage.repository, lineage.current_owner,
+            configured_prior_owners=lineage.configured_prior_owners,
+        )
+        if current_lineage != lineage:
+            raise ValueError("review owner lineage changed after inventory")
+        _recheck_submission_source(db, source)
+        if source.receipt_fields is not None:
+            effect = dict(source.receipt_fields)
+            receipt = EffectReceipt(
+                CommandId(command_id), effect["executor_identity"],
+                _parse_stamp(effect["started_at"]), _parse_stamp(effect["completed_at"]),
+                EffectStatus(effect["status"]), effect["remote_object_id"], effect["remote_revision"], effect["error"],
+            )
+            if (command["attempts"] < 1 or command["attempt_owner"] != receipt.executor_identity
+                    or effect["receipt_digest"] != _receipt_digest(receipt)):
+                raise ValueError("review effect receipt lacks its paid attempt or digest")
+        registration_fields, registration_digest = _read_recording_source(
+            db, "review-round-submission", lineage.repository, command_id,
+        )
+        registration = decode_workflow(dict(registration_fields)["payload_json"], ReviewSubmissionRegistration)
+        if (registration.submission.command_id != command_id
+                or registration.owner_id != command["executor_identity"]
+                or registration.owner_id not in lineage.owners
+                or registration.command_digest != command["payload_digest"]
+                or registration.idempotency_key != command["idempotency_key"]
+                or registration.config_version != command["config_version"]
+                or command["kind"] != "submit_review"):
+            raise ValueError("review registration disagrees with its exact command")
+        index_fields, index_digest = _read_recording_source(
+            db, "review-round-submission-index", lineage.repository,
+            review_submission_receipt_key(registration.round.round_id, command_id),
+        )
+        recorded = dict(registration_fields)
+        indexed = dict(index_fields)
+        if (indexed["payload_json"] != recorded["payload_json"]
+                or indexed["claimed_at"] != recorded["claimed_at"]
+                or indexed["reusable_after"] is not None or recorded["reusable_after"] is not None):
+            raise ValueError("review registration and round index disagree")
+        round_id = registration.round.round_id
+        preflight_fields, preflight_digest = _read_recording_source(
+            db, "review-round-preflight", lineage.repository, round_id,
+        )
+        preflight = decode_workflow(dict(preflight_fields)["payload_json"], tuple)
+        if (len(preflight) != 3 or not isinstance(preflight[0], ReviewPreflightSelection)
+                or not isinstance(preflight[1], str) or preflight[1] != registration.owner_id
+                or not isinstance(preflight[2], ReviewRoundPlan)
+                or preflight[0].request_id != round_id
+                or preflight[0].claim_occurrence_id != registration.claim_occurrence_id
+                or preflight[0].binding != registration.round.binding
+                or preflight[2].round != registration.round):
+            raise ValueError("review registration disagrees with its preflight")
+        sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in (
+            "round_id", "repository", "target_kind", "target_number", "execution_epoch",
+            "execution_episode", "generation", "sequence", "claim_occurrence_id", "plan_json",
+        ))
+        metadata = db.execute(
+            f"SELECT max({sizes}) AS largest_value FROM review_execution_rounds WHERE round_id=?", (round_id,),
+        ).fetchone()
+        if metadata is None or metadata["largest_value"] is None:
+            raise ValueError("registered review round is absent")
+        if metadata["largest_value"] > MAX_LEGACY_RECORDING_BYTES:
+            raise ValueError("registered review round exceeds its byte bound")
+        row = db.execute(
+            "SELECT round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
+            "generation,sequence,claim_occurrence_id,plan_json "
+            "FROM review_execution_rounds WHERE round_id=?", (round_id,),
+        ).fetchone()
+        if row is None:
+            raise ValueError("registered review round changed during its read")
+        fields = tuple((name, row[name]) for name in row.keys())
+        if any(type(value) is not (int if name in {"target_number", "execution_epoch", "generation", "sequence"}
+                                   else str) for name, value in fields):
+            raise ValueError("registered review round has malformed SQL fields")
+        plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
+        key = plan.round.binding.rejection.fence.key
+        if (plan.round != registration.round or row["repository"] != lineage.repository
+                or row["target_kind"] != "pr" or row["target_number"] != key.target.number
+                or row["execution_epoch"] != plan.round.binding.execution_epoch
+                or row["execution_episode"] != plan.round.binding.execution_episode
+                or row["generation"] != plan.round.binding.rejection.fence.generation
+                or row["sequence"] != plan.round.sequence
+                or row["claim_occurrence_id"] != registration.claim_occurrence_id):
+            raise ValueError("registered review round index disagrees with its plan")
+        if (replace(preflight[2], stages=plan.stages, submissions=plan.submissions) != plan
+                or registration.submission not in plan.submissions):
+            raise ValueError("registered review submission disagrees with its evolved plan")
+        if registration.submission.kind is ReviewSubmissionKind.PAID and not plan.stages:
+            raise ValueError("paid review submission lacks a planned stage")
+        if registration.submission.kind is ReviewSubmissionKind.COPIED and plan.stages:
+            effect = dict(source.receipt_fields) if source.receipt_fields is not None else None
+            if (command["state"] != "permanent_failure" or command["attempts"] < 1
+                    or effect is None or effect["status"] != "permanent_failure"
+                    or effect["remote_object_id"] is not None):
+                raise ValueError("copied review with later stages lacks its definitive refusal")
+        stage_digest = _verified_review_stage_sources(db, lineage.repository, plan)
+        if (command["expected_revision"] != plan.head_sha
+                or command["workflow_binding_json"] != encode_workflow(registration.round.binding.rejection)
+                or command["payload_digest"] != _encoded_payload_digest(
+                    command["payload_json"], command["workflow_binding_json"],
+                )):
+            raise ValueError("registered review command disagrees with its plan")
+        payload = json.loads(command["payload_json"], object_pairs_hook=_unique_receipt_object,
+                             parse_constant=_reject_nonfinite)
+        if (not isinstance(payload, dict) or payload.get("head") != plan.head_sha
+                or payload.get("pr") != key.target.number):
+            raise ValueError("registered review command payload disagrees with its plan")
+        round_digest = hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+        return VerifiedReviewSubmissionRoundLink(source, lineage, registration.round,
+                                                 registration_digest, index_digest,
+                                                 preflight_digest, stage_digest, round_digest)
+    except (KeyError, TypeError, ValueError, UnicodeError, sqlite3.Error,
+            WorkflowAuthorityError, CorruptControlStore) as exc:
+        return UnverifiedReviewSubmissionRoundLink(command_id, str(exc)[:512] or "review round link is unreadable")

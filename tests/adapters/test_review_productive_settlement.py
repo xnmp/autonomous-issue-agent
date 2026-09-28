@@ -1,12 +1,16 @@
 """Confirmed review submissions settle the baseline and outer round together."""
 
 import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
 
 import pytest
 
 from issue_agent.adapters.effects import bound_review_command_id
+from issue_agent.adapters.review_execution_activation import (
+    read_legacy_review_owner_lineage, read_legacy_review_submission_page, read_review_submission_round_link,
+)
 from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
 from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
@@ -20,7 +24,11 @@ from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress, ReviewRoundFailure
 from issue_agent.domain.review_evidence import ReviewEvidenceKind
 from issue_agent.domain.review_rejection import CountingRule
-from issue_agent.domain.review_rounds import ReviewSubmissionKind
+from issue_agent.domain.review_rounds import ReviewRoundPlan, ReviewSubmissionKind, ReviewSubmissionRegistration
+from issue_agent.domain.review_execution_activation import (
+    LegacyReviewOwnerLineage, LegacyReviewSubmissionSource,
+    VerifiedReviewSubmissionRoundLink, UnverifiedReviewSubmissionRoundLink,
+)
 from issue_agent.domain.review_workflow import FreshReviewRequired
 from issue_agent.domain.review_workflow_policy import record_review
 from issue_agent.domain.workflow import (
@@ -76,6 +84,176 @@ def confirmed_escalation(rig, *, cause="verdict", seal=True):
     store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
                                       EffectStatus.SUCCEEDED, remote_object_id="review:escalated"))
     return store, gateway, selection, control, plan, command
+
+
+def _registered_round_link(store, command_id):
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_page(db, "o/r")
+        source = next(entry for entry in page.entries if isinstance(entry, LegacyReviewSubmissionSource)
+                      and dict(entry.command_fields)["command_id"] == str(command_id))
+        lineage = read_legacy_review_owner_lineage(db, "o/r", OWNER)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        before = db.total_changes
+        result = read_review_submission_round_link(db, source, lineage)
+        assert db.total_changes == before
+        db.rollback()
+    return result
+
+
+def test_offline_registered_review_link_joins_real_round_and_command_sources(rig):
+    store, _, _, _, plan, command = confirmed_copy(rig)
+
+    result = _registered_round_link(store, command.command_id)
+
+    assert isinstance(result, VerifiedReviewSubmissionRoundLink)
+    assert result.round == plan.round
+    assert dict(result.source.command_fields)["command_id"] == str(command.command_id)
+    assert len(result.source_digest) == 64
+
+
+def test_offline_registered_review_link_survives_recording_and_round_finalization(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+
+    result = _registered_round_link(store, command.command_id)
+
+    assert isinstance(result, VerifiedReviewSubmissionRoundLink)
+    assert result.round == plan.round
+
+
+def test_offline_registered_paid_review_link_requires_real_stage_receipts(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    command = command_for(current(store, selection), patch_id="0" * 64)
+    control.register_submission(plan.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.PAID)
+
+    assert isinstance(_registered_round_link(store, command.command_id), VerifiedReviewSubmissionRoundLink)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-stage' AND scope='o/r'")
+    assert isinstance(_registered_round_link(store, command.command_id), UnverifiedReviewSubmissionRoundLink)
+
+
+def test_offline_registered_review_link_keeps_refused_copy_with_later_paid_stage(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    command = command_for(current(store, selection))
+    control.register_submission(plan.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.COPIED)
+    store.begin_command(command.command_id)
+    store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
+                                      EffectStatus.PERMANENT_FAILURE, error="head changed"))
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+
+    result = _registered_round_link(store, command.command_id)
+
+    assert isinstance(result, VerifiedReviewSubmissionRoundLink)
+    assert result.round == plan.round
+
+
+def test_offline_registered_review_link_blocks_forged_copy_of_paid_stage(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    command = command_for(current(store, selection), patch_id="0" * 64)
+    control.register_submission(plan.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.PAID)
+    with store.transaction() as db:
+        row = db.execute("SELECT plan_json FROM review_execution_rounds WHERE repository='o/r'").fetchone()
+        persisted = decode_workflow(row["plan_json"], ReviewRoundPlan)
+        copied = replace(persisted.submissions[0], kind=ReviewSubmissionKind.COPIED)
+        db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE repository='o/r'",
+                   (encode_workflow(replace(persisted, submissions=(copied,))),))
+        row = db.execute("SELECT payload_json FROM dedupe_keys "
+                         "WHERE namespace='review-round-submission' AND scope='o/r'").fetchone()
+        registration = decode_workflow(row["payload_json"], ReviewSubmissionRegistration)
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace LIKE 'review-round-submission%' "
+                   "AND scope='o/r'", (encode_workflow(replace(registration, submission=copied)),))
+
+    assert isinstance(_registered_round_link(store, command.command_id), UnverifiedReviewSubmissionRoundLink)
+
+
+@pytest.mark.parametrize("oversized", ["command", "effect"])
+def test_offline_registered_review_link_blocks_changed_oversized_source(rig, oversized):
+    store, _, _, _, _, command = confirmed_copy(rig)
+    with store.transaction() as db:
+        page = read_legacy_review_submission_page(db, "o/r")
+        source = next(entry for entry in page.entries if isinstance(entry, LegacyReviewSubmissionSource)
+                      and dict(entry.command_fields)["command_id"] == str(command.command_id))
+        lineage = read_legacy_review_owner_lineage(db, "o/r", OWNER)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        if oversized == "command":
+            db.execute("UPDATE lifecycle_commands SET payload_json=? WHERE command_id=?",
+                       ("x" * 65537, str(command.command_id)))
+        else:
+            db.execute("UPDATE effect_receipts SET error=? WHERE command_id=?",
+                       ("x" * 65537, str(command.command_id)))
+        before = db.total_changes
+        result = read_review_submission_round_link(db, source, lineage)
+        assert db.total_changes == before
+
+    assert isinstance(result, UnverifiedReviewSubmissionRoundLink)
+    assert "source bound" in result.reason
+
+
+@pytest.mark.parametrize("altered", ["command_id", "digest", "idempotency", "config", "owner"])
+def test_offline_registered_review_link_requires_exact_command_registration(rig, altered):
+    store, _, _, _, _, command = confirmed_copy(rig)
+    with store.transaction() as db:
+        row = db.execute("SELECT payload_json FROM dedupe_keys "
+                         "WHERE namespace='review-round-submission' AND scope='o/r'").fetchone()
+        registration = decode_workflow(row["payload_json"], ReviewSubmissionRegistration)
+        if altered == "command_id":
+            submission = replace(registration.submission, command_id="forged-command")
+            registration = replace(registration, submission=submission)
+            row = db.execute("SELECT plan_json FROM review_execution_rounds WHERE repository='o/r'").fetchone()
+            plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
+            db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE repository='o/r'",
+                       (encode_workflow(replace(plan, submissions=(submission,))),))
+        elif altered == "digest":
+            registration = replace(registration, command_digest="0" * 64)
+        elif altered == "idempotency":
+            registration = replace(registration, idempotency_key="forged-key")
+        elif altered == "config":
+            registration = replace(registration, config_version="forged-version")
+        else:
+            registration = replace(registration, owner_id="forged-owner")
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace LIKE 'review-round-submission%' "
+                   "AND scope='o/r'", (encode_workflow(registration),))
+
+    assert isinstance(_registered_round_link(store, command.command_id), UnverifiedReviewSubmissionRoundLink)
+
+
+@pytest.mark.parametrize("damage", ["index", "plan", "missing_registration", "command", "forged_paid_kind"])
+def test_offline_registered_review_link_blocks_contradictory_sources(rig, damage):
+    store, _, _, _, _, command = confirmed_copy(rig)
+    with store.transaction() as db:
+        if damage == "index":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' "
+                       "WHERE namespace='review-round-submission-index' AND scope='o/r'")
+        elif damage == "plan":
+            db.execute("UPDATE review_execution_rounds SET plan_json='{}' WHERE repository='o/r'")
+        elif damage == "missing_registration":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-submission' AND scope='o/r'")
+        elif damage == "forged_paid_kind":
+            row = db.execute("SELECT plan_json FROM review_execution_rounds WHERE repository='o/r'").fetchone()
+            plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
+            paid = replace(plan.submissions[0], kind=ReviewSubmissionKind.PAID)
+            db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE repository='o/r'",
+                       (encode_workflow(replace(plan, submissions=(paid,))),))
+            row = db.execute("SELECT payload_json FROM dedupe_keys "
+                             "WHERE namespace='review-round-submission' AND scope='o/r'").fetchone()
+            registration = decode_workflow(row["payload_json"], ReviewSubmissionRegistration)
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace LIKE 'review-round-submission%' "
+                       "AND scope='o/r'", (encode_workflow(replace(registration, submission=paid)),))
+        else:
+            db.execute("UPDATE lifecycle_commands SET payload_digest=? WHERE command_id=?",
+                       ("0" * 64, str(command.command_id)))
+
+    assert isinstance(_registered_round_link(store, command.command_id), UnverifiedReviewSubmissionRoundLink)
 
 
 def test_confirmed_copied_verdict_commits_baseline_and_execution_progress_together(rig):
