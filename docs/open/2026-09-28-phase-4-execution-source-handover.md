@@ -193,6 +193,15 @@ occurred.
 
 ## Next required boundary
 
+The next whole-set proof should revalidate complete command, submission
+receipt and round/outcome storage sets in one explicit SQL transaction. Pair
+each registration with its derived round-index key and exact payload/claim;
+account for every planned submission and every recorded marker. Historical
+unregistered commands and raw markers remain explicit observations. The result
+must not claim a productive reset: that still requires per-command bound effect,
+baseline and round proof, plus ordered outcome replay. Independent Sol design
+review recommended this boundary after checkpoint 47.
+
 1. Revalidate the bounded owner closure and run inventory under activation
    barriers before any import commit. Daemon boot's `adopt_legacy_owner`
    rewrites some prior run owners, so neither the current owner nor configured
