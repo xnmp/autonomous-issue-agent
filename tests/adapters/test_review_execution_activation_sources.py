@@ -1792,6 +1792,27 @@ def test_complete_success_classification_proves_stale_and_ceiling_paths(rig):
     assert len(classified.results) == 2
 
 
+def test_refused_ceiling_without_durable_prior_state_remains_unresolved(rig):
+    store, gateway, selection, control, plan, command = confirmed_escalation(rig, cause="ceiling")
+    refused = workflow_for(store, gateway).settle_submission(command.command_id)
+    assert isinstance(refused, WorkflowRejected)
+    assert current(store, selection).gates == ()
+
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+        assert len(classified.unresolved) == 1
+        assert dict(classified.unresolved[0].source.command_fields)["command_id"] == str(command.command_id)
+        assert "accepted gate transition" in classified.unresolved[0].reason
+        ordered = verify_complete_legacy_ordered_outcome_coverage(db, classified)
+        db.rollback()
+
+    assert isinstance(ordered, BlockedLegacyOrderedOutcomeCoverage)
+    assert "unresolved" in ordered.reason
+    assert control.finalize_completed_round(plan.round.round_id).outcome.round == plan.round
+
+
 def test_ordered_outcome_replay_includes_accepted_ceiling_and_stale_round(rig):
     store, plan, _, _ = _stale_settlement(rig)
 

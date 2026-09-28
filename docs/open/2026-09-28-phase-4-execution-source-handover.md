@@ -254,6 +254,21 @@ domain, 3,134 adapter, 2,866 app, hooks, governor, gate parity, four import
 contracts and both Pyrefly checks; 10 strict xfails remained expected. The
 gate log is `/tmp/phase4-session-source-gate.log` (ephemeral).
 
+The next refused-ceiling probe confirmed a separate prior-state gap. The
+writer durably closes a productive round when a fresh ceiling decision is
+refused, but the decision receipt embeds its own prior workflow snapshot.
+Replaying policy against that embedded snapshot alone cannot prove it was the
+actual durable prior state. An independent Sol review rejected a proposed
+classification on this basis; the change was withdrawn. A regression now
+asserts that this successful command stays unresolved and prevents complete
+ordered coverage. A future proof must join the prior snapshot to durable
+workflow lineage, including an activation origin or accepted predecessor
+transition, before admitting the refused productive round.
+The guard regression and full gate passed: 3,257 domain, 3,135 adapter and
+2,866 app tests, hooks, governor, gate parity, four import contracts and both
+Pyrefly checks; 10 strict xfails remained expected. The gate log is
+`/tmp/phase4-refused-ceiling-guard-gate.log` (ephemeral).
+
 Independent Sol review of checkpoint 63 found a mixed-repository provenance
 gap: the listing used the requested repository while PR and issue reads used
 the gateway's configured repository. The reader now checks equality before
@@ -505,7 +520,8 @@ order a durable clock.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Classify refused ceiling decisions and other unresolved historical
+2. Prove the prior workflow state for refused ceiling decisions from durable
+   lineage, then classify those decisions and other unresolved historical
    commands, then replay every eligible older-generation outcome against a
    source-backed execution origin/checkpoint to establish resets. Verify
    delivered escalated holds or their current observed state, and resolve or

@@ -201,6 +201,12 @@ may be read/replayed but acquire no new execution authority. Prove that a
 missing capture is refused after activation. No uncertain old command crosses
 this boundary silently.
 
+A refused ceiling decision closes a productive round without opening a gate.
+Its receipt embeds the prior workflow snapshot; replaying policy against that
+embedded value does not prove the snapshot was the actual durable prior state.
+Join it to source-backed workflow history before classifying the round for
+import. Until then, the successful command remains unresolved.
+
 Shadow compares eligibility, inherited failures, held/releasable causes,
 session choice and fresh-review obligations under identical observations.
 Rollback keeps both activated SQL components and all later receipts; retained
