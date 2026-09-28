@@ -283,6 +283,26 @@ with `CLAUDE.md`, `AGENTS.md`, the
   owner IDs. This closes configuration provenance for the source check only;
   historical debit, reset and session authority still require proof before a
   production import writer can commit.
+- Checkpoint 69 adds pure whole-set attribution of abandoned owner runs and
+  configured-root counter files to each currently open PR's signed keys.
+  Unattributed abandonments, a positive issue key shared by open PRs, and a
+  death whose key now selects another PR block. Closed-PR deaths remain
+  unassigned evidence. The current-owner count includes only that owner's
+  abandoned runs plus assigned files; predecessor-owner deaths remain separate
+  because the live SQL reader selects one owner. This is an observational
+  prerequisite, not proof of historical file resets, predecessor adoption,
+  session reuse or an inherited execution debit.
+
+Independent Sol review of checkpoint 69 found that an initial version counted
+predecessor-owner abandoned runs in the current owner's live count. The final
+variant separates those runs and retains them as explicit historical evidence;
+the reviewer found no further concrete issue. Tests cover current and prior
+owners, both signed keys, closed PRs, shared and relinked issues, unknown and
+foreign dispatch, overflow, forged complete values and source-order stability.
+Full `make test` passed: 3,270 domain, 3,171 adapter and 2,872 app tests,
+hooks, governor, gate parity, four import contracts and both Pyrefly checks;
+10 strict xfails remained expected. The gate log is
+`/tmp/phase4-death-attribution-gate.log` (ephemeral).
 
 Independent Sol review of checkpoint 68 found the new app module missing from
 the architecture manifest; the contract entry and focused regression were
@@ -613,8 +633,9 @@ order a durable clock.
 3. Use the barrier-held file/linkage/counter and SQL source scope in the
    production import writer, preserving the scope through commit.
    The pure mapper retains unassigned historical counters and refuses a
-   positive issue key shared by open PRs, but it has not established
-   historical deaths or resets. The typed session/round/counter parser keeps malformed values and
+   positive issue key shared by open PRs. Checkpoint 69 now retains every
+   owner-lineage death but has not established historical resets or predecessor
+   adoption. The typed session/round/counter parser keeps malformed values and
    mode markers explicit; a syntactically valid session candidate is now an
    explicit unproven source blocker. Even a current reviewed baseline cannot
    certify it because newer legacy reviews could retain an older handle.

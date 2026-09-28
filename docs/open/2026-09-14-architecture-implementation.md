@@ -24,6 +24,10 @@ and generation receipts against that barrier-held scope in one control-store
 transaction. Its owner inputs remain caller supplied; the production writer
 must use the new app composition that derives them from the same repoint
 configuration as daemon boot before import authority.
+Pure whole-set death attribution now separates current-owner abandoned runs
+from predecessor evidence and assigns current counter files to open PR keys.
+Unknown or cross-PR deaths block. Historical reset order and predecessor
+adoption remain unproved, so this does not yet authorize an inherited debit.
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 
