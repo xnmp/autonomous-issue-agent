@@ -559,6 +559,7 @@ adapters live under `adapters/dashweb/`.
 `app/loop.py`, `app/main.py`,
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
+`app/review_execution_import.py` (configuration-bound legacy owner source checks),
 `app/review_runtime.py` (the active review family's dispatch plan, bound
 submission authority, trusted external holds and fix-side guidance read, and the
 one review-control composition the daemon and the operator transport share),

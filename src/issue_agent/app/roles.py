@@ -176,6 +176,8 @@ from .config import (
     StewardRuntimeConfig,
     deployment_identity_for_target,
     owner_identity_for_target,
+    prior_deployment_identities,
+    configured_prior_owner_ids,
 )
 from .dispatch import AgentDispatcher, DispatchConfig
 from .infra_breaker import InfraBreaker
@@ -236,33 +238,6 @@ def _deployment_identity(cfg: HarnessConfig, role: str) -> str:
     return _deployment_identity_for_repository(cfg, role, cfg.repo)
 
 
-def _prior_deployments(
-    cfg: HarnessConfig,
-    role: str,
-) -> tuple[tuple[str, str], ...]:
-    """Exact prior ``(repository, deployment)`` identities authorized by config."""
-
-    candidates = list(cfg.repointed_from_deployments)
-    if cfg.repo_input and cfg.repo_input != cfg.repo:
-        candidates.append((cfg.repo_input, cfg.target_dir))
-    current = (cfg.repo, _deployment_identity(cfg, role))
-    return tuple(
-        identity
-        for identity in dict.fromkeys(
-            (
-                repository,
-                _deployment_identity_for_target(
-                    repository,
-                    target_dir,
-                    role,
-                ),
-            )
-            for repository, target_dir in candidates
-        )
-        if identity != current
-    )
-
-
 def process_supervision_state_dir(
     cfg: HarnessConfig,
     role: str,
@@ -292,7 +267,7 @@ def prior_process_supervision_state_dirs(
         raise ValueError("process supervisor state directory is required")
     return tuple(
         os.path.join(root, "process-supervision", deployment)
-        for _repository, deployment in _prior_deployments(cfg, role)
+        for _repository, deployment in prior_deployment_identities(cfg, role)
     )
 
 
@@ -310,15 +285,8 @@ def _control_store(
     control = SQLiteControlStore(_control_store_path(cfg, state_dir))
     control.initialize()
     role = journal.events.producer.role
-    prior_deployments = _prior_deployments(cfg, role)
-    prior_owners = tuple(
-        owner
-        for repository, deployment in prior_deployments
-        for owner in (
-            f"{repository}:{role}",
-            f"{repository}:{role}:{deployment}",
-        )
-    )
+    prior_deployments = prior_deployment_identities(cfg, role)
+    prior_owners = configured_prior_owner_ids(cfg, role)
     control.adopt_legacy_owner(
         cfg.repo,
         role,

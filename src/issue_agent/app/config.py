@@ -68,6 +68,35 @@ def owner_identity_for_target(
     return f"{repository}:{role}:{deployment}"
 
 
+def prior_deployment_identities(
+    cfg: HarnessConfig, role: str,
+) -> tuple[tuple[str, str], ...]:
+    """Exact prior repository/deployment identities authorized by config."""
+    if role not in ("fix", "review", "steward"):
+        raise ValueError("prior deployment identities require configured role authority")
+    candidates = list(cfg.repointed_from_deployments)
+    if cfg.repo_input and cfg.repo_input != cfg.repo:
+        candidates.append((cfg.repo_input, cfg.target_dir))
+    current = (cfg.repo, deployment_identity_for_target(cfg.repo, cfg.target_dir, role))
+    return tuple(
+        identity
+        for identity in dict.fromkeys(
+            (repository, deployment_identity_for_target(repository, target_dir, role))
+            for repository, target_dir in candidates
+        )
+        if identity != current
+    )
+
+
+def configured_prior_owner_ids(cfg: HarnessConfig, role: str) -> tuple[str, ...]:
+    """Owner predecessors passed to daemon boot's adoption operation."""
+    return tuple(
+        owner
+        for repository, deployment in prior_deployment_identities(cfg, role)
+        for owner in (f"{repository}:{role}", f"{repository}:{role}:{deployment}")
+    )
+
+
 def parse_repoint_history(raw: str) -> tuple[tuple[str, str], ...]:
     """Decode the explicit repository/checkout lineage written by the CLI."""
 

@@ -274,6 +274,27 @@ with `CLAUDE.md`, `AGENTS.md`, the
   provenance in the production writer. This is source observation only. It
   does not establish inherited debit, ordered resets, session reuse or import
   authority.
+- Checkpoint 68 derives review owner predecessors from the exact repoint
+  configuration helper used by daemon boot's owner adoption. An app-level
+  source verifier validates the deployment snapshot, excludes the current and
+  implicit owner from the configured predecessor tuple, then calls checkpoint
+  67's barrier-held SQL verifier. A prior run and a repository-alias predecessor
+  cannot disappear from the complete inventory by passing caller-selected
+  owner IDs. This closes configuration provenance for the source check only;
+  historical debit, reset and session authority still require proof before a
+  production import writer can commit.
+
+Independent Sol review of checkpoint 68 found the new app module missing from
+the architecture manifest; the contract entry and focused regression were
+added. The first full gate then exposed a boot test using the shared owner
+helper with a duck-typed configuration. The helper now preserves that boot
+contract, while the import wrapper requires a validated `HarnessConfig`.
+The final review found no remaining concrete issue. Tests cover a real prior
+run, omitted predecessor, repository alias, invalid configuration and existing
+repoint adoption/startup behavior. Full `make test` passed: 3,258 domain,
+3,171 adapter and 2,872 app tests, hooks, governor, gate parity, four import
+contracts and both Pyrefly checks; 10 strict xfails remained expected. The
+gate log is `/tmp/phase4-configured-import-owner-gate.log` (ephemeral).
 
 Independent Sol review of checkpoint 67 found scope lifetime, store identity,
 owner-input and proof-construction gaps. The final implementation binds the
@@ -574,10 +595,10 @@ old two-field receipts and unclassified commands block activation authority.
 [SQLite's rowid rules](https://www.sqlite.org/autoinc.html) do not make rowid
 order a durable clock.
 
-1. Bind the production writer's review owner and configured predecessors to
-   the actual deployment configuration, then use checkpoint 67's SQL
-   revalidation inside its acceptance transaction under activation barriers.
-   Daemon boot's `adopt_legacy_owner`
+1. Call checkpoint 68's configuration-bound source verifier from the
+   production import writer inside its acceptance transaction under activation
+   barriers, retaining the held source context through commit. Daemon boot's
+   `adopt_legacy_owner`
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
