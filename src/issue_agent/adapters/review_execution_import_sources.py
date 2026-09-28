@@ -20,6 +20,10 @@ from ..domain.review_execution_counter_mapping import (
     BlockedLegacyCounterMapping, BlockedLegacyOpenCounterLinks, CompleteLegacyCounterMapping,
     CompleteLegacyOpenCounterLinks, map_legacy_execution_counters,
 )
+from ..domain.review_execution_death_import import (
+    BlockedLegacyReviewDeathAttribution, CompleteLegacyReviewDeathAttribution,
+    attribute_complete_legacy_review_deaths,
+)
 from ..domain.workflow_identity import WorkflowWriter, canonical_workflow_repository, validate_workflow_text
 from .control_store import SQLiteControlStore
 from .deployment_authority import deployment_effect_barrier
@@ -150,18 +154,22 @@ class RevalidatedLegacyExecutionImportSources:
 
     counters: HeldLegacyExecutionCounterSources
     sql: ObservedLegacyExecutionSqlImportSources
+    deaths: CompleteLegacyReviewDeathAttribution
     _mint: object = field(repr=False)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.counters, HeldLegacyExecutionCounterSources)
                 or not isinstance(self.sql, ObservedLegacyExecutionSqlImportSources)
+                or not isinstance(self.deaths, CompleteLegacyReviewDeathAttribution)
                 or self.counters.mapping.links.repository != self.sql.repository
+                or self.deaths.runs != self.sql.runs
+                or self.deaths.mapping != self.counters.mapping
                 or _held_control_path(self.counters) is None or self._mint is not _VERIFICATION_MINT):
             raise ValueError("execution import sources require verified same-repository evidence")
 
     @property
     def source_digest(self) -> str:
-        source = (self.counters.source_digest, self.sql.source_digest)
+        source = (self.counters.source_digest, self.sql.source_digest, self.deaths.source_digest)
         return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -226,6 +234,9 @@ def verify_legacy_execution_import_sources(
     current = ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
     if current != observed or current.source_digest != observed.source_digest:
         return BlockedLegacyExecutionSqlImportSources("execution SQL sources changed after inventory")
+    deaths = attribute_complete_legacy_review_deaths(runs, counters.mapping)
+    if isinstance(deaths, BlockedLegacyReviewDeathAttribution):
+        return BlockedLegacyExecutionSqlImportSources(deaths.reason)
     if _held_control_path(counters) is None:
         return BlockedLegacyExecutionSqlImportSources("execution import source barriers are no longer held")
-    return RevalidatedLegacyExecutionImportSources(counters, current, _VERIFICATION_MINT)
+    return RevalidatedLegacyExecutionImportSources(counters, current, deaths, _VERIFICATION_MINT)

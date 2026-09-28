@@ -292,6 +292,23 @@ with `CLAUDE.md`, `AGENTS.md`, the
   because the live SQL reader selects one owner. This is an observational
   prerequisite, not proof of historical file resets, predecessor adoption,
   session reuse or an inherited execution debit.
+- Checkpoint 70 joins that attribution into the barrier-held SQL source
+  revalidation. The verifier now blocks an unattributed abandonment before it
+  returns, and its minted source result binds the attribution to the exact
+  revalidated run inventory and held counter mapping. It retains current-owner,
+  predecessor and unassigned deaths distinctly. The result is still an
+  observation; a future writer must prove resets and inherited debit before
+  committing import authority.
+
+Independent Sol review of checkpoint 70 found no concrete issue. Focused
+adapter and app tests cover a current-owner run, a retained predecessor, an
+opaque abandonment and an attempted substitute attribution. The first full
+gate failed after the host filesystem filled (`Errno 28` during pytest cache
+write); it was not a code assertion failure. After free space returned, the
+unchanged implementation passed the full rerun: 3,270 domain, 3,173 adapter
+and 2,872 app tests, hooks, governor, gate parity, four import contracts and
+both Pyrefly checks; 10 strict xfails remained expected. The passing log is
+`/tmp/phase4-sql-death-join-rerun.log` (ephemeral).
 
 Independent Sol review of checkpoint 69 found that an initial version counted
 predecessor-owner abandoned runs in the current owner's live count. The final
@@ -615,7 +632,7 @@ old two-field receipts and unclassified commands block activation authority.
 [SQLite's rowid rules](https://www.sqlite.org/autoinc.html) do not make rowid
 order a durable clock.
 
-1. Call checkpoint 68's configuration-bound source verifier from the
+1. Call checkpoint 70's configuration-bound source verifier from the
    production import writer inside its acceptance transaction under activation
    barriers, retaining the held source context through commit. Daemon boot's
    `adopt_legacy_owner`
@@ -633,9 +650,9 @@ order a durable clock.
 3. Use the barrier-held file/linkage/counter and SQL source scope in the
    production import writer, preserving the scope through commit.
    The pure mapper retains unassigned historical counters and refuses a
-   positive issue key shared by open PRs. Checkpoint 69 now retains every
-   owner-lineage death but has not established historical resets or predecessor
-   adoption. The typed session/round/counter parser keeps malformed values and
+   positive issue key shared by open PRs. Checkpoint 70 retains every
+   owner-lineage death in the barrier-held result but has not established
+   historical resets or predecessor adoption. The typed session/round/counter parser keeps malformed values and
    mode markers explicit; a syntactically valid session candidate is now an
    explicit unproven source blocker. Even a current reviewed baseline cannot
    certify it because newer legacy reviews could retain an older handle.

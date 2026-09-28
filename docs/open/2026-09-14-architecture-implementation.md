@@ -28,6 +28,8 @@ Pure whole-set death attribution now separates current-owner abandoned runs
 from predecessor evidence and assigns current counter files to open PR keys.
 Unknown or cross-PR deaths block. Historical reset order and predecessor
 adoption remain unproved, so this does not yet authorize an inherited debit.
+The barrier-held SQL source verifier now carries that exact attribution after
+revalidating its owner runs and counter mapping in the acceptance transaction.
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 

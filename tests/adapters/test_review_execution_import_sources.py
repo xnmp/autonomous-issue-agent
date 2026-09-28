@@ -1,6 +1,7 @@
 """Activation-source scope keeps remote-effect barriers over complete attribution."""
 
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -25,6 +26,9 @@ from issue_agent.domain.review_execution_activation import (
     CompleteLegacyReviewGenerationReceipts, CompleteLegacyReviewRuns, LegacyReviewOwnerLineage,
 )
 from issue_agent.domain.review_execution_counter_mapping import CompleteLegacyOpenCounterLinks
+from issue_agent.domain.review_execution_death_import import (
+    CompleteLegacyReviewDeathAttribution, attribute_complete_legacy_review_deaths,
+)
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.world import IssueView, PRView
 
@@ -135,6 +139,22 @@ def _observed_sql_sources(control):
     return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
 
 
+def _record_abandoned_run(control, run_id: str, owner: str, dispatch_id: str):
+    with control.transaction() as db:
+        db.execute(
+            "INSERT INTO runs(run_id,dispatch_id,kind,owner_id,state,config_version) "
+            "VALUES (?,?,?,?,?,?)",
+            (run_id, dispatch_id, "REVIEW", owner, "abandoned", "cfg"),
+        )
+
+
+def _dispatch(pr: int, key: int) -> str:
+    return json.dumps({
+        "repository": "o/r", "role": "review", "kind": "REVIEW", "number": pr,
+        "breaker_key": key, "issue": key if key > 0 else None,
+    })
+
+
 def test_sql_import_sources_revalidate_in_the_barrier_held_acceptance_transaction(sources):
     control, gateway, roots, files, links = sources
     observed = _observed_sql_sources(control)
@@ -146,10 +166,53 @@ def test_sql_import_sources_revalidate_in_the_barrier_held_acceptance_transactio
             )
             assert isinstance(result, RevalidatedLegacyExecutionImportSources)
             assert result.sql == observed
+            assert [(debit.pr, debit.count) for debit in result.deaths.debits] == [(9, 2), (10, 3)]
             assert len(result.source_digest) == 64
             with pytest.raises(BlockingIOError):
                 with deployment_effect_authority(control.path, "o/r", "review", blocking=False):
                     pass
+
+
+def test_sql_import_source_result_carries_current_and_predecessor_deaths_separately(sources):
+    control, gateway, roots, files, links = sources
+    _record_abandoned_run(control, "current-run", WRITER.owner_id, _dispatch(9, 7))
+    _record_abandoned_run(control, "prior-run", "o/r:review", _dispatch(9, -9))
+    observed = _observed_sql_sources(control)
+
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, held, observed, writer=WRITER, configured_prior_owners=(),
+            )
+            assert isinstance(result, RevalidatedLegacyExecutionImportSources)
+            substitute = attribute_complete_legacy_review_deaths(
+                CompleteLegacyReviewRuns(observed.runs.lineage, ()), held.mapping,
+            )
+            assert isinstance(substitute, CompleteLegacyReviewDeathAttribution)
+            with pytest.raises(ValueError, match="verified same-repository"):
+                replace(result, deaths=substitute)
+
+    debit = result.deaths.debits[0]
+    assert debit.count == 3
+    assert [run.source.run_id for run in debit.current_owner_runs] == ["current-run"]
+    assert [run.source.run_id for run in debit.predecessor_runs] == ["prior-run"]
+
+
+def test_sql_import_source_verification_blocks_unknown_abandoned_run(sources):
+    control, gateway, roots, files, links = sources
+    _record_abandoned_run(control, "opaque-run", WRITER.owner_id, "opaque")
+    observed = _observed_sql_sources(control)
+
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, held, observed, writer=WRITER, configured_prior_owners=(),
+            )
+
+    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+    assert "unattributed" in result.reason
 
 
 @pytest.mark.parametrize("change", ("lineage", "settlement", "generation"))
@@ -200,7 +263,7 @@ def test_sql_import_sources_reject_expired_barrier_lease(sources):
     assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
     assert "barriers" in result.reason
     with pytest.raises(ValueError, match="verified same-repository"):
-        RevalidatedLegacyExecutionImportSources(held, observed, object())
+        RevalidatedLegacyExecutionImportSources(held, observed, None, object())
 
 
 def test_sql_import_sources_reject_forged_counter_and_result_evidence(sources):
@@ -215,7 +278,7 @@ def test_sql_import_sources_reject_forged_counter_and_result_evidence(sources):
             )
         assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
         with pytest.raises(ValueError, match="verified same-repository"):
-            RevalidatedLegacyExecutionImportSources(held, observed, object())
+            RevalidatedLegacyExecutionImportSources(held, observed, None, object())
 
 
 def test_sql_import_sources_do_not_reactivate_an_escaped_scope(sources):

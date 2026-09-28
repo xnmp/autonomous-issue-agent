@@ -1,6 +1,7 @@
 """Configured import source checks use daemon boot's owner ancestry."""
 
 from dataclasses import replace
+import json
 
 import pytest
 
@@ -93,7 +94,10 @@ def _record_prior_run(cfg, control):
         db.execute(
             "INSERT INTO runs(run_id,dispatch_id,kind,owner_id,state,config_version) "
             "VALUES (?,?,?,?,?,?)",
-            ("prior-run", "prior-dispatch", "REVIEW", prior_owner, "abandoned", "cfg"),
+            ("prior-run", json.dumps({
+                "repository": "o/r", "role": "review", "kind": "REVIEW", "number": 9,
+                "breaker_key": -9, "issue": None,
+            }), "REVIEW", prior_owner, "abandoned", "cfg"),
         )
 
 
@@ -112,6 +116,7 @@ def test_configured_import_revalidates_the_full_boot_owner_lineage(sources):
             result = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
             assert isinstance(result, RevalidatedLegacyExecutionImportSources)
             assert result.sql == observed
+            assert [run.source.run_id for run in result.deaths.unassigned_deaths] == ["prior-run"]
 
 
 def test_configured_import_refuses_an_inventory_omitting_prior_owner(sources):
