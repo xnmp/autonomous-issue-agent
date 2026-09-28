@@ -185,6 +185,10 @@ retained.
 A legacy real session without an identifiable source admission either blocks
 import or uses an explicit imported-session provenance variant with its source
 evidence. Never fabricate a paid admission to make a legacy handle reusable.
+The legacy file cannot by itself identify the producing review: a later
+successful review with no returned session can leave an older handle in place.
+Until independent source evidence establishes the eligible producer, classify
+that handle as an import blocker, including when the current baseline is proved.
 
 Activation requires full quiescence of outer rounds, child runs, accounting
 reservations, unclassified returns, submissions and pending re-arms. It keeps

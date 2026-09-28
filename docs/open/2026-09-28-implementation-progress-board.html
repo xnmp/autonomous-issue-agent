@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 28 Sep 2026, 21:31 AEST · Latest accepted checkpoint: legacy issue-counter attribution</p>
+      <p class="meta">Updated 28 Sep 2026, 21:52 AEST · Latest accepted checkpoint: fail-closed legacy session source</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Offline source replay, imported-origin hot-read checks, bounded file-root revalidation and observational issue-counter attribution are in place. Next: join these proofs under activation barriers, prove session provenance, then build the production import writer and compaction audit. Refused ceilings and remote holds remain open. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Offline source replay, imported-origin hot-read checks, bounded file-root revalidation, issue-counter attribution and fail-closed session classification are in place. Next: join these proofs under activation barriers, prove the legacy session producer, then build the production import writer and compaction audit. Refused ceilings and remote holds remain open. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -124,6 +124,7 @@
           <li><time datetime="2026-09-28T20:50:00+10:00">28 Sep 2026, 20:50 AEST</time><strong>Legacy execution file values accepted offline · 3 of 6 accepted</strong><p>Typed parsing binds supplied session, round and counter values to their file source and root. Mode markers and malformed or disappearing files remain explicit blockers; valid handles still require provenance. Sol review and the full gate passed: 3,236 domain, 3,108 adapter and 2,866 app tests. Configured-root completeness and issue-to-PR counter mapping remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T21:09:00+10:00">28 Sep 2026, 21:09 AEST</time><strong>Configured-root file revalidation accepted offline · 3 of 6 accepted</strong><p>Each configured root's path and directory identity now bind the complete file-value snapshot; a fresh read under activation barriers must match it. One shared entry and byte budget stops cross-root overflow. Sol review found and verified the budget fix; the full gate passed: 3,236 domain, 3,120 adapter and 2,866 app tests. Issue-counter mapping, session provenance and the import writer remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T21:31:00+10:00">28 Sep 2026, 21:31 AEST</time><strong>Legacy issue-counter attribution accepted offline · 3 of 6 accepted</strong><p>Repository-bound complete open-PR and linked-issue reads now support pure assignment of positive issue and negative PR counter files. Shared issue keys and overflowing combined counts block; unused historical counters remain visible. Sol review found and verified a cross-repository provenance fix. The full gate passed: 3,250 domain, 3,132 adapter and 2,866 app tests. Activation-barrier integration and session provenance remain open. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-28T21:52:00+10:00">28 Sep 2026, 21:52 AEST</time><strong>Legacy session source classification accepted offline · 3 of 6 accepted</strong><p>A fresh configured-root read retains real session file evidence as an explicit blocker. Sol review found that later successful reviews can leave an older handle, so a current baseline cannot certify reuse. Absent files and mode markers yield no reusable session. The full gate passed: 3,257 domain, 3,134 adapter and 2,866 app tests, plus contracts and Pyrefly. Producer provenance and the production import writer remain open. Active work since the previous entry: About 21 minutes.</p></li>
         </ol>
       </div>
     </section>

@@ -236,6 +236,23 @@ with `CLAUDE.md`, `AGENTS.md`, the
   combined PR total blocks. This remains observational: the production writer
   must join it to configured-root revalidation and historical run/reset
   evidence inside activation barriers before importing any debit.
+- Checkpoint 64 adds a fail-closed session-file import decision. A configured-root
+  re-read retains repository, PR, root, parsed runtime/handle and file digest
+  for a real legacy session, but returns an unproven source variant rather than
+  a reusable handle. The old writer could leave a prior handle after a newer
+  successful multi review or sessionless re-review, so a current reviewed
+  baseline cannot identify the handle's producing reviewer. Absent files and
+  known mode markers produce no reusable session. Session admission remains
+  blocked until a durable producer can be joined; the observational reader
+  does not authorize activation.
+
+Independent Sol review of checkpoint 64 found the stale-handle case in both
+multi review and sessionless re-review, plus an initial evidence-ID binding
+gap. The implementation was narrowed to an explicit unproven source, and the
+second pass found no remaining material issue. The full gate passed: 3,257
+domain, 3,134 adapter, 2,866 app, hooks, governor, gate parity, four import
+contracts and both Pyrefly checks; 10 strict xfails remained expected. The
+gate log is `/tmp/phase4-session-source-gate.log` (ephemeral).
 
 Independent Sol review of checkpoint 63 found a mixed-repository provenance
 gap: the listing used the requested repository while PR and issue reads used
@@ -500,8 +517,9 @@ order a durable clock.
    mapper retains unassigned historical counters and refuses a positive issue
    key shared by open PRs, but it has not established historical deaths or
    resets. The typed session/round/counter parser keeps malformed values and
-   mode markers explicit; a syntactically valid session candidate still needs
-   source-backed admission provenance before reuse.
+   mode markers explicit; a syntactically valid session candidate is now an
+   explicit unproven source blocker. Even a current reviewed baseline cannot
+   certify it because newer legacy reviews could retain an older handle.
 4. Build the production import writer from revalidated legacy sources and
    activation decisions, then mint initialized/renewed origin variants,
    checkpoint receipts and the archived-source audit required by the

@@ -62,10 +62,13 @@ from ..domain.review_execution_activation import (
 )
 from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from ..domain.review_execution import (
-    ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundIdentity, ReviewRoundOutcome,
+    ExecutionNotActivated, ActivatedReviewExecution, NoReviewSession, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
     review_generation_chain_digest, same_execution_episode,
+)
+from ..domain.review_execution_session_import import (
+    BlockedLegacyReviewSessionImport, UnprovenLegacyReviewSession, plan_legacy_review_session_import,
 )
 from ..domain.review_workflow import (
     ReviewWorkflowSnapshot, RecordedPullRequest, ReviewedBaseline, PullRequestState,
@@ -333,6 +336,29 @@ def revalidate_complete_legacy_execution_file_values(
     if current.source_digest != observed.source_digest or current != observed:
         return BlockedLegacyExecutionFileValues("legacy execution roots or files changed or the supplied set was incomplete")
     return current
+
+
+def observe_legacy_review_session_import(
+    roots: LegacyRoots,
+    observed: CompleteLegacyExecutionRootFiles,
+    binding: ReviewExecutionBinding,
+) -> NoReviewSession | UnprovenLegacyReviewSession | BlockedLegacyReviewSessionImport:
+    """Re-read the configured file sources before proposing a session import.
+
+    The caller still must hold activation barriers and bind this observation
+    to the import decision and committed source audit.
+    """
+    if not isinstance(binding, ReviewExecutionBinding):
+        raise ValueError("session import observation requires an execution binding")
+    pr = binding.rejection.fence.key.target
+    assert isinstance(pr, PullRequestRef)
+    current = revalidate_complete_legacy_execution_file_values(roots, observed)
+    if isinstance(current, BlockedLegacyExecutionFileValues):
+        return BlockedLegacyReviewSessionImport(pr.number, current.reason)
+    source = next((item for item in current.values.prs if item.source.pr == pr.number), None)
+    if source is not None and source.source.root not in {root.label for root in current.roots}:
+        return BlockedLegacyReviewSessionImport(pr.number, "legacy session source root is not configured")
+    return plan_legacy_review_session_import(current.values, current.source_digest, binding)
 
 
 def _decode_run_source(
