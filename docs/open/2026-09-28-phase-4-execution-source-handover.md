@@ -310,6 +310,27 @@ with `CLAUDE.md`, `AGENTS.md`, the
   blocks duplicate PR sources across roots. This prevents an old review root
   from silently zeroing an active value, but does not prove historical resets,
   session producers or debit authority.
+- Checkpoint 72 writes new generation-boundary receipts with the accepted
+  transition's SHA-256 digest instead of copying its growing workflow snapshot.
+  Canonical reads and activation source matchers verify the digest against the
+  exact retained accepted row; older full-payload receipts remain readable.
+  This reduces duplicate stored payloads and prepares a compact transition
+  proof. The hot read still decodes each accepted snapshot, so it is not yet
+  bounded by the active suffix and compaction remains unimplemented.
+
+Independent Sol review of checkpoint 72 identified the remaining hot-read
+cost: each active generation boundary still reloads the full historical
+accepted snapshot, which embeds earlier boundaries. The reviewer classified
+this as an outstanding compaction-contract gap rather than a new regression.
+The new receipt is source-bound, but the production compacted checkpoint,
+small hot-read verification path and paged archived audit must land together
+before claiming bounded reads. Focused regressions cover digest mismatch,
+semantic mutation even with a matching digest, and legacy receipt reads.
+The full `make test` gate passed: 3,274 domain, 3,189 adapter and 2,876 app
+tests, plus hooks, governor, gate parity, four import contracts and both
+Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-generation-digest-gate.log` (ephemeral). No live service or
+workflow family was activated.
 
 Independent Sol review found and verified fixes for two gaps in checkpoint 71:
 the same signed key may legitimately exist in fix and review roots, and

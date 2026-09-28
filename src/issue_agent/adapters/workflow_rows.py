@@ -19,9 +19,10 @@ from ..domain.review_execution import (
     MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
     ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
     InitializedReviewExecutionOriginReceipt, initialized_review_execution,
-    ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary,
+    ReviewExecutionAcceptedTransitionSource, ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary,
     ReviewExecutionOriginKind, ReviewRoundOutcome,
-    replay_review_execution_generations, review_generation_chain_digest, same_execution_episode,
+    matches_accepted_review_transition_source, replay_review_execution_generations,
+    review_generation_chain_digest, same_execution_episode,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
@@ -784,17 +785,26 @@ def _check_execution_projection(
         ).fetchone()
         if receipt is None:
             raise WorkflowAuthorityError("review generation boundary lacks its accepted receipt")
-        captured = decode_workflow(receipt["payload_json"], tuple)
-        if (len(captured) != 4 or captured[0] != boundary
-                or not all(isinstance(item, str) for item in captured[1:])):
+        captured = decode_workflow(receipt["payload_json"], tuple | ReviewExecutionAcceptedTransitionSource)
+        if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
+            if captured.boundary != boundary:
+                raise WorkflowAuthorityError("review generation boundary receipt changed")
+            namespace, key = captured.namespace, captured.key
+        elif (len(captured) == 4 and captured[0] == boundary
+              and all(isinstance(item, str) for item in captured[1:])):
+            namespace, key = captured[1:3]
+        else:
             raise WorkflowAuthorityError("review generation boundary receipt changed")
-        namespace, key, accepted = captured[1:]
         committed = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
             (namespace, scope[0], key),
         ).fetchone()
-        if committed is None or committed["payload_json"] != accepted:
+        if (committed is None or not isinstance(committed["payload_json"], str)
+                or not matches_accepted_review_transition_source(
+                    captured, boundary, namespace, key, committed["payload_json"],
+                )):
             raise WorkflowAuthorityError("review generation boundary lost its accepted transition")
+        accepted = committed["payload_json"]
         try:
             payload = json.loads(accepted)
             observed = decode_workflow(payload["snapshot"], ReviewWorkflowSnapshot)

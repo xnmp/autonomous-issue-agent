@@ -1,10 +1,10 @@
 # Phase 4 — execution origin and bounded compaction contract
 
 Date: 2026-09-28 Australia/Sydney. Contract for offline implementation;
-the pure prefix planner, checkpoint cursor, imported-origin read prerequisite
-and fresh first-observation origin are implemented. Production import and
-renewal writers, checkpoint receipts, bounded hot reads and audit remain
-pending. Execution authority is not
+the pure prefix planner, checkpoint cursor, imported-origin read prerequisite,
+fresh first-observation origin and digest-bound generation receipts are
+implemented. Production import and renewal writers, checkpoint receipts,
+bounded hot reads and audit remain pending. Execution authority is not
 activated. Read with the
 [execution design](2026-09-27-phase-4-review-execution-design.md),
 [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md), and
@@ -54,10 +54,10 @@ specific to this repository.
    cannot distinguish successive zero-round advances. Exact retry keys on the
    previous checkpoint and this frontier/source set. Its receipt is inserted
    with the aggregate update. The current component names one checkpoint
-   receipt; a sequence-zero checkpoint after one or more zero-round generation
-   advances needs a receipt too, requiring a deliberate model/codec evolution
-   from the current prohibition on noninitial sequence-zero checkpoints. A
-   boundary alone never proves an older open round is finalized.
+   receipt. The current model permits a sequence-zero checkpoint after one or
+   more zero-round generation advances when it has a boundary cursor; a
+   production writer must mint its receipt and source proof. A boundary alone
+   never proves an older open round is finalized.
 3. **Source log.** Round, payment, closure, preparation, submission, transition,
    and generation-boundary receipts remain immutable and addressable after
    compaction. A checkpoint retires them from the *hot replay*, not from the

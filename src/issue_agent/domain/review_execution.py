@@ -860,6 +860,50 @@ class ReviewExecutionGenerationBoundary:
             previous = sequence
 
 
+@dataclass(frozen=True)
+class ReviewExecutionAcceptedTransitionSource:
+    """A bounded generation receipt binding its accepted transition by digest."""
+
+    boundary: ReviewExecutionGenerationBoundary
+    namespace: str
+    key: str
+    payload_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.boundary, ReviewExecutionGenerationBoundary):
+            raise ValueError("accepted transition source requires a generation boundary")
+        if self.namespace not in {"workflow-request", "workflow-transition"}:
+            raise ValueError("accepted transition source requires a known namespace")
+        identifier(self.key, "accepted generation transition key")
+        if (not isinstance(self.payload_sha256, str) or len(self.payload_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in self.payload_sha256)):
+            raise ValueError("accepted transition source requires a SHA-256 digest")
+
+
+def accepted_review_transition_source(
+    boundary: ReviewExecutionGenerationBoundary, namespace: str, key: str, payload: str,
+) -> ReviewExecutionAcceptedTransitionSource:
+    """Bind one canonical accepted payload without copying its growing snapshot."""
+    if not isinstance(payload, str):
+        raise ValueError("accepted generation transition payload must be text")
+    return ReviewExecutionAcceptedTransitionSource(
+        boundary, namespace, key, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+    )
+
+
+def matches_accepted_review_transition_source(
+    captured: object, boundary: ReviewExecutionGenerationBoundary,
+    namespace: str, key: str, payload: str,
+) -> bool:
+    """Revalidate new digest receipts and retained legacy full-payload receipts."""
+    if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
+        try:
+            return captured == accepted_review_transition_source(boundary, namespace, key, payload)
+        except (TypeError, ValueError, UnicodeError):
+            return False
+    return isinstance(captured, tuple) and captured == (boundary, namespace, key, payload)
+
+
 def review_generation_chain_digest(receipt_ids: tuple[str, ...]) -> str:
     """Bind an ordered, bounded crossing without storing a lifetime-sized list."""
     if not isinstance(receipt_ids, tuple) or not 1 <= len(receipt_ids) <= MAX_EXECUTION_SUFFIX:

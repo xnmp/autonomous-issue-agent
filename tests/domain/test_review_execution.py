@@ -16,11 +16,12 @@ from issue_agent.domain.review_execution import (
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
     ReviewExecutionGenerationBoundary, ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
+    ReviewExecutionAcceptedTransitionSource, accepted_review_transition_source,
     ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
     SetDisplayedRound, advance_review_execution_generation, carry_review_execution_generation,
-    compatible_review_session,
+    compatible_review_session, matches_accepted_review_transition_source,
     review_generation_chain_digest,
     plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
 )
@@ -268,6 +269,29 @@ def test_generation_boundary_refuses_missing_source_and_changed_carry():
         replace(boundary, to_revision=WorkflowRevision(binding(1).rejection.fence, 100))
     with pytest.raises(ValueError, match="exact advancing transition"):
         replace(boundary, mutation="request_rearm")
+
+
+def test_generation_transition_source_binds_payload_without_retaining_it():
+    initial = checkpoint()
+    carried = carry_review_execution_generation(initial.state, binding(1), 0)
+    boundary = generation_boundary(initial.state, carried, 0, (), "boundary:source")
+    accepted = "accepted-transition:" + "x" * 100_000
+    source = accepted_review_transition_source(boundary, "workflow-request", "request:1", accepted)
+
+    assert isinstance(source, ReviewExecutionAcceptedTransitionSource)
+    assert matches_accepted_review_transition_source(
+        source, boundary, "workflow-request", "request:1", accepted,
+    )
+    assert not matches_accepted_review_transition_source(
+        source, boundary, "workflow-request", "request:1", accepted + "changed",
+    )
+    assert matches_accepted_review_transition_source(
+        (boundary, "workflow-request", "request:1", accepted),
+        boundary, "workflow-request", "request:1", accepted,
+    )
+    assert len(source.payload_sha256) == 64 and accepted not in repr(source)
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(source, payload_sha256="not-a-digest")
 
 
 def test_active_generation_advance_preserves_imported_allowance_without_rounds():

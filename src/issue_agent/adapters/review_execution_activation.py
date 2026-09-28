@@ -64,6 +64,7 @@ from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStat
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, NoReviewSession, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
+    ReviewExecutionAcceptedTransitionSource, matches_accepted_review_transition_source,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
     review_generation_chain_digest, same_execution_episode,
 )
@@ -2653,9 +2654,10 @@ class MatchedLegacyReviewGenerationBoundarySources:
                 or accepted["reusable_after"] is not None
                 or accepted["namespace"] not in {"workflow-request", "workflow-transition"}
                 or accepted["payload_json"] is None
-                or source["payload_json"] != encode_workflow((
+                or not matches_accepted_review_transition_source(
+                    decode_workflow(source["payload_json"], tuple | ReviewExecutionAcceptedTransitionSource),
                     self.boundary, accepted["namespace"], accepted["key"], accepted["payload_json"],
-                ))):
+                )):
             raise ValueError("generation boundary and accepted receipt disagree")
         _parse_stamp(source["claimed_at"])
         _parse_stamp(accepted["claimed_at"])
@@ -2775,12 +2777,14 @@ def match_legacy_review_generation_boundary_sources(
         return UnmatchedLegacyReviewGenerationBoundarySources(receipt_id, "generation receipt is absent")
     try:
         values = dict(source.fields)
-        captured = decode_workflow(values["payload_json"], tuple)
-        if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
-                or not isinstance(captured[1], str) or not isinstance(captured[2], str)
-                or not isinstance(captured[3], str)):
+        captured = decode_workflow(values["payload_json"], tuple | ReviewExecutionAcceptedTransitionSource)
+        if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
+            boundary, namespace, key = captured.boundary, captured.namespace, captured.key
+        elif (len(captured) == 4 and isinstance(captured[0], ReviewExecutionGenerationBoundary)
+              and all(isinstance(item, str) for item in captured[1:])):
+            boundary, namespace, key = captured[:3]
+        else:
             raise ValueError("generation receipt has malformed accepted transition fields")
-        boundary, namespace, key, accepted_payload = captured
         rows = db.execute(
             "SELECT rowid,CASE WHEN length(CAST(scope AS BLOB))<=? "
             "THEN CAST(scope AS BLOB) END AS scope_bytes FROM dedupe_keys NOT INDEXED "
@@ -2808,7 +2812,9 @@ def match_legacy_review_generation_boundary_sources(
             raise ValueError("generation boundary lacks one exact accepted transition")
         accepted_rowid = accepted_rows[0]
         accepted_fields, _ = _read_recording_source(db, namespace, current.repository, key)
-        if dict(accepted_fields)["payload_json"] != accepted_payload:
+        if not matches_accepted_review_transition_source(
+            captured, boundary, namespace, key, dict(accepted_fields)["payload_json"],
+        ):
             raise ValueError("accepted generation transition changed")
         return MatchedLegacyReviewGenerationBoundarySources(
             current, source, boundary, accepted_rowid, accepted_fields,
@@ -2937,6 +2943,21 @@ def _accepted_generation_rows(
 _GenerationEpisodeKey = tuple[int, str, FamilyAuthority, str, WorkflowKey, int]
 
 
+_GenerationReceiptPayload = tuple[object, ...] | ReviewExecutionAcceptedTransitionSource
+
+
+def _generation_receipt_parts(
+    payload_json: str,
+) -> tuple[ReviewExecutionGenerationBoundary, str, str, _GenerationReceiptPayload]:
+    captured = decode_workflow(payload_json, tuple | ReviewExecutionAcceptedTransitionSource)
+    if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
+        return captured.boundary, captured.namespace, captured.key, captured
+    if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
+            or any(not isinstance(value, str) for value in captured[1:])):
+        raise ValueError("generation receipt has malformed accepted transition fields")
+    return captured[0], captured[1], captured[2], captured
+
+
 def _generation_episode_key(binding: ReviewExecutionBinding, generation: int) -> _GenerationEpisodeKey:
     return (binding.execution_epoch, binding.execution_episode, binding.rejection.authority,
             binding.rejection.episode_id, binding.rejection.fence.key, generation)
@@ -2947,11 +2968,7 @@ def _indexed_generation_sources(
 ) -> dict[_GenerationEpisodeKey, tuple[LegacyReviewGenerationReceiptSource, ...]]:
     indexed: dict[_GenerationEpisodeKey, list[LegacyReviewGenerationReceiptSource]] = {}
     for source in complete.receipts:
-        captured = decode_workflow(dict(source.fields)["payload_json"], tuple)
-        if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
-                or any(not isinstance(value, str) for value in captured[1:])):
-            raise ValueError("generation receipt has malformed accepted transition fields")
-        boundary = captured[0]
+        boundary, _, _, _ = _generation_receipt_parts(dict(source.fields)["payload_json"])
         key = _generation_episode_key(boundary.before.binding, boundary.from_revision.fence.generation)
         indexed.setdefault(key, []).append(source)
     return {key: tuple(sources) for key, sources in indexed.items()}
@@ -3010,24 +3027,22 @@ def _match_stale_productivity_generation_from_sources(
         if last - first > MAX_EXECUTION_SUFFIX:
             raise ValueError("stale generation crossing exceeds its suffix bound")
         selected: dict[int, tuple[LegacyReviewGenerationReceiptSource, ReviewExecutionGenerationBoundary,
-                                  str, str, str]] = {}
+                                  str, str, _GenerationReceiptPayload]] = {}
         sources = complete.receipts if generation_index is None else tuple(
             source for generation in range(first, last)
             for source in generation_index.get(_generation_episode_key(round_id.binding, generation), ())
         )
         for source in sources:
-            captured = decode_workflow(dict(source.fields)["payload_json"], tuple)
-            if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
-                    or any(not isinstance(value, str) for value in captured[1:])):
-                raise ValueError("generation receipt has malformed accepted transition fields")
-            boundary, namespace, key, accepted_payload = captured
+            boundary, namespace, key, captured = _generation_receipt_parts(
+                dict(source.fields)["payload_json"],
+            )
             if (not same_execution_episode(round_id.binding, boundary.before.binding)
                     or not first <= boundary.from_revision.fence.generation < last):
                 continue
             generation = boundary.from_revision.fence.generation
             if generation in selected:
                 raise ValueError("stale generation crossing repeats a boundary")
-            selected[generation] = (source, boundary, namespace, key, accepted_payload)
+            selected[generation] = (source, boundary, namespace, key, captured)
         if len(selected) != last - first:
             raise ValueError("stale generation crossing lacks an intervening boundary")
         ordered = tuple(selected[generation] for generation in range(first, last))
@@ -3041,17 +3056,22 @@ def _match_stale_productivity_generation_from_sources(
                    if accepted_cache is None or boundary.receipt_id not in accepted_cache}
         accepted_rowids = _accepted_generation_rows(db, complete.repository, targets) if targets else {}
         matched: list[MatchedLegacyReviewGenerationBoundarySources] = []
-        for source, boundary, namespace, key, accepted_payload in ordered:
+        for source, boundary, namespace, key, captured in ordered:
             cached = accepted_cache.get(boundary.receipt_id) if accepted_cache is not None else None
             if cached is not None:
                 if (cached.complete_receipts != complete or cached.receipt_source != source
                         or cached.boundary != boundary
-                        or dict(cached.accepted_fields)["payload_json"] != accepted_payload):
+                        or not matches_accepted_review_transition_source(
+                            captured, boundary, namespace, key,
+                            dict(cached.accepted_fields)["payload_json"],
+                        )):
                     raise ValueError("cached generation boundary disagrees with current sources")
                 matched.append(cached)
                 continue
             accepted_fields, _ = _read_recording_source(db, namespace, complete.repository, key)
-            if dict(accepted_fields)["payload_json"] != accepted_payload:
+            if not matches_accepted_review_transition_source(
+                captured, boundary, namespace, key, dict(accepted_fields)["payload_json"],
+            ):
                 raise ValueError("accepted generation transition changed")
             proof = MatchedLegacyReviewGenerationBoundarySources(
                 complete, source, boundary, accepted_rowids[(namespace.encode(), key.encode())],
@@ -3595,7 +3615,8 @@ class BlockedLegacyAllocationGenerationSources:
 
 
 _IndexedAllocationBoundary = tuple[
-    LegacyReviewGenerationReceiptSource, ReviewExecutionGenerationBoundary, str, str, str,
+    LegacyReviewGenerationReceiptSource, ReviewExecutionGenerationBoundary, str, str,
+    _GenerationReceiptPayload,
 ]
 
 
@@ -3604,15 +3625,13 @@ def _indexed_allocation_generation_boundaries(
 ) -> dict[_ExecutionEpisodeKey, dict[str, _IndexedAllocationBoundary]]:
     indexed: dict[_ExecutionEpisodeKey, dict[str, _IndexedAllocationBoundary]] = {}
     for source in complete.receipts:
-        captured = decode_workflow(dict(source.fields)["payload_json"], tuple)
-        if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
-                or any(not isinstance(value, str) for value in captured[1:])):
-            raise ValueError("generation receipt has malformed accepted transition fields")
-        boundary, namespace, key, accepted_payload = captured
+        boundary, namespace, key, captured = _generation_receipt_parts(
+            dict(source.fields)["payload_json"],
+        )
         related = indexed.setdefault(_execution_episode_key(boundary.before.binding), {})
         if boundary.receipt_id in related:
             raise ValueError("execution generation receipt repeats a boundary")
-        related[boundary.receipt_id] = (source, boundary, namespace, key, accepted_payload)
+        related[boundary.receipt_id] = (source, boundary, namespace, key, captured)
     return indexed
 
 
@@ -3633,9 +3652,11 @@ def _matched_allocation_generation_boundaries(
         raise ValueError("execution generation receipts repeat an accepted transition")
     accepted_rowids = _accepted_generation_rows(db, complete.repository, targets) if targets else {}
     matched: list[MatchedLegacyReviewGenerationBoundarySources] = []
-    for source, boundary, namespace, key, accepted_payload in selected:
+    for source, boundary, namespace, key, captured in selected:
         accepted_fields, _ = _read_recording_source(db, namespace, complete.repository, key)
-        if dict(accepted_fields)["payload_json"] != accepted_payload:
+        if not matches_accepted_review_transition_source(
+            captured, boundary, namespace, key, dict(accepted_fields)["payload_json"],
+        ):
             raise ValueError("accepted generation transition changed")
         matched.append(MatchedLegacyReviewGenerationBoundarySources(
             complete, source, boundary, accepted_rowids[(namespace.encode(), key.encode())],
