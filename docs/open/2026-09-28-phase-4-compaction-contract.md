@@ -211,17 +211,21 @@ round receipt-set definition, including command-keyed submission and recorded
 review receipts. It scans all repositories in indexed namespace, scope and
 key order, with a fixed upper key, at most 16 rows and 16 MiB of source fields
 per page. Each row retains a full source digest. BLOB namespace aliases,
-malformed identities and oversized sources block. This page does not decode
-the namespace-specific payload or decide whether a receipt is claimed by an
-expected round; a durable pass and that join remain prerequisites for the
-audit gate.
+malformed identities and oversized sources block. The classified page now
+requires canonical permanent payloads and identifies bound-round,
+named-round and command references. This remains a bounded observation, not
+a complete namespace census.
 
 The finalized-round point reader also returns its exact bounded, sorted
 `(namespace, key, source digest)` members. It checks that their aggregate
 matches the existing receipt-set fingerprint; those member digests match the
 indexed sweep's source digest for the same row. The member read still proves
-only the local retained set. A complete expected-round walk and unclaimed
-receipt reconciliation must compare both sides before audit authority exists.
+only the local retained set. A second bounded point read classifies every
+member payload, and a one-source join resolves named rounds or command
+registrations before comparing that source to its exact finalized-round
+member. Open rounds have no finalized member set. A complete expected-round
+walk and unclaimed receipt reconciliation must compare both sides before
+audit authority exists.
 
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money

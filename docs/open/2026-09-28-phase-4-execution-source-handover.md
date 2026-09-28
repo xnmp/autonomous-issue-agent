@@ -574,6 +574,18 @@ the complete audit benchmark.
   command or claim ancestry, or authorize a compacted load. Full-gate results
   are recorded in the progress board after acceptance.
 
+- Checkpoint 93 joins one classified namespace source to the exact finalized
+  round member that claims its namespace, key and full source digest. Bound
+  references use their embedded round, named receipts resolve through a
+  bounded indexed round-plan lookup, and recorded-review command markers use
+  their permanent submission registration. Missing or BLOB-aliased round rows,
+  missing or changed registrations, changed source fields, and unclaimed
+  members block. A real copied round's full retained set and a named ceiling
+  receipt pass. This remains an observational one-source join: an open round
+  has no finalized member set, and a complete namespace pass, checkpoint
+  ancestry, command effects and admission authority remain pending. Full-gate
+  results are recorded in the progress board after acceptance.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -581,14 +593,11 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–92, the durable round cursor completes a bounded row
-sweep, and separate reads expose both expected finalized-round receipt
-members with locally classified payloads and expose classified namespace
-sources. Next, reconcile round
-members against checkpoint ancestry and expected source digests, then persist
-and reconcile a complete receipt-namespace pass to find unclaimed receipts.
-Before a writer
-can use the checkpoint-86
+With checkpoints 88–93, the durable round cursor completes a bounded row
+sweep, and one indexed namespace source can be matched to an exact finalized
+round member. Next, persist and reconcile a complete receipt-namespace pass,
+including explicit treatment of open rounds, then bind the retired member
+stream to checkpoint ancestry. Before a writer can use the checkpoint-86
 proposal, establish a true cumulative read bound around canonical load and
 each source reader; prove generation-only and later-checkpoint paths; verify
 every retired receipt payload; and publish the checkpoint and initialized

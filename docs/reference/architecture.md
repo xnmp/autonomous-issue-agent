@@ -535,6 +535,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_execution_archive_audit.py` (durable bounded generation-source and receipt-namespace census; observational until checkpoint ancestry and retired round proof are joined),
 `adapters/review_round_archive_audit.py` (durable indexed round-row census over bounded repository pages; observational until checkpoint source and receipt reconciliation),
 `adapters/review_round_receipt_sweep.py` (bounded indexed read-only pages, canonical payload attribution and exact finalized-round member payload checks; no archive census or audit authority),
+`adapters/review_round_receipt_owner.py` (bounded read-only source-to-finalized-round member join for bound, named and command-keyed receipts; no complete census or admission authority),
 `adapters/review_execution_compaction.py` (transaction-local retired-source proposal and checkpoint receipt reconstruction; no compaction authority),
 `adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
 `adapters/review_execution_import_sources.py` (barrier-held revalidation of configured legacy execution files and complete PR linkage before counter attribution),
