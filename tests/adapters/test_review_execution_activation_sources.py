@@ -35,6 +35,7 @@ from issue_agent.adapters.review_execution_activation import (
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     read_review_generation_archive_page, verify_checkpoint_generation_anchor,
     read_checkpoint_round_row_source, read_checkpoint_round_receipt_source,
+    read_checkpoint_round_receipt_members,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
     read_review_generation_receipt_sweep_page, read_reconciled_review_generation_receipt_sweep_page,
     ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
@@ -57,6 +58,9 @@ from issue_agent.adapters.review_execution_activation import (
     verify_legacy_plain_productive_round,
 )
 from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
+from issue_agent.adapters.review_round_receipt_sweep import (
+    ObservedReviewRoundReceiptSweepPage, read_review_round_receipt_sweep_page,
+)
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
@@ -1432,6 +1436,67 @@ def test_checkpoint_manifest_observes_real_round_and_generation_sources(rig):
             observe_review_checkpoint_manifest(
                 db, key, 1, max_source_bytes=observed.source_bytes - 1,
             )
+
+
+def test_checkpoint_round_receipt_members_match_the_indexed_source_sweep(rig):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        row = db.execute(
+            "SELECT outcome_json FROM review_execution_rounds WHERE repository='o/r' AND sequence=1",
+        ).fetchone()
+        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+        before = db.total_changes
+        expected = read_checkpoint_round_receipt_members(db, outcome.round)
+        assert expected.source == read_checkpoint_round_receipt_source(db, outcome.round)
+        with pytest.raises(ValueError, match="disagree with their aggregate"):
+            replace(expected, members=(
+                replace(expected.members[0], source_sha256="0" * 64),
+                *expected.members[1:],
+            ))
+        actual = {}
+        cursor = None
+        upper = None
+        while True:
+            page = read_review_round_receipt_sweep_page(db, after=cursor, upper=upper)
+            assert isinstance(page, ObservedReviewRoundReceiptSweepPage)
+            actual.update({
+                (item.cursor.namespace, item.cursor.scope, item.cursor.key): item.source_sha256
+                for item in page.sources
+            })
+            if not page.has_more:
+                break
+            cursor, upper = page.next_cursor, page.upper_cursor
+        assert db.total_changes == before
+        db.rollback()
+    assert len(expected.members) >= 3
+    assert {
+        (member.namespace, "o/r", member.key): member.source_sha256
+        for member in expected.members
+    }.items() <= actual.items()
+
+
+def test_checkpoint_round_receipt_member_digest_tracks_retained_source_change(rig):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT outcome_json FROM review_execution_rounds WHERE repository='o/r' AND sequence=1",
+        ).fetchone()
+        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+        before = read_checkpoint_round_receipt_members(db, outcome.round)
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-09-30T00:00:00+00:00' "
+            "WHERE namespace='review-round-outcome' AND scope='o/r' AND key=?",
+            (outcome.round.round_id,),
+        )
+        after = read_checkpoint_round_receipt_members(db, outcome.round)
+    before_by_key = {(item.namespace, item.key): item.source_sha256 for item in before.members}
+    after_by_key = {(item.namespace, item.key): item.source_sha256 for item in after.members}
+    assert before_by_key.keys() == after_by_key.keys()
+    assert before_by_key[("review-round-outcome", outcome.round.round_id)] != (
+        after_by_key[("review-round-outcome", outcome.round.round_id)]
+    )
+    assert before.source.receipt_set_sha256 != after.source.receipt_set_sha256
 
 
 @pytest.mark.parametrize("mutation", ("missing", "aliased", "changed"))

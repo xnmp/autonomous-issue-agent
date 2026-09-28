@@ -541,6 +541,15 @@ the complete audit benchmark.
   keys; per-namespace index seeks and a late-cursor work regression replaced
   it. Full-gate results are recorded in the progress board after acceptance.
 
+- Checkpoint 90 exposes the finalized-round reader's exact bounded receipt
+  members as sorted namespace/key/source-digest values, checked against its
+  existing aggregate fingerprint. A real finalized-round fixture matches
+  those members to the indexed raw sweep and detects changed retained source
+  fields. Sol review found no correctness or authority regression. This is
+  the expected-member side of a future join, not a complete receipt census or
+  namespace-specific payload proof. Full-gate results are recorded in the
+  progress board after acceptance.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -548,11 +557,12 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–89, the durable round cursor completes a bounded row
-sweep, and a separate read-only page can enumerate relevant receipt sources.
-Next, reconcile round members against checkpoint ancestry and expected source
-digests, then persist and reconcile a complete receipt-namespace pass to find
-unclaimed receipts. Before a writer can use the checkpoint-86
+With checkpoints 88–90, the durable round cursor completes a bounded row
+sweep, and separate reads expose both expected finalized-round receipt
+members and raw namespace sources. Next, reconcile round members against
+checkpoint ancestry and expected source digests, then persist and reconcile
+a complete receipt-namespace pass to find unclaimed receipts. Before a writer
+can use the checkpoint-86
 proposal, establish a true cumulative read bound around canonical load and
 each source reader; prove generation-only and later-checkpoint paths; verify
 every retired receipt payload; and publish the checkpoint and initialized

@@ -1555,9 +1555,49 @@ def _checkpoint_prefixed_receipts(
     return keys
 
 
+@dataclass(frozen=True)
+class ObservedReviewCheckpointRoundReceiptMember:
+    namespace: str
+    key: str
+    source_sha256: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.namespace, "checkpoint round receipt namespace")
+        validate_workflow_identifier(self.key, "checkpoint round receipt key")
+        if (not isinstance(self.source_sha256, str) or len(self.source_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in self.source_sha256)):
+            raise ValueError("checkpoint round receipt member requires a source digest")
+
+
+@dataclass(frozen=True)
+class ObservedReviewCheckpointRoundReceiptSet:
+    source: ReviewExecutionCompactionRoundSource
+    members: tuple[ObservedReviewCheckpointRoundReceiptMember, ...]
+    source_bytes: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, ReviewExecutionCompactionRoundSource)
+                or not isinstance(self.members, tuple) or not self.members
+                or any(not isinstance(member, ObservedReviewCheckpointRoundReceiptMember)
+                       for member in self.members)
+                or type(self.source_bytes) is not int
+                or not 0 < self.source_bytes <= MAX_LEGACY_ROUND_PAGE_BYTES
+                + MAX_CHECKPOINT_ROUND_RECEIPT_BYTES):
+            raise ValueError("checkpoint round receipt set requires bounded typed members")
+        identities = tuple((item.namespace, item.key) for item in self.members)
+        if identities != tuple(sorted(set(identities))):
+            raise ValueError("checkpoint round receipt set requires unique ordered members")
+        digest = hashlib.sha256(json.dumps(
+            [(item.namespace, item.key, item.source_sha256) for item in self.members],
+            separators=(",", ":"), ensure_ascii=True,
+        ).encode()).hexdigest()
+        if digest != self.source.receipt_set_sha256:
+            raise ValueError("checkpoint round receipt members disagree with their aggregate")
+
+
 def _read_checkpoint_round_receipt_observation(
     db: sqlite3.Connection, round_id: ReviewRoundIdentity,
-) -> tuple[ReviewExecutionCompactionRoundSource, int]:
+) -> ObservedReviewCheckpointRoundReceiptSet:
     """Observe one finalized round's exact bounded receipt membership and fields."""
     row = read_checkpoint_round_row_source(db, round_id)
     values = dict(row.fields)
@@ -1633,24 +1673,27 @@ def _read_checkpoint_round_receipt_observation(
         if productive and settlement_count != 1:
             raise ValueError("checkpoint productive round lacks one settlement receipt")
         source_bytes = 0
-        members: list[tuple[str, str, str]] = []
+        members: list[ObservedReviewCheckpointRoundReceiptMember] = []
         for namespace, source_key in sorted(required):
             size = _recording_source_size(db, namespace, repository, source_key)
             if size is None or source_bytes + size > MAX_CHECKPOINT_ROUND_RECEIPT_BYTES:
                 raise ValueError("checkpoint round receipt set exceeds its byte bound")
             _, digest = _read_recording_source(db, namespace, repository, source_key)
             source_bytes += size
-            members.append((namespace, source_key, digest))
+            members.append(ObservedReviewCheckpointRoundReceiptMember(namespace, source_key, digest))
         receipt_digest = hashlib.sha256(json.dumps(
-            members, separators=(",", ":"), ensure_ascii=True,
+            [(item.namespace, item.key, item.source_sha256) for item in members],
+            separators=(",", ":"), ensure_ascii=True,
         ).encode()).hexdigest()
         row_bytes = sum(
             len(str(value).encode()) if isinstance(value, int)
             else len(value.encode("utf-8", "surrogatepass"))
             for _, value in row.fields if value is not None
         )
-        return (ReviewExecutionCompactionRoundSource(round_id, row.source_digest, receipt_digest),
-                row_bytes + source_bytes)
+        return ObservedReviewCheckpointRoundReceiptSet(
+            ReviewExecutionCompactionRoundSource(round_id, row.source_digest, receipt_digest),
+            tuple(members), row_bytes + source_bytes,
+        )
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error, WorkflowEncodingError) as exc:
         raise WorkflowAuthorityError("review execution checkpoint round receipt set is unreadable") from exc
@@ -1660,7 +1703,17 @@ def read_checkpoint_round_receipt_source(
     db: sqlite3.Connection, round_id: ReviewRoundIdentity,
 ) -> ReviewExecutionCompactionRoundSource:
     """Point-read the final retired round's source fingerprint for a hot anchor."""
-    return _read_checkpoint_round_receipt_observation(db, round_id)[0]
+    return _read_checkpoint_round_receipt_observation(db, round_id).source
+
+
+def read_checkpoint_round_receipt_members(
+    db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+) -> ObservedReviewCheckpointRoundReceiptSet:
+    """Expose the exact bounded source set for later archived membership joins.
+
+    This observation does not verify each namespace-specific payload's meaning.
+    """
+    return _read_checkpoint_round_receipt_observation(db, round_id)
 
 
 @dataclass(frozen=True)
@@ -1729,8 +1782,10 @@ def read_checkpoint_round_by_sequence(
         if (outcome.round.round_id != row["round_id"] or outcome.round.sequence != sequence
                 or not same_execution_episode(binding, outcome.round.binding)):
             raise ValueError("checkpoint round outcome has a foreign indexed identity")
-        source, source_bytes = _read_checkpoint_round_receipt_observation(db, outcome.round)
-        return ObservedReviewCheckpointRound(outcome, source, source_bytes)
+        observation = _read_checkpoint_round_receipt_observation(db, outcome.round)
+        return ObservedReviewCheckpointRound(
+            outcome, observation.source, observation.source_bytes,
+        )
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error, WorkflowEncodingError) as exc:
         raise WorkflowAuthorityError("review execution checkpoint round sequence is unreadable") from exc

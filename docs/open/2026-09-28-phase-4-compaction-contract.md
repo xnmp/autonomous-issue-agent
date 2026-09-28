@@ -216,6 +216,13 @@ the namespace-specific payload or decide whether a receipt is claimed by an
 expected round; a durable pass and that join remain prerequisites for the
 audit gate.
 
+The finalized-round point reader also returns its exact bounded, sorted
+`(namespace, key, source digest)` members. It checks that their aggregate
+matches the existing receipt-set fingerprint; those member digests match the
+indexed sweep's source digest for the same row. The member read still proves
+only the local retained set. A complete expected-round walk and unclaimed
+receipt reconciliation must compare both sides before audit authority exists.
+
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money
 settlement and evidence-preserving recovery remain allowed so a hold cannot

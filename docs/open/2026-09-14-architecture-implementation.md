@@ -45,6 +45,11 @@ receipt namespaces across repositories in bounded key order. It preflights
 source bytes, rejects malformed and aliased identities, and fixes an upper
 key for a future durable pass. The complete receipt census and expected
 round membership join are still pending.
+The finalized-round point reader now exposes its bounded, sorted receipt
+members with the same source digests used by the sweep. Its aggregate hash is
+checked against the retained round fingerprint. These members provide the
+expected side of a future join; no complete census or payload proof follows
+from one observed round.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the
