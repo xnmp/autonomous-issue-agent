@@ -2617,6 +2617,79 @@ def revalidate_complete_legacy_review_generation_receipts(
     return current
 
 
+def _verify_accepted_generation_transition(
+    repository: str, boundary: ReviewExecutionGenerationBoundary,
+    accepted: dict[str, str | None],
+) -> None:
+    """Validate the full accepted payload shared by import and archive reads."""
+    try:
+        raw = accepted["payload_json"]
+        payload = json.loads(raw, object_pairs_hook=_unique_receipt_object, parse_constant=_reject_nonfinite)
+        if (not isinstance(payload, dict)
+                or set(payload) != {"mutation", "expected", "snapshot", "audit", "commands"}
+                or json.dumps(payload, sort_keys=True, separators=(",", ":")) != raw
+                or not isinstance(payload["commands"], list)):
+            raise ValueError("accepted generation transition has malformed fields")
+        expected = decode_workflow(payload["expected"], WorkflowRevision)
+        snapshot = decode_workflow(payload["snapshot"], ReviewWorkflowSnapshot)
+        if (payload["mutation"] != boundary.mutation.value
+                or expected != boundary.from_revision
+                or snapshot.revision != boundary.to_revision
+                or not isinstance(snapshot.execution, ActivatedReviewExecution)
+                or not snapshot.execution.boundaries
+                or snapshot.execution.boundaries[-1] != boundary
+                or snapshot.execution.binding != boundary.after.binding
+                or snapshot.execution.state != boundary.after
+                or snapshot.binding.fence != boundary.to_revision.fence):
+            raise ValueError("accepted generation transition disagrees with its boundary")
+        commands = payload["commands"]
+        if len(commands) > MAX_REARM_COMMANDS:
+            raise ValueError("accepted generation transition has too many commands")
+        decoded_commands: list[LifecycleCommand] = []
+        for item in commands:
+            if (not isinstance(item, dict) or set(item) != {
+                "id", "idempotency", "kind", "target", "revision", "payload",
+                "config", "repository", "owner", "workflow",
+            } or not isinstance(item["payload"], dict)
+                    or any(not isinstance(item[name], str) for name in (
+                        "id", "idempotency", "kind", "target", "config",
+                        "repository", "owner", "workflow",
+                    ))
+                    or (item["revision"] is not None and not isinstance(item["revision"], str))):
+                raise ValueError("accepted generation transition has malformed commands")
+            command = LifecycleCommand(
+                item["id"], item["idempotency"], CommandKind(item["kind"]),
+                item["target"], item["revision"], item["payload"], item["config"],
+                item["repository"], item["owner"],
+                decode_workflow(item["workflow"], WorkflowBinding),
+            )
+            if (command.repository != repository
+                    or command.workflow != snapshot.binding
+                    or command.repository != item["repository"]):
+                raise ValueError("accepted generation command has a changed workflow binding")
+            decoded_commands.append(command)
+        if len({command.command_id for command in decoded_commands}) != len(decoded_commands):
+            raise ValueError("accepted generation transition repeats a command")
+        if boundary.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM):
+            audit = decode_workflow(payload["audit"], AuthorizedOperatorCommand)
+            audit_kind = (RequestRearm if boundary.mutation is WorkflowMutation.REQUEST_REARM
+                          else ContinueGrantedRearm)
+            if (accepted["namespace"] != "workflow-request"
+                    or not isinstance(audit.command, audit_kind)
+                    or accepted["key"] != audit.command.request_id
+                    or audit.command.expected != boundary.from_revision):
+                raise ValueError("generation request identity disagrees with accepted operator command")
+        else:
+            audit = decode_workflow(payload["audit"], ObservedTransition)
+            if (not audit.evidence_ids or accepted["namespace"] != "workflow-transition"
+                    or accepted["key"] != hashlib.sha256(
+                        encode_workflow(boundary.from_revision).encode(),
+                    ).hexdigest()):
+                raise ValueError("generation release identity disagrees with accepted transition")
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        raise ValueError("generation boundary lacks an exact accepted transition") from exc
+
+
 @dataclass(frozen=True)
 class MatchedLegacyReviewGenerationBoundarySources:
     """Observed content match; SQL provenance must be rechecked before authority use."""
@@ -2671,72 +2744,9 @@ class MatchedLegacyReviewGenerationBoundarySources:
                 or self.boundary.from_revision.fence.key != self.boundary.to_revision.fence.key
                 or key.repository != self.complete_receipts.repository):
             raise ValueError("generation boundary has a changed derived identity")
-        try:
-            raw = accepted["payload_json"]
-            payload = json.loads(raw, object_pairs_hook=_unique_receipt_object, parse_constant=_reject_nonfinite)
-            if (not isinstance(payload, dict)
-                    or set(payload) != {"mutation", "expected", "snapshot", "audit", "commands"}
-                    or json.dumps(payload, sort_keys=True, separators=(",", ":")) != raw
-                    or not isinstance(payload["commands"], list)):
-                raise ValueError("accepted generation transition has malformed fields")
-            expected = decode_workflow(payload["expected"], WorkflowRevision)
-            snapshot = decode_workflow(payload["snapshot"], ReviewWorkflowSnapshot)
-            if (payload["mutation"] != self.boundary.mutation.value
-                    or expected != self.boundary.from_revision
-                    or snapshot.revision != self.boundary.to_revision
-                    or not isinstance(snapshot.execution, ActivatedReviewExecution)
-                    or not snapshot.execution.boundaries
-                    or snapshot.execution.boundaries[-1] != self.boundary
-                    or snapshot.execution.binding != self.boundary.after.binding
-                    or snapshot.execution.state != self.boundary.after
-                    or snapshot.binding.fence != self.boundary.to_revision.fence):
-                raise ValueError("accepted generation transition disagrees with its boundary")
-            commands = payload["commands"]
-            if len(commands) > MAX_REARM_COMMANDS:
-                raise ValueError("accepted generation transition has too many commands")
-            decoded_commands: list[LifecycleCommand] = []
-            for item in commands:
-                if (not isinstance(item, dict) or set(item) != {
-                    "id", "idempotency", "kind", "target", "revision", "payload",
-                    "config", "repository", "owner", "workflow",
-                } or not isinstance(item["payload"], dict)
-                        or any(not isinstance(item[name], str) for name in (
-                            "id", "idempotency", "kind", "target", "config",
-                            "repository", "owner", "workflow",
-                        ))
-                        or (item["revision"] is not None and not isinstance(item["revision"], str))):
-                    raise ValueError("accepted generation transition has malformed commands")
-                command = LifecycleCommand(
-                    item["id"], item["idempotency"], CommandKind(item["kind"]),
-                    item["target"], item["revision"], item["payload"], item["config"],
-                    item["repository"], item["owner"],
-                    decode_workflow(item["workflow"], WorkflowBinding),
-                )
-                if (command.repository != self.complete_receipts.repository
-                        or command.workflow != snapshot.binding
-                        or command.repository != item["repository"]):
-                    raise ValueError("accepted generation command has a changed workflow binding")
-                decoded_commands.append(command)
-            if len({command.command_id for command in decoded_commands}) != len(decoded_commands):
-                raise ValueError("accepted generation transition repeats a command")
-            if self.boundary.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM):
-                audit = decode_workflow(payload["audit"], AuthorizedOperatorCommand)
-                audit_kind = (RequestRearm if self.boundary.mutation is WorkflowMutation.REQUEST_REARM
-                              else ContinueGrantedRearm)
-                if (accepted["namespace"] != "workflow-request"
-                        or not isinstance(audit.command, audit_kind)
-                        or accepted["key"] != audit.command.request_id
-                        or audit.command.expected != self.boundary.from_revision):
-                    raise ValueError("generation request identity disagrees with accepted operator command")
-            else:
-                audit = decode_workflow(payload["audit"], ObservedTransition)
-                if (not audit.evidence_ids or accepted["namespace"] != "workflow-transition"
-                        or accepted["key"] != hashlib.sha256(
-                            encode_workflow(self.boundary.from_revision).encode(),
-                        ).hexdigest()):
-                    raise ValueError("generation release identity disagrees with accepted transition")
-        except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
-            raise ValueError("generation boundary lacks an exact accepted transition") from exc
+        _verify_accepted_generation_transition(
+            self.complete_receipts.repository, self.boundary, accepted,
+        )
 
     @property
     def source_digest(self) -> str:
@@ -2879,12 +2889,14 @@ def _recording_source_size(
 def read_review_generation_archive_page(
     db: sqlite3.Connection, binding: ReviewExecutionBinding,
     first_generation: int, through_generation: int,
-    *, limit: int = MAX_GENERATION_ARCHIVE_PAGE,
+    *, preceding: ReviewExecutionGenerationBoundary | None = None,
+    limit: int = MAX_GENERATION_ARCHIVE_PAGE,
 ) -> ObservedReviewGenerationArchivePage | BlockedReviewGenerationArchivePage:
-    """Observe expected retained source pairs by deterministic generation ID.
+    """Observe retained transition semantics in expected generation order.
 
-    This does not prove a checkpoint, classify the accepted transition, or
-    detect unclaimed rows; the durable archive audit must do those separately.
+    A supplied predecessor is an observation, not proof of checkpoint ancestry.
+    This page does not detect unclaimed rows or prove retired-prefix replay;
+    the durable archive audit must do those before granting authority.
     """
     if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
         raise ValueError("generation archive page requires an explicit SQL transaction")
@@ -2893,9 +2905,17 @@ def read_review_generation_archive_page(
             or not 1 <= first_generation <= through_generation <= MAX_SQL_ROWID
             or type(limit) is not int or not 1 <= limit <= MAX_GENERATION_ARCHIVE_PAGE):
         raise ValueError("generation archive page requires a bounded episode range")
+    if preceding is not None and (not isinstance(preceding, ReviewExecutionGenerationBoundary)
+                                  or not same_execution_episode(binding, preceding.before.binding)):
+        raise ValueError("generation archive page requires a same-episode predecessor")
+    expected_first = (preceding.to_revision.fence.generation + 1 if preceding is not None
+                      else binding.rejection.fence.generation + 1)
+    if first_generation != expected_first:
+        raise ValueError("generation archive page requires the next contiguous generation")
     repository = binding.rejection.fence.key.repository
     sources: list[ObservedReviewGenerationArchiveSource] = []
     bytes_read = 0
+    previous_revision = preceding.to_revision if preceding is not None else None
     stop = min(through_generation + 1, first_generation + limit)
     for generation in range(first_generation, stop):
         try:
@@ -2915,6 +2935,11 @@ def read_review_generation_archive_page(
             if (receipt["reusable_after"] is not None or boundary.receipt_id != receipt_id
                     or boundary.to_revision.fence.generation != generation
                     or not same_execution_episode(binding, boundary.before.binding)
+                    or (previous_revision is None and boundary.from_revision.fence != binding.rejection.fence)
+                    or (previous_revision is not None and (
+                        boundary.from_revision.fence != previous_revision.fence
+                        or boundary.from_revision.version < previous_revision.version
+                    ))
                     or namespace not in {"workflow-request", "workflow-transition"}):
                 raise ValueError("generation receipt disagrees with its expected episode")
             accepted_size = _recording_source_size(db, namespace, repository, key)
@@ -2931,6 +2956,9 @@ def read_review_generation_archive_page(
                         captured, boundary, namespace, key, accepted["payload_json"],
                     )):
                 raise ValueError("generation receipt lost its accepted transition")
+            _parse_stamp(receipt["claimed_at"])
+            _parse_stamp(accepted["claimed_at"])
+            _verify_accepted_generation_transition(repository, boundary, accepted)
             source_bytes = sum(
                 len(value.encode("utf-8", "surrogatepass"))
                 for _, value in (*receipt_fields, *accepted_fields) if value is not None
@@ -2941,6 +2969,7 @@ def read_review_generation_archive_page(
                 generation, boundary, namespace, key, receipt_digest, accepted_digest,
             ))
             bytes_read += source_bytes
+            previous_revision = boundary.to_revision
         except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
                 sqlite3.Error, WorkflowAuthorityError) as exc:
             return BlockedReviewGenerationArchivePage(generation, _printable(str(exc)))

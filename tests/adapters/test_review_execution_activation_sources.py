@@ -1301,8 +1301,9 @@ def test_generation_archive_page_reads_exact_expected_source_without_writes(rig)
         db.execute("BEGIN")
         workflow = load_review_workflow_row(db, rig[1].revision.fence.key)
         assert workflow is not None
-        binding = workflow.execution.binding
-        generation = binding.rejection.fence.generation
+        boundary = workflow.execution.boundaries[0]
+        binding = boundary.before.binding
+        generation = boundary.to_revision.fence.generation
         before = db.total_changes
         page = read_review_generation_archive_page(db, binding, generation, generation)
         foreign = read_review_generation_archive_page(
@@ -1333,12 +1334,18 @@ def test_generation_archive_page_is_bounded_and_requires_every_expected_receipt(
         ContinueGrantedRearm("rearm:archive-page", stopped.revision,
                              "rearm:with-older-submission", expected_binding=stopped.binding), actor,
     ), WorkflowCommitted)
-    binding = current(store, selection).execution.binding
-    last = binding.rejection.fence.generation
+    execution = current(store, selection).execution
+    binding = execution.boundaries[0].before.binding
+    last = execution.binding.rejection.fence.generation
     with closing(store._connect()) as db:
         db.execute("BEGIN")
         first_page = read_review_generation_archive_page(db, binding, last - 1, last, limit=1)
-        second_page = read_review_generation_archive_page(db, binding, last, last, limit=1)
+        assert isinstance(first_page, ObservedReviewGenerationArchivePage)
+        second_page = read_review_generation_archive_page(
+            db, binding, last, last, preceding=first_page.sources[0].boundary, limit=1,
+        )
+        with pytest.raises(ValueError, match="contiguous generation"):
+            read_review_generation_archive_page(db, binding, last, last)
         db.rollback()
     assert isinstance(first_page, ObservedReviewGenerationArchivePage)
     assert isinstance(second_page, ObservedReviewGenerationArchivePage)
@@ -1366,7 +1373,9 @@ def test_generation_archive_page_is_bounded_and_requires_every_expected_receipt(
         with monkeypatch.context() as patcher:
             patcher.setattr(review_activation, "MAX_GENERATION_ARCHIVE_PAGE_BYTES", first_bytes)
             bounded = read_review_generation_archive_page(db, binding, last - 1, last)
-        malformed = read_review_generation_archive_page(db, binding, last, last)
+        malformed = read_review_generation_archive_page(
+            db, binding, last, last, preceding=first_page.sources[0].boundary,
+        )
         db.rollback()
     assert isinstance(bounded, ObservedReviewGenerationArchivePage)
     assert len(bounded.sources) == 1 and bounded.next_generation == last and bounded.has_more
@@ -1500,8 +1509,14 @@ def test_generation_boundary_rejects_mutated_accepted_transition_contents(rig, d
         observed = read_complete_legacy_review_generation_receipts(db, "o/r")
         assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
         result = match_legacy_review_generation_boundary_sources(db, observed, boundary.receipt_id)
+        archive = read_review_generation_archive_page(
+            db, boundary.before.binding,
+            boundary.to_revision.fence.generation,
+            boundary.to_revision.fence.generation,
+        )
         db.rollback()
     assert isinstance(result, UnmatchedLegacyReviewGenerationBoundarySources)
+    assert isinstance(archive, BlockedReviewGenerationArchivePage)
 
 
 @pytest.mark.parametrize("damage", ["blob_alias", "scope_case_alias", "scope_space_alias",

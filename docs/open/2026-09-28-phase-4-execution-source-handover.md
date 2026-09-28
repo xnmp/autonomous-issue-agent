@@ -336,6 +336,24 @@ with `CLAUDE.md`, `AGENTS.md`, the
   transition semantics, chronology or absence of unclaimed rows. The future
   archive audit must add those checks and a durable cursor before it can gate
   execution authority.
+- Checkpoint 75 reuses the accepted-transition verifier for each archived
+  source pair. A page now checks canonical accepted contents, command and audit
+  identity, valid claim times, contiguous generation fences and nondecreasing
+  revision versions. Following pages require an explicitly supplied prior
+  boundary; a skipped generation blocks. The predecessor is caller-held
+  observation, so this still does not prove checkpoint ancestry, replay a
+  retired prefix, find unclaimed rows or authorize execution. Historical
+  snapshot decoding also remains outside the bounded hot-read target.
+
+Independent Sol review of checkpoint 75 found no concrete medium or high
+issue in this observational slice. Prefix comparison cannot be required
+between accepted snapshots because a valid compaction may retire earlier
+boundaries; the checkpoint audit must establish that ancestry. The full
+`make test` gate passed: 3,275 domain, 3,191 adapter and 2,876 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-generation-archive-semantics-gate.log` (ephemeral). No live
+service or workflow family was activated.
 
 Independent Sol review of checkpoint 74 caught the original post-decode byte
 cap and missing malformed/foreign edge coverage. Size preflight and regressions
