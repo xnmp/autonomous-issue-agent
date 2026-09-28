@@ -952,3 +952,26 @@ remaining medium or high issue. Full `make test` passed: 3,191 domain, 2,868
 adapter and 2,866 app tests, plus hooks, governor, gate parity, four import
 contracts and both Pyrefly checks. Ten accepted strict xfails remained
 expected. Log: `/tmp/phase4-owner-lineage-gate.log` (ephemeral).
+
+## Checkpoint 36 — source-backed plain recorded review baseline (offline)
+
+A read-only verifier now joins one inventoried successful `SUBMIT_REVIEW`
+command and exact effect to its `review-recorded-submission` marker and
+accepted `workflow-transition` receipt under an explicit SQL snapshot. It
+checks the command payload and effect digests, paid attempt and attempt owner,
+authorized owner lineage, exact accepted revision pair, typed review snapshot,
+reviewed baseline and command/review evidence IDs. A verified variant exposes
+only the baseline, revision pair and audit, with source digests for later
+activation revalidation. The verifier rechecks the inventoried command rowid
+and the producer's unique GitHub review identity rule. It does not certify the
+full historical workflow snapshot, execution productivity, a reset, or
+outer-round ordering. Missing or contradictory facts return an explicit
+unverified variant; an unrecorded
+successful command does not prove the absence of a reset. Escalated verdicts
+remain blocked until their hold provenance is separately verified. Independent
+Sol review found the initial reset/productivity overclaim, an exposed
+unverifiable snapshot, a forged source cursor and a duplicate review receipt
+gap; the proof was narrowed and regression cases were added. Full `make test`
+passed: 3,191 domain, 2,878 adapter and 2,866 app tests, plus hooks, governor,
+gate parity, four import contracts and both Pyrefly checks. Ten strict xfails
+remained expected. Log: `/tmp/phase4-recorded-review-gate.log` (ephemeral).

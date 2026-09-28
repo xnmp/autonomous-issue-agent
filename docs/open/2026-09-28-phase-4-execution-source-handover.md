@@ -37,13 +37,21 @@ with `CLAUDE.md`, `AGENTS.md`, the
   daemon boot's implicit `repository:review` predecessor, configured prior
   deployments and transitive retirement links. Contradictory or unreadable
   links block a complete lineage claim.
+- Checkpoint 36 joins a plain successful review submission to its effect,
+  recorded marker and exact accepted workflow transition. Its verified
+  result proves a recorded baseline for that command only. It does not certify
+  the full historical snapshot, execution productivity or a reset. Escalated
+  verdict holds and outer-round ordering remain separate obligations.
 
-The checkpoint-35 full `make test` gate passed: 3,191 domain, 2,868 adapter
+The checkpoint-36 full `make test` gate passed: 3,191 domain, 2,878 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
 and both Pyrefly checks. Ten strict xfails remained expected. The log is
-`/tmp/phase4-owner-lineage-gate.log` (ephemeral). Independent Sol review found
-and verified fixes for the implicit legacy owner and BLOB successor omissions;
-its second pass found no remaining medium or high issue.
+`/tmp/phase4-recorded-review-gate.log` (ephemeral). Independent Sol review
+found the reset/productivity overclaim, exposed unverifiable snapshot, forged
+source cursor and duplicate review receipt gap. The proof now exposes only the
+baseline, revision pair and audit, and it rejects forged cursors or duplicate
+review identities. Exact historical snapshots are not certified from these
+sources.
 
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
@@ -58,11 +66,11 @@ occurred.
    barriers before commit. Daemon boot's `adopt_legacy_owner` rewrites some
    prior run owners, so neither the current owner nor configured owners alone
    establish complete historical run evidence.
-2. Join the inventoried `SUBMIT_REVIEW` commands, effects and registration/index
-   rows to bounded round plans; inspect verdict hold provenance. Reconstruct productive
-   reset boundaries from confirmed source receipts; a completed agent run is
-   not itself a productive review. Unknown death or reset attribution blocks
-   import with reviewable evidence.
+2. Join verified plain recorded baselines and the inventoried registration/index
+   rows to bounded round plans. Verify escalated verdict hold provenance and
+   classify unrecorded or stale successful commands separately. A completed
+   agent run is not itself a productive review; unknown death or reset
+   attribution blocks import with reviewable evidence.
 3. Join positive issue-keyed file counters to PRs with fresh complete
    linked-issue observations. Shared or ambiguous issue counters cannot be
    copied to multiple PRs. Parse runtime-tagged session and round values,

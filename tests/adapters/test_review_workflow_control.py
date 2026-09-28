@@ -22,6 +22,9 @@ from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.review_workflow_control import (
     BARRIER_ROLES, SQLiteReviewWorkflowControl, release_refused_gate_id,
 )
+from issue_agent.adapters.review_execution_activation import (
+    read_legacy_review_owner_lineage, read_legacy_recorded_review, read_legacy_review_submission_page,
+)
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, workflow_scope
 from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
@@ -39,6 +42,10 @@ from issue_agent.domain.review_workflow_policy import (
     ReleaseProjectionPending, ReviewHeld, ReviewNotOwed, ReviewOwed, SubmissionUnresolved, open_review_ceiling,
     record_review,
     reconcile_review_ceiling, request_review_rearm, review_rearm_observation_gate_id,
+)
+from issue_agent.domain.review_execution_activation import (
+    LegacyReviewOwnerLineage, LegacyReviewSubmissionSource, UnverifiedLegacyRecordedReview,
+    VerifiedLegacyRecordedReview,
 )
 from issue_agent.domain.workflow import (
     AuthorizeAbsentRetry, CancelRearm, ContinueGrantedRearm, EvidenceUnavailable, KeepGuidance, OpenGate,
@@ -328,6 +335,110 @@ def test_a_recorded_review_names_the_github_review_it_matched_and_records_once(r
     assert rollback.mutation is WorkflowMutation.RECORD_REVIEW
     assert isinstance(commit(rig, rollback), WorkflowConflict)
     assert rig.workflow().episode.continuation.source.command_id == second
+
+
+def _legacy_recorded_review_proof(rig, command_id, *, current_owner=REVIEWER, source_rowid_offset=0):
+    with closing(rig.store._connect()) as db:
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_page(db, "o/r")
+        source = next(entry for entry in page.entries if isinstance(entry, LegacyReviewSubmissionSource)
+                      and dict(entry.command_fields)["command_id"] == str(command_id))
+        source = replace(source, source_rowid=source.source_rowid + source_rowid_offset)
+        lineage = read_legacy_review_owner_lineage(db, "o/r", current_owner)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        before = db.total_changes
+        proof = read_legacy_recorded_review(db, source, lineage)
+        assert db.total_changes == before
+        db.rollback()
+    return proof
+
+
+def test_offline_legacy_recorded_review_proof_joins_real_verdict_sources(rig):
+    rig.activate()
+    rig.control().ensure_observed_workflow(PR_KEY)
+    command_id = rig.verdict()
+    rig.control().record_review(command_id)
+
+    proof = _legacy_recorded_review_proof(rig, command_id)
+
+    assert isinstance(proof, VerifiedLegacyRecordedReview)
+    assert proof.baseline.source.command_id == command_id
+    assert proof.recorded_revision.version == proof.expected_revision.version + 1
+    assert proof.submission.receipt_id.startswith("github-review:submitted-")
+    with pytest.raises(ValueError, match="do not prove"):
+        replace(proof, recorded_revision=proof.expected_revision)
+
+
+@pytest.mark.parametrize("damage", [
+    "effect_digest", "command_digest", "zero_attempts", "missing_marker", "transition", "large_transition",
+    "duplicate_review",
+])
+def test_offline_legacy_recorded_review_proof_blocks_corrupt_or_missing_source(rig, damage):
+    rig.activate()
+    rig.control().ensure_observed_workflow(PR_KEY)
+    command_id = rig.verdict()
+    rig.control().record_review(command_id)
+    with closing(rig.store._connect()) as db:
+        if damage == "effect_digest":
+            db.execute("UPDATE effect_receipts SET receipt_digest=? WHERE command_id=?",
+                       ("0" * 64, str(command_id)))
+        elif damage == "command_digest":
+            db.execute("UPDATE lifecycle_commands SET payload_digest=? WHERE command_id=?",
+                       ("0" * 64, str(command_id)))
+        elif damage == "zero_attempts":
+            db.execute("UPDATE lifecycle_commands SET attempts=0 WHERE command_id=?", (str(command_id),))
+        elif damage == "missing_marker":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-recorded-submission' AND key=?",
+                       (str(command_id),))
+        elif damage == "transition":
+            changed = db.execute("UPDATE dedupe_keys SET payload_json='{}' "
+                                 "WHERE namespace='workflow-transition' AND payload_json LIKE '%record_review%'")
+            assert changed.rowcount == 1
+        elif damage == "duplicate_review":
+            db.execute(
+                "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,occurrence,kind,target,"
+                "expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,state,"
+                "attempts,created_at,updated_at) "
+                "SELECT 'duplicate-review-command',idempotency_key || '-duplicate',logical_key,occurrence,kind,"
+                "target,expected_revision,config_version,repository,executor_identity,payload_json,payload_digest,"
+                "state,attempts,created_at,updated_at FROM lifecycle_commands "
+                "WHERE command_id=?", (str(command_id),),
+            )
+            db.execute(
+                "INSERT INTO effect_receipts SELECT 'duplicate-review-command', executor_identity, started_at, "
+                "completed_at, status, remote_object_id, remote_revision, error, receipt_digest "
+                "FROM effect_receipts WHERE command_id=?", (str(command_id),),
+            )
+        else:
+            changed = db.execute("UPDATE dedupe_keys SET payload_json=? "
+                                 "WHERE namespace='workflow-transition' AND payload_json LIKE '%record_review%'",
+                                 ("x" * (2**21 + 1),))
+            assert changed.rowcount == 1
+        db.commit()
+
+    assert isinstance(_legacy_recorded_review_proof(rig, command_id), UnverifiedLegacyRecordedReview)
+
+
+def test_offline_legacy_recorded_review_proof_rejects_another_owner_lineage(rig):
+    rig.activate()
+    rig.control().ensure_observed_workflow(PR_KEY)
+    command_id = rig.verdict()
+    rig.control().record_review(command_id)
+
+    proof = _legacy_recorded_review_proof(rig, command_id, current_owner="o/r:review:other")
+
+    assert isinstance(proof, UnverifiedLegacyRecordedReview)
+
+
+def test_offline_legacy_recorded_review_proof_rejects_forged_inventory_cursor(rig):
+    rig.activate()
+    rig.control().ensure_observed_workflow(PR_KEY)
+    command_id = rig.verdict()
+    rig.control().record_review(command_id)
+
+    proof = _legacy_recorded_review_proof(rig, command_id, source_rowid_offset=1000)
+
+    assert isinstance(proof, UnverifiedLegacyRecordedReview)
 
 
 # -- the commit boundary refuses forged priors, facts and preflights ----------------------------

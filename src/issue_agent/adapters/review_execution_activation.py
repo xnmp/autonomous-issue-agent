@@ -9,6 +9,8 @@ from __future__ import annotations
 import os
 import re
 import sqlite3
+import hashlib
+import json
 
 from ..domain.resolve_activation import LegacyAbsent, LegacyFile, UnmappedLegacyEntry
 from ..domain.review_execution_activation import (
@@ -22,9 +24,19 @@ from ..domain.review_execution_activation import (
     UnreadableLegacyReviewSubmissionReceipt,
     MAX_LEGACY_REVIEW_OWNERS, LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
     UnreadableLegacyReviewOwnerLineage,
+    VerifiedLegacyRecordedReview, UnverifiedLegacyRecordedReview,
 )
-from ..domain.workflow_identity import canonical_workflow_repository, validate_workflow_identifier
+from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
+from ..domain.review_execution import ExecutionNotActivated
+from ..domain.review_workflow import ReviewWorkflowSnapshot
+from ..domain.review_workflow_policy import ReviewSubmissionReceipt
+from ..domain.workflow import ObservedTransition, WorkflowMutation
+from ..domain.workflow_identity import WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier
+from .control_store import CorruptControlStore, _encoded_payload_digest, _parse_stamp, _receipt_digest, load_bound_review_submission
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
+from .workflow_codec import decode_workflow, encode_workflow
+from .workflow_commit import _unique_receipt_object
+from .workflow_rows import WorkflowAuthorityError
 
 _PR_NAME = re.compile(r"pr-(.*)\.(session|round)", re.DOTALL)
 _COUNTER_NAME = re.compile(r"issue-(.*)\.infra-deaths", re.DOTALL)
@@ -35,6 +47,8 @@ MAX_RUN_SOURCE_PAGE = 256
 MAX_SUBMISSION_SOURCE_PAGE = 64
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
 _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
+_DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json")
+MAX_LEGACY_RECORDING_BYTES = 2**21
 _RUN_COLUMNS = (
     "run_id", "dispatch_id", "kind", "state", "config_version", "started_at", "completed_at", "outcome",
     "provider_receipt_id", "workflow_binding_json", "workflow_episode_key", "review_round_id", "review_child_id",
@@ -421,3 +435,126 @@ def read_legacy_review_owner_lineage(
                                         tuple(owners), tuple(links))
     except ValueError:
         return UnreadableLegacyReviewOwnerLineage("review owner lineage is contradictory")
+
+
+def _read_recording_source(
+    db: sqlite3.Connection, namespace: str, repository: str, key: str,
+) -> tuple[tuple[tuple[str, str | None], ...], str]:
+    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in _DEDUPE_SOURCE_COLUMNS)
+    metadata = db.execute(
+        f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM dedupe_keys "
+        "WHERE namespace=? AND scope=? AND key=?", (namespace, repository, key),
+    ).fetchone()
+    if metadata is None:
+        raise ValueError(f"{namespace} source is absent")
+    if metadata["largest_value"] > MAX_LEGACY_RECORDING_BYTES:
+        raise ValueError(f"{namespace} source exceeds its byte bound")
+    columns = ",".join(
+        f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+        for column in _DEDUPE_SOURCE_COLUMNS
+    )
+    source = db.execute(
+        f"SELECT {columns} FROM dedupe_keys WHERE rowid=? AND namespace=? AND scope=? AND key=?",
+        (metadata["source_rowid"], namespace, repository, key),
+    ).fetchone()
+    if source is None:
+        raise ValueError(f"{namespace} source changed during its read")
+    fields = tuple(
+        (column, _sql_text(source[f"type_{column}"], source[f"raw_{column}"]))
+        for column in _DEDUPE_SOURCE_COLUMNS
+    )
+    values = dict(fields)
+    if values["payload_json"] is None or values["claimed_at"] is None:
+        raise ValueError(f"{namespace} source lacks its payload or claim")
+    digest = hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+    return fields, digest
+
+
+def _reject_nonfinite(value: str) -> None:
+    raise ValueError(f"accepted review transition contains {value}")
+
+
+def read_legacy_recorded_review(
+    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
+    lineage: LegacyReviewOwnerLineage,
+) -> VerifiedLegacyRecordedReview | UnverifiedLegacyRecordedReview:
+    """Prove one plain recorded baseline from its accepted SQL sources.
+
+    This does not certify a productive execution round or reset. Escalated
+    verdicts need a separate hold proof; missing recording remains unresolved.
+    """
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("recorded review proof requires an explicit SQL transaction")
+    if not isinstance(source, LegacyReviewSubmissionSource) or not isinstance(lineage, LegacyReviewOwnerLineage):
+        raise ValueError("recorded review proof requires typed command and lineage sources")
+    command = dict(source.command_fields)
+    command_id = command["command_id"]
+    if command["repository"] != lineage.repository:
+        return UnverifiedLegacyRecordedReview(command_id, "submission belongs to another repository")
+    if source.receipt_fields is None:
+        return UnverifiedLegacyRecordedReview(command_id, "submission effect receipt is absent")
+    effect = dict(source.receipt_fields)
+    try:
+        command_row = db.execute("SELECT rowid AS source_rowid,* FROM lifecycle_commands WHERE command_id=?", (command_id,)).fetchone()
+        effect_row = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (command_id,)).fetchone()
+        if (command_row is None or effect_row is None or command_row["source_rowid"] != source.source_rowid
+                or any(command_row[name] != value for name, value in source.command_fields)
+                or any(effect_row[name] != value for name, value in source.receipt_fields)):
+            raise ValueError("submission command or effect changed after inventory")
+        if command["state"] != "succeeded" or effect["status"] != "succeeded":
+            raise ValueError("submission lacks a successful effect")
+        if (command["attempts"] < 1 or command["workflow_binding_json"] is None
+                or command["payload_digest"] != _encoded_payload_digest(
+                    command["payload_json"], command["workflow_binding_json"],
+                )):
+            raise ValueError("submission command lacks its bound payload or paid attempt")
+        receipt = EffectReceipt(
+            CommandId(command_id), effect["executor_identity"],
+            _parse_stamp(effect["started_at"]), _parse_stamp(effect["completed_at"]),
+            EffectStatus(effect["status"]), effect["remote_object_id"], effect["remote_revision"], effect["error"],
+        )
+        if (command["attempt_owner"] != receipt.executor_identity
+                or effect["receipt_digest"] != _receipt_digest(receipt)):
+            raise ValueError("submission effect digest or attempt owner disagrees")
+        duplicate_review = db.execute(
+            "SELECT e.command_id FROM effect_receipts e JOIN lifecycle_commands c USING(command_id) "
+            "WHERE e.remote_object_id=? AND c.kind='submit_review' AND c.repository=? LIMIT 2",
+            (receipt.remote_object_id, lineage.repository),
+        ).fetchall()
+        if len(duplicate_review) != 1 or duplicate_review[0]["command_id"] != command_id:
+            raise ValueError("submission review identity is shared by another command")
+        bound = load_bound_review_submission(db, CommandId(command_id))
+        if not isinstance(bound, ReviewSubmissionReceipt) or bound.escalated:
+            raise ValueError("submission is not a plain bound verdict; hold provenance remains required")
+        recorded_fields, recorded_digest = _read_recording_source(
+            db, "review-recorded-submission", lineage.repository, command_id,
+        )
+        recorded = decode_workflow(dict(recorded_fields)["payload_json"], WorkflowRevision)
+        if recorded.version == 0:
+            raise ValueError("recorded review has no predecessor revision")
+        expected = WorkflowRevision(recorded.fence, recorded.version - 1)
+        transition_key = hashlib.sha256(encode_workflow(expected).encode()).hexdigest()
+        transition_fields, transition_digest = _read_recording_source(
+            db, "workflow-transition", lineage.repository, transition_key,
+        )
+        accepted = json.loads(dict(transition_fields)["payload_json"],
+                              object_pairs_hook=_unique_receipt_object, parse_constant=_reject_nonfinite)
+        if (not isinstance(accepted, dict)
+                or set(accepted) != {"mutation", "expected", "snapshot", "audit", "commands"}
+                or accepted["mutation"] != WorkflowMutation.RECORD_REVIEW.value
+                or accepted["commands"] != []):
+            raise ValueError("accepted transition is not a plain recorded review")
+        accepted_expected = decode_workflow(accepted["expected"], WorkflowRevision)
+        after = decode_workflow(accepted["snapshot"], ReviewWorkflowSnapshot)
+        audit = decode_workflow(accepted["audit"], ObservedTransition)
+        if accepted_expected != expected:
+            raise ValueError("accepted transition expected revision changed")
+        if (after.revision != recorded or after.binding != bound.submission.binding
+                or not isinstance(after.execution, ExecutionNotActivated)):
+            raise ValueError("accepted transition is not an inactive review baseline")
+        return VerifiedLegacyRecordedReview(source, lineage, bound, expected, recorded,
+                                            after.episode.continuation, audit,
+                                            recorded_digest, transition_digest)
+    except (KeyError, TypeError, ValueError, UnicodeError, sqlite3.Error,
+            WorkflowAuthorityError, CorruptControlStore) as exc:
+        return UnverifiedLegacyRecordedReview(command_id, str(exc)[:512] or "recorded review source is unreadable")

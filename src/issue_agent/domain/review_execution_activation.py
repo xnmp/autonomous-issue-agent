@@ -8,8 +8,12 @@ import hashlib
 import json
 
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
+from .review_workflow import ReviewedBaseline
+from .review_workflow_policy import ReviewSubmissionReceipt
+from .workflow import ObservedTransition
 from .workflow_identity import (
-    canonical_workflow_repository, validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
+    PullRequestRef, WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
+    validate_workflow_integer, validate_workflow_text,
 )
 
 
@@ -412,6 +416,74 @@ class UnreadableLegacyReviewOwnerLineage:
         validate_workflow_text(self.reason, "unreadable owner lineage reason")
         if self.source_rowid is not None:
             _rowid(self.source_rowid, "unreadable retired owner cursor")
+
+
+def _source_digest(value: str, name: str) -> None:
+    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
+        raise ValueError(f"{name} must be a SHA-256 digest")
+
+
+@dataclass(frozen=True)
+class VerifiedLegacyRecordedReview:
+    """A plain recorded baseline; execution productivity and round order remain unproved."""
+
+    source: LegacyReviewSubmissionSource
+    lineage: LegacyReviewOwnerLineage
+    submission: ReviewSubmissionReceipt
+    expected_revision: WorkflowRevision
+    recorded_revision: WorkflowRevision
+    baseline: ReviewedBaseline
+    audit: ObservedTransition
+    recorded_source_digest: str
+    transition_source_digest: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyReviewSubmissionSource)
+                or not isinstance(self.lineage, LegacyReviewOwnerLineage)
+                or not isinstance(self.submission, ReviewSubmissionReceipt)
+                or not isinstance(self.expected_revision, WorkflowRevision)
+                or not isinstance(self.recorded_revision, WorkflowRevision)
+                or not isinstance(self.baseline, ReviewedBaseline)
+                or not isinstance(self.audit, ObservedTransition)):
+            raise ValueError("verified recorded review requires typed sources")
+        for name in ("recorded_source_digest", "transition_source_digest"):
+            _source_digest(getattr(self, name), name)
+        command = dict(self.source.command_fields)
+        effect = dict(self.source.receipt_fields) if self.source.receipt_fields is not None else None
+        binding = self.submission.submission.binding
+        key = binding.fence.key
+        if (self.submission.escalated
+                or not isinstance(key.target, PullRequestRef) or key.repository != self.lineage.repository
+                or command["command_id"] != str(self.submission.submission.command_id)
+                or command["repository"] != key.repository
+                or command["executor_identity"] not in self.lineage.owners
+                or effect is None or effect["status"] != "succeeded"
+                or effect["executor_identity"] not in self.lineage.owners
+                or effect["remote_object_id"] != self.submission.receipt_id.removeprefix("github-review:")
+                or self.expected_revision.fence != self.recorded_revision.fence
+                or self.expected_revision.version + 1 != self.recorded_revision.version
+                or self.baseline.reviewed_generation != self.recorded_revision.fence.generation
+                or self.baseline.source != self.submission.submission
+                or self.baseline.head_sha != self.submission.head_sha
+                or self.baseline.patch_id != self.submission.patch_id
+                or self.audit.evidence_ids != (str(self.submission.submission.command_id), self.submission.receipt_id)):
+            raise ValueError("legacy sources do not prove one plain recorded baseline")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.source.source_digest, self.lineage.source_digest,
+                 self.recorded_source_digest, self.transition_source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnverifiedLegacyRecordedReview:
+    command_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "unverified review command")
+        validate_workflow_text(self.reason, "unverified recorded review reason")
 
 
 @dataclass(frozen=True)
