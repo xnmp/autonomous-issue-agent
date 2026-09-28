@@ -18,8 +18,12 @@ from issue_agent.domain.review_execution import (
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
     ReviewExecutionGenerationBoundary, ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
     ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint, ReviewGenerationArchiveScan,
+    ReviewGenerationArchiveReceiptMember, ReviewGenerationArchiveSweep,
+    ReviewGenerationReceiptSweepCursor, CompletedReviewGenerationArchiveAudit,
     CompletedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveScan,
+    BlockedReviewGenerationArchiveSweep,
     begin_review_generation_archive_scan, advance_review_generation_archive_scan,
+    advance_review_generation_archive_sweep,
     review_generation_archive_scan_overdue,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
     accepted_review_transition_source, accepted_review_transition_proof_source,
@@ -383,20 +387,20 @@ def test_archive_scan_folds_bounded_pages_and_preserves_its_predecessor():
     )
     initial = begin_review_generation_archive_scan(origin, origin_receipt, "c" * 64, 2, now, 60)
     assert isinstance(initial, ReviewGenerationArchiveScan)
-    advanced = advance_review_generation_archive_scan(initial, (fingerprint(first),), now, 60)
+    advanced = advance_review_generation_archive_scan(initial, (fingerprint(first),), now)
     assert isinstance(advanced, ReviewGenerationArchiveScan)
     assert advanced.next_generation == 2 and advanced.preceding == first
     assert advanced.rolling_sha256 != initial.rolling_sha256
-    complete = advance_review_generation_archive_scan(advanced, (fingerprint(second),), now, 60)
+    complete = advance_review_generation_archive_scan(advanced, (fingerprint(second),), now)
     assert isinstance(complete, CompletedReviewGenerationArchiveScan)
     assert complete.final_cursor == second and complete.through_generation == 2
     assert complete.rolling_sha256 != advanced.rolling_sha256
     assert complete.origin_source_sha256 == "c" * 64
     assert review_generation_archive_scan_overdue(advanced, advanced.due_at)
     assert not review_generation_archive_scan_overdue(complete, now)
-    assert review_generation_archive_scan_overdue(complete, complete.next_due_at)
+    assert review_generation_archive_scan_overdue(complete, complete.due_at)
     with pytest.raises(ValueError, match="expected generation"):
-        advance_review_generation_archive_scan(initial, (fingerprint(second),), now, 60)
+        advance_review_generation_archive_scan(initial, (fingerprint(second),), now)
     with pytest.raises(ValueError, match="predecessor"):
         replace(advanced, preceding=second)
     with pytest.raises(ValueError, match="SHA-256"):
@@ -412,6 +416,55 @@ def test_archive_scan_folds_bounded_pages_and_preserves_its_predecessor():
         BlockedReviewGenerationArchiveScan(initial, 2**63 - 1, "missing", now)
     assert isinstance(BlockedReviewGenerationArchiveScan(complete, 2, "origin changed", now),
                       BlockedReviewGenerationArchiveScan)
+
+
+def test_archive_sweep_reconciles_exact_receipt_membership_and_cursor_progress():
+    origin = checkpoint().state.binding
+    cause = ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:sweep")
+    now = datetime(2026, 9, 29, tzinfo=timezone.utc)
+    first = ReviewExecutionBoundaryCursor(
+        review_generation_receipt_id(origin, 1), WorkflowRevision(binding(1).rejection.fence, 5),
+    )
+    second = ReviewExecutionBoundaryCursor(
+        review_generation_receipt_id(origin, 2), WorkflowRevision(binding(2).rejection.fence, 6),
+    )
+    initial = begin_review_generation_archive_scan(origin, cause, "c" * 64, 2, now, 60)
+    assert isinstance(initial, ReviewGenerationArchiveScan)
+    fingerprints = tuple(ReviewGenerationArchiveFingerprint(
+        cursor, "a" * 64, "workflow-request", "request:one", "b" * 64,
+    ) for cursor in (first, second))
+    expected = advance_review_generation_archive_scan(initial, fingerprints, now)
+    assert isinstance(expected, CompletedReviewGenerationArchiveScan)
+    member = lambda cursor: ReviewGenerationArchiveReceiptMember(
+        cursor.revision.fence.generation, cursor.receipt_id, "a" * 64,
+        "workflow-request", "request:one",
+    )
+    first_key = ReviewGenerationReceiptSweepCursor("o/r", "receipt:first")
+    last_key = ReviewGenerationReceiptSweepCursor("o/r", "receipt:last")
+    sweep = advance_review_generation_archive_sweep(
+        ReviewGenerationArchiveSweep(expected), (member(first),), first_key, last_key,
+        True, now, 60,
+    )
+    assert isinstance(sweep, ReviewGenerationArchiveSweep)
+    assert sweep.source_count == 1 and sweep.after == first_key
+    complete = advance_review_generation_archive_sweep(
+        sweep, (member(second),), last_key, last_key, False, now, 60,
+    )
+    assert isinstance(complete, CompletedReviewGenerationArchiveAudit)
+    assert complete.source_count == 2
+    assert complete.receipt_membership_xor == expected.receipt_membership_xor
+    assert not review_generation_archive_scan_overdue(complete, now)
+    assert review_generation_archive_scan_overdue(complete, complete.next_due_at)
+    with pytest.raises(ValueError, match="did not advance"):
+        advance_review_generation_archive_sweep(
+            sweep, (member(second),), first_key, last_key, False, now, 60,
+        )
+    changed = replace(member(second), receipt_sha256="d" * 64)
+    blocked = advance_review_generation_archive_sweep(
+        sweep, (changed,), last_key, last_key, False, now, 60,
+    )
+    assert isinstance(blocked, BlockedReviewGenerationArchiveSweep)
+    assert review_generation_archive_scan_overdue(blocked, now)
 
 
 def test_active_generation_advance_preserves_imported_allowance_without_rounds():

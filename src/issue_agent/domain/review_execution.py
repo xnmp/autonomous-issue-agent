@@ -19,6 +19,7 @@ from .workflow import (
 )
 from .workflow_identity import (
     PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowRevision,
+    canonical_workflow_repository,
     validate_workflow_identifier as identifier,
     validate_workflow_integer as integer,
 )
@@ -562,6 +563,7 @@ class ReviewExecutionBoundaryCursor:
 
 
 _EMPTY_ARCHIVE_AUDIT_DIGEST = hashlib.sha256(b"").hexdigest()
+_EMPTY_ARCHIVE_RECEIPT_SET = "0" * 64
 MAX_ARCHIVE_AUDIT_STEP = 16
 MAX_ARCHIVE_AUDIT_DUE_SECONDS = 86400
 
@@ -570,6 +572,45 @@ def _archive_audit_digest(value: object, name: str) -> None:
     if (not isinstance(value, str) or len(value) != 64
             or any(char not in "0123456789abcdef" for char in value)):
         raise ValueError(f"{name} requires a SHA-256 digest")
+
+
+def _archive_receipt_member(
+    generation: int, receipt_id: str, receipt_sha256: str,
+    accepted_namespace: str, accepted_key: str,
+) -> int:
+    # Expected receipts are generation ordered; the namespace census is key ordered.
+    encoded = "\0".join((str(generation), receipt_id, receipt_sha256,
+                         accepted_namespace, accepted_key)).encode()
+    return int.from_bytes(hashlib.sha256(encoded).digest())
+
+
+@dataclass(frozen=True)
+class ReviewGenerationReceiptSweepCursor:
+    scope: str
+    key: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.scope, str)
+                or canonical_workflow_repository(self.scope) != self.scope):
+            raise ValueError("generation receipt sweep cursor requires a canonical repository")
+        identifier(self.key, "generation receipt sweep key")
+
+
+@dataclass(frozen=True)
+class ReviewGenerationArchiveReceiptMember:
+    generation: int
+    receipt_id: str
+    receipt_sha256: str
+    accepted_namespace: str
+    accepted_key: str
+
+    def __post_init__(self) -> None:
+        integer(self.generation, "swept generation", minimum=1)
+        identifier(self.receipt_id, "swept generation receipt")
+        _archive_audit_digest(self.receipt_sha256, "swept receipt digest")
+        if self.accepted_namespace not in {"workflow-request", "workflow-transition"}:
+            raise ValueError("swept receipt requires an accepted transition namespace")
+        identifier(self.accepted_key, "swept accepted key")
 
 
 @dataclass(frozen=True)
@@ -593,6 +634,16 @@ class ReviewGenerationArchiveFingerprint:
 
 
 @dataclass(frozen=True)
+class ReviewGenerationArchiveBaseline:
+    through_generation: int
+    rolling_sha256: str
+
+    def __post_init__(self) -> None:
+        integer(self.through_generation, "archive baseline frontier", minimum=0)
+        _archive_audit_digest(self.rolling_sha256, "archive baseline digest")
+
+
+@dataclass(frozen=True)
 class ReviewGenerationArchiveScan:
     """A durable, incomplete expected-generation scan; no admission authority."""
 
@@ -603,6 +654,8 @@ class ReviewGenerationArchiveScan:
     next_generation: int
     preceding: ReviewExecutionBoundaryCursor | None
     rolling_sha256: str
+    receipt_membership_xor: str
+    baseline: ReviewGenerationArchiveBaseline | None
     started_at: datetime
     due_at: datetime
 
@@ -626,6 +679,10 @@ class ReviewGenerationArchiveScan:
               ) or self.preceding.revision.fence.key != self.origin.rejection.fence.key):
             raise ValueError("archive scan predecessor disagrees with its frontier")
         _archive_audit_digest(self.rolling_sha256, "archive rolling digest")
+        _archive_audit_digest(self.receipt_membership_xor, "archive receipt set")
+        if (self.baseline is not None and (not isinstance(self.baseline, ReviewGenerationArchiveBaseline)
+                or not self.next_generation <= self.baseline.through_generation <= self.through_generation)):
+            raise ValueError("archive scan baseline must be an unvisited prefix")
         if (not isinstance(self.started_at, datetime) or self.started_at.tzinfo is None
                 or self.started_at.utcoffset() is None or not isinstance(self.due_at, datetime)
                 or self.due_at.tzinfo is None or self.due_at.utcoffset() is None):
@@ -642,9 +699,10 @@ class CompletedReviewGenerationArchiveScan:
     through_generation: int
     final_cursor: ReviewExecutionBoundaryCursor | None
     rolling_sha256: str
+    receipt_membership_xor: str
     started_at: datetime
     completed_at: datetime
-    next_due_at: datetime
+    due_at: datetime
 
     def __post_init__(self) -> None:
         if (not isinstance(self.origin, ReviewExecutionBinding)
@@ -654,7 +712,8 @@ class CompletedReviewGenerationArchiveScan:
         base = self.origin.rejection.fence.generation
         integer(self.through_generation, "completed archive frontier", minimum=base)
         if self.through_generation == base:
-            if self.final_cursor is not None or self.rolling_sha256 != _EMPTY_ARCHIVE_AUDIT_DIGEST:
+            if (self.final_cursor is not None or self.rolling_sha256 != _EMPTY_ARCHIVE_AUDIT_DIGEST
+                    or self.receipt_membership_xor != _EMPTY_ARCHIVE_RECEIPT_SET):
                 raise ValueError("empty archive scan cannot invent a source")
         elif (not isinstance(self.final_cursor, ReviewExecutionBoundaryCursor)
               or self.final_cursor.revision.fence.generation != self.through_generation
@@ -664,12 +723,72 @@ class CompletedReviewGenerationArchiveScan:
               )):
             raise ValueError("completed archive scan requires its final source")
         _archive_audit_digest(self.rolling_sha256, "completed archive digest")
+        _archive_audit_digest(self.receipt_membership_xor, "completed archive receipt set")
         if (not isinstance(self.started_at, datetime) or self.started_at.tzinfo is None
                 or self.started_at.utcoffset() is None or not isinstance(self.completed_at, datetime)
                 or self.completed_at.tzinfo is None or self.completed_at.utcoffset() is None
-                or not isinstance(self.next_due_at, datetime) or self.next_due_at.tzinfo is None
-                or self.next_due_at.utcoffset() is None or not self.started_at <= self.completed_at < self.next_due_at):
+                or not isinstance(self.due_at, datetime) or self.due_at.tzinfo is None
+                or self.due_at.utcoffset() is None
+                or not self.started_at <= self.completed_at):
             raise ValueError("completed archive scan requires ordered aware times")
+
+
+@dataclass(frozen=True)
+class ReviewGenerationArchiveSweep:
+    """Resume the namespace census after the expected source pass."""
+
+    generation_scan: CompletedReviewGenerationArchiveScan
+    after: ReviewGenerationReceiptSweepCursor | None = None
+    upper: ReviewGenerationReceiptSweepCursor | None = None
+    receipt_membership_xor: str = _EMPTY_ARCHIVE_RECEIPT_SET
+    source_count: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.generation_scan, CompletedReviewGenerationArchiveScan):
+            raise ValueError("archive sweep requires a completed expected generation pass")
+        if (self.after is not None and not isinstance(self.after, ReviewGenerationReceiptSweepCursor)
+                or self.upper is not None and not isinstance(self.upper, ReviewGenerationReceiptSweepCursor)
+                or self.after is not None and self.upper is None
+                or self.after is not None and self.upper is not None
+                and (self.after.scope, self.after.key) > (self.upper.scope, self.upper.key)):
+            raise ValueError("archive sweep requires ordered bounded namespace cursors")
+        _archive_audit_digest(self.receipt_membership_xor, "archive sweep receipt set")
+        expected = (self.generation_scan.through_generation
+                    - self.generation_scan.origin.rejection.fence.generation)
+        integer(self.source_count, "archive sweep source count", minimum=0)
+        if (self.source_count > expected or self.source_count == 0
+                and self.receipt_membership_xor != _EMPTY_ARCHIVE_RECEIPT_SET):
+            raise ValueError("archive sweep source set exceeds its expected frontier")
+
+
+@dataclass(frozen=True)
+class CompletedReviewGenerationArchiveAudit:
+    """One full expected-source and namespace pass, still without admission authority."""
+
+    generation_scan: CompletedReviewGenerationArchiveScan
+    sweep_upper: ReviewGenerationReceiptSweepCursor | None
+    receipt_membership_xor: str
+    source_count: int
+    completed_at: datetime
+    next_due_at: datetime
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.generation_scan, CompletedReviewGenerationArchiveScan)
+                or self.sweep_upper is not None
+                and not isinstance(self.sweep_upper, ReviewGenerationReceiptSweepCursor)):
+            raise ValueError("completed archive audit requires its expected pass and sweep frontier")
+        _archive_audit_digest(self.receipt_membership_xor, "completed archive sweep receipt set")
+        expected = (self.generation_scan.through_generation
+                    - self.generation_scan.origin.rejection.fence.generation)
+        if (type(self.source_count) is not int or self.source_count != expected
+                or self.receipt_membership_xor != self.generation_scan.receipt_membership_xor
+                or expected > 0 and self.sweep_upper is None
+                or not isinstance(self.completed_at, datetime)
+                or self.completed_at.tzinfo is None or self.completed_at.utcoffset() is None
+                or not isinstance(self.next_due_at, datetime)
+                or self.next_due_at.tzinfo is None or self.next_due_at.utcoffset() is None
+                or not self.generation_scan.completed_at <= self.completed_at < self.next_due_at):
+            raise ValueError("completed archive audit requires a matching source census and due time")
 
 
 @dataclass(frozen=True)
@@ -690,18 +809,43 @@ class BlockedReviewGenerationArchiveScan:
             raise ValueError("blocked archive scan requires its exact discrepancy")
 
 
+@dataclass(frozen=True)
+class BlockedReviewGenerationArchiveSweep:
+    prior: ReviewGenerationArchiveSweep | CompletedReviewGenerationArchiveAudit
+    reason: str
+    source_rowid: int | None
+    detected_at: datetime
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.prior, (ReviewGenerationArchiveSweep, CompletedReviewGenerationArchiveAudit))
+                or not isinstance(self.reason, str) or not 1 <= len(self.reason) <= 512
+                or self.source_rowid is not None and (type(self.source_rowid) is not int
+                    or not -_MAX_INTEGER - 1 <= self.source_rowid <= _MAX_INTEGER)
+                or not isinstance(self.detected_at, datetime)
+                or self.detected_at.tzinfo is None or self.detected_at.utcoffset() is None):
+            raise ValueError("blocked archive sweep requires its exact discrepancy")
+
+
 def review_generation_archive_scan_overdue(
-    state: ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan | BlockedReviewGenerationArchiveScan,
+    state: (
+        ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan
+        | ReviewGenerationArchiveSweep | CompletedReviewGenerationArchiveAudit
+        | BlockedReviewGenerationArchiveScan | BlockedReviewGenerationArchiveSweep
+    ),
     now: datetime,
 ) -> bool:
     """A source discrepancy or missed pass deadline must block future admission."""
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("archive scan due check requires an aware time")
-    if isinstance(state, BlockedReviewGenerationArchiveScan):
+    if isinstance(state, (BlockedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveSweep)):
         return True
     if isinstance(state, ReviewGenerationArchiveScan):
         return now >= state.due_at
     if isinstance(state, CompletedReviewGenerationArchiveScan):
+        return now >= state.due_at
+    if isinstance(state, ReviewGenerationArchiveSweep):
+        return now >= state.generation_scan.due_at
+    if isinstance(state, CompletedReviewGenerationArchiveAudit):
         return now >= state.next_due_at
     raise ValueError("archive scan due check requires a typed state")
 
@@ -710,6 +854,7 @@ def begin_review_generation_archive_scan(
     origin: ReviewExecutionBinding, origin_receipt: ReviewExecutionOrigin, origin_source_sha256: str,
     through_generation: int,
     now: datetime, due_seconds: int,
+    baseline: ReviewGenerationArchiveBaseline | None = None,
 ) -> ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan:
     """Start a bounded pass from the same episode's first expected generation."""
     if (not isinstance(origin, ReviewExecutionBinding)
@@ -718,6 +863,14 @@ def begin_review_generation_archive_scan(
         raise ValueError("archive scan requires an aware start and typed origin")
     _archive_audit_digest(origin_source_sha256, "archive origin source digest")
     integer(through_generation, "archive scan frontier", minimum=origin.rejection.fence.generation)
+    if baseline is not None:
+        if (not isinstance(baseline, ReviewGenerationArchiveBaseline)
+                or not origin.rejection.fence.generation <= baseline.through_generation <= through_generation):
+            raise ValueError("archive scan baseline exceeds its expected frontier")
+        if baseline.through_generation == origin.rejection.fence.generation:
+            if baseline.rolling_sha256 != _EMPTY_ARCHIVE_AUDIT_DIGEST:
+                raise ValueError("empty archive baseline must retain its empty digest")
+            baseline = None
     integer(due_seconds, "archive scan due seconds", minimum=1)
     if due_seconds > MAX_ARCHIVE_AUDIT_DUE_SECONDS:
         raise ValueError("archive scan due window exceeds one day")
@@ -728,28 +881,28 @@ def begin_review_generation_archive_scan(
     if through_generation == origin.rejection.fence.generation:
         return CompletedReviewGenerationArchiveScan(
             origin, origin_receipt, origin_source_sha256, through_generation, None,
-            _EMPTY_ARCHIVE_AUDIT_DIGEST, now, now, due,
+            _EMPTY_ARCHIVE_AUDIT_DIGEST, _EMPTY_ARCHIVE_RECEIPT_SET, now, now, due,
         )
     return ReviewGenerationArchiveScan(
         origin, origin_receipt, origin_source_sha256, through_generation,
         origin.rejection.fence.generation + 1,
-        None, _EMPTY_ARCHIVE_AUDIT_DIGEST, now, due,
+        None, _EMPTY_ARCHIVE_AUDIT_DIGEST, _EMPTY_ARCHIVE_RECEIPT_SET,
+        baseline, now, due,
     )
 
 
 def advance_review_generation_archive_scan(
     scan: ReviewGenerationArchiveScan, sources: tuple[ReviewGenerationArchiveFingerprint, ...],
-    now: datetime, due_seconds: int,
-) -> ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan:
+    now: datetime,
+) -> ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan | BlockedReviewGenerationArchiveScan:
     """Fold one verified page in generation order without retaining its payloads."""
     if not isinstance(scan, ReviewGenerationArchiveScan) or not isinstance(sources, tuple) or not 1 <= len(sources) <= MAX_ARCHIVE_AUDIT_STEP:
         raise ValueError("archive scan advance requires a bounded verified page")
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None or now < scan.started_at:
         raise ValueError("archive scan advance requires an aware later time")
-    integer(due_seconds, "archive scan due seconds", minimum=1)
-    if due_seconds > MAX_ARCHIVE_AUDIT_DUE_SECONDS:
-        raise ValueError("archive scan due window exceeds one day")
     digest = scan.rolling_sha256
+    receipt_set = int(scan.receipt_membership_xor, 16)
+    baseline = scan.baseline
     for index, source in enumerate(sources):
         generation = scan.next_generation + index
         if (not isinstance(source, ReviewGenerationArchiveFingerprint)
@@ -763,22 +916,98 @@ def advance_review_generation_archive_scan(
                              source.accepted_namespace, source.accepted_key,
                              source.accepted_sha256)).encode()
         digest = hashlib.sha256(bytes.fromhex(digest) + encoded).hexdigest()
+        receipt_set ^= _archive_receipt_member(
+            generation, source.cursor.receipt_id, source.receipt_sha256,
+            source.accepted_namespace, source.accepted_key,
+        )
+        if baseline is not None and generation == baseline.through_generation:
+            if digest != baseline.rolling_sha256:
+                return BlockedReviewGenerationArchiveScan(
+                    scan, generation, "archived generation source changed since its prior pass", now,
+                )
+            baseline = None
     final = sources[-1].cursor
     next_generation = scan.next_generation + len(sources)
     if next_generation <= scan.through_generation:
         return ReviewGenerationArchiveScan(
             scan.origin, scan.origin_receipt, scan.origin_source_sha256,
             scan.through_generation, next_generation, final,
-            digest, scan.started_at, scan.due_at,
+            digest, f"{receipt_set:064x}", baseline, scan.started_at, scan.due_at,
+        )
+    return CompletedReviewGenerationArchiveScan(
+        scan.origin, scan.origin_receipt, scan.origin_source_sha256,
+        scan.through_generation, final, digest, f"{receipt_set:064x}",
+        scan.started_at, now, scan.due_at,
+    )
+
+
+def advance_review_generation_archive_sweep(
+    sweep: ReviewGenerationArchiveSweep,
+    sources: tuple[ReviewGenerationArchiveReceiptMember, ...],
+    after: ReviewGenerationReceiptSweepCursor | None,
+    upper: ReviewGenerationReceiptSweepCursor | None,
+    has_more: bool,
+    now: datetime,
+    due_seconds: int,
+) -> ReviewGenerationArchiveSweep | CompletedReviewGenerationArchiveAudit | BlockedReviewGenerationArchiveSweep:
+    """Fold a bounded namespace page and reconcile its retained receipt set."""
+    if (not isinstance(sweep, ReviewGenerationArchiveSweep) or not isinstance(sources, tuple)
+            or len(sources) > MAX_ARCHIVE_AUDIT_STEP
+            or type(has_more) is not bool
+            or not isinstance(now, datetime) or now.tzinfo is None
+            or now.utcoffset() is None or now < sweep.generation_scan.completed_at):
+        raise ValueError("archive sweep advance requires a bounded page and aware later time")
+    integer(due_seconds, "archive sweep due seconds", minimum=1)
+    if due_seconds > MAX_ARCHIVE_AUDIT_DUE_SECONDS:
+        raise ValueError("archive sweep due window exceeds one day")
+    if (upper is not None and not isinstance(upper, ReviewGenerationReceiptSweepCursor)
+            or after is not None and not isinstance(after, ReviewGenerationReceiptSweepCursor)
+            or sweep.upper is not None and upper != sweep.upper
+            or upper is None and (after is not None or sources or has_more)
+            or upper is not None and after is None
+            or sweep.after is not None and (after is None or
+                (after.scope, after.key) < (sweep.after.scope, sweep.after.key)
+                or (has_more or sources) and after == sweep.after)
+            or has_more and after is None):
+        raise ValueError("archive sweep page did not advance its fixed namespace frontier")
+    origin = sweep.generation_scan.origin
+    base = origin.rejection.fence.generation
+    through = sweep.generation_scan.through_generation
+    seen: set[int] = set()
+    receipt_set = int(sweep.receipt_membership_xor, 16)
+    for source in sources:
+        if (not isinstance(source, ReviewGenerationArchiveReceiptMember)
+                or not base < source.generation <= through
+                or source.generation in seen
+                or source.receipt_id != review_generation_receipt_id(origin, source.generation)):
+            raise ValueError("archive sweep page disagrees with expected episode receipts")
+        seen.add(source.generation)
+        receipt_set ^= _archive_receipt_member(
+            source.generation, source.receipt_id, source.receipt_sha256,
+            source.accepted_namespace, source.accepted_key,
+        )
+    if sweep.source_count + len(sources) > through - base:
+        return BlockedReviewGenerationArchiveSweep(
+            sweep, "generation receipt census contains extra episode sources", None, now,
+        )
+    advanced = ReviewGenerationArchiveSweep(
+        sweep.generation_scan, after, upper, f"{receipt_set:064x}",
+        sweep.source_count + len(sources),
+    )
+    if has_more:
+        return advanced
+    if (advanced.source_count != through - base
+            or advanced.receipt_membership_xor != sweep.generation_scan.receipt_membership_xor):
+        return BlockedReviewGenerationArchiveSweep(
+            advanced, "generation receipt census disagrees with expected source pairs", None, now,
         )
     try:
         next_due = now + timedelta(seconds=due_seconds)
     except OverflowError as exc:
-        raise ValueError("archive scan due window exceeds representable time") from exc
-    return CompletedReviewGenerationArchiveScan(
-        scan.origin, scan.origin_receipt, scan.origin_source_sha256,
-        scan.through_generation, final, digest,
-        scan.started_at, now, next_due,
+        raise ValueError("archive sweep due window exceeds representable time") from exc
+    return CompletedReviewGenerationArchiveAudit(
+        sweep.generation_scan, upper, advanced.receipt_membership_xor,
+        advanced.source_count, now, next_due,
     )
 
 

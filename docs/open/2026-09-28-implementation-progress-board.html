@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 04:08 AEST · Latest accepted checkpoint: durable generation archive scan</p>
+      <p class="meta">Updated 29 Sep 2026, 04:31 AEST · Latest accepted checkpoint: durable generation receipt census</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>A durable cursor checks retained generation source pairs in bounded pages and persists discrepancies. It is observational: the namespace sweep and checkpoint ancestry are not joined to the cursor, and admission and hot reads remain unchanged. Next: complete the source audit, historical reset/session proof, and production import and checkpoint writers. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>A durable cursor now reconciles expected generation pairs with the retained receipt namespace and checks the prior pass digest. It remains observational: checkpoint ancestry, retired round sources, admission and bounded hot reads are still open. Next: complete those proofs, historical reset/session proof, and production import and checkpoint writers. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -141,6 +141,7 @@
           <li><time datetime="2026-09-29T03:21:00+10:00">29 Sep 2026, 03:21 AEST</time><strong>Fixed-size generation transition proof accepted offline · 3 of 6 accepted</strong><p>New generation receipts bind the accepted payload and audit by digest without retaining a potentially large operator preflight. Archive and canonical readers reject a changed cause; older receipt formats remain readable. Independent Sol review and the full gate passed: 3,276 domain, 3,203 adapter and 2,876 app tests, plus contracts and Pyrefly. The durable archive audit and bounded hot reader remain open. Active work since the previous entry: About 27 minutes.</p></li>
           <li><time datetime="2026-09-29T03:36:00+10:00">29 Sep 2026, 03:36 AEST</time><strong>Generation frontier reconciliation accepted offline · 3 of 6 accepted</strong><p>A bounded SQL sweep now blocks valid same-episode receipts outside a supplied origin and current-generation range. A real two-advance fixture exercises the extra receipt, and the pure test covers a receipt before the origin. Sol review and the full gate passed: 3,277 domain, 3,204 adapter and 2,876 app tests, plus contracts and Pyrefly. The supplied frontier needs checkpoint ancestry and a durable audit cursor before it can gate admission. Active work since the previous entry: About 15 minutes.</p></li>
           <li><time datetime="2026-09-29T04:08:00+10:00">29 Sep 2026, 04:08 AEST</time><strong>Durable generation archive scan accepted offline · 3 of 6 accepted</strong><p>One transaction checks a bounded source page and persists a small cursor or discrepancy. Origin mutation blocks on resume; new generations do not reset an incomplete pass. Sol review found both gaps and verified their fixes. Full gate passed: 3,278 domain, 3,212 adapter and 2,876 app tests, plus contracts and Pyrefly. Namespace reconciliation, checkpoint ancestry and the admission gate remain open. Active work since the previous entry: About 32 minutes.</p></li>
+          <li><time datetime="2026-09-29T04:31:00+10:00">29 Sep 2026, 04:31 AEST</time><strong>Durable generation receipt census accepted offline · 3 of 6 accepted</strong><p>A fixed-upper-key namespace sweep now reconciles retained receipts with the expected generation pass. Missing, changed and unclaimed sources persist discrepancies; a prior-prefix digest detects valid source drift on the next pass, including after frontier growth. Sol review, regressions and the full gate passed: 3,279 domain, 3,220 adapter and 2,876 app tests, plus contracts and Pyrefly. Checkpoint ancestry, retired rounds, admission and hot-read bounds remain open. Active work since the previous entry: About 23 minutes.</p></li>
         </ol>
       </div>
     </section>

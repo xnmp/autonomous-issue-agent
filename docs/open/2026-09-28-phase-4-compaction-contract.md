@@ -5,8 +5,9 @@ the pure prefix planner, checkpoint cursor, imported-origin read prerequisite,
 fresh first-observation origin and digest-bound generation receipts are
 implemented. Production import and renewal writers, checkpoint receipts,
 bounded hot reads and the complete audit remain pending. A durable offline
-cursor now scans expected generation sources in bounded pages; it has no
-admission or compaction authority. Execution authority is not
+cursor now scans expected generation sources and the retained receipt
+namespace in bounded pages, comparing the set and the prior pass digest. It
+has no admission or compaction authority. Execution authority is not
 activated. Read with the
 [execution design](2026-09-27-phase-4-review-execution-design.md),
 [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md), and

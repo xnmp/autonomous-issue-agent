@@ -384,10 +384,37 @@ with `CLAUDE.md`, `AGENTS.md`, the
   pass finishes its captured frontier when new generations arrive, preserving
   progress. Every call rechecks the bounded origin source row, including calls
   before the next due time; deletion or mutation persists a blocker. The scan
-  detects changed generation sources on its next pass, as required by the
-  eventual audit contract. This is an offline observational cursor only: it
+  reruns expected sources on its next pass; checkpoint 80 adds the missing
+  comparison with the prior completed pass. This is an offline observational
+  cursor only: it
   does not sweep unclaimed receipt rows, verify checkpoint ancestry or retired
   rounds, prove an atomic lifetime snapshot across pages, or gate admission.
+- Checkpoint 80 joins a durable, key-ordered namespace census to that cursor.
+  It stores the fixed upper key and one bounded page position per transaction,
+  checks every retained generation receipt's source identity, and compares a
+  count and order-independent receipt-set digest with the expected generation
+  pass. Missing tail rows, changed receipt metadata, malformed or unclaimed
+  rows and a retreating indexed frontier persist typed discrepancies. New
+  generations during either phase leave the captured pass intact; the next
+  pass covers them. The completed pass retains a generation-ordered digest as
+  a baseline. Rechecking the prior frontier detects a well-formed receipt or
+  accepted-transition mutation after its first checked page, even when the
+  current frontier has grown. The due deadline remains overdue until the
+  entire census catches up. The cursor remains an offline observation: it
+  does not prove checkpoint ancestry, retired rounds, an atomic lifetime
+  snapshot across transactions or admission authority.
+
+Independent Sol review of checkpoint 80 found no remaining concrete issue
+in the reviewed slice. A separate self-review found and fixed the missing
+cross-pass digest comparison, with regressions for source mutation after a
+sweep page and after generation growth. The terminal empty-page and frontier
+retreat cases also have behavioral regressions. Focused tests and the full
+`make test` gate passed: 3,279 domain, 3,220 adapter and 2,876 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-durable-generation-sweep-gate.log` (ephemeral). No live service
+or workflow family was activated. Next: bind checkpoint ancestry and retired
+round source proof before using the audit for admission or compaction.
 
 Independent Sol review of checkpoint 79 found two issues: a resumed cursor
 did not recheck the origin row, and a growing generation frontier restarted

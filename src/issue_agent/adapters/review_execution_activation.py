@@ -64,7 +64,7 @@ from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStat
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, NoReviewSession, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
-    ReviewExecutionBoundaryCursor,
+    ReviewExecutionBoundaryCursor, ReviewGenerationReceiptSweepCursor,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
     matches_accepted_review_transition_source,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
@@ -3006,18 +3006,6 @@ def read_review_generation_archive_page(
 
 MAX_GENERATION_RECEIPT_SWEEP_PAGE = 16
 MAX_GENERATION_RECEIPT_SWEEP_BYTES = 2**23
-
-
-@dataclass(frozen=True)
-class ReviewGenerationReceiptSweepCursor:
-    scope: str
-    key: str
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.scope, str)
-                or canonical_workflow_repository(self.scope) != self.scope):
-            raise ValueError("generation receipt sweep cursor requires a canonical repository")
-        validate_workflow_identifier(self.key, "generation receipt sweep key")
 
 
 @dataclass(frozen=True)
