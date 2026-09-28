@@ -265,6 +265,28 @@ with `CLAUDE.md`, `AGENTS.md`, the
   changed or foreign PR linkage and ambiguous issue attribution block. The
   context stays open for a future import transaction, but does not authorize
   any inherited debit or reset without SQL owner/run/settlement revalidation.
+- Checkpoint 67 composes the held counter sources with complete owner-run,
+  submission-settlement and generation-receipt SQL inventories in one explicit
+  transaction on the barrier-locked control database. The scope token expires
+  when its context exits, so escaped results and another database cannot pass.
+  The verifier checks current owner and configured predecessors against the
+  caller's declared writer inputs; those inputs still require deployment-config
+  provenance in the production writer. This is source observation only. It
+  does not establish inherited debit, ordered resets, session reuse or import
+  authority.
+
+Independent Sol review of checkpoint 67 found scope lifetime, store identity,
+owner-input and proof-construction gaps. The final implementation binds the
+exact held source object to an active context scope, checks the SQL connection
+against the locked store, compares the declared owner inputs, and mints the
+revalidated result only after the complete SQL reads agree. The final review
+found no remaining medium or high issue in this observational composition.
+Focused regressions cover expired/reopened scopes, substituted evidence,
+direct construction, another database, owner mismatches and changed source
+sets. Full `make test` passed: 3,258 domain, 3,171 adapter and 2,866 app tests,
+hooks, governor, gate parity, four import contracts and both Pyrefly checks;
+10 strict xfails remained expected. The gate log is
+`/tmp/phase4-sql-import-sources-gate.log` (ephemeral).
 
 Independent Sol review of checkpoint 66 found no concrete defect. Focused
 tests cover attribution, changed source refusal, all three lock lifetimes and
@@ -552,8 +574,10 @@ old two-field receipts and unclassified commands block activation authority.
 [SQLite's rowid rules](https://www.sqlite.org/autoinc.html) do not make rowid
 order a durable clock.
 
-1. Revalidate the bounded owner closure and run inventory under activation
-   barriers before any import commit. Daemon boot's `adopt_legacy_owner`
+1. Bind the production writer's review owner and configured predecessors to
+   the actual deployment configuration, then use checkpoint 67's SQL
+   revalidation inside its acceptance transaction under activation barriers.
+   Daemon boot's `adopt_legacy_owner`
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
@@ -565,8 +589,8 @@ order a durable clock.
    block historical unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
-3. Use the barrier-held file/linkage/counter scope in the production import
-   writer and revalidate SQL owner/run/settlement sources in its transaction.
+3. Use the barrier-held file/linkage/counter and SQL source scope in the
+   production import writer, preserving the scope through commit.
    The pure mapper retains unassigned historical counters and refuses a
    positive issue key shared by open PRs, but it has not established
    historical deaths or resets. The typed session/round/counter parser keeps malformed values and

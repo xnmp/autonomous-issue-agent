@@ -7,17 +7,29 @@ import pytest
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.deployment_authority import deployment_effect_authority
 from issue_agent.adapters.review_execution_activation import (
-    CompleteLegacyExecutionRootFiles, read_complete_legacy_execution_root_files,
+    CompleteLegacyExecutionRootFiles, CompleteLegacySubmissionSettlementStorage,
+    read_complete_legacy_execution_root_files, read_complete_legacy_review_generation_receipts,
+    read_complete_legacy_review_outcome_receipts, read_complete_legacy_review_rounds,
+    read_complete_legacy_review_runs, read_complete_legacy_review_submission_receipts,
+    read_complete_legacy_review_submissions, read_legacy_review_owner_lineage,
+    verify_complete_legacy_round_outcome_storage, verify_complete_legacy_submission_settlement_storage,
 )
 from issue_agent.adapters.review_execution_counter_links import read_complete_legacy_open_counter_links
 from issue_agent.adapters.review_execution_import_sources import (
-    BlockedLegacyExecutionCounterSources, HeldLegacyExecutionCounterSources,
-    held_legacy_execution_counter_sources,
+    BlockedLegacyExecutionCounterSources, BlockedLegacyExecutionSqlImportSources,
+    HeldLegacyExecutionCounterSources, ObservedLegacyExecutionSqlImportSources,
+    RevalidatedLegacyExecutionImportSources, held_legacy_execution_counter_sources,
+    verify_legacy_execution_import_sources,
+)
+from issue_agent.domain.review_execution_activation import (
+    CompleteLegacyReviewGenerationReceipts, CompleteLegacyReviewRuns, LegacyReviewOwnerLineage,
 )
 from issue_agent.domain.review_execution_counter_mapping import CompleteLegacyOpenCounterLinks
+from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.world import IssueView, PRView
 
 HEAD = "a" * 40
+WRITER = WorkflowWriter("o/r", "review", "o/r:review:test")
 
 
 class Gateway:
@@ -103,3 +115,152 @@ def test_counter_source_scope_blocks_changed_or_ambiguous_evidence(sources, chan
                 pass
     with deployment_effect_authority(control.path, "o/r", "review", blocking=False):
         pass
+
+
+def _observed_sql_sources(control):
+    with control.transaction() as db:
+        lineage = read_legacy_review_owner_lineage(db, "o/r", "o/r:review:test")
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        runs = read_complete_legacy_review_runs(db, lineage)
+        commands = read_complete_legacy_review_submissions(db, "o/r")
+        receipts = read_complete_legacy_review_submission_receipts(db, "o/r")
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        outcomes = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        round_storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcomes)
+        settlement = verify_complete_legacy_submission_settlement_storage(db, commands, receipts, round_storage)
+        generation = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(runs, CompleteLegacyReviewRuns)
+        assert isinstance(settlement, CompleteLegacySubmissionSettlementStorage)
+        assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
+    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
+
+
+def test_sql_import_sources_revalidate_in_the_barrier_held_acceptance_transaction(sources):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, held, observed, writer=WRITER, configured_prior_owners=(),
+            )
+            assert isinstance(result, RevalidatedLegacyExecutionImportSources)
+            assert result.sql == observed
+            assert len(result.source_digest) == 64
+            with pytest.raises(BlockingIOError):
+                with deployment_effect_authority(control.path, "o/r", "review", blocking=False):
+                    pass
+
+
+@pytest.mark.parametrize("change", ("lineage", "settlement", "generation"))
+def test_sql_import_sources_block_changed_caller_held_inventories(sources, change):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    with control.transaction() as db:
+        if change == "lineage":
+            db.execute("INSERT INTO retired_owners VALUES (?,?,?,?,?)",
+                       ("o/r:review:prior", "o/r:review:test", "o/r", "review", "2026-09-28T00:00:00+00:00"))
+        else:
+            namespace = ("review-round-submission" if change == "settlement"
+                         else "review-execution-generation")
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       (namespace, "o/r", "changed-source", "2026-09-28T00:00:00+00:00", "{}"))
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, held, observed, writer=WRITER, configured_prior_owners=(),
+            )
+            assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+
+
+def test_sql_import_sources_require_one_repository_and_an_explicit_transaction(sources):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    with pytest.raises(ValueError, match="same-repository"):
+        replace(observed, generation=CompleteLegacyReviewGenerationReceipts("other/repo", ()))
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control._connect() as db:
+            with pytest.raises(ValueError, match="explicit SQL transaction"):
+                verify_legacy_execution_import_sources(
+                    db, held, observed, writer=WRITER, configured_prior_owners=(),
+                )
+
+
+def test_sql_import_sources_reject_expired_barrier_lease(sources):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+    with control.transaction() as db:
+        result = verify_legacy_execution_import_sources(
+            db, held, observed, writer=WRITER, configured_prior_owners=(),
+        )
+    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+    assert "barriers" in result.reason
+    with pytest.raises(ValueError, match="verified same-repository"):
+        RevalidatedLegacyExecutionImportSources(held, observed, object())
+
+
+def test_sql_import_sources_reject_forged_counter_and_result_evidence(sources):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        forged = HeldLegacyExecutionCounterSources(held.roots, held.mapping, held._scope)
+        with control.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, forged, observed, writer=WRITER, configured_prior_owners=(),
+            )
+        assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+        with pytest.raises(ValueError, match="verified same-repository"):
+            RevalidatedLegacyExecutionImportSources(held, observed, object())
+
+
+def test_sql_import_sources_do_not_reactivate_an_escaped_scope(sources):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as old:
+        assert isinstance(old, HeldLegacyExecutionCounterSources)
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as current:
+        assert isinstance(current, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, old, observed, writer=WRITER, configured_prior_owners=(),
+            )
+        assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+        assert "barriers" in result.reason
+
+
+def test_sql_import_sources_reject_a_different_control_database(sources, tmp_path):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    other = SQLiteControlStore(str(tmp_path / "other-control.db"))
+    other.initialize()
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with other.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, held, observed, writer=WRITER, configured_prior_owners=(),
+            )
+    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+    assert "store differs" in result.reason
+
+
+@pytest.mark.parametrize("writer,priors", (
+    (WorkflowWriter("o/r", "review", "o/r:review:another"), ()),
+    (WRITER, ("o/r:review:prior",)),
+    (WorkflowWriter("another/repo", "review", "another/repo:review:test"), ()),
+))
+def test_sql_import_sources_reject_owner_configuration_mismatch(sources, writer, priors):
+    control, gateway, roots, files, links = sources
+    observed = _observed_sql_sources(control)
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = verify_legacy_execution_import_sources(
+                db, held, observed, writer=writer, configured_prior_owners=priors,
+            )
+    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+    assert "configuration" in result.reason

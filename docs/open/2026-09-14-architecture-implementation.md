@@ -19,6 +19,10 @@ production writers and archived audit. A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the
 [phase-4 source handover](2026-09-28-phase-4-execution-source-handover.md).
+The SQL inventory composition now rechecks owner runs, submission settlement
+and generation receipts against that barrier-held scope in one control-store
+transaction. Its owner inputs remain caller supplied; the production writer
+must bind them to actual deployment configuration before import authority.
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 
