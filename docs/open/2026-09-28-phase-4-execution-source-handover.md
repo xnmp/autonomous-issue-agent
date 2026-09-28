@@ -530,6 +530,17 @@ the complete audit benchmark.
   or grant compaction and admission authority. Full-gate results are recorded
   in the progress board after acceptance.
 
+- Checkpoint 89 adds a read-only, indexed receipt sweep page for all twelve
+  namespaces in the round receipt-set definition. A fixed `(namespace,
+  scope, key)` upper cursor bounds a pass; each page preflights at most 16
+  retained rows and 16 MiB of source fields, then records source digests.
+  Pages include foreign repositories so malformed and aliased source
+  identities cannot hide behind an episode filter. The page does not yet
+  interpret receipt payloads, persist a complete census or join members to
+  expected retired rounds. Sol review caught a query that rescanned earlier
+  keys; per-namespace index seeks and a late-cursor work regression replaced
+  it. Full-gate results are recorded in the progress board after acceptance.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -537,10 +548,11 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoint 88, a durable cursor completes the bounded round sweep and
-compares each pass with its prior source set. Next, reconcile its members
-against checkpoint ancestry and expected source digests. A separate receipt-namespace
-pass must find unclaimed receipts. Before a writer can use the checkpoint-86
+With checkpoints 88–89, the durable round cursor completes a bounded row
+sweep, and a separate read-only page can enumerate relevant receipt sources.
+Next, reconcile round members against checkpoint ancestry and expected source
+digests, then persist and reconcile a complete receipt-namespace pass to find
+unclaimed receipts. Before a writer can use the checkpoint-86
 proposal, establish a true cumulative read bound around canonical load and
 each source reader; prove generation-only and later-checkpoint paths; verify
 every retired receipt payload; and publish the checkpoint and initialized

@@ -40,6 +40,11 @@ rescan begins. It records a missing, changed or malformed source as a blocked
 audit state. The scan is observational: checkpoint ancestry, expected retired
 round source and payload joins, a separate unclaimed-receipt pass, and the
 atomic admission gate remain to be implemented.
+A read-only indexed receipt page now observes all twelve retained round
+receipt namespaces across repositories in bounded key order. It preflights
+source bytes, rejects malformed and aliased identities, and fixes an upper
+key for a future durable pass. The complete receipt census and expected
+round membership join are still pending.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

@@ -206,6 +206,16 @@ malformed rows persist a blocked state. This census does not yet join expected
 checkpoint entries or the round receipt namespace. It cannot authorize
 compaction or admission.
 
+A read-only receipt sweep page now covers the twelve namespaces used by the
+round receipt-set definition, including command-keyed submission and recorded
+review receipts. It scans all repositories in indexed namespace, scope and
+key order, with a fixed upper key, at most 16 rows and 16 MiB of source fields
+per page. Each row retains a full source digest. BLOB namespace aliases,
+malformed identities and oversized sources block. This page does not decode
+the namespace-specific payload or decide whether a receipt is claimed by an
+expected round; a durable pass and that join remain prerequisites for the
+audit gate.
+
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money
 settlement and evidence-preserving recovery remain allowed so a hold cannot

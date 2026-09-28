@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 07:08 AEST · Latest accepted checkpoint: durable round archive census</p>
+      <p class="meta">Updated 29 Sep 2026, 07:25 AEST · Latest accepted checkpoint: indexed round receipt sweep page</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>A durable round archive census now resumes bounded repository pages and compares each completed source set with its next pass. Compacted loads still refuse. Next: checkpoint source and receipt reconciliation, actual cumulative read bounds, checkpoint writer and gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>A durable round archive census resumes bounded repository pages, and indexed pages now observe the twelve round receipt namespaces. Compacted loads still refuse. Next: checkpoint source and receipt reconciliation, actual cumulative read bounds, checkpoint writer and gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -150,6 +150,7 @@
           <li><time datetime="2026-09-29T06:26:00+10:00">29 Sep 2026, 06:26 AEST</time><strong>Checkpoint manifest observation accepted offline · 3 of 6 accepted</strong><p>One SQL snapshot now compares expected retired round and generation sources with canonical replay and proposes a typed receipt. Its 128 MiB retained-field ceiling is accounting after reads; the writer needs actual read bounds, unclaimed-source census, payload audit and an atomic gate. Independent Sol review, malformed-source regressions and the full gate passed: 3,280 domain, 3,268 adapter and 2,876 app tests, plus contracts and Pyrefly. Active work since the previous entry: About 19 minutes.</p></li>
           <li><time datetime="2026-09-29T06:47:00+10:00">29 Sep 2026, 06:47 AEST</time><strong>Indexed round archive sweep accepted offline · 3 of 6 accepted</strong><p>Schema v26 adds a repository index for 16-row, 16 MiB sweep pages with a fixed upper rowid. Every selected row's plan and finalized outcome are checked before episode filtering; BLOB aliases and rekeyed rows block. A v25 migration fixture retains rounds. Independent Sol review found two filtering gaps, both fixed. Full gate passed: 3,280 domain, 3,279 adapter and 2,876 app tests, plus contracts and Pyrefly. Durable reconciliation, receipt census and compaction authority remain open. Active work since the previous entry: About 21 minutes.</p></li>
           <li><time datetime="2026-09-29T07:08:00+10:00">29 Sep 2026, 07:08 AEST</time><strong>Durable round archive census accepted offline · 3 of 6 accepted</strong><p>A persisted fixed-rowid cursor checks one bounded repository page per transaction, compares exact episode row count, and retains prior-pass source membership. Missing tails, changed earlier rows, malformed later pages and origin drift block; growth starts a new pass. Independent Sol review found no defect within the observational scope. Full gate passed: 3,287 domain, 3,286 adapter and 2,876 app tests, plus contracts and Pyrefly. Checkpoint-source joins, receipt census and the admission gate remain open. Active work since the previous entry: About 21 minutes.</p></li>
+          <li><time datetime="2026-09-29T07:25:00+10:00">29 Sep 2026, 07:25 AEST</time><strong>Indexed round receipt sweep page accepted offline · 3 of 6 accepted</strong><p>Read-only pages now cover twelve round receipt namespaces across repositories with a fixed upper key, 16-row and 16 MiB bounds, and full source digests. Sol review exposed a quadratic late-cursor query; indexed per-namespace seeks and a 5,000-row work regression passed re-review. Full gate passed: 3,287 domain, 3,294 adapter and 2,876 app tests, plus contracts and Pyrefly. Durable receipt reconciliation and the checkpoint gate remain open. Active work since the previous entry: About 17 minutes.</p></li>
         </ol>
       </div>
     </section>

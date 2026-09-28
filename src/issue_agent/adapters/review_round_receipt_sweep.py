@@ -1,0 +1,215 @@
+"""Bounded, read-only census pages for retained review round receipts."""
+
+from __future__ import annotations
+
+import sqlite3
+from dataclasses import dataclass
+
+from ..domain.workflow_identity import canonical_workflow_repository, validate_workflow_identifier
+from .review_execution_activation import (
+    MAX_LEGACY_RECORDING_BYTES, _DEDUPE_SOURCE_COLUMNS, _printable,
+    _read_recording_source,
+)
+from .workflow_rows import (
+    RECORDED_REVIEW_NAMESPACE, REVIEW_ABANDONMENT_NAMESPACE,
+    REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_OUTCOME_NAMESPACE,
+    REVIEW_PREPARATION_NAMESPACE, REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
+    REVIEW_STALE_PRODUCTIVITY_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE,
+    REVIEW_SUBMISSION_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
+)
+
+
+ROUND_RECEIPT_NAMESPACES = tuple(sorted((
+    RECORDED_REVIEW_NAMESPACE, REVIEW_ABANDONMENT_NAMESPACE,
+    REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_OUTCOME_NAMESPACE,
+    "review-round-preflight", REVIEW_PREPARATION_NAMESPACE, REVIEW_SEAL_NAMESPACE,
+    REVIEW_STAGE_NAMESPACE, REVIEW_STALE_PRODUCTIVITY_NAMESPACE,
+    REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
+    REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
+)))
+MAX_ROUND_RECEIPT_SWEEP_PAGE = 16
+MAX_ROUND_RECEIPT_SWEEP_BYTES = 2**24
+MAX_ROUND_RECEIPT_IDENTITY_BYTES = 512
+
+
+@dataclass(frozen=True, order=True)
+class ReviewRoundReceiptSweepCursor:
+    namespace: str
+    scope: str
+    key: str
+
+    def __post_init__(self) -> None:
+        if self.namespace not in ROUND_RECEIPT_NAMESPACES:
+            raise ValueError("round receipt cursor requires a selected namespace")
+        if canonical_workflow_repository(self.scope) != self.scope:
+            raise ValueError("round receipt cursor requires a canonical repository")
+        validate_workflow_identifier(self.key, "round receipt cursor key")
+
+
+@dataclass(frozen=True)
+class ObservedReviewRoundReceiptSweepSource:
+    source_rowid: int
+    cursor: ReviewRoundReceiptSweepCursor
+    source_sha256: str
+
+    def __post_init__(self) -> None:
+        if (type(self.source_rowid) is not int
+                or not isinstance(self.cursor, ReviewRoundReceiptSweepCursor)
+                or not isinstance(self.source_sha256, str)
+                or len(self.source_sha256) != 64
+                or any(char not in "0123456789abcdef" for char in self.source_sha256)):
+            raise ValueError("round receipt sweep source requires a typed source fingerprint")
+
+
+@dataclass(frozen=True)
+class ObservedReviewRoundReceiptSweepPage:
+    sources: tuple[ObservedReviewRoundReceiptSweepSource, ...]
+    next_cursor: ReviewRoundReceiptSweepCursor | None
+    upper_cursor: ReviewRoundReceiptSweepCursor | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.sources, tuple)
+                or len(self.sources) > MAX_ROUND_RECEIPT_SWEEP_PAGE
+                or any(not isinstance(source, ObservedReviewRoundReceiptSweepSource)
+                       for source in self.sources)
+                or self.next_cursor is not None and not isinstance(
+                    self.next_cursor, ReviewRoundReceiptSweepCursor)
+                or self.upper_cursor is not None and not isinstance(
+                    self.upper_cursor, ReviewRoundReceiptSweepCursor)
+                or type(self.has_more) is not bool
+                or self.upper_cursor is None and (self.sources or self.next_cursor or self.has_more)
+                or self.sources and self.next_cursor != self.sources[-1].cursor
+                or self.has_more and self.next_cursor is None):
+            raise ValueError("round receipt sweep page requires bounded typed observations")
+
+
+@dataclass(frozen=True)
+class BlockedReviewRoundReceiptSweepPage:
+    reason: str
+    source_rowid: int | None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.reason, str) or not 1 <= len(self.reason) <= 512
+                or self.source_rowid is not None and type(self.source_rowid) is not int):
+            raise ValueError("blocked round receipt sweep requires a bounded reason")
+
+
+def read_review_round_receipt_sweep_page(
+    db: sqlite3.Connection,
+    *, after: ReviewRoundReceiptSweepCursor | None = None,
+    upper: ReviewRoundReceiptSweepCursor | None = None,
+) -> ObservedReviewRoundReceiptSweepPage | BlockedReviewRoundReceiptSweepPage:
+    """Observe all selected namespaces across repositories in indexed key order.
+
+    A page is source evidence only. A durable pass and expected-source join
+    must independently account for all returned fingerprints.
+    """
+    if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
+            or after is not None and not isinstance(after, ReviewRoundReceiptSweepCursor)
+            or upper is not None and not isinstance(upper, ReviewRoundReceiptSweepCursor)
+            or after is not None and upper is None
+            or after is not None and upper is not None and after > upper):
+        raise ValueError("round receipt sweep requires a transaction and typed cursor")
+    current_rowid: int | None = None
+    names = ",".join("?" for _ in ROUND_RECEIPT_NAMESPACES)
+    try:
+        alias = db.execute(
+            f"SELECT rowid FROM dedupe_keys WHERE namespace IN ({names}) LIMIT 1",
+            tuple(name.encode() for name in ROUND_RECEIPT_NAMESPACES),
+        ).fetchone()
+        if alias is not None:
+            return BlockedReviewRoundReceiptSweepPage(
+                "round receipt namespace has a BLOB alias", alias["rowid"],
+            )
+        if upper is None:
+            edge = db.execute(
+                "SELECT rowid,typeof(scope) AS scope_type,typeof(key) AS key_type,"
+                "CASE WHEN length(CAST(scope AS BLOB))<=? THEN scope END AS scope_value,"
+                "CASE WHEN length(CAST(key AS BLOB))<=? THEN key END AS key_value,namespace "
+                f"FROM dedupe_keys WHERE namespace IN ({names}) "
+                "ORDER BY namespace DESC,scope DESC,key DESC LIMIT 1",
+                (MAX_ROUND_RECEIPT_IDENTITY_BYTES, MAX_ROUND_RECEIPT_IDENTITY_BYTES,
+                 *ROUND_RECEIPT_NAMESPACES),
+            ).fetchone()
+            if edge is None:
+                return ObservedReviewRoundReceiptSweepPage((), None, None, False)
+            current_rowid = edge["rowid"]
+            if (edge["scope_type"] != "text" or edge["key_type"] != "text"
+                    or edge["scope_value"] is None or edge["key_value"] is None):
+                return BlockedReviewRoundReceiptSweepPage(
+                    "round receipt sweep has an unreadable upper key", current_rowid,
+                )
+            upper = ReviewRoundReceiptSweepCursor(
+                edge["namespace"], edge["scope_value"], edge["key_value"],
+            )
+        assert upper is not None
+        sizes = "+".join(
+            f"ifnull(length(CAST({column} AS BLOB)),0)" for column in _DEDUPE_SOURCE_COLUMNS
+        )
+        rows: list[sqlite3.Row] = []
+        for namespace in ROUND_RECEIPT_NAMESPACES:
+            if (namespace > upper.namespace or after is not None
+                    and namespace < after.namespace):
+                continue
+            lower = "" if after is None or namespace != after.namespace else "AND (scope,key)>(?,?) "
+            ceiling = "" if namespace != upper.namespace else "AND (scope,key)<=(?,?) "
+            parameters: tuple[object, ...] = (namespace,)
+            if lower:
+                parameters = (*parameters, after.scope, after.key)
+            if ceiling:
+                parameters = (*parameters, upper.scope, upper.key)
+            rows.extend(db.execute(
+                "SELECT rowid,typeof(namespace) AS namespace_type,"
+                "typeof(scope) AS scope_type,typeof(key) AS key_type,"
+                "CASE WHEN length(CAST(scope AS BLOB))<=? THEN scope END AS scope_value,"
+                "CASE WHEN length(CAST(key AS BLOB))<=? THEN key END AS key_value,"
+                f"namespace,{sizes} AS source_bytes FROM dedupe_keys "
+                f"WHERE namespace=? {lower}{ceiling}"
+                "ORDER BY scope,key LIMIT ?",
+                (MAX_ROUND_RECEIPT_IDENTITY_BYTES, MAX_ROUND_RECEIPT_IDENTITY_BYTES,
+                 *parameters, MAX_ROUND_RECEIPT_SWEEP_PAGE + 1 - len(rows)),
+            ).fetchall())
+            if len(rows) > MAX_ROUND_RECEIPT_SWEEP_PAGE:
+                break
+        sources: list[ObservedReviewRoundReceiptSweepSource] = []
+        cursor = after
+        source_bytes = 0
+        processed = 0
+        for row in rows[:MAX_ROUND_RECEIPT_SWEEP_PAGE]:
+            current_rowid = row["rowid"]
+            if (row["namespace_type"] != "text" or row["scope_type"] != "text"
+                    or row["key_type"] != "text" or row["scope_value"] is None
+                    or row["key_value"] is None):
+                return BlockedReviewRoundReceiptSweepPage(
+                    "round receipt sweep has a malformed source identity", current_rowid,
+                )
+            if (type(row["source_bytes"]) is not int
+                    or row["source_bytes"] > MAX_LEGACY_RECORDING_BYTES * 6):
+                return BlockedReviewRoundReceiptSweepPage(
+                    "round receipt sweep has an oversized source", current_rowid,
+                )
+            if source_bytes + row["source_bytes"] > MAX_ROUND_RECEIPT_SWEEP_BYTES:
+                if processed:
+                    break
+                return BlockedReviewRoundReceiptSweepPage(
+                    "round receipt exceeds the sweep page byte bound", current_rowid,
+                )
+            source_cursor = ReviewRoundReceiptSweepCursor(
+                row["namespace"], row["scope_value"], row["key_value"],
+            )
+            _, digest = _read_recording_source(
+                db, source_cursor.namespace, source_cursor.scope, source_cursor.key,
+            )
+            sources.append(ObservedReviewRoundReceiptSweepSource(
+                current_rowid, source_cursor, digest,
+            ))
+            source_bytes += row["source_bytes"]
+            cursor = source_cursor
+            processed += 1
+        return ObservedReviewRoundReceiptSweepPage(
+            tuple(sources), cursor, upper, processed < len(rows),
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            sqlite3.Error) as exc:
+        return BlockedReviewRoundReceiptSweepPage(_printable(str(exc))[:512], current_rowid)
