@@ -876,6 +876,20 @@ class BlockedLegacyRoundOutcomeStorage:
             _rowid(self.source_rowid, "blocked outcome storage cursor")
 
 
+@dataclass(frozen=True)
+class BlockedLegacySubmissionSettlementStorage:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked settlement storage requires a canonical repository")
+        validate_workflow_text(self.reason, "blocked settlement storage reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked settlement storage cursor")
+
+
 MAX_LEGACY_REVIEW_OWNERS = 64
 
 

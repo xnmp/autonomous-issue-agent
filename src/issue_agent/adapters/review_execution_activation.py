@@ -11,7 +11,7 @@ import re
 import sqlite3
 import hashlib
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 
 from ..domain.resolve_activation import LegacyAbsent, LegacyFile, UnmappedLegacyEntry
 from ..domain.review_execution_activation import (
@@ -45,6 +45,7 @@ from ..domain.review_execution_activation import (
     VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
     CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
     VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
+    BlockedLegacySubmissionSettlementStorage,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
 from ..domain.review_execution import ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome
@@ -57,7 +58,9 @@ from ..domain.review_rounds import (
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.workflow import ObservedTransition, WorkflowMutation
-from ..domain.workflow_identity import WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier
+from ..domain.workflow_identity import (
+    PullRequestRef, WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
+)
 from .control_store import CorruptControlStore, _encoded_payload_digest, _parse_stamp, _receipt_digest, load_bound_review_submission
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
 from .review_round_sources import _effect_receipt_id
@@ -1473,3 +1476,273 @@ def verify_legacy_plain_productive_round(
         )
     except ValueError as exc:
         return UnverifiedLegacyPlainProductiveRound(command_id, _printable(str(exc)))
+
+
+@dataclass(frozen=True)
+class VerifiedLegacySubmissionRegistrationStorage:
+    """One command, registration, index and planned round agree on storage identity."""
+
+    command_source: LegacyReviewSubmissionSource
+    registration_source: LegacyReviewSubmissionReceiptSource
+    index_source: LegacyReviewSubmissionReceiptSource
+    round_source: LegacyReviewRoundSource
+    plan: ReviewRoundPlan
+    registration: ReviewSubmissionRegistration
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.command_source, LegacyReviewSubmissionSource)
+                or not isinstance(self.registration_source, LegacyReviewSubmissionReceiptSource)
+                or not isinstance(self.index_source, LegacyReviewSubmissionReceiptSource)
+                or not isinstance(self.round_source, LegacyReviewRoundSource)
+                or not isinstance(self.plan, ReviewRoundPlan)
+                or not isinstance(self.registration, ReviewSubmissionRegistration)):
+            raise ValueError("registered submission storage requires typed sources")
+        command = dict(self.command_source.command_fields)
+        receipt = dict(self.registration_source.fields)
+        index = dict(self.index_source.fields)
+        round_row = dict(self.round_source.fields)
+        if (receipt["namespace"] != "review-round-submission"
+                or index["namespace"] != "review-round-submission-index"
+                or receipt["scope"] != command["repository"] or index["scope"] != command["repository"]
+                or receipt["key"] != command["command_id"]
+                or index["key"] != review_submission_receipt_key(
+                    self.registration.round.round_id, command["command_id"],
+                )
+                or receipt["payload_json"] != encode_workflow(self.registration)
+                or receipt["payload_json"] != index["payload_json"]
+                or receipt["claimed_at"] != index["claimed_at"]
+                or receipt["reusable_after"] is not None or index["reusable_after"] is not None
+                or self.registration.submission.command_id != command["command_id"]
+                or self.registration.round != self.plan.round
+                or self.registration.submission not in self.plan.submissions
+                or round_row["round_id"] != self.plan.round.round_id
+                or round_row["claim_occurrence_id"] != self.registration.claim_occurrence_id
+                or self.registration.owner_id != command["executor_identity"]
+                or self.registration.command_digest != command["payload_digest"]
+                or self.registration.idempotency_key != command["idempotency_key"]
+                or self.registration.config_version != command["config_version"]
+                or command["target"] != f"pr:{self.plan.round.binding.rejection.fence.key.target.number}"
+                or command["expected_revision"] != self.plan.head_sha
+                or command["workflow_binding_json"] != encode_workflow(self.plan.round.binding.rejection)
+                or command["payload_digest"] != _encoded_payload_digest(
+                    command["payload_json"], command["workflow_binding_json"],
+                )
+                or _stored_review_round_plan(self.round_source) != self.plan):
+            raise ValueError("registered submission storage has contradictory identities")
+        _parse_stamp(receipt["claimed_at"])
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.command_source.source_digest, self.registration_source.source_digest,
+                 self.index_source.source_digest, self.round_source.source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class CompleteLegacySubmissionSettlementStorage:
+    """Every inventoried command and settlement receipt is accounted for as storage."""
+
+    commands: CompleteLegacyReviewSubmissions
+    receipts: CompleteLegacyReviewSubmissionReceipts
+    round_storage: CompleteLegacyRoundOutcomeStorage
+    round_plans: tuple[tuple[LegacyReviewRoundSource, ReviewRoundPlan], ...]
+    registered: tuple[VerifiedLegacySubmissionRegistrationStorage, ...]
+    unregistered: tuple[LegacyReviewSubmissionSource, ...]
+    recorded_markers: tuple[LegacyReviewSubmissionReceiptSource, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.commands, CompleteLegacyReviewSubmissions)
+                or not isinstance(self.receipts, CompleteLegacyReviewSubmissionReceipts)
+                or not isinstance(self.round_storage, CompleteLegacyRoundOutcomeStorage)
+                or not isinstance(self.round_plans, tuple) or not isinstance(self.registered, tuple)
+                or not isinstance(self.unregistered, tuple) or not isinstance(self.recorded_markers, tuple)
+                or len({self.commands.repository, self.receipts.repository, self.round_storage.repository}) != 1):
+            raise ValueError("submission settlement storage requires matching complete inventories")
+        command_by_id = {dict(source.command_fields)["command_id"]: source for source in self.commands.submissions}
+        receipt_by_key = {(dict(source.fields)["namespace"], dict(source.fields)["key"]): source
+                          for source in self.receipts.receipts}
+        round_by_id = {dict(source.fields)["round_id"]: source for source in self.round_storage.rounds.rounds}
+        sealed_by_id = {entry.outcome.round.round_id: entry for entry in self.round_storage.sealed}
+        plan_by_id: dict[str, ReviewRoundPlan] = {}
+        for entry in self.round_plans:
+            if (not isinstance(entry, tuple) or len(entry) != 2
+                    or not isinstance(entry[0], LegacyReviewRoundSource)
+                    or not isinstance(entry[1], ReviewRoundPlan)):
+                raise ValueError("settlement storage requires typed round plans")
+            source, plan = entry
+            round_id = plan.round.round_id
+            if (round_id in plan_by_id or round_by_id.get(round_id) != source
+                    or _stored_review_round_plan(source) != plan
+                    or (round_id in sealed_by_id and sealed_by_id[round_id].facts.plan != plan)):
+                raise ValueError("settlement storage has an unaccounted round plan")
+            plan_by_id[round_id] = plan
+        if set(plan_by_id) != set(round_by_id):
+            raise ValueError("settlement storage leaves a round plan unaccounted for")
+        registered_by_id: dict[str, VerifiedLegacySubmissionRegistrationStorage] = {}
+        for proof in self.registered:
+            if not isinstance(proof, VerifiedLegacySubmissionRegistrationStorage):
+                raise ValueError("settlement storage requires typed registration proofs")
+            command_id = dict(proof.command_source.command_fields)["command_id"]
+            round_id = proof.plan.round.round_id
+            index = dict(proof.index_source.fields)
+            if (command_id in registered_by_id or command_by_id.get(command_id) != proof.command_source
+                    or round_by_id.get(round_id) != proof.round_source or plan_by_id.get(round_id) != proof.plan
+                    or receipt_by_key.get(("review-round-submission", command_id)) != proof.registration_source
+                    or receipt_by_key.get((index["namespace"], index["key"])) != proof.index_source):
+                raise ValueError("settlement storage has an unaccounted registration")
+            registered_by_id[command_id] = proof
+        unregistered_ids = [dict(source.command_fields)["command_id"] for source in self.unregistered
+                            if isinstance(source, LegacyReviewSubmissionSource)]
+        if (len(unregistered_ids) != len(self.unregistered)
+                or len(set(unregistered_ids)) != len(unregistered_ids)
+                or any(command_by_id.get(command_id) != source
+                       for command_id, source in zip(unregistered_ids, self.unregistered, strict=True))
+                or set(registered_by_id) & set(unregistered_ids)
+                or set(registered_by_id) | set(unregistered_ids) != set(command_by_id)):
+            raise ValueError("settlement storage leaves a command unaccounted for")
+        planned_ids = [submission.command_id for plan in plan_by_id.values() for submission in plan.submissions]
+        if len(planned_ids) != len(set(planned_ids)) or set(planned_ids) != set(registered_by_id):
+            raise ValueError("settlement storage leaves a planned submission unaccounted for")
+        marker_keys = set()
+        for marker in self.recorded_markers:
+            if not isinstance(marker, LegacyReviewSubmissionReceiptSource):
+                raise ValueError("settlement storage requires typed recorded markers")
+            values = dict(marker.fields)
+            if (values["namespace"] != "review-recorded-submission"
+                    or receipt_by_key.get((values["namespace"], values["key"])) != marker
+                    or values["key"] not in command_by_id):
+                raise ValueError("settlement storage has an orphaned recorded marker")
+            marker_keys.add(values["key"])
+        registration_keys = {("review-round-submission", command_id) for command_id in registered_by_id}
+        index_keys = {(dict(proof.index_source.fields)["namespace"], dict(proof.index_source.fields)["key"])
+                      for proof in self.registered}
+        marker_receipt_keys = {("review-recorded-submission", command_id) for command_id in marker_keys}
+        if len(index_keys) != len(self.registered) or set(receipt_by_key) != registration_keys | index_keys | marker_receipt_keys:
+            raise ValueError("settlement storage leaves a receipt unaccounted for")
+
+    @property
+    def repository(self) -> str:
+        return self.commands.repository
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.commands.source_digest, self.receipts.source_digest, self.round_storage.source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+def _stored_review_round_plan(source: LegacyReviewRoundSource) -> ReviewRoundPlan:
+    row = dict(source.fields)
+    plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
+    identity = plan.round
+    key = identity.binding.rejection.fence.key
+    if (row["plan_json"] != encode_workflow(plan) or row["round_id"] != identity.round_id
+            or not isinstance(key.target, PullRequestRef) or row["repository"] != key.repository
+            or row["target_kind"] != "pr" or row["target_number"] != key.target.number
+            or row["execution_epoch"] != identity.binding.execution_epoch
+            or row["execution_episode"] != identity.binding.execution_episode
+            or row["generation"] != identity.binding.rejection.fence.generation
+            or row["sequence"] != identity.sequence):
+        raise ValueError("review round plan disagrees with its SQL identity")
+    return plan
+
+
+def verify_complete_legacy_submission_settlement_storage(
+    db: sqlite3.Connection, observed_commands: CompleteLegacyReviewSubmissions,
+    observed_receipts: CompleteLegacyReviewSubmissionReceipts,
+    observed_round_storage: CompleteLegacyRoundOutcomeStorage,
+) -> CompleteLegacySubmissionSettlementStorage | BlockedLegacySubmissionSettlementStorage:
+    """Account for every command, registration, index and marker in one SQL snapshot."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("submission settlement storage requires an explicit SQL transaction")
+    if (not isinstance(observed_commands, CompleteLegacyReviewSubmissions)
+            or not isinstance(observed_receipts, CompleteLegacyReviewSubmissionReceipts)
+            or not isinstance(observed_round_storage, CompleteLegacyRoundOutcomeStorage)):
+        raise ValueError("submission settlement storage requires complete typed observations")
+    repository = observed_commands.repository
+    if repository != observed_receipts.repository or repository != observed_round_storage.repository:
+        return BlockedLegacySubmissionSettlementStorage(repository, "submission and round repositories disagree")
+    commands = revalidate_complete_legacy_review_submissions(db, observed_commands)
+    if isinstance(commands, BlockedLegacyReviewSubmissions):
+        return BlockedLegacySubmissionSettlementStorage(repository, commands.reason, commands.source_rowid)
+    receipts = revalidate_complete_legacy_review_submission_receipts(db, observed_receipts)
+    if isinstance(receipts, BlockedLegacyReviewSubmissionReceipts):
+        return BlockedLegacySubmissionSettlementStorage(repository, receipts.reason, receipts.source_rowid)
+    round_storage = verify_complete_legacy_round_outcome_storage(
+        db, observed_round_storage.rounds, observed_round_storage.receipts,
+    )
+    if isinstance(round_storage, BlockedLegacyRoundOutcomeStorage):
+        return BlockedLegacySubmissionSettlementStorage(repository, round_storage.reason, round_storage.source_rowid)
+    command_by_id = {dict(source.command_fields)["command_id"]: source for source in commands.submissions}
+    receipt_by_key = {(dict(source.fields)["namespace"], dict(source.fields)["key"]): source
+                      for source in receipts.receipts}
+    plan_by_id: dict[str, tuple[LegacyReviewRoundSource, ReviewRoundPlan]] = {}
+    round_plans: list[tuple[LegacyReviewRoundSource, ReviewRoundPlan]] = []
+    sealed_by_id = {entry.outcome.round.round_id: entry for entry in round_storage.sealed}
+    for source in round_storage.rounds.rounds:
+        try:
+            plan = _stored_review_round_plan(source)
+            sealed = sealed_by_id.get(plan.round.round_id)
+            if sealed is not None and sealed.facts.plan != plan:
+                raise ValueError("sealed review round plan disagrees with its closure")
+        except (TypeError, ValueError, UnicodeError, WorkflowAuthorityError) as exc:
+            return BlockedLegacySubmissionSettlementStorage(repository, _printable(str(exc)), source.source_rowid)
+        plan_by_id[plan.round.round_id] = (source, plan)
+        round_plans.append((source, plan))
+    registered: list[VerifiedLegacySubmissionRegistrationStorage] = []
+    registered_ids: set[str] = set()
+    recorded_markers: list[LegacyReviewSubmissionReceiptSource] = []
+    for source in receipts.receipts:
+        row = dict(source.fields)
+        namespace = row["namespace"]
+        if namespace == "review-recorded-submission":
+            if row["key"] not in command_by_id:
+                return BlockedLegacySubmissionSettlementStorage(
+                    repository, "recorded review marker has no submission command", source.source_rowid,
+                )
+            recorded_markers.append(source)
+            continue
+        if namespace != "review-round-submission":
+            continue
+        try:
+            registration = decode_workflow(row["payload_json"], ReviewSubmissionRegistration)
+            command_id = registration.submission.command_id
+            command_source = command_by_id.get(command_id)
+            planned = plan_by_id.get(registration.round.round_id)
+            if (row["payload_json"] != encode_workflow(registration)
+                    or row["key"] != command_id or command_source is None or planned is None):
+                raise ValueError("review registration lacks its exact command or round")
+            round_source, plan = planned
+            command = dict(command_source.command_fields)
+            if (command["repository"] != repository or command["target"] !=
+                    f"pr:{registration.round.binding.rejection.fence.key.target.number}"
+                    or command["expected_revision"] != plan.head_sha
+                    or command["workflow_binding_json"] != encode_workflow(registration.round.binding.rejection)
+                    or command["payload_digest"] != _encoded_payload_digest(
+                        command["payload_json"], command["workflow_binding_json"],
+                    )):
+                raise ValueError("review registration disagrees with its bound command")
+            index_key = review_submission_receipt_key(registration.round.round_id, command_id)
+            index_source = receipt_by_key.get(("review-round-submission-index", index_key))
+            if index_source is None:
+                raise ValueError("review registration lacks its exact round index")
+            index = dict(index_source.fields)
+            if (index["payload_json"] != row["payload_json"] or index["claimed_at"] != row["claimed_at"]
+                    or row["reusable_after"] is not None or index["reusable_after"] is not None):
+                raise ValueError("review registration and round index disagree")
+            _parse_stamp(row["claimed_at"])
+            registered.append(VerifiedLegacySubmissionRegistrationStorage(
+                command_source, source, index_source, round_source, plan, registration,
+            ))
+            registered_ids.add(command_id)
+        except (KeyError, TypeError, ValueError, AttributeError, UnicodeError,
+                WorkflowAuthorityError) as exc:
+            return BlockedLegacySubmissionSettlementStorage(repository, _printable(str(exc)), source.source_rowid)
+    unregistered = tuple(source for source in commands.submissions
+                         if dict(source.command_fields)["command_id"] not in registered_ids)
+    try:
+        return CompleteLegacySubmissionSettlementStorage(
+            commands, receipts, round_storage, tuple(round_plans), tuple(registered),
+            unregistered, tuple(recorded_markers),
+        )
+    except ValueError as exc:
+        return BlockedLegacySubmissionSettlementStorage(repository, _printable(str(exc)))

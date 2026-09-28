@@ -24,6 +24,8 @@ from issue_agent.adapters.review_execution_activation import (
     read_complete_legacy_review_outcome_receipts, revalidate_complete_legacy_review_outcome_receipts,
     verify_legacy_round_outcome_storage,
     verify_complete_legacy_round_outcome_storage,
+    verify_complete_legacy_submission_settlement_storage,
+    VerifiedLegacySubmissionRegistrationStorage, CompleteLegacySubmissionSettlementStorage,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -31,7 +33,7 @@ from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
 from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome
-from issue_agent.domain.review_rounds import ReviewRoundFacts
+from issue_agent.domain.review_rounds import ReviewRoundFacts, ReviewRoundPlan
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
@@ -49,6 +51,7 @@ from issue_agent.domain.review_execution_activation import (
     CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
     VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
     CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
+    BlockedLegacySubmissionSettlementStorage,
     VerifiedLegacyRecordedReview, VerifiedReviewSubmissionRoundLink,
     VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
 )
@@ -896,6 +899,175 @@ def test_paid_plain_recording_can_join_its_confirmed_round(rig):
     assert isinstance(proof, VerifiedLegacyPlainProductiveRound)
     assert isinstance(proof.storage.outcome.disposition, PaidReviewProgress)
     assert proof.storage.outcome.round == plan.round
+
+
+def _complete_settlement_observations(db):
+    commands = read_complete_legacy_review_submissions(db, "o/r")
+    receipts = read_complete_legacy_review_submission_receipts(db, "o/r")
+    rounds = read_complete_legacy_review_rounds(db, "o/r")
+    outcome_receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+    assert isinstance(commands, CompleteLegacyReviewSubmissions)
+    assert isinstance(receipts, CompleteLegacyReviewSubmissionReceipts)
+    assert isinstance(rounds, CompleteLegacyReviewRounds)
+    assert isinstance(outcome_receipts, CompleteLegacyReviewOutcomeReceipts)
+    storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcome_receipts)
+    assert isinstance(storage, CompleteLegacyRoundOutcomeStorage)
+    return commands, receipts, storage
+
+
+def test_complete_settlement_storage_accounts_registered_and_historical_commands(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        _submission(db, 42, receipt=False)
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                   ("review-recorded-submission", "o/r", "cmd-42", "2026-09-28T00:00:00+00:00", "{}"))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _complete_settlement_observations(db)
+        before = db.total_changes
+        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(result, CompleteLegacySubmissionSettlementStorage)
+    assert [dict(proof.command_source.command_fields)["command_id"] for proof in result.registered] == [
+        str(command.command_id),
+    ]
+    assert [dict(source.command_fields)["command_id"] for source in result.unregistered] == ["cmd-42"]
+    assert {dict(source.fields)["key"] for source in result.recorded_markers} == {
+        str(command.command_id), "cmd-42",
+    }
+    assert result.registered[0].plan.round == plan.round
+    pair = result.registered[0]
+    forged_index = replace(pair.index_source, fields=tuple(
+        (name, "orphan-index" if name == "key" else value) for name, value in pair.index_source.fields
+    ))
+    with pytest.raises(ValueError, match="contradictory"):
+        replace(pair, index_source=forged_index)
+    forged_registration = replace(pair.registration_source, fields=tuple(
+        (name, "{}" if name == "payload_json" else value) for name, value in pair.registration_source.fields
+    ))
+    forged_index = replace(pair.index_source, fields=tuple(
+        (name, "{}" if name == "payload_json" else value) for name, value in pair.index_source.fields
+    ))
+    with pytest.raises(ValueError, match="contradictory"):
+        replace(pair, registration_source=forged_registration, index_source=forged_index)
+    changed_plan = replace(pair.plan, displayed_round=pair.plan.displayed_round + 1)
+    changed_round = replace(pair.round_source, fields=tuple(
+        (name, encode_workflow(changed_plan) if name == "plan_json" else value)
+        for name, value in pair.round_source.fields
+    ))
+    changed_rounds = replace(result.round_storage.rounds, rounds=(changed_round,))
+    changed_seal = replace(result.round_storage.sealed[0], round_source=changed_round)
+    changed_storage = replace(result.round_storage, rounds=changed_rounds, sealed=(changed_seal,))
+    changed_pair = replace(pair, round_source=changed_round, plan=changed_plan)
+    with pytest.raises(ValueError, match="round plan"):
+        replace(result, round_storage=changed_storage, round_plans=((changed_round, changed_plan),),
+                registered=(changed_pair,))
+
+
+@pytest.mark.parametrize("damage", [
+    "orphan_registration", "orphan_index", "orphan_marker", "missing_registration",
+    "index_payload", "index_claim", "index_reusable", "registration_claim",
+])
+def test_complete_settlement_storage_blocks_orphaned_or_contradictory_receipts(rig, damage):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        if damage == "orphan_registration":
+            row = db.execute("SELECT payload_json,claimed_at FROM dedupe_keys "
+                             "WHERE namespace='review-round-submission'").fetchone()
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       ("review-round-submission", "o/r", "missing-command", row["claimed_at"], row["payload_json"]))
+        elif damage == "orphan_index":
+            row = db.execute("SELECT payload_json,claimed_at FROM dedupe_keys "
+                             "WHERE namespace='review-round-submission-index'").fetchone()
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       ("review-round-submission-index", "o/r", "orphan-index", row["claimed_at"], row["payload_json"]))
+        elif damage == "orphan_marker":
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                       ("review-recorded-submission", "o/r", "missing-command",
+                        "2026-09-28T00:00:00+00:00", "{}"))
+        elif damage == "missing_registration":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-submission'")
+        elif damage == "index_payload":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' "
+                       "WHERE namespace='review-round-submission-index'")
+        elif damage == "index_claim":
+            db.execute("UPDATE dedupe_keys SET claimed_at='2026-09-28T00:00:00+00:00' "
+                       "WHERE namespace='review-round-submission-index'")
+        elif damage == "index_reusable":
+            db.execute("UPDATE dedupe_keys SET reusable_after='2026-09-29T00:00:00+00:00' "
+                       "WHERE namespace='review-round-submission-index'")
+        else:
+            db.execute("UPDATE dedupe_keys SET claimed_at='invalid' "
+                       "WHERE namespace='review-round-submission'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _complete_settlement_observations(db)
+        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
+
+
+def test_complete_settlement_storage_blocks_round_plan_without_its_registration(rig):
+    store, _, _, control, plan, command = confirmed_copy(rig)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-submission'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _complete_settlement_observations(db)
+        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
+    assert "receipt" in result.reason or "planned" in result.reason
+
+
+def test_complete_settlement_storage_blocks_registration_missing_from_open_plan(rig):
+    store, _, _, _, plan, _ = confirmed_copy(rig)
+    with store.transaction() as db:
+        row = db.execute("SELECT plan_json FROM review_execution_rounds WHERE round_id=?",
+                         (plan.round.round_id,)).fetchone()
+        stored = decode_workflow(row["plan_json"], ReviewRoundPlan)
+        db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE round_id=?",
+                   (encode_workflow(replace(stored, submissions=())), plan.round.round_id))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _complete_settlement_observations(db)
+        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
+
+
+@pytest.mark.parametrize("changed", ["command", "receipt", "round"])
+def test_complete_settlement_storage_rechecks_every_observed_sql_set(rig, changed):
+    store, _, _, _, plan, command = confirmed_copy(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _complete_settlement_observations(db)
+        db.rollback()
+    with store.transaction() as db:
+        if changed == "command":
+            db.execute("UPDATE lifecycle_commands SET payload_json='{}' WHERE command_id=?",
+                       (str(command.command_id),))
+        elif changed == "receipt":
+            db.execute("UPDATE dedupe_keys SET claimed_at='changed' "
+                       "WHERE namespace='review-round-submission'")
+        else:
+            db.execute("UPDATE review_execution_rounds SET plan_json='{}' WHERE round_id=?",
+                       (plan.round.round_id,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
 
 
 @pytest.mark.parametrize("damage", [

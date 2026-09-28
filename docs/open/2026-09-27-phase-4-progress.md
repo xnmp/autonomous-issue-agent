@@ -1188,3 +1188,23 @@ Full `make test` passed: 3,198 domain, 2,972 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-complete-submission-receipts-gate.log` (ephemeral).
+
+## Checkpoint 48 — whole-set submission settlement storage accounting (offline)
+
+A read-only verifier now revalidates the complete command, submission receipt
+and round/outcome storage sets in one explicit SQL transaction. It decodes each
+canonical stored round plan and registration, pairs every registration with
+the exact permanent round index and bound command, and requires every planned
+submission to have one pair. Every recorded-review marker must name an
+inventoried command; historical commands without a registration remain
+explicitly unregistered. Orphaned, missing, reclaimable, changed or
+contradictory sources block. The proof accounts for storage only: raw markers
+do not prove a baseline, productive verdict or ordered reset, and escalated
+holds need their own provenance. Independent Sol review found two direct
+constructor gaps for derived index/payload identity and sealed closure-plan
+equality; moving trusted proofs to the adapter and adding constructor checks
+and regressions closed both. Its final pass found no medium or high issue.
+Full `make test` passed: 3,198 domain, 2,986 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-submission-settlement-storage-gate.log` (ephemeral).

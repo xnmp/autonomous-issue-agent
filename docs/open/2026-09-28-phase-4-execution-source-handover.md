@@ -97,6 +97,12 @@ with `CLAUDE.md`, `AGENTS.md`, the
   matching-row and 64 MiB limits. Matching BLOB scope/namespace aliases
   block. SQL revalidation rejects changed or partial caller-held sets. Raw
   receipt presence does not yet establish the exact command/round authority.
+- Checkpoint 48 revalidates complete command, submission receipt and
+  round/outcome storage sets in one SQL snapshot. Canonical round plans and
+  registrations pair every registered command to its permanent derived index;
+  every planned submission and marker is accounted for. Historical commands
+  without registration remain explicit. This is storage accounting, not a
+  baseline, productivity or reset proof.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -185,6 +191,15 @@ domain, 2,972 adapter and 2,866 app tests passed, plus hooks, governor, gate
 parity, four import contracts and both Pyrefly checks. Ten strict xfails
 remained expected.
 
+Independent Sol review of checkpoint 48 found two constructor gaps: derived
+index and payload identity, and sealed closure-plan equality. Trusted proof
+types now live beside their wire codec in the adapter, with direct forged-value
+regressions. The final pass found no medium or high issue. The full gate passed:
+3,198 domain, 2,986 adapter and 2,866 app tests, plus hooks, governor, gate
+parity, four import contracts and both Pyrefly checks. Ten strict xfails
+remained expected. Log:
+`/tmp/phase4-submission-settlement-storage-gate.log` (ephemeral).
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -193,24 +208,19 @@ occurred.
 
 ## Next required boundary
 
-The next whole-set proof should revalidate complete command, submission
-receipt and round/outcome storage sets in one explicit SQL transaction. Pair
-each registration with its derived round-index key and exact payload/claim;
-account for every planned submission and every recorded marker. Historical
-unregistered commands and raw markers remain explicit observations. The result
-must not claim a productive reset: that still requires per-command bound effect,
-baseline and round proof, plus ordered outcome replay. Independent Sol design
-review recommended this boundary after checkpoint 47.
+The next proof must classify each successful command against its bound effect,
+recorded baseline, sealed outcome and productivity settlement path, then replay
+ordered outcomes for each execution episode. Raw recorded markers and completed
+agent runs are observations, not reset authority. Keep unregistered historical
+commands explicit until their legacy provenance is resolved.
 
 1. Revalidate the bounded owner closure and run inventory under activation
    barriers before any import commit. Daemon boot's `adopt_legacy_owner`
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Account for every submission command, registration, round index and
-   recorded-review receipt across the revalidated complete sets. Extend the
-   single plain productive round proof across these sets to establish ordered
-   resets. Verify escalated verdict hold
+2. Extend the single plain productive round proof across the complete
+   accounting set to establish ordered resets. Verify escalated verdict hold
    provenance and classify unrecorded or stale successful commands separately.
    A completed
    agent run is not itself a productive review; unknown death or reset
