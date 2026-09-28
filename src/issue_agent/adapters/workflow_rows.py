@@ -676,11 +676,18 @@ def _check_execution_checkpoint_receipt(
     if receipt.previous_checkpoint != previous:
         raise WorkflowAuthorityError("review execution checkpoint has a changed predecessor")
     if receipt.last_round_source is not None:
-        from .review_execution_activation import read_checkpoint_round_row_source
+        from .review_execution_activation import (
+            read_checkpoint_round_row_source, read_checkpoint_round_receipt_source,
+        )
 
-        round_source = read_checkpoint_round_row_source(db, receipt.last_round_source.round)
-        if round_source.source_digest != receipt.last_round_source.row_sha256:
+        row_source = read_checkpoint_round_row_source(db, receipt.last_round_source.round)
+        if row_source.source_digest != receipt.last_round_source.row_sha256:
             raise WorkflowAuthorityError("review execution checkpoint round row changed after compaction")
+        round_source = read_checkpoint_round_receipt_source(db, receipt.last_round_source.round)
+        if round_source.row_sha256 != row_source.source_digest:
+            raise WorkflowAuthorityError("review execution checkpoint round row changed during its read")
+        if round_source.receipt_set_sha256 != receipt.last_round_source.receipt_set_sha256:
+            raise WorkflowAuthorityError("review execution checkpoint round receipts changed after compaction")
     if receipt.last_generation_source is not None:
         from .review_execution_activation import verify_checkpoint_generation_anchor
 

@@ -34,7 +34,7 @@ from issue_agent.adapters.review_execution_activation import (
     match_legacy_review_generation_boundary_sources,
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     read_review_generation_archive_page, verify_checkpoint_generation_anchor,
-    read_checkpoint_round_row_source,
+    read_checkpoint_round_row_source, read_checkpoint_round_receipt_source,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
     read_review_generation_receipt_sweep_page, read_reconciled_review_generation_receipt_sweep_page,
     ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
@@ -1437,7 +1437,7 @@ def test_staged_checkpoint_load_checks_generation_anchor_before_global_refusal(r
             execution, plan,
             (ReviewExecutionCompactionRoundSource(
                 outcome.round, read_checkpoint_round_row_source(db, outcome.round).source_digest,
-                "b" * 64,
+                read_checkpoint_round_receipt_source(db, outcome.round).receipt_set_sha256,
             ),),
             (fingerprint,),
         )

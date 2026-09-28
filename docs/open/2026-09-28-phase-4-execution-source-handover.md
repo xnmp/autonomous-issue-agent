@@ -438,19 +438,32 @@ with `CLAUDE.md`, `AGENTS.md`, the
   The receipt-set digest for that round is still unverified, and the canonical
   loader still refuses every compacted component until it and the paged audit
   gate are installed.
+- Checkpoint 84 reconstructs the final retired round's exact bounded receipt
+  membership from its canonical plan and finalized closure. It binds preflight,
+  stages, submission registrations and indexes, applicable planning seal or
+  abandonment, outcome, deferred preparation and one productive settlement.
+  It rejects extra stage/index keys, fixed-key contradictions, TEXT/BLOB
+  aliases, oversized fields and a receipt set above 32 MiB before hashing
+  ordered `(namespace, key, all-field digest)` members. Canonical loads compare
+  this digest to the checkpoint's final round fingerprint, then retain the
+  global refusal because the writer and paged audit gate are pending. Tests
+  cover source mutation and removal, aliases, extra and oversized keys,
+  productive settlement cardinality and abandonment. The point reader binds
+  source fields; semantic verification of every member remains a writer and
+  archived-audit obligation.
 
-Independent Sol review of checkpoint 83 found no medium or high issue. Final
-`make test` passed: 3,280 domain, 3,241 adapter and 2,876 app tests, plus
-hooks, governor, gate parity, four import contracts and both Pyrefly checks.
-Ten strict xfails remained expected. Log:
-`/tmp/phase4-checkpoint-round-row-anchor-gate.log` (ephemeral). The next
-source seam is the exact bounded receipt set for one retired round. Define it
-from the same preflight, stage, submission, seal or abandonment, closure,
-outcome, preparation and productivity sources the current suffix verifier
-uses; include their identities and immutable field digests, then compare the
-checkpoint's final `receipt_set_sha256` against a point-read reconstruction.
-The writer and paged audit must use that identical set definition. Keep the
-canonical compaction refusal until those proofs and the audit gate pass.
+Independent Sol review of checkpoint 84 identified an unbounded prefixed-key
+fetch; the length-first revision and a large-key regression passed re-review
+with no remaining medium or high finding. Final `make test` passed: 3,280
+domain, 3,250 adapter and 2,876 app tests, plus hooks, governor, gate parity,
+four import contracts and both Pyrefly checks. Ten strict xfails remained
+expected. Log: `/tmp/phase4-checkpoint-round-receipts-gate.log` (ephemeral).
+The next seam is the transactional
+checkpoint writer: it must verify the full retired stream, use this identical
+round receipt-set definition, bind the ordered source digests, and publish the
+aggregate and checkpoint atomically. The paged audit must reconstruct all
+retired member payloads and unclaimed receipts and supply the admission gate.
+Keep the canonical compaction refusal until both are complete.
 
 The intended read metric is bytes and latency per canonical load as archived
 generations grow; the guardrail is refusal on changed immediate sources. The

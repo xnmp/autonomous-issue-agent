@@ -145,14 +145,28 @@ the same transaction as the checkpoint and active-suffix update. Subsequent
 audit pages verify retained membership and payloads, including full historical
 accepted transitions, and persist a cursor, rolling digest, due state and any
 discrepancy. The current loader checks typed checkpoint ancestry, the last
-retired generation source pair and the last retired round row, then refuses
-every compacted component because the round receipt-set check and audit gate
-are absent. It cannot yet serve a
+retired generation source pair, and the last retired round row and receipt
+set, then refuses every compacted component because the checkpoint writer and
+audit gate are absent. It cannot yet serve a
 compacted writer. The completed hot reader checks the typed receipt,
 immediate source anchor, bounded active suffix and audit gate without decoding
 historical accepted snapshots or scanning the compacted prefix. Older
 full-payload generation receipts require retirement into an audited checkpoint
 or an explicit bounded refusal before a universal hot-read bound is claimed.
+
+For the final retired round, the point reader derives membership from its
+canonical finalized plan and closure: preflight and outcome, every planned
+stage receipt, each planned submission's registration and round index,
+completed planning seal and abandonment fence when applicable, deferred
+preparation when applicable, and exactly one productivity settlement for a
+productive outcome. It rejects contradictory fixed-key receipts, extra stage
+or submission-index keys under the round's derived prefixes, and TEXT/BLOB
+aliases. Each member contributes `(namespace, key, digest of all six stored
+dedupe fields)` in sorted order to the receipt-set SHA-256. The read caps each
+field at 2 MiB and the set at 32 MiB. This immediate anchor detects a changed
+last-round source; the future writer must verify member payload semantics and
+commit the same digest, while the paged audit must reconstruct all retired
+round sets and unclaimed global receipts.
 
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money

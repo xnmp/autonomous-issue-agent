@@ -11,7 +11,9 @@ import hashlib
 import pytest
 
 from issue_agent.adapters.workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, encode_workflow
-from issue_agent.adapters.review_execution_activation import read_checkpoint_round_row_source
+from issue_agent.adapters.review_execution_activation import (
+    read_checkpoint_round_receipt_source, read_checkpoint_round_row_source,
+)
 from issue_agent.domain.review_execution_activation import MAX_LEGACY_ROUND_JSON_BYTES
 from issue_agent.adapters.control_store import _command_payload_digest, _json
 from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
@@ -70,12 +72,14 @@ def round_facts(snapshot, sequence, *, copied=False):
 
 def insert_seal_receipt(db, facts):
     identity = facts.plan.round
+    seal = (facts.planning.completed_seal if isinstance(
+        facts.planning, rounds.ReviewSealedParentAbandoned) else facts.planning)
     db.execute(
         "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
         "VALUES ('review-round-seal',?,?,'2026-09-27T00:00:00+00:00',?)",
         (identity.binding.rejection.fence.key.repository, identity.round_id,
          encode_workflow((identity.round_id, "fixture-owner", "claim:fixture",
-                          WorkflowRevision(identity.binding.rejection.fence, 0), facts.plan, facts.planning))),
+                          WorkflowRevision(identity.binding.rejection.fence, 0), facts.plan, seal))),
     )
 
 
@@ -101,7 +105,7 @@ def insert_round(db, facts, outcome=None, *, index_sequence=None):
              review_stage_receipt_key(identity.round_id, stage.stage_id),
             encode_workflow((identity.round_id, stage))),
         )
-    if facts.plan.submissions:
+    if outcome is not None or facts.plan.submissions:
         initial = replace(facts.plan, stages=(), submissions=())
         selection = ReviewPreflightSelection(
             identity.round_id, WorkflowRevision(binding.rejection.fence, 0), binding,
@@ -155,7 +159,25 @@ def insert_round(db, facts, outcome=None, *, index_sequence=None):
                 (namespace, binding.rejection.fence.key.repository, key, encode_workflow(registration)),
             )
     if outcome is not None:
-        insert_seal_receipt(db, facts)
+        completed = (facts.planning.completed_seal if isinstance(
+            facts.planning, rounds.ReviewSealedParentAbandoned) else facts.planning)
+        if isinstance(completed, rounds.ReviewPlanningSealed) and isinstance(
+            completed.conclusion, rounds.ReviewPlanningComplete,
+        ):
+            insert_seal_receipt(db, facts)
+        if isinstance(facts.planning, rounds.ReviewParentAbandoned):
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES ('review-round-abandonment',?,?,'2026-09-27T00:00:00+00:00',?)",
+                (binding.rejection.fence.key.repository, identity.round_id,
+                 encode_workflow((identity.round_id, "fixture-owner", "claim:fixture", facts.plan,
+                                  facts.planning))),
+            )
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-round-outcome',?,?,'2026-09-27T00:00:00+00:00',?)",
+            (binding.rejection.fence.key.repository, identity.round_id, encode_workflow((facts, outcome))),
+        )
 
 
 def set_projection(db, snapshot, outcomes, last_sequence):
@@ -166,11 +188,11 @@ def set_projection(db, snapshot, outcomes, last_sequence):
 
 
 def checkpoint_receipt(db, snapshot, checkpoint, round_id):
-    row_sha256 = read_checkpoint_round_row_source(db, round_id).source_digest
+    source = read_checkpoint_round_receipt_source(db, round_id)
     return execution.ReviewExecutionCheckpointReceipt(
         snapshot.execution.origin, snapshot.execution.checkpoint, None, checkpoint,
         "a" * 64, hashlib.sha256(b"").hexdigest(),
-        execution.ReviewExecutionCompactionRoundSource(round_id, row_sha256, "c" * 64), None,
+        source, None,
     )
 
 
@@ -354,7 +376,14 @@ def test_compacted_checkpoint_cannot_claim_an_unsettled_open_round(active):
         insert_round(db, facts)
         current = set_projection(db, snapshot, (), 1)
         checkpoint = replace(current.execution.checkpoint, through_sequence=1)
-        receipt_id = insert_checkpoint_receipt(db, checkpoint_receipt(db, snapshot, checkpoint, facts.plan.round))
+        open_row = read_checkpoint_round_row_source(db, facts.plan.round)
+        receipt_id = insert_checkpoint_receipt(db, execution.ReviewExecutionCheckpointReceipt(
+            snapshot.execution.origin, snapshot.execution.checkpoint, None, checkpoint,
+            "a" * 64, hashlib.sha256(b"").hexdigest(),
+            execution.ReviewExecutionCompactionRoundSource(
+                facts.plan.round, open_row.source_digest, "c" * 64,
+            ), None,
+        ))
         corrupted = replace(current, execution=replace(current.execution, checkpoint=checkpoint, checkpoint_receipt=receipt_id))
         db.execute("UPDATE workflows SET episode_json=? WHERE target_kind='pr'", (encode_workflow_episodes(corrupted),))
         before = tuple(db.iterdump())
@@ -387,6 +416,112 @@ def test_typed_compacted_prefix_refuses_load_without_verified_source_anchors(act
         with pytest.raises(WorkflowAuthorityError, match="round row changed"):
             load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == tampered_before
+
+
+@pytest.mark.parametrize("corruption", [
+    "missing_preflight", "changed_outcome", "aliased_seal", "extra_stage", "extra_index",
+    "oversized_stage", "huge_stage_key", "blob_extra_stage",
+])
+def test_compacted_round_anchor_checks_exact_bounded_receipt_sources(active, corruption):
+    store, snapshot = active
+    facts, outcome = round_facts(snapshot, 1)
+    checkpoint = execution.project_review_execution(snapshot.execution.checkpoint, (outcome,)).checkpoint
+    with store.transaction() as db:
+        insert_round(db, facts, outcome)
+        source = read_checkpoint_round_receipt_source(db, facts.plan.round)
+        assert source == read_checkpoint_round_receipt_source(db, facts.plan.round)
+        receipt_id = insert_checkpoint_receipt(db, checkpoint_receipt(
+            db, snapshot, checkpoint, facts.plan.round,
+        ))
+        compacted = replace(snapshot, execution=replace(
+            snapshot.execution, checkpoint=checkpoint, state=checkpoint.state,
+            last_sequence=1, checkpoint_receipt=receipt_id,
+        ))
+        set_projection(db, compacted, (), 1)
+        if corruption == "missing_preflight":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-preflight'")
+        elif corruption == "changed_outcome":
+            db.execute(
+                "UPDATE dedupe_keys SET claimed_at='2026-09-28T00:00:00+00:00' "
+                "WHERE namespace='review-round-outcome'",
+            )
+        elif corruption == "aliased_seal":
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "SELECT CAST(namespace AS BLOB),scope,key,claimed_at,payload_json FROM dedupe_keys "
+                "WHERE namespace='review-round-seal'",
+            )
+        elif corruption in {"extra_stage", "extra_index", "huge_stage_key", "blob_extra_stage"}:
+            namespace = REVIEW_STAGE_NAMESPACE if corruption == "extra_stage" else REVIEW_SUBMISSION_INDEX_NAMESPACE
+            if corruption in {"huge_stage_key", "blob_extra_stage"}:
+                namespace = REVIEW_STAGE_NAMESPACE
+            prefix = (review_stage_receipt_key(facts.plan.round.round_id, "review")[:-64]
+                      if corruption == "extra_stage" else
+                      review_submission_receipt_key(facts.plan.round.round_id, "missing")[:-64])
+            source_key = prefix + "e" * (2**21 + 1 if corruption == "huge_stage_key" else 64)
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,'o/r',CAST(? AS BLOB),'2026-09-27T00:00:00+00:00','{}')"
+                if corruption == "blob_extra_stage" else
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,'o/r',?,'2026-09-27T00:00:00+00:00','{}')",
+                (namespace, source_key),
+            )
+        else:
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json=? WHERE namespace=?",
+                ("x" * (2**21 + 1), REVIEW_STAGE_NAMESPACE),
+            )
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint round"):
+            load_review_workflow_row(db, snapshot.revision.fence.key)
+        assert tuple(db.iterdump()) == before
+
+
+def test_compacted_productive_round_requires_one_settlement_source(active):
+    store, snapshot = active
+    facts, outcome = round_facts(snapshot, 1, copied=True)
+    assert isinstance(outcome.disposition, execution.CopiedReviewProgress)
+    with store.transaction() as db:
+        insert_round(db, facts, outcome)
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint round receipt set"):
+            read_checkpoint_round_receipt_source(db, facts.plan.round)
+        command_id = facts.plan.submissions[0].command_id
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-recorded-submission','o/r',?,'2026-09-27T00:00:00+00:00',?)",
+            (command_id, encode_workflow(WorkflowRevision(facts.plan.round.binding.rejection.fence, 0))),
+        )
+        source = read_checkpoint_round_receipt_source(db, facts.plan.round)
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-round-stale-productivity','o/r',?,'2026-09-27T00:00:00+00:00',?)",
+            (facts.plan.round.round_id, encode_workflow((facts, outcome))),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint round receipt set"):
+            read_checkpoint_round_receipt_source(db, facts.plan.round)
+        db.execute(
+            "DELETE FROM dedupe_keys WHERE namespace='review-round-stale-productivity'",
+        )
+        assert read_checkpoint_round_receipt_source(db, facts.plan.round) == source
+
+
+def test_compacted_abandoned_round_binds_its_fence_receipt(active):
+    store, snapshot = active
+    original, _ = round_facts(snapshot, 1)
+    abandoned = rounds.ReviewSealedParentAbandoned(
+        "parent:dead", "late:fenced", original.planning,
+    )
+    facts = replace(original, planning=abandoned)
+    result = rounds.finalize_review_round(facts)
+    assert isinstance(result, rounds.FinalizedReviewRound)
+    with store.transaction() as db:
+        insert_round(db, facts, result.outcome)
+        source = read_checkpoint_round_receipt_source(db, facts.plan.round)
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-abandonment'")
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint round receipt set"):
+            read_checkpoint_round_receipt_source(db, facts.plan.round)
+        assert source.receipt_set_sha256
 
 
 def test_indexed_round_high_water_does_not_hide_a_missing_suffix_middle(active):
@@ -527,10 +662,7 @@ def test_compacted_checkpoint_checks_its_immediate_predecessor(active, predecess
         second_receipt = execution.ReviewExecutionCheckpointReceipt(
             snapshot.execution.origin, first_checkpoint, first_id, second_checkpoint,
             "a" * 64, hashlib.sha256(b"").hexdigest(),
-            execution.ReviewExecutionCompactionRoundSource(
-                second.plan.round, read_checkpoint_round_row_source(db, second.plan.round).source_digest,
-                "c" * 64,
-            ), None,
+            read_checkpoint_round_receipt_source(db, second.plan.round), None,
         )
         if predecessor != "missing":
             insert_checkpoint_receipt(db, first_receipt)

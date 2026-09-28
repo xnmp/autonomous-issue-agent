@@ -20,8 +20,9 @@ now scans expected generation sources and the retained receipt namespace in
 bounded pages, comparing the set and a prior pass digest. Checkpoint ancestry
 and retired round sources are not yet joined to it. A typed checkpoint receipt
 and bounded identity/predecessor read now exist. Canonical reads point-check
-the final retired generation source pair and round row, but refuse all
-compacted components until the round receipt set and audit gate are installed.
+the final retired generation source pair and the final retired round's row and
+bounded receipt set, but refuse all compacted components until the checkpoint
+writer and audit gate are installed.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

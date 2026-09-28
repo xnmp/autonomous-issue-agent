@@ -67,7 +67,7 @@ from ..domain.review_execution import (
     ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint, ReviewGenerationReceiptSweepCursor,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
     matches_accepted_review_transition_source,
-    MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
+    MAX_EXECUTION_SUFFIX, ReviewExecutionCompactionRoundSource, replay_review_execution_generations,
     review_generation_chain_digest, review_generation_receipt_id, review_generation_within_frontier,
     same_execution_episode,
 )
@@ -83,7 +83,9 @@ from ..domain.review_workflow_policy import (
 )
 from ..domain.labels import Label
 from ..domain.review_rounds import (
-    MAX_REVIEW_STAGES, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionRegistration,
+    MAX_REVIEW_STAGES, MAX_ROUND_SUBMISSIONS, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind,
+    ReviewSubmissionRegistration, ReviewPlanningSealed, ReviewPlanningComplete, ReviewParentAbandoned,
+    ReviewSealedParentAbandoned, FinalizedReviewRound,
     ReviewRoundFacts,
     DeferredReviewPreparation, ReviewSubmissionConfirmed, finalize_review_round,
     StaleReviewProductivitySettlement,
@@ -103,11 +105,16 @@ from .control_store import (
 )
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
 from .review_round_sources import _effect_receipt_id
-from .workflow_codec import decode_workflow, encode_workflow
+from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_commit import _unique_receipt_object
 from .workflow_rows import (
     WorkflowAuthorityError, load_review_workflow_row, review_stage_receipt_key, review_stage_receipt_prefix,
-    review_submission_receipt_key,
+    review_submission_receipt_key, review_submission_receipt_prefix,
+    REVIEW_STAGE_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE,
+    REVIEW_SEAL_NAMESPACE, REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE,
+    REVIEW_PREPARATION_NAMESPACE, REVIEW_STALE_PRODUCTIVITY_NAMESPACE,
+    REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, REVIEW_CEILING_PRODUCTIVITY_NAMESPACE,
+    RECORDED_REVIEW_NAMESPACE,
 )
 
 _PR_NAME = re.compile(r"pr-(.*)\.(session|round)", re.DOTALL)
@@ -132,6 +139,7 @@ MAX_LEGACY_EXECUTION_ROOTS = 64
 _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
 _DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json")
 MAX_LEGACY_RECORDING_BYTES = 2**21
+MAX_CHECKPOINT_ROUND_RECEIPT_BYTES = 2**25
 _RUN_COLUMNS = (
     "run_id", "dispatch_id", "kind", "state", "config_version", "started_at", "completed_at", "outcome",
     "provider_receipt_id", "workflow_binding_json", "workflow_episode_key", "review_round_id", "review_child_id",
@@ -1493,6 +1501,150 @@ def _read_recording_source(
         raise ValueError(f"{namespace} source lacks its payload or claim")
     digest = hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
     return fields, digest
+
+
+def _checkpoint_receipt_present(
+    db: sqlite3.Connection, namespace: str, repository: str, key: str,
+) -> bool:
+    rows = db.execute(
+        "SELECT typeof(namespace) AS namespace_type,typeof(scope) AS scope_type,"
+        "typeof(key) AS key_type FROM dedupe_keys "
+        "WHERE namespace IN (?,CAST(? AS BLOB)) AND scope IN (?,CAST(? AS BLOB)) "
+        "AND key IN (?,CAST(? AS BLOB)) LIMIT 2",
+        (namespace, namespace, repository, repository, key, key),
+    ).fetchall()
+    if len(rows) > 1 or any(row[f"{name}_type"] != "text"
+                            for row in rows for name in ("namespace", "scope", "key")):
+        raise ValueError("checkpoint round receipt has an aliased identity")
+    return bool(rows)
+
+
+def _checkpoint_prefixed_receipts(
+    db: sqlite3.Connection, namespace: str, repository: str, prefix: str, limit: int,
+) -> set[str]:
+    upper = prefix[:-1] + ";"
+    metadata = []
+    for lower_bound, upper_bound in ((prefix, upper), (prefix.encode(), upper.encode())):
+        metadata.extend(db.execute(
+            "SELECT rowid AS source_rowid,typeof(namespace) AS namespace_type,"
+            "typeof(scope) AS scope_type,typeof(key) AS key_type,"
+            "length(CAST(key AS BLOB)) AS key_bytes FROM dedupe_keys "
+            "WHERE namespace IN (?,CAST(? AS BLOB)) AND scope IN (?,CAST(? AS BLOB)) "
+            "AND key>=? AND key<? LIMIT ?",
+            (namespace, namespace, repository, repository, lower_bound, upper_bound, limit + 1),
+        ).fetchall())
+    if (len(metadata) > limit or any(
+        row["key_bytes"] != len(prefix) + 64
+        or any(row[f"{name}_type"] != "text" for name in ("namespace", "scope", "key"))
+        for row in metadata
+    )):
+        raise ValueError("checkpoint round has excess or aliased prefixed receipts")
+    rows = db.execute(
+        f"SELECT rowid AS source_rowid,key FROM dedupe_keys WHERE rowid IN "
+        f"({','.join('?' for _ in metadata)})",
+        tuple(row["source_rowid"] for row in metadata),
+    ).fetchall() if metadata else []
+    if len(rows) != len(metadata):
+        raise ValueError("checkpoint round prefixed receipts changed during read")
+    keys = {row["key"] for row in rows}
+    if len(keys) != len(rows):
+        raise ValueError("checkpoint round has duplicate prefixed receipts")
+    return keys
+
+
+def read_checkpoint_round_receipt_source(
+    db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+) -> ReviewExecutionCompactionRoundSource:
+    """Observe one finalized round's exact bounded receipt membership and fields."""
+    row = read_checkpoint_round_row_source(db, round_id)
+    values = dict(row.fields)
+    try:
+        if values["closure_json"] is None or values["outcome_json"] is None:
+            raise ValueError("checkpoint round is not finalized")
+        plan = decode_workflow(values["plan_json"], ReviewRoundPlan)
+        facts = decode_workflow(values["closure_json"], ReviewRoundFacts)
+        outcome = decode_workflow(values["outcome_json"], ReviewRoundOutcome)
+        result = finalize_review_round(facts)
+        if (facts.plan != plan or facts.plan.round != round_id
+                or values["planning_json"] != encode_workflow(facts.planning)
+                or encode_workflow(facts) != values["closure_json"]
+                or encode_workflow(outcome) != values["outcome_json"]
+                or not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation))
+                or result.outcome != outcome):
+            raise ValueError("checkpoint round closure disagrees with its canonical outcome")
+        repository = round_id.binding.rejection.fence.key.repository
+        key = round_id.round_id
+        stage_keys = {review_stage_receipt_key(key, stage.stage_id) for stage in plan.stages}
+        index_keys = {review_submission_receipt_key(key, submission.command_id)
+                      for submission in plan.submissions}
+        stored_stage_keys = _checkpoint_prefixed_receipts(
+            db, REVIEW_STAGE_NAMESPACE, repository, review_stage_receipt_prefix(key), MAX_REVIEW_STAGES,
+        )
+        stored_index_keys = _checkpoint_prefixed_receipts(
+            db, REVIEW_SUBMISSION_INDEX_NAMESPACE, repository, review_submission_receipt_prefix(key),
+            MAX_ROUND_SUBMISSIONS,
+        )
+        if (len(stage_keys) != len(plan.stages) or len(index_keys) != len(plan.submissions)
+                or stored_stage_keys != stage_keys or stored_index_keys != index_keys):
+            raise ValueError("checkpoint round receipt membership disagrees with its plan")
+        required = {
+            ("review-round-preflight", key), (REVIEW_OUTCOME_NAMESPACE, key),
+            *((REVIEW_STAGE_NAMESPACE, stage_key) for stage_key in stage_keys),
+            *((REVIEW_SUBMISSION_INDEX_NAMESPACE, index_key) for index_key in index_keys),
+            *((REVIEW_SUBMISSION_NAMESPACE, submission.command_id) for submission in plan.submissions),
+        }
+        completed_seal = (facts.planning.completed_seal if isinstance(
+            facts.planning, ReviewSealedParentAbandoned) else facts.planning)
+        optional = {
+            (REVIEW_SEAL_NAMESPACE, key): (isinstance(completed_seal, ReviewPlanningSealed)
+                                                 and isinstance(completed_seal.conclusion, ReviewPlanningComplete)),
+            (REVIEW_ABANDONMENT_NAMESPACE, key): isinstance(facts.planning, ReviewParentAbandoned),
+            (REVIEW_PREPARATION_NAMESPACE, key): isinstance(result, DeferredReviewPreparation),
+        }
+        confirmed = tuple(item.plan.command_id for item in facts.submissions
+                          if isinstance(item.result, ReviewSubmissionConfirmed))
+        productive = isinstance(outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
+        if productive and len(confirmed) != 1:
+            raise ValueError("checkpoint productive round lacks one confirmed submission")
+        for submission in plan.submissions:
+            optional[(RECORDED_REVIEW_NAMESPACE, submission.command_id)] = (
+                productive and submission.command_id in confirmed
+            )
+        for namespace in (
+            REVIEW_STALE_PRODUCTIVITY_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
+            REVIEW_CEILING_PRODUCTIVITY_NAMESPACE,
+        ):
+            optional[(namespace, key)] = productive
+        settlement_count = 0
+        for (namespace, source_key), expected in optional.items():
+            present = _checkpoint_receipt_present(db, namespace, repository, source_key)
+            if expected is True and namespace in (
+                RECORDED_REVIEW_NAMESPACE, REVIEW_STALE_PRODUCTIVITY_NAMESPACE,
+                REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, REVIEW_CEILING_PRODUCTIVITY_NAMESPACE,
+            ):
+                settlement_count += present
+            elif present != expected:
+                raise ValueError("checkpoint round has absent or contradictory receipt")
+            if present:
+                required.add((namespace, source_key))
+        if productive and settlement_count != 1:
+            raise ValueError("checkpoint productive round lacks one settlement receipt")
+        source_bytes = 0
+        members: list[tuple[str, str, str]] = []
+        for namespace, source_key in sorted(required):
+            size = _recording_source_size(db, namespace, repository, source_key)
+            if size is None or source_bytes + size > MAX_CHECKPOINT_ROUND_RECEIPT_BYTES:
+                raise ValueError("checkpoint round receipt set exceeds its byte bound")
+            _, digest = _read_recording_source(db, namespace, repository, source_key)
+            source_bytes += size
+            members.append((namespace, source_key, digest))
+        receipt_digest = hashlib.sha256(json.dumps(
+            members, separators=(",", ":"), ensure_ascii=True,
+        ).encode()).hexdigest()
+        return ReviewExecutionCompactionRoundSource(round_id, row.source_digest, receipt_digest)
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            sqlite3.Error, WorkflowEncodingError) as exc:
+        raise WorkflowAuthorityError("review execution checkpoint round receipt set is unreadable") from exc
 
 
 def _bounded_identity_row(
