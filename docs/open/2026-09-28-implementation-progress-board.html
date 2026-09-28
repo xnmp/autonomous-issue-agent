@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 06:26 AEST · Latest accepted checkpoint: transaction-local checkpoint manifest observation</p>
+      <p class="meta">Updated 29 Sep 2026, 06:47 AEST · Latest accepted checkpoint: indexed round archive sweep page</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>A read-only transaction-local proposal joins expected retired round and generation sources to canonical prefix replay. Compacted loads still refuse. Next: actual cumulative read bounds, transactional checkpoint writer, full archive census and gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>An indexed round sweep now observes bounded repository pages and catches malformed or rekeyed rows before episode filtering. Compacted loads still refuse. Next: durable census reconciliation, actual cumulative read bounds, checkpoint writer and gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -148,6 +148,7 @@
           <li><time datetime="2026-09-29T05:48:00+10:00">29 Sep 2026, 05:48 AEST</time><strong>Retired round receipt anchor accepted offline · 3 of 6 accepted</strong><p>Canonical reads compare the final round's exact bounded receipt-set digest after its row and generation anchors, then retain the compaction refusal. A Sol review found and verified the fix for an unbounded key fetch; a query-plan check led to separate indexed TEXT/BLOB range reads. Full gate passed: 3,280 domain, 3,250 adapter and 2,876 app tests, plus contracts and Pyrefly. The writer and archived audit remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T06:07:00+10:00">29 Sep 2026, 06:07 AEST</time><strong>Retired round archive page accepted offline · 3 of 6 accepted</strong><p>An indexed point read and two-round page now return expected finalized outcomes with row and receipt-set fingerprints. Sol review reproduced a duplicate BLOB sequence gap; the alias-inclusive query passed re-review. Full gate passed: 3,280 domain, 3,263 adapter and 2,876 app tests, plus contracts and Pyrefly. An unclaimed-row census, writer and audit gate remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T06:26:00+10:00">29 Sep 2026, 06:26 AEST</time><strong>Checkpoint manifest observation accepted offline · 3 of 6 accepted</strong><p>One SQL snapshot now compares expected retired round and generation sources with canonical replay and proposes a typed receipt. Its 128 MiB retained-field ceiling is accounting after reads; the writer needs actual read bounds, unclaimed-source census, payload audit and an atomic gate. Independent Sol review, malformed-source regressions and the full gate passed: 3,280 domain, 3,268 adapter and 2,876 app tests, plus contracts and Pyrefly. Active work since the previous entry: About 19 minutes.</p></li>
+          <li><time datetime="2026-09-29T06:47:00+10:00">29 Sep 2026, 06:47 AEST</time><strong>Indexed round archive sweep accepted offline · 3 of 6 accepted</strong><p>Schema v26 adds a repository index for 16-row, 16 MiB sweep pages with a fixed upper rowid. Every selected row's plan and finalized outcome are checked before episode filtering; BLOB aliases and rekeyed rows block. A v25 migration fixture retains rounds. Independent Sol review found two filtering gaps, both fixed. Full gate passed: 3,280 domain, 3,279 adapter and 2,876 app tests, plus contracts and Pyrefly. Durable reconciliation, receipt census and compaction authority remain open. Active work since the previous entry: About 21 minutes.</p></li>
         </ol>
       </div>
     </section>

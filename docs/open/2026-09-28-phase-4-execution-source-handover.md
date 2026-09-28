@@ -497,6 +497,27 @@ accounting limit and missing archive census as explicit constraints. The
 reader documents them; malformed-source and byte-limit regressions pass.
 Full-gate results are recorded in the progress board after acceptance.
 
+- Checkpoint 87 adds schema v26's repository index and a read-only,
+  transaction-local round archive sweep page. Each page fixes an upper rowid
+  and reads at most 16 repository rows and 16 MiB of retained fields through
+  that index. It validates every selected row's canonical plan, planning,
+  closure and derived outcome before selecting the requested execution
+  episode. Thus a SQL row rekeyed to another episode while its payload still
+  claims this one blocks instead of disappearing. A BLOB repository alias,
+  noncanonical numeric BLOB, malformed row or oversized source blocks.
+  Negative rowids and genuine other-episode rows remain visible in sweep
+  progress. A v25-to-v26 migration fixture retains existing rounds. This
+  page is an observation only: no caller yet completes a pass, compares its
+  matching set with expected sources, or grants checkpoint authority.
+
+Independent Sol review found and verified the fix for a rekeyed-row omission
+and a foreign-episode finalized-payload gap. The full-gate result is recorded
+in the progress board after acceptance.
+The sweep metric is rows and latency per page as repository round history
+grows; its guardrail is refusal on rekeyed or malformed rows. The indexed
+query plan is checked now, and a history-size latency comparison belongs in
+the complete audit benchmark.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -504,13 +525,15 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoint 86, a transaction can assemble the expected retired streams
-without accepting a caller-supplied source list. Before a writer can use
-this proposal, establish a true cumulative read bound around canonical load
-and each source reader; prove generation-only and later-checkpoint paths;
-verify every retired receipt payload; and census unclaimed round rows and
-receipts, including noncanonical BLOB numeric encodings that point lookups
-cannot find. Publish the checkpoint and initialized audit gate atomically.
+With checkpoint 87, a bounded indexed page can inspect repository round rows
+outside expected sequence lookups. Next, persist and reconcile a complete
+round sweep against checkpoint ancestry and expected source digests, including
+rows inserted or changed behind a prior cursor. A separate receipt-namespace
+pass must find unclaimed receipts. Before a writer can use the checkpoint-86
+proposal, establish a true cumulative read bound around canonical load and
+each source reader; prove generation-only and later-checkpoint paths; verify
+every retired receipt payload; and publish the checkpoint and initialized
+audit gate atomically.
 
 The intended read metric is bytes and latency per canonical load as archived
 generations grow; the guardrail is refusal on changed immediate sources. The

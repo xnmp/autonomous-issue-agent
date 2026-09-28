@@ -85,7 +85,7 @@ from ..domain.labels import Label
 from ..domain.review_rounds import (
     MAX_REVIEW_STAGES, MAX_ROUND_SUBMISSIONS, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind,
     ReviewSubmissionRegistration, ReviewPlanningSealed, ReviewPlanningComplete, ReviewParentAbandoned,
-    ReviewSealedParentAbandoned, FinalizedReviewRound,
+    ReviewPlanningOpen, ReviewSealedParentAbandoned, FinalizedReviewRound,
     ReviewRoundFacts,
     DeferredReviewPreparation, ReviewSubmissionConfirmed, finalize_review_round,
     StaleReviewProductivitySettlement,
@@ -141,6 +141,8 @@ _DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_a
 MAX_LEGACY_RECORDING_BYTES = 2**21
 MAX_CHECKPOINT_ROUND_RECEIPT_BYTES = 2**25
 MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE = 2
+MAX_CHECKPOINT_ROUND_SWEEP_PAGE = 16
+MAX_CHECKPOINT_ROUND_SWEEP_BYTES = 2**24
 _RUN_COLUMNS = (
     "run_id", "dispatch_id", "kind", "state", "config_version", "started_at", "completed_at", "outcome",
     "provider_receipt_id", "workflow_binding_json", "workflow_episode_key", "review_round_id", "review_child_id",
@@ -1784,6 +1786,183 @@ def read_checkpoint_round_archive_page(
     return ObservedReviewCheckpointRoundPage(
         tuple(rounds), next_sequence, next_sequence <= through_sequence,
     )
+
+
+@dataclass(frozen=True)
+class ObservedReviewCheckpointRoundSweepPage:
+    """One repository-indexed page; matching episode rows remain raw sources."""
+
+    sources: tuple[LegacyReviewRoundSource, ...]
+    next_rowid: int | None
+    upper_rowid: int | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.sources, tuple)
+                or len(self.sources) > MAX_CHECKPOINT_ROUND_SWEEP_PAGE
+                or any(not isinstance(source, LegacyReviewRoundSource) for source in self.sources)
+                or type(self.has_more) is not bool
+                or (self.upper_rowid is None
+                    and (self.sources or self.next_rowid is not None or self.has_more))
+                or (self.upper_rowid is not None
+                    and (type(self.upper_rowid) is not int
+                         or not MIN_SQL_ROWID <= self.upper_rowid <= MAX_SQL_ROWID))
+                or (self.next_rowid is not None
+                    and (type(self.next_rowid) is not int
+                         or not MIN_SQL_ROWID <= self.next_rowid <= MAX_SQL_ROWID
+                         or self.upper_rowid is None or self.next_rowid > self.upper_rowid))
+                or (self.has_more and self.next_rowid is None)):
+            raise ValueError("checkpoint round sweep page requires bounded source progress")
+
+
+@dataclass(frozen=True)
+class BlockedReviewCheckpointRoundSweepPage:
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.reason, str) or not self.reason
+                or (self.source_rowid is not None
+                    and (type(self.source_rowid) is not int
+                         or not MIN_SQL_ROWID <= self.source_rowid <= MAX_SQL_ROWID))):
+            raise ValueError("blocked checkpoint round sweep requires a bounded reason")
+
+
+def read_checkpoint_round_sweep_page(
+    db: sqlite3.Connection, binding: ReviewExecutionBinding,
+    *, after_rowid: int | None = None, upper_rowid: int | None = None,
+) -> ObservedReviewCheckpointRoundSweepPage | BlockedReviewCheckpointRoundSweepPage:
+    """Sweep all repository rows so malformed or extra episode keys cannot hide.
+
+    The upper rowid fixes a pass frontier; a later pass must recheck earlier
+    rows and discover newer ones. Pages alone do not prove a complete census.
+    """
+    if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
+            or not isinstance(binding, ReviewExecutionBinding)
+            or (after_rowid is not None
+                and (type(after_rowid) is not int
+                     or not MIN_SQL_ROWID <= after_rowid <= MAX_SQL_ROWID))
+            or (upper_rowid is not None
+                and (type(upper_rowid) is not int
+                     or not MIN_SQL_ROWID <= upper_rowid <= MAX_SQL_ROWID))
+            or (after_rowid is not None
+                and (upper_rowid is None or after_rowid > upper_rowid))):
+        raise ValueError("checkpoint round sweep requires a transaction and bounded cursor")
+    repository = binding.rejection.fence.key.repository
+    current_rowid: int | None = None
+    try:
+        alias = db.execute(
+            "SELECT rowid FROM review_execution_rounds INDEXED BY review_execution_rounds_repository "
+            "WHERE repository=CAST(? AS BLOB) LIMIT 1", (repository,),
+        ).fetchone()
+        if alias is not None:
+            return BlockedReviewCheckpointRoundSweepPage(
+                "checkpoint round repository has a BLOB alias", alias["rowid"],
+            )
+        if upper_rowid is None:
+            edge = db.execute(
+                "SELECT rowid FROM review_execution_rounds INDEXED BY review_execution_rounds_repository "
+                "WHERE repository=? ORDER BY rowid DESC LIMIT 1", (repository,),
+            ).fetchone()
+            if edge is None:
+                return ObservedReviewCheckpointRoundSweepPage((), None, None, False)
+            upper_rowid = edge["rowid"]
+        json_columns = ("plan_json", "planning_json", "closure_json", "outcome_json")
+        other_columns = tuple(column for column in LEGACY_REVIEW_ROUND_COLUMNS if column not in json_columns)
+        json_sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in json_columns]
+        other_sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in other_columns]
+        position = "" if after_rowid is None else "AND rowid>? "
+        parameters: tuple[object, ...] = (repository, upper_rowid)
+        if after_rowid is not None:
+            parameters = (*parameters, after_rowid)
+        metadata = db.execute(
+            f"SELECT rowid AS source_rowid,max({','.join(json_sizes)}) AS largest_json,"
+            f"max({','.join(other_sizes)}) AS largest_other,"
+            f"{'+'.join(json_sizes + other_sizes)} AS total_bytes "
+            "FROM review_execution_rounds INDEXED BY review_execution_rounds_repository "
+            f"WHERE repository=? AND rowid<=? {position}ORDER BY rowid LIMIT ?",
+            (*parameters, MAX_CHECKPOINT_ROUND_SWEEP_PAGE + 1),
+        ).fetchall()
+        selected: list[sqlite3.Row] = []
+        source_bytes = 0
+        for row in metadata[:MAX_CHECKPOINT_ROUND_SWEEP_PAGE]:
+            current_rowid = row["source_rowid"]
+            if (type(row["largest_json"]) is not int
+                    or type(row["largest_other"]) is not int
+                    or type(row["total_bytes"]) is not int
+                    or row["largest_json"] > MAX_LEGACY_ROUND_JSON_BYTES
+                    or row["largest_other"] > MAX_LEGACY_SQL_TEXT_BYTES):
+                return BlockedReviewCheckpointRoundSweepPage(
+                    "checkpoint round sweep found an oversized or unreadable row", current_rowid,
+                )
+            if source_bytes + row["total_bytes"] > MAX_CHECKPOINT_ROUND_SWEEP_BYTES:
+                if selected:
+                    break
+                return BlockedReviewCheckpointRoundSweepPage(
+                    "checkpoint round exceeds the sweep page byte bound", current_rowid,
+                )
+            selected.append(row)
+            source_bytes += row["total_bytes"]
+        columns = ",".join(
+            f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+            for column in LEGACY_REVIEW_ROUND_COLUMNS
+        )
+        sources: list[LegacyReviewRoundSource] = []
+        for row in selected:
+            current_rowid = row["source_rowid"]
+            captured = db.execute(
+                f"SELECT {columns} FROM review_execution_rounds WHERE rowid=? AND repository=?",
+                (current_rowid, repository),
+            ).fetchone()
+            if captured is None:
+                raise ValueError("checkpoint round changed during its sweep")
+            fields = tuple((column, (
+                _sql_integer(captured[f"type_{column}"], captured[f"raw_{column}"])
+                if column in {"target_number", "execution_epoch", "generation", "sequence"}
+                else _sql_text(captured[f"type_{column}"], captured[f"raw_{column}"])
+            )) for column in LEGACY_REVIEW_ROUND_COLUMNS)
+            source = LegacyReviewRoundSource(current_rowid, fields)
+            values = dict(source.fields)
+            plan = decode_workflow(values["plan_json"], ReviewRoundPlan)
+            planned = plan.round
+            planned_binding = planned.binding
+            if (encode_workflow(plan) != values["plan_json"]
+                    or planned.round_id != values["round_id"]
+                    or planned.sequence != values["sequence"]
+                    or planned_binding.rejection.fence.key.repository != values["repository"]
+                    or planned_binding.rejection.fence.key.target.number != values["target_number"]
+                    or planned_binding.execution_epoch != values["execution_epoch"]
+                    or planned_binding.execution_episode != values["execution_episode"]
+                    or planned_binding.rejection.fence.generation != values["generation"]
+                    or (values["closure_json"] is None) != (values["outcome_json"] is None)):
+                raise ValueError("checkpoint round sweep found a changed indexed plan")
+            planning = decode_workflow(
+                values["planning_json"],
+                ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+            )
+            if encode_workflow(planning) != values["planning_json"]:
+                raise ValueError("checkpoint round sweep found noncanonical planning")
+            if values["closure_json"] is not None:
+                facts = decode_workflow(values["closure_json"], ReviewRoundFacts)
+                outcome = decode_workflow(values["outcome_json"], ReviewRoundOutcome)
+                result = finalize_review_round(facts)
+                if (facts.plan != plan or facts.planning != planning
+                        or not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation))
+                        or result.outcome != outcome or outcome.round != planned
+                        or encode_workflow(facts) != values["closure_json"]
+                        or encode_workflow(outcome) != values["outcome_json"]):
+                    raise ValueError("checkpoint round sweep found a foreign closure or outcome")
+            if (values["target_number"] == binding.rejection.fence.key.target.number
+                    and values["execution_epoch"] == binding.execution_epoch
+                    and values["execution_episode"] == binding.execution_episode):
+                sources.append(source)
+        next_rowid = selected[-1]["source_rowid"] if selected else after_rowid
+        return ObservedReviewCheckpointRoundSweepPage(
+            tuple(sources), next_rowid, upper_rowid, len(metadata) > len(selected),
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            sqlite3.Error) as exc:
+        return BlockedReviewCheckpointRoundSweepPage(_printable(str(exc)), current_rowid)
 
 
 def _bounded_identity_row(

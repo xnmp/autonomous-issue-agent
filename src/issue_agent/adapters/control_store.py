@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 25
+SCHEMA_VERSION = 26
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1590,6 +1590,10 @@ CREATE TRIGGER dispatch_claims_occurrence_update BEFORE UPDATE ON dispatch_claim
 WHEN NEW.occurrence_id IS NULL OR length(NEW.occurrence_id)=0
     OR (OLD.occurrence_id IS NOT NULL AND NEW.occurrence_id IS NOT OLD.occurrence_id)
 BEGIN SELECT RAISE(ABORT,'dispatch claim occurrence is immutable'); END;
+"""),
+    SchemaMigration(26, """
+CREATE INDEX review_execution_rounds_repository
+ON review_execution_rounds(repository);
 """),
 )
 

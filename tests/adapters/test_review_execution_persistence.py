@@ -5,16 +5,20 @@ production admission and provenance minting remain a later checkpoint.
 """
 
 from dataclasses import replace
+from contextlib import closing
 from datetime import datetime, timezone
 import hashlib
+import sqlite3
 
 import pytest
 
 from issue_agent.adapters.workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, encode_workflow
 from issue_agent.adapters.review_execution_activation import (
     BlockedReviewCheckpointRoundPage, ObservedReviewCheckpointRoundPage,
+    BlockedReviewCheckpointRoundSweepPage, ObservedReviewCheckpointRoundSweepPage,
     read_checkpoint_round_archive_page, read_checkpoint_round_by_sequence,
     read_checkpoint_round_receipt_source, read_checkpoint_round_row_source,
+    read_checkpoint_round_sweep_page,
 )
 from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.domain.review_execution_activation import MAX_LEGACY_ROUND_JSON_BYTES
@@ -35,7 +39,9 @@ from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequ
 from issue_agent.domain import review_execution as execution
 from issue_agent.domain import review_rounds as rounds
 from issue_agent.domain.workflow_identity import WorkflowRevision
-from tests.adapters.test_control_store import _activate_execution_fixture, _seed_v24_workflow_history, _store
+from tests.adapters.test_control_store import (
+    _activate_execution_fixture, _historical_fixture, _seed_v24_workflow_history, _store,
+)
 
 
 @pytest.fixture
@@ -645,6 +651,143 @@ def test_checkpoint_manifest_refuses_an_open_retired_round(active):
         set_projection(db, snapshot, (), 1)
         with pytest.raises(WorkflowAuthorityError, match="checkpoint manifest"):
             observe_review_checkpoint_manifest(db, snapshot.revision.fence.key, 1)
+
+
+def test_checkpoint_round_sweep_pages_retain_a_fixed_repository_frontier(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        for sequence in range(1, 18):
+            facts, _ = round_facts(snapshot, sequence)
+            insert_round(db, facts)
+        first = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(first, ObservedReviewCheckpointRoundSweepPage)
+        assert len(first.sources) == 16 and first.has_more
+        assert [dict(source.fields)["sequence"] for source in first.sources] == list(range(1, 17))
+        facts, _ = round_facts(snapshot, 18)
+        insert_round(db, facts)
+        second = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding,
+            after_rowid=first.next_rowid, upper_rowid=first.upper_rowid,
+        )
+        assert isinstance(second, ObservedReviewCheckpointRoundSweepPage)
+        assert [dict(source.fields)["sequence"] for source in second.sources] == [17]
+        assert not second.has_more and second.upper_rowid == first.upper_rowid
+        fresh = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(fresh, ObservedReviewCheckpointRoundSweepPage)
+        assert fresh.upper_rowid != first.upper_rowid
+        plan = db.execute(
+            "EXPLAIN QUERY PLAN SELECT rowid FROM review_execution_rounds "
+            "INDEXED BY review_execution_rounds_repository "
+            "WHERE repository=? AND rowid<=? AND rowid>? ORDER BY rowid LIMIT 17",
+            ("o/r", first.upper_rowid, first.next_rowid),
+        ).fetchall()
+        assert any("review_execution_rounds_repository" in row["detail"] for row in plan)
+
+
+def test_v26_round_sweep_index_migrates_without_losing_existing_rounds(active):
+    store, snapshot = active
+    facts, _ = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts)
+    with closing(sqlite3.connect(store.path)) as db:
+        _historical_fixture(db, 25)
+        db.commit()
+    store.initialize()
+    with store.transaction() as db:
+        page = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(page, ObservedReviewCheckpointRoundSweepPage)
+        assert [dict(source.fields)["round_id"] for source in page.sources] == [
+            facts.plan.round.round_id,
+        ]
+
+
+def test_checkpoint_round_sweep_keeps_negative_rowids_and_skips_other_episodes(active):
+    store, snapshot = active
+    first, _ = round_facts(snapshot, 1)
+    second, _ = round_facts(snapshot, 2, copied=True)
+    with store.transaction() as db:
+        insert_round(db, first)
+        insert_round(db, second)
+        db.execute("UPDATE review_execution_rounds SET rowid=-7 WHERE round_id=?",
+                   (first.plan.round.round_id,))
+        foreign_binding = replace(snapshot.execution.binding, execution_episode="other-episode")
+        foreign_plan = replace(second.plan, round=replace(second.plan.round, binding=foreign_binding))
+        db.execute("UPDATE review_execution_rounds SET execution_episode='other-episode',plan_json=? "
+                   "WHERE round_id=?", (encode_workflow(foreign_plan), second.plan.round.round_id))
+        page = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(page, ObservedReviewCheckpointRoundSweepPage)
+        assert [source.source_rowid for source in page.sources] == [-7]
+        assert page.next_rowid > 0 and not page.has_more
+
+
+def test_checkpoint_round_sweep_blocks_a_rekeyed_episode_with_old_plan(active):
+    store, snapshot = active
+    facts, _ = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts)
+        db.execute("UPDATE review_execution_rounds SET execution_episode='other-episode' "
+                   "WHERE round_id=?", (facts.plan.round.round_id,))
+        blocked = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(blocked, BlockedReviewCheckpointRoundSweepPage)
+        assert blocked.source_rowid is not None
+
+
+@pytest.mark.parametrize("mutation", ("changed_outcome", "changed_planning"))
+def test_checkpoint_round_sweep_checks_finalized_foreign_episode_before_filtering(active, mutation):
+    store, snapshot = active
+    facts, outcome = round_facts(snapshot, 1, copied=True)
+    with store.transaction() as db:
+        insert_round(db, facts, outcome)
+        foreign_binding = replace(snapshot.execution.binding, execution_episode="other-episode")
+        foreign_round = replace(facts.plan.round, binding=foreign_binding)
+        foreign_plan = replace(facts.plan, round=foreign_round)
+        foreign_facts = replace(facts, plan=foreign_plan)
+        foreign_outcome = replace(outcome, round=foreign_round)
+        if mutation == "changed_outcome":
+            foreign_outcome = replace(
+                foreign_outcome, disposition=execution.ReviewUnlaunchedRound("fake-closure"),
+            )
+            planning = foreign_facts.planning
+        else:
+            planning = rounds.ReviewPlanningOpen()
+        db.execute(
+            "UPDATE review_execution_rounds SET execution_episode=?,plan_json=?,"
+            "planning_json=?,closure_json=?,outcome_json=? WHERE round_id=?",
+            ("other-episode", encode_workflow(foreign_plan), encode_workflow(planning),
+             encode_workflow(foreign_facts), encode_workflow(foreign_outcome),
+             facts.plan.round.round_id),
+        )
+        blocked = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(blocked, BlockedReviewCheckpointRoundSweepPage)
+        assert blocked.source_rowid is not None
+
+
+@pytest.mark.parametrize("mutation", ("blob_repository", "blob_sequence", "noncanonical_blob_sequence"))
+def test_checkpoint_round_sweep_blocks_malformed_repository_sources(active, mutation):
+    store, snapshot = active
+    facts, _ = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts)
+    with closing(store._connect()) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("BEGIN")
+        if mutation == "noncanonical_blob_sequence":
+            db.execute(
+                "UPDATE review_execution_rounds SET sequence=? WHERE round_id=?",
+                (b"01", facts.plan.round.round_id),
+            )
+        else:
+            column = "repository" if mutation == "blob_repository" else "sequence"
+            db.execute(
+                f"UPDATE review_execution_rounds SET {column}=CAST({column} AS BLOB) WHERE round_id=?",
+                (facts.plan.round.round_id,),
+            )
+        before = db.total_changes
+        blocked = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(blocked, BlockedReviewCheckpointRoundSweepPage)
+        assert blocked.source_rowid is not None
+        assert db.total_changes == before
+        db.rollback()
 
 
 def test_indexed_round_high_water_does_not_hide_a_missing_suffix_middle(active):

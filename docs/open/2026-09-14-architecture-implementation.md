@@ -31,6 +31,10 @@ round and generation sources to a canonical prefix replay and proposes a
 typed checkpoint receipt. Its byte ceiling accounts for retained fields after
 reads; the writer still needs a true cumulative read bound, an unclaimed-row
 and receipt census, payload audit and atomic audit gate.
+Schema v26 now supplies an indexed, read-only repository round sweep page
+that checks row and finalized-payload identities before selecting an episode.
+The sweep still needs durable completion, reconciliation with checkpoint
+sources, and a separate unclaimed-receipt pass before it can gate admission.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

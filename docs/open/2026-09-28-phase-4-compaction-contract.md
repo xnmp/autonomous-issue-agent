@@ -186,6 +186,16 @@ projection and verify member payload semantics, and the audit must separately
 census unclaimed rows, including noncanonical numeric BLOB encodings that an
 exact indexed point lookup cannot enumerate.
 
+Schema v26 adds a repository-key index for a separate round archive sweep.
+The read-only page fixes an upper rowid and examines at most 16 repository
+rows and 16 MiB of retained fields. Every selected row must have a canonical
+SQL/plan identity, planning state and closure-derived outcome before the page
+filters for the requested episode; a rekeyed row cannot silently disappear.
+The page rejects BLOB repository aliases and malformed numeric BLOB fields.
+A complete durable pass must reconcile its episode sources with the expected
+checkpoint chain, repeat from the origin after completion, and record
+discrepancies before it can gate admission.
+
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money
 settlement and evidence-preserving recovery remain allowed so a hold cannot
