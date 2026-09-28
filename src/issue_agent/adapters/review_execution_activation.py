@@ -60,8 +60,13 @@ from ..domain.review_execution import (
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
     MAX_EXECUTION_SUFFIX, review_generation_chain_digest, same_execution_episode,
 )
-from ..domain.review_workflow import ReviewWorkflowSnapshot
-from ..domain.review_workflow_policy import ReviewSubmissionReceipt, CeilingProductivityDecision
+from ..domain.review_workflow import (
+    ReviewWorkflowSnapshot, RecordedPullRequest, ReviewedBaseline, PullRequestState,
+)
+from ..domain.review_workflow_policy import (
+    ReviewSubmissionReceipt, CeilingProductivityDecision, _escalation_projection,
+)
+from ..domain.labels import Label
 from ..domain.review_rounds import (
     MAX_REVIEW_STAGES, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionRegistration,
     ReviewRoundFacts,
@@ -77,7 +82,10 @@ from ..domain.workflow_identity import (
     PullRequestRef, WorkflowBinding, WorkflowRevision, WorkflowKey, FamilyAuthority, MAX_REARM_COMMANDS,
     canonical_workflow_repository, validate_workflow_identifier, validate_workflow_text,
 )
-from .control_store import CorruptControlStore, _encoded_payload_digest, _parse_stamp, _receipt_digest, load_bound_review_submission
+from .control_store import (
+    CorruptControlStore, _command_from_row, _encoded_payload_digest, _parse_stamp,
+    _receipt_digest, load_bound_review_submission,
+)
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
 from .review_round_sources import _effect_receipt_id
 from .workflow_codec import decode_workflow, encode_workflow
@@ -1184,6 +1192,28 @@ def _read_recording_source(
     return fields, digest
 
 
+def _bounded_identity_row(
+    db: sqlite3.Connection, table: str, key_column: str, key: str,
+    columns: tuple[str, ...], max_field_bytes: int,
+) -> sqlite3.Row:
+    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in columns)
+    metadata = db.execute(
+        f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM {table} WHERE {key_column}=?",
+        (key,),
+    ).fetchone()
+    if metadata is None or metadata["source_rowid"] is None:
+        raise ValueError(f"{table} source is absent")
+    if metadata["largest_value"] > max_field_bytes:
+        raise ValueError(f"{table} source exceeds its field bound")
+    row = db.execute(
+        f"SELECT rowid AS source_rowid,* FROM {table} WHERE rowid=? AND {key_column}=?",
+        (metadata["source_rowid"], key),
+    ).fetchone()
+    if row is None:
+        raise ValueError(f"{table} source changed during its read")
+    return row
+
+
 def _reject_nonfinite(value: str) -> None:
     raise ValueError(f"accepted review transition contains {value}")
 
@@ -1274,33 +1304,7 @@ def _read_legacy_recorded_review(
         return UnverifiedLegacyRecordedReview(command_id, "submission effect receipt is absent")
     effect = dict(source.receipt_fields)
     try:
-        _recheck_submission_source(db, source)
-        if command["state"] != "succeeded" or effect["status"] != "succeeded":
-            raise ValueError("submission lacks a successful effect")
-        if (command["attempts"] < 1 or command["workflow_binding_json"] is None
-                or command["payload_digest"] != _encoded_payload_digest(
-                    command["payload_json"], command["workflow_binding_json"],
-                )):
-            raise ValueError("submission command lacks its bound payload or paid attempt")
-        receipt = EffectReceipt(
-            CommandId(command_id), effect["executor_identity"],
-            _parse_stamp(effect["started_at"]), _parse_stamp(effect["completed_at"]),
-            EffectStatus(effect["status"]), effect["remote_object_id"], effect["remote_revision"], effect["error"],
-        )
-        if (command["attempt_owner"] != receipt.executor_identity
-                or effect["receipt_digest"] != _receipt_digest(receipt)):
-            raise ValueError("submission effect digest or attempt owner disagrees")
-        if unique_remote_ids is None:
-            duplicate_review = db.execute(
-                "SELECT e.command_id FROM effect_receipts e JOIN lifecycle_commands c USING(command_id) "
-                "WHERE e.remote_object_id=? AND c.kind='submit_review' AND c.repository=? LIMIT 2",
-                (receipt.remote_object_id, lineage.repository),
-            ).fetchall()
-            if len(duplicate_review) != 1 or duplicate_review[0]["command_id"] != command_id:
-                raise ValueError("submission review identity is shared by another command")
-        elif receipt.remote_object_id not in unique_remote_ids:
-            raise ValueError("submission review identity is shared by another command")
-        bound = load_bound_review_submission(db, CommandId(command_id))
+        bound = _verified_successful_review_receipt(db, source, lineage, unique_remote_ids)
         if not isinstance(bound, ReviewSubmissionReceipt) or bound.escalated:
             raise ValueError("submission is not a plain bound verdict; hold provenance remains required")
         recorded_fields, recorded_digest = _read_recording_source(
@@ -1345,6 +1349,307 @@ def _read_legacy_recorded_review(
     except (KeyError, TypeError, ValueError, UnicodeError, sqlite3.Error,
             WorkflowAuthorityError, CorruptControlStore) as exc:
         return UnverifiedLegacyRecordedReview(command_id, _printable(str(exc)))
+
+
+def _verified_successful_review_receipt(
+    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
+    lineage: LegacyReviewOwnerLineage, unique_remote_ids: frozenset[str] | None,
+) -> ReviewSubmissionReceipt:
+    command = dict(source.command_fields)
+    effect = dict(source.receipt_fields) if source.receipt_fields is not None else None
+    if command["repository"] != lineage.repository or effect is None:
+        raise ValueError("submission lacks a same-repository effect receipt")
+    _recheck_submission_source(db, source)
+    if command["state"] != "succeeded" or effect["status"] != "succeeded":
+        raise ValueError("submission lacks a successful effect")
+    if (command["attempts"] < 1 or command["workflow_binding_json"] is None
+            or command["payload_digest"] != _encoded_payload_digest(
+                command["payload_json"], command["workflow_binding_json"],
+            )):
+        raise ValueError("submission command lacks its bound payload or paid attempt")
+    receipt = EffectReceipt(
+        CommandId(command["command_id"]), effect["executor_identity"],
+        _parse_stamp(effect["started_at"]), _parse_stamp(effect["completed_at"]),
+        EffectStatus(effect["status"]), effect["remote_object_id"], effect["remote_revision"], effect["error"],
+    )
+    if (command["attempt_owner"] != receipt.executor_identity
+            or effect["receipt_digest"] != _receipt_digest(receipt)):
+        raise ValueError("submission effect digest or attempt owner disagrees")
+    if unique_remote_ids is None:
+        duplicate_review = db.execute(
+            "SELECT e.command_id FROM effect_receipts e JOIN lifecycle_commands c USING(command_id) "
+            "WHERE e.remote_object_id=? AND c.kind='submit_review' AND c.repository=? LIMIT 2",
+            (receipt.remote_object_id, lineage.repository),
+        ).fetchall()
+        if len(duplicate_review) != 1 or duplicate_review[0]["command_id"] != command["command_id"]:
+            raise ValueError("submission review identity is shared by another command")
+    elif receipt.remote_object_id not in unique_remote_ids:
+        raise ValueError("submission review identity is shared by another command")
+    bound = load_bound_review_submission(db, CommandId(command["command_id"]))
+    if not isinstance(bound, ReviewSubmissionReceipt):
+        raise ValueError("submission is not a bound verdict review")
+    return bound
+
+
+@dataclass(frozen=True)
+class MatchedLegacyEscalatedReviewHoldPlan:
+    """Accepted baseline and one durable hold obligation; delivery is separate."""
+
+    source: LegacyReviewSubmissionSource
+    lineage: LegacyReviewOwnerLineage
+    submission: ReviewSubmissionReceipt
+    recorded_revision: WorkflowRevision
+    snapshot: ReviewWorkflowSnapshot
+    audit: ObservedTransition
+    observation: RecordedPullRequest
+    projection: LifecycleCommand
+    recorded_source_digest: str
+    transition_source_digest: str
+    observation_source_digest: str
+    projection_source_digest: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyReviewSubmissionSource)
+                or not isinstance(self.lineage, LegacyReviewOwnerLineage)
+                or not isinstance(self.submission, ReviewSubmissionReceipt) or not self.submission.escalated
+                or not isinstance(self.recorded_revision, WorkflowRevision)
+                or not isinstance(self.snapshot, ReviewWorkflowSnapshot)
+                or not isinstance(self.audit, ObservedTransition)
+                or not isinstance(self.observation, RecordedPullRequest)
+                or not isinstance(self.projection, LifecycleCommand)):
+            raise ValueError("escalated hold plan requires typed accepted sources")
+        for digest in (self.recorded_source_digest, self.transition_source_digest,
+                       self.observation_source_digest, self.projection_source_digest):
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError("escalated hold plan requires source digests")
+        command = dict(self.source.command_fields)
+        effect = dict(self.source.receipt_fields) if self.source.receipt_fields is not None else {}
+        baseline = self.snapshot.episode.continuation
+        bound = self.submission.submission
+        if (command["command_id"] != str(bound.command_id)
+                or command["repository"] != self.lineage.repository
+                or command["executor_identity"] not in self.lineage.owners
+                or effect.get("executor_identity") != command["executor_identity"]
+                or command["attempt_owner"] != effect.get("executor_identity")
+                or effect.get("remote_object_id") != self.submission.receipt_id.removeprefix("github-review:")
+                or self.snapshot.revision != self.recorded_revision
+                or self.snapshot.binding != bound.binding
+                or not isinstance(baseline, ReviewedBaseline)
+                or baseline.source != bound or baseline.head_sha != self.submission.head_sha
+                or baseline.patch_id != self.submission.patch_id
+                or self.audit.evidence_ids[:2] != (command["command_id"], self.submission.receipt_id)
+                or len(self.audit.evidence_ids) != 3
+                or self.observation.observation.key != bound.binding.fence.key
+                or self.observation.observation.head_sha != self.submission.head_sha
+                or self.observation.observation.state is not PullRequestState.OPEN
+                or self.projection.repository != self.lineage.repository
+                or self.projection.executor_identity not in self.lineage.owners
+                or self.projection.workflow != self.snapshot.binding):
+            raise ValueError("escalated hold plan disagrees with its submission or workflow")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.source.source_digest, self.lineage.source_digest,
+                 self.recorded_source_digest, self.transition_source_digest,
+                 self.observation_source_digest, self.projection_source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnmatchedLegacyEscalatedReviewHoldPlan:
+    command_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "unmatched escalation submission")
+        validate_workflow_text(self.reason, "unmatched escalation hold reason")
+
+
+def match_legacy_escalated_review_hold_plan(
+    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
+    lineage: LegacyReviewOwnerLineage,
+) -> MatchedLegacyEscalatedReviewHoldPlan | UnmatchedLegacyEscalatedReviewHoldPlan:
+    """Match a verdict escalation to its committed baseline and relabel plan."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("escalated hold match requires an explicit SQL transaction")
+    if not isinstance(source, LegacyReviewSubmissionSource) or not isinstance(lineage, LegacyReviewOwnerLineage):
+        raise ValueError("escalated hold match requires typed command and owner sources")
+    current = read_legacy_review_owner_lineage(
+        db, lineage.repository, lineage.current_owner,
+        configured_prior_owners=lineage.configured_prior_owners,
+    )
+    if current != lineage:
+        return UnmatchedLegacyEscalatedReviewHoldPlan(
+            dict(source.command_fields)["command_id"], "review owner lineage changed after inventory",
+        )
+    return _match_legacy_escalated_review_hold_plan(db, source, lineage, None)
+
+
+def _match_legacy_escalated_review_hold_plan(
+    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
+    lineage: LegacyReviewOwnerLineage, unique_remote_ids: frozenset[str] | None,
+) -> MatchedLegacyEscalatedReviewHoldPlan | UnmatchedLegacyEscalatedReviewHoldPlan:
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("escalated hold match requires an explicit SQL transaction")
+    if not isinstance(source, LegacyReviewSubmissionSource) or not isinstance(lineage, LegacyReviewOwnerLineage):
+        raise ValueError("escalated hold match requires typed command and owner sources")
+    command_id = dict(source.command_fields)["command_id"]
+    try:
+        bound = _verified_successful_review_receipt(db, source, lineage, unique_remote_ids)
+        if not bound.escalated:
+            raise ValueError("submission is not an escalated verdict")
+        recorded_fields, recorded_digest = _read_recording_source(
+            db, "review-recorded-submission", lineage.repository, command_id,
+        )
+        recorded = decode_workflow(dict(recorded_fields)["payload_json"], WorkflowRevision)
+        if recorded.version == 0:
+            raise ValueError("escalated review has no predecessor revision")
+        expected = WorkflowRevision(recorded.fence, recorded.version - 1)
+        transition_key = hashlib.sha256(encode_workflow(expected).encode()).hexdigest()
+        transition_fields, transition_digest = _read_recording_source(
+            db, "workflow-transition", lineage.repository, transition_key,
+        )
+        for fields in (recorded_fields, transition_fields):
+            receipt = dict(fields)
+            if receipt["reusable_after"] is not None:
+                raise ValueError("escalated baseline source is reclaimable")
+            _parse_stamp(receipt["claimed_at"])
+        accepted = json.loads(dict(transition_fields)["payload_json"],
+                              object_pairs_hook=_unique_receipt_object, parse_constant=_reject_nonfinite)
+        if (not isinstance(accepted, dict)
+                or set(accepted) != {"mutation", "expected", "snapshot", "audit", "commands"}
+                or accepted["mutation"] != WorkflowMutation.RECORD_REVIEW.value
+                or not isinstance(accepted["commands"], list)
+                or len(accepted["commands"]) != 1
+                or decode_workflow(accepted["expected"], WorkflowRevision) != expected):
+            raise ValueError("accepted transition is not an escalated review with one hold plan")
+        after = decode_workflow(accepted["snapshot"], ReviewWorkflowSnapshot)
+        audit = decode_workflow(accepted["audit"], ObservedTransition)
+        if (after.revision != recorded or after.binding != bound.submission.binding
+                or len(audit.evidence_ids) != 3
+                or audit.evidence_ids[:2] != (command_id, bound.receipt_id)
+                or (not isinstance(after.execution, ExecutionNotActivated)
+                    and (not isinstance(after.execution, ActivatedReviewExecution)
+                         or after.execution.binding.rejection != bound.submission.binding))):
+            raise ValueError("accepted escalation disagrees with its bound review")
+        key = bound.submission.binding.fence.key
+        evidence_id = audit.evidence_ids[2]
+        evidence_columns = (
+            "evidence_id", "repository", "target_kind", "target_number", "command_id", "kind", "payload_json",
+        )
+        evidence = _bounded_identity_row(
+            db, "workflow_evidence", "evidence_id", evidence_id,
+            evidence_columns, MAX_LEGACY_RECORDING_BYTES,
+        )
+        if any(type(evidence[name]) is not str for name in (
+            "evidence_id", "repository", "target_kind", "kind", "payload_json",
+        )) or not isinstance(key.target, PullRequestRef) or (
+            evidence["repository"], evidence["target_kind"], evidence["target_number"],
+            evidence["command_id"], evidence["kind"],
+        ) != (key.repository, "pr", key.target.number, None, "observation"):
+            raise ValueError("escalated hold lacks its exact pull request observation")
+        observation = decode_workflow(evidence["payload_json"], RecordedPullRequest)
+        if (evidence_id != "pr-observation:" + hashlib.sha256(encode_workflow(observation).encode()).hexdigest()
+                or observation.observation.key != key
+                or observation.observation.head_sha != bound.head_sha
+                or observation.observation.state is not PullRequestState.OPEN):
+            raise ValueError("escalated hold observation disagrees with its receipt")
+        projected = accepted["commands"][0]
+        if not isinstance(projected, dict) or not isinstance(projected.get("id"), str):
+            raise ValueError("escalated hold plan lacks a command identity")
+        projection_row = _bounded_identity_row(
+            db, "lifecycle_commands", "command_id", projected["id"],
+            LEGACY_SUBMISSION_COMMAND_COLUMNS, MAX_LEGACY_SQL_TEXT_BYTES,
+        )
+        projection = _command_from_row(projection_row)
+        if projection_row["payload_digest"] != _encoded_payload_digest(
+            projection_row["payload_json"], projection_row["workflow_binding_json"],
+        ):
+            raise ValueError("durable hold projection has a corrupt payload digest")
+        projection_fields = {
+            "id": projection.command_id, "idempotency": projection.idempotency_key,
+            "kind": projection.kind.value, "target": projection.target,
+            "revision": projection.expected_revision, "payload": dict(projection.payload),
+            "config": projection.config_version, "repository": projection.repository,
+            "owner": projection.executor_identity, "workflow": encode_workflow(projection.workflow),
+        }
+        if (projected != projection_fields
+                or projection_row["logical_key"] != projection.idempotency_key
+                or projection_row["occurrence"] != 0
+                or projection.kind is not CommandKind.RELABEL
+                or projection.executor_identity not in lineage.owners):
+            raise ValueError("durable hold projection disagrees with accepted plan")
+        trigger = Label(projection.payload["remove"])
+        expected_projection = _escalation_projection(
+            after, observation.observation, bound.submission.command_id,
+            escalation=command_id, trigger_label=trigger,
+            executor_identity=projection.executor_identity,
+        )
+        if projection != expected_projection:
+            raise ValueError("accepted relabel is not the guarded escalation hold")
+        observation_fields = tuple((name, evidence[name]) for name in evidence_columns)
+        command_fields = tuple((name, projection_row[name]) for name in LEGACY_SUBMISSION_COMMAND_COLUMNS)
+        observation_digest = hashlib.sha256(json.dumps(
+            (evidence["source_rowid"], observation_fields), separators=(",", ":"),
+        ).encode()).hexdigest()
+        projection_digest = hashlib.sha256(json.dumps(
+            (projection_row["source_rowid"], command_fields), separators=(",", ":"),
+        ).encode()).hexdigest()
+        return MatchedLegacyEscalatedReviewHoldPlan(
+            source, lineage, bound, recorded, after, audit, observation, projection,
+            recorded_digest, transition_digest, observation_digest, projection_digest,
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, sqlite3.Error,
+            WorkflowAuthorityError, CorruptControlStore) as exc:
+        return UnmatchedLegacyEscalatedReviewHoldPlan(command_id, _printable(str(exc)))
+
+
+@dataclass(frozen=True)
+class VerifiedLegacyEscalatedProductiveRound:
+    """A confirmed productive round with its accepted escalation hold plan."""
+
+    complete_storage: CompleteLegacyRoundOutcomeStorage
+    storage: VerifiedLegacyRoundOutcomeStorage
+    link: VerifiedReviewSubmissionRoundLink
+    hold_plan: MatchedLegacyEscalatedReviewHoldPlan
+    effect_receipt_id: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.complete_storage, CompleteLegacyRoundOutcomeStorage)
+                or not isinstance(self.storage, VerifiedLegacyRoundOutcomeStorage)
+                or not isinstance(self.link, VerifiedReviewSubmissionRoundLink)
+                or not isinstance(self.hold_plan, MatchedLegacyEscalatedReviewHoldPlan)):
+            raise ValueError("escalated productive round requires typed source proofs")
+        validate_workflow_identifier(self.effect_receipt_id, "escalated productive effect identity")
+        round_id = self.storage.outcome.round.round_id
+        conflicting = {"review-round-stale-productivity", "review-round-superseded-productivity",
+                       "review-round-ceiling-productivity"}
+        confirmed = tuple(item for item in self.storage.facts.submissions
+                          if isinstance(item.result, ReviewSubmissionConfirmed))
+        disposition = self.storage.outcome.disposition
+        execution = self.hold_plan.snapshot.execution
+        if (self.complete_storage._sealed_by_id.get(round_id) != self.storage
+                or bool(self.complete_storage._receipt_names_by_round.get(round_id, frozenset()) & conflicting)
+                or len(confirmed) != 1 or not isinstance(disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or self.storage.outcome.round != self.link.round
+                or self.link.source != self.hold_plan.source or self.link.lineage != self.hold_plan.lineage
+                or str(confirmed[0].plan.command_id) != dict(self.link.source.command_fields)["command_id"]
+                or confirmed[0].result.receipt_id != disposition.submission_receipt
+                or confirmed[0].result.receipt_id != self.effect_receipt_id
+                or confirmed[0].plan.kind is not (
+                    ReviewSubmissionKind.PAID if isinstance(disposition, PaidReviewProgress)
+                    else ReviewSubmissionKind.COPIED
+                )
+                or self.hold_plan.recorded_revision.fence != self.link.round.binding.rejection.fence
+                or not isinstance(execution, ActivatedReviewExecution)
+                or execution.binding != self.link.round.binding):
+            raise ValueError("escalated productive round has contradictory submission or hold evidence")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.complete_storage.source_digest, self.storage.source_digest,
+                 self.link.source_digest, self.hold_plan.source_digest, self.effect_receipt_id)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
 
 
 def read_review_submission_round_link(
@@ -2530,6 +2835,18 @@ class ClassifiedLegacyPlainReviewSuccess:
 
 
 @dataclass(frozen=True)
+class ClassifiedLegacyEscalatedReviewSuccess:
+    source: LegacyReviewSubmissionSource
+    proof: VerifiedLegacyEscalatedProductiveRound
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyReviewSubmissionSource)
+                or not isinstance(self.proof, VerifiedLegacyEscalatedProductiveRound)
+                or self.proof.link.source != self.source):
+            raise ValueError("escalated review classification requires its exact command proof")
+
+
+@dataclass(frozen=True)
 class ClassifiedLegacyStaleReviewSuccess:
     source: LegacyReviewSubmissionSource
     proof: MatchedLegacyStaleProductivityGenerationSources
@@ -2553,7 +2870,8 @@ class UnresolvedLegacyReviewSuccess:
 
 
 LegacyReviewSuccessClassification = (
-    ClassifiedLegacyPlainReviewSuccess | ClassifiedLegacyStaleReviewSuccess | UnresolvedLegacyReviewSuccess
+    ClassifiedLegacyPlainReviewSuccess | ClassifiedLegacyEscalatedReviewSuccess
+    | ClassifiedLegacyStaleReviewSuccess | UnresolvedLegacyReviewSuccess
 )
 
 
@@ -2578,7 +2896,8 @@ class CompleteLegacyReviewSuccessClassifications:
                            if potentially_successful_review_submission(source))
         if (len(self.results) != len(candidates)
                 or any(not isinstance(result, (
-                    ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyStaleReviewSuccess,
+                    ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyEscalatedReviewSuccess,
+                    ClassifiedLegacyStaleReviewSuccess,
                     UnresolvedLegacyReviewSuccess,
                 )) or result.source != source
                        for result, source in zip(self.results, candidates, strict=True))):
@@ -2598,6 +2917,11 @@ class CompleteLegacyReviewSuccessClassifications:
                         or result.proof.complete_storage != self.storage.round_storage
                         or result.proof.link.lineage != self.lineage):
                     raise ValueError("plain review classification lacks complete source membership")
+            elif isinstance(result, ClassifiedLegacyEscalatedReviewSuccess):
+                if (command_id not in registered_ids or command_id not in marker_ids
+                        or result.proof.complete_storage != self.storage.round_storage
+                        or result.proof.link.lineage != self.lineage):
+                    raise ValueError("escalated review classification lacks complete source membership")
             elif isinstance(result, ClassifiedLegacyStaleReviewSuccess):
                 if (command_id not in registered_ids or command_id in marker_ids
                         or result.proof.stale_path.complete_storage != self.storage
@@ -2667,24 +2991,38 @@ def classify_complete_legacy_review_successes(
             results.append(UnresolvedLegacyReviewSuccess(source, "successful command owner is outside the review lineage"))
         elif command_id in storage._recorded_marker_ids:
             link = read_review_submission_round_link(db, source, lineage)
-            baseline = _read_legacy_recorded_review(db, source, lineage, storage._unique_remote_review_ids)
             if isinstance(link, UnverifiedReviewSubmissionRoundLink):
                 results.append(UnresolvedLegacyReviewSuccess(source, link.reason))
-                continue
-            if isinstance(baseline, UnverifiedLegacyRecordedReview):
-                results.append(UnresolvedLegacyReviewSuccess(source, baseline.reason))
                 continue
             round_storage = storage.round_storage._sealed_by_id.get(registration.plan.round.round_id)
             if round_storage is None:
                 results.append(UnresolvedLegacyReviewSuccess(source, "recorded review lacks a sealed round"))
                 continue
             try:
-                proof = VerifiedLegacyPlainProductiveRound(
-                    storage.round_storage, round_storage, link, baseline,
-                    _effect_receipt_id(command_id, effect["receipt_digest"]),
-                )
-                results.append(ClassifiedLegacyPlainReviewSuccess(source, proof))
-            except (KeyError, TypeError, ValueError) as exc:
+                bound = load_bound_review_submission(db, CommandId(command_id))
+                if isinstance(bound, ReviewSubmissionReceipt) and bound.escalated:
+                    hold = _match_legacy_escalated_review_hold_plan(
+                        db, source, lineage, storage._unique_remote_review_ids,
+                    )
+                    if isinstance(hold, UnmatchedLegacyEscalatedReviewHoldPlan):
+                        raise ValueError(hold.reason)
+                    proof = VerifiedLegacyEscalatedProductiveRound(
+                        storage.round_storage, round_storage, link, hold,
+                        _effect_receipt_id(command_id, effect["receipt_digest"]),
+                    )
+                    results.append(ClassifiedLegacyEscalatedReviewSuccess(source, proof))
+                else:
+                    baseline = _read_legacy_recorded_review(
+                        db, source, lineage, storage._unique_remote_review_ids,
+                    )
+                    if isinstance(baseline, UnverifiedLegacyRecordedReview):
+                        raise ValueError(baseline.reason)
+                    proof = VerifiedLegacyPlainProductiveRound(
+                        storage.round_storage, round_storage, link, baseline,
+                        _effect_receipt_id(command_id, effect["receipt_digest"]),
+                    )
+                    results.append(ClassifiedLegacyPlainReviewSuccess(source, proof))
+            except (KeyError, TypeError, ValueError, WorkflowAuthorityError, CorruptControlStore) as exc:
                 results.append(UnresolvedLegacyReviewSuccess(source, _printable(str(exc))))
         else:
             path = _stale_productivity_path_from_storage(storage, command_id)

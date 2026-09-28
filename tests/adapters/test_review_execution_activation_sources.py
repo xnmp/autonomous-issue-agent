@@ -35,7 +35,10 @@ from issue_agent.adapters.review_execution_activation import (
     MatchedLegacyStaleProductivityGenerationSources, UnmatchedLegacyStaleProductivityGenerationSources,
     classify_complete_legacy_review_successes,
     CompleteLegacyReviewSuccessClassifications, BlockedLegacyReviewSuccessClassifications,
-    ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyStaleReviewSuccess, UnresolvedLegacyReviewSuccess,
+    ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyEscalatedReviewSuccess,
+    ClassifiedLegacyStaleReviewSuccess, UnresolvedLegacyReviewSuccess,
+    match_legacy_escalated_review_hold_plan,
+    MatchedLegacyEscalatedReviewHoldPlan, UnmatchedLegacyEscalatedReviewHoldPlan,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -1478,6 +1481,125 @@ def test_complete_success_classification_rejects_shared_remote_review_identity(r
     assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
     assert not any(isinstance(result, ClassifiedLegacyPlainReviewSuccess) for result in classified.results)
     assert any("shared by another command" in result.reason for result in classified.unresolved)
+
+
+def _match_recorded_escalation(store, command_id):
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_submissions(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewSubmissions)
+        source = next(item for item in observed.submissions
+                      if dict(item.command_fields)["command_id"] == str(command_id))
+        lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        before = db.total_changes
+        result = match_legacy_escalated_review_hold_plan(db, source, lineage)
+        assert db.total_changes == before
+        db.rollback()
+    return result
+
+
+def test_recorded_escalation_matches_accepted_hold_plan_without_claiming_delivery(rig):
+    store, gateway, _, _, _, command = confirmed_escalation(rig)
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+
+    result = _match_recorded_escalation(store, command.command_id)
+
+    assert isinstance(result, MatchedLegacyEscalatedReviewHoldPlan)
+    assert result.snapshot.episode.continuation.source.command_id == command.command_id
+    assert result.projection.payload["add"] == Label.NEEDS_HUMAN_REVIEW.value
+    assert len(result.source_digest) == 64
+    with store.transaction() as db:
+        effect = db.execute("SELECT 1 FROM effect_receipts WHERE command_id=?",
+                            (str(result.projection.command_id),)).fetchone()
+    assert effect is None
+
+
+@pytest.mark.parametrize("damage", [
+    "observation", "transition", "projection", "projection_digest", "projection_identity",
+])
+def test_recorded_escalation_rejects_changed_hold_sources(rig, damage):
+    store, gateway, _, _, _, command = confirmed_escalation(rig)
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    with store.transaction() as db:
+        if damage == "observation":
+            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-transition' "
+                             "AND scope='o/r' ORDER BY rowid DESC LIMIT 1").fetchone()
+            accepted = json.loads(row["payload_json"])
+            evidence_id = decode_workflow(accepted["audit"], ObservedTransition).evidence_ids[2]
+            db.execute("UPDATE workflow_evidence SET payload_json='{}' WHERE evidence_id=?", (evidence_id,))
+        elif damage == "transition":
+            row = db.execute("SELECT key,payload_json FROM dedupe_keys WHERE namespace='workflow-transition' "
+                             "AND scope='o/r' ORDER BY rowid DESC LIMIT 1").fetchone()
+            accepted = json.loads(row["payload_json"])
+            accepted["commands"][0]["payload"]["add"] = Label.AI_PR_OPEN.value
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='workflow-transition' "
+                       "AND scope='o/r' AND key=?", (json.dumps(accepted), row["key"]))
+        elif damage == "projection":
+            db.execute("UPDATE lifecycle_commands SET payload_json='{}' WHERE kind='relabel' "
+                       "AND repository='o/r'")
+        elif damage == "projection_digest":
+            db.execute("UPDATE lifecycle_commands SET payload_digest=? WHERE kind='relabel' "
+                       "AND repository='o/r'", ("0" * 64,))
+        else:
+            db.execute("UPDATE lifecycle_commands SET logical_key='wrong',occurrence=7 "
+                       "WHERE kind='relabel' AND repository='o/r'")
+
+    result = _match_recorded_escalation(store, command.command_id)
+
+    assert isinstance(result, UnmatchedLegacyEscalatedReviewHoldPlan)
+
+
+def test_recorded_escalation_rechecks_owner_lineage_before_matching(rig):
+    store, gateway, _, _, _, command = confirmed_escalation(rig)
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    with store.transaction() as db:
+        observed = read_complete_legacy_review_submissions(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewSubmissions)
+        source = next(item for item in observed.submissions
+                      if dict(item.command_fields)["command_id"] == str(command.command_id))
+        lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
+        assert isinstance(lineage, LegacyReviewOwnerLineage)
+        _retired_review_owner(db, "o/r:review:older", CONTROL_OWNER)
+        result = match_legacy_escalated_review_hold_plan(db, source, lineage)
+
+    assert isinstance(result, UnmatchedLegacyEscalatedReviewHoldPlan)
+    assert "lineage changed" in result.reason
+
+
+def test_complete_success_classification_proves_escalated_verdict_and_hold_plan(rig):
+    store, gateway, _, control, plan, command = confirmed_escalation(rig)
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        db.rollback()
+
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    assert len(classified.results) == 1
+    result = classified.results[0]
+    assert isinstance(result, ClassifiedLegacyEscalatedReviewSuccess)
+    assert result.proof.storage.outcome.round == plan.round
+    assert result.proof.hold_plan.projection.payload["add"] == Label.NEEDS_HUMAN_REVIEW.value
+    assert not classified.unresolved
+
+
+def test_complete_success_classification_keeps_corrupt_escalation_hold_unresolved(rig):
+    store, gateway, _, control, plan, command = confirmed_escalation(rig)
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        db.execute("UPDATE lifecycle_commands SET payload_digest=? WHERE kind='relabel' "
+                   "AND repository='o/r'", ("0" * 64,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        db.rollback()
+
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    assert len(classified.unresolved) == 1
+    assert "corrupt payload digest" in classified.unresolved[0].reason
 
 
 def test_stale_generation_join_proves_real_accepted_crossing_without_writes(rig):

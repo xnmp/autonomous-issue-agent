@@ -144,6 +144,13 @@ with `CLAUDE.md`, `AGENTS.md`, the
   validates candidate coverage, but is observational and cannot reset or
   activate an execution. Immutable indexes and snapshot-local caches keep
   repeated classifications bounded by their relevant sources.
+- Checkpoint 54 matches an escalated verdict to the accepted recorded-baseline
+  transition, its exact harness-owned pull request observation and the
+  durable guarded relabel command enqueued in that transition. It checks the
+  initial outbox identity and payload digest. Complete classification now
+  has a distinct escalated productive-round variant when its sealed outcome
+  agrees. This proves the accepted hold plan, not remote relabel delivery or
+  the present GitHub hold state.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -295,6 +302,18 @@ The log is `/tmp/phase4-success-classification-gate.log` (ephemeral):
 governor, gate parity, four import contracts and both Pyrefly checks. Ten
 strict xfails remained expected.
 
+Independent Sol review of checkpoint 54 found a projected-command digest
+gap and stale owner lineage in the standalone matcher. Both were fixed, along
+with an outbox logical-key/occurrence mismatch, and regression-tested. The
+final review found no remaining medium or high issue. The complete classifier
+distinguishes plain, escalated-with-plan, typed stale and unresolved
+successes. Full gate evidence follows.
+
+The log is `/tmp/phase4-escalated-hold-plan-gate.log` (ephemeral):
+3,200 domain, 3,065 adapter and 2,866 app tests passed, plus hooks,
+governor, gate parity, four import contracts and both Pyrefly checks. Ten
+strict xfails remained expected.
+
 These are offline source readers and classifiers. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -304,11 +323,12 @@ occurred.
 ## Next required boundary
 
 The next proof must replay ordered outcomes for each execution episode, with
-escalated verdict hold provenance and unresolved historical submissions kept
-explicit. Every potentially successful submission now has an observational
-classification against its bound effect, recorded baseline, sealed outcome
-and productivity path. Raw recorded markers and completed agent runs are
-observations, not reset authority.
+the delivered or otherwise verified current state of escalated holds and
+unresolved historical submissions kept explicit. Every potentially successful
+submission now has an observational classification against its bound effect,
+recorded baseline, sealed outcome and productivity path. An accepted relabel
+plan does not establish its remote effect. Raw recorded markers and completed
+agent runs are observations, not reset authority.
 
 Legacy stale receipts store only `(facts, outcome)` and the writer's claim
 time; they remain unknown for historical crossing. New typed receipts capture
@@ -326,9 +346,9 @@ order a durable clock.
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
 2. Replay the complete successful-submission classifications and sealed
-   outcomes in execution order to establish resets. Verify escalated verdict
-   hold provenance and resolve or block historical unregistered and old stale
-   submissions. A completed
+   outcomes in execution order to establish resets. Verify delivered escalated
+   holds or their current observed state, and resolve or block historical
+   unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
 3. Join positive issue-keyed file counters to PRs with fresh complete

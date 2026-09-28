@@ -1349,3 +1349,32 @@ Full `make test` passed: 3,200 domain, 3,056 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-success-classification-gate.log` (ephemeral).
+
+## Checkpoint 54 — escalated verdict hold-plan provenance (offline)
+
+A read-only matcher now joins a successful escalated verdict to its permanent
+recorded baseline, accepted `RECORD_REVIEW` transition, harness-owned pull
+request observation, and the exact durable guarded relabel command projected
+by that transition. It checks the command's payload and binding digest,
+deterministic escalation identity, initial outbox logical key and occurrence,
+owner lineage, and reconstructed hold plan. The returned value proves an
+accepted **hold obligation**, not that GitHub received the relabel. It remains
+an observation that must be rechecked under activation barriers.
+
+Complete successful-submission classification now includes a distinct
+escalated productive-round variant only when that hold plan, registered
+submission, sealed outcome and effect receipt agree. A ceiling escalation,
+missing plan, corrupt command or unresolved hold delivery still cannot become
+a proven current hold. Ordered outcome replay and final hold-state provenance
+remain separate activation obligations.
+
+Independent Sol review found a corrupt projected-command payload digest could
+pass the first match and that standalone owner lineage needed a fresh read.
+Both were fixed with regressions. A malformed initial outbox logical key and
+occurrence were also rejected. Its final pass found no remaining medium or
+high issue. Full gate evidence follows.
+
+Full `make test` passed: 3,200 domain, 3,065 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-escalated-hold-plan-gate.log` (ephemeral).
