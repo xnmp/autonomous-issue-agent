@@ -586,6 +586,21 @@ the complete audit benchmark.
   ancestry, command effects and admission authority remain pending. Full-gate
   results are recorded in the progress board after acceptance.
 
+- Checkpoint 94 (`b55803e`) retains a distinct typed pending owner for a
+  receipt in an unfinished round. It rechecks the exact indexed round row and
+  swept receipt digest, requires the receipt to be planned by that open round,
+  and does not grant finalized membership. A contradictory non-complete seal
+  is blocked. Sol review found that seal edge; its regression and the full
+  gate passed: 3,291 domain, 3,332 adapter and 2,876 app tests, four import
+  contracts and Pyrefly.
+- Checkpoint 95 (`abd4995`) lets the indexed round and receipt sweeps take a
+  caller-selected one-to-sixteen source limit. A durable audit can now use one
+  source per transaction while retaining the same fixed upper cursor,
+  lookahead, malformed-source checks and byte limits. Sol review found no
+  issue. The full gate passed: 3,291 domain, 3,334 adapter and 2,876 app
+  tests, four import contracts and Pyrefly. Neither commit changes live
+  authority, activates a family or permits a compacted load.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -593,11 +608,21 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–93, the durable round cursor completes a bounded row
-sweep, and one indexed namespace source can be matched to an exact finalized
-round member. Next, persist and reconcile a complete receipt-namespace pass,
-including explicit treatment of open rounds, then bind the retired member
-stream to checkpoint ancestry. Before a writer can use the checkpoint-86
+With checkpoints 88–95, the durable round cursor completes a bounded row
+sweep, one indexed namespace source can be matched to an exact finalized
+round member, and valid open-round receipts remain explicitly pending. Next,
+persist and reconcile a complete receipt-namespace pass, then bind the retired
+member stream to checkpoint ancestry. The expected pass should capture a
+fixed contiguous finalized sequence frontier so an open round cannot be
+mistaken for a missing archived member. It must revisit a prior finalized
+prefix on later passes and detect changed source digests even when newer
+rounds are appended. Sweep every retained receipt namespace, resolve each
+source to a finalized or pending owner, and compare the finalized expected
+member count and source fingerprint with the namespace census. Include
+unclaimed global receipts, missing tails, malformed aliases, open-to-final
+growth between transactions, origin drift and due-state regressions. A
+completed observational pass is still not admission or checkpoint authority.
+Before a writer can use the checkpoint-86
 proposal, establish a true cumulative read bound around canonical load and
 each source reader; prove generation-only and later-checkpoint paths; verify
 every retired receipt payload; and publish the checkpoint and initialized
