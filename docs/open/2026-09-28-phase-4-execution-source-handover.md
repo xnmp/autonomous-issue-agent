@@ -564,6 +564,16 @@ the complete audit benchmark.
   gaps; all have focused regressions. Full-gate results are recorded in the progress
   board after acceptance.
 
+- Checkpoint 92 reuses the same classifier for one finalized round's exact
+  bounded receipt members. It first reads the canonical round and its member
+  digests, re-reads each member under the same SQL transaction, checks its
+  digest and payload, and requires every embedded round reference to name the
+  requested round. A real copied round and a generation-witnessed stale round
+  pass; malformed and historical unwitnessed payloads block. This point read
+  is observational. It does not detect unclaimed namespace rows, prove external
+  command or claim ancestry, or authorize a compacted load. Full-gate results
+  are recorded in the progress board after acceptance.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -571,9 +581,10 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–91, the durable round cursor completes a bounded row
+With checkpoints 88–92, the durable round cursor completes a bounded row
 sweep, and separate reads expose both expected finalized-round receipt
-members and locally classified namespace sources. Next, reconcile round
+members with locally classified payloads and expose classified namespace
+sources. Next, reconcile round
 members against checkpoint ancestry and expected source digests, then persist
 and reconcile a complete receipt-namespace pass to find unclaimed receipts.
 Before a writer

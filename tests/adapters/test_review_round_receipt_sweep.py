@@ -1,24 +1,31 @@
 """Indexed, bounded observations of retained review round receipt rows."""
 
 from dataclasses import replace
+from contextlib import closing
 
 import pytest
 
 import issue_agent.adapters.review_round_receipt_sweep as sweep
 from issue_agent.adapters.review_round_receipt_sweep import (
     BlockedReviewRoundReceiptSweepPage, ClassifiedReviewRoundReceiptSweepPage,
-    ObservedReviewRoundReceiptSweepPage,
+    ObservedReviewCheckpointRoundClassifiedReceiptSet, ObservedReviewRoundReceiptSweepPage,
     ReviewRoundReceiptSweepCursor,
+    read_classified_checkpoint_round_receipt_members,
     read_classified_review_round_receipt_sweep_page, read_review_round_receipt_sweep_page,
 )
 from issue_agent.domain.review_receipt_attribution import (
     BoundReviewRoundReceipt, CommandReviewRoundReceipt,
 )
+from issue_agent.domain.review_rounds import (
+    ReviewSubmissionRegistration, StaleReviewProductivitySettlement,
+)
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from tests.adapters.test_review_execution_persistence import active
 from tests.adapters.test_review_execution_control import current, rig
 from tests.adapters.test_review_productive_settlement import (
-    confirmed_copy, confirmed_escalation, workflow_for,
+    accepted_generation_with_open_submission, confirmed_copy, confirmed_escalation,
+    workflow_for,
 )
 from tests.adapters.test_review_execution_stage import stage
 
@@ -177,6 +184,90 @@ def test_classified_receipt_sweep_attributes_real_finalized_round(rig):
         assert by_namespace[namespace].round == plan.round
     assert isinstance(by_namespace["review-recorded-submission"], CommandReviewRoundReceipt)
     assert by_namespace["review-recorded-submission"].command_id == str(command.command_id)
+
+
+def test_classified_checkpoint_round_members_match_real_receipt_payloads(rig):
+    store, gateway, _, _, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).settle_submission(command.command_id)
+    with store.transaction() as db:
+        before = db.total_changes
+        result = read_classified_checkpoint_round_receipt_members(db, plan.round)
+        assert db.total_changes == before
+    assert isinstance(result, ObservedReviewCheckpointRoundClassifiedReceiptSet)
+    assert tuple(item.member for item in result.receipts) == result.source.members
+    assert all(
+        item.reference == BoundReviewRoundReceipt(plan.round)
+        for item in result.receipts
+        if item.member.namespace != "review-recorded-submission"
+    )
+    recorded = next(item for item in result.receipts
+                    if item.member.namespace == "review-recorded-submission")
+    assert recorded.reference == CommandReviewRoundReceipt(str(command.command_id))
+
+
+def test_classified_checkpoint_round_members_block_mutated_payload(rig):
+    store, gateway, _, _, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).settle_submission(command.command_id)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json='{}' "
+            "WHERE namespace='review-round-preflight' AND key=?",
+            (plan.round.round_id,),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="payload is unreadable"):
+            read_classified_checkpoint_round_receipt_members(db, plan.round)
+
+
+def test_classified_checkpoint_round_members_block_well_formed_foreign_round(rig):
+    store, gateway, _, _, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).settle_submission(command.command_id)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys "
+            "WHERE namespace='review-round-submission' AND key=?",
+            (str(command.command_id),),
+        ).fetchone()
+        registered = decode_workflow(row["payload_json"], ReviewSubmissionRegistration)
+        foreign = replace(registered, round=replace(registered.round, round_id="round:foreign"))
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json=? "
+            "WHERE namespace='review-round-submission' AND key=?",
+            (encode_workflow(foreign), str(command.command_id)),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="payload is unreadable"):
+            read_classified_checkpoint_round_receipt_members(db, plan.round)
+
+
+def test_classified_checkpoint_round_members_require_stale_generation_witness(rig):
+    store, _, _, _, plan, command, workflow = accepted_generation_with_open_submission(rig)
+    workflow.settle_submission(command.command_id)
+    with store.transaction() as db:
+        observed = read_classified_checkpoint_round_receipt_members(db, plan.round)
+        assert any(item.member.namespace == "review-round-stale-productivity"
+                   for item in observed.receipts)
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys "
+            "WHERE namespace='review-round-stale-productivity' AND key=?",
+            (plan.round.round_id,),
+        ).fetchone()
+        stale = decode_workflow(row["payload_json"], StaleReviewProductivitySettlement)
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json=? "
+            "WHERE namespace='review-round-stale-productivity' AND key=?",
+            (encode_workflow((stale.facts, stale.outcome)), plan.round.round_id),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="payload is unreadable"):
+            read_classified_checkpoint_round_receipt_members(db, plan.round)
+
+
+def test_classified_checkpoint_round_members_require_transaction_and_round(rig):
+    store, _, _, _, plan, _ = confirmed_copy(rig)
+    with store.transaction() as db:
+        with pytest.raises(ValueError, match="transaction and round"):
+            read_classified_checkpoint_round_receipt_members(db, None)
+    with closing(store._connect()) as db:
+        with pytest.raises(ValueError, match="transaction and round"):
+            read_classified_checkpoint_round_receipt_members(db, plan.round)
 
 
 def test_classified_receipt_sweep_checks_stage_derived_key(rig):
