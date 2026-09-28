@@ -10,7 +10,7 @@ import json
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from .review_workflow import ReviewedBaseline
 from .review_workflow_policy import ReviewSubmissionReceipt
-from .review_execution import ReviewRoundIdentity, ReviewRoundOutcome
+from .review_execution import ReviewRoundIdentity, ReviewRoundOutcome, PaidReviewProgress, CopiedReviewProgress
 from .review_rounds import ReviewRoundFacts, FinalizedReviewRound, DeferredReviewPreparation, finalize_review_round
 from .workflow import ObservedTransition
 from .workflow_identity import (
@@ -696,6 +696,79 @@ class UnverifiedLegacyRoundOutcomeStorage:
     def __post_init__(self) -> None:
         validate_workflow_identifier(self.round_id, "unverified round outcome")
         validate_workflow_text(self.reason, "unverified round outcome reason")
+
+
+@dataclass(frozen=True)
+class CompleteLegacyRoundOutcomeStorage:
+    """Every sealed round has one verified outcome receipt; open rounds have none."""
+
+    rounds: CompleteLegacyReviewRounds
+    receipts: CompleteLegacyReviewOutcomeReceipts
+    sealed: tuple[VerifiedLegacyRoundOutcomeStorage, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.rounds, CompleteLegacyReviewRounds)
+                or not isinstance(self.receipts, CompleteLegacyReviewOutcomeReceipts)
+                or self.rounds.repository != self.receipts.repository
+                or not isinstance(self.sealed, tuple)
+                or any(not isinstance(entry, VerifiedLegacyRoundOutcomeStorage) for entry in self.sealed)):
+            raise ValueError("complete outcome storage requires typed matching inventories")
+        round_sources = {dict(source.fields)["round_id"]: source for source in self.rounds.rounds}
+        receipt_sources = {(dict(source.fields)["namespace"], dict(source.fields)["key"]): source
+                           for source in self.receipts.receipts}
+        if any((dict(source.fields)["closure_json"] is None) != (dict(source.fields)["outcome_json"] is None)
+               for source in self.rounds.rounds):
+            raise ValueError("complete outcome storage has a partially sealed round")
+        closed_ids = {round_id for round_id, source in round_sources.items()
+                      if dict(source.fields)["outcome_json"] is not None}
+        proof_ids = [entry.facts.plan.round.round_id for entry in self.sealed]
+        outcome_receipt_ids = {key for namespace, key in receipt_sources if namespace == "review-round-outcome"}
+        if (len(set(proof_ids)) != len(proof_ids)
+                or set(proof_ids) != closed_ids or outcome_receipt_ids != closed_ids
+                or any(dict(source.fields)["key"] not in closed_ids
+                       or dict(source.fields)["reusable_after"] is not None
+                       for source in self.receipts.receipts)
+                or any(entry.round_source != round_sources[round_id]
+                       or entry.receipt_source != receipt_sources[("review-round-outcome", round_id)]
+                       for round_id, entry in zip(proof_ids, self.sealed, strict=True))):
+            raise ValueError("complete outcome storage leaves a round or receipt unaccounted for")
+        productivity_names = {"review-round-stale-productivity", "review-round-superseded-productivity",
+                              "review-round-ceiling-productivity"}
+        names_by_round: dict[str, set[str]] = {}
+        for namespace, key in receipt_sources:
+            names_by_round.setdefault(key, set()).add(namespace)
+        for entry in self.sealed:
+            round_id = entry.facts.plan.round.round_id
+            names = names_by_round[round_id]
+            deferred = isinstance(finalize_review_round(entry.facts), DeferredReviewPreparation)
+            productive = isinstance(entry.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
+            if (("review-round-preparation" in names) != deferred
+                    or len(names & productivity_names) > 1
+                    or (not productive and bool(names & productivity_names))):
+                raise ValueError("complete outcome storage has contradictory auxiliary receipts")
+
+    @property
+    def repository(self) -> str:
+        return self.rounds.repository
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.rounds.source_digest, self.receipts.source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyRoundOutcomeStorage:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked outcome storage requires a canonical repository")
+        validate_workflow_text(self.reason, "blocked outcome storage reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked outcome storage cursor")
 
 
 MAX_LEGACY_REVIEW_OWNERS = 64

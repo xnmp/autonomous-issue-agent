@@ -1109,3 +1109,24 @@ Full `make test` passed: 3,198 domain, 2,934 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-round-outcome-storage-gate.log` (ephemeral).
+
+## Checkpoint 44 — whole-set round and outcome receipt accounting (offline)
+
+A read-only verifier now revalidates each complete SQL inventory once, then
+accounts for every sealed and open round and all five outcome/productivity
+receipt namespaces. Every sealed round must pass the closure-derived outcome
+proof and have one permanent outcome receipt; open rounds have none. Missing or
+orphaned receipts, partially sealed rounds, expiring receipts, malformed claim
+times, contradictory preparation obligations and multiple or nonproductive
+productivity receipts block the complete result. Preparation and stale
+productivity payloads must match their exact facts; superseded and ceiling
+receipts must have canonical typed settlement tuples. The source set remains a
+storage proof: external observation authority, recorded baselines, productive
+reset order and escalated hold provenance still need separate joins.
+Independent Sol review found an initial auxiliary receipt gap; the outcome
+specific constraints and regressions address it. Its second pass found no
+remaining medium or high issue.
+Full `make test` passed: 3,198 domain, 2,948 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-whole-outcome-storage-gate.log` (ephemeral).
