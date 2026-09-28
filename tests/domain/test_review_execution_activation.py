@@ -13,6 +13,7 @@ from issue_agent.domain.review_execution_activation import (
     UnreadableLegacyReviewSubmission,
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LegacyReviewSubmissionReceiptPage,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
+    LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
 )
 
 
@@ -187,3 +188,24 @@ def test_submission_receipt_source_digest_and_page_cursor():
 def test_submission_receipt_source_rejects_bad_identity_or_text(changes):
     with pytest.raises(ValueError):
         receipt_source(**changes)
+
+
+def test_review_owner_lineage_binds_retirement_sources_without_rowid():
+    first = LegacyReviewOwnerLink(1, "o/r:review:old", "o/r:review:new", "o/r", "review", "retired")
+    second = LegacyReviewOwnerLink(2, "o/r:review:oldest", "o/r:review:old", "o/r", "review", "earlier")
+    lineage = LegacyReviewOwnerLineage("o/r", "o/r:review:new", (),
+                                       ("o/r:review:new", "o/r:review", "o/r:review:old", "o/r:review:oldest"),
+                                       (first, second))
+    assert replace(first, source_rowid=9).source_digest == first.source_digest
+    assert replace(lineage, links=(replace(first, source_rowid=9), second)).source_digest == lineage.source_digest
+    assert replace(lineage, links=(second, first)).source_digest == lineage.source_digest
+    with pytest.raises(ValueError, match="incomplete"):
+        replace(lineage, owners=lineage.owners[:-1])
+
+
+def test_review_owner_lineage_rejects_reachable_cycle():
+    a = LegacyReviewOwnerLink(1, "old-a", "old-b", "o/r", "review", "first")
+    b = LegacyReviewOwnerLink(2, "old-b", "old-a", "o/r", "review", "second")
+    with pytest.raises(ValueError, match="cycle"):
+        LegacyReviewOwnerLineage("o/r", "o/r:review:current", ("old-a",),
+                                 ("o/r:review:current", "o/r:review", "old-a", "old-b"), (a, b))

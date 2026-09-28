@@ -33,12 +33,17 @@ with `CLAUDE.md`, `AGENTS.md`, the
   round index and recorded-review settlement namespaces in `dedupe_keys`.
   These raw rows must still be joined to command/effect, round and verdict
   sources; their presence alone does not prove a productive reset.
+- Checkpoint 35 adds a bounded, read-only owner lineage source. It includes
+  daemon boot's implicit `repository:review` predecessor, configured prior
+  deployments and transitive retirement links. Contradictory or unreadable
+  links block a complete lineage claim.
 
-The checkpoint-34 full `make test` gate passed: 3,189 domain, 2,855 adapter
+The checkpoint-35 full `make test` gate passed: 3,191 domain, 2,868 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
 and both Pyrefly checks. Ten strict xfails remained expected. The log is
-`/tmp/phase4-submission-index-source-gate.log` (ephemeral). Independent Sol
-review found no medium or high issue in the registration/index reader.
+`/tmp/phase4-owner-lineage-gate.log` (ephemeral). Independent Sol review found
+and verified fixes for the implicit legacy owner and BLOB successor omissions;
+its second pass found no remaining medium or high issue.
 
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
@@ -48,11 +53,11 @@ occurred.
 
 ## Next required boundary
 
-1. Inventory all authorized review owners, including configured predecessor
-   deployments. Daemon boot calls `adopt_legacy_owner`; the offline importer
-   must inspect the authorized lineage without rewriting it. Complete every
-   paged run scan under one SQL snapshot, and revalidate under activation
-   barriers before commit.
+1. Complete every paged run scan for the inventoried owner closure under the
+   same SQL snapshot, then revalidate the closure and runs under activation
+   barriers before commit. Daemon boot's `adopt_legacy_owner` rewrites some
+   prior run owners, so neither the current owner nor configured owners alone
+   establish complete historical run evidence.
 2. Join the inventoried `SUBMIT_REVIEW` commands, effects and registration/index
    rows to bounded round plans; inspect verdict hold provenance. Reconstruct productive
    reset boundaries from confirmed source receipts; a completed agent run is

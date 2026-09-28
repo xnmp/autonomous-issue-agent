@@ -20,8 +20,10 @@ from ..domain.review_execution_activation import (
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
     LegacyReviewSubmissionReceiptPage, LegacyReviewSubmissionReceiptSource,
     UnreadableLegacyReviewSubmissionReceipt,
+    MAX_LEGACY_REVIEW_OWNERS, LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
+    UnreadableLegacyReviewOwnerLineage,
 )
-from ..domain.workflow_identity import canonical_workflow_repository
+from ..domain.workflow_identity import canonical_workflow_repository, validate_workflow_identifier
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
 
 _PR_NAME = re.compile(r"pr-(.*)\.(session|round)", re.DOTALL)
@@ -32,6 +34,7 @@ _MAX_NUMBER = 2**63 - 1
 MAX_RUN_SOURCE_PAGE = 256
 MAX_SUBMISSION_SOURCE_PAGE = 64
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
+_RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
 _RUN_COLUMNS = (
     "run_id", "dispatch_id", "kind", "state", "config_version", "started_at", "completed_at", "outcome",
     "provider_receipt_id", "workflow_binding_json", "workflow_episode_key", "review_round_id", "review_child_id",
@@ -302,3 +305,119 @@ def read_legacy_review_submission_receipt_page(
         tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
         len(metadata) > MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
     )
+
+
+def read_legacy_review_owner_lineage(
+    db: sqlite3.Connection, repository: str, current_owner: str,
+    *, configured_prior_owners: tuple[str, ...] = (),
+) -> LegacyReviewOwnerLineage | UnreadableLegacyReviewOwnerLineage:
+    """Resolve a bounded review-owner closure without adopting or rewriting it.
+
+    The caller supplies exact config-authorized predecessors; retained
+    retirements extend that set. Every run scan must use the same SQL snapshot.
+    """
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("owner lineage requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("owner lineage requires a canonical repository")
+    validate_workflow_identifier(current_owner, "current review owner")
+    if (not isinstance(configured_prior_owners, tuple)
+            or len(configured_prior_owners) >= MAX_LEGACY_REVIEW_OWNERS):
+        raise ValueError("owner lineage requires bounded configured predecessors")
+    for owner in (current_owner, *configured_prior_owners):
+        validate_workflow_identifier(owner, "configured review owner")
+        try:
+            owner.encode("utf-8")
+        except UnicodeError as exc:
+            raise ValueError("review owner must have a UTF-8 identity") from exc
+    implicit_legacy_owner = f"{repository}:review"
+    if current_owner != implicit_legacy_owner and not current_owner.startswith(implicit_legacy_owner + ":"):
+        raise ValueError("current review owner does not match its repository and role")
+    configured = tuple(dict.fromkeys(
+        owner for owner in configured_prior_owners if owner not in {current_owner, implicit_legacy_owner}
+    ))
+    owners = list(dict.fromkeys((current_owner, implicit_legacy_owner, *configured)))
+    if len(owners) > MAX_LEGACY_REVIEW_OWNERS:
+        raise ValueError("owner lineage has too many configured predecessors")
+
+    current_retirement = db.execute(
+        "SELECT rowid FROM retired_owners WHERE owner_id IN (?,?)",
+        (current_owner, current_owner.encode("utf-8")),
+    ).fetchone()
+    if current_retirement is not None:
+        return UnreadableLegacyReviewOwnerLineage("current review owner is retired", current_retirement["rowid"])
+
+    seen = set(owners)
+    links: list[LegacyReviewOwnerLink] = []
+    processed: set[str] = set()
+    frontier = owners.copy()
+    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in _RETIRED_OWNER_COLUMNS)
+    while frontier:
+        frontier = [owner for owner in frontier if owner not in processed]
+        if not frontier:
+            break
+        processed.update(frontier)
+        lookup = (*frontier, *(owner.encode("utf-8") for owner in frontier))
+        placeholders = ",".join("?" for _ in lookup)
+        metadata = db.execute(
+            f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM retired_owners "
+            f"WHERE successor_owner_id IN ({placeholders}) ORDER BY rowid LIMIT ?",
+            (*lookup, MAX_LEGACY_REVIEW_OWNERS + 1),
+        ).fetchall()
+        if len(metadata) > MAX_LEGACY_REVIEW_OWNERS:
+            return UnreadableLegacyReviewOwnerLineage("retired review owner frontier exceeds the bound")
+        oversized = next((row for row in metadata if row["largest_value"] > MAX_LEGACY_SQL_TEXT_BYTES), None)
+        if oversized is not None:
+            return UnreadableLegacyReviewOwnerLineage(
+                "retired review owner field exceeds the SQL text bound", oversized["source_rowid"],
+            )
+        if not metadata:
+            break
+        rowids = [row["source_rowid"] for row in metadata]
+        ids = ",".join("?" for _ in rowids)
+        fields = ",".join(
+            f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+            for column in _RETIRED_OWNER_COLUMNS
+        )
+        values = {row["source_rowid"]: row for row in db.execute(
+            f"SELECT rowid AS source_rowid,{fields} FROM retired_owners WHERE rowid IN ({ids})", rowids,
+        )}
+        next_frontier: list[str] = []
+        for meta in metadata:
+            rowid = meta["source_rowid"]
+            source = values.get(rowid)
+            if source is None:
+                return UnreadableLegacyReviewOwnerLineage("retired review owner changed during its read", rowid)
+            try:
+                values_by_name = {
+                    column: _sql_text(source[f"type_{column}"], source[f"raw_{column}"])
+                    for column in _RETIRED_OWNER_COLUMNS
+                }
+                link = LegacyReviewOwnerLink(rowid, **values_by_name)
+            except (TypeError, ValueError, UnicodeError):
+                return UnreadableLegacyReviewOwnerLineage("retired review owner has malformed fields", rowid)
+            if (link.repository != repository or link.role != "review"
+                    or link.successor_owner_id not in processed):
+                return UnreadableLegacyReviewOwnerLineage("retired review owner conflicts with the lineage", rowid)
+            links.append(link)
+            if link.owner_id not in seen:
+                seen.add(link.owner_id)
+                owners.append(link.owner_id)
+            next_frontier.append(link.owner_id)
+            if len(owners) > MAX_LEGACY_REVIEW_OWNERS:
+                return UnreadableLegacyReviewOwnerLineage("review owner lineage exceeds the bound", rowid)
+        frontier = next_frontier
+    owner_lookup = (*owners, *(owner.encode("utf-8") for owner in owners))
+    owner_marks = ",".join("?" for _ in owner_lookup)
+    outgoing = db.execute(
+        f"SELECT rowid FROM retired_owners WHERE owner_id IN ({owner_marks}) LIMIT ?",
+        (*owner_lookup, MAX_LEGACY_REVIEW_OWNERS + 1),
+    ).fetchall()
+    if (len(outgoing) > MAX_LEGACY_REVIEW_OWNERS
+            or {row["rowid"] for row in outgoing} != {link.source_rowid for link in links}):
+        return UnreadableLegacyReviewOwnerLineage("review owner has an unjoined retirement receipt")
+    try:
+        return LegacyReviewOwnerLineage(repository, current_owner, configured,
+                                        tuple(owners), tuple(links))
+    except ValueError:
+        return UnreadableLegacyReviewOwnerLineage("review owner lineage is contradictory")

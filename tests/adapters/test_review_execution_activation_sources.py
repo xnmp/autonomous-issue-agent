@@ -9,6 +9,7 @@ from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
     read_legacy_review_run_page, read_legacy_review_submission_page,
     read_legacy_review_submission_receipt_page, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
+    read_legacy_review_owner_lineage,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
@@ -17,6 +18,7 @@ from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
+    LegacyReviewOwnerLineage, UnreadableLegacyReviewOwnerLineage,
 )
 
 
@@ -379,3 +381,105 @@ def test_submission_receipt_scan_marks_bad_source_and_requires_snapshot(tmp_path
     assert isinstance(page.entries[1], UnreadableLegacyReviewSubmissionReceipt)
     assert isinstance(page.entries[2], LegacyReviewSubmissionReceiptSource)
     assert dict(page.entries[2].fields)["payload_json"] is None
+
+
+def _retired_review_owner(db, owner, successor, *, repository="o/r", role="review", rowid=None):
+    db.execute(
+        "INSERT INTO retired_owners(rowid,owner_id,successor_owner_id,repository,role,retired_at) "
+        "VALUES (?,?,?,?,?,?)",
+        (rowid, owner, successor, repository, role, "retired"),
+    )
+
+
+def test_owner_lineage_includes_configured_and_transitive_retired_owners_without_writes(tmp_path):
+    control = _control(tmp_path)
+    current = "o/r:review:new"
+    configured = "old-alias:review:configured"
+    with closing(control._connect()) as db:
+        _run(db, 97, owner="o/r:review")
+        _retired_review_owner(db, "o/r:review:old", current)
+        _retired_review_owner(db, "o/r:review:oldest", "o/r:review:old")
+        _retired_review_owner(db, "old-alias:review:configured-child", configured)
+        _retired_review_owner(db, "o/r:fix:foreign", "o/r:fix:current", role="fix")
+        db.execute("BEGIN")
+        before = db.total_changes
+        source = read_legacy_review_owner_lineage(db, "o/r", current,
+                                                   configured_prior_owners=(configured,))
+        implicit_runs = read_legacy_review_run_page(db, "o/r:review")
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(source, LegacyReviewOwnerLineage)
+    assert set(source.owners) == {current, "o/r:review", configured, "o/r:review:old",
+                                  "o/r:review:oldest", "old-alias:review:configured-child"}
+    assert len(source.links) == 3
+    assert [entry.run_id for entry in implicit_runs.entries] == ["run-97"]
+
+
+def test_owner_lineage_includes_implicit_legacy_owner_without_config(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        db.execute("BEGIN")
+        source = read_legacy_review_owner_lineage(db, "o/r", "o/r:review:new")
+        db.rollback()
+    assert isinstance(source, LegacyReviewOwnerLineage)
+    assert source.owners == ("o/r:review:new", "o/r:review")
+
+
+@pytest.mark.parametrize("anomaly", [
+    "retired_current", "blob_current_retirement", "foreign_role", "foreign_repository", "cycle",
+    "oversized", "invalid_utf8", "configured_elsewhere", "blob_successor", "too_many",
+])
+def test_owner_lineage_blocks_contradictory_or_unreadable_sources(tmp_path, anomaly):
+    control = _control(tmp_path)
+    current = "o/r:review:new"
+    with closing(control._connect()) as db:
+        if anomaly == "retired_current":
+            _retired_review_owner(db, current, "o/r:review:later")
+        elif anomaly == "blob_current_retirement":
+            _retired_review_owner(db, current, "o/r:review:later")
+            db.execute("UPDATE retired_owners SET owner_id=CAST(owner_id AS BLOB) WHERE owner_id=?", (current,))
+        elif anomaly == "foreign_role":
+            _retired_review_owner(db, "o/r:fix:old", current, role="fix")
+        elif anomaly == "foreign_repository":
+            _retired_review_owner(db, "o/r:review:old", current, repository="other/r")
+        elif anomaly == "cycle":
+            _retired_review_owner(db, "o/r:review:a", "o/r:review:b")
+            _retired_review_owner(db, "o/r:review:b", "o/r:review:a")
+        elif anomaly == "configured_elsewhere":
+            _retired_review_owner(db, "o/r:review:a", "o/r:review:foreign")
+        elif anomaly == "blob_successor":
+            _retired_review_owner(db, "o/r:review:old", current)
+            db.execute("UPDATE retired_owners SET successor_owner_id=CAST(successor_owner_id AS BLOB) "
+                       "WHERE owner_id='o/r:review:old'")
+        elif anomaly == "too_many":
+            for number in range(65):
+                _retired_review_owner(db, f"o/r:review:old-{number}", current)
+        elif anomaly == "oversized":
+            _retired_review_owner(db, "o/r:review:old", current)
+            db.execute("UPDATE retired_owners SET retired_at=? WHERE owner_id='o/r:review:old'",
+                       ("x" * 65537,))
+        else:
+            _retired_review_owner(db, "o/r:review:old", current)
+            db.execute("UPDATE retired_owners SET retired_at=CAST(x'ff' AS TEXT) "
+                       "WHERE owner_id='o/r:review:old'")
+        db.execute("BEGIN")
+        source = read_legacy_review_owner_lineage(
+            db, "o/r", current,
+            configured_prior_owners=("o/r:review:a",) if anomaly in {"cycle", "configured_elsewhere"} else (),
+        )
+        db.rollback()
+    assert isinstance(source, UnreadableLegacyReviewOwnerLineage)
+
+
+def test_owner_lineage_requires_snapshot_and_canonical_repository(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        with pytest.raises(ValueError, match="transaction"):
+            read_legacy_review_owner_lineage(db, "o/r", OWNER)
+        db.execute("BEGIN")
+        with pytest.raises(ValueError, match="canonical"):
+            read_legacy_review_owner_lineage(db, "Other/R", OWNER)
+        with pytest.raises(ValueError, match="repository and role"):
+            read_legacy_review_owner_lineage(db, "o/r", "o/r:fix:owner")
+        db.rollback()

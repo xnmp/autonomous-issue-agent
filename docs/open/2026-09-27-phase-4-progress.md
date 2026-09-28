@@ -932,3 +932,23 @@ source reader. Full `make test` passed: 3,189 domain, 2,855 adapter and
 2,866 app tests, plus hooks, governor, gate parity, four import contracts
 and both Pyrefly checks. Ten accepted strict xfails remained expected. Log:
 `/tmp/phase4-submission-index-source-gate.log` (ephemeral).
+
+## Checkpoint 35 — review owner lineage source (offline)
+
+The execution activation reader now resolves a bounded review-owner closure
+under one explicit SQL snapshot. It includes the current owner, the implicit
+`repository:review` predecessor adopted at daemon boot, exact configured
+predecessors and their transitive `retired_owners` links. It does not call
+adoption or rewrite any row. Raw retirement links retain source digests
+independent of SQLite rowids. A retired current owner, foreign role or
+repository, cycle, unreadable row, malformed SQL type, oversize field,
+conflicting configured retirement or over-bound closure returns an explicit
+blocker. The caller must use this same snapshot for every paged owner-run
+scan and revalidate under activation barriers before commit. Execution
+authority remains inactive. Independent Sol review reproduced two missing
+owner cases: the implicit legacy owner and a BLOB successor alias. Both were
+fixed, as was a configured owner retired elsewhere; its second pass found no
+remaining medium or high issue. Full `make test` passed: 3,191 domain, 2,868
+adapter and 2,866 app tests, plus hooks, governor, gate parity, four import
+contracts and both Pyrefly checks. Ten accepted strict xfails remained
+expected. Log: `/tmp/phase4-owner-lineage-gate.log` (ephemeral).

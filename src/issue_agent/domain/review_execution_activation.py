@@ -8,7 +8,9 @@ import hashlib
 import json
 
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
-from .workflow_identity import canonical_workflow_repository, validate_workflow_integer, validate_workflow_text
+from .workflow_identity import (
+    canonical_workflow_repository, validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
+)
 
 
 def _files(*values: LegacyFile) -> None:
@@ -316,6 +318,100 @@ class LegacyReviewSubmissionReceiptPage:
             raise ValueError("submission receipt page must advance through unique rowids")
         if self.has_more and not rowids:
             raise ValueError("submission receipt page cannot continue without a cursor")
+
+
+MAX_LEGACY_REVIEW_OWNERS = 64
+
+
+@dataclass(frozen=True)
+class LegacyReviewOwnerLink:
+    """One retained deployment retirement; rowid is observation provenance."""
+
+    source_rowid: int
+    owner_id: str
+    successor_owner_id: str
+    repository: str
+    role: str
+    retired_at: str
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "retired owner cursor")
+        for name in ("owner_id", "successor_owner_id", "repository", "role", "retired_at"):
+            validate_workflow_text(getattr(self, name), f"retired owner {name}", limit=MAX_LEGACY_SQL_TEXT_BYTES)
+
+    @property
+    def source_digest(self) -> str:
+        fields = (self.owner_id, self.successor_owner_id, self.repository, self.role, self.retired_at)
+        return hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class LegacyReviewOwnerLineage:
+    """Complete bounded owner closure from current, implicit, configured and retired sources."""
+
+    repository: str
+    current_owner: str
+    configured_prior_owners: tuple[str, ...]
+    owners: tuple[str, ...]
+    links: tuple[LegacyReviewOwnerLink, ...]
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("owner lineage requires a canonical repository")
+        validate_workflow_identifier(self.current_owner, "current review owner")
+        implicit_owner = f"{self.repository}:review"
+        if self.current_owner != implicit_owner and not self.current_owner.startswith(implicit_owner + ":"):
+            raise ValueError("current review owner does not match its repository and role")
+        if (not isinstance(self.configured_prior_owners, tuple)
+                or not isinstance(self.owners, tuple) or not isinstance(self.links, tuple)
+                or len(self.owners) > MAX_LEGACY_REVIEW_OWNERS
+                or any(not isinstance(link, LegacyReviewOwnerLink) for link in self.links)):
+            raise ValueError("owner lineage requires bounded typed sources")
+        for owner in (*self.configured_prior_owners, *self.owners):
+            validate_workflow_identifier(owner, "review owner")
+        if (len(set(self.configured_prior_owners)) != len(self.configured_prior_owners)
+                or self.current_owner in self.configured_prior_owners
+                or implicit_owner in self.configured_prior_owners
+                or len(set(self.owners)) != len(self.owners)
+                or self.owners[0:1] != (self.current_owner,)):
+            raise ValueError("owner lineage has duplicate or missing identities")
+        reachable = {self.current_owner, implicit_owner, *self.configured_prior_owners}
+        if any(link.repository != self.repository or link.role != "review"
+               or link.owner_id == self.current_owner for link in self.links):
+            raise ValueError("retired owner link is outside the review lineage")
+        for _ in range(MAX_LEGACY_REVIEW_OWNERS):
+            new = {link.owner_id for link in self.links if link.successor_owner_id in reachable}
+            if new <= reachable:
+                break
+            reachable.update(new)
+        if reachable != set(self.owners) or len({link.owner_id for link in self.links}) != len(self.links):
+            raise ValueError("owner lineage is incomplete or has disconnected receipts")
+        successor_by_owner = {link.owner_id: link.successor_owner_id for link in self.links}
+        for owner in successor_by_owner:
+            path: set[str] = set()
+            current = owner
+            while current in successor_by_owner:
+                if current in path:
+                    raise ValueError("retired owner lineage contains a cycle")
+                path.add(current)
+                current = successor_by_owner[current]
+
+    @property
+    def source_digest(self) -> str:
+        payload = (self.repository, self.current_owner, self.configured_prior_owners,
+                   tuple(sorted((link.owner_id, link.source_digest) for link in self.links)))
+        return hashlib.sha256(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnreadableLegacyReviewOwnerLineage:
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        validate_workflow_text(self.reason, "unreadable owner lineage reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "unreadable retired owner cursor")
 
 
 @dataclass(frozen=True)
