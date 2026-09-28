@@ -64,6 +64,7 @@ from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStat
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, NoReviewSession, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
+    ReviewExecutionBoundaryCursor,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
     matches_accepted_review_transition_source,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
@@ -2901,7 +2902,7 @@ def _recording_source_size(
 def read_review_generation_archive_page(
     db: sqlite3.Connection, binding: ReviewExecutionBinding,
     first_generation: int, through_generation: int,
-    *, preceding: ReviewExecutionGenerationBoundary | None = None,
+    *, preceding: ReviewExecutionGenerationBoundary | ReviewExecutionBoundaryCursor | None = None,
     limit: int = MAX_GENERATION_ARCHIVE_PAGE,
 ) -> ObservedReviewGenerationArchivePage | BlockedReviewGenerationArchivePage:
     """Observe retained transition semantics in expected generation order.
@@ -2917,17 +2918,29 @@ def read_review_generation_archive_page(
             or not 1 <= first_generation <= through_generation <= MAX_SQL_ROWID
             or type(limit) is not int or not 1 <= limit <= MAX_GENERATION_ARCHIVE_PAGE):
         raise ValueError("generation archive page requires a bounded episode range")
-    if preceding is not None and (not isinstance(preceding, ReviewExecutionGenerationBoundary)
-                                  or not same_execution_episode(binding, preceding.before.binding)):
+    if isinstance(preceding, ReviewExecutionGenerationBoundary):
+        if not same_execution_episode(binding, preceding.before.binding):
+            raise ValueError("generation archive page requires a same-episode predecessor")
+        previous_revision = preceding.to_revision
+    elif isinstance(preceding, ReviewExecutionBoundaryCursor):
+        previous_revision = preceding.revision
+        if (previous_revision.fence.key != binding.rejection.fence.key
+                or previous_revision.fence.generation <= binding.rejection.fence.generation
+                or preceding.receipt_id != review_generation_receipt_id(
+                    binding, previous_revision.fence.generation,
+                )):
+            raise ValueError("generation archive page requires a same-episode predecessor")
+    elif preceding is None:
+        previous_revision = None
+    else:
         raise ValueError("generation archive page requires a same-episode predecessor")
-    expected_first = (preceding.to_revision.fence.generation + 1 if preceding is not None
+    expected_first = (previous_revision.fence.generation + 1 if previous_revision is not None
                       else binding.rejection.fence.generation + 1)
     if first_generation != expected_first:
         raise ValueError("generation archive page requires the next contiguous generation")
     repository = binding.rejection.fence.key.repository
     sources: list[ObservedReviewGenerationArchiveSource] = []
     bytes_read = 0
-    previous_revision = preceding.to_revision if preceding is not None else None
     stop = min(through_generation + 1, first_generation + limit)
     for generation in range(first_generation, stop):
         try:

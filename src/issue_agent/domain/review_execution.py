@@ -8,7 +8,7 @@ no runtime authority until the execution family is explicitly activated.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from enum import Enum
 import hashlib
 
@@ -559,6 +559,227 @@ class ReviewExecutionBoundaryCursor:
         identifier(self.receipt_id, "compacted generation boundary")
         if not isinstance(self.revision, WorkflowRevision):
             raise ValueError("compacted generation boundary requires its revision")
+
+
+_EMPTY_ARCHIVE_AUDIT_DIGEST = hashlib.sha256(b"").hexdigest()
+MAX_ARCHIVE_AUDIT_STEP = 16
+MAX_ARCHIVE_AUDIT_DUE_SECONDS = 86400
+
+
+def _archive_audit_digest(value: object, name: str) -> None:
+    if (not isinstance(value, str) or len(value) != 64
+            or any(char not in "0123456789abcdef" for char in value)):
+        raise ValueError(f"{name} requires a SHA-256 digest")
+
+
+@dataclass(frozen=True)
+class ReviewGenerationArchiveFingerprint:
+    """Small identity of one already verified retained generation source pair."""
+
+    cursor: ReviewExecutionBoundaryCursor
+    receipt_sha256: str
+    accepted_namespace: str
+    accepted_key: str
+    accepted_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.cursor, ReviewExecutionBoundaryCursor):
+            raise ValueError("archive fingerprint requires its generation cursor")
+        if self.accepted_namespace not in {"workflow-request", "workflow-transition"}:
+            raise ValueError("archive fingerprint requires an accepted transition namespace")
+        identifier(self.accepted_key, "archive fingerprint accepted key")
+        _archive_audit_digest(self.receipt_sha256, "archive receipt digest")
+        _archive_audit_digest(self.accepted_sha256, "archive accepted digest")
+
+
+@dataclass(frozen=True)
+class ReviewGenerationArchiveScan:
+    """A durable, incomplete expected-generation scan; no admission authority."""
+
+    origin: ReviewExecutionBinding
+    origin_receipt: ReviewExecutionOrigin
+    origin_source_sha256: str
+    through_generation: int
+    next_generation: int
+    preceding: ReviewExecutionBoundaryCursor | None
+    rolling_sha256: str
+    started_at: datetime
+    due_at: datetime
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionBinding)
+                or not isinstance(self.origin_receipt, ReviewExecutionOrigin)):
+            raise ValueError("archive scan requires its execution origin binding")
+        _archive_audit_digest(self.origin_source_sha256, "archive origin source digest")
+        base = self.origin.rejection.fence.generation
+        integer(self.through_generation, "archive scan frontier", minimum=base + 1)
+        integer(self.next_generation, "archive scan next generation", minimum=base + 1)
+        if self.next_generation > self.through_generation:
+            raise ValueError("archive scan must have an unvisited generation")
+        if self.next_generation == base + 1:
+            if self.preceding is not None:
+                raise ValueError("initial archive scan cannot invent a predecessor")
+        elif (not isinstance(self.preceding, ReviewExecutionBoundaryCursor)
+              or self.preceding.revision.fence.generation != self.next_generation - 1
+              or self.preceding.receipt_id != review_generation_receipt_id(
+                  self.origin, self.next_generation - 1,
+              ) or self.preceding.revision.fence.key != self.origin.rejection.fence.key):
+            raise ValueError("archive scan predecessor disagrees with its frontier")
+        _archive_audit_digest(self.rolling_sha256, "archive rolling digest")
+        if (not isinstance(self.started_at, datetime) or self.started_at.tzinfo is None
+                or self.started_at.utcoffset() is None or not isinstance(self.due_at, datetime)
+                or self.due_at.tzinfo is None or self.due_at.utcoffset() is None):
+            raise ValueError("archive scan requires aware start and due times")
+
+
+@dataclass(frozen=True)
+class CompletedReviewGenerationArchiveScan:
+    """One completed pass; the next pass must revisit the retained sources."""
+
+    origin: ReviewExecutionBinding
+    origin_receipt: ReviewExecutionOrigin
+    origin_source_sha256: str
+    through_generation: int
+    final_cursor: ReviewExecutionBoundaryCursor | None
+    rolling_sha256: str
+    started_at: datetime
+    completed_at: datetime
+    next_due_at: datetime
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionBinding)
+                or not isinstance(self.origin_receipt, ReviewExecutionOrigin)):
+            raise ValueError("completed archive scan requires its origin")
+        _archive_audit_digest(self.origin_source_sha256, "completed archive origin source digest")
+        base = self.origin.rejection.fence.generation
+        integer(self.through_generation, "completed archive frontier", minimum=base)
+        if self.through_generation == base:
+            if self.final_cursor is not None or self.rolling_sha256 != _EMPTY_ARCHIVE_AUDIT_DIGEST:
+                raise ValueError("empty archive scan cannot invent a source")
+        elif (not isinstance(self.final_cursor, ReviewExecutionBoundaryCursor)
+              or self.final_cursor.revision.fence.generation != self.through_generation
+              or self.final_cursor.revision.fence.key != self.origin.rejection.fence.key
+              or self.final_cursor.receipt_id != review_generation_receipt_id(
+                  self.origin, self.through_generation,
+              )):
+            raise ValueError("completed archive scan requires its final source")
+        _archive_audit_digest(self.rolling_sha256, "completed archive digest")
+        if (not isinstance(self.started_at, datetime) or self.started_at.tzinfo is None
+                or self.started_at.utcoffset() is None or not isinstance(self.completed_at, datetime)
+                or self.completed_at.tzinfo is None or self.completed_at.utcoffset() is None
+                or not isinstance(self.next_due_at, datetime) or self.next_due_at.tzinfo is None
+                or self.next_due_at.utcoffset() is None or not self.started_at <= self.completed_at < self.next_due_at):
+            raise ValueError("completed archive scan requires ordered aware times")
+
+
+@dataclass(frozen=True)
+class BlockedReviewGenerationArchiveScan:
+    scan: ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan
+    generation: int
+    reason: str
+    detected_at: datetime
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.scan, (ReviewGenerationArchiveScan, CompletedReviewGenerationArchiveScan))
+                or type(self.generation) is not int
+                or not (self.scan.next_generation if isinstance(self.scan, ReviewGenerationArchiveScan)
+                        else self.scan.through_generation) <= self.generation <= self.scan.through_generation
+                or not isinstance(self.reason, str) or not 1 <= len(self.reason) <= 512
+                or not isinstance(self.detected_at, datetime) or self.detected_at.tzinfo is None
+                or self.detected_at.utcoffset() is None):
+            raise ValueError("blocked archive scan requires its exact discrepancy")
+
+
+def review_generation_archive_scan_overdue(
+    state: ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan | BlockedReviewGenerationArchiveScan,
+    now: datetime,
+) -> bool:
+    """A source discrepancy or missed pass deadline must block future admission."""
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
+        raise ValueError("archive scan due check requires an aware time")
+    if isinstance(state, BlockedReviewGenerationArchiveScan):
+        return True
+    if isinstance(state, ReviewGenerationArchiveScan):
+        return now >= state.due_at
+    if isinstance(state, CompletedReviewGenerationArchiveScan):
+        return now >= state.next_due_at
+    raise ValueError("archive scan due check requires a typed state")
+
+
+def begin_review_generation_archive_scan(
+    origin: ReviewExecutionBinding, origin_receipt: ReviewExecutionOrigin, origin_source_sha256: str,
+    through_generation: int,
+    now: datetime, due_seconds: int,
+) -> ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan:
+    """Start a bounded pass from the same episode's first expected generation."""
+    if (not isinstance(origin, ReviewExecutionBinding)
+            or not isinstance(origin_receipt, ReviewExecutionOrigin)
+            or not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None):
+        raise ValueError("archive scan requires an aware start and typed origin")
+    _archive_audit_digest(origin_source_sha256, "archive origin source digest")
+    integer(through_generation, "archive scan frontier", minimum=origin.rejection.fence.generation)
+    integer(due_seconds, "archive scan due seconds", minimum=1)
+    if due_seconds > MAX_ARCHIVE_AUDIT_DUE_SECONDS:
+        raise ValueError("archive scan due window exceeds one day")
+    try:
+        due = now + timedelta(seconds=due_seconds)
+    except OverflowError as exc:
+        raise ValueError("archive scan due window exceeds representable time") from exc
+    if through_generation == origin.rejection.fence.generation:
+        return CompletedReviewGenerationArchiveScan(
+            origin, origin_receipt, origin_source_sha256, through_generation, None,
+            _EMPTY_ARCHIVE_AUDIT_DIGEST, now, now, due,
+        )
+    return ReviewGenerationArchiveScan(
+        origin, origin_receipt, origin_source_sha256, through_generation,
+        origin.rejection.fence.generation + 1,
+        None, _EMPTY_ARCHIVE_AUDIT_DIGEST, now, due,
+    )
+
+
+def advance_review_generation_archive_scan(
+    scan: ReviewGenerationArchiveScan, sources: tuple[ReviewGenerationArchiveFingerprint, ...],
+    now: datetime, due_seconds: int,
+) -> ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan:
+    """Fold one verified page in generation order without retaining its payloads."""
+    if not isinstance(scan, ReviewGenerationArchiveScan) or not isinstance(sources, tuple) or not 1 <= len(sources) <= MAX_ARCHIVE_AUDIT_STEP:
+        raise ValueError("archive scan advance requires a bounded verified page")
+    if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None or now < scan.started_at:
+        raise ValueError("archive scan advance requires an aware later time")
+    integer(due_seconds, "archive scan due seconds", minimum=1)
+    if due_seconds > MAX_ARCHIVE_AUDIT_DUE_SECONDS:
+        raise ValueError("archive scan due window exceeds one day")
+    digest = scan.rolling_sha256
+    for index, source in enumerate(sources):
+        generation = scan.next_generation + index
+        if (not isinstance(source, ReviewGenerationArchiveFingerprint)
+                or generation > scan.through_generation
+                or source.cursor.revision.fence.generation != generation
+                or source.cursor.revision.fence.key != scan.origin.rejection.fence.key
+                or source.cursor.receipt_id != review_generation_receipt_id(scan.origin, generation)):
+            raise ValueError("archive scan page disagrees with its expected generation")
+        encoded = "\0".join((str(generation), source.cursor.receipt_id,
+                             str(source.cursor.revision.version), source.receipt_sha256,
+                             source.accepted_namespace, source.accepted_key,
+                             source.accepted_sha256)).encode()
+        digest = hashlib.sha256(bytes.fromhex(digest) + encoded).hexdigest()
+    final = sources[-1].cursor
+    next_generation = scan.next_generation + len(sources)
+    if next_generation <= scan.through_generation:
+        return ReviewGenerationArchiveScan(
+            scan.origin, scan.origin_receipt, scan.origin_source_sha256,
+            scan.through_generation, next_generation, final,
+            digest, scan.started_at, scan.due_at,
+        )
+    try:
+        next_due = now + timedelta(seconds=due_seconds)
+    except OverflowError as exc:
+        raise ValueError("archive scan due window exceeds representable time") from exc
+    return CompletedReviewGenerationArchiveScan(
+        scan.origin, scan.origin_receipt, scan.origin_source_sha256,
+        scan.through_generation, final, digest,
+        scan.started_at, now, next_due,
+    )
 
 
 @dataclass(frozen=True)

@@ -17,6 +17,10 @@ from issue_agent.domain.review_execution import (
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
     ReviewExecutionGenerationBoundary, ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
+    ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint, ReviewGenerationArchiveScan,
+    CompletedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveScan,
+    begin_review_generation_archive_scan, advance_review_generation_archive_scan,
+    review_generation_archive_scan_overdue,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
     accepted_review_transition_source, accepted_review_transition_proof_source,
     ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
@@ -362,6 +366,52 @@ def test_generation_frontier_classifies_swept_episode_receipts():
         review_generation_within_frontier(origin, -1, boundary)
     with pytest.raises(ValueError, match="typed episode"):
         review_generation_within_frontier(origin, 1, "untyped")
+
+
+def test_archive_scan_folds_bounded_pages_and_preserves_its_predecessor():
+    origin = checkpoint().state.binding
+    origin_receipt = ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:audit")
+    now = datetime(2026, 9, 29, tzinfo=timezone.utc)
+    first = ReviewExecutionBoundaryCursor(
+        review_generation_receipt_id(origin, 1), WorkflowRevision(binding(1).rejection.fence, 5),
+    )
+    second = ReviewExecutionBoundaryCursor(
+        review_generation_receipt_id(origin, 2), WorkflowRevision(binding(2).rejection.fence, 6),
+    )
+    fingerprint = lambda cursor: ReviewGenerationArchiveFingerprint(
+        cursor, "a" * 64, "workflow-request", "request:one", "b" * 64,
+    )
+    initial = begin_review_generation_archive_scan(origin, origin_receipt, "c" * 64, 2, now, 60)
+    assert isinstance(initial, ReviewGenerationArchiveScan)
+    advanced = advance_review_generation_archive_scan(initial, (fingerprint(first),), now, 60)
+    assert isinstance(advanced, ReviewGenerationArchiveScan)
+    assert advanced.next_generation == 2 and advanced.preceding == first
+    assert advanced.rolling_sha256 != initial.rolling_sha256
+    complete = advance_review_generation_archive_scan(advanced, (fingerprint(second),), now, 60)
+    assert isinstance(complete, CompletedReviewGenerationArchiveScan)
+    assert complete.final_cursor == second and complete.through_generation == 2
+    assert complete.rolling_sha256 != advanced.rolling_sha256
+    assert complete.origin_source_sha256 == "c" * 64
+    assert review_generation_archive_scan_overdue(advanced, advanced.due_at)
+    assert not review_generation_archive_scan_overdue(complete, now)
+    assert review_generation_archive_scan_overdue(complete, complete.next_due_at)
+    with pytest.raises(ValueError, match="expected generation"):
+        advance_review_generation_archive_scan(initial, (fingerprint(second),), now, 60)
+    with pytest.raises(ValueError, match="predecessor"):
+        replace(advanced, preceding=second)
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(advanced, rolling_sha256="malformed")
+    with pytest.raises(ValueError, match="SHA-256"):
+        replace(advanced, origin_source_sha256="malformed")
+    with pytest.raises(ValueError, match="one day"):
+        begin_review_generation_archive_scan(origin, origin_receipt, "c" * 64, 1, now, 86401)
+    assert isinstance(BlockedReviewGenerationArchiveScan(initial, 1, "missing", now),
+                      BlockedReviewGenerationArchiveScan)
+    assert review_generation_archive_scan_overdue(BlockedReviewGenerationArchiveScan(initial, 1, "missing", now), now)
+    with pytest.raises(ValueError, match="exact discrepancy"):
+        BlockedReviewGenerationArchiveScan(initial, 2**63 - 1, "missing", now)
+    assert isinstance(BlockedReviewGenerationArchiveScan(complete, 2, "origin changed", now),
+                      BlockedReviewGenerationArchiveScan)
 
 
 def test_active_generation_advance_preserves_imported_allowance_without_rounds():

@@ -61,6 +61,7 @@ from issue_agent.domain.resolve_activation import (
 from issue_agent.domain.review_execution import (
     CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
+    ReviewExecutionBoundaryCursor,
     accepted_review_transition_source,
     review_generation_chain_digest,
 )
@@ -1380,11 +1381,23 @@ def test_generation_archive_page_is_bounded_and_requires_every_expected_receipt(
         second_page = read_review_generation_archive_page(
             db, binding, last, last, preceding=first_page.sources[0].boundary, limit=1,
         )
+        small = ReviewExecutionBoundaryCursor(
+            first_page.sources[0].boundary.receipt_id,
+            first_page.sources[0].boundary.to_revision,
+        )
+        resumed = read_review_generation_archive_page(
+            db, binding, last, last, preceding=small, limit=1,
+        )
+        with pytest.raises(ValueError, match="same-episode predecessor"):
+            read_review_generation_archive_page(
+                db, binding, last, last, preceding=replace(small, receipt_id="forged"), limit=1,
+            )
         with pytest.raises(ValueError, match="contiguous generation"):
             read_review_generation_archive_page(db, binding, last, last)
         db.rollback()
     assert isinstance(first_page, ObservedReviewGenerationArchivePage)
     assert isinstance(second_page, ObservedReviewGenerationArchivePage)
+    assert resumed == second_page
     assert first_page.next_generation == last and first_page.has_more
     assert second_page.next_generation == last + 1 and not second_page.has_more
     assert [first_page.sources[0].generation, second_page.sources[0].generation] == [last - 1, last]

@@ -376,6 +376,30 @@ with `CLAUDE.md`, `AGENTS.md`, the
   frontier ending at the first advance. The frontier and page cursor remain
   caller-supplied observations. Checkpoint ancestry and a durable audit-owned
   cursor must bind them before execution admission can depend on this check.
+- Checkpoint 79 persists an expected-generation archive scan in `level_state`
+  under the workflow episode. Each write transaction checks at most 16
+  retained generation source pairs, folds their identities and digests, and
+  saves a small predecessor cursor or an exact discrepancy. A completed pass
+  restarts at the origin when due or after the frontier advances. An incomplete
+  pass finishes its captured frontier when new generations arrive, preserving
+  progress. Every call rechecks the bounded origin source row, including calls
+  before the next due time; deletion or mutation persists a blocker. The scan
+  detects changed generation sources on its next pass, as required by the
+  eventual audit contract. This is an offline observational cursor only: it
+  does not sweep unclaimed receipt rows, verify checkpoint ancestry or retired
+  rounds, prove an atomic lifetime snapshot across pages, or gate admission.
+
+Independent Sol review of checkpoint 79 found two issues: a resumed cursor
+did not recheck the origin row, and a growing generation frontier restarted
+an incomplete pass. Both were fixed with behavioral regressions; the reviewer
+found no further medium or high severity issue in this slice. Focused tests
+and the full `make test` gate passed: 3,278 domain, 3,212 adapter and 2,876
+app tests, plus hooks, governor, gate parity, four import contracts and both
+Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-durable-generation-archive-scan-gate.log` (ephemeral). No live
+service or workflow family was activated. Next: join a durable namespace
+sweep and checkpoint ancestry to the audit cursor before using its result for
+admission or compaction.
 
 Independent Sol review of checkpoint 78 found no medium or high severity
 issue. A lower-bound case was added to the pure test after review. Focused
