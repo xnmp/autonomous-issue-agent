@@ -1221,6 +1221,72 @@ def read_legacy_review_round_page(
     )
 
 
+def read_checkpoint_round_row_source(
+    db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+) -> LegacyReviewRoundSource:
+    """Point-read one exact indexed round row without scanning retired history."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("checkpoint round source requires an explicit SQL transaction")
+    if not isinstance(round_id, ReviewRoundIdentity):
+        raise ValueError("checkpoint round source requires a typed round identity")
+    try:
+        aliases = db.execute(
+            "SELECT rowid,typeof(round_id) AS round_id_type FROM review_execution_rounds "
+            "WHERE round_id IN (?,CAST(? AS BLOB)) LIMIT 2",
+            (round_id.round_id, round_id.round_id),
+        ).fetchall()
+        if len(aliases) != 1 or aliases[0]["round_id_type"] != "text":
+            raise ValueError("checkpoint round has absent or aliased identity")
+        json_columns = ("plan_json", "planning_json", "closure_json", "outcome_json")
+        other_columns = tuple(column for column in LEGACY_REVIEW_ROUND_COLUMNS if column not in json_columns)
+        json_sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in json_columns]
+        other_sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in other_columns]
+        metadata = db.execute(
+            f"SELECT max({','.join(json_sizes)}) AS largest_json,"
+            f"max({','.join(other_sizes)}) AS largest_other,"
+            f"{'+'.join(json_sizes + other_sizes)} AS total_bytes "
+            "FROM review_execution_rounds WHERE rowid=? AND round_id=?",
+            (aliases[0]["rowid"], round_id.round_id),
+        ).fetchone()
+        if (metadata is None or metadata["largest_json"] is None
+                or metadata["largest_json"] > MAX_LEGACY_ROUND_JSON_BYTES
+                or metadata["largest_other"] > MAX_LEGACY_SQL_TEXT_BYTES
+                or metadata["total_bytes"] > MAX_LEGACY_ROUND_PAGE_BYTES):
+            raise ValueError("checkpoint round row exceeds its bounded source")
+        columns = ",".join(
+            f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+            for column in LEGACY_REVIEW_ROUND_COLUMNS
+        )
+        row = db.execute(
+            f"SELECT {columns} FROM review_execution_rounds WHERE rowid=? AND round_id=?",
+            (aliases[0]["rowid"], round_id.round_id),
+        ).fetchone()
+        if row is None:
+            raise ValueError("checkpoint round row changed during its bounded read")
+        integer_columns = {"target_number", "execution_epoch", "generation", "sequence"}
+        fields = tuple((column, (
+            _sql_integer(row[f"type_{column}"], row[f"raw_{column}"])
+            if column in integer_columns else _sql_text(row[f"type_{column}"], row[f"raw_{column}"])
+        )) for column in LEGACY_REVIEW_ROUND_COLUMNS)
+        source = LegacyReviewRoundSource(aliases[0]["rowid"], fields)
+        values = dict(source.fields)
+        plan = decode_workflow(values["plan_json"], ReviewRoundPlan)
+        binding = round_id.binding
+        if (values["repository"] != binding.rejection.fence.key.repository
+                or values["target_number"] != binding.rejection.fence.key.target.number
+                or values["execution_epoch"] != binding.execution_epoch
+                or values["execution_episode"] != binding.execution_episode
+                or values["generation"] != binding.rejection.fence.generation
+                or values["sequence"] != round_id.sequence
+                or plan.round != round_id
+                or encode_workflow(plan) != values["plan_json"]):
+            raise ValueError("checkpoint round row disagrees with its indexed plan")
+        return source
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            sqlite3.Error) as exc:
+        raise WorkflowAuthorityError("review execution checkpoint round row is unreadable") from exc
+
+
 def read_complete_legacy_review_rounds(
     db: sqlite3.Connection, repository: str,
 ) -> CompleteLegacyReviewRounds | BlockedLegacyReviewRounds:

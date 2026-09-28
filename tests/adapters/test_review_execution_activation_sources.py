@@ -34,6 +34,7 @@ from issue_agent.adapters.review_execution_activation import (
     match_legacy_review_generation_boundary_sources,
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     read_review_generation_archive_page, verify_checkpoint_generation_anchor,
+    read_checkpoint_round_row_source,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
     read_review_generation_receipt_sweep_page, read_reconciled_review_generation_receipt_sweep_page,
     ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
@@ -1434,7 +1435,10 @@ def test_staged_checkpoint_load_checks_generation_anchor_before_global_refusal(r
         )
         receipt = build_review_execution_checkpoint_receipt(
             execution, plan,
-            (ReviewExecutionCompactionRoundSource(outcome.round, "a" * 64, "b" * 64),),
+            (ReviewExecutionCompactionRoundSource(
+                outcome.round, read_checkpoint_round_row_source(db, outcome.round).source_digest,
+                "b" * 64,
+            ),),
             (fingerprint,),
         )
         receipt_id = review_execution_checkpoint_receipt_id(receipt)

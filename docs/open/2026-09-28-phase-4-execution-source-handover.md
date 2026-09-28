@@ -428,6 +428,29 @@ with `CLAUDE.md`, `AGENTS.md`, the
   path and detects changed source metadata; direct tests cover foreign
   episodes, missing and aliased rows, malformed claim time and pair byte cap.
   The remaining round anchor and audit gate still prevent compaction use.
+- Checkpoint 83 adds a bounded indexed point read for the final retired round
+  row. It refuses a missing or BLOB-aliased round ID, checks every field's
+  SQLite type and byte limit before materializing the row, validates the
+  canonical plan and exact episode/sequence identity, and derives the same
+  row digest as the archived round inventory. Canonical loads compare that
+  digest to the checkpoint's final round fingerprint. Tests cover a changed
+  planning row, missing and aliased IDs, oversized plan and foreign episode.
+  The receipt-set digest for that round is still unverified, and the canonical
+  loader still refuses every compacted component until it and the paged audit
+  gate are installed.
+
+Independent Sol review of checkpoint 83 found no medium or high issue. Final
+`make test` passed: 3,280 domain, 3,241 adapter and 2,876 app tests, plus
+hooks, governor, gate parity, four import contracts and both Pyrefly checks.
+Ten strict xfails remained expected. Log:
+`/tmp/phase4-checkpoint-round-row-anchor-gate.log` (ephemeral). The next
+source seam is the exact bounded receipt set for one retired round. Define it
+from the same preflight, stage, submission, seal or abandonment, closure,
+outcome, preparation and productivity sources the current suffix verifier
+uses; include their identities and immutable field digests, then compare the
+checkpoint's final `receipt_set_sha256` against a point-read reconstruction.
+The writer and paged audit must use that identical set definition. Keep the
+canonical compaction refusal until those proofs and the audit gate pass.
 
 The intended read metric is bytes and latency per canonical load as archived
 generations grow; the guardrail is refusal on changed immediate sources. The
