@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-09-27. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-09-28. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -486,6 +486,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_activation.py`, `domain/review_exemptions.py`, `domain/review_linkage.py`,
 `domain/review_execution.py` (phase-4 pure ordered execution projection; runtime cutover pending),
 `domain/review_execution_activation.py` (typed execution import sources, complete owner-run and round observations, abandoned-run attribution, plain recorded review baseline proof and registered command-to-round links),
+`domain/review_execution_counter_mapping.py` (offline attribution of legacy issue and negated-PR counter files from complete open-PR linkage observations; shared issue keys block),
 `domain/review_rounds.py` (pure outer-round plans, verified evidence and finalization),
 `domain/review_preflight.py` (pure round selection and current paid-work eligibility under captured execution authority),
 `domain/review_return.py` (bounded, unclassified review child result evidence),
@@ -527,6 +528,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/reload.py`,
 `adapters/repository_guidance.py`, `adapters/resolve_activation.py`, `adapters/review_activation.py`, `adapters/review_linkage.py`,
 `adapters/review_execution_activation.py` (bounded read-only execution file and SQL sources, owner lineage, complete round, run, submission command, submission settlement receipt and outcome receipt scans/revalidation, whole-set outcome and submission settlement storage accounting, plain recorded-review baseline verification, exact command-to-round registration joins, single plain productive-round proof and scoped stale-productivity receipt-path proof),
+`adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),

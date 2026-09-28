@@ -225,6 +225,29 @@ with `CLAUDE.md`, `AGENTS.md`, the
   symlink retarget to a directory with identical file contents. This remains
   an observational reader; the production activation transaction must hold
   the barriers, resolve positive issue counters and prove session admission.
+- Checkpoint 63 adds a complete open-PR linkage reader and pure legacy counter
+  attribution. It reads the bounded paginated open-PR list, each PR's validated
+  lifecycle/linkage view and its linked issue, then rechecks the listing. A
+  fresh re-read must match the held repository-bound linkage source. Positive
+  issue keys use the runtime's closing-reference-then-branch rule; negative
+  keys name their PR directly. Every parsed file counter is assigned once to
+  an open PR or retained as unassigned historical evidence. A positive key
+  shared by open PRs, malformed/unavailable linkage or an unrepresentable
+  combined PR total blocks. This remains observational: the production writer
+  must join it to configured-root revalidation and historical run/reset
+  evidence inside activation barriers before importing any debit.
+
+Independent Sol review of checkpoint 63 found a mixed-repository provenance
+gap: the listing used the requested repository while PR and issue reads used
+the gateway's configured repository. The reader now checks equality before
+reading, and the proof digest includes the canonical repository. The second
+review pass found no remaining material issue. The full gate log is
+`/tmp/phase4-counter-mapping-final-gate.log` (ephemeral).
+The gate passed: 3,250 domain, 3,132 adapter and 2,866 app tests, plus
+hooks, governor, gate parity, four import contracts and both Pyrefly checks.
+Ten strict xfails remained expected. The architecture manifest now names both
+new modules; its contract was the only failure in the first gate attempt and
+passed after that documentation correction.
 
 Independent Sol review of checkpoint 62 found that the first implementation
 enforced row and byte bounds only after accumulating all configured roots.
@@ -472,12 +495,12 @@ order a durable clock.
    block historical unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
-3. Use the complete configured-root file revalidation reader inside the
-   activation barriers. Join positive issue-keyed file
-   counters to PRs with fresh complete linked-issue observations; shared or
-   ambiguous issue counters cannot be copied to multiple PRs. The typed
-   session/round/counter parser keeps malformed values and mode markers
-   explicit, but a syntactically valid session candidate still needs
+3. Join the complete configured-root file and repository-bound open-PR
+   linkage revalidation readers inside the activation barriers. The pure
+   mapper retains unassigned historical counters and refuses a positive issue
+   key shared by open PRs, but it has not established historical deaths or
+   resets. The typed session/round/counter parser keeps malformed values and
+   mode markers explicit; a syntactically valid session candidate still needs
    source-backed admission provenance before reuse.
 4. Build the production import writer from revalidated legacy sources and
    activation decisions, then mint initialized/renewed origin variants,
