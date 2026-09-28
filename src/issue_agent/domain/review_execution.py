@@ -13,7 +13,10 @@ from enum import Enum
 import hashlib
 
 from .agent_task import RuntimeCapabilities, RuntimeName
-from .workflow import WorkflowMutation
+from .workflow import (
+    AuthorizedOperatorCommand, ContinueGrantedRearm, ObservedTransition,
+    RequestRearm, WorkflowMutation,
+)
 from .workflow_identity import (
     PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowRevision,
     validate_workflow_identifier as identifier,
@@ -880,6 +883,34 @@ class ReviewExecutionAcceptedTransitionSource:
             raise ValueError("accepted transition source requires a SHA-256 digest")
 
 
+@dataclass(frozen=True)
+class ReviewExecutionTransitionProofSource:
+    """Small accepted-transition proof minted with a generation boundary."""
+
+    boundary: ReviewExecutionGenerationBoundary
+    namespace: str
+    key: str
+    payload_sha256: str
+    audit_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.boundary, ReviewExecutionGenerationBoundary):
+            raise ValueError("generation transition proof requires its boundary")
+        identifier(self.key, "generation transition proof key")
+        for name, digest in (("payload", self.payload_sha256), ("audit", self.audit_sha256)):
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValueError(f"generation transition proof requires a SHA-256 {name} digest")
+        if self.boundary.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM):
+            if self.namespace != "workflow-request":
+                raise ValueError("generation request proof disagrees with its boundary")
+        elif self.boundary.mutation is WorkflowMutation.RELEASE_CEILING:
+            if self.namespace != "workflow-transition":
+                raise ValueError("generation release proof disagrees with its boundary")
+        else:
+            raise ValueError("generation transition proof requires an advancing mutation")
+
+
 def accepted_review_transition_source(
     boundary: ReviewExecutionGenerationBoundary, namespace: str, key: str, payload: str,
 ) -> ReviewExecutionAcceptedTransitionSource:
@@ -891,6 +922,32 @@ def accepted_review_transition_source(
     )
 
 
+def accepted_review_transition_proof_source(
+    boundary: ReviewExecutionGenerationBoundary, namespace: str, key: str,
+    payload: str, audit: AuthorizedOperatorCommand | ObservedTransition, audit_payload: str,
+) -> ReviewExecutionTransitionProofSource:
+    """Bind the accepted bytes and typed cause without copying their snapshot."""
+    if not isinstance(payload, str) or not isinstance(audit_payload, str):
+        raise ValueError("generation transition proof payloads must be text")
+    command_type = {
+        WorkflowMutation.REQUEST_REARM: RequestRearm,
+        WorkflowMutation.CONTINUE_REARM: ContinueGrantedRearm,
+    }.get(boundary.mutation)
+    if command_type is not None:
+        if (not isinstance(audit, AuthorizedOperatorCommand)
+                or not isinstance(audit.command, command_type)
+                or audit.command.request_id != key
+                or audit.command.expected != boundary.from_revision):
+            raise ValueError("generation request proof disagrees with its boundary")
+    elif (boundary.mutation is not WorkflowMutation.RELEASE_CEILING
+          or not isinstance(audit, ObservedTransition)):
+        raise ValueError("generation release proof disagrees with its boundary")
+    return ReviewExecutionTransitionProofSource(
+        boundary, namespace, key, hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        hashlib.sha256(audit_payload.encode("utf-8")).hexdigest(),
+    )
+
+
 def matches_accepted_review_transition_source(
     captured: object, boundary: ReviewExecutionGenerationBoundary,
     namespace: str, key: str, payload: str,
@@ -899,6 +956,13 @@ def matches_accepted_review_transition_source(
     if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
         try:
             return captured == accepted_review_transition_source(boundary, namespace, key, payload)
+        except (TypeError, ValueError, UnicodeError):
+            return False
+    if isinstance(captured, ReviewExecutionTransitionProofSource):
+        try:
+            return (captured.boundary == boundary and captured.namespace == namespace
+                    and captured.key == key
+                    and captured.payload_sha256 == hashlib.sha256(payload.encode("utf-8")).hexdigest())
         except (TypeError, ValueError, UnicodeError):
             return False
     return isinstance(captured, tuple) and captured == (boundary, namespace, key, payload)

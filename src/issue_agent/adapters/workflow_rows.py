@@ -19,7 +19,8 @@ from ..domain.review_execution import (
     MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
     ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
     InitializedReviewExecutionOriginReceipt, initialized_review_execution,
-    ReviewExecutionAcceptedTransitionSource, ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary,
+    ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
+    ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary,
     ReviewExecutionOriginKind, ReviewRoundOutcome,
     matches_accepted_review_transition_source, replay_review_execution_generations,
     review_generation_chain_digest, same_execution_episode,
@@ -38,7 +39,7 @@ from ..domain.review_workflow_policy import (
 )
 from ..domain.workflow import (
     AuthorizedOperatorCommand, CancelledRearm, CompletedRearm, ContinueGrantedRearm, OpenGate,
-    PendingRearm, RequestRearm,
+    ObservedTransition, PendingRearm, RequestRearm,
     RearmIntent, RearmingGate,
     ResolveEpisode, SupersededRearm, WorkflowAbsent, WorkflowChanged, WorkflowMigrationRequired,
     WorkflowMutation, WorkflowRejected, WorkflowSnapshot, WorkflowUnchanged,
@@ -785,8 +786,11 @@ def _check_execution_projection(
         ).fetchone()
         if receipt is None:
             raise WorkflowAuthorityError("review generation boundary lacks its accepted receipt")
-        captured = decode_workflow(receipt["payload_json"], tuple | ReviewExecutionAcceptedTransitionSource)
-        if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
+        captured = decode_workflow(
+            receipt["payload_json"],
+            tuple | ReviewExecutionAcceptedTransitionSource | ReviewExecutionTransitionProofSource,
+        )
+        if isinstance(captured, (ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource)):
             if captured.boundary != boundary:
                 raise WorkflowAuthorityError("review generation boundary receipt changed")
             namespace, key = captured.namespace, captured.key
@@ -811,7 +815,7 @@ def _check_execution_projection(
             expected = decode_workflow(payload["expected"], WorkflowRevision)
             audit = decode_workflow(payload["audit"], AuthorizedOperatorCommand) if (
                 boundary.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM)
-            ) else None
+            ) else decode_workflow(payload["audit"], ObservedTransition)
         except (ValueError, TypeError, KeyError) as exc:
             raise WorkflowAuthorityError("review generation boundary has invalid transition facts") from exc
         if (payload.get("mutation") != boundary.mutation.value or expected != boundary.from_revision
@@ -820,7 +824,10 @@ def _check_execution_projection(
                 or not observed.execution.boundaries
                 or observed.execution.boundaries[-1] != boundary):
             raise WorkflowAuthorityError("review generation boundary disagrees with accepted transition")
-        if audit is not None:
+        if (isinstance(captured, ReviewExecutionTransitionProofSource)
+                and captured.audit_sha256 != hashlib.sha256(payload["audit"].encode()).hexdigest()):
+            raise WorkflowAuthorityError("review generation proof disagrees with accepted transition")
+        if isinstance(audit, AuthorizedOperatorCommand):
             if (not isinstance(audit.command, (RequestRearm, ContinueGrantedRearm))
                     or namespace != "workflow-request" or key != audit.command.request_id
                     or audit.command.expected != boundary.from_revision):

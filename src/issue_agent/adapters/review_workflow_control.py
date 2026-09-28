@@ -42,7 +42,7 @@ from ..domain.review_evidence import (
     unavailable_evidence, unavailable_first_observation,
 )
 from ..domain.review_execution import (
-    ActivatedReviewExecution, accepted_review_transition_source, initialized_review_execution,
+    ActivatedReviewExecution, accepted_review_transition_proof_source, initialized_review_execution,
 )
 from ..domain.review_rounds import (
     FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed,
@@ -1276,11 +1276,13 @@ class SQLiteReviewWorkflowControl:
                 raise WorkflowAuthorityError("generation advance lost its execution boundary")
             boundary = after.execution.boundaries[-1]
             namespace, dedupe = transition_dedupe_key(transition)
+            if not isinstance(transition.audit, (AuthorizedOperatorCommand, ObservedTransition)):
+                raise WorkflowAuthorityError("generation advance lacks a typed transition cause")
             db.execute(
                 "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                 ("review-execution-generation", self._writer.repository, boundary.receipt_id,
-                 self._now().isoformat(), encode_workflow(accepted_review_transition_source(
-                     boundary, namespace, dedupe, encoded,
+                 self._now().isoformat(), encode_workflow(accepted_review_transition_proof_source(
+                     boundary, namespace, dedupe, encoded, transition.audit, encode_workflow(transition.audit),
                  ))),
             )
         intent = after.intent

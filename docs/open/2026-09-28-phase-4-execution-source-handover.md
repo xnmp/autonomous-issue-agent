@@ -1,6 +1,6 @@
 # Phase 4 handover — execution activation sources
 
-Date: 2026-09-28 Australia/Sydney. Branch `dev`. The six-phase goal remains
+Date: 2026-09-29 Australia/Sydney. Branch `dev`. The six-phase goal remains
 active: phases 1–3 accepted, phase 4 in progress, phases 5–6 pending. Start
 with `CLAUDE.md`, `AGENTS.md`, the
 [phase-4 progress record](2026-09-27-phase-4-progress.md), the
@@ -355,6 +355,28 @@ with `CLAUDE.md`, `AGENTS.md`, the
   observed rows still have no authority. A durable audit must persist its own
   cursor and reconcile the sweep with every expected generation pair to find
   unclaimed or missing sources before admission can depend on it.
+- Checkpoint 77 mints a typed, fixed-size cause proof with each newly accepted
+  generation transition in the writer's existing SQL transaction. It binds
+  the boundary, accepted namespace and key, accepted payload digest, and
+  canonical audit digest. Request and continue causes must name the matching
+  request and prior revision; release causes must be observed transitions.
+  Archive and canonical readers verify the digest against the retained
+  accepted audit. Earlier digest-only and full-payload receipt variants stay
+  readable. A forged cause digest blocks both readers even when the accepted
+  transition bytes are unchanged. The proof stores no preflight or accepted
+  snapshot, so a large operator audit cannot enlarge this receipt. It is a
+  prerequisite for bounded hot reads, not a source-audit or compaction gate.
+
+Independent Sol review of checkpoint 77 found no medium or high severity
+issue in the fixed-size proof, writer or readers. Focused tests and the full
+`make test` gate passed: 3,276 domain, 3,203 adapter and 2,876 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-small-transition-proof-gate.log` (ephemeral). No live service
+or workflow family was activated. The intended efficiency metric is bytes
+decoded per canonical hot read; the guardrail is exact source authenticity.
+The next measurement is the compaction contract's 10/1,000/5,000-transition
+benchmark after the audited bounded reader is installed.
 
 Independent Sol review of checkpoint 76 found no concrete medium or high
 issue. The final focused sweep and archive tests passed (12 cases), including

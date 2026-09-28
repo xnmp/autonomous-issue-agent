@@ -93,6 +93,7 @@ _VALUES = (
     rx.ReviewRoundCancelled, rx.ReviewRoundOutcome, rx.ReviewExecutionPolicy,
     rx.ReviewExecutionState, rx.ReviewExecutionBoundaryCursor, rx.ReviewExecutionCheckpoint,
     rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,
+    rx.ReviewExecutionTransitionProofSource,
     rx.ReviewExecutionOrigin, rx.ImportedReviewExecutionOriginReceipt,
     rx.InitializedReviewExecutionOriginReceipt,
     rx.ImportedReviewExecutionDecision,

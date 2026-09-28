@@ -60,7 +60,8 @@ from issue_agent.domain.resolve_activation import (
 )
 from issue_agent.domain.review_execution import (
     CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome,
-    ReviewExecutionAcceptedTransitionSource, accepted_review_transition_source,
+    ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
+    accepted_review_transition_source,
     review_generation_chain_digest,
 )
 from issue_agent.domain.review_rounds import ReviewRoundFacts, ReviewRoundPlan, StaleReviewProductivitySettlement
@@ -1209,13 +1210,14 @@ def test_complete_generation_receipts_read_actual_accepted_boundary_without_writ
     source = observed.receipts[0]
     assert source.source_rowid > 0
     accepted_source = decode_workflow(
-        dict(source.fields)["payload_json"], ReviewExecutionAcceptedTransitionSource,
+        dict(source.fields)["payload_json"], ReviewExecutionTransitionProofSource,
     )
     assert accepted_source.namespace == "workflow-request"
     assert accepted_source.key == "rearm:generation-inventory"
     assert (accepted_source.boundary.from_revision.fence.generation + 1
             == accepted_source.boundary.to_revision.fence.generation)
     assert len(accepted_source.payload_sha256) == 64 and len(source.source_digest) == 64
+    assert len(accepted_source.audit_sha256) == 64
 
 
 def test_generation_boundary_proves_one_accepted_transition_and_causal_rows(rig):
@@ -1237,20 +1239,25 @@ def test_generation_boundary_proves_one_accepted_transition_and_causal_rows(rig)
     assert replace(proof, accepted_rowid=proof.receipt_source.source_rowid + 1).source_digest != proof.source_digest
 
 
-def test_generation_boundary_keeps_legacy_full_payload_receipts_readable(rig):
+@pytest.mark.parametrize("legacy_format", ["digest", "full_payload"])
+def test_generation_boundary_keeps_legacy_receipts_readable(rig, legacy_format):
     store = _accepted_generation(rig)
     with store.transaction() as db:
         row = db.execute(
             "SELECT key,payload_json FROM dedupe_keys WHERE namespace='review-execution-generation'",
         ).fetchone()
-        source = decode_workflow(row["payload_json"], ReviewExecutionAcceptedTransitionSource)
+        source = decode_workflow(row["payload_json"], ReviewExecutionTransitionProofSource)
         accepted = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope='o/r' AND key=?",
             (source.namespace, source.key),
         ).fetchone()["payload_json"]
         db.execute(
             "UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-generation' AND key=?",
-            (encode_workflow((source.boundary, source.namespace, source.key, accepted)), row["key"]),
+            (encode_workflow(
+                accepted_review_transition_source(source.boundary, source.namespace, source.key, accepted)
+                if legacy_format == "digest"
+                else (source.boundary, source.namespace, source.key, accepted)
+            ), row["key"]),
         )
     with store.transaction() as db:
         observed = read_complete_legacy_review_generation_receipts(db, "o/r")
@@ -1269,13 +1276,40 @@ def test_generation_boundary_keeps_legacy_full_payload_receipts_readable(rig):
     assert archive.sources[0].boundary == source.boundary
 
 
+def test_generation_proof_rejects_changed_cause_with_unchanged_accepted_bytes(rig):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation'",
+        ).fetchone()
+        source = decode_workflow(row["payload_json"], ReviewExecutionTransitionProofSource)
+        changed = replace(source, audit_sha256="f" * 64)
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-generation'",
+            (encode_workflow(changed),),
+        )
+    with store.transaction() as db:
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+        matched = match_legacy_review_generation_boundary_sources(db, observed, source.boundary.receipt_id)
+        archive = read_review_generation_archive_page(
+            db, source.boundary.before.binding,
+            source.boundary.to_revision.fence.generation,
+            source.boundary.to_revision.fence.generation,
+        )
+        with pytest.raises(WorkflowAuthorityError, match="proof disagrees"):
+            load_review_workflow_row(db, rig[1].revision.fence.key)
+    assert isinstance(matched, UnmatchedLegacyReviewGenerationBoundarySources)
+    assert isinstance(archive, BlockedReviewGenerationArchivePage)
+
+
 def test_generation_digest_rejects_a_changed_accepted_payload(rig):
     store = _accepted_generation(rig)
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation'",
         ).fetchone()
-        source = decode_workflow(row["payload_json"], ReviewExecutionAcceptedTransitionSource)
+        source = decode_workflow(row["payload_json"], ReviewExecutionTransitionProofSource)
         db.execute(
             "UPDATE dedupe_keys SET payload_json=? WHERE namespace=? AND scope='o/r' AND key=?",
             ("{}", source.namespace, source.key),
@@ -1454,7 +1488,7 @@ def test_generation_receipt_sweep_blocks_unclaimed_or_malformed_source(rig, dama
             )
     with closing(store._connect()) as db:
         db.execute("BEGIN")
-        binding = decode_workflow(row["payload_json"], ReviewExecutionAcceptedTransitionSource).boundary.before.binding
+        binding = decode_workflow(row["payload_json"], ReviewExecutionTransitionProofSource).boundary.before.binding
         sweep = read_review_generation_receipt_sweep_page(db, binding)
         db.rollback()
     assert isinstance(sweep, BlockedReviewGenerationReceiptSweepPage)
@@ -1603,7 +1637,7 @@ def test_generation_boundary_rejects_mutated_accepted_transition_contents(rig, d
     store = _accepted_generation(rig)
     with store.transaction() as db:
         row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation'").fetchone()
-        source = decode_workflow(row["payload_json"], ReviewExecutionAcceptedTransitionSource)
+        source = decode_workflow(row["payload_json"], ReviewExecutionTransitionProofSource)
         boundary, namespace, key = source.boundary, source.namespace, source.key
         accepted = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace=? AND key=?",
                               (namespace, key)).fetchone()["payload_json"]
@@ -2682,7 +2716,7 @@ def test_older_successful_submission_can_settle_after_accepted_generation_advanc
     captured = decode_workflow(stale["payload_json"], StaleReviewProductivitySettlement)
     boundary = decode_workflow(
         dict(generation.receipts[0].fields)["payload_json"],
-        ReviewExecutionAcceptedTransitionSource,
+        ReviewExecutionTransitionProofSource,
     ).boundary
     assert captured.settled_revision == current(store, selection).revision
     assert captured.facts.plan.round == old.round

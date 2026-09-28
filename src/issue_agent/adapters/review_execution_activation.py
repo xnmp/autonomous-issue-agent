@@ -64,7 +64,8 @@ from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStat
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, NoReviewSession, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
-    ReviewExecutionAcceptedTransitionSource, matches_accepted_review_transition_source,
+    ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
+    matches_accepted_review_transition_source,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
     review_generation_chain_digest, review_generation_receipt_id, same_execution_episode,
 )
@@ -2619,7 +2620,7 @@ def revalidate_complete_legacy_review_generation_receipts(
 
 def _verify_accepted_generation_transition(
     repository: str, boundary: ReviewExecutionGenerationBoundary,
-    accepted: dict[str, str | None],
+    accepted: dict[str, str | None], captured: object,
 ) -> None:
     """Validate the full accepted payload shared by import and archive reads."""
     try:
@@ -2686,6 +2687,9 @@ def _verify_accepted_generation_transition(
                         encode_workflow(boundary.from_revision).encode(),
                     ).hexdigest()):
                 raise ValueError("generation release identity disagrees with accepted transition")
+        if (isinstance(captured, ReviewExecutionTransitionProofSource)
+                and captured.audit_sha256 != hashlib.sha256(payload["audit"].encode()).hexdigest()):
+            raise ValueError("generation proof cause disagrees with accepted transition")
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise ValueError("generation boundary lacks an exact accepted transition") from exc
 
@@ -2720,6 +2724,10 @@ class MatchedLegacyReviewGenerationBoundarySources:
             raise ValueError("generation boundary requires complete typed source evidence")
         source = dict(self.receipt_source.fields)
         accepted = dict(self.accepted_fields)
+        captured = decode_workflow(
+            source["payload_json"],
+            tuple | ReviewExecutionAcceptedTransitionSource | ReviewExecutionTransitionProofSource,
+        )
         if (source["scope"] != self.complete_receipts.repository
                 or source["key"] != self.boundary.receipt_id
                 or source["reusable_after"] is not None
@@ -2728,7 +2736,7 @@ class MatchedLegacyReviewGenerationBoundarySources:
                 or accepted["namespace"] not in {"workflow-request", "workflow-transition"}
                 or accepted["payload_json"] is None
                 or not matches_accepted_review_transition_source(
-                    decode_workflow(source["payload_json"], tuple | ReviewExecutionAcceptedTransitionSource),
+                    captured,
                     self.boundary, accepted["namespace"], accepted["key"], accepted["payload_json"],
                 )):
             raise ValueError("generation boundary and accepted receipt disagree")
@@ -2745,7 +2753,7 @@ class MatchedLegacyReviewGenerationBoundarySources:
                 or key.repository != self.complete_receipts.repository):
             raise ValueError("generation boundary has a changed derived identity")
         _verify_accepted_generation_transition(
-            self.complete_receipts.repository, self.boundary, accepted,
+            self.complete_receipts.repository, self.boundary, accepted, captured,
         )
 
     @property
@@ -2783,8 +2791,11 @@ def match_legacy_review_generation_boundary_sources(
         return UnmatchedLegacyReviewGenerationBoundarySources(receipt_id, "generation receipt is absent")
     try:
         values = dict(source.fields)
-        captured = decode_workflow(values["payload_json"], tuple | ReviewExecutionAcceptedTransitionSource)
-        if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
+        captured = decode_workflow(
+            values["payload_json"],
+            tuple | ReviewExecutionAcceptedTransitionSource | ReviewExecutionTransitionProofSource,
+        )
+        if isinstance(captured, (ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource)):
             boundary, namespace, key = captured.boundary, captured.namespace, captured.key
         elif (len(captured) == 4 and isinstance(captured[0], ReviewExecutionGenerationBoundary)
               and all(isinstance(item, str) for item in captured[1:])):
@@ -2958,7 +2969,7 @@ def read_review_generation_archive_page(
                 raise ValueError("generation receipt lost its accepted transition")
             _parse_stamp(receipt["claimed_at"])
             _parse_stamp(accepted["claimed_at"])
-            _verify_accepted_generation_transition(repository, boundary, accepted)
+            _verify_accepted_generation_transition(repository, boundary, accepted, captured)
             source_bytes = sum(
                 len(value.encode("utf-8", "surrogatepass"))
                 for _, value in (*receipt_fields, *accepted_fields) if value is not None
@@ -3280,14 +3291,18 @@ def _accepted_generation_rows(
 _GenerationEpisodeKey = tuple[int, str, FamilyAuthority, str, WorkflowKey, int]
 
 
-_GenerationReceiptPayload = tuple[object, ...] | ReviewExecutionAcceptedTransitionSource
+_GenerationReceiptPayload = (
+    tuple[object, ...] | ReviewExecutionAcceptedTransitionSource | ReviewExecutionTransitionProofSource
+)
 
 
 def _generation_receipt_parts(
     payload_json: str,
 ) -> tuple[ReviewExecutionGenerationBoundary, str, str, _GenerationReceiptPayload]:
-    captured = decode_workflow(payload_json, tuple | ReviewExecutionAcceptedTransitionSource)
-    if isinstance(captured, ReviewExecutionAcceptedTransitionSource):
+    captured = decode_workflow(
+        payload_json, tuple | ReviewExecutionAcceptedTransitionSource | ReviewExecutionTransitionProofSource,
+    )
+    if isinstance(captured, (ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource)):
         return captured.boundary, captured.namespace, captured.key, captured
     if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
             or any(not isinstance(value, str) for value in captured[1:])):

@@ -2,6 +2,7 @@
 
 from dataclasses import FrozenInstanceError, replace
 from datetime import datetime, timedelta, timezone
+import hashlib
 from itertools import permutations
 
 import pytest
@@ -16,7 +17,8 @@ from issue_agent.domain.review_execution import (
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
     ReviewExecutionGenerationBoundary, ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
-    ReviewExecutionAcceptedTransitionSource, accepted_review_transition_source,
+    ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
+    accepted_review_transition_source, accepted_review_transition_proof_source,
     ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
@@ -26,7 +28,7 @@ from issue_agent.domain.review_execution import (
     plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
-from issue_agent.domain.workflow import WorkflowMutation
+from issue_agent.domain.workflow import ObservedTransition, WorkflowMutation
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
 )
@@ -292,6 +294,38 @@ def test_generation_transition_source_binds_payload_without_retaining_it():
     assert len(source.payload_sha256) == 64 and accepted not in repr(source)
     with pytest.raises(ValueError, match="SHA-256"):
         replace(source, payload_sha256="not-a-digest")
+
+
+def test_generation_transition_proof_binds_a_typed_release_cause():
+    initial = checkpoint()
+    carried = carry_review_execution_generation(initial.state, binding(1), 0)
+    boundary = replace(
+        generation_boundary(initial.state, carried, 0, (), "boundary:release"),
+        mutation=WorkflowMutation.RELEASE_CEILING,
+    )
+    accepted = "accepted-release:" + "x" * 100_000
+    cause = ObservedTransition(("release:evidence",))
+    proof = accepted_review_transition_proof_source(
+        boundary, "workflow-transition", "transition:key", accepted, cause, "encoded-release-audit",
+    )
+
+    assert isinstance(proof, ReviewExecutionTransitionProofSource)
+    assert proof.audit_sha256 == hashlib.sha256(b"encoded-release-audit").hexdigest()
+    assert accepted not in repr(proof)
+    assert matches_accepted_review_transition_source(
+        proof, boundary, "workflow-transition", "transition:key", accepted,
+    )
+    assert not matches_accepted_review_transition_source(
+        proof, boundary, "workflow-transition", "transition:key", accepted + "changed",
+    )
+    with pytest.raises(ValueError, match="release proof"):
+        replace(proof, namespace="workflow-request")
+    with pytest.raises(ValueError, match="SHA-256 audit"):
+        replace(proof, audit_sha256="untyped")
+    with pytest.raises(ValueError, match="release proof"):
+        accepted_review_transition_proof_source(
+            boundary, "workflow-transition", "transition:key", accepted, "untyped", "encoded-release-audit",
+        )
 
 
 def test_generation_receipt_identity_is_reconstructible_from_episode_and_destination():
