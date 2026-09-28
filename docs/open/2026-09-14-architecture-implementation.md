@@ -9,8 +9,9 @@ acceptance through the production fix-daemon composition `6905184`). The
 **review-rejection slice and phase 3 are accepted** at `a7214bf`; see the
 [verification record](2026-09-27-review-slice-verification.md). Current work is
 phase 4 under the [review execution design](2026-09-27-phase-4-review-execution-design.md).
-The current offline source checkpoint inventories durable generation receipts
-and matches each selected receipt to its accepted workflow transition; see the
+The current offline source checkpoints inventory durable generation receipts,
+match them to accepted transitions, and capture a typed stale-settlement
+generation witness for future imports; see the
 [phase-4 source handover](2026-09-28-phase-4-execution-source-handover.md).
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.

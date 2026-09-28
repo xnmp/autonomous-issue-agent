@@ -742,6 +742,21 @@ class ReviewExecutionGenerationBoundary:
             previous = sequence
 
 
+def review_generation_chain_digest(receipt_ids: tuple[str, ...]) -> str:
+    """Bind an ordered, bounded crossing without storing a lifetime-sized list."""
+    if not isinstance(receipt_ids, tuple) or not 1 <= len(receipt_ids) <= MAX_EXECUTION_SUFFIX:
+        raise ValueError("generation crossing requires bounded receipts")
+    for receipt_id in receipt_ids:
+        identifier(receipt_id, "generation crossing receipt")
+        try:
+            receipt_id.encode("utf-8")
+        except UnicodeError as exc:
+            raise ValueError("generation crossing receipt must be UTF-8") from exc
+    if len(set(receipt_ids)) != len(receipt_ids):
+        raise ValueError("generation crossing requires distinct receipts")
+    return hashlib.sha256("\x00".join(receipt_ids).encode()).hexdigest()
+
+
 def _apply(
     state: ReviewExecutionState, outcome: ReviewRoundOutcome, policy: ReviewExecutionPolicy,
 ) -> ReviewExecutionState:

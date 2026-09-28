@@ -86,6 +86,44 @@ def confirmed_escalation(rig, *, cause="verdict", seal=True):
     return store, gateway, selection, control, plan, command
 
 
+def accepted_generation_with_open_submission(rig, *, seal=True, old_cause="verdict"):
+    store, snapshot, gateway, selection, control = rig
+    old = control.preflight(selection)
+    later_selection = replace(selection, request_id="preflight:later-ceiling",
+                              expected=current(store, selection).revision)
+    _, _, _, _, _, escalation = confirmed_escalation(
+        (store, snapshot, gateway, later_selection, control), cause="ceiling",
+    )
+    binding = current(store, selection).binding
+    if old_cause == "ceiling":
+        op = BoundReviewSubmissionOp(9, "COMMENT", "older human review", "b" * 40,
+                                     "review-bot", "c" * 64, "ceiling")
+        command_id = bound_review_command_id(op, binding)
+        command = LifecycleCommand(command_id, f"github:{command_id}", CommandKind.SUBMIT_REVIEW,
+                                   "pr:9", op.head, op.payload(), "test", "o/r", OWNER,
+                                   workflow=binding)
+    else:
+        command = command_for(current(store, selection))
+    control.register_submission(old.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.COPIED)
+    if seal:
+        control.seal_completed_planning(old.round.round_id, current(store, selection).revision)
+    store.begin_command(command.command_id)
+    store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
+                                      EffectStatus.SUCCEEDED, remote_object_id="review:older"))
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(escalation.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    request_rearm = RequestRearm("rearm:with-older-submission", before.revision,
+                                 before.gates[0].gate_id, KeepGuidance(), expected_binding=before.binding)
+    assert isinstance(workflow.request_rearm(request_rearm, OperatorActor("operator", "test")),
+                      WorkflowCommitted)
+    return store, gateway, selection, control, old, command, workflow
+
+
 def _registered_round_link(store, command_id):
     with closing(store._connect()) as db:
         db.execute("BEGIN")
@@ -425,14 +463,13 @@ def _advance_generation_with_open_round(store, selection):
 
 
 def test_stale_confirmed_verdict_closes_round_before_settled_marker_without_reset(rig):
-    store, gateway, selection, control, plan, command = confirmed_copy(rig)
-    _advance_generation_with_open_round(store, selection)
-    before_state = current(store, selection).execution.state
+    store, gateway, selection, control, plan, command, workflow = accepted_generation_with_open_submission(rig)
+    before = current(store, selection)
 
-    result = workflow_for(store, gateway).settle_submission(command.command_id)
+    result = workflow.settle_submission(command.command_id)
 
     assert isinstance(result, WorkflowRejected)
-    assert current(store, selection).execution.state == before_state
+    assert current(store, selection).execution.state == before.execution.state
     assert plan.round.round_id not in control.reconcile_review_rounds().finalized
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-round-stale-productivity' "
@@ -440,14 +477,14 @@ def test_stale_confirmed_verdict_closes_round_before_settled_marker_without_rese
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-submission-settled' "
                           "AND key=?", (str(command.command_id),)).fetchone()[0] == 1
     before = dump(store)
-    assert workflow_for(store, gateway).settle_submission(command.command_id) is None
+    assert workflow.settle_submission(command.command_id) is None
     assert dump(store) == before
 
 
 def test_stale_confirmed_verdict_waits_for_parent_seal_before_marker(rig):
-    store, gateway, selection, control, plan, command = confirmed_copy(rig, seal=False)
-    _advance_generation_with_open_round(store, selection)
-    workflow = workflow_for(store, gateway)
+    store, gateway, selection, control, plan, command, workflow = accepted_generation_with_open_submission(
+        rig, seal=False,
+    )
 
     assert workflow.settle_submission(command.command_id) is None
     with store.transaction() as db:
@@ -456,6 +493,24 @@ def test_stale_confirmed_verdict_waits_for_parent_seal_before_marker(rig):
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     sweep = control.reconcile_review_rounds()
     assert plan.round.round_id in sweep.finalized
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
+
+
+def test_stale_generation_witness_and_round_closure_commit_atomically(rig):
+    store, _, _, _, plan, command, workflow = accepted_generation_with_open_submission(rig)
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_stale_witness BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='review-round-stale-productivity' "
+                   "BEGIN SELECT RAISE(ABORT,'stale witness refused'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="stale witness refused"):
+        workflow.settle_submission(command.command_id)
+    with store.transaction() as db:
+        outcome = db.execute("SELECT outcome_json FROM review_execution_rounds WHERE round_id=?",
+                             (plan.round.round_id,)).fetchone()
+        assert outcome["outcome_json"] is None
+        assert db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='review-round-stale-productivity' "
+                          "AND key=?", (plan.round.round_id,)).fetchone() is None
+        db.execute("DROP TRIGGER refuse_stale_witness")
     assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
 
 
@@ -834,15 +889,16 @@ def test_ceiling_waits_for_parent_seal_before_opening_gate(rig):
 
 
 def test_stale_ceiling_result_closes_as_audit_without_opening_gate(rig):
-    store, gateway, selection, control, plan, command = confirmed_escalation(rig, cause="ceiling")
-    _advance_generation_with_open_round(store, selection)
-    before_state = current(store, selection).execution.state
+    store, gateway, selection, control, plan, command, workflow = accepted_generation_with_open_submission(
+        rig, old_cause="ceiling",
+    )
+    before = current(store, selection)
 
-    result = workflow_for(store, gateway).settle_submission(command.command_id)
+    result = workflow.settle_submission(command.command_id)
 
     assert isinstance(result, WorkflowRejected)
     state = current(store, selection)
-    assert state.execution.state == before_state and state.gates == ()
+    assert state.execution.state == before.execution.state and state.gates == before.gates
     assert control.finalize_completed_round(plan.round.round_id).outcome.round == plan.round
 
 

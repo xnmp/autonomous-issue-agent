@@ -61,6 +61,7 @@ from ..domain.review_rounds import (
     MAX_REVIEW_STAGES, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionRegistration,
     ReviewRoundFacts,
     DeferredReviewPreparation, ReviewSubmissionConfirmed, finalize_review_round,
+    StaleReviewProductivitySettlement,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.workflow import (
@@ -862,10 +863,21 @@ def verify_complete_legacy_round_outcome_storage(
                                                     "nondeferred round has a preparation receipt",
                                                     preparation.source_rowid)
         stale = receipt_by_identity.get(("review-round-stale-productivity", round_id))
-        if stale is not None and dict(stale.fields)["payload_json"] != encode_workflow((proof.facts, proof.outcome)):
-            return BlockedLegacyRoundOutcomeStorage(rounds.repository,
-                                                    "stale productivity receipt disagrees with its round",
-                                                    stale.source_rowid)
+        if stale is not None:
+            try:
+                raw_stale = dict(stale.fields)["payload_json"]
+                captured_stale = decode_workflow(raw_stale, tuple | StaleReviewProductivitySettlement)
+                valid_stale = (
+                    captured_stale == (proof.facts, proof.outcome)
+                    if isinstance(captured_stale, tuple)
+                    else captured_stale.facts == proof.facts and captured_stale.outcome == proof.outcome
+                ) and raw_stale == encode_workflow(captured_stale)
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                valid_stale = False
+            if not valid_stale:
+                return BlockedLegacyRoundOutcomeStorage(rounds.repository,
+                                                        "stale productivity receipt disagrees with its round",
+                                                        stale.source_rowid)
         for namespace, expected in (("review-round-superseded-productivity", str),
                                     ("review-round-ceiling-productivity", CeilingProductivityDecision)):
             source = receipt_by_identity.get((namespace, round_id))
@@ -1805,6 +1817,16 @@ class VerifiedLegacyStaleProductivityReceiptPath:
                           if isinstance(item.result, ReviewSubmissionConfirmed))
         disposition = self.sealed.outcome.disposition
         stale = dict(self.stale_receipt.fields)
+        try:
+            stale_payload = decode_workflow(stale["payload_json"], tuple | StaleReviewProductivitySettlement)
+            stale_matches = (
+                stale_payload == (self.sealed.facts, self.sealed.outcome)
+                if isinstance(stale_payload, tuple)
+                else stale_payload.facts == self.sealed.facts
+                and stale_payload.outcome == self.sealed.outcome
+            ) and stale["payload_json"] == encode_workflow(stale_payload)
+        except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+            raise ValueError("stale settlement has malformed receipt evidence") from exc
         auxiliary = {"review-round-superseded-productivity", "review-round-ceiling-productivity"}
         if (self.registered not in self.complete_storage.registered
                 or self.sealed not in self.complete_storage.round_storage.sealed
@@ -1839,7 +1861,7 @@ class VerifiedLegacyStaleProductivityReceiptPath:
                 or stale["key"] != round_id
                 or stale["reusable_after"] is not None
                 or stale["claimed_at"] != dict(self.sealed.receipt_source.fields)["claimed_at"]
-                or stale["payload_json"] != encode_workflow((self.sealed.facts, self.sealed.outcome))):
+                or not stale_matches):
             raise ValueError("stale settlement has contradictory command or round evidence")
         _parse_stamp(stale["claimed_at"])
 
@@ -2029,7 +2051,8 @@ class MatchedLegacyReviewGenerationBoundarySources:
                 or not isinstance(self.receipt_source, LegacyReviewGenerationReceiptSource)
                 or not isinstance(self.boundary, ReviewExecutionGenerationBoundary)
                 or self.receipt_source not in self.complete_receipts.receipts
-                or type(self.accepted_rowid) is not int or self.accepted_rowid <= 0
+                or type(self.accepted_rowid) is not int
+                or not MIN_SQL_ROWID <= self.accepted_rowid <= MAX_SQL_ROWID
                 or not isinstance(self.accepted_fields, tuple)
                 or tuple(name for name, _ in self.accepted_fields) != _DEDUPE_SOURCE_COLUMNS
                 or any(value is not None and (not isinstance(value, str)
@@ -2038,8 +2061,7 @@ class MatchedLegacyReviewGenerationBoundarySources:
             raise ValueError("generation boundary requires complete typed source evidence")
         source = dict(self.receipt_source.fields)
         accepted = dict(self.accepted_fields)
-        if (self.receipt_source.source_rowid <= self.accepted_rowid
-                or source["scope"] != self.complete_receipts.repository
+        if (source["scope"] != self.complete_receipts.repository
                 or source["key"] != self.boundary.receipt_id
                 or source["reusable_after"] is not None
                 or accepted["scope"] != self.complete_receipts.repository

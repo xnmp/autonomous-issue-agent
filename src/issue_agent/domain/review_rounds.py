@@ -17,8 +17,9 @@ from .review_execution import (
     ReplaceReviewSession, ReusableReviewSession, ReviewAdmissionRefused,
     ReviewCancellationReason, ReviewChildIdentity, ReviewChildKind,
     ReviewInfrastructureDeath, ReviewBudgetExhausted, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
-    ReviewRoundCancelled, ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome,
+    ReviewExecutionBinding, ReviewRoundCancelled, ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome,
     ReviewUnlaunchedRound, SaturateReviewFailures, SetDisplayedRound,
+    same_execution_episode,
 )
 from .review_rejection import validate_commit_sha
 from .review_return import ReviewReturnedEnvelope
@@ -493,6 +494,33 @@ class ReviewRoundFacts:
             if isinstance(child, ReviewChildReturned) and isinstance(child.result, ReviewChildSucceeded) and isinstance(child.result.session, ReusableReviewSession):
                 if child.result.session.runtime is not self.plan.runtime:
                     raise ValueError("reviewer session runtime differs from the captured plan")
+
+
+@dataclass(frozen=True)
+class StaleReviewProductivitySettlement:
+    """The writer's generation witness captured atomically with a stale round."""
+
+    facts: ReviewRoundFacts
+    outcome: ReviewRoundOutcome
+    settled_revision: WorkflowRevision
+    settled_binding: ReviewExecutionBinding
+    crossing_digest: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.facts, ReviewRoundFacts)
+                or not isinstance(self.outcome, ReviewRoundOutcome)
+                or not isinstance(self.settled_revision, WorkflowRevision)
+                or not isinstance(self.settled_binding, ReviewExecutionBinding)):
+            raise ValueError("stale settlement requires typed round and revision evidence")
+        round_id = self.facts.plan.round
+        if (self.outcome.round != round_id
+                or not isinstance(self.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or not same_execution_episode(round_id.binding, self.settled_binding)
+                or self.settled_revision.fence != self.settled_binding.rejection.fence
+                or self.settled_revision.fence.generation <= round_id.binding.rejection.fence.generation
+                or not isinstance(self.crossing_digest, str) or len(self.crossing_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.crossing_digest)):
+            raise ValueError("stale settlement lacks its later generation and execution episode")
 
 
 class ReviewRoundWait(str, Enum):

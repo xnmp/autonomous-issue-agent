@@ -1248,8 +1248,7 @@ second SQL read rejects changed or partial caller-held inventories.
 For one receipt, a source matcher checks the permanent receipt against its
 captured accepted workflow transition, including exact payload, derived
 identity, generation boundary, mutation-specific audit, retained command
-shape, repository and binding. It requires the accepted transition's source
-rowid to precede the generation receipt's rowid and rejects duplicate scope
+shape, repository and binding. It rejects duplicate scope
 aliases. The matched value is an observation: its direct constructor cannot
 prove SQL existence, arbitrary imported rowids do not establish chronology,
 and the command plan still needs a durable command-row join. A stale
@@ -1263,3 +1262,33 @@ Full `make test` passed: 3,198 domain, 3,022 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-generation-boundary-gate.log` (ephemeral).
+
+## Checkpoint 51 — stale settlement generation witness (offline)
+
+The stale successful-submission writer now records a typed permanent receipt
+in the same transaction as the sealed round and outcome. It captures the
+settlement workflow revision, execution binding and digest of every intervening
+generation boundary ID. Before writing, it reloads the current workflow and
+requires a contiguous accepted boundary chain from the round's generation to
+the settlement generation. The canonical hot read checks that chain and its
+accepted transition receipts, the captured revision's position after the final
+boundary, and the digest. A failed receipt insert rolls back the round closure;
+an exact retry can settle it.
+
+The old two-field `(facts, outcome)` receipt remains readable as historical
+data, but it still does not prove the generation crossing for activation.
+The source inventory's content matcher no longer treats SQLite rowids as a
+clock: implicit rowids may be reused after deletes, as [SQLite documents](https://www.sqlite.org/autoinc.html).
+Tests now exercise a real two-round path with an older successful submission,
+a later ceiling escalation, accepted rearm and late settlement. The source
+matcher also accepts valid zero and negative rowids. A complete activation
+join of all boundary and settlement sources remains required before the stale
+path grants historical authority or participates in ordered resets.
+
+Independent Sol review found an omitted boundary-version inequality and a
+positive-rowid assumption in the matcher. Both were fixed with regressions;
+its final pass found no further medium or high issue.
+Full `make test` passed: 3,199 domain, 3,031 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-stale-generation-witness-gate.log` (ephemeral).

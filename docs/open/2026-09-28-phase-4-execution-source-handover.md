@@ -114,11 +114,19 @@ with `CLAUDE.md`, `AGENTS.md`, the
 - Checkpoint 50 inventories every generation receipt in one bounded SQL
   snapshot, with repository-alias refusal and rowid-aware revalidation. A
   source matcher checks one permanent receipt against its accepted transition,
-  derived boundary identity, mutation-specific audit and command shape. Its
-  rowid relation records writer insertion order; the result is an observation
+  derived boundary identity, mutation-specific audit and command shape. The
+  result is an observation
   that must be rechecked in SQL before authority use. It does not prove that
   accepted commands were persisted, that arbitrary imported rowids establish
   chronology, or that a stale productivity receipt crossed a generation.
+- Checkpoint 51 writes a typed stale-productivity receipt with the current
+  workflow revision, execution binding and digest of the complete intervening
+  generation-boundary ID chain in the same transaction as round closure. The
+  writer reloads the current workflow and requires the accepted contiguous
+  chain; the hot read checks its digest and revision. Existing two-field
+  receipts remain readable but have no historical crossing proof. The
+  generation source matcher accepts zero/negative SQL rowids and makes no
+  chronological claim from their order.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -236,6 +244,17 @@ The gate passed: 3,198 domain, 3,022 adapter and 2,866 app tests, plus hooks,
 governor, gate parity, four import contracts and both Pyrefly checks. Ten
 strict xfails remained expected.
 
+Independent Sol review of checkpoint 51 found a missing hot-read check that
+the captured settlement revision follows the final boundary revision, and a
+positive-rowid assumption in the source matcher. Both were fixed and
+regression-tested; its final pass found no further medium or high issue. The
+real two-round fixture covers an accepted rearm with an older successful
+submission still open, and a failed stale-receipt insert proves transaction
+rollback. Full gate log: `/tmp/phase4-stale-generation-witness-gate.log`
+(ephemeral). The gate passed: 3,199 domain, 3,031 adapter and 2,866 app
+tests, plus hooks, governor, gate parity, four import contracts and both
+Pyrefly checks. Ten strict xfails remained expected.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -252,13 +271,16 @@ ordered outcomes for each execution episode. Raw recorded markers and completed
 agent runs are observations, not reset authority. Keep unregistered historical
 commands explicit until their legacy provenance is resolved.
 
-The current stale receipt stores `(facts, outcome)` and the writer's claim time,
-but no settlement revision. The existing positive stale-path fixture advances
-the snapshot directly; a normal second preflight is held while its successful
-submission remains unresolved, so that fixture has no accepted generation
-transition or durable generation receipt. A future join must use a real
-source-backed crossing and settlement order, or leave this path blocked as
-unknown. Rowid order alone cannot supply authority for arbitrary imported SQL.
+Legacy stale receipts store only `(facts, outcome)` and the writer's claim
+time; they remain unknown for historical crossing. New typed receipts capture
+the settlement revision and full crossing-chain digest. The regression fixture
+now uses two preflighted rounds, a later ceiling escalation and a public
+accepted rearm before settling the older successful submission. The next
+activation join must revalidate the complete generation and settlement source
+sets together and match every intervening accepted boundary. Missing or
+changed source rows, old two-field receipts and unclassified commands block
+authority. [SQLite's rowid rules](https://www.sqlite.org/autoinc.html) do not
+make rowid order a durable clock.
 
 1. Revalidate the bounded owner closure and run inventory under activation
    barriers before any import commit. Daemon boot's `adopt_legacy_owner`

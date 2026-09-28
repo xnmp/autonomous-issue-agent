@@ -37,9 +37,13 @@ from issue_agent.adapters.review_execution_activation import (
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
-from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome
-from issue_agent.domain.review_rounds import ReviewRoundFacts, ReviewRoundPlan
+from issue_agent.domain.review_execution import (
+    CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome,
+    review_generation_chain_digest,
+)
+from issue_agent.domain.review_rounds import ReviewRoundFacts, ReviewRoundPlan, StaleReviewProductivitySettlement
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
+from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
@@ -64,13 +68,14 @@ from issue_agent.domain.review_execution_activation import (
 )
 from tests.adapters.test_review_execution_control import rig, current, OWNER as CONTROL_OWNER
 from tests.adapters.test_review_productive_settlement import (
+    accepted_generation_with_open_submission,
     confirmed_copy, confirmed_escalation, workflow_for, _advance_generation_with_open_round,
 )
 from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.workflow import (
     RequestRearm, ContinueGrantedRearm, AuthorizedOperatorCommand,
-    ObservedTransition, OperatorActor, KeepGuidance, WorkflowCommitted,
+    ObservedTransition, OperatorActor, KeepGuidance, WorkflowCommitted, WorkflowRejected,
 )
 from issue_agent.domain.review_rejection import CountingRule
 from issue_agent.domain.labels import Label
@@ -980,11 +985,50 @@ def test_generation_boundary_proves_one_accepted_transition_and_causal_rows(rig)
         db.rollback()
 
     assert isinstance(proof, MatchedLegacyReviewGenerationBoundarySources)
-    assert proof.accepted_rowid < proof.receipt_source.source_rowid
+    assert proof.accepted_rowid > 0 and proof.receipt_source.source_rowid > 0
     assert proof.boundary.to_revision.fence.generation == proof.boundary.from_revision.fence.generation + 1
     assert len(proof.source_digest) == 64
-    with pytest.raises(ValueError, match="disagree"):
-        replace(proof, accepted_rowid=proof.receipt_source.source_rowid + 1)
+    assert replace(proof, accepted_rowid=proof.receipt_source.source_rowid + 1).source_digest != proof.source_digest
+
+
+def test_generation_source_match_does_not_infer_time_from_sql_rowids(rig):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        row = db.execute("SELECT namespace,scope,key,claimed_at,reusable_after,payload_json "
+                         "FROM dedupe_keys WHERE namespace='review-execution-generation'").fetchone()
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-generation'")
+        db.execute("INSERT INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,reusable_after,payload_json) "
+                   "VALUES (?,?,?,?,?,?,?)", (-1, *tuple(row)))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+        result = match_legacy_review_generation_boundary_sources(db, observed, row["key"])
+        db.rollback()
+    assert isinstance(result, MatchedLegacyReviewGenerationBoundarySources)
+    assert result.receipt_source.source_rowid < result.accepted_rowid
+
+
+@pytest.mark.parametrize("accepted_rowid", [-1, 0])
+def test_generation_source_match_accepts_nonpositive_accepted_sql_rowid(rig, accepted_rowid):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        row = db.execute("SELECT namespace,scope,key,claimed_at,reusable_after,payload_json "
+                         "FROM dedupe_keys WHERE namespace='workflow-request' "
+                         "AND key='rearm:generation-inventory'").fetchone()
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-request' "
+                   "AND key='rearm:generation-inventory'")
+        db.execute("INSERT INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,reusable_after,payload_json) "
+                   "VALUES (?,?,?,?,?,?,?)", (accepted_rowid, *tuple(row)))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+        receipt_id = dict(observed.receipts[0].fields)["key"]
+        result = match_legacy_review_generation_boundary_sources(db, observed, receipt_id)
+        db.rollback()
+    assert isinstance(result, MatchedLegacyReviewGenerationBoundarySources)
+    assert result.accepted_rowid == accepted_rowid
 
 
 @pytest.mark.parametrize("damage", ["boundary_payload", "transition_payload", "boundary_reusable",
@@ -1157,9 +1201,8 @@ def test_generation_receipt_scan_preserves_negative_and_zero_rowids(tmp_path):
 
 
 def _stale_settlement(rig):
-    store, gateway, selection, _, plan, command = confirmed_copy(rig)
-    _advance_generation_with_open_round(store, selection)
-    workflow_for(store, gateway).settle_submission(command.command_id)
+    store, _, _, _, plan, command, workflow = accepted_generation_with_open_submission(rig)
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
     with closing(store._connect()) as db:
         db.execute("BEGIN")
         complete = verify_complete_legacy_submission_settlement_storage(
@@ -1168,6 +1211,55 @@ def _stale_settlement(rig):
         db.rollback()
     assert isinstance(complete, CompleteLegacySubmissionSettlementStorage)
     return store, plan, command, complete
+
+
+def test_older_successful_submission_can_settle_after_accepted_generation_advance(rig):
+    store, _, selection, _, old, command, workflow = accepted_generation_with_open_submission(rig)
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        generation = read_complete_legacy_review_generation_receipts(db, "o/r")
+        stale = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-stale-productivity' "
+                           "AND key=?", (old.round.round_id,)).fetchone()
+        db.rollback()
+    assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
+    assert len(generation.receipts) == 1 and stale is not None
+    captured = decode_workflow(stale["payload_json"], StaleReviewProductivitySettlement)
+    boundary = decode_workflow(dict(generation.receipts[0].fields)["payload_json"], tuple)[0]
+    assert captured.settled_revision == current(store, selection).revision
+    assert captured.facts.plan.round == old.round
+    assert captured.crossing_digest == review_generation_chain_digest((boundary.receipt_id,))
+
+
+@pytest.mark.parametrize("damage", ["crossing_digest", "future_revision",
+                                    "preboundary_revision", "legacy_receipt"])
+def test_stale_settlement_hot_read_checks_new_witness_and_retains_legacy_reads(rig, damage):
+    store, _, selection, _, old, command, workflow = accepted_generation_with_open_submission(rig)
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
+    boundary_version = current(store, selection).execution.boundaries[-1].to_revision.version
+    with store.transaction() as db:
+        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-stale-productivity' "
+                         "AND key=?", (old.round.round_id,)).fetchone()
+        captured = decode_workflow(row["payload_json"], StaleReviewProductivitySettlement)
+        if damage == "crossing_digest":
+            changed = replace(captured, crossing_digest="0" * 64)
+        elif damage == "future_revision":
+            changed = replace(captured, settled_revision=replace(
+                captured.settled_revision, version=captured.settled_revision.version + 1,
+            ))
+        elif damage == "preboundary_revision":
+            changed = replace(captured, settled_revision=replace(
+                captured.settled_revision, version=boundary_version - 1,
+            ))
+        else:
+            changed = (captured.facts, captured.outcome)
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-stale-productivity' "
+                   "AND key=?", (encode_workflow(changed), old.round.round_id))
+    if damage == "legacy_receipt":
+        assert current(store, selection).execution.state.productive_sequence > 0
+    else:
+        with pytest.raises(WorkflowAuthorityError, match="stale productive review round"):
+            current(store, selection)
 
 
 def test_stale_successful_submission_has_sealed_round_without_recorded_baseline(rig):

@@ -11,12 +11,14 @@ from ..domain.review_execution import (
     ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress,
     ReviewPreparationKind,
     ReviewRoundOutcome, replay_review_execution_generations, same_execution_episode,
+    review_generation_chain_digest,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningComplete,
     ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     ReviewRoundAwaitingEvidence, ReviewSubmissionConfirmed, ReviewSubmissionKind, ReviewSubmissionPlan,
     ReviewSubmissionRegistration, finalize_review_round,
+    StaleReviewProductivitySettlement,
 )
 from ..domain.review_workflow import ObservedPullRequest, PullRequestState, RecordedPullRequest, ReviewWorkflowSnapshot
 from ..domain.review_evidence import ReviewEvidenceKind
@@ -482,6 +484,27 @@ class SQLiteReviewExecutionControl:
                            and isinstance(submission.result, ReviewSubmissionConfirmed)
                            for submission in facts.submissions)):
             raise WorkflowAuthorityError("review verdict has no sealed, settled productive round")
+        stale_settlement: StaleReviewProductivitySettlement | None = None
+        if stale:
+            persisted = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
+            if persisted != after_rejection:
+                raise WorkflowAuthorityError("stale review settlement changed its current workflow")
+            old_generation = plan.round.binding.rejection.fence.generation
+            settled_generation = after_rejection.revision.fence.generation
+            boundaries = tuple(boundary for boundary in after_rejection.execution.boundaries
+                               if old_generation <= boundary.from_revision.fence.generation < settled_generation)
+            if (len(boundaries) != settled_generation - old_generation
+                    or any(boundary.from_revision.fence.generation != old_generation + index
+                           or boundary.to_revision.fence.generation != old_generation + index + 1
+                           or not same_execution_episode(boundary.before.binding, plan.round.binding)
+                           or not same_execution_episode(boundary.after.binding, plan.round.binding)
+                           for index, boundary in enumerate(boundaries))
+                    or boundaries[-1].to_revision.version > after_rejection.revision.version):
+                raise WorkflowAuthorityError("stale review settlement lacks its accepted generation chain")
+            stale_settlement = StaleReviewProductivitySettlement(
+                facts, result.outcome, after_rejection.revision, after_rejection.execution.binding,
+                review_generation_chain_digest(tuple(boundary.receipt_id for boundary in boundaries)),
+            )
         changed = db.execute(
             "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
             "WHERE round_id=? AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
@@ -496,10 +519,11 @@ class SQLiteReviewExecutionControl:
              _stamp(settled_at), encode_workflow((facts, result.outcome))),
         )
         if stale:
+            assert stale_settlement is not None
             db.execute(
                 "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                 (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
-                 _stamp(settled_at), encode_workflow((facts, result.outcome))),
+                 _stamp(settled_at), encode_workflow(stale_settlement)),
             )
         if superseded_evidence_id is not None:
             db.execute(

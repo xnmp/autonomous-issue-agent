@@ -19,6 +19,7 @@ from issue_agent.domain.review_execution import (
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
     SetDisplayedRound, advance_review_execution_generation, carry_review_execution_generation,
     compatible_review_session,
+    review_generation_chain_digest,
     plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
@@ -29,6 +30,16 @@ from issue_agent.domain.workflow_identity import (
 
 
 MAX_INTEGER = 2**63 - 1
+
+
+def test_generation_chain_digest_binds_order_and_rejects_malformed_receipts():
+    assert review_generation_chain_digest(("boundary:1", "boundary:2")) != review_generation_chain_digest(
+        ("boundary:2", "boundary:1"),
+    )
+    for malformed in ((), ("boundary:1", "boundary:1"), ([],), ("\ud800",),
+                      tuple(f"boundary:{index}" for index in range(MAX_EXECUTION_SUFFIX + 1))):
+        with pytest.raises(ValueError):
+            review_generation_chain_digest(malformed)
 
 
 def binding(generation=0):

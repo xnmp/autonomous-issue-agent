@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 28 Sep 2026, 16:03 AEST · Latest accepted checkpoint: phase 4 generation receipt source match</p>
+      <p class="meta">Updated 28 Sep 2026, 16:32 AEST · Latest accepted checkpoint: phase 4 stale settlement generation witness</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Complete source inventories, whole-set settlement storage, one plain productive round, the scoped stale receipt path and generation receipt source matching are accepted offline. Next: prove historical generation ordering, escalated hold provenance and ordered resets; then map issue counters and build source-backed origin and compaction. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Complete source inventories, whole-set settlement storage, one plain productive round, generation source matching and a typed stale settlement witness are accepted offline. Next: join the complete generation chain to settlement, prove escalated hold provenance and ordered resets; then map issue counters and build source-backed origin and compaction. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -111,6 +111,7 @@
           <li><time datetime="2026-09-28T15:15:00+10:00">28 Sep 2026, 15:15 AEST</time><strong>Whole-set submission settlement storage accepted offline · 3 of 6 accepted</strong><p>One SQL snapshot now accounts for every submission command, registration, round index and recorded marker against canonical round plans. Forged pairings, missing planned submissions and changed sources block. Sol review, regressions and the full repository gate passed. Productivity classification and ordered resets remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T15:33:00+10:00">28 Sep 2026, 15:33 AEST</time><strong>Stale productivity receipt path accepted offline · 3 of 6 accepted</strong><p>A succeeded command, unique remote review ID, sealed outcome and matching stale receipt now form one source-backed path without a recorded marker. Sol review, malformed-source regressions and the full repository gate passed. The receipt does not prove generation ordering or a reset. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T16:03:00+10:00">28 Sep 2026, 16:03 AEST</time><strong>Generation receipt source match accepted offline · 3 of 6 accepted</strong><p>Bounded SQL inventory and revalidation cover generation receipts; a selected receipt is matched to its accepted transition, audit and command shape. Sol review, alias and malformed-source regressions, and the full repository gate passed. Settlement chronology and durable command joins remain open. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-28T16:32:00+10:00">28 Sep 2026, 16:32 AEST</time><strong>Stale settlement generation witness accepted offline · 3 of 6 accepted</strong><p>A real two-round path now records the settlement revision and complete generation-chain digest with the stale round; hot reads verify both. Legacy receipts remain readable but cannot prove the crossing. Sol review, rollback and malformed-source regressions, and the full repository gate passed. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

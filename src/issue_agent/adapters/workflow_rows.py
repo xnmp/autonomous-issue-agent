@@ -18,7 +18,7 @@ from ..domain.review_workflow import (
 from ..domain.review_execution import (
     MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
     ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary, ReviewRoundOutcome,
-    replay_review_execution_generations,
+    replay_review_execution_generations, review_generation_chain_digest, same_execution_episode,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
@@ -26,7 +26,7 @@ from ..domain.review_rounds import (
     MAX_REVIEW_STAGES, MAX_ROUND_SUBMISSIONS, ReviewPlanningComplete, ReviewPlanningOpen,
     ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     ReviewSubmissionConfirmed, ReviewSubmissionRegistration,
-    finalize_review_round,
+    StaleReviewProductivitySettlement, finalize_review_round,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.review_workflow_policy import (
@@ -690,9 +690,38 @@ def _check_execution_projection(
                         or (recorded_revision.fence == revision.fence
                             and recorded_revision.version > revision.version)):
                     raise WorkflowAuthorityError("productive review round baseline receipt disagrees with its generation")
-            elif stale is not None and (decode_workflow(stale["payload_json"], tuple) != (facts, outcome)
-                  or plan.round.binding.rejection.fence.generation >= revision.fence.generation):
-                raise WorkflowAuthorityError("stale productive review round lacks its exact retirement")
+            elif stale is not None:
+                old_generation = identity.binding.rejection.fence.generation
+                recorded = decode_workflow(
+                    stale["payload_json"], tuple | StaleReviewProductivitySettlement,
+                )
+                if isinstance(recorded, tuple):
+                    valid = recorded == (facts, outcome)
+                else:
+                    settled_generation = recorded.settled_revision.fence.generation
+                    crossings = tuple(boundary for boundary in execution.boundaries
+                                      if old_generation <= boundary.from_revision.fence.generation
+                                      < settled_generation)
+                    valid = (
+                        recorded.facts == facts and recorded.outcome == outcome
+                        and recorded.settled_revision.fence.key == revision.fence.key
+                        and recorded.settled_revision.version <= revision.version
+                        and settled_generation <= revision.fence.generation
+                        and same_execution_episode(recorded.settled_binding, execution.binding)
+                        and len(crossings) == settled_generation - old_generation
+                        and all(boundary.from_revision.fence.generation == old_generation + index
+                                and boundary.to_revision.fence.generation == old_generation + index + 1
+                                and same_execution_episode(boundary.before.binding, identity.binding)
+                                and same_execution_episode(boundary.after.binding, identity.binding)
+                                for index, boundary in enumerate(crossings))
+                        and bool(crossings)
+                        and crossings[-1].to_revision.version <= recorded.settled_revision.version
+                        and recorded.crossing_digest == review_generation_chain_digest(
+                            tuple(boundary.receipt_id for boundary in crossings)
+                        )
+                    )
+                if not valid or old_generation >= revision.fence.generation:
+                    raise WorkflowAuthorityError("stale productive review round lacks its exact retirement")
             elif superseded is not None:
                 supersession = decode_workflow(superseded["payload_json"], tuple)
                 if (len(supersession) != 3 or not isinstance(supersession[0], str)
