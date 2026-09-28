@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 28 Sep 2026, 12:54 AEST · Latest accepted checkpoint: phase 4 complete round inventory</p>
+      <p class="meta">Updated 28 Sep 2026, 13:12 AEST · Latest accepted checkpoint: phase 4 outcome receipt pages</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Review source inventory, recorded baseline, command-to-round link and complete round source revalidation accepted offline. Next: outcome and hold proof, issue mapping, then source-backed origin and compaction. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Review source inventory, recorded baseline, command-to-round link, complete round source revalidation and bounded outcome receipt pages accepted offline. Next: complete receipt inventory, outcome and hold proof, issue mapping, then source-backed origin and compaction. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -101,6 +101,7 @@
           <li><time datetime="2026-09-28T12:21:00+10:00">28 Sep 2026, 12:21 AEST</time><strong>Registered command-to-round link accepted offline · 3 of 6 accepted</strong><p>Exact command, registration, index, preflight, plan and stage sources now verify one round identity without claiming productivity. Bounded reads, regressions, Sol review and the full repository gate passed. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T12:37:00+10:00">28 Sep 2026, 12:37 AEST</time><strong>Bounded round row inventory accepted offline · 3 of 6 accepted</strong><p>All round columns, including closure and outcome, are inventoried in bounded SQL pages. Malformed or oversized rows remain explicit blockers. Focused tests, Sol review and the full repository gate passed. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T12:54:00+10:00">28 Sep 2026, 12:54 AEST</time><strong>Complete round inventory accepted offline · 3 of 6 accepted</strong><p>The full SQL round set has row, byte and shared-table scan ceilings. A second read blocks partial or changed inventories. Sol review, regressions and the full repository gate passed. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-28T13:12:00+10:00">28 Sep 2026, 13:12 AEST</time><strong>Outcome receipt pages accepted offline · 3 of 6 accepted</strong><p>Five durable round outcome and productivity namespaces now have bounded raw source pages. Sol review, focused regressions and the full repository gate passed. Productivity and reset proof remain open. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

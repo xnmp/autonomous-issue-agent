@@ -33,6 +33,9 @@ from ..domain.review_execution_activation import (
     LegacyReviewRoundPage, LegacyReviewRoundSource, UnreadableLegacyReviewRound,
     CompleteLegacyReviewRounds, BlockedLegacyReviewRounds,
     MAX_LEGACY_ROUND_INVENTORY_ROWS, MAX_LEGACY_ROUND_INVENTORY_BYTES,
+    LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES, MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES,
+    LegacyReviewOutcomeReceiptPage, LegacyReviewOutcomeReceiptSource,
+    UnreadableLegacyReviewOutcomeReceipt, BlockedLegacyReviewOutcomeReceiptPage,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
 from ..domain.review_execution import ExecutionNotActivated
@@ -64,6 +67,10 @@ MAX_LEGACY_ROUND_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_SOURCE_PAGE = 64
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
 MAX_REVIEW_ROUND_SOURCE_PAGE = 16
+MAX_OUTCOME_RECEIPT_SOURCE_PAGE = 16
+MAX_OUTCOME_RECEIPT_PAGE_BYTES = 2**24
+MAX_OUTCOME_RECEIPT_SCAN_ROWS = 1_000_000
+MAX_OUTCOME_RECEIPT_SCAN_CHUNK = 256
 _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
 _DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json")
 MAX_LEGACY_RECORDING_BYTES = 2**21
@@ -445,6 +452,118 @@ def read_legacy_review_submission_receipt_page(
     return LegacyReviewSubmissionReceiptPage(
         tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
         len(metadata) > MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
+    )
+
+
+def read_legacy_review_outcome_receipt_page(
+    db: sqlite3.Connection, repository: str, *, after_rowid: int | None = None,
+) -> LegacyReviewOutcomeReceiptPage | BlockedLegacyReviewOutcomeReceiptPage:
+    """Inventory durable round outcome and productivity receipts without interpretation."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("review outcome receipt scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("review outcome receipt scan requires a canonical repository")
+    if after_rowid is not None and (type(after_rowid) is not int or not MIN_SQL_ROWID <= after_rowid <= MAX_SQL_ROWID):
+        raise ValueError("review outcome receipt scan requires a valid cursor")
+    repository_bytes = repository.encode("utf-8")
+    if len(repository_bytes) > 512:
+        raise ValueError("review outcome receipt repository exceeds the scan identity bound")
+    namespace_bytes = {name.encode("utf-8") for name in LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES}
+    matching_ids: list[int] = []
+    examined = 0
+    cursor = after_rowid
+    exhausted = False
+    while len(matching_ids) <= MAX_OUTCOME_RECEIPT_SOURCE_PAGE and not exhausted:
+        remaining = MAX_OUTCOME_RECEIPT_SCAN_ROWS - examined
+        if remaining == 0:
+            predicate = "" if cursor is None else "WHERE rowid>?"
+            params = () if cursor is None else (cursor,)
+            if db.execute(
+                f"SELECT rowid FROM dedupe_keys NOT INDEXED {predicate} ORDER BY rowid LIMIT 1", params,
+            ).fetchone() is not None:
+                return BlockedLegacyReviewOutcomeReceiptPage(
+                    repository, "review outcome receipt page exceeds its total scan bound", cursor,
+                )
+            break
+        predicate = "" if cursor is None else "WHERE rowid>?"
+        params = () if cursor is None else (cursor,)
+        batch = db.execute(
+            "SELECT rowid AS source_rowid,"
+            "CASE WHEN length(CAST(namespace AS BLOB))<=512 THEN CAST(namespace AS BLOB) END AS namespace_bytes,"
+            "CASE WHEN length(CAST(scope AS BLOB))<=512 THEN CAST(scope AS BLOB) END AS scope_bytes "
+            f"FROM dedupe_keys NOT INDEXED {predicate} ORDER BY rowid LIMIT ?",
+            (*params, min(MAX_OUTCOME_RECEIPT_SCAN_CHUNK, remaining)),
+        ).fetchall()
+        if not batch:
+            exhausted = True
+            break
+        for row in batch:
+            cursor = row["source_rowid"]
+            examined += 1
+            if row["scope_bytes"] == repository_bytes and row["namespace_bytes"] in namespace_bytes:
+                matching_ids.append(cursor)
+                if len(matching_ids) > MAX_OUTCOME_RECEIPT_SOURCE_PAGE:
+                    break
+        exhausted = len(batch) < min(MAX_OUTCOME_RECEIPT_SCAN_CHUNK, remaining)
+
+    other_columns = ("namespace", "scope", "key", "claimed_at", "reusable_after")
+    other_sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in other_columns]
+    payload_size = "ifnull(length(CAST(payload_json AS BLOB)),0)"
+    metadata = []
+    if matching_ids:
+        marks = ",".join("?" for _ in matching_ids)
+        metadata = db.execute(
+            f"SELECT rowid AS source_rowid,max({','.join(other_sizes)}) AS largest_other,"
+            f"{payload_size} AS payload_bytes,{'+'.join((*other_sizes, payload_size))} AS total_bytes "
+            f"FROM dedupe_keys WHERE rowid IN ({marks}) ORDER BY rowid", matching_ids,
+        ).fetchall()
+    selected: list[sqlite3.Row] = []
+    retained_bytes = 0
+    for row in metadata[:MAX_OUTCOME_RECEIPT_SOURCE_PAGE]:
+        safe = (row["largest_other"] <= MAX_LEGACY_SQL_TEXT_BYTES
+                and row["payload_bytes"] <= MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES)
+        if safe and selected and retained_bytes + row["total_bytes"] > MAX_OUTCOME_RECEIPT_PAGE_BYTES:
+            break
+        selected.append(row)
+        if safe:
+            retained_bytes += row["total_bytes"]
+    safe_ids = [row["source_rowid"] for row in selected if (
+        row["largest_other"] <= MAX_LEGACY_SQL_TEXT_BYTES
+        and row["payload_bytes"] <= MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES
+        and row["total_bytes"] <= MAX_OUTCOME_RECEIPT_PAGE_BYTES
+    )]
+    values = {}
+    if safe_ids:
+        ids = ",".join("?" for _ in safe_ids)
+        fields = ",".join(
+            f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+            for column in LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS
+        )
+        values = {row["source_rowid"]: row for row in db.execute(
+            f"SELECT rowid AS source_rowid,{fields} FROM dedupe_keys "
+            f"WHERE rowid IN ({ids})", safe_ids,
+        )}
+    entries: list[LegacyReviewOutcomeReceiptSource | UnreadableLegacyReviewOutcomeReceipt] = []
+    for row in selected:
+        rowid = row["source_rowid"]
+        if (row["largest_other"] > MAX_LEGACY_SQL_TEXT_BYTES
+                or row["payload_bytes"] > MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES
+                or row["total_bytes"] > MAX_OUTCOME_RECEIPT_PAGE_BYTES):
+            entries.append(UnreadableLegacyReviewOutcomeReceipt(rowid, "review outcome receipt exceeds its SQL source bound"))
+            continue
+        source = values.get(rowid)
+        if source is None:
+            entries.append(UnreadableLegacyReviewOutcomeReceipt(rowid, "review outcome receipt changed during its read"))
+            continue
+        try:
+            fields = tuple((column, _sql_text(source[f"type_{column}"], source[f"raw_{column}"]))
+                           for column in LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS)
+            entries.append(LegacyReviewOutcomeReceiptSource(rowid, fields))
+        except (TypeError, ValueError, UnicodeError):
+            entries.append(UnreadableLegacyReviewOutcomeReceipt(rowid, "review outcome receipt has malformed fields"))
+    return LegacyReviewOutcomeReceiptPage(
+        tuple(entries), selected[-1]["source_rowid"] if selected else after_rowid,
+        len(metadata) > len(selected),
     )
 
 

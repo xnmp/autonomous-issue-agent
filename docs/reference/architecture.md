@@ -526,7 +526,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
 `adapters/repository_guidance.py`, `adapters/resolve_activation.py`, `adapters/review_activation.py`, `adapters/review_linkage.py`,
-`adapters/review_execution_activation.py` (bounded read-only execution file and SQL sources, owner lineage, complete round and run scans/revalidation, plain recorded-review baseline verification and exact command-to-round registration joins),
+`adapters/review_execution_activation.py` (bounded read-only execution file and SQL sources, owner lineage, complete round and run scans/revalidation, raw outcome receipt pages, plain recorded-review baseline verification and exact command-to-round registration joins),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),

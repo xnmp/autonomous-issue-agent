@@ -510,6 +510,98 @@ class BlockedLegacyReviewRounds:
             _rowid(self.source_rowid, "blocked review round cursor")
 
 
+LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES = frozenset({
+    "review-round-outcome", "review-round-preparation", "review-round-stale-productivity",
+    "review-round-superseded-productivity", "review-round-ceiling-productivity",
+})
+MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES = 2**21
+
+
+@dataclass(frozen=True)
+class LegacyReviewOutcomeReceiptSource:
+    """Uninterpreted outcome or productivity receipt from the durable source log."""
+
+    source_rowid: int
+    fields: tuple[tuple[str, str | None], ...]
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "review outcome receipt cursor")
+        if (not isinstance(self.fields, tuple)
+                or any(not isinstance(field, tuple) or len(field) != 2 for field in self.fields)
+                or tuple(name for name, _ in self.fields) != LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS):
+            raise ValueError("review outcome receipt requires exact fields and order")
+        for name, value in self.fields:
+            if value is None and name == "reusable_after":
+                continue
+            if (not isinstance(value, str)
+                    or len(value.encode("utf-8", "surrogatepass")) > (
+                        MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES if name == "payload_json" else MAX_LEGACY_SQL_TEXT_BYTES
+                    )):
+                raise ValueError(f"review outcome receipt {name} must be bounded text")
+        values = dict(self.fields)
+        if (values["namespace"] not in LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES
+                or canonical_workflow_repository(values["scope"]) != values["scope"]
+                or not values["key"] or not values["claimed_at"] or not values["payload_json"]):
+            raise ValueError("review outcome receipt lacks its canonical source identity")
+
+    @property
+    def source_bytes(self) -> int:
+        return sum(len(value.encode("utf-8", "surrogatepass")) for _, value in self.fields if value is not None)
+
+    @property
+    def source_digest(self) -> str:
+        return hashlib.sha256(json.dumps(self.fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnreadableLegacyReviewOutcomeReceipt:
+    source_rowid: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "unreadable review outcome receipt cursor")
+        validate_workflow_text(self.reason, "unreadable review outcome receipt reason")
+
+
+LegacyReviewOutcomeReceiptEntry = LegacyReviewOutcomeReceiptSource | UnreadableLegacyReviewOutcomeReceipt
+
+
+@dataclass(frozen=True)
+class LegacyReviewOutcomeReceiptPage:
+    entries: tuple[LegacyReviewOutcomeReceiptEntry, ...]
+    next_rowid: int | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.entries, tuple)
+                or any(not isinstance(entry, (LegacyReviewOutcomeReceiptSource, UnreadableLegacyReviewOutcomeReceipt))
+                       for entry in self.entries)):
+            raise ValueError("review outcome receipt page requires typed entries")
+        if self.next_rowid is not None:
+            _rowid(self.next_rowid, "review outcome receipt page cursor")
+        if type(self.has_more) is not bool:
+            raise ValueError("review outcome receipt page continuation must be boolean")
+        rowids = [entry.source_rowid for entry in self.entries]
+        if rowids != sorted(set(rowids)) or (rowids and rowids[-1] != self.next_rowid):
+            raise ValueError("review outcome receipt page must advance through unique rowids")
+        if self.has_more and not rowids:
+            raise ValueError("review outcome receipt page cannot continue without a cursor")
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewOutcomeReceiptPage:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked outcome receipt page requires a canonical repository")
+        validate_workflow_text(self.reason, "blocked outcome receipt page reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked outcome receipt scan cursor")
+
+
 MAX_LEGACY_REVIEW_OWNERS = 64
 
 

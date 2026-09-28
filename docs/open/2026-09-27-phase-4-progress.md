@@ -1052,3 +1052,23 @@ Full `make test` passed: 3,192 domain, 2,912 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-complete-rounds-gate.log` (ephemeral).
+
+## Checkpoint 41 — bounded outcome receipt source pages (offline)
+
+The execution activation reader now pages the five durable review-round
+outcome and productivity namespaces in `dedupe_keys` for one repository under
+an explicit SQL snapshot. It retains all six source columns with a digest
+independent of SQLite rowid, including negative and zero rowids, and marks
+malformed, BLOB or oversized fields unreadable. Pages retain at most 16 rows
+or 16 MiB, with a 2 MiB payload bound and 64 KiB bound on each other field.
+The rowid scan examines at most one million total `dedupe_keys` rows per page,
+including unrelated namespaces and repositories; exceeding that ceiling
+returns a typed blocker. This is raw source inventory only. A complete receipt
+set, productive outcome, ordered reset and escalated hold provenance still
+require separate proof. Independent Sol review found an initial query sorted
+all matching receipts for each page; the bounded rowid scan addresses that
+finding, and its second pass found no remaining medium or high issue.
+Full `make test` passed: 3,192 domain, 2,919 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-outcome-receipt-gate.log` (ephemeral).

@@ -59,6 +59,11 @@ with `CLAUDE.md`, `AGENTS.md`, the
   including a one-million-row ceiling on the shared round table. A second SQL
   read blocks partial or changed caller-held inventories. This proves source
   completeness within the stated bounds, not a productive outcome or reset.
+- Checkpoint 41 adds bounded, read-only pages for five durable review-round
+  outcome and productivity receipt namespaces. It preserves all `dedupe_keys`
+  source columns and explicit malformed or oversized entries. A one-million-row
+  shared-table scan ceiling blocks unbounded work. Pages alone do not prove a
+  complete receipt inventory, productivity or ordered resets.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -91,6 +96,15 @@ found the initial scan could traverse unlimited foreign-repository rows;
 the global table bound addresses that finding, and its second pass found no
 remaining medium or high issue.
 
+Independent Sol review of checkpoint 41 found that an initial indexed query
+sorted every matching receipt for each page. A bounded rowid scan replaced it;
+the second pass found no remaining medium or high issue. The page reader
+retains raw outcome/productivity sources without interpreting them.
+The full `make test` gate passed: 3,192 domain, 2,919 adapter and 2,866 app
+tests, plus hooks, governor, gate parity, four import contracts and both
+Pyrefly checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-outcome-receipt-gate.log` (ephemeral).
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -104,7 +118,8 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Join bounded outcome receipts to the complete round inventory, then use
+2. Complete and revalidate the bounded outcome receipt inventory. Join it to
+   the complete round inventory, then use
    verified command-to-round links with plain recorded baselines to prove
    confirmed productive outcomes and ordered resets. Verify escalated verdict
    hold provenance and classify unrecorded or stale successful commands
