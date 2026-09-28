@@ -1090,3 +1090,22 @@ Full `make test` passed: 3,198 domain, 2,923 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-complete-outcome-receipt-gate.log` (ephemeral).
+
+## Checkpoint 43 — one sealed round's outcome storage proof (offline)
+
+A read-only verifier now revalidates both complete round and outcome receipt
+inventories under one SQL snapshot, then joins one sealed round to its exact,
+permanent `review-round-outcome` receipt. It decodes the plan, planning state,
+closure facts and outcome through the closed workflow codec, requires their
+canonical stored encodings to agree with the receipt, and independently
+recomputes the outcome from the closure facts. Missing, changed, contradictory,
+unfinalized or expiring evidence yields an explicit unverified result. This
+proves one stored outcome pair, not that the outcome was productive, had a
+recorded baseline, or reset later rounds. Independent Sol review found a
+forged matching outcome, an unsafe malformed-tag diagnostic and an expiring
+receipt gap; domain validation, diagnostic sanitization and regressions address
+them. Its final pass found no remaining medium or high issue.
+Full `make test` passed: 3,198 domain, 2,934 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-round-outcome-storage-gate.log` (ephemeral).

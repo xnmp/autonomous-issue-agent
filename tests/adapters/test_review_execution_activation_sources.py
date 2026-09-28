@@ -1,7 +1,9 @@
 """Review execution legacy file and owner-run inventories are bounded and read-only."""
 
 import sqlite3
+import json
 from contextlib import closing
+from dataclasses import replace
 
 import pytest
 
@@ -17,10 +19,14 @@ from issue_agent.adapters.review_execution_activation import (
     read_complete_legacy_review_rounds, revalidate_complete_legacy_review_rounds,
     read_legacy_review_outcome_receipt_page, MAX_OUTCOME_RECEIPT_SOURCE_PAGE,
     read_complete_legacy_review_outcome_receipts, revalidate_complete_legacy_review_outcome_receipts,
+    verify_legacy_round_outcome_storage,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
+from issue_agent.domain.review_execution import CopiedReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome
+from issue_agent.domain.review_rounds import ReviewRoundFacts
+from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
@@ -33,6 +39,7 @@ from issue_agent.domain.review_execution_activation import (
     LegacyReviewOutcomeReceiptPage, LegacyReviewOutcomeReceiptSource, UnreadableLegacyReviewOutcomeReceipt,
     BlockedLegacyReviewOutcomeReceiptPage,
     CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
+    VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
 )
 from tests.adapters.test_review_execution_control import rig
 from tests.adapters.test_review_productive_settlement import confirmed_copy, workflow_for
@@ -511,6 +518,147 @@ def test_complete_outcome_receipts_bounds_shared_table_and_retained_bytes(monkey
     assert "total scan bound" in scan_blocked.reason
     assert isinstance(bytes_blocked, BlockedLegacyReviewOutcomeReceipts)
     assert "total bound" in bytes_blocked.reason
+
+
+def test_sealed_round_outcome_joins_exact_durable_receipt_without_writes(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        proof = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(proof, VerifiedLegacyRoundOutcomeStorage)
+    assert proof.facts.plan.round == plan.round
+    assert proof.outcome.round == plan.round
+    assert isinstance(proof.outcome.disposition, CopiedReviewProgress)
+    assert dict(proof.receipt_source.fields)["key"] == plan.round.round_id
+
+
+@pytest.mark.parametrize("damage", ["receipt_payload", "round_outcome", "missing_receipt"])
+def test_sealed_round_outcome_rejects_changed_or_missing_sources(rig, damage):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        db.rollback()
+    assert isinstance(rounds, CompleteLegacyReviewRounds)
+    assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+    with store.transaction() as db:
+        if damage == "receipt_payload":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='review-round-outcome'")
+        elif damage == "round_outcome":
+            db.execute("UPDATE review_execution_rounds SET outcome_json='{}' WHERE round_id=?",
+                       (plan.round.round_id,))
+        else:
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-outcome'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
+
+
+@pytest.mark.parametrize("damage", ["receipt_payload", "round_plan", "round_closure", "expiring_receipt"])
+def test_sealed_round_outcome_rejects_matching_inventories_with_contradictory_storage(rig, damage):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        if damage == "receipt_payload":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='review-round-outcome'")
+        elif damage == "round_plan":
+            db.execute("UPDATE review_execution_rounds SET plan_json='{}' WHERE round_id=?",
+                       (plan.round.round_id,))
+        elif damage == "round_closure":
+            db.execute("UPDATE review_execution_rounds SET closure_json='{}' WHERE round_id=?",
+                       (plan.round.round_id,))
+        else:
+            db.execute("UPDATE dedupe_keys SET reusable_after='2026-09-29T00:00:00Z' "
+                       "WHERE namespace='review-round-outcome'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
+
+
+def test_open_round_cannot_claim_a_sealed_outcome(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
+
+
+def test_sealed_round_outcome_rejects_forged_but_matching_receipt(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        row = db.execute("SELECT closure_json,outcome_json FROM review_execution_rounds WHERE round_id=?",
+                         (plan.round.round_id,)).fetchone()
+        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
+        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+        forged = replace(outcome, disposition=ReviewUnlaunchedRound(facts.closure_receipt))
+        db.execute("UPDATE review_execution_rounds SET outcome_json=? WHERE round_id=?",
+                   (encode_workflow(forged), plan.round.round_id))
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-outcome'",
+                   (encode_workflow((facts, forged)),))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
+    assert "closure facts" in result.reason
+
+
+def test_sealed_round_outcome_returns_unverified_for_control_characters_in_bad_tag(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        db.execute("UPDATE review_execution_rounds SET closure_json=? WHERE round_id=?",
+                   (json.dumps({"format": 1, "value": {"type": "unknown\nvariant"}}), plan.round.round_id))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        rounds = read_complete_legacy_review_rounds(db, "o/r")
+        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(rounds, CompleteLegacyReviewRounds)
+        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
+        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
+        db.rollback()
+
+    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
+    assert "unknown" in result.reason and "\n" not in result.reason
 
 
 def _control(tmp_path):

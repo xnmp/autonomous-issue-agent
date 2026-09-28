@@ -10,7 +10,8 @@ import json
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from .review_workflow import ReviewedBaseline
 from .review_workflow_policy import ReviewSubmissionReceipt
-from .review_execution import ReviewRoundIdentity
+from .review_execution import ReviewRoundIdentity, ReviewRoundOutcome
+from .review_rounds import ReviewRoundFacts, FinalizedReviewRound, DeferredReviewPreparation, finalize_review_round
 from .workflow import ObservedTransition
 from .workflow_identity import (
     PullRequestRef, WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
@@ -644,6 +645,57 @@ class BlockedLegacyReviewOutcomeReceipts:
         validate_workflow_text(self.reason, "blocked outcome receipt reason")
         if self.source_rowid is not None:
             _rowid(self.source_rowid, "blocked outcome receipt cursor")
+
+
+@dataclass(frozen=True)
+class VerifiedLegacyRoundOutcomeStorage:
+    """One typed round outcome is paired with its exact durable receipt."""
+
+    round_source: LegacyReviewRoundSource
+    receipt_source: LegacyReviewOutcomeReceiptSource
+    facts: ReviewRoundFacts
+    outcome: ReviewRoundOutcome
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.round_source, LegacyReviewRoundSource)
+                or not isinstance(self.receipt_source, LegacyReviewOutcomeReceiptSource)
+                or not isinstance(self.facts, ReviewRoundFacts)
+                or not isinstance(self.outcome, ReviewRoundOutcome)):
+            raise ValueError("round outcome storage requires typed sources")
+        row = dict(self.round_source.fields)
+        receipt = dict(self.receipt_source.fields)
+        identity = self.facts.plan.round
+        key = identity.binding.rejection.fence.key
+        if (not isinstance(key.target, PullRequestRef)
+                or self.outcome.round != identity or row["round_id"] != identity.round_id
+                or row["repository"] != key.repository
+                or row["target_number"] != key.target.number
+                or row["execution_epoch"] != identity.binding.execution_epoch
+                or row["execution_episode"] != identity.binding.execution_episode
+                or row["generation"] != identity.binding.rejection.fence.generation
+                or row["sequence"] != identity.sequence
+                or receipt["namespace"] != "review-round-outcome"
+                or receipt["scope"] != key.repository or receipt["key"] != identity.round_id
+                or receipt["reusable_after"] is not None):
+            raise ValueError("round outcome storage has contradictory identities")
+        derived = finalize_review_round(self.facts)
+        if not isinstance(derived, (FinalizedReviewRound, DeferredReviewPreparation)) or derived.outcome != self.outcome:
+            raise ValueError("round outcome disagrees with its closure facts")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.round_source.source_digest, self.receipt_source.source_digest)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnverifiedLegacyRoundOutcomeStorage:
+    round_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.round_id, "unverified round outcome")
+        validate_workflow_text(self.reason, "unverified round outcome reason")
 
 
 MAX_LEGACY_REVIEW_OWNERS = 64

@@ -69,6 +69,11 @@ with `CLAUDE.md`, `AGENTS.md`, the
   Unreadable and duplicate sources block a complete set. A second SQL read
   rejects partial or changed caller-held inventories. This is still raw
   evidence; it does not certify a productive outcome or execution reset.
+- Checkpoint 43 joins one sealed round with its exact permanent outcome receipt
+  after revalidating both complete SQL inventories. It checks canonical plan,
+  planning, closure and outcome encodings and independently re-derives the
+  outcome from closure facts. The proof is per round and does not yet establish
+  productivity, baseline pairing, outer-round order or reset.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -117,6 +122,14 @@ and both Pyrefly checks. Ten strict xfails remained expected. Log:
 review found no medium or high issue in the complete inventory and SQL
 revalidation.
 
+The checkpoint-43 full `make test` gate passed: 3,198 domain, 2,934 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-round-outcome-storage-gate.log` (ephemeral). Independent Sol
+review found and drove fixes for an outcome that contradicted closure facts,
+an unsafe decoder diagnostic and an expiring receipt; its final pass found no
+remaining medium or high issue.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -130,8 +143,8 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Join the complete, revalidated outcome receipt inventory to the complete
-   round inventory, then use
+2. Check every closed round's outcome receipt and account for unmatched
+   receipts, then use
    verified command-to-round links with plain recorded baselines to prove
    confirmed productive outcomes and ordered resets. Verify escalated verdict
    hold provenance and classify unrecorded or stale successful commands

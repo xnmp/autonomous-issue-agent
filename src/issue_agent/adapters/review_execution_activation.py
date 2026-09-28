@@ -38,13 +38,15 @@ from ..domain.review_execution_activation import (
     UnreadableLegacyReviewOutcomeReceipt, BlockedLegacyReviewOutcomeReceiptPage,
     CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
     MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS, MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES,
+    VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
-from ..domain.review_execution import ExecutionNotActivated
+from ..domain.review_execution import ExecutionNotActivated, ReviewRoundOutcome
 from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import ReviewSubmissionReceipt
 from ..domain.review_rounds import (
     MAX_REVIEW_STAGES, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind, ReviewSubmissionRegistration,
+    ReviewRoundFacts,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.workflow import ObservedTransition, WorkflowMutation
@@ -620,6 +622,44 @@ def revalidate_complete_legacy_review_outcome_receipts(
     if current.source_digest != observed.source_digest:
         return BlockedLegacyReviewOutcomeReceipts(observed.repository, "outcome receipt sources changed after inventory")
     return current
+
+
+def verify_legacy_round_outcome_storage(
+    db: sqlite3.Connection, observed_rounds: CompleteLegacyReviewRounds,
+    observed_receipts: CompleteLegacyReviewOutcomeReceipts, round_id: str,
+) -> VerifiedLegacyRoundOutcomeStorage | UnverifiedLegacyRoundOutcomeStorage:
+    """Recheck complete source sets and pair one sealed round to its exact receipt."""
+    validate_workflow_identifier(round_id, "round outcome storage")
+    if observed_rounds.repository != observed_receipts.repository:
+        return UnverifiedLegacyRoundOutcomeStorage(round_id, "round and receipt inventories disagree on repository")
+    rounds = revalidate_complete_legacy_review_rounds(db, observed_rounds)
+    if isinstance(rounds, BlockedLegacyReviewRounds):
+        return UnverifiedLegacyRoundOutcomeStorage(round_id, rounds.reason)
+    receipts = revalidate_complete_legacy_review_outcome_receipts(db, observed_receipts)
+    if isinstance(receipts, BlockedLegacyReviewOutcomeReceipts):
+        return UnverifiedLegacyRoundOutcomeStorage(round_id, receipts.reason)
+    round_source = next((source for source in rounds.rounds if dict(source.fields)["round_id"] == round_id), None)
+    receipt_source = next((source for source in receipts.receipts
+                           if dict(source.fields)["namespace"] == "review-round-outcome"
+                           and dict(source.fields)["key"] == round_id), None)
+    if round_source is None or receipt_source is None:
+        return UnverifiedLegacyRoundOutcomeStorage(round_id, "round or outcome receipt is absent")
+    row = dict(round_source.fields)
+    receipt = dict(receipt_source.fields)
+    if row["closure_json"] is None or row["outcome_json"] is None:
+        return UnverifiedLegacyRoundOutcomeStorage(round_id, "round outcome is not sealed")
+    try:
+        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
+        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+        if (row["plan_json"] != encode_workflow(facts.plan)
+                or row["planning_json"] != encode_workflow(facts.planning)
+                or row["closure_json"] != encode_workflow(facts)
+                or row["outcome_json"] != encode_workflow(outcome)
+                or receipt["payload_json"] != encode_workflow((facts, outcome))):
+            raise ValueError("round outcome and receipt disagree on canonical stored facts")
+        return VerifiedLegacyRoundOutcomeStorage(round_source, receipt_source, facts, outcome)
+    except (KeyError, TypeError, ValueError, UnicodeError, CorruptControlStore) as exc:
+        return UnverifiedLegacyRoundOutcomeStorage(round_id, _printable(str(exc)))
 
 
 def read_legacy_review_round_page(
