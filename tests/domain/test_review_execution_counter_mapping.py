@@ -66,6 +66,20 @@ def test_shared_issue_counter_blocks_instead_of_copying_to_two_open_prs():
                       CompleteLegacyCounterMapping)
 
 
+def test_unscoped_same_counter_key_from_two_roots_cannot_be_summed_as_review():
+    entries = (
+        LegacyExecutionCounterRecord(7, LegacyPresent(hashlib.sha256(b"2").hexdigest(), "2"), "fix"),
+        LegacyExecutionCounterRecord(7, LegacyPresent(hashlib.sha256(b"3").hexdigest(), "3"), "review"),
+    )
+    files = classify_legacy_execution_file_values(entries)
+    assert isinstance(files, CompleteLegacyExecutionFileValues)
+
+    mapped = map_legacy_execution_counters(files, _links((9, 7)))
+
+    assert isinstance(mapped, BlockedLegacyCounterMapping)
+    assert "multiple source roots" in mapped.reason
+
+
 def test_closing_reference_takes_precedence_over_branch_and_no_link_keeps_negative_key():
     closing = classify_legacy_counter_link(
         PRView(9, head_ref_name="fix/7-work", head_ref_oid=HEAD, closing_issue=8),

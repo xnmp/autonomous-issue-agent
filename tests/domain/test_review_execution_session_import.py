@@ -11,7 +11,7 @@ from issue_agent.domain.review_execution_activation import (
     CompleteLegacyExecutionFileValues, LegacyExecutionPRRecord, classify_legacy_execution_file_values,
 )
 from issue_agent.domain.review_execution_session_import import (
-    UnprovenLegacyReviewSession, plan_legacy_review_session_import,
+    BlockedLegacyReviewSessionImport, UnprovenLegacyReviewSession, plan_legacy_review_session_import,
 )
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
@@ -72,6 +72,18 @@ def test_real_handle_stays_unproven_even_with_a_round_file():
 def test_session_for_another_pr_is_not_imported():
     result = plan_legacy_review_session_import(_files("claude:session-7", pr=8), "c" * 64, _binding())
     assert isinstance(result, NoReviewSession)
+
+
+def test_same_pr_in_two_roots_blocks_direct_session_planning():
+    files = classify_legacy_execution_file_values((
+        LegacyExecutionPRRecord(7, _source("claude:review-session"), LegacyAbsent(), "review"),
+        LegacyExecutionPRRecord(7, _source("claude:old-session"), LegacyAbsent(), "extra:old"),
+    ))
+    assert isinstance(files, CompleteLegacyExecutionFileValues)
+
+    result = plan_legacy_review_session_import(files, "c" * 64, _binding())
+    assert isinstance(result, BlockedLegacyReviewSessionImport)
+    assert "multiple source roots" in result.reason
 
 
 def test_source_identity_rejects_invalid_digest_or_candidate():

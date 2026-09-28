@@ -299,6 +299,27 @@ with `CLAUDE.md`, `AGENTS.md`, the
   predecessor and unassigned deaths distinctly. The result is still an
   observation; a future writer must prove resets and inherited debit before
   committing import authority.
+- Checkpoint 71 scopes current review file attribution to the physical
+  configured review directory while retaining every configured and declared
+  historical root in the revalidated audit. Fix and steward files may have the
+  same signed key as review files without adding review deaths. The app source
+  verifier binds those other-role exemptions and explicit extra roots to
+  deployment configuration. A foreign root with a counter, session or round
+  source for an open PR blocks until producer provenance is established;
+  arbitrary root labels cannot bypass that check. Direct session planning also
+  blocks duplicate PR sources across roots. This prevents an old review root
+  from silently zeroing an active value, but does not prove historical resets,
+  session producers or debit authority.
+
+Independent Sol review found and verified fixes for two gaps in checkpoint 71:
+the same signed key may legitimately exist in fix and review roots, and
+caller-supplied labels cannot establish historical root ownership. Focused
+regressions cover both, duplicated sessions, explicit extra roots, and a
+substituted deployment root. The full `make test` gate passed: 3,273 domain,
+3,187 adapter and 2,876 app tests, plus hooks, governor, gate parity, four
+import contracts and both Pyrefly checks. Ten strict xfails remained expected.
+The log is `/tmp/phase4-root-scope-gate.log` (ephemeral). No live service or
+workflow family was activated.
 
 Independent Sol review of checkpoint 70 found no concrete issue. Focused
 adapter and app tests cover a current-owner run, a retained predecessor, an
@@ -632,7 +653,7 @@ old two-field receipts and unclassified commands block activation authority.
 [SQLite's rowid rules](https://www.sqlite.org/autoinc.html) do not make rowid
 order a durable clock.
 
-1. Call checkpoint 70's configuration-bound source verifier from the
+1. Call checkpoint 71's configuration-bound source verifier from the
    production import writer inside its acceptance transaction under activation
    barriers, retaining the held source context through commit. Daemon boot's
    `adopt_legacy_owner`
@@ -649,8 +670,10 @@ order a durable clock.
    attribution blocks import with reviewable evidence.
 3. Use the barrier-held file/linkage/counter and SQL source scope in the
    production import writer, preserving the scope through commit.
-   The pure mapper retains unassigned historical counters and refuses a
-   positive issue key shared by open PRs. Checkpoint 70 retains every
+   The pure mapper retains unassigned counters in the selected review root and
+   refuses a positive issue key shared by open PRs. Checkpoint 71 retains
+   other-role and historical files in the full root audit; active evidence in
+   a foreign root needs producer provenance before import. It retains every
    owner-lineage death in the barrier-held result but has not established
    historical resets or predecessor adoption. The typed session/round/counter parser keeps malformed values and
    mode markers explicit; a syntactically valid session candidate is now an

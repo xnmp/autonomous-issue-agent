@@ -53,7 +53,7 @@ def plan_legacy_review_session_import(
     files: CompleteLegacyExecutionFileValues,
     roots_digest: str,
     binding: ReviewExecutionBinding,
-) -> NoReviewSession | UnprovenLegacyReviewSession:
+) -> NoReviewSession | UnprovenLegacyReviewSession | BlockedLegacyReviewSessionImport:
     """Retain real handles as blockers until their source reviewer is proved.
 
     The old writer could retain a handle after a newer successful review that
@@ -66,7 +66,10 @@ def plan_legacy_review_session_import(
         raise ValueError("session import requires a complete root source digest")
     pr = binding.rejection.fence.key.target
     assert isinstance(pr, PullRequestRef)
-    source = next((item for item in files.prs if item.source.pr == pr.number), None)
+    matches = tuple(item for item in files.prs if item.source.pr == pr.number)
+    if len(matches) > 1:
+        return BlockedLegacyReviewSessionImport(pr.number, "review session occurs in multiple source roots")
+    source = matches[0] if matches else None
     if source is None or isinstance(source.session, LegacyReviewSessionModeMarker):
         return NoReviewSession()
     candidate = source.session

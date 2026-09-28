@@ -152,9 +152,9 @@ def test_complete_legacy_file_values_bind_parsed_values_to_roots_and_keys():
     ((LegacyExecutionPRRecord(7, LegacyAbsent(), LegacyAbsent()),), "lacks its file source"),
     ((LegacyExecutionCounterRecord(7, LegacyAbsent()),), "counter has an unreadable"),
     ((LegacyExecutionPRRecord(7, _legacy_text("codex:handle"), LegacyAbsent(), "first"),
-      LegacyExecutionPRRecord(7, _legacy_text("codex:handle"), LegacyAbsent(), "second")), "duplicated"),
+      LegacyExecutionPRRecord(7, _legacy_text("codex:handle"), LegacyAbsent(), "first")), "duplicated"),
     ((LegacyExecutionCounterRecord(7, _legacy_text("1"), "first"),
-      LegacyExecutionCounterRecord(7, _legacy_text("1"), "second")), "duplicated"),
+      LegacyExecutionCounterRecord(7, _legacy_text("1"), "first")), "duplicated"),
     ((UnmappedLegacyEntry("issue-0.infra-deaths", "malformed", "review"),), "unmapped"),
     ((LegacyExecutionCounterRecord(-7, LegacyPresent("a" * 64, "1")),), "digest"),
 ))
@@ -162,6 +162,21 @@ def test_complete_legacy_file_values_block_ambiguous_or_unverified_sources(entri
     blocked = classify_legacy_execution_file_values(entries)
     assert isinstance(blocked, BlockedLegacyExecutionFileValues)
     assert reason in blocked.reason
+
+
+def test_complete_legacy_file_values_retain_same_numeric_keys_from_separate_roots():
+    sources = (
+        LegacyExecutionPRRecord(7, _legacy_text("claude:fix-handle"), LegacyAbsent(), "fix"),
+        LegacyExecutionPRRecord(7, _legacy_text("claude:review-handle"), LegacyAbsent(), "review"),
+        LegacyExecutionCounterRecord(7, _legacy_text("3"), "fix"),
+        LegacyExecutionCounterRecord(7, _legacy_text("2"), "review"),
+    )
+
+    complete = classify_legacy_execution_file_values(sources)
+
+    assert isinstance(complete, CompleteLegacyExecutionFileValues)
+    assert [(item.source.root, item.source.pr) for item in complete.prs] == [("fix", 7), ("review", 7)]
+    assert [(item.source.root, item.source.key) for item in complete.counters] == [("fix", 7), ("review", 7)]
 
 
 def test_complete_legacy_file_values_enforce_inventory_bound_and_typed_membership():

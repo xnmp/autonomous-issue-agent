@@ -79,7 +79,7 @@ def test_complete_counter_sources_keep_all_effect_barriers_through_sql_scope(sou
     control, gateway, roots, files, links = sources
     with control._connect() as db:
         before = tuple(db.iterdump())
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         assert {(item.counter.source.key, item.pr) for item in held.mapping.assignments} == {(7, 9), (-10, 10)}
         assert not held.mapping.unassigned
@@ -97,6 +97,145 @@ def test_complete_counter_sources_keep_all_effect_barriers_through_sql_scope(sou
         assert tuple(db.iterdump()) == before
 
 
+def test_nonreview_root_counter_for_an_open_pr_is_retained_without_review_credit(sources, tmp_path):
+    control, gateway, roots, _files, links = sources
+    fix_root = tmp_path / "fix"
+    fix_root.mkdir()
+    (fix_root / "issue--9.infra-deaths").write_text("5")
+    mixed_roots = (("fix", str(fix_root)), *roots)
+    files = read_complete_legacy_execution_root_files(mixed_roots)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", mixed_roots, files, links,
+                                               review_state_dir=roots[0][1],
+                                               other_role_state_dirs=(str(fix_root),)) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        assert [(item.counter.source.key, item.pr) for item in held.mapping.assignments] == [(-10, 10), (7, 9)]
+        assert [(item.source.root, item.source.key) for item in held.roots.values.counters] == [
+            ("review", -10), ("fix", -9), ("review", 7),
+        ]
+
+
+def test_nonreview_root_session_for_an_open_pr_stays_outside_review_selection(sources, tmp_path):
+    control, gateway, roots, _files, links = sources
+    fix_root = tmp_path / "fix"
+    fix_root.mkdir()
+    (fix_root / "pr-9.session").write_text("legacy-session")
+    mixed_roots = (("fix", str(fix_root)), *roots)
+    files = read_complete_legacy_execution_root_files(mixed_roots)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", mixed_roots, files, links,
+                                               review_state_dir=roots[0][1],
+                                               other_role_state_dirs=(str(fix_root),)) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        assert [item.source.root for item in held.roots.values.prs] == ["fix"]
+        assert held.mapping.files.prs == ()
+
+
+def test_missing_review_root_blocks_even_when_no_counter_files_exist(sources, tmp_path):
+    control, gateway, _roots, _files, links = sources
+    fix_root = tmp_path / "fix"
+    fix_root.mkdir()
+    roots = (("fix", str(fix_root)),)
+    files = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links,
+                                               review_state_dir=str(tmp_path / "missing-review")) as held:
+        assert isinstance(held, BlockedLegacyExecutionCounterSources)
+        assert "review root" in held.reason
+
+
+def test_nonreview_root_counter_without_an_open_key_remains_in_full_audit(sources, tmp_path):
+    control, gateway, roots, _files, links = sources
+    fix_root = tmp_path / "fix"
+    fix_root.mkdir()
+    (fix_root / "issue--11.infra-deaths").write_text("5")
+    mixed_roots = (("fix", str(fix_root)), *roots)
+    files = read_complete_legacy_execution_root_files(mixed_roots)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", mixed_roots, files, links,
+                                               review_state_dir=roots[0][1],
+                                               other_role_state_dirs=(str(fix_root),)) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        assert [(item.counter.source.key, item.pr) for item in held.mapping.assignments] == [(-10, 10), (7, 9)]
+        assert held.mapping.unassigned == ()
+        assert [(item.source.root, item.source.key) for item in held.roots.values.counters] == [
+            ("fix", -11), ("review", -10), ("review", 7),
+        ]
+
+
+@pytest.mark.parametrize("filename, contents", (
+    ("issue--9.infra-deaths", "5"),
+    ("issue-7.infra-deaths", "5"),
+    ("pr-9.session", "claude:old-session"),
+    ("pr-9.round", "2"),
+))
+def test_historical_root_with_open_review_key_requires_provenance(sources, tmp_path, filename, contents):
+    control, gateway, roots, _files, links = sources
+    old = tmp_path / "old-review"
+    old.mkdir()
+    (old / filename).write_text(contents)
+    complete_roots = (*roots, (f"extra:{old.resolve()}", str(old)))
+    files = read_complete_legacy_execution_root_files(complete_roots)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, "o/r", complete_roots, files, links, review_state_dir=roots[0][1],
+    ) as held:
+        assert isinstance(held, BlockedLegacyExecutionCounterSources)
+        assert "historical" in held.reason
+
+
+def test_historical_root_without_an_open_review_key_is_retained(sources, tmp_path):
+    control, gateway, roots, _files, links = sources
+    old = tmp_path / "old-review"
+    old.mkdir()
+    (old / "issue--11.infra-deaths").write_text("5")
+    complete_roots = (*roots, (f"extra:{old.resolve()}", str(old)))
+    files = read_complete_legacy_execution_root_files(complete_roots)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, "o/r", complete_roots, files, links, review_state_dir=roots[0][1],
+    ) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        assert [(item.source.root, item.source.key) for item in held.roots.values.counters
+                if item.source.root.startswith("extra:")] == [(f"extra:{old.resolve()}", -11)]
+
+
+def test_arbitrary_foreign_root_label_cannot_hide_an_open_counter(sources, tmp_path):
+    control, gateway, roots, _files, links = sources
+    old = tmp_path / "old-review"
+    old.mkdir()
+    (old / "issue--9.infra-deaths").write_text("5")
+    complete_roots = (*roots, ("old-review", str(old)))
+    files = read_complete_legacy_execution_root_files(complete_roots)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, "o/r", complete_roots, files, links, review_state_dir=roots[0][1],
+    ) as held:
+        assert isinstance(held, BlockedLegacyExecutionCounterSources)
+        assert "historical" in held.reason
+
+
+def test_review_root_alias_can_use_the_first_physical_root_label(sources):
+    control, gateway, roots, _files, links = sources
+    review_dir = roots[0][1]
+    aliases = (("fix", review_dir), ("review", review_dir))
+    files = read_complete_legacy_execution_root_files(aliases)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+    assert {item.source.root for item in files.values.counters} == {"fix"}
+
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", aliases, files, links,
+                                               review_state_dir=review_dir) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        assert [(item.counter.source.key, item.pr) for item in held.mapping.assignments] == [(-10, 10), (7, 9)]
+
+
 @pytest.mark.parametrize("change", ("file", "link", "repository", "ambiguous_issue"))
 def test_counter_source_scope_blocks_changed_or_ambiguous_evidence(sources, change):
     control, gateway, roots, files, links = sources
@@ -111,7 +250,7 @@ def test_counter_source_scope_blocks_changed_or_ambiguous_evidence(sources, chan
         gateway.views[10] = replace(gateway.views[10], head_ref_name="fix/7-other")
         links = read_complete_legacy_open_counter_links(control, gateway, "o/r")
         assert isinstance(links, CompleteLegacyOpenCounterLinks)
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, BlockedLegacyExecutionCounterSources)
         assert held.reason
         with pytest.raises(BlockingIOError):
@@ -158,7 +297,7 @@ def _dispatch(pr: int, key: int) -> str:
 def test_sql_import_sources_revalidate_in_the_barrier_held_acceptance_transaction(sources):
     control, gateway, roots, files, links = sources
     observed = _observed_sql_sources(control)
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_legacy_execution_import_sources(
@@ -179,7 +318,7 @@ def test_sql_import_source_result_carries_current_and_predecessor_deaths_separat
     _record_abandoned_run(control, "prior-run", "o/r:review", _dispatch(9, -9))
     observed = _observed_sql_sources(control)
 
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_legacy_execution_import_sources(
@@ -204,7 +343,7 @@ def test_sql_import_source_verification_blocks_unknown_abandoned_run(sources):
     _record_abandoned_run(control, "opaque-run", WRITER.owner_id, "opaque")
     observed = _observed_sql_sources(control)
 
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_legacy_execution_import_sources(
@@ -228,7 +367,7 @@ def test_sql_import_sources_block_changed_caller_held_inventories(sources, chang
                          else "review-execution-generation")
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                        (namespace, "o/r", "changed-source", "2026-09-28T00:00:00+00:00", "{}"))
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_legacy_execution_import_sources(
@@ -242,7 +381,7 @@ def test_sql_import_sources_require_one_repository_and_an_explicit_transaction(s
     observed = _observed_sql_sources(control)
     with pytest.raises(ValueError, match="same-repository"):
         replace(observed, generation=CompleteLegacyReviewGenerationReceipts("other/repo", ()))
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control._connect() as db:
             with pytest.raises(ValueError, match="explicit SQL transaction"):
@@ -254,7 +393,7 @@ def test_sql_import_sources_require_one_repository_and_an_explicit_transaction(s
 def test_sql_import_sources_reject_expired_barrier_lease(sources):
     control, gateway, roots, files, links = sources
     observed = _observed_sql_sources(control)
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
     with control.transaction() as db:
         result = verify_legacy_execution_import_sources(
@@ -269,9 +408,11 @@ def test_sql_import_sources_reject_expired_barrier_lease(sources):
 def test_sql_import_sources_reject_forged_counter_and_result_evidence(sources):
     control, gateway, roots, files, links = sources
     observed = _observed_sql_sources(control)
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
-        forged = HeldLegacyExecutionCounterSources(held.roots, held.mapping, held._scope)
+        forged = HeldLegacyExecutionCounterSources(
+            held.roots, held.mapping, held.review_state_dir, held.other_role_state_dirs, held._scope,
+        )
         with control.transaction() as db:
             result = verify_legacy_execution_import_sources(
                 db, forged, observed, writer=WRITER, configured_prior_owners=(),
@@ -284,9 +425,9 @@ def test_sql_import_sources_reject_forged_counter_and_result_evidence(sources):
 def test_sql_import_sources_do_not_reactivate_an_escaped_scope(sources):
     control, gateway, roots, files, links = sources
     observed = _observed_sql_sources(control)
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as old:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as old:
         assert isinstance(old, HeldLegacyExecutionCounterSources)
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as current:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as current:
         assert isinstance(current, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_legacy_execution_import_sources(
@@ -301,7 +442,7 @@ def test_sql_import_sources_reject_a_different_control_database(sources, tmp_pat
     observed = _observed_sql_sources(control)
     other = SQLiteControlStore(str(tmp_path / "other-control.db"))
     other.initialize()
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with other.transaction() as db:
             result = verify_legacy_execution_import_sources(
@@ -319,7 +460,7 @@ def test_sql_import_sources_reject_a_different_control_database(sources, tmp_pat
 def test_sql_import_sources_reject_owner_configuration_mismatch(sources, writer, priors):
     control, gateway, roots, files, links = sources
     observed = _observed_sql_sources(control)
-    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links) as held:
+    with held_legacy_execution_counter_sources(control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1]) as held:
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_legacy_execution_import_sources(

@@ -156,8 +156,12 @@ def _expected_mapping(
     assigned: list[LegacyCounterAssignment] = []
     unassigned: list[LegacyUnassignedCounter] = []
     total_by_pr: dict[int, int] = {}
+    seen_keys: set[int] = set()
     for counter in files.counters:
         key = counter.source.key
+        if key in seen_keys:
+            return BlockedLegacyCounterMapping(f"counter key {key} occurs in multiple source roots")
+        seen_keys.add(key)
         if key < 0:
             target = -key if -key in open_prs else None
             reason = LegacyUnassignedCounterReason.NO_OPEN_PR

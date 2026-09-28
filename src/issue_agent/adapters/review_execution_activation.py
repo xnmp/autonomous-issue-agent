@@ -338,10 +338,46 @@ def revalidate_complete_legacy_execution_file_values(
     return current
 
 
+def select_legacy_review_execution_files(
+    files: CompleteLegacyExecutionRootFiles, review_state_dir: str,
+) -> CompleteLegacyExecutionFileValues | BlockedLegacyExecutionFileValues:
+    """Select only the physical review root while retaining the full root audit."""
+    if not isinstance(files, CompleteLegacyExecutionRootFiles):
+        raise ValueError("review execution file selection requires complete roots")
+    if not isinstance(review_state_dir, str) or not os.path.isabs(review_state_dir):
+        raise ValueError("review execution file selection requires an absolute review directory")
+    paths = {root.label: root.resolved_path for root in files.roots}
+    review_path = os.path.realpath(review_state_dir)
+    if len(paths) != len(files.roots) or review_path not in paths.values():
+        return BlockedLegacyExecutionFileValues("configured review root is missing or its labels are ambiguous")
+    labels = {label for label, path in paths.items() if path == review_path}
+    return CompleteLegacyExecutionFileValues(
+        tuple(item for item in files.values.prs if item.source.root in labels),
+        tuple(item for item in files.values.counters if item.source.root in labels),
+    )
+
+
+def has_unattributed_historical_review_files(
+    files: CompleteLegacyExecutionRootFiles, review_state_dir: str,
+    *, other_role_state_dirs: tuple[str, ...], prs: frozenset[int], counter_keys: frozenset[int],
+) -> bool:
+    """Historical roots need producer provenance before active review state is imported."""
+    current_paths = {os.path.realpath(path) for path in (review_state_dir, *other_role_state_dirs)}
+    historical_labels = {
+        root.label for root in files.roots
+        if root.resolved_path not in current_paths
+    }
+    return (any(item.source.root in historical_labels and item.source.pr in prs
+                for item in files.values.prs)
+            or any(item.source.root in historical_labels and item.source.key in counter_keys
+                   for item in files.values.counters))
+
+
 def observe_legacy_review_session_import(
     roots: LegacyRoots,
     observed: CompleteLegacyExecutionRootFiles,
     binding: ReviewExecutionBinding,
+    *, review_state_dir: str, other_role_state_dirs: tuple[str, ...] = (),
 ) -> NoReviewSession | UnprovenLegacyReviewSession | BlockedLegacyReviewSessionImport:
     """Re-read the configured file sources before proposing a session import.
 
@@ -350,15 +386,24 @@ def observe_legacy_review_session_import(
     """
     if not isinstance(binding, ReviewExecutionBinding):
         raise ValueError("session import observation requires an execution binding")
+    if (not isinstance(other_role_state_dirs, tuple)
+            or any(not isinstance(path, str) or not os.path.isabs(path)
+                   for path in other_role_state_dirs)):
+        raise ValueError("session import observation requires absolute other-role paths")
     pr = binding.rejection.fence.key.target
     assert isinstance(pr, PullRequestRef)
     current = revalidate_complete_legacy_execution_file_values(roots, observed)
     if isinstance(current, BlockedLegacyExecutionFileValues):
         return BlockedLegacyReviewSessionImport(pr.number, current.reason)
-    source = next((item for item in current.values.prs if item.source.pr == pr.number), None)
-    if source is not None and source.source.root not in {root.label for root in current.roots}:
-        return BlockedLegacyReviewSessionImport(pr.number, "legacy session source root is not configured")
-    return plan_legacy_review_session_import(current.values, current.source_digest, binding)
+    if has_unattributed_historical_review_files(
+        current, review_state_dir, other_role_state_dirs=other_role_state_dirs,
+        prs=frozenset((pr.number,)), counter_keys=frozenset(),
+    ):
+        return BlockedLegacyReviewSessionImport(pr.number, "historical review session or round source lacks root provenance")
+    selected = select_legacy_review_execution_files(current, review_state_dir)
+    if isinstance(selected, BlockedLegacyExecutionFileValues):
+        return BlockedLegacyReviewSessionImport(pr.number, selected.reason)
+    return plan_legacy_review_session_import(selected, current.source_digest, binding)
 
 
 def _decode_run_source(

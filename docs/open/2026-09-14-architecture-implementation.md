@@ -30,6 +30,12 @@ Unknown or cross-PR deaths block. Historical reset order and predecessor
 adoption remain unproved, so this does not yet authorize an inherited debit.
 The barrier-held SQL source verifier now carries that exact attribution after
 revalidating its owner runs and counter mapping in the acceptance transaction.
+The file scope now attributes counters only from the physical review state
+directory, while retaining other configured and declared historical roots in
+the complete audit. Current fix and steward directories are exempted by
+deployment configuration; an unrelated root with active PR evidence blocks
+until its producing role is proved. Duplicate PR session sources block direct
+planning. These remain offline source checks, not import authority.
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 

@@ -31,8 +31,9 @@ from .resolve_activation import LegacyRoots
 from .review_execution_activation import (
     BlockedLegacyExecutionFileValues, CompleteLegacyExecutionRootFiles,
     CompleteLegacySubmissionSettlementStorage, revalidate_complete_legacy_execution_file_values,
+    has_unattributed_historical_review_files,
     revalidate_complete_legacy_review_generation_receipts, revalidate_complete_legacy_review_runs,
-    verify_complete_legacy_submission_settlement_storage,
+    select_legacy_review_execution_files, verify_complete_legacy_submission_settlement_storage,
 )
 from .review_execution_counter_links import revalidate_complete_legacy_open_counter_links
 
@@ -47,17 +48,26 @@ class HeldLegacyExecutionCounterSources:
 
     roots: CompleteLegacyExecutionRootFiles
     mapping: CompleteLegacyCounterMapping
+    review_state_dir: str
+    other_role_state_dirs: tuple[str, ...]
     _scope: object = field(repr=False)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.roots, CompleteLegacyExecutionRootFiles)
                 or not isinstance(self.mapping, CompleteLegacyCounterMapping)
-                or self.roots.values != self.mapping.files):
+                or not isinstance(self.review_state_dir, str)
+                or not os.path.isabs(self.review_state_dir)
+                or not isinstance(self.other_role_state_dirs, tuple)
+                or any(not isinstance(path, str) or not os.path.isabs(path)
+                       for path in self.other_role_state_dirs)
+                or (selected := select_legacy_review_execution_files(self.roots, self.review_state_dir))
+                != self.mapping.files):
             raise ValueError("held counter sources require the same complete file values")
 
     @property
     def source_digest(self) -> str:
-        source = (self.roots.source_digest, self.mapping.source_digest)
+        source = (self.roots.source_digest, self.mapping.source_digest,
+                  self.review_state_dir, self.other_role_state_dirs)
         return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -84,6 +94,7 @@ def held_legacy_execution_counter_sources(
     control: SQLiteControlStore, gateway: object, repository: str, roots: LegacyRoots,
     observed_files: CompleteLegacyExecutionRootFiles,
     observed_links: CompleteLegacyOpenCounterLinks,
+    *, review_state_dir: str, other_role_state_dirs: tuple[str, ...] = (),
 ) -> Iterator[HeldLegacyExecutionCounterSources | BlockedLegacyExecutionCounterSources]:
     """Recheck files and PR linkage while excluding all three role effects.
 
@@ -93,6 +104,12 @@ def held_legacy_execution_counter_sources(
     """
     if not isinstance(control, SQLiteControlStore):
         raise ValueError("execution counter sources require a control store")
+    if not isinstance(review_state_dir, str) or not os.path.isabs(review_state_dir):
+        raise ValueError("execution counter sources require an absolute review state directory")
+    if (not isinstance(other_role_state_dirs, tuple)
+            or any(not isinstance(path, str) or not os.path.isabs(path)
+                   for path in other_role_state_dirs)):
+        raise ValueError("execution counter sources require absolute other-role paths")
     repo = canonical_workflow_repository(repository)
     control.require_initialized()
     with ExitStack() as barriers:
@@ -106,13 +123,33 @@ def held_legacy_execution_counter_sources(
         if isinstance(links, BlockedLegacyOpenCounterLinks):
             yield BlockedLegacyExecutionCounterSources(links.reason)
             return
-        mapping = map_legacy_execution_counters(files.values, links)
+        if has_unattributed_historical_review_files(
+            files, review_state_dir,
+            other_role_state_dirs=other_role_state_dirs,
+            prs=frozenset(links.listing.numbers),
+            counter_keys=frozenset(
+                key for link in links.links
+                for key in ((-link.pr, link.linked_issue) if link.linked_issue is not None else (-link.pr,))
+            ),
+        ):
+            yield BlockedLegacyExecutionCounterSources(
+                "historical review execution source for an open PR lacks root provenance",
+            )
+            return
+        review_files = select_legacy_review_execution_files(files, review_state_dir)
+        if isinstance(review_files, BlockedLegacyExecutionFileValues):
+            yield BlockedLegacyExecutionCounterSources(review_files.reason)
+            return
+        mapping = map_legacy_execution_counters(review_files, links)
         if isinstance(mapping, BlockedLegacyCounterMapping):
             yield BlockedLegacyExecutionCounterSources(mapping.reason)
             return
         scope = object()
         scope_reset = _CURRENT_SCOPE.set(scope)
-        held = HeldLegacyExecutionCounterSources(files, mapping, scope)
+        held = HeldLegacyExecutionCounterSources(
+            files, mapping, os.path.abspath(review_state_dir),
+            tuple(os.path.abspath(path) for path in other_role_state_dirs), scope,
+        )
         _OPEN_SCOPES[scope] = (control.path, held)
         try:
             yield held

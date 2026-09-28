@@ -252,8 +252,10 @@ class CompleteLegacyExecutionFileValues:
                 or len(self.prs) + len(self.counters) > MAX_LEGACY_EXECUTION_FILE_ENTRIES
                 or any(not isinstance(item, ParsedLegacyExecutionPR) for item in self.prs)
                 or any(not isinstance(item, ParsedLegacyExecutionCounter) for item in self.counters)
-                or [item.source.pr for item in self.prs] != sorted({item.source.pr for item in self.prs})
-                or [item.source.key for item in self.counters] != sorted({item.source.key for item in self.counters})
+                or [(item.source.pr, item.source.root) for item in self.prs]
+                != sorted({(item.source.pr, item.source.root) for item in self.prs})
+                or [(item.source.key, item.source.root) for item in self.counters]
+                != sorted({(item.source.key, item.source.root) for item in self.counters})
                 or not all(matches for matches, _ in verified)
                 or sum(size for _, size in verified) > MAX_LEGACY_EXECUTION_FILE_BYTES):
             raise ValueError("complete legacy execution files require bounded unique ordered sources")
@@ -308,8 +310,8 @@ def classify_legacy_execution_file_values(
         return BlockedLegacyExecutionFileValues("legacy execution file inventory exceeds its row bound")
     prs: list[ParsedLegacyExecutionPR] = []
     counters: list[ParsedLegacyExecutionCounter] = []
-    seen_prs: set[int] = set()
-    seen_counters: set[int] = set()
+    seen_prs: set[tuple[int, str]] = set()
+    seen_counters: set[tuple[int, str]] = set()
     total_bytes = 0
     for entry in entries:
         if isinstance(entry, UnmappedLegacyEntry):
@@ -322,9 +324,9 @@ def classify_legacy_execution_file_values(
             if not matches or total_bytes > MAX_LEGACY_EXECUTION_FILE_BYTES:
                 return BlockedLegacyExecutionFileValues("legacy execution file digest or total byte bound disagrees")
         if isinstance(entry, LegacyExecutionPRRecord):
-            if entry.pr in seen_prs:
-                return BlockedLegacyExecutionFileValues("legacy execution PR is duplicated across roots")
-            seen_prs.add(entry.pr)
+            if (entry.pr, entry.root) in seen_prs:
+                return BlockedLegacyExecutionFileValues("legacy execution PR is duplicated within one root")
+            seen_prs.add((entry.pr, entry.root))
             session = parse_legacy_review_session(entry.session)
             round_value = parse_legacy_review_round(entry)
             if isinstance(session, BlockedLegacyExecutionValue) or isinstance(round_value, BlockedLegacyExecutionValue):
@@ -334,16 +336,16 @@ def classify_legacy_execution_file_values(
             except ValueError:
                 return BlockedLegacyExecutionFileValues("legacy execution PR lacks its file source")
         else:
-            if entry.key in seen_counters:
-                return BlockedLegacyExecutionFileValues("legacy execution counter is duplicated across roots")
-            seen_counters.add(entry.key)
+            if (entry.key, entry.root) in seen_counters:
+                return BlockedLegacyExecutionFileValues("legacy execution counter is duplicated within one root")
+            seen_counters.add((entry.key, entry.root))
             value = parse_legacy_review_counter(entry)
             if isinstance(value, BlockedLegacyExecutionValue):
                 return BlockedLegacyExecutionFileValues("legacy execution counter has an unreadable or malformed value")
             counters.append(ParsedLegacyExecutionCounter(entry, value))
     return CompleteLegacyExecutionFileValues(
-        tuple(sorted(prs, key=lambda item: item.source.pr)),
-        tuple(sorted(counters, key=lambda item: item.source.key)),
+        tuple(sorted(prs, key=lambda item: (item.source.pr, item.source.root))),
+        tuple(sorted(counters, key=lambda item: (item.source.key, item.source.root))),
     )
 
 
