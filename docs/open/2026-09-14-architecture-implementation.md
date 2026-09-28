@@ -18,7 +18,10 @@ transaction as its workflow; imported and renewed episodes still need their
 production writers and the complete archived audit. An offline durable cursor
 now scans expected generation sources and the retained receipt namespace in
 bounded pages, comparing the set and a prior pass digest. Checkpoint ancestry
-and retired round sources are not yet joined to it. A barrier-held source scope now joins
+and retired round sources are not yet joined to it. A typed checkpoint receipt
+and bounded identity/predecessor read now exist, but canonical reads refuse
+all compacted components until source anchors and the audit gate are installed.
+A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the
 [phase-4 source handover](2026-09-28-phase-4-execution-source-handover.md).

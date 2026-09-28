@@ -2,9 +2,12 @@
 
 Date: 2026-09-28 Australia/Sydney. Contract for offline implementation;
 the pure prefix planner, checkpoint cursor, imported-origin read prerequisite,
-fresh first-observation origin and digest-bound generation receipts are
-implemented. Production import and renewal writers, checkpoint receipts,
-bounded hot reads and the complete audit remain pending. A durable offline
+fresh first-observation origin, digest-bound generation receipts and typed
+checkpoint source manifest are implemented. The canonical reader verifies
+checkpoint row identity and one predecessor but refuses every compacted
+component until immediate source anchors and the audit gate can be verified.
+Production import and renewal writers, the checkpoint writer, bounded
+compacted hot reads and the complete audit remain pending. A durable offline
 cursor now scans expected generation sources and the retained receipt
 namespace in bounded pages, comparing the set and the prior pass digest. It
 has no admission or compaction authority. Execution authority is not

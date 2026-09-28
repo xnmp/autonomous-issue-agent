@@ -403,6 +403,30 @@ with `CLAUDE.md`, `AGENTS.md`, the
   entire census catches up. The cursor remains an offline observation: it
   does not prove checkpoint ancestry, retired rounds, an atomic lifetime
   snapshot across transactions or admission authority.
+- Checkpoint 81 adds a typed, fixed-size checkpoint receipt model binding the
+  origin, previous and new frontiers, ordered retired round and generation
+  source digests, and final source fingerprints. The pure builder checks the
+  prefix plan and exact source order. The canonical loader now checks the
+  receipt's scoped, canonical, digest-derived identity and one predecessor
+  link against the retained origin; a forged origin, missing predecessor,
+  changed frontier, alias or oversized row blocks. Because this still does
+  not verify the immediate retained source anchors or the archived audit
+  gate, every noninitial checkpoint deliberately refuses a canonical load.
+  The old lifetime round count is replaced with an indexed high-water read;
+  current suffix rows remain checked in sequence within their limit. The
+  production writer, source anchor verifier and audit gate remain required
+  before compaction can be used.
+
+Independent Sol review of checkpoint 81 caught the first reader accepting
+fabricated anchor digests and retaining lifetime prefix scans. The revised
+reader refuses all compacted components and uses the indexed high-water; its
+second review found no remaining medium or high issue in this limited slice.
+Focused domain and persistence tests pass. Final `make test` passed: 3,280
+domain, 3,231 adapter and 2,876 app tests, plus hooks, governor, gate parity,
+four import contracts and both Pyrefly checks. Ten strict xfails remained
+expected. The log is `/tmp/phase4-checkpoint-receipt-final-gate.log`
+(ephemeral). All four watched services were inactive; no live service or
+workflow family was activated.
 
 Independent Sol review of checkpoint 80 found no remaining concrete issue
 in the reviewed slice. A separate self-review found and fixed the missing

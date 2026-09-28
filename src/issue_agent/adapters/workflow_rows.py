@@ -20,7 +20,7 @@ from ..domain.review_execution import (
     ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
     InitializedReviewExecutionOriginReceipt, initialized_review_execution,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
-    ReviewExecutionCheckpoint, ReviewExecutionGenerationBoundary,
+    ReviewExecutionCheckpoint, ReviewExecutionCheckpointReceipt, ReviewExecutionGenerationBoundary,
     ReviewExecutionOriginKind, ReviewRoundOutcome,
     matches_accepted_review_transition_source, replay_review_execution_generations,
     review_generation_chain_digest, same_execution_episode,
@@ -73,6 +73,7 @@ REVIEW_STALE_PRODUCTIVITY_NAMESPACE = "review-round-stale-productivity"
 REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE = "review-round-superseded-productivity"
 REVIEW_CEILING_PRODUCTIVITY_NAMESPACE = "review-round-ceiling-productivity"
 REVIEW_EXECUTION_ORIGIN_NAMESPACE = "review-execution-origin"
+REVIEW_EXECUTION_CHECKPOINT_NAMESPACE = "review-execution-checkpoint"
 RECORDED_REVIEW_NAMESPACE = "review-recorded-submission"
 
 
@@ -536,6 +537,7 @@ def insert_initialized_review_execution_origin(
 def _unique_text_identity_rowid(
     db: sqlite3.Connection, table: str, text_fields: tuple[tuple[str, str], ...],
     integer_fields: tuple[tuple[str, int], ...] = (),
+    *, source: str = "review execution origin",
 ) -> int:
     predicates = [f"{name} IN (?,CAST(? AS BLOB))" for name, _ in text_fields]
     predicates.extend(f"{name} IN (?,CAST(? AS BLOB))" for name, _ in integer_fields)
@@ -549,7 +551,7 @@ def _unique_text_identity_rowid(
     if (len(rows) != 1
             or any(rows[0][f"{name}_type"] != "text" for name, _ in text_fields)
             or any(rows[0][f"{name}_type"] != "integer" for name, _ in integer_fields)):
-        raise WorkflowAuthorityError(f"review execution origin {table} source is absent or aliased")
+        raise WorkflowAuthorityError(f"{source} {table} source is absent or aliased")
     return rows[0]["rowid"]
 
 
@@ -605,6 +607,74 @@ def _read_execution_origin(
                 and execution.checkpoint != captured.checkpoint)):
         raise WorkflowAuthorityError("review execution origin disagrees with its component")
     return captured, claimed
+
+
+def review_execution_checkpoint_receipt_id(receipt: ReviewExecutionCheckpointReceipt) -> str:
+    if not isinstance(receipt, ReviewExecutionCheckpointReceipt):
+        raise ValueError("checkpoint identity requires a typed receipt")
+    return "review-execution-checkpoint:" + hashlib.sha256(encode_workflow(receipt).encode()).hexdigest()
+
+
+def _read_checkpoint_receipt_row(
+    db: sqlite3.Connection, repository: str, receipt_id: str,
+) -> tuple[ReviewExecutionCheckpointReceipt, datetime]:
+    rowid = _unique_text_identity_rowid(
+        db, "dedupe_keys", (("namespace", REVIEW_EXECUTION_CHECKPOINT_NAMESPACE),
+                            ("scope", repository), ("key", receipt_id)),
+        source="review execution checkpoint",
+    )
+    metadata = db.execute(
+        "SELECT rowid,max(ifnull(length(CAST(claimed_at AS BLOB)),0),"
+        "ifnull(length(CAST(payload_json AS BLOB)),0)) AS largest "
+        "FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, repository, receipt_id),
+    ).fetchone()
+    if (metadata is None or metadata["rowid"] != rowid
+            or metadata["largest"] > MAX_WORKFLOW_PAYLOAD_BYTES):
+        raise WorkflowAuthorityError("review execution checkpoint receipt exceeds its bound")
+    row = db.execute(
+        "SELECT rowid,claimed_at,reusable_after,payload_json,"
+        "typeof(claimed_at) AS claimed_type,typeof(payload_json) AS payload_type "
+        "FROM dedupe_keys WHERE rowid=? AND namespace=? AND scope=? AND key=?",
+        (rowid, REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, repository, receipt_id),
+    ).fetchone()
+    if (row is None or row["reusable_after"] is not None or row["claimed_type"] != "text"
+            or row["payload_type"] != "text"):
+        raise WorkflowAuthorityError("review execution checkpoint receipt changed or is malformed")
+    try:
+        claimed = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
+        if claimed.tzinfo is None or claimed.utcoffset() is None:
+            raise ValueError("checkpoint claim has no timezone")
+        receipt = decode_workflow(row["payload_json"], ReviewExecutionCheckpointReceipt)
+        if (encode_workflow(receipt) != row["payload_json"]
+                or review_execution_checkpoint_receipt_id(receipt) != receipt_id):
+            raise ValueError("checkpoint receipt identity is not canonical")
+    except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
+        raise WorkflowAuthorityError("review execution checkpoint receipt is unreadable") from exc
+    return receipt, claimed
+
+
+def _check_execution_checkpoint_receipt(
+    db: sqlite3.Connection, repository: str, execution: ActivatedReviewExecution,
+    origin: ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt,
+) -> None:
+    receipt_id = execution.checkpoint_receipt
+    if receipt_id is None:
+        raise WorkflowAuthorityError("review execution checkpoint lacks its compaction receipt")
+    receipt, claimed = _read_checkpoint_receipt_row(db, repository, receipt_id)
+    if receipt.origin != origin.origin or receipt.checkpoint != execution.checkpoint:
+        raise WorkflowAuthorityError("review execution checkpoint disagrees with its origin or component")
+    if receipt.previous_receipt_id is None:
+        previous = origin.checkpoint
+    else:
+        predecessor, previous_claimed = _read_checkpoint_receipt_row(
+            db, repository, receipt.previous_receipt_id,
+        )
+        if predecessor.origin != origin.origin or previous_claimed > claimed:
+            raise WorkflowAuthorityError("review execution checkpoint has a foreign predecessor")
+        previous = predecessor.checkpoint
+    if receipt.previous_checkpoint != previous:
+        raise WorkflowAuthorityError("review execution checkpoint has a changed predecessor")
 
 
 def _check_initialized_execution_origin(
@@ -773,12 +843,16 @@ def _check_execution_projection(
     else:
         _check_initialized_execution_origin(db, scope, execution, origin, claimed)
     episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
-    count = db.execute(
-        "SELECT COUNT(*) AS total FROM review_execution_rounds WHERE repository=? AND target_number=? "
-        "AND execution_epoch=? AND execution_episode=?", episode_scope,
-    ).fetchone()["total"]
-    if count != execution.last_sequence:
-        raise WorkflowAuthorityError("review execution rounds disagree with allocated sequence")
+    latest = db.execute(
+        "SELECT sequence FROM review_execution_rounds WHERE repository=? AND target_number=? "
+        "AND execution_epoch=? AND execution_episode=? ORDER BY sequence DESC LIMIT 1",
+        episode_scope,
+    ).fetchone()
+    if (latest["sequence"] if latest is not None else 0) != execution.last_sequence:
+        raise WorkflowAuthorityError("review execution round high water disagrees with allocated sequence")
+    suffix_count = execution.last_sequence - execution.checkpoint.through_sequence
+    if suffix_count > MAX_EXECUTION_SUFFIX:
+        raise WorkflowAuthorityError("review execution suffix exceeds its bounded projection")
     for boundary in execution.boundaries:
         receipt = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation' "
@@ -837,28 +911,9 @@ def _check_execution_projection(
         ).hexdigest()):
             raise WorkflowAuthorityError("review generation boundary release identity changed")
     if execution.checkpoint.through_sequence or execution.checkpoint.boundary_cursor is not None:
-        if execution.checkpoint_receipt is None:
-            raise WorkflowAuthorityError("review execution checkpoint lacks its compaction receipt")
-        compacted = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-checkpoint' "
-            "AND scope=? AND key=?", (scope[0], execution.checkpoint_receipt),
-        ).fetchone()
-        if compacted is None or decode_workflow(compacted["payload_json"], ReviewExecutionCheckpoint) != execution.checkpoint:
-            raise WorkflowAuthorityError("review execution checkpoint disagrees with its compaction receipt")
-        prefix_scope = (*episode_scope, execution.checkpoint.through_sequence)
-        if db.execute(
-            "SELECT 1 FROM review_execution_rounds WHERE repository=? AND target_number=? "
-            "AND execution_epoch=? AND execution_episode=? AND sequence<=? "
-            "AND outcome_json IS NULL LIMIT 1", prefix_scope,
-        ).fetchone() is not None or db.execute(
-            "SELECT 1 FROM review_execution_rounds WHERE repository=? AND target_number=? "
-            "AND execution_epoch=? AND execution_episode=? AND sequence<=? "
-            "AND closure_json IS NULL LIMIT 1", prefix_scope,
-        ).fetchone() is not None:
-            raise WorkflowAuthorityError("execution checkpoint includes an unfinalized review round")
-    suffix_count = count - execution.checkpoint.through_sequence
-    if suffix_count > MAX_EXECUTION_SUFFIX:
-        raise WorkflowAuthorityError("review execution suffix exceeds its bounded projection")
+        _check_execution_checkpoint_receipt(db, scope[0], execution, origin)
+        # The typed chain alone cannot prove the retired source digests or audit gate.
+        raise WorkflowAuthorityError("review execution checkpoint source anchors are not yet verified")
     outcomes: list[ReviewRoundOutcome] = []
     rows = db.execute(
         "SELECT round_id,generation,sequence,claim_occurrence_id,plan_json,planning_json,closure_json,outcome_json "

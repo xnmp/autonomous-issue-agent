@@ -10,13 +10,13 @@ import hashlib
 
 import pytest
 
-from issue_agent.adapters.workflow_codec import encode_workflow
+from issue_agent.adapters.workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, encode_workflow
 from issue_agent.adapters.control_store import _command_payload_digest, _json
 from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
 from issue_agent.adapters.workflow_rows import (
     REVIEW_STAGE_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
     WorkflowAuthorityError, encode_workflow_episodes, load_review_workflow_row,
-    review_stage_receipt_key, review_submission_receipt_key,
+    review_execution_checkpoint_receipt_id, review_stage_receipt_key, review_submission_receipt_key,
 )
 from issue_agent.domain.contracts import CommandKind, LifecycleCommand
 from issue_agent.domain.agent_task import RuntimeName
@@ -163,12 +163,22 @@ def set_projection(db, snapshot, outcomes, last_sequence):
     return updated
 
 
-def insert_checkpoint_receipt(db, checkpoint, *, receipt="checkpoint:1", scope="o/r"):
+def checkpoint_receipt(snapshot, checkpoint, round_id):
+    return execution.ReviewExecutionCheckpointReceipt(
+        snapshot.execution.origin, snapshot.execution.checkpoint, None, checkpoint,
+        "a" * 64, hashlib.sha256(b"").hexdigest(),
+        execution.ReviewExecutionCompactionRoundSource(round_id, "b" * 64, "c" * 64), None,
+    )
+
+
+def insert_checkpoint_receipt(db, receipt, *, key=None, scope="o/r"):
+    receipt_id = key or review_execution_checkpoint_receipt_id(receipt)
     db.execute(
         "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
         "VALUES ('review-execution-checkpoint',?,?,'2026-09-27T00:00:00+00:00',?)",
-        (scope, receipt, encode_workflow(checkpoint)),
+        (scope, receipt_id, encode_workflow(receipt)),
     )
+    return receipt_id
 
 
 def test_ordinary_failure_projection_preserves_rejection_baseline(active):
@@ -341,8 +351,8 @@ def test_compacted_checkpoint_cannot_claim_an_unsettled_open_round(active):
         insert_round(db, facts)
         current = set_projection(db, snapshot, (), 1)
         checkpoint = replace(current.execution.checkpoint, through_sequence=1)
-        corrupted = replace(current, execution=replace(current.execution, checkpoint=checkpoint, checkpoint_receipt="checkpoint:1"))
-        insert_checkpoint_receipt(db, checkpoint)
+        receipt_id = insert_checkpoint_receipt(db, checkpoint_receipt(snapshot, checkpoint, facts.plan.round))
+        corrupted = replace(current, execution=replace(current.execution, checkpoint=checkpoint, checkpoint_receipt=receipt_id))
         db.execute("UPDATE workflows SET episode_json=? WHERE target_kind='pr'", (encode_workflow_episodes(corrupted),))
         before = tuple(db.iterdump())
         with pytest.raises(WorkflowAuthorityError):
@@ -350,23 +360,39 @@ def test_compacted_checkpoint_cannot_claim_an_unsettled_open_round(active):
         assert tuple(db.iterdump()) == before
 
 
-def test_verified_compacted_prefix_loads_without_replaying_it(active):
+def test_typed_compacted_prefix_refuses_load_without_verified_source_anchors(active):
     store, snapshot = active
     first, failure = round_facts(snapshot, 1)
     checkpoint = execution.project_review_execution(snapshot.execution.checkpoint, (failure,)).checkpoint
     assert checkpoint.through_sequence == 1 and checkpoint.state.failures == 4
     with store.transaction() as db:
         insert_round(db, first, failure)
-        insert_checkpoint_receipt(db, checkpoint)
+        receipt_id = insert_checkpoint_receipt(db, checkpoint_receipt(snapshot, checkpoint, first.plan.round))
         compacted = replace(snapshot, execution=replace(snapshot.execution, checkpoint=checkpoint, state=checkpoint.state,
-                                                       last_sequence=1, checkpoint_receipt="checkpoint:1"))
+                                                       last_sequence=1, checkpoint_receipt=receipt_id))
         expected = set_projection(db, compacted, (), 1)
         before = tuple(db.iterdump())
-        recovered = load_review_workflow_row(db, snapshot.revision.fence.key)
-        assert recovered == expected
-        assert recovered.execution.state.failures == 4
-        assert recovered.execution.checkpoint.policy.free_pin_deferrals == 1
-        assert load_review_workflow_row(db, snapshot.revision.fence.key) == recovered
+        with pytest.raises(WorkflowAuthorityError, match="source anchors"):
+            load_review_workflow_row(db, snapshot.revision.fence.key)
+        assert expected.execution.state.failures == 4
+        assert tuple(db.iterdump()) == before
+
+
+def test_indexed_round_high_water_does_not_hide_a_missing_suffix_middle(active):
+    store, snapshot = active
+    first, _ = round_facts(snapshot, 1)
+    third, _ = round_facts(snapshot, 3)
+    with store.transaction() as db:
+        insert_round(db, first)
+        insert_round(db, third)
+        allocated = replace(snapshot, execution=replace(snapshot.execution, last_sequence=3))
+        db.execute(
+            "UPDATE workflows SET episode_json=? WHERE target_kind='pr'",
+            (encode_workflow_episodes(allocated),),
+        )
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="round index"):
+            load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before
 
 
@@ -381,25 +407,102 @@ def test_compacted_projection_applies_later_suffix_once(active, copied, expected
     assert projected.checkpoint.policy.free_pin_deferrals == 1
 
 
-@pytest.mark.parametrize("corruption", ["missing_reference", "missing_receipt", "foreign_scope", "different_state", "different_policy"])
+@pytest.mark.parametrize("corruption", [
+    "missing_reference", "missing_receipt", "foreign_scope", "different_state",
+    "different_policy", "foreign_origin", "wrong_key", "blob_alias",
+    "oversized_payload", "naive_claim",
+])
 def test_compacted_checkpoint_requires_its_exact_scoped_typed_receipt(active, corruption):
     store, snapshot = active
     facts, outcome = round_facts(snapshot, 1)
     checkpoint = execution.project_review_execution(snapshot.execution.checkpoint, (outcome,)).checkpoint
+    receipt = checkpoint_receipt(snapshot, checkpoint, facts.plan.round)
+    if corruption == "foreign_origin":
+        receipt = replace(receipt, origin=execution.ReviewExecutionOrigin(
+            execution.ReviewExecutionOriginKind.INITIALIZED, "foreign:origin",
+        ))
+    receipt_id = review_execution_checkpoint_receipt_id(receipt)
     with store.transaction() as db:
         insert_round(db, facts, outcome)
         compacted = replace(snapshot, execution=replace(snapshot.execution, checkpoint=checkpoint, state=checkpoint.state,
                                                        last_sequence=1,
-                                                       checkpoint_receipt=None if corruption == "missing_reference" else "checkpoint:1"))
+                                                       checkpoint_receipt=None if corruption == "missing_reference" else receipt_id))
         set_projection(db, compacted, (), 1)
         if corruption != "missing_receipt":
-            receipt = checkpoint
             if corruption == "different_state":
-                receipt = replace(checkpoint, state=replace(checkpoint.state, failures=0))
+                receipt = replace(receipt, checkpoint=replace(checkpoint, state=replace(checkpoint.state, failures=0)))
             elif corruption == "different_policy":
-                receipt = replace(checkpoint, policy=execution.ReviewExecutionPolicy(99))
-            insert_checkpoint_receipt(db, receipt, scope="other/repo" if corruption == "foreign_scope" else "o/r")
+                receipt = checkpoint
+            insert_checkpoint_receipt(
+                db, receipt, key="checkpoint:wrong" if corruption == "wrong_key" else receipt_id,
+                scope="other/repo" if corruption == "foreign_scope" else "o/r",
+            )
+        if corruption == "blob_alias":
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (CAST(? AS BLOB),?,?,?,?)",
+                ("review-execution-checkpoint", "o/r", receipt_id,
+                 "2026-09-27T00:00:00+00:00", encode_workflow(receipt)),
+            )
+        elif corruption == "oversized_payload":
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-checkpoint' AND key=?",
+                ("x" * (MAX_WORKFLOW_PAYLOAD_BYTES + 1), receipt_id),
+            )
+        elif corruption == "naive_claim":
+            db.execute(
+                "UPDATE dedupe_keys SET claimed_at='2026-09-27T00:00:00' "
+                "WHERE namespace='review-execution-checkpoint' AND key=?", (receipt_id,),
+            )
         before = tuple(db.iterdump())
         with pytest.raises(WorkflowAuthorityError, match="checkpoint"):
+            load_review_workflow_row(db, snapshot.revision.fence.key)
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("predecessor", ["valid", "missing", "foreign_origin", "changed_frontier", "later_claim"])
+def test_compacted_checkpoint_checks_its_immediate_predecessor(active, predecessor):
+    store, snapshot = active
+    first, first_outcome = round_facts(snapshot, 1)
+    second, second_outcome = round_facts(snapshot, 2)
+    first_checkpoint = execution.project_review_execution(
+        snapshot.execution.checkpoint, (first_outcome,),
+    ).checkpoint
+    second_checkpoint = execution.project_review_execution(
+        snapshot.execution.checkpoint, (first_outcome, second_outcome),
+    ).checkpoint
+    first_receipt = checkpoint_receipt(snapshot, first_checkpoint, first.plan.round)
+    if predecessor == "foreign_origin":
+        first_receipt = replace(first_receipt, origin=execution.ReviewExecutionOrigin(
+            execution.ReviewExecutionOriginKind.INITIALIZED, "foreign:origin",
+        ))
+    elif predecessor == "changed_frontier":
+        first_receipt = replace(first_receipt, checkpoint=replace(
+            first_checkpoint, state=replace(first_checkpoint.state, failures=0),
+        ))
+    first_id = review_execution_checkpoint_receipt_id(first_receipt)
+    second_receipt = execution.ReviewExecutionCheckpointReceipt(
+        snapshot.execution.origin, first_checkpoint, first_id, second_checkpoint,
+        "a" * 64, hashlib.sha256(b"").hexdigest(),
+        execution.ReviewExecutionCompactionRoundSource(second.plan.round, "b" * 64, "c" * 64), None,
+    )
+    with store.transaction() as db:
+        insert_round(db, first, first_outcome)
+        insert_round(db, second, second_outcome)
+        if predecessor != "missing":
+            insert_checkpoint_receipt(db, first_receipt)
+        second_id = insert_checkpoint_receipt(db, second_receipt)
+        if predecessor == "later_claim":
+            db.execute(
+                "UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00+00:00' "
+                "WHERE namespace='review-execution-checkpoint' AND key=?", (first_id,),
+            )
+        compacted = replace(snapshot, execution=replace(
+            snapshot.execution, checkpoint=second_checkpoint, state=second_checkpoint.state,
+            last_sequence=2, checkpoint_receipt=second_id,
+        ))
+        set_projection(db, compacted, (), 2)
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="source anchors" if predecessor == "valid" else "checkpoint"):
             load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before

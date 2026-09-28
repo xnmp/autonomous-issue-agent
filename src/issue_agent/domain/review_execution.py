@@ -1239,6 +1239,136 @@ class ReviewExecutionCompactionPlan:
         return cursor.revision if cursor is not None else None
 
 
+@dataclass(frozen=True)
+class ReviewExecutionCompactionRoundSource:
+    """Small identity of one verified retired round row and its receipt set."""
+
+    round: ReviewRoundIdentity
+    row_sha256: str
+    receipt_set_sha256: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.round, ReviewRoundIdentity):
+            raise ValueError("compaction round source requires a typed round")
+        _archive_audit_digest(self.row_sha256, "compaction round row digest")
+        _archive_audit_digest(self.receipt_set_sha256, "compaction round receipt digest")
+
+
+@dataclass(frozen=True)
+class ReviewExecutionCheckpointReceipt:
+    """Fixed-size checkpoint chain and retired source manifest, not a minted SQL proof."""
+
+    origin: ReviewExecutionOrigin
+    previous_checkpoint: ReviewExecutionCheckpoint
+    previous_receipt_id: str | None
+    checkpoint: ReviewExecutionCheckpoint
+    round_stream_sha256: str
+    generation_stream_sha256: str
+    last_round_source: ReviewExecutionCompactionRoundSource | None
+    last_generation_source: ReviewGenerationArchiveFingerprint | None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionOrigin)
+                or not isinstance(self.previous_checkpoint, ReviewExecutionCheckpoint)
+                or not isinstance(self.checkpoint, ReviewExecutionCheckpoint)):
+            raise ValueError("checkpoint receipt requires its origin and two typed frontiers")
+        initial = (self.previous_checkpoint.through_sequence == 0
+                   and self.previous_checkpoint.boundary_cursor is None)
+        if (self.previous_receipt_id is None) != initial:
+            raise ValueError("checkpoint receipt must name its previous checkpoint or initial origin")
+        if self.previous_receipt_id is not None:
+            identifier(self.previous_receipt_id, "previous execution checkpoint receipt")
+        if (not same_execution_episode(self.previous_checkpoint.state.binding,
+                                       self.checkpoint.state.binding)
+                or self.previous_checkpoint.policy != self.checkpoint.policy):
+            raise ValueError("checkpoint receipt changed its execution episode or policy")
+        previous_sequence = self.previous_checkpoint.through_sequence
+        next_sequence = self.checkpoint.through_sequence
+        previous_generation = self.previous_checkpoint.state.binding.rejection.fence.generation
+        next_generation = self.checkpoint.state.binding.rejection.fence.generation
+        rounds = next_sequence - previous_sequence
+        generations = next_generation - previous_generation
+        if (rounds < 0 or generations < 0 or rounds > MAX_EXECUTION_SUFFIX
+                or generations > MAX_EXECUTION_SUFFIX or (rounds == 0 and generations == 0)):
+            raise ValueError("checkpoint receipt requires a bounded advancing frontier")
+        _archive_audit_digest(self.round_stream_sha256, "checkpoint round source stream")
+        _archive_audit_digest(self.generation_stream_sha256, "checkpoint generation source stream")
+        if (rounds == 0) != (self.last_round_source is None):
+            raise ValueError("checkpoint receipt round anchor disagrees with its frontier")
+        if rounds == 0 and self.round_stream_sha256 != _EMPTY_ARCHIVE_AUDIT_DIGEST:
+            raise ValueError("checkpoint receipt cannot invent retired round sources")
+        if self.last_round_source is not None and (
+            not isinstance(self.last_round_source, ReviewExecutionCompactionRoundSource)
+            or self.last_round_source.round.sequence != next_sequence
+            or not same_execution_episode(self.previous_checkpoint.state.binding,
+                                          self.last_round_source.round.binding)
+            or self.last_round_source.round.binding.rejection.fence.generation > next_generation
+        ):
+            raise ValueError("checkpoint receipt has a foreign final round source")
+        if (generations == 0) != (self.last_generation_source is None):
+            raise ValueError("checkpoint receipt generation anchor disagrees with its frontier")
+        if generations == 0 and (
+            self.generation_stream_sha256 != _EMPTY_ARCHIVE_AUDIT_DIGEST
+            or self.checkpoint.boundary_cursor != self.previous_checkpoint.boundary_cursor
+        ):
+            raise ValueError("checkpoint receipt cannot invent retired generation sources")
+        if self.last_generation_source is not None and (
+            not isinstance(self.last_generation_source, ReviewGenerationArchiveFingerprint)
+            or self.last_generation_source.cursor != self.checkpoint.boundary_cursor
+            or self.last_generation_source.cursor.revision.fence.generation != next_generation
+        ):
+            raise ValueError("checkpoint receipt has a foreign final generation source")
+
+
+def build_review_execution_checkpoint_receipt(
+    execution: ActivatedReviewExecution,
+    plan: ReviewExecutionCompactionPlan,
+    round_sources: tuple[ReviewExecutionCompactionRoundSource, ...],
+    generation_sources: tuple[ReviewGenerationArchiveFingerprint, ...],
+) -> ReviewExecutionCheckpointReceipt:
+    """Bind a validated prefix plan to ordered source fingerprints supplied by an adapter."""
+    if (not isinstance(execution, ActivatedReviewExecution)
+            or not isinstance(plan, ReviewExecutionCompactionPlan)
+            or not isinstance(round_sources, tuple)
+            or not isinstance(generation_sources, tuple)
+            or len(round_sources) > MAX_EXECUTION_SUFFIX
+            or len(generation_sources) > MAX_EXECUTION_SUFFIX):
+        raise ValueError("checkpoint receipt builder requires bounded typed plan and sources")
+    if (plan_review_execution_compaction(
+        execution, plan.retired_outcomes + plan.remaining_outcomes,
+        plan.checkpoint.through_sequence,
+    ) != plan or len(round_sources) != len(plan.retired_outcomes)
+            or len(generation_sources) != len(plan.retired_boundaries)):
+        raise ValueError("checkpoint receipt sources disagree with the projected prefix")
+    round_digest = _EMPTY_ARCHIVE_AUDIT_DIGEST
+    for source, outcome in zip(round_sources, plan.retired_outcomes, strict=True):
+        if (not isinstance(source, ReviewExecutionCompactionRoundSource)
+                or source.round != outcome.round):
+            raise ValueError("checkpoint receipt has an unverified round source order")
+        encoded = "\0".join((str(source.round.sequence), source.round.round_id,
+                             str(source.round.binding.rejection.fence.generation),
+                             source.row_sha256, source.receipt_set_sha256)).encode()
+        round_digest = hashlib.sha256(bytes.fromhex(round_digest) + encoded).hexdigest()
+    generation_digest = _EMPTY_ARCHIVE_AUDIT_DIGEST
+    for source, boundary in zip(generation_sources, plan.retired_boundaries, strict=True):
+        if (not isinstance(source, ReviewGenerationArchiveFingerprint)
+                or source.cursor != ReviewExecutionBoundaryCursor(
+                    boundary.receipt_id, boundary.to_revision,
+                )):
+            raise ValueError("checkpoint receipt has an unverified generation source order")
+        encoded = "\0".join((str(boundary.to_revision.fence.generation),
+                             source.cursor.receipt_id, str(source.cursor.revision.version),
+                             source.receipt_sha256, source.accepted_namespace,
+                             source.accepted_key, source.accepted_sha256)).encode()
+        generation_digest = hashlib.sha256(bytes.fromhex(generation_digest) + encoded).hexdigest()
+    return ReviewExecutionCheckpointReceipt(
+        execution.origin, execution.checkpoint, execution.checkpoint_receipt,
+        plan.checkpoint, round_digest, generation_digest,
+        round_sources[-1] if round_sources else None,
+        generation_sources[-1] if generation_sources else None,
+    )
+
+
 def same_execution_episode(current: ReviewExecutionBinding, observed: ReviewExecutionBinding) -> bool:
     """Whether two round bindings belong to one execution episode across generations."""
     if not isinstance(current, ReviewExecutionBinding) or not isinstance(observed, ReviewExecutionBinding):

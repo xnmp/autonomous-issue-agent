@@ -17,6 +17,7 @@ from issue_agent.domain.review_execution import (
     ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
     ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
     ReviewExecutionGenerationBoundary, ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
+    ReviewExecutionCompactionRoundSource, ReviewExecutionCheckpointReceipt,
     ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint, ReviewGenerationArchiveScan,
     ReviewGenerationArchiveReceiptMember, ReviewGenerationArchiveSweep,
     ReviewGenerationReceiptSweepCursor, CompletedReviewGenerationArchiveAudit,
@@ -34,6 +35,7 @@ from issue_agent.domain.review_execution import (
     compatible_review_session, matches_accepted_review_transition_source,
     review_generation_chain_digest, review_generation_receipt_id, review_generation_within_frontier,
     plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
+    build_review_execution_checkpoint_receipt,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
 from issue_agent.domain.workflow import ObservedTransition, WorkflowMutation
@@ -539,6 +541,62 @@ def test_zero_round_advances_compact_at_same_sequence_with_distinct_boundary_fro
     assert later_plan.last_boundary_revision == second.to_revision
     with pytest.raises(ValueError, match="new finalized frontier"):
         plan_review_execution_compaction(activated(), (), 0)
+
+
+def test_checkpoint_receipt_binds_retired_generation_order_and_next_round_frontier():
+    initial = checkpoint()
+    first_after = carry_review_execution_generation(initial.state, binding(1), 0)
+    first = generation_boundary(initial.state, first_after, 0, (), "boundary:receipt:1")
+    second_after = carry_review_execution_generation(first_after, binding(2), 0)
+    second = generation_boundary(first_after, second_after, 0, (), "boundary:receipt:2")
+    component = ActivatedReviewExecution(
+        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:checkpoint-receipt"),
+        initial, second_after, 0, boundaries=(first, second),
+    )
+    plan = plan_review_execution_compaction(component, (), 0)
+    sources = tuple(ReviewGenerationArchiveFingerprint(
+        ReviewExecutionBoundaryCursor(boundary.receipt_id, boundary.to_revision),
+        "a" * 64, "workflow-request", f"request:receipt:{index}", "b" * 64,
+    ) for index, boundary in enumerate((first, second), start=1))
+    receipt = build_review_execution_checkpoint_receipt(component, plan, (), sources)
+    assert isinstance(receipt, ReviewExecutionCheckpointReceipt)
+    assert receipt.previous_checkpoint == initial and receipt.previous_receipt_id is None
+    assert receipt.checkpoint == plan.checkpoint
+    assert receipt.last_generation_source == sources[-1]
+    assert receipt.last_round_source is None
+    assert receipt.generation_stream_sha256 != hashlib.sha256(b"").hexdigest()
+    with pytest.raises(ValueError, match="generation source order"):
+        build_review_execution_checkpoint_receipt(component, plan, (), tuple(reversed(sources)))
+    with pytest.raises(ValueError, match="projected prefix"):
+        build_review_execution_checkpoint_receipt(component, plan, (), sources[:1])
+    with pytest.raises(ValueError, match="generation anchor"):
+        replace(receipt, last_generation_source=None)
+    with pytest.raises(ValueError, match="previous checkpoint"):
+        replace(receipt, previous_receipt_id="checkpoint:forged")
+
+    next_outcome = failed(1, captured=binding(2))
+    later = ActivatedReviewExecution(
+        component.origin, plan.checkpoint,
+        project_review_execution(plan.checkpoint, (next_outcome,)).state, 1,
+        checkpoint_receipt="checkpoint:first",
+    )
+    later_plan = plan_review_execution_compaction(later, (next_outcome,), 1)
+    round_source = ReviewExecutionCompactionRoundSource(
+        next_outcome.round, "c" * 64, "d" * 64,
+    )
+    later_receipt = build_review_execution_checkpoint_receipt(
+        later, later_plan, (round_source,), (),
+    )
+    assert later_receipt.previous_receipt_id == "checkpoint:first"
+    assert later_receipt.last_round_source == round_source
+    assert later_receipt.last_generation_source is None
+    assert later_receipt.generation_stream_sha256 == hashlib.sha256(b"").hexdigest()
+    with pytest.raises(ValueError, match="round anchor"):
+        replace(later_receipt, last_round_source=None)
+    with pytest.raises(ValueError, match="previous checkpoint"):
+        replace(later_receipt, previous_receipt_id=None)
+    with pytest.raises(ValueError, match="advancing frontier"):
+        replace(later_receipt, checkpoint=later_receipt.previous_checkpoint)
 
 
 def test_partial_compaction_keeps_a_later_boundary_and_ignores_late_old_outcome():
