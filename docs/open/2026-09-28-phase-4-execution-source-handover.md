@@ -151,6 +151,14 @@ with `CLAUDE.md`, `AGENTS.md`, the
   has a distinct escalated productive-round variant when its sealed outcome
   agrees. This proves the accepted hold plan, not remote relabel delivery or
   the present GitHub hold state.
+- Checkpoint 55 revalidates complete classifications in one SQL snapshot and
+  orders every allocated round by execution identity and preflight sequence.
+  Open and unproductive rounds remain explicit; each productive sealed outcome
+  requires exactly one classified successful command. Conflicting parent
+  rejection metadata and missing sequences block. For now, only rounds whose
+  binding exactly matches the current activated workflow binding can produce
+  complete coverage. Older generations require a complete accepted-boundary
+  join before replay or import. The result proves coverage, not reset order.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -345,8 +353,10 @@ order a durable clock.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Replay the complete successful-submission classifications and sealed
-   outcomes in execution order to establish resets. Verify delivered escalated
+2. Join every historical round, including open and unproductive rounds, to
+   its accepted generation boundary and current workflow authority. Replay
+   the complete successful-submission classifications and sealed outcomes in
+   execution order to establish resets. Verify delivered escalated
    holds or their current observed state, and resolve or block historical
    unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset

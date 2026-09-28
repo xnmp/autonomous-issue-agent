@@ -4,6 +4,14 @@ import pytest
 from dataclasses import replace
 import json
 
+from issue_agent.domain.contracts import CommandId
+from issue_agent.domain.review_execution import (
+    ReviewExecutionBinding, ReviewRoundIdentity, ReviewRoundOutcome, CopiedReviewProgress, ReviewPinDeferred,
+)
+from issue_agent.domain.workflow_identity import (
+    FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
+)
+
 from issue_agent.domain.resolve_activation import LegacyAbsent
 from issue_agent.domain.review_execution_activation import (
     AttributedLegacyReviewDeath, LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunPage,
@@ -16,6 +24,8 @@ from issue_agent.domain.review_execution_activation import (
     LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
     CompleteLegacyReviewRuns,
     LegacyReviewOutcomeReceiptSource, CompleteLegacyReviewOutcomeReceipts,
+    OpenLegacyOrderedRound, FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound,
+    LegacyOrderedExecutionEpisode,
 )
 
 
@@ -278,3 +288,25 @@ def test_review_owner_lineage_rejects_reachable_cycle():
     with pytest.raises(ValueError, match="cycle"):
         LegacyReviewOwnerLineage("o/r", "o/r:review:current", ("old-a",),
                                  ("o/r:review:current", "o/r:review", "old-a", "old-b"), (a, b))
+
+
+def test_ordered_legacy_episode_preserves_open_gaps_and_productive_boundary():
+    parent = WorkflowBinding(
+        WorkflowFence(WorkflowKey("o/r", PullRequestRef(9)), 0),
+        FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1), "rejections:1",
+    )
+    binding = ReviewExecutionBinding(parent, 2, "execution:1")
+    first = ReviewRoundIdentity(binding, "round:1", 1)
+    second = ReviewRoundIdentity(binding, "round:2", 2)
+    completed = ReviewRoundOutcome(second, CopiedReviewProgress("review:2"))
+    episode = LegacyOrderedExecutionEpisode((OpenLegacyOrderedRound(first),
+                                             FinalizedLegacyProductiveRound(completed, CommandId("command:2"))))
+
+    assert episode.latest_productive_outcome_sequence == 2
+    assert episode.outcomes == (completed,)
+    with pytest.raises(ValueError, match="gap"):
+        LegacyOrderedExecutionEpisode((FinalizedLegacyProductiveRound(completed, CommandId("command:2")),))
+    with pytest.raises(ValueError, match="nonproductive"):
+        FinalizedLegacyUnproductiveRound(completed)
+    with pytest.raises(ValueError, match="productive"):
+        FinalizedLegacyProductiveRound(ReviewRoundOutcome(first, ReviewPinDeferred("pin:1")), CommandId("cmd"))

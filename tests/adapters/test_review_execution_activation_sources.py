@@ -39,6 +39,8 @@ from issue_agent.adapters.review_execution_activation import (
     ClassifiedLegacyStaleReviewSuccess, UnresolvedLegacyReviewSuccess,
     match_legacy_escalated_review_hold_plan,
     MatchedLegacyEscalatedReviewHoldPlan, UnmatchedLegacyEscalatedReviewHoldPlan,
+    verify_complete_legacy_ordered_outcome_coverage,
+    CompleteLegacyOrderedOutcomeCoverage, BlockedLegacyOrderedOutcomeCoverage,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -1236,6 +1238,118 @@ def _classification_observations(db):
     lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
     assert isinstance(lineage, LegacyReviewOwnerLineage)
     return storage, generation, lineage
+
+
+def _ordered_coverage(store):
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        classified = classify_complete_legacy_review_successes(db, *_classification_observations(db))
+        assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+        before = db.total_changes
+        ordered = verify_complete_legacy_ordered_outcome_coverage(db, classified)
+        assert db.total_changes == before
+        db.rollback()
+    return ordered
+
+
+@pytest.mark.parametrize("escalated", [False, True])
+def test_ordered_outcome_coverage_pairs_each_recorded_productive_round(rig, escalated):
+    store, gateway, selection, control, plan, command = (
+        confirmed_escalation(rig) if escalated else confirmed_copy(rig)
+    )
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    control.finalize_completed_round(plan.round.round_id)
+
+    ordered = _ordered_coverage(store)
+
+    assert isinstance(ordered, CompleteLegacyOrderedOutcomeCoverage)
+    assert len(ordered.episodes) == 1
+    assert ordered.episodes[0].latest_productive_outcome_sequence == plan.round.sequence
+    assert ordered.episodes[0].outcomes[0].round == plan.round
+    assert len(ordered.source_digest) == 64
+
+
+def test_ordered_outcome_coverage_keeps_open_later_round_in_sequence(rig):
+    store, _, gateway, selection, control = rig
+    first = control.preflight(selection)
+    later = control.preflight(replace(
+        selection, request_id="preflight:ordered-later-open", expected=current(store, selection).revision,
+    ))
+    command = command_for(current(store, selection))
+    control.register_submission(first.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.COPIED)
+    control.seal_completed_planning(first.round.round_id, current(store, selection).revision)
+    store.begin_command(command.command_id)
+    store.record_effect(EffectReceipt(command.command_id, CONTROL_OWNER, store.now(), store.now(),
+                                      EffectStatus.SUCCEEDED, remote_object_id="review:ordered-first"))
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    control.finalize_completed_round(first.round.round_id)
+
+    ordered = _ordered_coverage(store)
+
+    assert isinstance(ordered, CompleteLegacyOrderedOutcomeCoverage)
+    assert [entry.round for entry in ordered.episodes[0].rounds] == [first.round, later.round]
+    assert ordered.episodes[0].latest_productive_outcome_sequence == first.round.sequence
+    assert len(ordered.episodes[0].outcomes) == 1
+
+
+def test_ordered_outcome_coverage_retains_unproductive_finalization(stopped_round):
+    store, _, control, _, child, _, _ = stopped_round
+    finalized = control.finalize_completed_round(child.round.round_id)
+    assert isinstance(finalized.outcome.disposition, ReviewUnlaunchedRound)
+
+    ordered = _ordered_coverage(store)
+
+    assert isinstance(ordered, CompleteLegacyOrderedOutcomeCoverage)
+    assert ordered.episodes[0].outcomes == (finalized.outcome,)
+    assert ordered.episodes[0].latest_productive_outcome_sequence == 0
+
+
+def test_ordered_outcome_coverage_blocks_unresolved_productive_round(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    assert isinstance(workflow_for(store, gateway).record_review(command.command_id), WorkflowCommitted)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-recorded-submission' AND scope='o/r' "
+                   "AND key=?", (str(command.command_id),))
+
+    ordered = _ordered_coverage(store)
+
+    assert isinstance(ordered, BlockedLegacyOrderedOutcomeCoverage)
+    assert "unresolved" in ordered.reason
+
+
+def test_ordered_outcome_coverage_blocks_unaccepted_open_generation(rig):
+    store, _, _, selection, control = rig
+    control.preflight(selection)
+    _advance_generation_with_open_round(store, selection)
+
+    ordered = _ordered_coverage(store)
+
+    assert isinstance(ordered, BlockedLegacyOrderedOutcomeCoverage)
+    assert "accepted historical generation proof" in ordered.reason
+
+
+def test_ordered_outcome_coverage_blocks_split_execution_identity(rig):
+    store, _, _, selection, control = rig
+    first = control.preflight(selection)
+    second = control.preflight(replace(
+        selection, request_id="preflight:conflicting-episode", expected=current(store, selection).revision,
+    ))
+    changed = replace(second, round=replace(second.round, binding=replace(
+        second.round.binding, rejection=replace(
+            second.round.binding.rejection, episode_id="rejections:conflicting",
+        ),
+    )))
+    with store.transaction() as db:
+        db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE round_id=?",
+                   (encode_workflow(changed), second.round.round_id))
+
+    ordered = _ordered_coverage(store)
+
+    assert isinstance(ordered, BlockedLegacyOrderedOutcomeCoverage)
+    assert "crossed episode" in ordered.reason
+    assert first.round.sequence == 1
 
 
 def test_complete_success_classification_proves_plain_round_and_keeps_historical_unknown(rig):

@@ -1378,3 +1378,30 @@ Full `make test` passed: 3,200 domain, 3,065 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-escalated-hold-plan-gate.log` (ephemeral).
+
+## Checkpoint 55 — ordered outcome coverage for the current generation (offline)
+
+A read-only join now revalidates complete submission, outcome, generation and
+owner sources in one SQL transaction, then accounts for every allocated round
+in each execution episode. Open rounds remain explicit. Every sealed productive
+outcome must have exactly one classified successful submission, and every
+classified success must pair with its exact sealed outcome. Episodes require
+contiguous preflight sequence numbers and one consistent execution identity.
+
+The coverage result is deliberately limited to rounds whose binding exactly
+matches the current activated workflow binding. An older generation, even with
+an individually proved stale submission, blocks until the complete accepted
+boundary chain can assign every open and unproductive round to its historical
+generation. This result does not replay execution state, prove reset order or
+authorize import. The next checkpoint must join historical generation
+boundaries and replay outcomes against the source-backed execution checkpoint.
+
+Independent Sol review found that conflicting rejection metadata could split
+one execution episode and that open rounds could claim an unproved generation.
+Both now block; real SQL regressions cover each case. A finalized preparation
+stop remains an explicit unproductive outcome in a separate real fixture.
+
+Full `make test` passed: 3,201 domain, 3,072 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-ordered-coverage-final-gate.log` (ephemeral).

@@ -49,6 +49,8 @@ from ..domain.review_execution_activation import (
     VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
     CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
     VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
+    OpenLegacyOrderedRound, FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound,
+    LegacyOrderedExecutionEpisode,
     BlockedLegacySubmissionSettlementStorage,
     LegacyReviewGenerationReceiptSource, CompleteLegacyReviewGenerationReceipts,
     BlockedLegacyReviewGenerationReceipts, MAX_LEGACY_GENERATION_RECEIPT_ROWS,
@@ -3046,3 +3048,151 @@ def classify_complete_legacy_review_successes(
         return CompleteLegacyReviewSuccessClassifications(storage, generation, lineage, tuple(results))
     except ValueError as exc:
         return BlockedLegacyReviewSuccessClassifications(repository, _printable(str(exc)))
+
+
+_ExecutionEpisodeKey = tuple[WorkflowKey, int, str]
+
+
+def _execution_episode_key(binding: ReviewExecutionBinding) -> _ExecutionEpisodeKey:
+    return (binding.rejection.fence.key, binding.execution_epoch, binding.execution_episode)
+
+
+def _classified_productive_storage(
+    result: ClassifiedLegacyPlainReviewSuccess | ClassifiedLegacyEscalatedReviewSuccess
+    | ClassifiedLegacyStaleReviewSuccess,
+) -> VerifiedLegacyRoundOutcomeStorage:
+    return (result.proof.stale_path.sealed if isinstance(result, ClassifiedLegacyStaleReviewSuccess)
+            else result.proof.storage)
+
+
+@dataclass(frozen=True)
+class CompleteLegacyOrderedOutcomeCoverage:
+    """Current-generation rounds are ordered and productive outcomes have proofs."""
+
+    classifications: CompleteLegacyReviewSuccessClassifications
+    episodes: tuple[LegacyOrderedExecutionEpisode, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.classifications, CompleteLegacyReviewSuccessClassifications)
+                or self.classifications.unresolved or not isinstance(self.episodes, tuple)
+                or any(not isinstance(episode, LegacyOrderedExecutionEpisode) for episode in self.episodes)):
+            raise ValueError("ordered outcome coverage requires resolved complete classifications")
+        plans = {plan.round.round_id: plan for _, plan in self.classifications.storage.round_plans}
+        sealed = self.classifications.storage.round_storage._sealed_by_id
+        entries = tuple(item for episode in self.episodes for item in episode.rounds)
+        by_round = {item.round.round_id: item for item in entries}
+        episode_keys = [_execution_episode_key(episode.rounds[0].round.binding) for episode in self.episodes]
+        if (len(by_round) != len(entries) or set(by_round) != set(plans)
+                or len(set(episode_keys)) != len(episode_keys)
+                or any(item.round != plans[round_id].round for round_id, item in by_round.items())):
+            raise ValueError("ordered outcome coverage leaves an allocated round unaccounted for")
+        finalized = {round_id: item for round_id, item in by_round.items()
+                     if isinstance(item, (FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound))}
+        if (set(finalized) != set(sealed)
+                or any(item.outcome != sealed[round_id].outcome for round_id, item in finalized.items())):
+            raise ValueError("ordered outcome coverage leaves a sealed outcome unaccounted for")
+        proven: dict[str, tuple[str, VerifiedLegacyRoundOutcomeStorage]] = {}
+        for result in self.classifications.results:
+            if isinstance(result, UnresolvedLegacyReviewSuccess):
+                raise ValueError("ordered outcome coverage contains an unresolved success")
+            round_storage = _classified_productive_storage(result)
+            round_id = round_storage.outcome.round.round_id
+            command_id = dict(result.source.command_fields)["command_id"]
+            if round_id in proven or sealed.get(round_id) != round_storage:
+                raise ValueError("ordered outcome coverage has duplicate or foreign productivity proof")
+            proven[round_id] = (command_id, round_storage)
+        productive = {round_id: item for round_id, item in finalized.items()
+                      if isinstance(item, FinalizedLegacyProductiveRound)}
+        if (set(proven) != set(productive)
+                or any(proven[round_id][0] != item.command_id for round_id, item in productive.items())):
+            raise ValueError("ordered outcome coverage leaves a productive round unproved")
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.classifications.storage.source_digest, self.classifications.generation.source_digest,
+                 self.classifications.lineage.source_digest,
+                 tuple((item.round.round_id, item.command_id)
+                       for episode in self.episodes for item in episode.rounds
+                       if isinstance(item, FinalizedLegacyProductiveRound)))
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyOrderedOutcomeCoverage:
+    repository: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked ordered outcomes require a canonical repository")
+        validate_workflow_text(self.reason, "blocked ordered outcome reason")
+
+
+def verify_complete_legacy_ordered_outcome_coverage(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewSuccessClassifications,
+) -> CompleteLegacyOrderedOutcomeCoverage | BlockedLegacyOrderedOutcomeCoverage:
+    """Recheck SQL and pair current-generation rounds before ordered reset replay."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("ordered outcome coverage requires an explicit SQL transaction")
+    if not isinstance(observed, CompleteLegacyReviewSuccessClassifications):
+        raise ValueError("ordered outcome coverage requires complete typed classifications")
+    current = classify_complete_legacy_review_successes(
+        db, observed.storage, observed.generation, observed.lineage,
+    )
+    if isinstance(current, BlockedLegacyReviewSuccessClassifications):
+        return BlockedLegacyOrderedOutcomeCoverage(observed.storage.repository, current.reason)
+    if current.unresolved:
+        command_id = dict(current.unresolved[0].source.command_fields)["command_id"]
+        return BlockedLegacyOrderedOutcomeCoverage(
+            current.storage.repository, f"successful command {command_id} remains unresolved: {current.unresolved[0].reason}",
+        )
+    proven: dict[str, tuple[str, VerifiedLegacyRoundOutcomeStorage]] = {}
+    for result in current.results:
+        round_storage = _classified_productive_storage(result)
+        round_id = round_storage.outcome.round.round_id
+        command_id = dict(result.source.command_fields)["command_id"]
+        if round_id in proven:
+            return BlockedLegacyOrderedOutcomeCoverage(current.storage.repository,
+                                                       "two successful commands claim one productive round")
+        proven[round_id] = (command_id, round_storage)
+    grouped: dict[_ExecutionEpisodeKey, list[
+        OpenLegacyOrderedRound | FinalizedLegacyUnproductiveRound | FinalizedLegacyProductiveRound,
+    ]] = {}
+    try:
+        for _, plan in current.storage.round_plans:
+            identity = plan.round
+            sealed = current.storage.round_storage._sealed_by_id.get(identity.round_id)
+            if sealed is None:
+                entry = OpenLegacyOrderedRound(identity)
+            elif isinstance(sealed.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+                matched = proven.pop(identity.round_id, None)
+                if matched is None or matched[1] != sealed:
+                    raise ValueError("productive sealed round lacks one classified successful submission")
+                entry = FinalizedLegacyProductiveRound(sealed.outcome, CommandId(matched[0]))
+            else:
+                entry = FinalizedLegacyUnproductiveRound(sealed.outcome)
+            grouped.setdefault(_execution_episode_key(identity.binding), []).append(entry)
+        if proven:
+            raise ValueError("classified success has no productive sealed round")
+        episodes_list: list[LegacyOrderedExecutionEpisode] = []
+        for (workflow_key, execution_epoch, execution_episode), entries in sorted(
+            grouped.items(), key=lambda pair: (
+                pair[0][0].repository, pair[0][0].target.number, pair[0][1], pair[0][2],
+            ),
+        ):
+            episode = LegacyOrderedExecutionEpisode(tuple(sorted(
+                entries, key=lambda item: item.round.sequence,
+            )))
+            current_workflow = load_review_workflow_row(db, workflow_key)
+            if (current_workflow is None
+                    or not isinstance(current_workflow.execution, ActivatedReviewExecution)
+                    or current_workflow.execution.binding != episode.rounds[0].round.binding
+                    or any(item.round.binding != current_workflow.execution.binding for item in episode.rounds)):
+                raise ValueError(
+                    f"execution {execution_epoch}:{execution_episode} requires accepted historical generation proof"
+                )
+            episodes_list.append(episode)
+        episodes = tuple(episodes_list)
+        return CompleteLegacyOrderedOutcomeCoverage(current, episodes)
+    except (TypeError, ValueError, KeyError, WorkflowAuthorityError, CorruptControlStore) as exc:
+        return BlockedLegacyOrderedOutcomeCoverage(current.storage.repository, _printable(str(exc)))

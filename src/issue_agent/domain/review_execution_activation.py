@@ -11,9 +11,11 @@ import json
 
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from .review_workflow import ReviewedBaseline
+from .contracts import CommandId
 from .review_workflow_policy import ReviewSubmissionReceipt
 from .review_execution import (
     ReviewExecutionBinding, ReviewRoundIdentity, ReviewRoundOutcome, PaidReviewProgress, CopiedReviewProgress,
+    same_execution_episode,
 )
 from .review_rounds import (
     ReviewRoundFacts, ReviewSubmissionConfirmed, ReviewSubmissionKind,
@@ -1256,6 +1258,82 @@ class VerifiedLegacyPlainProductiveRound:
                  self.link.source_digest, self.baseline.source_digest,
                  self.effect_receipt_id)
         return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class OpenLegacyOrderedRound:
+    round: ReviewRoundIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.round, ReviewRoundIdentity):
+            raise ValueError("open ordered round requires its identity")
+
+
+@dataclass(frozen=True)
+class FinalizedLegacyUnproductiveRound:
+    outcome: ReviewRoundOutcome
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.outcome, ReviewRoundOutcome)
+                or isinstance(self.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))):
+            raise ValueError("unproductive ordered round requires a nonproductive outcome")
+
+    @property
+    def round(self) -> ReviewRoundIdentity:
+        return self.outcome.round
+
+
+@dataclass(frozen=True)
+class FinalizedLegacyProductiveRound:
+    outcome: ReviewRoundOutcome
+    command_id: CommandId
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.outcome, ReviewRoundOutcome)
+                or not isinstance(self.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or not isinstance(self.command_id, str)):
+            raise ValueError("productive ordered round requires a confirmed command and outcome")
+        validate_workflow_identifier(self.command_id, "productive ordered command")
+
+    @property
+    def round(self) -> ReviewRoundIdentity:
+        return self.outcome.round
+
+
+LegacyOrderedRound = OpenLegacyOrderedRound | FinalizedLegacyUnproductiveRound | FinalizedLegacyProductiveRound
+
+
+@dataclass(frozen=True)
+class LegacyOrderedExecutionEpisode:
+    """Every allocated round in one uncompacted episode, in preflight order."""
+
+    rounds: tuple[LegacyOrderedRound, ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.rounds, tuple) or not self.rounds
+                or len(self.rounds) > MAX_LEGACY_ROUND_INVENTORY_ROWS
+                or any(not isinstance(item, (
+                    OpenLegacyOrderedRound, FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound,
+                )) for item in self.rounds)):
+            raise ValueError("ordered execution requires bounded typed rounds")
+        identities = tuple(item.round for item in self.rounds)
+        first = identities[0]
+        if (tuple(round_.sequence for round_ in identities) != tuple(range(1, len(identities) + 1))
+                or len({round_.round_id for round_ in identities}) != len(identities)
+                or any(not same_execution_episode(first.binding, round_.binding) for round_ in identities)
+                or tuple(round_.binding.rejection.fence.generation for round_ in identities)
+                != tuple(sorted(round_.binding.rejection.fence.generation for round_ in identities))):
+            raise ValueError("ordered execution has a gap, duplicate or crossed episode")
+
+    @property
+    def latest_productive_outcome_sequence(self) -> int:
+        return max((item.round.sequence for item in self.rounds
+                    if isinstance(item, FinalizedLegacyProductiveRound)), default=0)
+
+    @property
+    def outcomes(self) -> tuple[ReviewRoundOutcome, ...]:
+        return tuple(item.outcome for item in self.rounds
+                     if isinstance(item, (FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound)))
 
 
 @dataclass(frozen=True)
