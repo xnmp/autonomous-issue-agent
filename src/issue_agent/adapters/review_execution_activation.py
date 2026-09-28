@@ -67,7 +67,8 @@ from ..domain.review_workflow import (
     ReviewWorkflowSnapshot, RecordedPullRequest, ReviewedBaseline, PullRequestState,
 )
 from ..domain.review_workflow_policy import (
-    ReviewSubmissionReceipt, CeilingProductivityDecision, _escalation_projection,
+    ReviewSubmissionReceipt, CeilingEscalation, CeilingProductivityDecision,
+    OBSERVATION_MAX_AGE_SECONDS, _escalation_projection, open_review_ceiling,
 )
 from ..domain.labels import Label
 from ..domain.review_rounds import (
@@ -78,7 +79,7 @@ from ..domain.review_rounds import (
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.workflow import (
-    ObservedTransition, WorkflowMutation, AuthorizedOperatorCommand,
+    ObservedTransition, WorkflowChanged, WorkflowMutation, AuthorizedOperatorCommand,
     RequestRearm, ContinueGrantedRearm,
 )
 from ..domain.workflow_identity import (
@@ -1354,10 +1355,10 @@ def _read_legacy_recorded_review(
         return UnverifiedLegacyRecordedReview(command_id, _printable(str(exc)))
 
 
-def _verified_successful_review_receipt(
+def _verified_successful_review_submission(
     db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
     lineage: LegacyReviewOwnerLineage, unique_remote_ids: frozenset[str] | None,
-) -> ReviewSubmissionReceipt:
+) -> ReviewSubmissionReceipt | CeilingEscalation:
     command = dict(source.command_fields)
     effect = dict(source.receipt_fields) if source.receipt_fields is not None else None
     if command["repository"] != lineage.repository or effect is None:
@@ -1389,6 +1390,16 @@ def _verified_successful_review_receipt(
     elif receipt.remote_object_id not in unique_remote_ids:
         raise ValueError("submission review identity is shared by another command")
     bound = load_bound_review_submission(db, CommandId(command["command_id"]))
+    if not isinstance(bound, (ReviewSubmissionReceipt, CeilingEscalation)):
+        raise ValueError("submission is not a bound review")
+    return bound
+
+
+def _verified_successful_review_receipt(
+    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
+    lineage: LegacyReviewOwnerLineage, unique_remote_ids: frozenset[str] | None,
+) -> ReviewSubmissionReceipt:
+    bound = _verified_successful_review_submission(db, source, lineage, unique_remote_ids)
     if not isinstance(bound, ReviewSubmissionReceipt):
         raise ValueError("submission is not a bound verdict review")
     return bound
@@ -2862,6 +2873,182 @@ class ClassifiedLegacyStaleReviewSuccess:
 
 
 @dataclass(frozen=True)
+class VerifiedLegacyCeilingProductiveRound:
+    """Accepted ceiling gate and confirmed round; never a reviewed baseline."""
+
+    complete_storage: CompleteLegacyRoundOutcomeStorage
+    storage: VerifiedLegacyRoundOutcomeStorage
+    link: VerifiedReviewSubmissionRoundLink
+    decision: CeilingProductivityDecision
+    receipt: LegacyReviewOutcomeReceiptSource
+    receipt_digest: str
+    transition_digest: str
+    observation_digest: str
+    projection_digest: str
+    effect_receipt_id: str
+
+    def __post_init__(self) -> None:
+        disposition = self.storage.outcome.disposition
+        confirmed = tuple(item for item in self.storage.facts.submissions
+                          if isinstance(item.result, ReviewSubmissionConfirmed))
+        if (self.complete_storage._sealed_by_id.get(self.link.round.round_id) != self.storage
+                or self.storage.outcome.round != self.link.round
+                or self.complete_storage._receipt_by_key.get(
+                    ("review-round-ceiling-productivity", self.link.round.round_id)) != self.receipt
+                or bool(self.complete_storage._receipt_names_by_round.get(
+                    self.link.round.round_id, frozenset())
+                    & {"review-round-stale-productivity", "review-round-superseded-productivity"})
+                or self.decision.refusal is not None
+                or self.decision.escalation.submission.binding != self.link.round.binding.rejection
+                or str(self.decision.escalation.submission.command_id) != dict(self.link.source.command_fields)["command_id"]
+                or not isinstance(disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or len(confirmed) != 1
+                or confirmed[0].result.receipt_id != self.effect_receipt_id
+                or disposition.submission_receipt != self.effect_receipt_id
+                or str(confirmed[0].plan.command_id) != str(self.decision.escalation.submission.command_id)
+                or confirmed[0].plan.kind is not (
+                    ReviewSubmissionKind.PAID if isinstance(disposition, PaidReviewProgress)
+                    else ReviewSubmissionKind.COPIED
+                )):
+            raise ValueError("ceiling productivity disagrees with its confirmed round")
+        for digest in (self.receipt_digest, self.transition_digest,
+                       self.observation_digest, self.projection_digest):
+            if len(digest) != 64 or any(char not in "0123456789abcdef" for char in digest):
+                raise ValueError("ceiling productivity requires bounded source digests")
+
+
+def _verify_legacy_ceiling_productive_round(
+    db: sqlite3.Connection, storage: CompleteLegacySubmissionSettlementStorage,
+    source: LegacyReviewSubmissionSource, lineage: LegacyReviewOwnerLineage,
+    link: VerifiedReviewSubmissionRoundLink,
+) -> VerifiedLegacyCeilingProductiveRound:
+    command_id = dict(source.command_fields)["command_id"]
+    bound = _verified_successful_review_submission(db, source, lineage, storage._unique_remote_review_ids)
+    if not isinstance(bound, CeilingEscalation) or bound.escalate_cause != "ceiling":
+        raise ValueError("submission is not a bound ceiling escalation")
+    round_storage = storage.round_storage._sealed_by_id.get(link.round.round_id)
+    receipt = storage.round_storage._receipt_by_key.get(
+        ("review-round-ceiling-productivity", link.round.round_id),
+    )
+    if round_storage is None or receipt is None:
+        raise ValueError("ceiling escalation lacks a sealed productive round and decision")
+    fields, receipt_digest = _read_recording_source(
+        db, "review-round-ceiling-productivity", lineage.repository, link.round.round_id,
+    )
+    if fields != receipt.fields or dict(fields)["reusable_after"] is not None:
+        raise ValueError("ceiling decision changed after inventory or is reclaimable")
+    decision, settled_revision, settled_stamp = decode_workflow(dict(fields)["payload_json"], tuple)
+    if (not isinstance(decision, CeilingProductivityDecision) or decision.escalation != bound
+            or not isinstance(settled_revision, WorkflowRevision) or not isinstance(settled_stamp, str)
+            or _parse_stamp(settled_stamp) != _parse_stamp(dict(fields)["claimed_at"])
+            or settled_revision.fence != link.round.binding.rejection.fence
+            or decision.executor_identity not in lineage.owners
+            or decision.prior.binding != bound.submission.binding
+            or decision.prior.revision.fence != settled_revision.fence):
+        raise ValueError("ceiling decision disagrees with its escalation or round")
+    settled_at = _parse_stamp(settled_stamp)
+    evidence_columns = (
+        "evidence_id", "repository", "target_kind", "target_number", "command_id", "kind", "payload_json",
+    )
+    evidence = _bounded_identity_row(
+        db, "workflow_evidence", "evidence_id", decision.observation_evidence_id,
+        evidence_columns, MAX_LEGACY_RECORDING_BYTES,
+    )
+    key = bound.submission.binding.fence.key
+    if (not isinstance(key.target, PullRequestRef)
+            or (evidence["repository"], evidence["target_kind"], evidence["target_number"],
+                evidence["command_id"], evidence["kind"])
+            != (lineage.repository, "pr", key.target.number, None, "observation")
+            or type(evidence["payload_json"]) is not str):
+        raise ValueError("ceiling decision lacks its exact pull request observation")
+    observed = decode_workflow(evidence["payload_json"], RecordedPullRequest)
+    if (decision.observation_evidence_id
+            != "pr-observation:" + hashlib.sha256(encode_workflow(observed).encode()).hexdigest()
+            or observed.observation.key != key
+            or not 0 <= (decision.decided_at - observed.observation.observed_at).total_seconds()
+            <= OBSERVATION_MAX_AGE_SECONDS
+            or not 0 <= (settled_at - observed.observation.observed_at).total_seconds()
+            <= OBSERVATION_MAX_AGE_SECONDS):
+        raise ValueError("ceiling decision observation is stale or changed")
+    proposal = open_review_ceiling(
+        decision.prior, observed.observation, now=decision.decided_at,
+        rule=decision.configured_rule, ceiling=decision.configured_ceiling,
+        escalation=bound, trigger_label=decision.trigger_label,
+        executor_identity=decision.executor_identity,
+        evidence_ids=(decision.observation_evidence_id,),
+    )
+    if decision.refusal is not None or not isinstance(proposal, WorkflowChanged):
+        raise ValueError("ceiling decision lacks an accepted gate transition")
+    transition_key = hashlib.sha256(encode_workflow(decision.prior.revision).encode()).hexdigest()
+    transition_fields, transition_digest = _read_recording_source(
+        db, "workflow-transition", lineage.repository, transition_key,
+    )
+    _parse_stamp(dict(transition_fields)["claimed_at"])
+    accepted = json.loads(dict(transition_fields)["payload_json"],
+                          object_pairs_hook=_unique_receipt_object, parse_constant=_reject_nonfinite)
+    if (dict(transition_fields)["reusable_after"] is not None
+            or not isinstance(accepted, dict)
+            or set(accepted) != {"mutation", "expected", "snapshot", "audit", "commands"}
+            or accepted["mutation"] != WorkflowMutation.OPEN_GATE.value
+            or decode_workflow(accepted["expected"], WorkflowRevision) != proposal.expected
+            or decode_workflow(accepted["snapshot"], ReviewWorkflowSnapshot) != proposal.snapshot
+            or decode_workflow(accepted["audit"], ObservedTransition) != proposal.audit
+            or not isinstance(accepted["commands"], list)
+            or len(accepted["commands"]) != 1
+            or settled_revision != proposal.snapshot.revision):
+        raise ValueError("accepted ceiling transition disagrees with its decision")
+    projected = accepted["commands"][0]
+    if not isinstance(projected, dict) or not isinstance(projected.get("id"), str):
+        raise ValueError("accepted ceiling transition lacks its hold command")
+    projection_row = _bounded_identity_row(
+        db, "lifecycle_commands", "command_id", projected["id"],
+        LEGACY_SUBMISSION_COMMAND_COLUMNS, MAX_LEGACY_SQL_TEXT_BYTES,
+    )
+    projection = _command_from_row(projection_row)
+    expected_projection = proposal.commands[0]
+    if (projection != expected_projection
+            or projection_row["logical_key"] != projection.idempotency_key
+            or projection_row["occurrence"] != 0
+            or projection_row["payload_digest"] != _encoded_payload_digest(
+                projection_row["payload_json"], projection_row["workflow_binding_json"],
+            )
+            or projected != {
+                "id": projection.command_id, "idempotency": projection.idempotency_key,
+                "kind": projection.kind.value, "target": projection.target,
+                "revision": projection.expected_revision, "payload": dict(projection.payload),
+                "config": projection.config_version, "repository": projection.repository,
+                "owner": projection.executor_identity, "workflow": encode_workflow(projection.workflow),
+            }):
+        raise ValueError("durable ceiling hold disagrees with its accepted plan")
+    effect = dict(source.receipt_fields) if source.receipt_fields is not None else {}
+    observation_digest = hashlib.sha256(json.dumps(
+        (evidence["source_rowid"], tuple((name, evidence[name]) for name in evidence_columns)),
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    projection_digest = hashlib.sha256(json.dumps(
+        (projection_row["source_rowid"], tuple((name, projection_row[name])
+                                          for name in LEGACY_SUBMISSION_COMMAND_COLUMNS)),
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    return VerifiedLegacyCeilingProductiveRound(
+        storage.round_storage, round_storage, link, decision, receipt,
+        receipt_digest, transition_digest,
+        observation_digest, projection_digest,
+        _effect_receipt_id(command_id, effect["receipt_digest"]),
+    )
+
+
+@dataclass(frozen=True)
+class ClassifiedLegacyCeilingReviewSuccess:
+    source: LegacyReviewSubmissionSource
+    proof: VerifiedLegacyCeilingProductiveRound
+
+    def __post_init__(self) -> None:
+        if self.proof.link.source != self.source:
+            raise ValueError("ceiling review classification requires its exact command proof")
+
+
+@dataclass(frozen=True)
 class UnresolvedLegacyReviewSuccess:
     source: LegacyReviewSubmissionSource
     reason: str
@@ -2874,7 +3061,8 @@ class UnresolvedLegacyReviewSuccess:
 
 LegacyReviewSuccessClassification = (
     ClassifiedLegacyPlainReviewSuccess | ClassifiedLegacyEscalatedReviewSuccess
-    | ClassifiedLegacyStaleReviewSuccess | UnresolvedLegacyReviewSuccess
+    | ClassifiedLegacyStaleReviewSuccess | ClassifiedLegacyCeilingReviewSuccess
+    | UnresolvedLegacyReviewSuccess
 )
 
 
@@ -2900,7 +3088,7 @@ class CompleteLegacyReviewSuccessClassifications:
         if (len(self.results) != len(candidates)
                 or any(not isinstance(result, (
                     ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyEscalatedReviewSuccess,
-                    ClassifiedLegacyStaleReviewSuccess,
+                    ClassifiedLegacyStaleReviewSuccess, ClassifiedLegacyCeilingReviewSuccess,
                     UnresolvedLegacyReviewSuccess,
                 )) or result.source != source
                        for result, source in zip(self.results, candidates, strict=True))):
@@ -2930,6 +3118,11 @@ class CompleteLegacyReviewSuccessClassifications:
                         or result.proof.stale_path.complete_storage != self.storage
                         or result.proof.complete_receipts != self.generation):
                     raise ValueError("stale review classification lacks complete source membership")
+            elif isinstance(result, ClassifiedLegacyCeilingReviewSuccess):
+                if (command_id not in registered_ids or command_id in marker_ids
+                        or result.proof.complete_storage != self.storage.round_storage
+                        or result.proof.link.lineage != self.lineage):
+                    raise ValueError("ceiling review classification lacks complete source membership")
 
     @property
     def unresolved(self) -> tuple[UnresolvedLegacyReviewSuccess, ...]:
@@ -3026,6 +3219,19 @@ def classify_complete_legacy_review_successes(
                     )
                     results.append(ClassifiedLegacyPlainReviewSuccess(source, proof))
             except (KeyError, TypeError, ValueError, WorkflowAuthorityError, CorruptControlStore) as exc:
+                results.append(UnresolvedLegacyReviewSuccess(source, _printable(str(exc))))
+        elif ("review-round-ceiling-productivity", registration.plan.round.round_id) in (
+            storage.round_storage._receipt_by_key
+        ):
+            link = read_review_submission_round_link(db, source, lineage)
+            if isinstance(link, UnverifiedReviewSubmissionRoundLink):
+                results.append(UnresolvedLegacyReviewSuccess(source, link.reason))
+                continue
+            try:
+                proof = _verify_legacy_ceiling_productive_round(db, storage, source, lineage, link)
+                results.append(ClassifiedLegacyCeilingReviewSuccess(source, proof))
+            except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, sqlite3.Error,
+                    WorkflowAuthorityError, CorruptControlStore) as exc:
                 results.append(UnresolvedLegacyReviewSuccess(source, _printable(str(exc))))
         else:
             path = _stale_productivity_path_from_storage(storage, command_id)
@@ -3258,7 +3464,7 @@ def verify_complete_legacy_allocation_generation_sources(
 
 def _classified_productive_storage(
     result: ClassifiedLegacyPlainReviewSuccess | ClassifiedLegacyEscalatedReviewSuccess
-    | ClassifiedLegacyStaleReviewSuccess,
+    | ClassifiedLegacyStaleReviewSuccess | ClassifiedLegacyCeilingReviewSuccess,
 ) -> VerifiedLegacyRoundOutcomeStorage:
     return (result.proof.stale_path.sealed if isinstance(result, ClassifiedLegacyStaleReviewSuccess)
             else result.proof.storage)

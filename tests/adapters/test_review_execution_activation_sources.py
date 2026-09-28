@@ -36,7 +36,8 @@ from issue_agent.adapters.review_execution_activation import (
     classify_complete_legacy_review_successes,
     CompleteLegacyReviewSuccessClassifications, BlockedLegacyReviewSuccessClassifications,
     ClassifiedLegacyPlainReviewSuccess, ClassifiedLegacyEscalatedReviewSuccess,
-    ClassifiedLegacyStaleReviewSuccess, UnresolvedLegacyReviewSuccess,
+    ClassifiedLegacyStaleReviewSuccess, ClassifiedLegacyCeilingReviewSuccess,
+    UnresolvedLegacyReviewSuccess,
     match_legacy_escalated_review_hold_plan,
     MatchedLegacyEscalatedReviewHoldPlan, UnmatchedLegacyEscalatedReviewHoldPlan,
     verify_complete_legacy_ordered_outcome_coverage,
@@ -1550,7 +1551,7 @@ def test_complete_success_classification_proves_plain_round_and_keeps_historical
         replace(classified, results=(plain,))
 
 
-def test_complete_success_classification_proves_stale_path_and_keeps_escalated_unknown(rig):
+def test_complete_success_classification_proves_stale_and_ceiling_paths(rig):
     store, plan, command, _ = _stale_settlement(rig)
     with closing(store._connect()) as db:
         db.execute("BEGIN")
@@ -1562,8 +1563,51 @@ def test_complete_success_classification_proves_stale_path_and_keeps_escalated_u
     stale = next(result for result in classified.results if isinstance(result, ClassifiedLegacyStaleReviewSuccess))
     assert stale.proof.settlement.outcome.round == plan.round
     assert stale.source == stale.proof.stale_path.registered.command_source
-    assert any("stale settlement receipt is absent" in result.reason for result in classified.unresolved)
+    ceiling = next(result for result in classified.results if isinstance(result, ClassifiedLegacyCeilingReviewSuccess))
+    assert ceiling.proof.decision.refusal is None
+    assert ceiling.proof.storage.outcome.round == ceiling.proof.link.round
+    assert classified.unresolved == ()
     assert len(classified.results) == 2
+
+
+def test_ordered_outcome_replay_includes_accepted_ceiling_and_stale_round(rig):
+    store, plan, _, _ = _stale_settlement(rig)
+
+    replayed = _ordered_replay(store)
+
+    assert isinstance(replayed, ObservedLegacyOrderedCheckpointReplay)
+    productive = [entry for entry in replayed.coverage.episodes[0].rounds
+                  if isinstance(entry, review_activation.FinalizedLegacyProductiveRound)]
+    assert len(productive) == 2
+    assert productive[0].round == plan.round
+
+
+@pytest.mark.parametrize("damage", (
+    "transition", "transition_claim", "observation", "projection", "outbox_identity",
+))
+def test_ceiling_success_requires_independent_gate_sources(rig, damage):
+    store, _, _, _, _, _, _ = accepted_generation_with_open_submission(rig)
+    with store.transaction() as db:
+        if damage == "transition":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-transition' "
+                       "AND payload_json LIKE '%open_gate%'")
+        elif damage == "transition_claim":
+            db.execute("UPDATE dedupe_keys SET claimed_at='invalid' "
+                       "WHERE namespace='workflow-transition' AND payload_json LIKE '%open_gate%'")
+        elif damage == "observation":
+            db.execute("UPDATE workflow_evidence SET payload_json='{}' WHERE kind='observation'")
+        elif damage == "projection":
+            db.execute("UPDATE lifecycle_commands SET payload_digest='changed' WHERE kind='relabel'")
+        else:
+            db.execute("UPDATE lifecycle_commands SET logical_key='changed' WHERE kind='relabel'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observations = _classification_observations(db)
+        classified = classify_complete_legacy_review_successes(db, *observations)
+        db.rollback()
+
+    assert isinstance(classified, CompleteLegacyReviewSuccessClassifications)
+    assert any(isinstance(result, UnresolvedLegacyReviewSuccess) for result in classified.results)
 
 
 def test_complete_success_classification_accounts_many_stale_review_commands(rig):
@@ -1614,7 +1658,9 @@ def test_complete_success_classification_accounts_many_stale_review_commands(rig
     assert {dict(result.source.command_fields)["command_id"] for result in stale} == {
         str(command.command_id) for command in old_commands
     }
-    assert len(classified.unresolved) == 1
+    assert len([result for result in classified.results
+                if isinstance(result, ClassifiedLegacyCeilingReviewSuccess)]) == 1
+    assert classified.unresolved == ()
 
 
 def test_complete_success_classification_keeps_legacy_stale_receipt_unknown(rig):

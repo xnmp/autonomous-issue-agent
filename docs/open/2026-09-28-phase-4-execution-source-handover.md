@@ -176,6 +176,23 @@ with `CLAUDE.md`, `AGENTS.md`, the
   The result is an observation only: no source-backed initial checkpoint or
   origin receipt exists yet, so it cannot certify imported state or activate
   execution.
+- Checkpoint 58 classifies an accepted ceiling escalation through its exact
+  successful effect, registered and sealed productive round, permanent ceiling
+  decision, fresh harness observation, accepted `OPEN_GATE` transition, and
+  durable guarded relabel command. It checks the command's initial dedupe
+  identity and transition claim time. A real historical ceiling plus stale
+  verdict now passes ordered checkpoint replay. Refused ceiling decisions
+  remain unresolved until their prior workflow state has independent source
+  proof. This is still observational; it does not make a ceiling escalation a
+  reviewed baseline or prove remote hold delivery.
+
+The checkpoint-58 full `make test` gate passed: 3,201 domain, 3,089 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-ceiling-productivity-gate.log` (ephemeral). Independent Sol
+review found two source checks missing from the first proof: the relabel
+command's persisted dedupe identity and the accepted transition's claim time.
+Both are now checked and covered by mutation regressions.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -370,7 +387,7 @@ order a durable clock.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Classify successful ceiling submissions and other unresolved historical
+2. Classify refused ceiling decisions and other unresolved historical
    commands, then replay every eligible older-generation outcome against a
    source-backed execution origin/checkpoint to establish resets. Verify
    delivered escalated holds or their current observed state, and resolve or
