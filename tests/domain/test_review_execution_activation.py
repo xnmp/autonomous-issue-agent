@@ -8,7 +8,9 @@ from issue_agent.domain.resolve_activation import LegacyAbsent
 from issue_agent.domain.review_execution_activation import (
     AttributedLegacyReviewDeath, LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunPage,
     LegacyExecutionRunRecord, LegacyReviewRunNoDeath, LegacyReviewRunState, UnattributedLegacyReviewDeath,
-    UnreadableLegacyExecutionRun, classify_legacy_review_death,
+    UnreadableLegacyExecutionRun, classify_legacy_review_death, LEGACY_SUBMISSION_COMMAND_COLUMNS,
+    LEGACY_SUBMISSION_RECEIPT_COLUMNS, LegacyReviewSubmissionPage, LegacyReviewSubmissionSource,
+    UnreadableLegacyReviewSubmission,
 )
 
 
@@ -120,3 +122,40 @@ def test_attributed_variant_cannot_claim_facts_that_disagree_with_its_source():
         AttributedLegacyReviewDeath(source, "other/r", 7, -7)
     with pytest.raises(ValueError, match="source"):
         AttributedLegacyReviewDeath(run_source(dispatch_id=review_dispatch(kind=[])), "o/r", 7, -7)
+
+
+def submission_source(**changes):
+    command = dict.fromkeys(LEGACY_SUBMISSION_COMMAND_COLUMNS, "value")
+    command.update(command_id="command-7", kind="submit_review", repository="o/r", occurrence=0,
+                   attempts=1, refusals=0, expected_revision=None, workflow_binding_json=None,
+                   workflow_reconciliation_json=None, attempt_owner=None, prewrite_read_json=None)
+    command.update(changes)
+    receipt = dict.fromkeys(LEGACY_SUBMISSION_RECEIPT_COLUMNS, "value")
+    receipt.update(command_id="command-7", remote_revision=None, error=None)
+    return LegacyReviewSubmissionSource(7, tuple(command.items()), tuple(receipt.items()))
+
+
+def test_submission_source_digest_covers_command_and_receipt_without_sql_cursor():
+    source = submission_source()
+    assert replace(source, source_rowid=-1).source_digest == source.source_digest
+    changed = tuple((name, "different" if name == "remote_object_id" else value)
+                    for name, value in source.receipt_fields)
+    assert replace(source, receipt_fields=changed).source_digest != source.source_digest
+    assert LegacyReviewSubmissionPage((UnreadableLegacyReviewSubmission(-1, "bad"), source), 7, False).next_rowid == 7
+
+
+@pytest.mark.parametrize("changes", [
+    {"kind": "relabel"}, {"repository": "Other/R"}, {"occurrence": True},
+    {"payload_json": "x" * 65537}, {"command_id": ""},
+])
+def test_submission_source_rejects_invalid_command_fields(changes):
+    with pytest.raises(ValueError):
+        submission_source(**changes)
+
+
+def test_submission_source_requires_exact_fields_and_matching_receipt():
+    source = submission_source()
+    with pytest.raises(ValueError):
+        replace(source, command_fields=source.command_fields[:-1])
+    with pytest.raises(ValueError):
+        replace(source, receipt_fields=(("command_id", "other"), *source.receipt_fields[1:]))

@@ -150,6 +150,102 @@ class LegacyExecutionRunPage:
             raise ValueError("legacy run page cannot continue without a cursor")
 
 
+LEGACY_SUBMISSION_COMMAND_COLUMNS = (
+    "command_id", "idempotency_key", "logical_key", "occurrence", "kind", "target", "expected_revision",
+    "config_version", "repository", "executor_identity", "payload_json", "payload_digest", "state", "attempts",
+    "created_at", "updated_at", "refusals", "workflow_binding_json", "workflow_reconciliation_json",
+    "attempt_owner", "prewrite_read_json",
+)
+LEGACY_SUBMISSION_RECEIPT_COLUMNS = (
+    "command_id", "executor_identity", "started_at", "completed_at", "status", "remote_object_id",
+    "remote_revision", "error", "receipt_digest",
+)
+_SUBMISSION_INTEGERS = frozenset({"occurrence", "attempts", "refusals"})
+_SUBMISSION_OPTIONAL_TEXT = frozenset({
+    "expected_revision", "workflow_binding_json", "workflow_reconciliation_json", "attempt_owner",
+    "prewrite_read_json", "remote_object_id", "remote_revision", "error",
+})
+
+
+def _submission_fields(
+    fields: tuple[tuple[str, str | int | None], ...], names: tuple[str, ...],
+) -> None:
+    if not isinstance(fields, tuple) or tuple(name for name, _ in fields) != names:
+        raise ValueError("submission source has the wrong fields or order")
+    for name, value in fields:
+        if name in _SUBMISSION_INTEGERS:
+            if type(value) is not int or value < 0 or value > MAX_SQL_ROWID:
+                raise ValueError(f"submission {name} must be a nonnegative SQL integer")
+        elif value is None:
+            if name not in _SUBMISSION_OPTIONAL_TEXT:
+                raise ValueError(f"submission {name} cannot be absent")
+        elif not isinstance(value, str) or len(value.encode("utf-8", "surrogatepass")) > MAX_LEGACY_SQL_TEXT_BYTES:
+            raise ValueError(f"submission {name} must be bounded text")
+
+
+@dataclass(frozen=True)
+class LegacyReviewSubmissionSource:
+    """Exact raw command and optional effect receipt for an offline review import."""
+
+    source_rowid: int
+    command_fields: tuple[tuple[str, str | int | None], ...]
+    receipt_fields: tuple[tuple[str, str | int | None], ...] | None
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "submission source cursor")
+        _submission_fields(self.command_fields, LEGACY_SUBMISSION_COMMAND_COLUMNS)
+        command = dict(self.command_fields)
+        if (command["kind"] != "submit_review" or not isinstance(command["command_id"], str)
+                or not command["command_id"] or not isinstance(command["repository"], str)
+                or canonical_workflow_repository(command["repository"]) != command["repository"]):
+            raise ValueError("submission source requires a canonical review command")
+        if self.receipt_fields is not None:
+            _submission_fields(self.receipt_fields, LEGACY_SUBMISSION_RECEIPT_COLUMNS)
+            if dict(self.receipt_fields)["command_id"] != command["command_id"]:
+                raise ValueError("submission receipt belongs to another command")
+
+    @property
+    def source_digest(self) -> str:
+        payload = {"command": self.command_fields, "receipt": self.receipt_fields}
+        return hashlib.sha256(json.dumps(payload, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnreadableLegacyReviewSubmission:
+    source_rowid: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "unreadable submission cursor")
+        validate_workflow_text(self.reason, "unreadable submission reason")
+
+
+LegacyReviewSubmissionEntry = LegacyReviewSubmissionSource | UnreadableLegacyReviewSubmission
+
+
+@dataclass(frozen=True)
+class LegacyReviewSubmissionPage:
+    entries: tuple[LegacyReviewSubmissionEntry, ...]
+    next_rowid: int | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple) or any(
+            not isinstance(entry, (LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission))
+            for entry in self.entries
+        ):
+            raise ValueError("submission page requires typed source entries")
+        if self.next_rowid is not None:
+            _rowid(self.next_rowid, "submission page cursor")
+        if type(self.has_more) is not bool:
+            raise ValueError("submission page continuation must be boolean")
+        rowids = [entry.source_rowid for entry in self.entries]
+        if rowids != sorted(set(rowids)) or (rowids and rowids[-1] != self.next_rowid):
+            raise ValueError("submission page must advance through unique rowids")
+        if self.has_more and not rowids:
+            raise ValueError("submission page cannot continue without a cursor")
+
+
 @dataclass(frozen=True)
 class LegacyReviewRunNoDeath:
     source: LegacyExecutionRunRecord

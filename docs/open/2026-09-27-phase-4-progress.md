@@ -896,3 +896,22 @@ found no remaining medium or high classifier defect. Full `make test` passed:
 parity, four import contracts and both Pyrefly checks. Ten accepted strict
 xfails remained expected. Log: `/tmp/phase4-review-death-classifier-gate.log`
 (ephemeral).
+
+## Checkpoint 33 — paged review submission command and effect sources (offline)
+
+The execution activation reader now scans canonical repository
+`submit_review` lifecycle commands and their optional effect receipts in
+bounded pages under an explicit SQL transaction. Typed source records retain
+all current columns and a digest independent of the SQLite cursor. The first
+page includes negative and zero rowids; malformed, invalid UTF-8 and
+oversized fields become explicit unreadable records. Missing receipts stay
+absent. This inventory does not equate command completion with a productive
+review. Round submission indices and remote verdict hold provenance remain
+separate required evidence before a reset can be imported.
+
+Focused behavior tests and Pyrefly passed. Independent Sol review found no
+medium or high issue in this bounded source reader. Execution authority
+remains inactive. Full `make test` passed: 3,183 domain, 2,852 adapter and
+2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten accepted strict xfails remained expected. Log:
+`/tmp/phase4-submission-source-gate.log` (ephemeral).

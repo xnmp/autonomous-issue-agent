@@ -6,14 +6,15 @@ import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.review_execution_activation import (
-    MAX_RUN_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state, read_legacy_review_run_page,
+    MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
+    read_legacy_review_run_page, read_legacy_review_submission_page,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
 from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
-    UnreadableLegacyExecutionRun,
+    UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
 )
 
 
@@ -224,3 +225,86 @@ def test_run_scan_includes_explicit_negative_and_zero_sqlite_rowids(tmp_path):
 
     assert [entry.source_rowid for entry in first.entries] == [-7, 0, 3]
     assert [entry.source_rowid for entry in after_negative.entries] == [0, 3]
+
+
+def _submission(db, number, *, repository="o/r", kind="submit_review", receipt=True, rowid=None):
+    db.execute(
+        "INSERT INTO lifecycle_commands(rowid,command_id,idempotency_key,logical_key,kind,target,config_version,"
+        "repository,executor_identity,payload_json,payload_digest,state,created_at,updated_at) "
+        "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+        (rowid, f"cmd-{number}", f"idem-{number}", f"review:{number}", kind, f"pr:{number}", "cfg",
+         repository, OWNER, "{}", "a" * 64, "succeeded", "created", "updated"),
+    )
+    if receipt:
+        db.execute(
+            "INSERT INTO effect_receipts(command_id,executor_identity,started_at,completed_at,status,"
+            "remote_object_id,receipt_digest) VALUES (?,?,?,?,?,?,?)",
+            (f"cmd-{number}", OWNER, "started", "completed", "succeeded", f"review-{number}", "b" * 64),
+        )
+
+
+def test_submission_scan_keeps_command_and_effect_receipt_or_explicit_absence(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission(db, 7)
+        _submission(db, 8, receipt=False)
+        _submission(db, 9, repository="other/r")
+        _submission(db, 10, kind="relabel")
+        db.execute("BEGIN")
+        before = db.total_changes
+        page = read_legacy_review_submission_page(db, "o/r")
+        assert db.total_changes == before
+        db.rollback()
+
+    assert not page.has_more
+    assert [dict(entry.command_fields)["command_id"] for entry in page.entries] == ["cmd-7", "cmd-8"]
+    assert isinstance(page.entries[0], LegacyReviewSubmissionSource)
+    assert dict(page.entries[0].receipt_fields)["remote_object_id"] == "review-7"
+    assert page.entries[1].receipt_fields is None
+
+
+def test_submission_scan_pages_negative_and_zero_rowids(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission(db, 1, rowid=-3)
+        _submission(db, 2, rowid=0)
+        for number in range(3, MAX_SUBMISSION_SOURCE_PAGE + 4):
+            _submission(db, number)
+        db.execute("BEGIN")
+        first = read_legacy_review_submission_page(db, "o/r")
+        second = read_legacy_review_submission_page(db, "o/r", after_rowid=first.next_rowid)
+        db.rollback()
+
+    assert first.entries[0].source_rowid == -3 and first.entries[1].source_rowid == 0
+    assert len(first.entries) == MAX_SUBMISSION_SOURCE_PAGE and first.has_more
+    assert len(second.entries) == 3 and not second.has_more
+
+
+def test_submission_scan_marks_oversized_or_invalid_utf8_as_unreadable(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission(db, 1)
+        _submission(db, 2)
+        _submission(db, 3)
+        db.execute("UPDATE lifecycle_commands SET payload_json=? WHERE command_id='cmd-1'", ("x" * 65537,))
+        db.execute("UPDATE effect_receipts SET error=CAST(x'ff' AS TEXT) WHERE command_id='cmd-2'")
+        db.execute("UPDATE lifecycle_commands SET payload_json='malformed JSON stays raw' WHERE command_id='cmd-3'")
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_page(db, "o/r")
+        db.rollback()
+
+    assert isinstance(page.entries[0], UnreadableLegacyReviewSubmission)
+    assert isinstance(page.entries[1], UnreadableLegacyReviewSubmission)
+    assert isinstance(page.entries[2], LegacyReviewSubmissionSource)
+    assert dict(page.entries[2].command_fields)["payload_json"] == "malformed JSON stays raw"
+
+
+def test_submission_scan_requires_explicit_snapshot_and_canonical_scope(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        with pytest.raises(ValueError, match="transaction"):
+            read_legacy_review_submission_page(db, "o/r")
+        db.execute("BEGIN")
+        with pytest.raises(ValueError, match="repository"):
+            read_legacy_review_submission_page(db, "Other/R")
+        db.rollback()

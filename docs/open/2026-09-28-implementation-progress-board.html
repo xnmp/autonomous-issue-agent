@@ -1,0 +1,125 @@
+<!doctype html>
+<!-- Phase acceptance and the linked plan determine the count. Record checkpoint changes in History. -->
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Six-phase plan · Progress</title>
+  <style>
+    :root { font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color-scheme: light dark; --bg:#f5f7f8; --card:#fff; --ink:#18313c; --muted:#526873; --line:#d2dce0; --todo:#6b7e88; --doing:#176383; --done:#207052; }
+    @media (prefers-color-scheme: dark) { :root { --bg:#101e25; --card:#192e38; --ink:#e7f1f3; --muted:#b5c8ce; --line:#38535e; --todo:#b8cbd1; --doing:#8fcfe8; --done:#9dddb8; } }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); line-height:1.45; }
+    main { max-width:1200px; margin:auto; padding:clamp(1rem,3vw,2.5rem); }
+    header { border-bottom:1px solid var(--line); padding-bottom:1.5rem; }
+    .eyebrow { margin:0 0 .4rem; color:var(--muted); font:700 .73rem ui-monospace, SFMono-Regular, Consolas, monospace; text-transform:uppercase; letter-spacing:.07em; }
+    h1 { margin:0; font-size:clamp(1.8rem,4vw,2.7rem); letter-spacing:-.04em; line-height:1.1; }
+    .meta { color:var(--muted); font-size:.83rem; margin:.65rem 0 1.3rem; }
+    .progress-label { display:flex; justify-content:space-between; gap:1rem; font-size:.88rem; font-weight:700; }
+    progress { width:100%; height:1rem; margin-top:.45rem; accent-color:var(--done); }
+    .progress-note { margin:.25rem 0 0; color:var(--muted); font-size:.76rem; }
+    .tabs { display:flex; gap:.4rem; margin-top:1.4rem; border-bottom:1px solid var(--line); }
+    .tabs button { cursor:pointer; border:1px solid transparent; border-radius:.45rem .45rem 0 0; padding:.55rem .9rem; background:transparent; color:var(--muted); font:inherit; font-weight:700; }
+    .tabs button[aria-selected="true"] { border-color:var(--line); border-bottom-color:var(--card); background:var(--card); color:var(--ink); }
+    .board { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:1rem; margin-top:1.5rem; align-items:start; }
+    .column { background:var(--card); border:1px solid var(--line); border-radius:.55rem; min-width:0; overflow:hidden; }
+    .column h2 { display:flex; align-items:center; gap:.55rem; margin:0; padding:.9rem 1rem; border-bottom:1px solid var(--line); font-size:1rem; }
+    .dot { width:.65rem; height:.65rem; border-radius:50%; background:var(--todo); flex:none; }
+    .doing .dot { background:var(--doing); }
+    .done .dot { background:var(--done); }
+    ol { list-style:none; margin:0; padding:0; }
+    li { padding:.85rem 1rem; border-bottom:1px solid var(--line); }
+    li:last-child { border-bottom:0; }
+    li strong { display:block; font-size:.9rem; line-height:1.3; }
+    li p { margin:.3rem 0 0; color:var(--muted); font-size:.8rem; }
+    li a { color:var(--doing); text-underline-offset:.15em; }
+    .done li a { color:var(--done); }
+    .history { max-width:48rem; margin-top:1.5rem; background:var(--card); border:1px solid var(--line); border-radius:.55rem; }
+    .history h2 { margin:0; padding:.9rem 1rem; border-bottom:1px solid var(--line); font-size:1rem; }
+    .history time { display:block; color:var(--muted); font-size:.78rem; }
+    footer { margin-top:1.25rem; color:var(--muted); font-size:.78rem; }
+    footer a { color:var(--doing); }
+    :focus-visible { outline:3px solid #e8a72c; outline-offset:3px; }
+    @media (max-width:800px) { .board { grid-template-columns:1fr; } }
+  </style>
+</head>
+<body>
+  <main>
+    <header>
+      <p class="eyebrow">Autonomous issue agent</p>
+      <h1>Six-phase plan</h1>
+      <p class="meta">Updated 28 Sep 2026, 10:38 AEST · Latest accepted checkpoint: phase 4 submission source inventory</p>
+      <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
+      <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
+      <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
+    </header>
+
+    <div class="tabs" role="tablist" aria-label="Progress views">
+      <button id="board-tab" role="tab" type="button" aria-controls="board-panel" aria-selected="true" tabindex="0">Board</button>
+      <button id="history-tab" role="tab" type="button" aria-controls="history-panel" aria-selected="false" tabindex="-1">History</button>
+    </div>
+
+    <section id="board-panel" role="tabpanel" aria-labelledby="board-tab">
+    <div class="board">
+      <section class="column todo" aria-labelledby="todo-title">
+        <h2 id="todo-title"><span class="dot" aria-hidden="true"></span>To do</h2>
+        <ol>
+          <li><strong>Phase 5 · Measurement</strong><p>Incident records, comparable cohorts, intervention replay, then authorized live windows.</p></li>
+          <li><strong>Phase 6 · Policy and closeout</strong><p>Gate consolidation, revision-bound tests, and final requirement audit.</p></li>
+        </ol>
+      </section>
+
+      <section class="column doing" aria-labelledby="doing-title">
+        <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
+        <ol>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Review file, owner run, death and submission command/effect sources accepted offline. Next: submission indices, verdict holds, owner lineage and issue mapping, then source-backed origin and compaction. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+        </ol>
+      </section>
+
+      <section class="column done" aria-labelledby="done-title">
+        <h2 id="done-title"><span class="dot" aria-hidden="true"></span>Done</h2>
+        <ol>
+          <li><strong>Phase 1 · Correctness</strong><p>Accepted.</p></li>
+          <li><strong>Phase 2 · Composed recovery</strong><p>Accepted.</p></li>
+          <li><strong>Phase 3 · Generation-fenced gates</strong><p>Accepted at <code>a7214bf</code>.</p></li>
+        </ol>
+      </section>
+    </div>
+    </section>
+
+    <section id="history-panel" role="tabpanel" aria-labelledby="history-tab" hidden>
+      <div class="history">
+        <h2>Work history</h2>
+        <ol>
+          <li><time datetime="2026-09-28T09:51:00+10:00">28 Sep 2026, 09:51 AEST</time><strong>Baseline · 3 of 6 accepted</strong><p>The existing board showed checkpoint <code>1432acb</code>, although <code>d04070b</code> had already been accepted. No previous work interval is available.</p></li>
+          <li><time datetime="2026-09-28T10:19:00+10:00">28 Sep 2026, 10:19 AEST</time><strong>Phase 4 sources advanced · 3 of 6 accepted</strong><p>Corrected the stale checkpoint and recorded file inventory <code>d04070b</code>, SQL run inventory <code>97668c4</code>, and death attribution <code>ccbbf00</code>. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-28T10:38:00+10:00">28 Sep 2026, 10:38 AEST</time><strong>Submission source inventory accepted offline · 3 of 6 accepted</strong><p>Bounded SQL command/effect paging, malformed-source evidence, focused tests, independent Sol review and the full repository gate passed. Active work since the previous entry: Not recorded.</p></li>
+        </ol>
+      </div>
+    </section>
+
+    <footer>Details: <a href="2026-09-27-phase-4-progress.md">phase 4 progress</a> · <a href="2026-09-14-architecture-implementation.md">six-phase plan</a>.</footer>
+  </main>
+  <script>
+    const tabs = [...document.querySelectorAll('[role="tab"]')];
+    function selectTab(selected, focus = false) {
+      for (const tab of tabs) {
+        const active = tab === selected;
+        tab.setAttribute('aria-selected', String(active));
+        tab.tabIndex = active ? 0 : -1;
+        document.getElementById(tab.getAttribute('aria-controls')).hidden = !active;
+      }
+      if (focus) selected.focus();
+    }
+    tabs.forEach((tab, index) => {
+      tab.addEventListener('click', () => selectTab(tab));
+      tab.addEventListener('keydown', (event) => {
+        const move = {ArrowRight: 1, ArrowLeft: -1, Home: -index, End: tabs.length - 1 - index}[event.key];
+        if (move === undefined) return;
+        event.preventDefault();
+        selectTab(tabs[(index + move + tabs.length) % tabs.length], true);
+      });
+    });
+  </script>
+</body>
+</html>
