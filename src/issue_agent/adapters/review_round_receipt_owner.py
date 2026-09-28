@@ -10,14 +10,22 @@ from ..domain.review_receipt_attribution import (
     BoundReviewRoundReceipt, CommandReviewRoundReceipt, NamedReviewRoundReceipt,
     ReviewRoundReceiptNamespace,
 )
-from ..domain.review_rounds import ReviewRoundPlan
-from .review_execution_activation import _printable, _read_recording_source
+from ..domain.review_rounds import (
+    ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen,
+    ReviewPlanningSealed,
+    ReviewRoundPlan, ReviewSealedParentAbandoned,
+)
+from .review_execution_activation import (
+    _printable, _read_recording_source, read_checkpoint_round_row_source,
+)
 from .review_round_receipt_sweep import (
     ClassifiedReviewRoundReceiptSweepSource, ReviewRoundReceiptSweepCursor,
     _classify_source_payload, read_classified_checkpoint_round_receipt_members,
 )
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError
+from .workflow_rows import (
+    WorkflowAuthorityError, review_stage_receipt_key, review_submission_receipt_key,
+)
 
 
 @dataclass(frozen=True)
@@ -47,6 +55,29 @@ class MatchedReviewRoundReceiptOwner:
             or any(char not in "0123456789abcdef" for char in self.registration_source_sha256)
         ):
             raise ValueError("matched receipt owner requires a registration source digest")
+
+
+@dataclass(frozen=True)
+class PendingOpenReviewRoundReceiptOwner:
+    source: ClassifiedReviewRoundReceiptSweepSource
+    round: ReviewRoundIdentity
+    round_source_sha256: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, ClassifiedReviewRoundReceiptSweepSource)
+                or not isinstance(self.round, ReviewRoundIdentity)
+                or self.round.binding.rejection.fence.key.repository
+                != self.source.source.cursor.scope
+                or isinstance(self.source.reference, BoundReviewRoundReceipt)
+                and self.source.reference.round != self.round
+                or isinstance(self.source.reference, NamedReviewRoundReceipt)
+                and self.source.reference.round_id != self.round.round_id
+                or isinstance(self.source.reference, CommandReviewRoundReceipt)
+                or not isinstance(self.round_source_sha256, str)
+                or len(self.round_source_sha256) != 64
+                or any(char not in "0123456789abcdef"
+                       for char in self.round_source_sha256)):
+            raise ValueError("pending open receipt requires its source and round")
 
 
 @dataclass(frozen=True)
@@ -107,10 +138,42 @@ def _registered_round(
     return reference.round, digest
 
 
+def _open_receipt_is_planned(
+    source: ClassifiedReviewRoundReceiptSweepSource,
+    plan: ReviewRoundPlan,
+    planning: ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+) -> bool:
+    cursor = source.source.cursor
+    namespace = ReviewRoundReceiptNamespace(cursor.namespace)
+    if namespace is ReviewRoundReceiptNamespace.PREFLIGHT:
+        return cursor.key == plan.round.round_id
+    if namespace is ReviewRoundReceiptNamespace.STAGE:
+        return cursor.key in {
+            review_stage_receipt_key(plan.round.round_id, stage.stage_id)
+            for stage in plan.stages
+        }
+    if namespace is ReviewRoundReceiptNamespace.SUBMISSION:
+        return cursor.key in {item.command_id for item in plan.submissions}
+    if namespace is ReviewRoundReceiptNamespace.SUBMISSION_INDEX:
+        return cursor.key in {
+            review_submission_receipt_key(plan.round.round_id, item.command_id)
+            for item in plan.submissions
+        }
+    if namespace is ReviewRoundReceiptNamespace.SEAL:
+        completed = (planning.completed_seal if isinstance(
+            planning, ReviewSealedParentAbandoned) else planning)
+        return (cursor.key == plan.round.round_id
+                and isinstance(completed, ReviewPlanningSealed)
+                and isinstance(completed.conclusion, ReviewPlanningComplete))
+    if namespace is ReviewRoundReceiptNamespace.ABANDONMENT:
+        return cursor.key == plan.round.round_id and isinstance(planning, ReviewParentAbandoned)
+    return False
+
+
 def reconcile_review_round_receipt_owner(
     db: sqlite3.Connection, source: ClassifiedReviewRoundReceiptSweepSource,
-) -> MatchedReviewRoundReceiptOwner | BlockedReviewRoundReceiptOwner:
-    """Join one classified source to its exact finalized round receipt member.
+) -> MatchedReviewRoundReceiptOwner | PendingOpenReviewRoundReceiptOwner | BlockedReviewRoundReceiptOwner:
+    """Join one source to a finalized member or retain explicit open uncertainty.
 
     The result is observational; command effects, claim authority, checkpoint
     ancestry and complete namespace coverage require independent proof.
@@ -132,6 +195,23 @@ def reconcile_review_round_receipt_owner(
             )
         else:
             raise ValueError("receipt has an unknown round reference")
+        row = read_checkpoint_round_row_source(db, round_id)
+        values = dict(row.fields)
+        if values["closure_json"] is None and values["outcome_json"] is None:
+            plan = decode_workflow(values["plan_json"], ReviewRoundPlan)
+            planning = decode_workflow(
+                values["planning_json"],
+                ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+            )
+            if (encode_workflow(planning) != values["planning_json"]
+                    or not _open_receipt_is_planned(source, plan, planning)):
+                raise ValueError("open round does not plan this receipt")
+            _, current_digest = _read_recording_source(
+                db, cursor.namespace, cursor.scope, cursor.key,
+            )
+            if current_digest != source.source.source_sha256:
+                raise ValueError("open round receipt changed after its sweep")
+            return PendingOpenReviewRoundReceiptOwner(source, round_id, row.source_digest)
         members = read_classified_checkpoint_round_receipt_members(db, round_id)
         exact = next((item for item in members.receipts
                       if (item.member.namespace, item.member.key)
