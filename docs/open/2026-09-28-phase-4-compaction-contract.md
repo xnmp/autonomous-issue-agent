@@ -196,6 +196,16 @@ A complete durable pass must reconcile its episode sources with the expected
 checkpoint chain, repeat from the origin after completion, and record
 discrepancies before it can gate admission.
 
+The current read-only round audit stores a bounded page cursor and fixed
+repository rowid edge in `level_state`. It compares the number of episode
+rows with the allocated sequence frontier and XORs SHA-256 members over each
+row's sequence, round identity and full source digest. A completed pass keeps
+the previous frontier and membership as a baseline; the next pass compares
+that prefix while also seeing newly allocated rows. Missing, changed and
+malformed rows persist a blocked state. This census does not yet join expected
+checkpoint entries or the round receipt namespace. It cannot authorize
+compaction or admission.
+
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money
 settlement and evidence-preserving recovery remain allowed so a hold cannot

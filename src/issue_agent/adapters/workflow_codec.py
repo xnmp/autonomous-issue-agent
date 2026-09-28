@@ -17,6 +17,7 @@ from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
 from ..domain import review_execution as rx
 from ..domain import review_rounds as rr
+from ..domain import review_round_archive as round_archive
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
@@ -98,6 +99,11 @@ _VALUES = (
     rx.CompletedReviewGenerationArchiveScan, rx.ReviewGenerationArchiveSweep,
     rx.CompletedReviewGenerationArchiveAudit,
     rx.BlockedReviewGenerationArchiveScan, rx.BlockedReviewGenerationArchiveSweep,
+    round_archive.ReviewRoundArchiveFingerprint,
+    round_archive.ReviewRoundArchiveBaseline,
+    round_archive.ReviewRoundArchiveScan,
+    round_archive.CompletedReviewRoundArchiveScan,
+    round_archive.BlockedReviewRoundArchiveScan,
     rx.ReviewExecutionCheckpoint, rx.ReviewExecutionCompactionRoundSource,
     rx.ReviewExecutionCheckpointReceipt,
     rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,

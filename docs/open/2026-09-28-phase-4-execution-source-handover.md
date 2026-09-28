@@ -518,6 +518,18 @@ grows; its guardrail is refusal on rekeyed or malformed rows. The indexed
 query plan is checked now, and a history-size latency comparison belongs in
 the complete audit benchmark.
 
+- Checkpoint 88 adds a durable, observational round archive census. One
+  transaction reads one bounded repository sweep page and persists its fixed
+  rowid frontier, cursor, expected sequence count and source membership in
+  `level_state`. An empty final page detects a deleted tail. Completed passes
+  retain a prior-prefix membership digest, so a scheduled pass or frontier
+  growth detects a changed earlier source. Origin source drift, malformed
+  rows and missing rows persist a blocked state. A Sol adversarial review
+  found no correctness defect within this observational scope. The census
+  does not match rows to checkpoint ancestry, verify retired receipt payloads
+  or grant compaction and admission authority. Full-gate results are recorded
+  in the progress board after acceptance.
+
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
 ordered source digests, and publish the aggregate and checkpoint atomically.
@@ -525,10 +537,9 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoint 87, a bounded indexed page can inspect repository round rows
-outside expected sequence lookups. Next, persist and reconcile a complete
-round sweep against checkpoint ancestry and expected source digests, including
-rows inserted or changed behind a prior cursor. A separate receipt-namespace
+With checkpoint 88, a durable cursor completes the bounded round sweep and
+compares each pass with its prior source set. Next, reconcile its members
+against checkpoint ancestry and expected source digests. A separate receipt-namespace
 pass must find unclaimed receipts. Before a writer can use the checkpoint-86
 proposal, establish a true cumulative read bound around canonical load and
 each source reader; prove generation-only and later-checkpoint paths; verify
