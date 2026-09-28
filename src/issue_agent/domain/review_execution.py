@@ -1075,17 +1075,26 @@ def advance_review_execution_generation(
         execution.binding, rejection=replace(execution.binding.rejection, fence=to_revision.fence),
     )
     after = carry_review_execution_generation(execution.state, next_binding, execution.last_sequence)
-    identity = (
-        f"{from_revision.fence.key.repository}:{from_revision.fence.key.target.number}:"
-        f"{execution.binding.execution_epoch}:{execution.binding.execution_episode}:"
-        f"{to_revision.fence.generation}"
-    )
-    receipt_id = "review-generation:" + hashlib.sha256(identity.encode()).hexdigest()
+    receipt_id = review_generation_receipt_id(execution.binding, to_revision.fence.generation)
     boundary = ReviewExecutionGenerationBoundary(
         execution.state, after, execution.last_sequence, applied_sequences,
         receipt_id, from_revision, to_revision, mutation,
     )
     return replace(execution, state=after, boundaries=execution.boundaries + (boundary,))
+
+
+def review_generation_receipt_id(binding: ReviewExecutionBinding, to_generation: int) -> str:
+    """Derive an episode's accepted generation source identity for indexed audit reads."""
+    if (not isinstance(binding, ReviewExecutionBinding)
+            or not isinstance(binding.rejection.fence.key.target, PullRequestRef)):
+        raise ValueError("review generation source requires a review execution PR binding")
+    integer(to_generation, "review generation source generation", minimum=1)
+    key = binding.rejection.fence.key
+    identity = (
+        f"{key.repository}:{key.target.number}:"
+        f"{binding.execution_epoch}:{binding.execution_episode}:{to_generation}"
+    )
+    return "review-generation:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
 def plan_review_execution_compaction(

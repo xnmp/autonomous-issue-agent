@@ -66,7 +66,7 @@ from ..domain.review_execution import (
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
     ReviewExecutionAcceptedTransitionSource, matches_accepted_review_transition_source,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
-    review_generation_chain_digest, same_execution_episode,
+    review_generation_chain_digest, review_generation_receipt_id, same_execution_episode,
 )
 from ..domain.review_execution_session_import import (
     BlockedLegacyReviewSessionImport, UnprovenLegacyReviewSession, plan_legacy_review_session_import,
@@ -2664,13 +2664,9 @@ class MatchedLegacyReviewGenerationBoundarySources:
         key = self.boundary.from_revision.fence.key
         if not isinstance(key.target, PullRequestRef):
             raise ValueError("generation boundary requires a review PR")
-        identity = (
-            f"{key.repository}:{key.target.number}:"
-            f"{self.boundary.before.binding.execution_epoch}:"
-            f"{self.boundary.before.binding.execution_episode}:"
-            f"{self.boundary.to_revision.fence.generation}"
+        derived_id = review_generation_receipt_id(
+            self.boundary.before.binding, self.boundary.to_revision.fence.generation,
         )
-        derived_id = "review-generation:" + hashlib.sha256(identity.encode()).hexdigest()
         if (self.boundary.receipt_id != derived_id
                 or self.boundary.from_revision.fence.key != self.boundary.to_revision.fence.key
                 or key.repository != self.complete_receipts.repository):
@@ -2821,6 +2817,137 @@ def match_legacy_review_generation_boundary_sources(
         )
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, WorkflowAuthorityError) as exc:
         return UnmatchedLegacyReviewGenerationBoundarySources(receipt_id, _printable(str(exc)))
+
+
+MAX_GENERATION_ARCHIVE_PAGE = 16
+MAX_GENERATION_ARCHIVE_PAGE_BYTES = 2**23
+
+
+@dataclass(frozen=True)
+class ObservedReviewGenerationArchiveSource:
+    """One retained generation source pair; semantic archival audit is separate."""
+
+    generation: int
+    boundary: ReviewExecutionGenerationBoundary
+    accepted_namespace: str
+    accepted_key: str
+    receipt_digest: str
+    accepted_digest: str
+
+    def __post_init__(self) -> None:
+        if (type(self.generation) is not int or self.generation < 1
+                or not isinstance(self.boundary, ReviewExecutionGenerationBoundary)
+                or self.boundary.to_revision.fence.generation != self.generation
+                or self.accepted_namespace not in {"workflow-request", "workflow-transition"}
+                or not isinstance(self.accepted_key, str) or not self.accepted_key):
+            raise ValueError("archived generation source has an invalid identity")
+        for digest in (self.receipt_digest, self.accepted_digest):
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValueError("archived generation source requires SHA-256 source digests")
+
+
+@dataclass(frozen=True)
+class ObservedReviewGenerationArchivePage:
+    """A bounded page in expected generation order, without a lifetime scan."""
+
+    sources: tuple[ObservedReviewGenerationArchiveSource, ...]
+    next_generation: int
+    has_more: bool
+
+
+@dataclass(frozen=True)
+class BlockedReviewGenerationArchivePage:
+    generation: int
+    reason: str
+
+
+def _recording_source_size(
+    db: sqlite3.Connection, namespace: str, repository: str, key: str,
+) -> int | None:
+    columns = "+".join(
+        f"ifnull(length(CAST({column} AS BLOB)),0)" for column in _DEDUPE_SOURCE_COLUMNS
+    )
+    row = db.execute(
+        f"SELECT {columns} AS source_bytes FROM dedupe_keys "
+        "WHERE namespace=? AND scope=? AND key=?",
+        (namespace, repository, key),
+    ).fetchone()
+    return row["source_bytes"] if row is not None else None
+
+
+def read_review_generation_archive_page(
+    db: sqlite3.Connection, binding: ReviewExecutionBinding,
+    first_generation: int, through_generation: int,
+    *, limit: int = MAX_GENERATION_ARCHIVE_PAGE,
+) -> ObservedReviewGenerationArchivePage | BlockedReviewGenerationArchivePage:
+    """Observe expected retained source pairs by deterministic generation ID.
+
+    This does not prove a checkpoint, classify the accepted transition, or
+    detect unclaimed rows; the durable archive audit must do those separately.
+    """
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("generation archive page requires an explicit SQL transaction")
+    if (not isinstance(binding, ReviewExecutionBinding)
+            or type(first_generation) is not int or type(through_generation) is not int
+            or not 1 <= first_generation <= through_generation <= MAX_SQL_ROWID
+            or type(limit) is not int or not 1 <= limit <= MAX_GENERATION_ARCHIVE_PAGE):
+        raise ValueError("generation archive page requires a bounded episode range")
+    repository = binding.rejection.fence.key.repository
+    sources: list[ObservedReviewGenerationArchiveSource] = []
+    bytes_read = 0
+    stop = min(through_generation + 1, first_generation + limit)
+    for generation in range(first_generation, stop):
+        try:
+            receipt_id = review_generation_receipt_id(binding, generation)
+            receipt_size = _recording_source_size(db, "review-execution-generation", repository, receipt_id)
+            if receipt_size is None:
+                raise ValueError("generation receipt is absent")
+            if bytes_read + receipt_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES:
+                if sources:
+                    break
+                raise ValueError("generation receipt exceeds the archive page byte bound")
+            receipt_fields, receipt_digest = _read_recording_source(
+                db, "review-execution-generation", repository, receipt_id,
+            )
+            receipt = dict(receipt_fields)
+            boundary, namespace, key, captured = _generation_receipt_parts(receipt["payload_json"])
+            if (receipt["reusable_after"] is not None or boundary.receipt_id != receipt_id
+                    or boundary.to_revision.fence.generation != generation
+                    or not same_execution_episode(binding, boundary.before.binding)
+                    or namespace not in {"workflow-request", "workflow-transition"}):
+                raise ValueError("generation receipt disagrees with its expected episode")
+            accepted_size = _recording_source_size(db, namespace, repository, key)
+            if accepted_size is None:
+                raise ValueError("accepted generation transition is absent")
+            if bytes_read + receipt_size + accepted_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES:
+                if sources:
+                    break
+                raise ValueError("generation source pair exceeds the archive page byte bound")
+            accepted_fields, accepted_digest = _read_recording_source(db, namespace, repository, key)
+            accepted = dict(accepted_fields)
+            if (accepted["reusable_after"] is not None
+                    or not matches_accepted_review_transition_source(
+                        captured, boundary, namespace, key, accepted["payload_json"],
+                    )):
+                raise ValueError("generation receipt lost its accepted transition")
+            source_bytes = sum(
+                len(value.encode("utf-8", "surrogatepass"))
+                for _, value in (*receipt_fields, *accepted_fields) if value is not None
+            )
+            if source_bytes != receipt_size + accepted_size:
+                raise ValueError("generation source pair changed during its bounded read")
+            sources.append(ObservedReviewGenerationArchiveSource(
+                generation, boundary, namespace, key, receipt_digest, accepted_digest,
+            ))
+            bytes_read += source_bytes
+        except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+                sqlite3.Error, WorkflowAuthorityError) as exc:
+            return BlockedReviewGenerationArchivePage(generation, _printable(str(exc)))
+    next_generation = first_generation + len(sources)
+    return ObservedReviewGenerationArchivePage(
+        tuple(sources), next_generation, next_generation <= through_generation,
+    )
 
 
 @dataclass(frozen=True)

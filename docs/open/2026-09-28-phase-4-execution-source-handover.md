@@ -326,6 +326,25 @@ with `CLAUDE.md`, `AGENTS.md`, the
   settlement remains available. Open-prefix byte exhaustion must refuse an
   advance before writing any partial receipt. This is a reviewed contract,
   not a production writer or bounded hot read.
+- Checkpoint 74 derives a generation receipt's deterministic ID from its
+  execution episode and destination generation, and reads expected retained
+  receipt/accepted-transition pairs in pages of at most 16 and 8 MiB of
+  source fields. A missing, changed, malformed or foreign-episode source
+  blocks the page; older full-payload receipts remain observable. The page
+  preflights row sizes before decoding and never changes SQL. It is only a
+  source observation: it does not prove checkpoint ancestry, accepted
+  transition semantics, chronology or absence of unclaimed rows. The future
+  archive audit must add those checks and a durable cursor before it can gate
+  execution authority.
+
+Independent Sol review of checkpoint 74 caught the original post-decode byte
+cap and missing malformed/foreign edge coverage. Size preflight and regressions
+now cover both; its final pass found no remaining medium or high issue in this
+observational slice. The full `make test` gate passed: 3,275 domain, 3,191
+adapter and 2,876 app tests, plus hooks, governor, gate parity, four import
+contracts and both Pyrefly checks. Ten strict xfails remained expected. The
+log is `/tmp/phase4-generation-archive-page-gate.log` (ephemeral). No live
+service or workflow family was activated.
 
 Independent Sol review of design checkpoint 73 identified an unsafe initial
 rollout order, an omitted open-prefix codec refusal and an incomplete authority

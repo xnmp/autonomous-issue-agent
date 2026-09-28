@@ -22,7 +22,7 @@ from issue_agent.domain.review_execution import (
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
     SetDisplayedRound, advance_review_execution_generation, carry_review_execution_generation,
     compatible_review_session, matches_accepted_review_transition_source,
-    review_generation_chain_digest,
+    review_generation_chain_digest, review_generation_receipt_id,
     plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
@@ -292,6 +292,24 @@ def test_generation_transition_source_binds_payload_without_retaining_it():
     assert len(source.payload_sha256) == 64 and accepted not in repr(source)
     with pytest.raises(ValueError, match="SHA-256"):
         replace(source, payload_sha256="not-a-digest")
+
+
+def test_generation_receipt_identity_is_reconstructible_from_episode_and_destination():
+    component = activated(origin=ReviewExecutionOriginKind.IMPORTED)
+    from_revision = WorkflowRevision(component.binding.rejection.fence, 7)
+    to_revision = WorkflowRevision(binding(1).rejection.fence, 8)
+    advanced = advance_review_execution_generation(
+        component, from_revision, to_revision, WorkflowMutation.REQUEST_REARM, (),
+    )
+    episode = component.binding
+
+    assert advanced.boundaries[0].receipt_id == review_generation_receipt_id(episode, 1)
+    assert review_generation_receipt_id(episode, 1) == review_generation_receipt_id(
+        advanced.binding, 1,
+    )
+    assert review_generation_receipt_id(episode, 1) != review_generation_receipt_id(episode, 2)
+    with pytest.raises(ValueError, match="generation"):
+        review_generation_receipt_id(episode, 0)
 
 
 def test_active_generation_advance_preserves_imported_allowance_without_rounds():

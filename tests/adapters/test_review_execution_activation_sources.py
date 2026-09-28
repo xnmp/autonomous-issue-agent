@@ -33,6 +33,8 @@ from issue_agent.adapters.review_execution_activation import (
     read_complete_legacy_review_generation_receipts, revalidate_complete_legacy_review_generation_receipts,
     match_legacy_review_generation_boundary_sources,
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
+    read_review_generation_archive_page,
+    ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
     match_legacy_stale_productivity_generation_sources,
     MatchedLegacyStaleProductivityGenerationSources, UnmatchedLegacyStaleProductivityGenerationSources,
     classify_complete_legacy_review_successes,
@@ -1252,10 +1254,17 @@ def test_generation_boundary_keeps_legacy_full_payload_receipts_readable(rig):
         observed = read_complete_legacy_review_generation_receipts(db, "o/r")
         assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
         proof = match_legacy_review_generation_boundary_sources(db, observed, source.boundary.receipt_id)
-        workflow = load_review_workflow_row(db, rig[1].revision.fence.key)
+        workflow = load_review_workflow_row(db, rig[3].expected.fence.key)
+        archive = read_review_generation_archive_page(
+            db, source.boundary.before.binding,
+            source.boundary.to_revision.fence.generation,
+            source.boundary.to_revision.fence.generation,
+        )
 
     assert isinstance(proof, MatchedLegacyReviewGenerationBoundarySources)
     assert workflow is not None and workflow.execution.boundaries[-1] == source.boundary
+    assert isinstance(archive, ObservedReviewGenerationArchivePage)
+    assert archive.sources[0].boundary == source.boundary
 
 
 def test_generation_digest_rejects_a_changed_accepted_payload(rig):
@@ -1273,10 +1282,106 @@ def test_generation_digest_rejects_a_changed_accepted_payload(rig):
         observed = read_complete_legacy_review_generation_receipts(db, "o/r")
         assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
         proof = match_legacy_review_generation_boundary_sources(db, observed, source.boundary.receipt_id)
+        archive = read_review_generation_archive_page(
+            db, source.boundary.before.binding,
+            source.boundary.to_revision.fence.generation,
+            source.boundary.to_revision.fence.generation,
+        )
         with pytest.raises(WorkflowAuthorityError, match="lost its accepted transition"):
             load_review_workflow_row(db, rig[1].revision.fence.key)
 
     assert isinstance(proof, UnmatchedLegacyReviewGenerationBoundarySources)
+    assert isinstance(archive, BlockedReviewGenerationArchivePage)
+    assert "accepted transition" in archive.reason
+
+
+def test_generation_archive_page_reads_exact_expected_source_without_writes(rig):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        workflow = load_review_workflow_row(db, rig[1].revision.fence.key)
+        assert workflow is not None
+        binding = workflow.execution.binding
+        generation = binding.rejection.fence.generation
+        before = db.total_changes
+        page = read_review_generation_archive_page(db, binding, generation, generation)
+        foreign = read_review_generation_archive_page(
+            db, replace(binding, execution_episode="another-episode"), generation, generation,
+        )
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(page, ObservedReviewGenerationArchivePage)
+    assert len(page.sources) == 1 and page.sources[0].generation == generation
+    assert page.sources[0].boundary == workflow.execution.boundaries[0]
+    assert len(page.sources[0].receipt_digest) == len(page.sources[0].accepted_digest) == 64
+    assert page.next_generation == generation + 1 and not page.has_more
+    assert isinstance(foreign, BlockedReviewGenerationArchivePage)
+    assert foreign.generation == generation and "absent" in foreign.reason
+
+
+def test_generation_archive_page_is_bounded_and_requires_every_expected_receipt(rig, monkeypatch):
+    store, _, selection, _, _, _, workflow = accepted_generation_with_open_submission(rig)
+    first = current(store, selection)
+    actor = OperatorActor("operator", "test")
+    assert isinstance(workflow.cancel_rearm(
+        CancelRearm("cancel:archive-page", first.revision, "rearm:with-older-submission", "stop",
+                    expected_binding=first.binding), actor,
+    ), WorkflowCommitted)
+    stopped = current(store, selection)
+    assert isinstance(workflow.continue_rearm(
+        ContinueGrantedRearm("rearm:archive-page", stopped.revision,
+                             "rearm:with-older-submission", expected_binding=stopped.binding), actor,
+    ), WorkflowCommitted)
+    binding = current(store, selection).execution.binding
+    last = binding.rejection.fence.generation
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        first_page = read_review_generation_archive_page(db, binding, last - 1, last, limit=1)
+        second_page = read_review_generation_archive_page(db, binding, last, last, limit=1)
+        db.rollback()
+    assert isinstance(first_page, ObservedReviewGenerationArchivePage)
+    assert isinstance(second_page, ObservedReviewGenerationArchivePage)
+    assert first_page.next_generation == last and first_page.has_more
+    assert second_page.next_generation == last + 1 and not second_page.has_more
+    assert [first_page.sources[0].generation, second_page.sources[0].generation] == [last - 1, last]
+
+    second = second_page.sources[0]
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json=CAST(x'ff' AS BLOB) "
+            "WHERE namespace=? AND scope='o/r' AND key=?",
+            (second.accepted_namespace, second.accepted_key),
+        )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        first_source = first_page.sources[0]
+        first_bytes = (
+            review_activation._recording_source_size(
+                db, "review-execution-generation", "o/r", first_source.boundary.receipt_id,
+            ) + review_activation._recording_source_size(
+                db, first_source.accepted_namespace, "o/r", first_source.accepted_key,
+            )
+        )
+        with monkeypatch.context() as patcher:
+            patcher.setattr(review_activation, "MAX_GENERATION_ARCHIVE_PAGE_BYTES", first_bytes)
+            bounded = read_review_generation_archive_page(db, binding, last - 1, last)
+        malformed = read_review_generation_archive_page(db, binding, last, last)
+        db.rollback()
+    assert isinstance(bounded, ObservedReviewGenerationArchivePage)
+    assert len(bounded.sources) == 1 and bounded.next_generation == last and bounded.has_more
+    assert isinstance(malformed, BlockedReviewGenerationArchivePage)
+    assert malformed.generation == last
+
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-generation' AND key=?",
+                   (second_page.sources[0].boundary.receipt_id,))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        missing = read_review_generation_archive_page(db, binding, last - 1, last)
+        db.rollback()
+    assert isinstance(missing, BlockedReviewGenerationArchivePage)
+    assert missing.generation == last and "absent" in missing.reason
 
 
 def test_generation_source_match_does_not_infer_time_from_sql_rowids(rig):
