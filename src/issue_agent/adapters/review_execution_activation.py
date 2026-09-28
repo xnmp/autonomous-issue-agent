@@ -27,6 +27,8 @@ from ..domain.review_execution_activation import (
     LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
     LegacyReviewSubmissionReceiptPage, LegacyReviewSubmissionReceiptSource,
     UnreadableLegacyReviewSubmissionReceipt,
+    CompleteLegacyReviewSubmissionReceipts, BlockedLegacyReviewSubmissionReceipts,
+    MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_ROWS, MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_BYTES,
     MAX_LEGACY_REVIEW_OWNERS, LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
     UnreadableLegacyReviewOwnerLineage,
     VerifiedLegacyRecordedReview, UnverifiedLegacyRecordedReview,
@@ -77,6 +79,7 @@ MAX_LEGACY_ROUND_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_SOURCE_PAGE = 64
 MAX_LEGACY_SUBMISSION_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
+MAX_LEGACY_SUBMISSION_RECEIPT_SCAN_ROWS = 1_000_000
 MAX_REVIEW_ROUND_SOURCE_PAGE = 16
 MAX_OUTCOME_RECEIPT_SOURCE_PAGE = 16
 MAX_OUTCOME_RECEIPT_PAGE_BYTES = 2**24
@@ -473,14 +476,17 @@ def read_legacy_review_submission_receipt_page(
     columns = LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS
     sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in columns)
     namespaces = tuple(sorted(LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES))
-    placeholders = ",".join("?" for _ in namespaces)
-    predicate = f"WHERE scope=? AND namespace IN ({placeholders})" + (
+    namespace_values = (*namespaces, *(name.encode("utf-8") for name in namespaces))
+    placeholders = ",".join("?" for _ in namespace_values)
+    predicate = f"WHERE scope IN (?,?) AND namespace IN ({placeholders})" + (
         " AND rowid>?" if after_rowid is not None else ""
     )
-    params = (repository, *namespaces) if after_rowid is None else (repository, *namespaces, after_rowid)
+    params = (repository, repository.encode("utf-8"), *namespace_values)
+    if after_rowid is not None:
+        params = (*params, after_rowid)
     metadata = db.execute(
         f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM dedupe_keys "
-        f"{predicate} ORDER BY rowid LIMIT ?",
+        f"NOT INDEXED {predicate} ORDER BY rowid LIMIT ?",
         (*params, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE + 1),
     ).fetchall()
     page = metadata[:MAX_SUBMISSION_RECEIPT_SOURCE_PAGE]
@@ -494,8 +500,8 @@ def read_legacy_review_submission_receipt_page(
         )
         values = {row["source_rowid"]: row for row in db.execute(
             f"SELECT rowid AS source_rowid,{fields} FROM dedupe_keys "
-            f"WHERE scope=? AND namespace IN ({placeholders}) AND rowid IN ({rowids})",
-            (repository, *namespaces, *safe_ids),
+            f"WHERE scope IN (?,?) AND namespace IN ({placeholders}) AND rowid IN ({rowids})",
+            (repository, repository.encode("utf-8"), *namespace_values, *safe_ids),
         )}
     entries: list[LegacyReviewSubmissionReceiptSource | UnreadableLegacyReviewSubmissionReceipt] = []
     for row in page:
@@ -517,6 +523,58 @@ def read_legacy_review_submission_receipt_page(
         tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
         len(metadata) > MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
     )
+
+
+def read_complete_legacy_review_submission_receipts(
+    db: sqlite3.Connection, repository: str,
+) -> CompleteLegacyReviewSubmissionReceipts | BlockedLegacyReviewSubmissionReceipts:
+    """Scan every settlement receipt; partial pages cannot authorize import."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("complete submission receipt scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("complete submission receipt scan requires a canonical repository")
+    if db.execute(
+        "SELECT rowid FROM dedupe_keys NOT INDEXED ORDER BY rowid LIMIT 1 OFFSET ?",
+        (MAX_LEGACY_SUBMISSION_RECEIPT_SCAN_ROWS,),
+    ).fetchone() is not None:
+        return BlockedLegacyReviewSubmissionReceipts(repository, "dedupe table exceeds its total scan bound")
+    receipts: list[LegacyReviewSubmissionReceiptSource] = []
+    source_bytes = 0
+    cursor = None
+    while True:
+        page = read_legacy_review_submission_receipt_page(db, repository, after_rowid=cursor)
+        for entry in page.entries:
+            if isinstance(entry, UnreadableLegacyReviewSubmissionReceipt):
+                return BlockedLegacyReviewSubmissionReceipts(repository, entry.reason, entry.source_rowid)
+            source_bytes += entry.source_bytes
+            if (len(receipts) >= MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_ROWS
+                    or source_bytes > MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_BYTES):
+                return BlockedLegacyReviewSubmissionReceipts(
+                    repository, "submission receipt inventory exceeds its total bound", entry.source_rowid,
+                )
+            receipts.append(entry)
+        if not page.has_more:
+            break
+        cursor = page.next_rowid
+    try:
+        return CompleteLegacyReviewSubmissionReceipts(repository, tuple(receipts))
+    except ValueError as exc:
+        return BlockedLegacyReviewSubmissionReceipts(repository, _printable(str(exc)))
+
+
+def revalidate_complete_legacy_review_submission_receipts(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewSubmissionReceipts,
+) -> CompleteLegacyReviewSubmissionReceipts | BlockedLegacyReviewSubmissionReceipts:
+    """Re-read every settlement receipt before trusting a caller-held set."""
+    if not isinstance(observed, CompleteLegacyReviewSubmissionReceipts):
+        raise ValueError("submission receipt revalidation requires a complete observed inventory")
+    current = read_complete_legacy_review_submission_receipts(db, observed.repository)
+    if isinstance(current, BlockedLegacyReviewSubmissionReceipts):
+        return current
+    if current.source_digest != observed.source_digest:
+        return BlockedLegacyReviewSubmissionReceipts(observed.repository,
+                                                     "submission receipt sources changed after inventory")
+    return current
 
 
 def read_legacy_review_outcome_receipt_page(

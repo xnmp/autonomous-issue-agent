@@ -1170,3 +1170,21 @@ Full `make test` passed: 3,198 domain, 2,965 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-complete-submissions-gate.log` (ephemeral).
+
+## Checkpoint 47 — complete submission settlement receipt inventory (offline)
+
+The read-only receipt scanner now exhausts the registration, round-index and
+recorded-review namespaces under one SQL snapshot. Matching text and BLOB
+scope/namespace aliases are retained, so malformed aliases block rather than
+disappear. A complete value requires unique readable namespace/key pairs, at
+most 65,536 matching rows and 64 MiB of source fields, and a one-million-row
+bound on the shared `dedupe_keys` table, including unrelated rows. A second
+SQL read rejects partial or changed caller-held inventories. The payloads
+remain raw evidence; exact registration and baseline joins, orphan accounting,
+escalated hold provenance and ordered resets remain to be proved. Independent
+Sol review found no medium or high issue; focused tests cover alias,
+malformed, partial, changed and bound cases.
+Full `make test` passed: 3,198 domain, 2,972 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-complete-submission-receipts-gate.log` (ephemeral).

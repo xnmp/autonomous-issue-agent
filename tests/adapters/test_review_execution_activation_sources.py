@@ -16,6 +16,7 @@ from issue_agent.adapters.review_execution_activation import (
     read_complete_legacy_review_submissions, revalidate_complete_legacy_review_submissions,
     revalidate_complete_legacy_review_runs,
     read_legacy_review_submission_receipt_page, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
+    read_complete_legacy_review_submission_receipts, revalidate_complete_legacy_review_submission_receipts,
     read_legacy_review_owner_lineage,
     read_legacy_review_round_page, MAX_REVIEW_ROUND_SOURCE_PAGE,
     read_complete_legacy_review_rounds, revalidate_complete_legacy_review_rounds,
@@ -37,6 +38,7 @@ from issue_agent.domain.review_execution_activation import (
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
     CompleteLegacyReviewSubmissions, BlockedLegacyReviewSubmissions,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
+    CompleteLegacyReviewSubmissionReceipts, BlockedLegacyReviewSubmissionReceipts,
     LegacyReviewOwnerLineage, UnreadableLegacyReviewOwnerLineage,
     CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
     LegacyReviewRoundSource, UnreadableLegacyReviewRound, MAX_LEGACY_ROUND_JSON_BYTES,
@@ -1303,6 +1305,87 @@ def test_submission_receipt_scan_marks_bad_source_and_requires_snapshot(tmp_path
     assert isinstance(page.entries[1], UnreadableLegacyReviewSubmissionReceipt)
     assert isinstance(page.entries[2], LegacyReviewSubmissionReceiptSource)
     assert dict(page.entries[2].fields)["payload_json"] is None
+
+
+def test_complete_submission_receipt_inventory_rechecks_exact_sql_set(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission_receipt(db, 1, namespace="review-round-submission", rowid=-3)
+        _submission_receipt(db, 2, namespace="review-round-submission-index", rowid=0)
+        _submission_receipt(db, 3, namespace="review-recorded-submission")
+        _submission_receipt(db, 4, namespace="other")
+        _submission_receipt(db, 5, scope="other/r")
+        db.execute("BEGIN")
+        before = db.total_changes
+        observed = read_complete_legacy_review_submission_receipts(db, "o/r")
+        assert db.total_changes == before
+        assert isinstance(observed, CompleteLegacyReviewSubmissionReceipts)
+        assert revalidate_complete_legacy_review_submission_receipts(db, observed) == observed
+        partial = CompleteLegacyReviewSubmissionReceipts("o/r", observed.receipts[:1])
+        assert isinstance(revalidate_complete_legacy_review_submission_receipts(db, partial),
+                          BlockedLegacyReviewSubmissionReceipts)
+        with pytest.raises(ValueError, match="unique namespace"):
+            CompleteLegacyReviewSubmissionReceipts("o/r", (observed.receipts[0], observed.receipts[0]))
+        db.rollback()
+        db.execute("UPDATE dedupe_keys SET payload_json='changed' WHERE key='key-1'")
+        db.execute("BEGIN")
+        changed = revalidate_complete_legacy_review_submission_receipts(db, observed)
+        db.rollback()
+
+    assert len(observed.receipts) == 3
+    assert isinstance(changed, BlockedLegacyReviewSubmissionReceipts)
+
+
+@pytest.mark.parametrize("alias", ["scope", "namespace"])
+def test_complete_submission_receipt_inventory_blocks_matching_blob_alias(tmp_path, alias):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission_receipt(db, 1, scope=b"o/r" if alias == "scope" else "o/r",
+                            namespace=b"review-round-submission" if alias == "namespace"
+                            else "review-round-submission")
+        db.execute("BEGIN")
+        page = read_legacy_review_submission_receipt_page(db, "o/r")
+        result = read_complete_legacy_review_submission_receipts(db, "o/r")
+        db.rollback()
+
+    assert isinstance(page.entries[0], UnreadableLegacyReviewSubmissionReceipt)
+    assert isinstance(result, BlockedLegacyReviewSubmissionReceipts)
+
+
+def test_complete_submission_receipt_inventory_blocks_foreign_row_scan_excess(tmp_path, monkeypatch):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        for number in range(3):
+            _submission_receipt(db, number, scope="other/r")
+        db.execute("BEGIN")
+        monkeypatch.setattr(review_activation, "MAX_LEGACY_SUBMISSION_RECEIPT_SCAN_ROWS", 2)
+        result = read_complete_legacy_review_submission_receipts(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewSubmissionReceipts)
+    assert "total scan bound" in result.reason
+
+
+@pytest.mark.parametrize("damage", ["unreadable", "rows", "bytes"])
+def test_complete_submission_receipt_inventory_blocks_source_excess(tmp_path, monkeypatch, damage):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission_receipt(db, 1)
+        _submission_receipt(db, 2)
+        if damage == "unreadable":
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE key='key-1'", ("x" * 65537,))
+        db.execute("BEGIN")
+        if damage == "rows":
+            monkeypatch.setattr(review_activation, "MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_ROWS", 1)
+        elif damage == "bytes":
+            page = read_legacy_review_submission_receipt_page(db, "o/r")
+            assert isinstance(page.entries[0], LegacyReviewSubmissionReceiptSource)
+            monkeypatch.setattr(review_activation, "MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_BYTES",
+                                page.entries[0].source_bytes - 1)
+        result = read_complete_legacy_review_submission_receipts(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewSubmissionReceipts)
 
 
 def _retired_review_owner(db, owner, successor, *, repository="o/r", role="review", rowid=None):

@@ -397,6 +397,11 @@ class LegacyReviewSubmissionReceiptSource:
     def source_digest(self) -> str:
         return hashlib.sha256(json.dumps(self.fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
 
+    @property
+    def source_bytes(self) -> int:
+        return sum(len(value.encode("utf-8", "surrogatepass")) for _, value in self.fields
+                   if isinstance(value, str))
+
 
 @dataclass(frozen=True)
 class UnreadableLegacyReviewSubmissionReceipt:
@@ -432,6 +437,51 @@ class LegacyReviewSubmissionReceiptPage:
             raise ValueError("submission receipt page must advance through unique rowids")
         if self.has_more and not rowids:
             raise ValueError("submission receipt page cannot continue without a cursor")
+
+
+MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_ROWS = 65536
+MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_BYTES = 2**26
+
+
+@dataclass(frozen=True)
+class CompleteLegacyReviewSubmissionReceipts:
+    """A bounded whole-repository receipt observation; activation must recheck SQL."""
+
+    repository: str
+    receipts: tuple[LegacyReviewSubmissionReceiptSource, ...]
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository or not isinstance(self.receipts, tuple):
+            raise ValueError("complete submission receipts require a canonical repository and tuple")
+        if (len(self.receipts) > MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_ROWS
+                or any(not isinstance(source, LegacyReviewSubmissionReceiptSource)
+                       or dict(source.fields)["scope"] != self.repository for source in self.receipts)
+                or sum(source.source_bytes for source in self.receipts) > MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_BYTES):
+            raise ValueError("complete submission receipts require bounded readable repository sources")
+        identities = [(dict(source.fields)["namespace"], dict(source.fields)["key"])
+                      for source in self.receipts]
+        if len(set(identities)) != len(identities):
+            raise ValueError("complete submission receipts require unique namespace and key identities")
+
+    @property
+    def source_digest(self) -> str:
+        parts = tuple(sorted((dict(source.fields)["namespace"], dict(source.fields)["key"], source.source_digest)
+                             for source in self.receipts))
+        return hashlib.sha256(json.dumps((self.repository, parts), separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewSubmissionReceipts:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked submission receipts require a canonical repository")
+        validate_workflow_text(self.reason, "blocked submission receipts reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked submission receipts cursor")
 
 
 LEGACY_REVIEW_ROUND_COLUMNS = (
