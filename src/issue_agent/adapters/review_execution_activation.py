@@ -17,6 +17,9 @@ from ..domain.review_execution_activation import (
     LegacyExecutionRunPage, LegacyExecutionRunRecord, LegacyReviewRunState, UnreadableLegacyExecutionRun,
     LEGACY_SUBMISSION_COMMAND_COLUMNS, LEGACY_SUBMISSION_RECEIPT_COLUMNS,
     LegacyReviewSubmissionPage, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
+    LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
+    LegacyReviewSubmissionReceiptPage, LegacyReviewSubmissionReceiptSource,
+    UnreadableLegacyReviewSubmissionReceipt,
 )
 from ..domain.workflow_identity import canonical_workflow_repository
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
@@ -28,6 +31,7 @@ _SIGNED = re.compile(r"-?[1-9][0-9]{0,18}")
 _MAX_NUMBER = 2**63 - 1
 MAX_RUN_SOURCE_PAGE = 256
 MAX_SUBMISSION_SOURCE_PAGE = 64
+MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
 _RUN_COLUMNS = (
     "run_id", "dispatch_id", "kind", "state", "config_version", "started_at", "completed_at", "outcome",
     "provider_receipt_id", "workflow_binding_json", "workflow_episode_key", "review_round_id", "review_child_id",
@@ -234,3 +238,67 @@ def read_legacy_review_submission_page(
             entries.append(UnreadableLegacyReviewSubmission(rowid, "submission source has malformed fields"))
     return LegacyReviewSubmissionPage(tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
                                       len(metadata) > MAX_SUBMISSION_SOURCE_PAGE)
+
+
+def read_legacy_review_submission_receipt_page(
+    db: sqlite3.Connection, repository: str, *, after_rowid: int | None = None,
+) -> LegacyReviewSubmissionReceiptPage:
+    """Inventory registration, round-index and recorded-review receipts.
+
+    The importer must join all pages to command/effect and round sources;
+    a recorded-review row by itself does not prove a productive reset.
+    """
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("submission receipt scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("submission receipt scan requires a canonical repository")
+    if after_rowid is not None and (type(after_rowid) is not int or not MIN_SQL_ROWID <= after_rowid <= MAX_SQL_ROWID):
+        raise ValueError("submission receipt scan requires a valid cursor")
+
+    columns = LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS
+    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in columns)
+    namespaces = tuple(sorted(LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES))
+    placeholders = ",".join("?" for _ in namespaces)
+    predicate = f"WHERE scope=? AND namespace IN ({placeholders})" + (
+        " AND rowid>?" if after_rowid is not None else ""
+    )
+    params = (repository, *namespaces) if after_rowid is None else (repository, *namespaces, after_rowid)
+    metadata = db.execute(
+        f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM dedupe_keys "
+        f"{predicate} ORDER BY rowid LIMIT ?",
+        (*params, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE + 1),
+    ).fetchall()
+    page = metadata[:MAX_SUBMISSION_RECEIPT_SOURCE_PAGE]
+    safe_ids = [row["source_rowid"] for row in page if row["largest_value"] <= MAX_LEGACY_SQL_TEXT_BYTES]
+    values = {}
+    if safe_ids:
+        rowids = ",".join("?" for _ in safe_ids)
+        fields = ",".join(
+            f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+            for column in columns
+        )
+        values = {row["source_rowid"]: row for row in db.execute(
+            f"SELECT rowid AS source_rowid,{fields} FROM dedupe_keys "
+            f"WHERE scope=? AND namespace IN ({placeholders}) AND rowid IN ({rowids})",
+            (repository, *namespaces, *safe_ids),
+        )}
+    entries: list[LegacyReviewSubmissionReceiptSource | UnreadableLegacyReviewSubmissionReceipt] = []
+    for row in page:
+        rowid = row["source_rowid"]
+        if row["largest_value"] > MAX_LEGACY_SQL_TEXT_BYTES:
+            entries.append(UnreadableLegacyReviewSubmissionReceipt(rowid, "submission receipt field exceeds the SQL text bound"))
+            continue
+        source = values.get(rowid)
+        if source is None:
+            entries.append(UnreadableLegacyReviewSubmissionReceipt(rowid, "submission receipt changed during its read"))
+            continue
+        try:
+            fields = tuple((column, _sql_text(source[f"type_{column}"], source[f"raw_{column}"]))
+                           for column in columns)
+            entries.append(LegacyReviewSubmissionReceiptSource(rowid, fields))
+        except (TypeError, ValueError, UnicodeError):
+            entries.append(UnreadableLegacyReviewSubmissionReceipt(rowid, "submission receipt has malformed fields"))
+    return LegacyReviewSubmissionReceiptPage(
+        tuple(entries), page[-1]["source_rowid"] if page else after_rowid,
+        len(metadata) > MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
+    )

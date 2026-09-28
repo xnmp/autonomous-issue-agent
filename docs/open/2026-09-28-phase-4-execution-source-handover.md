@@ -29,12 +29,16 @@ with `CLAUDE.md`, `AGENTS.md`, the
   negative and zero rowids, and marks oversized or malformed source fields
   unreadable. A source digest excludes its page cursor. It does not interpret
   the command as a productive review or infer a missing receipt.
+- Checkpoint 34 adds a paged, read-only scan of the submission registration,
+  round index and recorded-review settlement namespaces in `dedupe_keys`.
+  These raw rows must still be joined to command/effect, round and verdict
+  sources; their presence alone does not prove a productive reset.
 
-The checkpoint-33 full `make test` gate passed: 3,183 domain, 2,852 adapter
+The checkpoint-34 full `make test` gate passed: 3,189 domain, 2,855 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
 and both Pyrefly checks. Ten strict xfails remained expected. The log is
-`/tmp/phase4-submission-source-gate.log` (ephemeral). Independent Sol review
-found no medium or high issue in the submission reader.
+`/tmp/phase4-submission-index-source-gate.log` (ephemeral). Independent Sol
+review found no medium or high issue in the registration/index reader.
 
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
@@ -49,8 +53,8 @@ occurred.
    must inspect the authorized lineage without rewriting it. Complete every
    paged run scan under one SQL snapshot, and revalidate under activation
    barriers before commit.
-2. Join the inventoried `SUBMIT_REVIEW` commands and effects to bounded round
-   submission indices, and inspect verdict hold provenance. Reconstruct productive
+2. Join the inventoried `SUBMIT_REVIEW` commands, effects and registration/index
+   rows to bounded round plans; inspect verdict hold provenance. Reconstruct productive
    reset boundaries from confirmed source receipts; a completed agent run is
    not itself a productive review. Unknown death or reset attribution blocks
    import with reviewable evidence.

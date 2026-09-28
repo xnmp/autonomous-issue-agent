@@ -8,6 +8,7 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
     read_legacy_review_run_page, read_legacy_review_submission_page,
+    read_legacy_review_submission_receipt_page, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
@@ -15,6 +16,7 @@ from issue_agent.domain.resolve_activation import (
 from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
+    LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
 )
 
 
@@ -308,3 +310,72 @@ def test_submission_scan_requires_explicit_snapshot_and_canonical_scope(tmp_path
         with pytest.raises(ValueError, match="repository"):
             read_legacy_review_submission_page(db, "Other/R")
         db.rollback()
+
+
+def _submission_receipt(db, number, *, namespace="review-round-submission-index", scope="o/r", rowid=None):
+    db.execute(
+        "INSERT INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?,?)",
+        (rowid, namespace, scope, f"key-{number}", "claimed", f"payload-{number}"),
+    )
+
+
+def test_submission_receipt_scan_keeps_all_three_sources_and_raw_payloads(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        for number, namespace in enumerate(("review-round-submission", "review-round-submission-index",
+                                            "review-recorded-submission"), 1):
+            _submission_receipt(db, number, namespace=namespace)
+        _submission_receipt(db, 4, namespace="other")
+        _submission_receipt(db, 5, scope="other/r")
+        db.execute("BEGIN")
+        before = db.total_changes
+        page = read_legacy_review_submission_receipt_page(db, "o/r")
+        assert db.total_changes == before
+        db.rollback()
+
+    assert not page.has_more
+    assert len(page.entries) == 3
+    assert all(isinstance(entry, LegacyReviewSubmissionReceiptSource) for entry in page.entries)
+    assert [dict(entry.fields)["payload_json"] for entry in page.entries] == [
+        "payload-1", "payload-2", "payload-3",
+    ]
+
+
+def test_submission_receipt_scan_pages_negative_and_zero_rowids(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission_receipt(db, 1, rowid=-3)
+        _submission_receipt(db, 2, rowid=0)
+        for number in range(3, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE + 4):
+            _submission_receipt(db, number)
+        db.execute("BEGIN")
+        first = read_legacy_review_submission_receipt_page(db, "o/r")
+        second = read_legacy_review_submission_receipt_page(db, "o/r", after_rowid=first.next_rowid)
+        db.rollback()
+
+    assert [entry.source_rowid for entry in first.entries[:2]] == [-3, 0]
+    assert len(first.entries) == MAX_SUBMISSION_RECEIPT_SOURCE_PAGE and first.has_more
+    assert len(second.entries) == 3 and not second.has_more
+
+
+def test_submission_receipt_scan_marks_bad_source_and_requires_snapshot(tmp_path):
+    control = _control(tmp_path)
+    with closing(control._connect()) as db:
+        _submission_receipt(db, 1)
+        _submission_receipt(db, 2)
+        _submission_receipt(db, 3)
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE key='key-1'", ("x" * 65537,))
+        db.execute("UPDATE dedupe_keys SET claimed_at=CAST(x'ff' AS TEXT) WHERE key='key-2'")
+        db.execute("UPDATE dedupe_keys SET payload_json=NULL WHERE key='key-3'")
+        with pytest.raises(ValueError, match="transaction"):
+            read_legacy_review_submission_receipt_page(db, "o/r")
+        db.execute("BEGIN")
+        with pytest.raises(ValueError, match="repository"):
+            read_legacy_review_submission_receipt_page(db, "Other/R")
+        page = read_legacy_review_submission_receipt_page(db, "o/r")
+        db.rollback()
+
+    assert isinstance(page.entries[0], UnreadableLegacyReviewSubmissionReceipt)
+    assert isinstance(page.entries[1], UnreadableLegacyReviewSubmissionReceipt)
+    assert isinstance(page.entries[2], LegacyReviewSubmissionReceiptSource)
+    assert dict(page.entries[2].fields)["payload_json"] is None

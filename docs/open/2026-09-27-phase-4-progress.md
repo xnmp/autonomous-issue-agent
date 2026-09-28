@@ -915,3 +915,20 @@ remains inactive. Full `make test` passed: 3,183 domain, 2,852 adapter and
 2,866 app tests, plus hooks, governor, gate parity, four import contracts
 and both Pyrefly checks. Ten accepted strict xfails remained expected. Log:
 `/tmp/phase4-submission-source-gate.log` (ephemeral).
+
+## Checkpoint 34 — paged review submission registration and index sources (offline)
+
+The execution activation reader now inventories the three durable
+`dedupe_keys` namespaces for review command registration, round submission
+index and recorded-review settlement under an explicit SQL snapshot. It
+retains all six current row columns, including nullable payload and reuse
+fields, in bounded pages with a rowid-independent digest. Negative and zero
+rowids are included; malformed, invalid UTF-8 and oversized fields become
+explicit unreadable records. A recorded-review row by itself is not a
+productive reset; the importer must join the index and registration to its
+round, command/effect and verdict sources. Execution authority remains
+inactive. Independent Sol review found no medium or high issue in this
+source reader. Full `make test` passed: 3,189 domain, 2,855 adapter and
+2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten accepted strict xfails remained expected. Log:
+`/tmp/phase4-submission-index-source-gate.log` (ephemeral).

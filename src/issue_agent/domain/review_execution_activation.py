@@ -246,6 +246,78 @@ class LegacyReviewSubmissionPage:
             raise ValueError("submission page cannot continue without a cursor")
 
 
+LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES = frozenset({
+    "review-round-submission", "review-round-submission-index", "review-recorded-submission",
+})
+LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS = (
+    "namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json",
+)
+
+
+@dataclass(frozen=True)
+class LegacyReviewSubmissionReceiptSource:
+    """Raw registration, round index or recorded-review receipt from dedupe_keys."""
+
+    source_rowid: int
+    fields: tuple[tuple[str, str | None], ...]
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "submission receipt cursor")
+        if (not isinstance(self.fields, tuple)
+                or any(not isinstance(field, tuple) or len(field) != 2 for field in self.fields)
+                or tuple(name for name, _ in self.fields) != LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS):
+            raise ValueError("submission receipt requires exact fields and order")
+        values = dict(self.fields)
+        for name, value in self.fields:
+            if value is None and name in {"reusable_after", "payload_json"}:
+                continue
+            if not isinstance(value, str) or len(value.encode("utf-8", "surrogatepass")) > MAX_LEGACY_SQL_TEXT_BYTES:
+                raise ValueError(f"submission receipt {name} must be bounded text")
+        if (values["namespace"] not in LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES
+                or not values["key"] or canonical_workflow_repository(values["scope"]) != values["scope"]):
+            raise ValueError("submission receipt requires a canonical review source")
+
+    @property
+    def source_digest(self) -> str:
+        return hashlib.sha256(json.dumps(self.fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnreadableLegacyReviewSubmissionReceipt:
+    source_rowid: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "unreadable submission receipt cursor")
+        validate_workflow_text(self.reason, "unreadable submission receipt reason")
+
+
+LegacyReviewSubmissionReceiptEntry = LegacyReviewSubmissionReceiptSource | UnreadableLegacyReviewSubmissionReceipt
+
+
+@dataclass(frozen=True)
+class LegacyReviewSubmissionReceiptPage:
+    entries: tuple[LegacyReviewSubmissionReceiptEntry, ...]
+    next_rowid: int | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.entries, tuple) or any(
+            not isinstance(entry, (LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt))
+            for entry in self.entries
+        ):
+            raise ValueError("submission receipt page requires typed entries")
+        if self.next_rowid is not None:
+            _rowid(self.next_rowid, "submission receipt page cursor")
+        if type(self.has_more) is not bool:
+            raise ValueError("submission receipt continuation must be boolean")
+        rowids = [entry.source_rowid for entry in self.entries]
+        if rowids != sorted(set(rowids)) or (rowids and rowids[-1] != self.next_rowid):
+            raise ValueError("submission receipt page must advance through unique rowids")
+        if self.has_more and not rowids:
+            raise ValueError("submission receipt page cannot continue without a cursor")
+
+
 @dataclass(frozen=True)
 class LegacyReviewRunNoDeath:
     source: LegacyExecutionRunRecord

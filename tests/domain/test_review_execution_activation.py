@@ -11,6 +11,8 @@ from issue_agent.domain.review_execution_activation import (
     UnreadableLegacyExecutionRun, classify_legacy_review_death, LEGACY_SUBMISSION_COMMAND_COLUMNS,
     LEGACY_SUBMISSION_RECEIPT_COLUMNS, LegacyReviewSubmissionPage, LegacyReviewSubmissionSource,
     UnreadableLegacyReviewSubmission,
+    LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LegacyReviewSubmissionReceiptPage,
+    LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
 )
 
 
@@ -159,3 +161,29 @@ def test_submission_source_requires_exact_fields_and_matching_receipt():
         replace(source, command_fields=source.command_fields[:-1])
     with pytest.raises(ValueError):
         replace(source, receipt_fields=(("command_id", "other"), *source.receipt_fields[1:]))
+
+
+def receipt_source(**changes):
+    fields = dict.fromkeys(LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, "value")
+    fields.update(namespace="review-round-submission-index", scope="o/r", key="index-key",
+                  reusable_after=None, payload_json="{}")
+    fields.update(changes)
+    return LegacyReviewSubmissionReceiptSource(5, tuple(fields.items()))
+
+
+def test_submission_receipt_source_digest_and_page_cursor():
+    source = receipt_source()
+    assert replace(source, source_rowid=-1).source_digest == source.source_digest
+    assert replace(source, fields=tuple((name, "other" if name == "payload_json" else value)
+                                        for name, value in source.fields)).source_digest != source.source_digest
+    page = LegacyReviewSubmissionReceiptPage((UnreadableLegacyReviewSubmissionReceipt(-1, "bad"), source), 5, False)
+    assert page.next_rowid == 5
+
+
+@pytest.mark.parametrize("changes", [
+    {"namespace": "other"}, {"scope": "Other/R"}, {"key": ""}, {"claimed_at": None},
+    {"payload_json": "x" * 65537},
+])
+def test_submission_receipt_source_rejects_bad_identity_or_text(changes):
+    with pytest.raises(ValueError):
+        receipt_source(**changes)
