@@ -2,8 +2,10 @@
 
 import pytest
 from dataclasses import replace
+import hashlib
 import json
 
+from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.contracts import CommandId
 from issue_agent.domain.review_execution import (
     ReviewExecutionBinding, ReviewRoundIdentity, ReviewRoundOutcome, CopiedReviewProgress, ReviewPinDeferred,
@@ -12,8 +14,14 @@ from issue_agent.domain.workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
 )
 
-from issue_agent.domain.resolve_activation import LegacyAbsent
+from issue_agent.domain.resolve_activation import LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from issue_agent.domain.review_execution_activation import (
+    BlockedLegacyExecutionValue, LegacyExecutionNumber, LegacyReviewSessionCandidate,
+    LegacyReviewSessionModeMarker,
+    LegacyReviewSessionEncoding, parse_legacy_review_counter, parse_legacy_review_round,
+    parse_legacy_review_session, classify_legacy_execution_file_values,
+    CompleteLegacyExecutionFileValues, BlockedLegacyExecutionFileValues,
+    MAX_LEGACY_EXECUTION_FILE_ENTRIES, ParsedLegacyExecutionPR,
     AttributedLegacyReviewDeath, LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunPage,
     LegacyExecutionRunRecord, LegacyReviewRunNoDeath, LegacyReviewRunState, UnattributedLegacyReviewDeath,
     UnreadableLegacyExecutionRun, classify_legacy_review_death, LEGACY_SUBMISSION_COMMAND_COLUMNS,
@@ -27,6 +35,146 @@ from issue_agent.domain.review_execution_activation import (
     OpenLegacyOrderedRound, FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound,
     LegacyOrderedExecutionEpisode,
 )
+
+
+def _legacy_text(value: str) -> LegacyPresent:
+    return LegacyPresent(hashlib.sha256(value.encode()).hexdigest(), value)
+
+
+@pytest.mark.parametrize("raw,runtime,handle,encoding", (
+    ("bare-id", RuntimeName.CLAUDE, "bare-id", LegacyReviewSessionEncoding.BARE_CLAUDE),
+    ("codex:session:part", RuntimeName.CODEX, "session:part", LegacyReviewSessionEncoding.RUNTIME_TAG),
+    ("RuntimeName.GLM:handle", RuntimeName.GLM, "handle", LegacyReviewSessionEncoding.LEGACY_ENUM_TAG),
+    (" claude:session \n", RuntimeName.CLAUDE, "session", LegacyReviewSessionEncoding.RUNTIME_TAG),
+))
+def test_legacy_session_parser_retains_runtime_handle_and_file_identity(raw, runtime, handle, encoding):
+    source = _legacy_text(raw)
+    parsed = parse_legacy_review_session(source)
+    assert isinstance(parsed, LegacyReviewSessionCandidate)
+    assert (parsed.runtime, parsed.handle, parsed.encoding, parsed.file_digest) == (
+        runtime, handle, encoding, source.digest,
+    )
+
+
+@pytest.mark.parametrize("raw", ("", " ", "codex:", "unknown:session", "x" * 513,
+                                 "claude:\ud800"))
+def test_legacy_session_parser_blocks_unusable_values_without_losing_source(raw):
+    source = LegacyPresent("a" * 64, raw) if "\ud800" in raw else _legacy_text(raw)
+    blocked = parse_legacy_review_session(source)
+    assert isinstance(blocked, BlockedLegacyExecutionValue)
+    assert blocked.source == source
+
+
+@pytest.mark.parametrize("raw,runtime,marker,encoding", (
+    ("multi", RuntimeName.CLAUDE, "multi", LegacyReviewSessionEncoding.BARE_CLAUDE),
+    ("github-review", RuntimeName.CLAUDE, "github-review", LegacyReviewSessionEncoding.BARE_CLAUDE),
+    ("codex-review", RuntimeName.CLAUDE, "codex-review", LegacyReviewSessionEncoding.BARE_CLAUDE),
+    ("codex:codex-review", RuntimeName.CODEX, "codex-review", LegacyReviewSessionEncoding.RUNTIME_TAG),
+    ("codex:multi", RuntimeName.CODEX, "multi", LegacyReviewSessionEncoding.RUNTIME_TAG),
+    ("RuntimeName.CLAUDE:github-review", RuntimeName.CLAUDE, "github-review",
+     LegacyReviewSessionEncoding.LEGACY_ENUM_TAG),
+))
+def test_legacy_mode_marker_is_preserved_without_becoming_a_reusable_handle(raw, runtime, marker, encoding):
+    source = _legacy_text(raw)
+    parsed = parse_legacy_review_session(source)
+    assert isinstance(parsed, LegacyReviewSessionModeMarker)
+    assert (parsed.runtime, parsed.marker, parsed.encoding, parsed.file_digest) == (
+        runtime, marker, encoding, source.digest,
+    )
+    record = LegacyExecutionPRRecord(7, source, LegacyAbsent())
+    complete = classify_legacy_execution_file_values((record,))
+    assert isinstance(complete, CompleteLegacyExecutionFileValues)
+    assert complete.prs[0].session == parsed
+
+
+def test_legacy_session_parser_keeps_absence_and_unreadability_distinct():
+    absent = LegacyAbsent()
+    assert parse_legacy_review_session(absent) == absent
+    unreadable = LegacyUnreadable("bad UTF-8")
+    blocked = parse_legacy_review_session(unreadable)
+    assert isinstance(blocked, BlockedLegacyExecutionValue) and blocked.source == unreadable
+    with pytest.raises(ValueError, match="bare legacy session"):
+        LegacyReviewSessionCandidate(RuntimeName.CODEX, "handle", LegacyReviewSessionEncoding.BARE_CLAUDE,
+                                     "a" * 64)
+
+
+def test_legacy_round_and_signed_counter_parsers_preserve_default_and_file_values():
+    absent_round = parse_legacy_review_round(LegacyExecutionPRRecord(7, LegacyAbsent(), LegacyAbsent()))
+    assert absent_round == LegacyAbsent()
+    round_file = _legacy_text(" 0002\n")
+    assert parse_legacy_review_round(LegacyExecutionPRRecord(7, LegacyAbsent(), round_file)) == (
+        LegacyExecutionNumber(2, round_file.digest)
+    )
+    counter_file = _legacy_text("0\n")
+    for key in (7, -7):
+        assert parse_legacy_review_counter(LegacyExecutionCounterRecord(key, counter_file)) == (
+            LegacyExecutionNumber(0, counter_file.digest)
+        )
+    missing = parse_legacy_review_counter(LegacyExecutionCounterRecord(7, LegacyAbsent()))
+    assert isinstance(missing, BlockedLegacyExecutionValue)
+    with pytest.raises(ValueError, match="source digest"):
+        LegacyExecutionNumber(0, None)
+
+
+@pytest.mark.parametrize("raw", ("", "-1", "+1", "1.5", "٣", "1\n2", "9" * 20, str(2**63)))
+def test_legacy_number_parsers_block_malformed_or_unbounded_values(raw):
+    source = _legacy_text(raw)
+    for parsed in (
+        parse_legacy_review_round(LegacyExecutionPRRecord(7, LegacyAbsent(), source)),
+        parse_legacy_review_counter(LegacyExecutionCounterRecord(-7, source)),
+    ):
+        assert isinstance(parsed, BlockedLegacyExecutionValue)
+        assert parsed.source == source
+
+
+def test_complete_legacy_file_values_bind_parsed_values_to_roots_and_keys():
+    first = LegacyExecutionPRRecord(7, _legacy_text("codex:handle"), _legacy_text("3"), "review")
+    second = LegacyExecutionPRRecord(8, LegacyAbsent(), _legacy_text("2"), "steward")
+    counter = LegacyExecutionCounterRecord(-7, _legacy_text("4"), "review")
+
+    complete = classify_legacy_execution_file_values((counter, second, first))
+
+    assert isinstance(complete, CompleteLegacyExecutionFileValues)
+    assert [item.source.pr for item in complete.prs] == [7, 8]
+    assert isinstance(complete.prs[0].session, LegacyReviewSessionCandidate)
+    assert complete.prs[0].session.handle == "handle"
+    assert complete.counters[0].source.key == -7
+    changed_root = classify_legacy_execution_file_values((replace(first, root="fix"), second, counter))
+    changed_value = classify_legacy_execution_file_values((replace(first, round=_legacy_text("4")), second, counter))
+    assert isinstance(changed_root, CompleteLegacyExecutionFileValues)
+    assert isinstance(changed_value, CompleteLegacyExecutionFileValues)
+    assert len({complete.source_digest, changed_root.source_digest, changed_value.source_digest}) == 3
+    with pytest.raises(ValueError, match="disagree"):
+        replace(complete.prs[0], source=replace(first, session=_legacy_text("codex:other")))
+
+
+@pytest.mark.parametrize("entries,reason", (
+    ((LegacyExecutionPRRecord(7, LegacyAbsent(), LegacyAbsent()),), "lacks its file source"),
+    ((LegacyExecutionCounterRecord(7, LegacyAbsent()),), "counter has an unreadable"),
+    ((LegacyExecutionPRRecord(7, _legacy_text("codex:handle"), LegacyAbsent(), "first"),
+      LegacyExecutionPRRecord(7, _legacy_text("codex:handle"), LegacyAbsent(), "second")), "duplicated"),
+    ((LegacyExecutionCounterRecord(7, _legacy_text("1"), "first"),
+      LegacyExecutionCounterRecord(7, _legacy_text("1"), "second")), "duplicated"),
+    ((UnmappedLegacyEntry("issue-0.infra-deaths", "malformed", "review"),), "unmapped"),
+    ((LegacyExecutionCounterRecord(-7, LegacyPresent("a" * 64, "1")),), "digest"),
+))
+def test_complete_legacy_file_values_block_ambiguous_or_unverified_sources(entries, reason):
+    blocked = classify_legacy_execution_file_values(entries)
+    assert isinstance(blocked, BlockedLegacyExecutionFileValues)
+    assert reason in blocked.reason
+
+
+def test_complete_legacy_file_values_enforce_inventory_bound_and_typed_membership():
+    source = LegacyExecutionCounterRecord(-7, _legacy_text("1"))
+    blocked = classify_legacy_execution_file_values((source,) * (MAX_LEGACY_EXECUTION_FILE_ENTRIES + 1))
+    assert isinstance(blocked, BlockedLegacyExecutionFileValues)
+    with pytest.raises(ValueError, match="typed inventory"):
+        classify_legacy_execution_file_values((object(),))
+    with pytest.raises(ValueError, match="disagree"):
+        ParsedLegacyExecutionPR(
+            LegacyExecutionPRRecord(7, _legacy_text("claude:real"), LegacyAbsent()),
+            LegacyAbsent(), LegacyAbsent(),
+        )
 
 
 @pytest.mark.parametrize("pr", [0, -1, 2**63, True, "7"])

@@ -16,10 +16,11 @@ from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from types import MappingProxyType
 
-from ..domain.resolve_activation import LegacyAbsent, LegacyFile, UnmappedLegacyEntry
+from ..domain.resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from ..domain.review_execution_activation import (
     MAX_LEGACY_SQL_TEXT_BYTES, MAX_SQL_ROWID, MIN_SQL_ROWID, LegacyExecutionCounterRecord,
     LegacyExecutionEntry, LegacyExecutionPRRecord,
+    MAX_LEGACY_EXECUTION_FILE_ENTRIES, MAX_LEGACY_EXECUTION_FILE_BYTES,
     LegacyExecutionRunPage, LegacyExecutionRunRecord, LegacyReviewRunState, UnreadableLegacyExecutionRun,
     CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
     MAX_LEGACY_RUN_INVENTORY_ROWS, MAX_LEGACY_RUN_INVENTORY_BYTES,
@@ -150,7 +151,13 @@ def _number(raw: str, pattern: re.Pattern[str]) -> int | None:
 def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[LegacyExecutionEntry, ...]:
     """Every legacy review execution key in one labelled root, without writes."""
     try:
-        names = sorted(entry.name for entry in os.scandir(state_dir))
+        names: list[str] = []
+        with os.scandir(state_dir) as scan:
+            for entry in scan:
+                if len(names) == MAX_LEGACY_EXECUTION_FILE_ENTRIES:
+                    return (UnmappedLegacyEntry("<state-dir>", "legacy execution directory exceeds its entry bound", root),)
+                names.append(entry.name)
+        names.sort()
     except FileNotFoundError:
         return ()
     except OSError as exc:
@@ -159,6 +166,7 @@ def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[L
     pr_files: dict[int, dict[str, LegacyFile]] = {}
     counters: list[LegacyExecutionCounterRecord] = []
     unmapped: list[UnmappedLegacyEntry] = []
+    total_bytes = 0
     for name in names:
         pr_match = _PR_NAME.fullmatch(name)
         if pr_match is not None:
@@ -167,7 +175,14 @@ def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[L
             if pr is None:
                 unmapped.append(UnmappedLegacyEntry(_printable(name), "not a canonical positive pull request number", root))
             else:
-                pr_files.setdefault(pr, {})[suffix] = _read_legacy_file(os.path.join(state_dir, name))
+                source = _read_legacy_file(os.path.join(state_dir, name))
+                if isinstance(source, LegacyAbsent):
+                    source = LegacyUnreadable("listed review file disappeared during inventory")
+                if isinstance(source, LegacyPresent):
+                    total_bytes += len(source.text.encode("utf-8"))
+                if total_bytes > MAX_LEGACY_EXECUTION_FILE_BYTES:
+                    return (UnmappedLegacyEntry("<state-dir>", "legacy execution files exceed their byte bound", root),)
+                pr_files.setdefault(pr, {})[suffix] = source
             continue
         counter_match = _COUNTER_NAME.fullmatch(name)
         if counter_match is not None:
@@ -175,7 +190,14 @@ def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[L
             if key is None:
                 unmapped.append(UnmappedLegacyEntry(_printable(name), "not a canonical signed issue or PR key", root))
             else:
-                counters.append(LegacyExecutionCounterRecord(key, _read_legacy_file(os.path.join(state_dir, name)), root))
+                source = _read_legacy_file(os.path.join(state_dir, name))
+                if isinstance(source, LegacyAbsent):
+                    source = LegacyUnreadable("listed review counter disappeared during inventory")
+                if isinstance(source, LegacyPresent):
+                    total_bytes += len(source.text.encode("utf-8"))
+                if total_bytes > MAX_LEGACY_EXECUTION_FILE_BYTES:
+                    return (UnmappedLegacyEntry("<state-dir>", "legacy execution files exceed their byte bound", root),)
+                counters.append(LegacyExecutionCounterRecord(key, source, root))
 
     prs = [LegacyExecutionPRRecord(pr, found.get("session", LegacyAbsent()), found.get("round", LegacyAbsent()), root)
            for pr, found in sorted(pr_files.items())]

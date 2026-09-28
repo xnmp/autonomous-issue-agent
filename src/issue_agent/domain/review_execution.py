@@ -26,6 +26,20 @@ _MAX_INTEGER = 2**63 - 1
 _LEGACY_SESSION_MARKERS = frozenset({"multi", "github-review", "codex-review"})
 
 
+def is_review_session_mode_marker(value: object) -> bool:
+    return isinstance(value, str) and value in _LEGACY_SESSION_MARKERS
+
+
+def validate_review_session_handle(handle: str) -> None:
+    identifier(handle, "review session handle")
+    try:
+        handle.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ValueError("review session handle must be valid UTF-8 text") from exc
+    if is_review_session_mode_marker(handle):
+        raise ValueError("legacy mode markers are not reusable session handles")
+
+
 @dataclass(frozen=True)
 class ReviewExecutionBinding:
     rejection: WorkflowBinding
@@ -228,9 +242,7 @@ class ReusableReviewSession:
     def __post_init__(self) -> None:
         if not isinstance(self.runtime, RuntimeName):
             raise ValueError("review session requires its runtime")
-        identifier(self.handle, "review session handle")
-        if self.handle in _LEGACY_SESSION_MARKERS:
-            raise ValueError("legacy mode markers are not reusable session handles")
+        validate_review_session_handle(self.handle)
         if not isinstance(self.source, (LaunchedReviewChild, ImportedReviewSession)):
             raise ValueError("review session requires verified source provenance")
         if isinstance(self.source, LaunchedReviewChild) and self.source.child.kind is not ReviewChildKind.REVIEWER:

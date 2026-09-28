@@ -204,6 +204,27 @@ with `CLAUDE.md`, `AGENTS.md`, the
   evidence. Initialized and renewed origins remain unsupported. Hot reads do
   not replay retired prefixes after compaction; that requires archived-source
   audit and durable checkpoint receipts.
+- Checkpoint 61 parses observed legacy session, round and counter file values
+  into typed candidates, mode markers, numbers and explicit blocked evidence.
+  Session candidates retain their source digest and still require admission
+  provenance before reuse. Real persisted mode markers cannot become session
+  handles. The supplied file tuple is bound to inventory root and PR or
+  counter key; duplicates, changed digests, malformed values, disappearing
+  listed files and bounded-scan overflow block it. This proves only the
+  supplied tuple is internally complete. Activation must re-read every
+  configured root under its barriers, join issue counters to PRs and verify
+  session provenance before granting authority.
+
+Independent Sol review of checkpoint 61 found that persisted session mode
+markers must be retained as distinct nonreusable evidence; this was fixed and
+regression-tested. A second pass found no remaining material issue in the
+typed parsing or bounded scanner. The scanner also converts a listed file
+that disappears during reading into unreadable evidence; a regression covers
+the race. The full gate log is
+`/tmp/phase4-legacy-file-values-gate.log` (ephemeral).
+The gate passed: 3,236 domain, 3,108 adapter and 2,866 app tests, plus
+hooks, governor, gate parity, four import contracts and both Pyrefly checks.
+Ten strict xfails remained expected.
 
 The checkpoint-60 full `make test` gate passed: 3,202 domain, 3,105 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -430,10 +451,13 @@ order a durable clock.
    block historical unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
-3. Join positive issue-keyed file counters to PRs with fresh complete
-   linked-issue observations. Shared or ambiguous issue counters cannot be
-   copied to multiple PRs. Parse runtime-tagged session and round values,
-   preserving real session provenance or blocking an unproved handle.
+3. Re-read and compare the complete legacy file inventory across every
+   configured root under activation barriers. Join positive issue-keyed file
+   counters to PRs with fresh complete linked-issue observations; shared or
+   ambiguous issue counters cannot be copied to multiple PRs. The typed
+   session/round/counter parser keeps malformed values and mode markers
+   explicit, but a syntactically valid session candidate still needs
+   source-backed admission provenance before reuse.
 4. Build the production import writer from revalidated legacy sources and
    activation decisions, then mint initialized/renewed origin variants,
    checkpoint receipts and the archived-source audit required by the

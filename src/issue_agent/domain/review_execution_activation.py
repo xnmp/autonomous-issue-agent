@@ -9,13 +9,14 @@ from types import MappingProxyType
 import hashlib
 import json
 
+from .agent_task import RuntimeName
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from .review_workflow import ReviewedBaseline
 from .contracts import CommandId
 from .review_workflow_policy import ReviewSubmissionReceipt
 from .review_execution import (
     ReviewExecutionBinding, ReviewRoundIdentity, ReviewRoundOutcome, PaidReviewProgress, CopiedReviewProgress,
-    same_execution_episode,
+    same_execution_episode, is_review_session_mode_marker, validate_review_session_handle,
 )
 from .review_rounds import (
     ReviewRoundFacts, ReviewSubmissionConfirmed, ReviewSubmissionKind,
@@ -64,6 +65,286 @@ class LegacyExecutionCounterRecord:
 
 
 LegacyExecutionEntry = LegacyExecutionPRRecord | LegacyExecutionCounterRecord | UnmappedLegacyEntry
+
+
+class LegacyReviewSessionEncoding(str, Enum):
+    BARE_CLAUDE = "bare_claude"
+    RUNTIME_TAG = "runtime_tag"
+    LEGACY_ENUM_TAG = "legacy_enum_tag"
+
+
+@dataclass(frozen=True)
+class LegacyReviewSessionCandidate:
+    """Parsed file value; its source admission and reuse remain unproved."""
+
+    runtime: RuntimeName
+    handle: str
+    encoding: LegacyReviewSessionEncoding
+    file_digest: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.runtime, RuntimeName) or not isinstance(self.encoding, LegacyReviewSessionEncoding):
+            raise ValueError("legacy session candidate requires runtime and encoding")
+        if self.encoding is LegacyReviewSessionEncoding.BARE_CLAUDE and self.runtime is not RuntimeName.CLAUDE:
+            raise ValueError("bare legacy session belongs to Claude")
+        validate_review_session_handle(self.handle)
+        if (not isinstance(self.file_digest, str) or len(self.file_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.file_digest)):
+            raise ValueError("legacy session candidate requires its source digest")
+
+
+@dataclass(frozen=True)
+class LegacyReviewSessionModeMarker:
+    """Legacy mode state from the session file; never a reusable handle."""
+
+    runtime: RuntimeName
+    marker: str
+    encoding: LegacyReviewSessionEncoding
+    file_digest: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.runtime, RuntimeName)
+                or not isinstance(self.encoding, LegacyReviewSessionEncoding)
+                or self.encoding is LegacyReviewSessionEncoding.BARE_CLAUDE
+                and self.runtime is not RuntimeName.CLAUDE
+                or not is_review_session_mode_marker(self.marker)
+                or not isinstance(self.file_digest, str) or len(self.file_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.file_digest)):
+            raise ValueError("legacy review mode marker requires its runtime and file source")
+
+
+@dataclass(frozen=True)
+class LegacyExecutionNumber:
+    """A parsed, present file counter or round value."""
+
+    value: int
+    file_digest: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_integer(self.value, "legacy execution number")
+        if (not isinstance(self.file_digest, str) or len(self.file_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.file_digest)):
+            raise ValueError("legacy execution number requires its source digest")
+
+
+@dataclass(frozen=True)
+class BlockedLegacyExecutionValue:
+    source: LegacyFile
+    reason: str
+
+    def __post_init__(self) -> None:
+        _files(self.source)
+        validate_workflow_text(self.reason, "blocked legacy execution value")
+
+
+def parse_legacy_review_session(
+    source: LegacyFile,
+) -> LegacyAbsent | LegacyReviewSessionCandidate | LegacyReviewSessionModeMarker | BlockedLegacyExecutionValue:
+    """Preserve runtime tagging without granting a reusable session."""
+    _files(source)
+    if isinstance(source, LegacyAbsent):
+        return source
+    if isinstance(source, LegacyUnreadable):
+        return BlockedLegacyExecutionValue(source, "legacy review session file is unreadable")
+    raw = source.text.strip()
+    if not raw:
+        return BlockedLegacyExecutionValue(source, "legacy review session file is empty")
+    if ":" not in raw:
+        runtime, handle, encoding = RuntimeName.CLAUDE, raw, LegacyReviewSessionEncoding.BARE_CLAUDE
+    else:
+        tag, handle = raw.split(":", 1)
+        named_runtime = next((candidate for candidate in RuntimeName if candidate.value == tag), None)
+        if named_runtime is not None:
+            runtime, encoding = named_runtime, LegacyReviewSessionEncoding.RUNTIME_TAG
+        elif tag.startswith("RuntimeName.") and tag.removeprefix("RuntimeName.") in RuntimeName.__members__:
+            runtime = RuntimeName[tag.removeprefix("RuntimeName.")]
+            encoding = LegacyReviewSessionEncoding.LEGACY_ENUM_TAG
+        else:
+            return BlockedLegacyExecutionValue(source, "legacy review session runtime tag is unknown")
+    if is_review_session_mode_marker(handle):
+        return LegacyReviewSessionModeMarker(runtime, handle, encoding, source.digest)
+    try:
+        return LegacyReviewSessionCandidate(runtime, handle, encoding, source.digest)
+    except ValueError:
+        return BlockedLegacyExecutionValue(source, "legacy review session handle is unusable")
+
+
+def _parse_legacy_execution_number(source: LegacyFile) -> LegacyExecutionNumber | BlockedLegacyExecutionValue:
+    _files(source)
+    if isinstance(source, LegacyAbsent):
+        return BlockedLegacyExecutionValue(source, "legacy execution number source disappeared")
+    if isinstance(source, LegacyUnreadable):
+        return BlockedLegacyExecutionValue(source, "legacy execution number file is unreadable")
+    raw = source.text.strip()
+    if not raw.isascii() or not raw.isdecimal() or len(raw) > 19:
+        return BlockedLegacyExecutionValue(source, "legacy execution number is malformed")
+    number = int(raw)
+    if number > 2**63 - 1:
+        return BlockedLegacyExecutionValue(source, "legacy execution number exceeds the supported range")
+    return LegacyExecutionNumber(number, source.digest)
+
+
+def parse_legacy_review_round(
+    record: LegacyExecutionPRRecord,
+) -> LegacyAbsent | LegacyExecutionNumber | BlockedLegacyExecutionValue:
+    if not isinstance(record, LegacyExecutionPRRecord):
+        raise ValueError("legacy round parsing requires a PR file record")
+    if isinstance(record.round, LegacyAbsent):
+        return record.round
+    return _parse_legacy_execution_number(record.round)
+
+
+def parse_legacy_review_counter(
+    record: LegacyExecutionCounterRecord,
+) -> LegacyExecutionNumber | BlockedLegacyExecutionValue:
+    if not isinstance(record, LegacyExecutionCounterRecord):
+        raise ValueError("legacy counter parsing requires a signed counter record")
+    return _parse_legacy_execution_number(record.infra_deaths)
+
+
+MAX_LEGACY_EXECUTION_FILE_ENTRIES = 16384
+MAX_LEGACY_EXECUTION_FILE_BYTES = 2**26
+
+
+@dataclass(frozen=True)
+class ParsedLegacyExecutionPR:
+    source: LegacyExecutionPRRecord
+    session: LegacyAbsent | LegacyReviewSessionCandidate | LegacyReviewSessionModeMarker
+    round: LegacyAbsent | LegacyExecutionNumber
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyExecutionPRRecord)
+                or not isinstance(self.session, (LegacyAbsent, LegacyReviewSessionCandidate,
+                                                 LegacyReviewSessionModeMarker))
+                or not isinstance(self.round, (LegacyAbsent, LegacyExecutionNumber))
+                or isinstance(self.source.session, LegacyAbsent) and isinstance(self.source.round, LegacyAbsent)
+                or self.session != parse_legacy_review_session(self.source.session)
+                or self.round != parse_legacy_review_round(self.source)):
+            raise ValueError("parsed legacy PR values disagree with their file source")
+
+
+@dataclass(frozen=True)
+class ParsedLegacyExecutionCounter:
+    source: LegacyExecutionCounterRecord
+    value: LegacyExecutionNumber
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, LegacyExecutionCounterRecord)
+                or not isinstance(self.value, LegacyExecutionNumber)
+                or self.value != parse_legacy_review_counter(self.source)):
+            raise ValueError("parsed legacy counter disagrees with its file source")
+
+
+@dataclass(frozen=True)
+class CompleteLegacyExecutionFileValues:
+    """Each supplied inventory entry is parsed; root-set completeness needs a separate re-read."""
+
+    prs: tuple[ParsedLegacyExecutionPR, ...]
+    counters: tuple[ParsedLegacyExecutionCounter, ...]
+
+    def __post_init__(self) -> None:
+        sources = tuple(source for item in self.prs if isinstance(item, ParsedLegacyExecutionPR)
+                        for source in (item.source.session, item.source.round)) + tuple(
+            item.source.infra_deaths for item in self.counters if isinstance(item, ParsedLegacyExecutionCounter)
+        ) if isinstance(self.prs, tuple) and isinstance(self.counters, tuple) else ()
+        verified = tuple(_legacy_file_size_matches(source) for source in sources)
+        if (not isinstance(self.prs, tuple) or not isinstance(self.counters, tuple)
+                or len(self.prs) + len(self.counters) > MAX_LEGACY_EXECUTION_FILE_ENTRIES
+                or any(not isinstance(item, ParsedLegacyExecutionPR) for item in self.prs)
+                or any(not isinstance(item, ParsedLegacyExecutionCounter) for item in self.counters)
+                or [item.source.pr for item in self.prs] != sorted({item.source.pr for item in self.prs})
+                or [item.source.key for item in self.counters] != sorted({item.source.key for item in self.counters})
+                or not all(matches for matches, _ in verified)
+                or sum(size for _, size in verified) > MAX_LEGACY_EXECUTION_FILE_BYTES):
+            raise ValueError("complete legacy execution files require bounded unique ordered sources")
+
+    @property
+    def source_digest(self) -> str:
+        records = (
+            tuple(("pr", item.source.root, item.source.pr,
+                   _legacy_file_identity(item.source.session), _legacy_file_identity(item.source.round))
+                  for item in self.prs)
+            + tuple(("counter", item.source.root, item.source.key,
+                     _legacy_file_identity(item.source.infra_deaths)) for item in self.counters)
+        )
+        return hashlib.sha256(json.dumps(records, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyExecutionFileValues:
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_text(self.reason, "blocked legacy execution files")
+
+
+def _legacy_file_identity(source: LegacyFile) -> tuple[str, str | None]:
+    if isinstance(source, LegacyAbsent):
+        return ("absent", None)
+    if isinstance(source, LegacyPresent):
+        return ("present", source.digest)
+    return ("unreadable", source.reason)
+
+
+def _legacy_file_size_matches(source: LegacyFile) -> tuple[bool, int]:
+    if not isinstance(source, LegacyPresent):
+        return (True, 0)
+    try:
+        raw = source.text.encode("utf-8")
+    except UnicodeEncodeError:
+        return (False, 0)
+    return (hashlib.sha256(raw).hexdigest() == source.digest, len(raw))
+
+
+def classify_legacy_execution_file_values(
+    entries: tuple[LegacyExecutionEntry, ...],
+) -> CompleteLegacyExecutionFileValues | BlockedLegacyExecutionFileValues:
+    """Bind parsed values to every inventoried root/key; never assign issues to PRs here."""
+    if not isinstance(entries, tuple) or any(not isinstance(entry, (
+        LegacyExecutionPRRecord, LegacyExecutionCounterRecord, UnmappedLegacyEntry,
+    )) for entry in entries):
+        raise ValueError("legacy execution parsing requires typed inventory entries")
+    if len(entries) > MAX_LEGACY_EXECUTION_FILE_ENTRIES:
+        return BlockedLegacyExecutionFileValues("legacy execution file inventory exceeds its row bound")
+    prs: list[ParsedLegacyExecutionPR] = []
+    counters: list[ParsedLegacyExecutionCounter] = []
+    seen_prs: set[int] = set()
+    seen_counters: set[int] = set()
+    total_bytes = 0
+    for entry in entries:
+        if isinstance(entry, UnmappedLegacyEntry):
+            return BlockedLegacyExecutionFileValues("legacy execution inventory has an unmapped source")
+        files = ((entry.session, entry.round) if isinstance(entry, LegacyExecutionPRRecord)
+                 else (entry.infra_deaths,))
+        for source in files:
+            matches, size = _legacy_file_size_matches(source)
+            total_bytes += size
+            if not matches or total_bytes > MAX_LEGACY_EXECUTION_FILE_BYTES:
+                return BlockedLegacyExecutionFileValues("legacy execution file digest or total byte bound disagrees")
+        if isinstance(entry, LegacyExecutionPRRecord):
+            if entry.pr in seen_prs:
+                return BlockedLegacyExecutionFileValues("legacy execution PR is duplicated across roots")
+            seen_prs.add(entry.pr)
+            session = parse_legacy_review_session(entry.session)
+            round_value = parse_legacy_review_round(entry)
+            if isinstance(session, BlockedLegacyExecutionValue) or isinstance(round_value, BlockedLegacyExecutionValue):
+                return BlockedLegacyExecutionFileValues("legacy execution PR has an unreadable or malformed value")
+            try:
+                prs.append(ParsedLegacyExecutionPR(entry, session, round_value))
+            except ValueError:
+                return BlockedLegacyExecutionFileValues("legacy execution PR lacks its file source")
+        else:
+            if entry.key in seen_counters:
+                return BlockedLegacyExecutionFileValues("legacy execution counter is duplicated across roots")
+            seen_counters.add(entry.key)
+            value = parse_legacy_review_counter(entry)
+            if isinstance(value, BlockedLegacyExecutionValue):
+                return BlockedLegacyExecutionFileValues("legacy execution counter has an unreadable or malformed value")
+            counters.append(ParsedLegacyExecutionCounter(entry, value))
+    return CompleteLegacyExecutionFileValues(
+        tuple(sorted(prs, key=lambda item: item.source.pr)),
+        tuple(sorted(counters, key=lambda item: item.source.key)),
+    )
 
 
 class LegacyReviewRunState(str, Enum):

@@ -60,7 +60,12 @@ from issue_agent.domain.review_rounds import ReviewRoundFacts, ReviewRoundPlan, 
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.review_execution_activation import (
-    LegacyExecutionCounterRecord, LegacyExecutionPRRecord, LegacyExecutionRunRecord, LegacyReviewRunState,
+    LegacyExecutionCounterRecord, LegacyExecutionNumber, LegacyExecutionPRRecord,
+    LegacyExecutionRunRecord, LegacyReviewRunState, LegacyReviewSessionCandidate,
+    LegacyReviewSessionModeMarker,
+    parse_legacy_review_counter, parse_legacy_review_round, parse_legacy_review_session,
+    classify_legacy_execution_file_values, CompleteLegacyExecutionFileValues,
+    BlockedLegacyExecutionFileValues,
     UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
     CompleteLegacyReviewSubmissions, BlockedLegacyReviewSubmissions,
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
@@ -127,6 +132,17 @@ def test_inventory_keeps_both_counter_namespaces_and_runtime_session_bytes(tmp_p
     assert set(counters) == {-7, 99}
     assert isinstance(counters[-7].infra_deaths, LegacyPresent) and counters[-7].infra_deaths.text == "3"
     assert isinstance(counters[99].infra_deaths, LegacyPresent) and counters[99].infra_deaths.text == "1"
+    session = parse_legacy_review_session(prs[7].session)
+    assert isinstance(session, LegacyReviewSessionCandidate)
+    assert (session.runtime.value, session.handle, session.file_digest) == (
+        "codex", "session-1", prs[7].session.digest,
+    )
+    assert parse_legacy_review_round(prs[7]) == LegacyExecutionNumber(4, prs[7].round.digest)
+    assert parse_legacy_review_counter(counters[-7]) == LegacyExecutionNumber(3, counters[-7].infra_deaths.digest)
+    complete = classify_legacy_execution_file_values(entries)
+    assert isinstance(complete, CompleteLegacyExecutionFileValues)
+    assert [item.source.pr for item in complete.prs] == [7, 8]
+    assert [item.source.key for item in complete.counters] == [-7, 99]
 
 
 def test_unreadable_files_remain_distinct_from_absent_files(tmp_path):
@@ -147,6 +163,18 @@ def test_unreadable_files_remain_distinct_from_absent_files(tmp_path):
     assert prs[10].round == LegacyUnreadable("symbolic link")
     assert counters[-10].infra_deaths == LegacyUnreadable("not valid UTF-8")
     assert prs[7].round == LegacyAbsent()
+
+
+def test_legacy_mode_marker_file_is_inventoried_as_nonreusable_state(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pr-7.session").write_text("codex:multi")
+
+    complete = classify_legacy_execution_file_values(read_legacy_execution_state(str(state)))
+
+    assert isinstance(complete, CompleteLegacyExecutionFileValues)
+    assert isinstance(complete.prs[0].session, LegacyReviewSessionModeMarker)
+    assert complete.prs[0].session.marker == "multi"
 
 
 def test_malformed_legacy_names_remain_visible_and_other_names_are_ignored(tmp_path):
@@ -197,6 +225,37 @@ def test_missing_and_non_directory_roots_are_explicit(tmp_path):
     (entry,) = read_legacy_execution_state(str(bad))
     assert isinstance(entry, UnmappedLegacyEntry)
     assert entry.root == "review" and "unreadable" in entry.reason
+
+
+def test_file_inventory_refuses_directory_and_retained_byte_excess(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    for number in (7, 8, 9):
+        (state / f"pr-{number}.round").write_text("1")
+    monkeypatch.setattr(review_activation, "MAX_LEGACY_EXECUTION_FILE_ENTRIES", 2)
+    (blocked,) = read_legacy_execution_state(str(state))
+    assert isinstance(blocked, UnmappedLegacyEntry) and "entry bound" in blocked.reason
+
+    monkeypatch.setattr(review_activation, "MAX_LEGACY_EXECUTION_FILE_ENTRIES", 3)
+    monkeypatch.setattr(review_activation, "MAX_LEGACY_EXECUTION_FILE_BYTES", 2)
+    (blocked,) = read_legacy_execution_state(str(state))
+    assert isinstance(blocked, UnmappedLegacyEntry) and "byte bound" in blocked.reason
+
+
+def test_listed_file_disappearance_is_unreadable_not_absent(tmp_path, monkeypatch):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pr-7.session").write_text("codex:handle")
+    (state / "issue--7.infra-deaths").write_text("1")
+    monkeypatch.setattr(review_activation, "_read_legacy_file", lambda _path: LegacyAbsent())
+
+    entries = read_legacy_execution_state(str(state))
+
+    pr = next(entry for entry in entries if isinstance(entry, LegacyExecutionPRRecord))
+    counter = next(entry for entry in entries if isinstance(entry, LegacyExecutionCounterRecord))
+    assert isinstance(pr.session, LegacyUnreadable) and "disappeared" in pr.session.reason
+    assert isinstance(counter.infra_deaths, LegacyUnreadable) and "disappeared" in counter.infra_deaths.reason
+    assert isinstance(classify_legacy_execution_file_values(entries), BlockedLegacyExecutionFileValues)
 
 
 OWNER = "o/r:review:owner"
