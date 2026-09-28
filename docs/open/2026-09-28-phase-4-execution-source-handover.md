@@ -55,6 +55,10 @@ with `CLAUDE.md`, `AGENTS.md`, the
   repository. It preserves all 13 columns, malformed and oversized rows,
   negative/zero rowids and matching BLOB aliases. A page is an observation,
   not a complete round inventory or a productive-outcome proof.
+- Checkpoint 40 exhausts those pages within bounded total row and byte limits,
+  including a one-million-row ceiling on the shared round table. A second SQL
+  read blocks partial or changed caller-held inventories. This proves source
+  completeness within the stated bounds, not a productive outcome or reset.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -79,6 +83,14 @@ and both Pyrefly checks. Ten strict xfails remained expected. The log is
 `/tmp/phase4-round-source-gate.log` (ephemeral). Independent Sol review found
 no medium or high issue in the bounded round row reader.
 
+The checkpoint-40 full `make test` gate passed: 3,192 domain, 2,912 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-complete-rounds-gate.log` (ephemeral). Independent Sol review
+found the initial scan could traverse unlimited foreign-repository rows;
+the global table bound addresses that finding, and its second pass found no
+remaining medium or high issue.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -92,9 +104,9 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Complete and revalidate the round page scan, join bounded outcome receipts,
-   then use verified command-to-round links with plain recorded baselines to
-   prove confirmed productive outcomes and ordered resets. Verify escalated verdict
+2. Join bounded outcome receipts to the complete round inventory, then use
+   verified command-to-round links with plain recorded baselines to prove
+   confirmed productive outcomes and ordered resets. Verify escalated verdict
    hold provenance and classify unrecorded or stale successful commands
    separately. A completed
    agent run is not itself a productive review; unknown death or reset

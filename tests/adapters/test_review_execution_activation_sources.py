@@ -4,6 +4,7 @@ from contextlib import closing
 
 import pytest
 
+import issue_agent.adapters.review_execution_activation as review_activation
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
@@ -12,6 +13,7 @@ from issue_agent.adapters.review_execution_activation import (
     read_legacy_review_submission_receipt_page, MAX_SUBMISSION_RECEIPT_SOURCE_PAGE,
     read_legacy_review_owner_lineage,
     read_legacy_review_round_page, MAX_REVIEW_ROUND_SOURCE_PAGE,
+    read_complete_legacy_review_rounds, revalidate_complete_legacy_review_rounds,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
@@ -23,6 +25,7 @@ from issue_agent.domain.review_execution_activation import (
     LegacyReviewOwnerLineage, UnreadableLegacyReviewOwnerLineage,
     CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
     LegacyReviewRoundSource, UnreadableLegacyReviewRound, MAX_LEGACY_ROUND_JSON_BYTES,
+    CompleteLegacyReviewRounds, BlockedLegacyReviewRounds,
 )
 from tests.adapters.test_review_execution_control import rig
 
@@ -203,11 +206,14 @@ def test_round_inventory_pages_at_bounded_row_count(rig):
         db.execute("BEGIN")
         first = read_legacy_review_round_page(db, "o/r")
         second = read_legacy_review_round_page(db, "o/r", after_rowid=first.next_rowid)
+        complete = read_complete_legacy_review_rounds(db, "o/r")
         db.rollback()
 
     assert len(first.entries) == MAX_REVIEW_ROUND_SOURCE_PAGE and first.has_more
     assert len(second.entries) == 2 and not second.has_more
     assert first.next_rowid < second.entries[0].source_rowid
+    assert isinstance(complete, CompleteLegacyReviewRounds)
+    assert len(complete.rounds) == MAX_REVIEW_ROUND_SOURCE_PAGE + 2
 
 
 def test_round_inventory_pages_before_exceeding_retained_byte_budget(rig):
@@ -235,6 +241,86 @@ def test_round_inventory_pages_before_exceeding_retained_byte_budget(rig):
     assert len(second.entries) == 1 and not second.has_more
     assert isinstance(first.entries[0], LegacyReviewRoundSource)
     assert isinstance(second.entries[0], LegacyReviewRoundSource)
+
+
+def test_complete_round_inventory_revalidates_same_sql_sources_without_writes(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        observed = read_complete_legacy_review_rounds(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewRounds)
+        revalidated = revalidate_complete_legacy_review_rounds(db, observed)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(revalidated, CompleteLegacyReviewRounds)
+    assert tuple(dict(source.fields)["round_id"] for source in revalidated.rounds) == (plan.round.round_id,)
+    assert revalidated.source_digest == observed.source_digest
+
+
+def test_complete_round_inventory_rejects_partial_or_changed_observation(rig):
+    store, _, _, selection, control = rig
+    control.preflight(selection)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_rounds(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewRounds)
+        partial = CompleteLegacyReviewRounds("o/r", ())
+        assert isinstance(revalidate_complete_legacy_review_rounds(db, partial), BlockedLegacyReviewRounds)
+        db.rollback()
+    with store.transaction() as db:
+        db.execute("UPDATE review_execution_rounds SET plan_json='{}'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = revalidate_complete_legacy_review_rounds(db, observed)
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewRounds)
+    assert "changed" in result.reason
+
+
+def test_complete_round_inventory_blocks_unreadable_source(rig):
+    store, _, _, selection, control = rig
+    control.preflight(selection)
+    with store.transaction() as db:
+        db.execute("UPDATE review_execution_rounds SET plan_json=?",
+                   ("x" * (MAX_LEGACY_ROUND_JSON_BYTES + 1),))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = read_complete_legacy_review_rounds(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewRounds)
+    assert result.source_rowid is not None
+
+
+def test_complete_round_inventory_bounds_unrelated_table_rows(rig, monkeypatch):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    with closing(store._connect()) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("BEGIN")
+        for index in (2, 3):
+            db.execute(
+                "INSERT INTO review_execution_rounds "
+                "(round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
+                "generation,sequence,claim_occurrence_id,plan_json,planning_json) "
+                "SELECT ?,?,target_kind,target_number,execution_epoch,execution_episode,"
+                "generation,?,claim_occurrence_id,plan_json,planning_json "
+                "FROM review_execution_rounds WHERE round_id=?",
+                (f"foreign-round-{index}", "other/repo", index, plan.round.round_id),
+            )
+        db.commit()
+    monkeypatch.setattr(review_activation, "MAX_LEGACY_ROUND_SCAN_ROWS", 2)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = read_complete_legacy_review_rounds(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewRounds)
+    assert "total scan bound" in result.reason
 
 
 def _control(tmp_path):

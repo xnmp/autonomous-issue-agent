@@ -31,6 +31,8 @@ from ..domain.review_execution_activation import (
     VerifiedReviewSubmissionRoundLink, UnverifiedReviewSubmissionRoundLink,
     LEGACY_REVIEW_ROUND_COLUMNS, MAX_LEGACY_ROUND_JSON_BYTES, MAX_LEGACY_ROUND_PAGE_BYTES,
     LegacyReviewRoundPage, LegacyReviewRoundSource, UnreadableLegacyReviewRound,
+    CompleteLegacyReviewRounds, BlockedLegacyReviewRounds,
+    MAX_LEGACY_ROUND_INVENTORY_ROWS, MAX_LEGACY_ROUND_INVENTORY_BYTES,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
 from ..domain.review_execution import ExecutionNotActivated
@@ -58,6 +60,7 @@ _SIGNED = re.compile(r"-?[1-9][0-9]{0,18}")
 _MAX_NUMBER = 2**63 - 1
 MAX_RUN_SOURCE_PAGE = 256
 MAX_LEGACY_RUN_SCAN_ROWS = 1_000_000
+MAX_LEGACY_ROUND_SCAN_ROWS = 1_000_000
 MAX_SUBMISSION_SOURCE_PAGE = 64
 MAX_SUBMISSION_RECEIPT_SOURCE_PAGE = 64
 MAX_REVIEW_ROUND_SOURCE_PAGE = 16
@@ -467,7 +470,7 @@ def read_legacy_review_round_page(
         f"SELECT rowid AS source_rowid,max({','.join(json_sizes)}) AS largest_json,"
         f"max({','.join(other_sizes)}) AS largest_other,"
         f"{'+'.join(json_sizes + other_sizes)} AS total_bytes "
-        f"FROM review_execution_rounds {predicate} ORDER BY rowid LIMIT ?",
+        f"FROM review_execution_rounds NOT INDEXED {predicate} ORDER BY rowid LIMIT ?",
         (*params, MAX_REVIEW_ROUND_SOURCE_PAGE + 1),
     ).fetchall()
     selected: list[sqlite3.Row] = []
@@ -522,6 +525,55 @@ def read_legacy_review_round_page(
         tuple(entries), selected[-1]["source_rowid"] if selected else after_rowid,
         len(metadata) > len(selected),
     )
+
+
+def read_complete_legacy_review_rounds(
+    db: sqlite3.Connection, repository: str,
+) -> CompleteLegacyReviewRounds | BlockedLegacyReviewRounds:
+    """Scan every round source once; a partial page is never import evidence."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("complete review round scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("complete review round scan requires a canonical repository")
+    if db.execute(
+        "SELECT rowid FROM review_execution_rounds NOT INDEXED ORDER BY rowid LIMIT 1 OFFSET ?",
+        (MAX_LEGACY_ROUND_SCAN_ROWS,),
+    ).fetchone() is not None:
+        return BlockedLegacyReviewRounds(repository, "review round table exceeds its total scan bound")
+    rounds: list[LegacyReviewRoundSource] = []
+    source_bytes = 0
+    cursor = None
+    while True:
+        page = read_legacy_review_round_page(db, repository, after_rowid=cursor)
+        for entry in page.entries:
+            if isinstance(entry, UnreadableLegacyReviewRound):
+                return BlockedLegacyReviewRounds(repository, entry.reason, entry.source_rowid)
+            source_bytes += entry.source_bytes
+            if len(rounds) >= MAX_LEGACY_ROUND_INVENTORY_ROWS or source_bytes > MAX_LEGACY_ROUND_INVENTORY_BYTES:
+                return BlockedLegacyReviewRounds(repository, "review round inventory exceeds its total bound",
+                                                 entry.source_rowid)
+            rounds.append(entry)
+        if not page.has_more:
+            break
+        cursor = page.next_rowid
+    try:
+        return CompleteLegacyReviewRounds(repository, tuple(rounds))
+    except ValueError as exc:
+        return BlockedLegacyReviewRounds(repository, str(exc)[:512])
+
+
+def revalidate_complete_legacy_review_rounds(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewRounds,
+) -> CompleteLegacyReviewRounds | BlockedLegacyReviewRounds:
+    """Re-read the whole repository before accepting a caller-held inventory."""
+    if not isinstance(observed, CompleteLegacyReviewRounds):
+        raise ValueError("round revalidation requires a complete observed inventory")
+    current = read_complete_legacy_review_rounds(db, observed.repository)
+    if isinstance(current, BlockedLegacyReviewRounds):
+        return current
+    if current.source_digest != observed.source_digest:
+        return BlockedLegacyReviewRounds(observed.repository, "review round sources changed after inventory")
+    return current
 
 
 def read_legacy_review_owner_lineage(

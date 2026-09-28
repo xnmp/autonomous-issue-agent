@@ -465,6 +465,51 @@ class LegacyReviewRoundPage:
             raise ValueError("review round page cannot continue without a cursor")
 
 
+MAX_LEGACY_ROUND_INVENTORY_ROWS = 65536
+MAX_LEGACY_ROUND_INVENTORY_BYTES = 2**26
+
+
+@dataclass(frozen=True)
+class CompleteLegacyReviewRounds:
+    """A bounded whole-repository observation; activation must recheck SQL."""
+
+    repository: str
+    rounds: tuple[LegacyReviewRoundSource, ...]
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository or not isinstance(self.rounds, tuple):
+            raise ValueError("complete review rounds require a canonical repository and tuple")
+        if (len(self.rounds) > MAX_LEGACY_ROUND_INVENTORY_ROWS
+                or any(not isinstance(source, LegacyReviewRoundSource)
+                       or dict(source.fields)["repository"] != self.repository for source in self.rounds)
+                or sum(source.source_bytes for source in self.rounds) > MAX_LEGACY_ROUND_INVENTORY_BYTES):
+            raise ValueError("complete review rounds require bounded readable repository sources")
+        identities = [dict(source.fields) for source in self.rounds]
+        if (len({row["round_id"] for row in identities}) != len(identities)
+                or len({(row["target_number"], row["execution_epoch"], row["execution_episode"], row["sequence"])
+                        for row in identities}) != len(identities)):
+            raise ValueError("complete review rounds require unique round and sequence identities")
+
+    @property
+    def source_digest(self) -> str:
+        parts = tuple(sorted((dict(source.fields)["round_id"], source.source_digest) for source in self.rounds))
+        return hashlib.sha256(json.dumps((self.repository, parts), separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewRounds:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked review rounds require a canonical repository")
+        validate_workflow_text(self.reason, "blocked review round reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked review round cursor")
+
+
 MAX_LEGACY_REVIEW_OWNERS = 64
 
 

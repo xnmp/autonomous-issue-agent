@@ -1032,3 +1032,23 @@ Full `make test` passed: 3,192 domain, 2,908 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-round-source-gate.log` (ephemeral).
+
+## Checkpoint 40 — complete bounded round inventory and SQL revalidation (offline)
+
+The execution activation reader now exhausts the bounded round pages for one
+repository in a single SQL snapshot. It returns a complete typed set only when
+every page is readable, at most 65,536 round rows and 64 MiB of source data
+are retained, and the shared round table has at most one million rows to
+examine. Foreign-repository rows count toward that scan ceiling. Duplicate
+round or episode-sequence identities, malformed rows and over-bound scans
+return an explicit blocker. A separate read compares a caller-held complete
+set against SQL before activation can trust it, so a partial or changed set
+cannot masquerade as complete. This remains offline evidence, not a
+productive-outcome or reset proof. Independent Sol review found the initial
+repository-filtered rowid scan could traverse an unbounded shared table; the
+global scan ceiling and regression address that issue. Its second pass found
+no remaining medium or high issue.
+Full `make test` passed: 3,192 domain, 2,912 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-complete-rounds-gate.log` (ephemeral).
