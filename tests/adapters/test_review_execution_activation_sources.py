@@ -12,6 +12,8 @@ from issue_agent.adapters.control_store import SQLiteControlStore, _encoded_payl
 from issue_agent.domain.contracts import EffectReceipt, EffectStatus
 from issue_agent.adapters.review_execution_activation import (
     MAX_RUN_SOURCE_PAGE, MAX_SUBMISSION_SOURCE_PAGE, read_legacy_execution_roots, read_legacy_execution_state,
+    read_complete_legacy_execution_root_files, revalidate_complete_legacy_execution_file_values,
+    CompleteLegacyExecutionRootFiles,
     read_complete_legacy_review_runs, read_legacy_review_run_page, read_legacy_review_submission_page,
     read_complete_legacy_review_submissions, revalidate_complete_legacy_review_submissions,
     revalidate_complete_legacy_review_runs,
@@ -256,6 +258,167 @@ def test_listed_file_disappearance_is_unreadable_not_absent(tmp_path, monkeypatc
     assert isinstance(pr.session, LegacyUnreadable) and "disappeared" in pr.session.reason
     assert isinstance(counter.infra_deaths, LegacyUnreadable) and "disappeared" in counter.infra_deaths.reason
     assert isinstance(classify_legacy_execution_file_values(entries), BlockedLegacyExecutionFileValues)
+
+
+def test_complete_legacy_file_roots_revalidate_without_writes(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "pr-7.session").write_text("codex:handle")
+    (second / "issue--7.infra-deaths").write_text("2")
+    roots = (("first", str(first)), ("second", str(second)))
+    before = {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in (
+        first / "pr-7.session", second / "issue--7.infra-deaths",
+    )}
+
+    observed = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(observed, CompleteLegacyExecutionRootFiles)
+    current = revalidate_complete_legacy_execution_file_values(roots, observed)
+
+    assert current == observed
+    assert current.source_digest == observed.source_digest
+    assert {path: (path.stat().st_mtime_ns, path.read_bytes()) for path in before} == before
+
+
+@pytest.mark.parametrize("mutation", ("change", "add", "remove", "malformed", "duplicate"))
+def test_complete_legacy_file_roots_block_changed_or_partial_sources(tmp_path, mutation):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    session = first / "pr-7.session"
+    session.write_text("codex:handle")
+    roots = (("first", str(first)), ("second", str(second)))
+    observed = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(observed, CompleteLegacyExecutionRootFiles)
+
+    if mutation == "change":
+        session.write_text("codex:other")
+    elif mutation == "add":
+        (second / "issue--7.infra-deaths").write_text("1")
+    elif mutation == "remove":
+        session.unlink()
+    elif mutation == "malformed":
+        session.write_text("unknown:handle")
+    else:
+        (second / "pr-7.round").write_text("2")
+
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots, observed),
+                      BlockedLegacyExecutionFileValues)
+
+
+def test_complete_legacy_file_roots_bind_empty_and_alias_configuration(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "pr-7.round").write_text("1")
+    alias = tmp_path / "alias"
+    alias.symlink_to(first)
+    roots = (("first", str(first)), ("alias", str(alias)), ("empty", str(second)))
+    observed = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(observed, CompleteLegacyExecutionRootFiles)
+    assert len(observed.roots) == 3
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots, observed),
+                      CompleteLegacyExecutionRootFiles)
+
+    alias.unlink()
+    alias.symlink_to(second)
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots, observed),
+                      BlockedLegacyExecutionFileValues)
+    alias.unlink()
+    alias.symlink_to(first)
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots[:-1], observed),
+                      BlockedLegacyExecutionFileValues)
+
+
+def test_complete_legacy_file_roots_block_invented_partial_and_invalid_configuration(tmp_path):
+    state = tmp_path / "state"
+    state.mkdir()
+    (state / "pr-7.round").write_text("1")
+    roots = (("review", str(state)),)
+    observed = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(observed, CompleteLegacyExecutionRootFiles)
+    partial = CompleteLegacyExecutionRootFiles(observed.roots, CompleteLegacyExecutionFileValues((), ()))
+
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots, partial),
+                      BlockedLegacyExecutionFileValues)
+    assert isinstance(revalidate_complete_legacy_execution_file_values((("review", ""),), observed),
+                      BlockedLegacyExecutionFileValues)
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots, observed.values),
+                      BlockedLegacyExecutionFileValues)
+
+
+def test_complete_legacy_file_roots_block_missing_root_replacement(tmp_path):
+    missing = tmp_path / "missing"
+    roots = (("review", str(missing)),)
+    observed = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(observed, CompleteLegacyExecutionRootFiles)
+    assert observed.roots[0].directory_identity is None
+
+    missing.mkdir()
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots, observed),
+                      BlockedLegacyExecutionFileValues)
+
+
+def test_complete_legacy_file_roots_bind_same_content_to_physical_directory(tmp_path):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    for path in (first, second):
+        (path / "pr-7.round").write_text("1")
+    alias = tmp_path / "alias"
+    alias.symlink_to(first)
+    roots = (("review", str(alias)),)
+    observed = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(observed, CompleteLegacyExecutionRootFiles)
+
+    alias.unlink()
+    alias.symlink_to(second)
+    changed = read_complete_legacy_execution_root_files(roots)
+    assert isinstance(changed, CompleteLegacyExecutionRootFiles)
+    assert changed.values == observed.values
+    assert isinstance(revalidate_complete_legacy_execution_file_values(roots, observed),
+                      BlockedLegacyExecutionFileValues)
+
+
+def test_complete_legacy_file_roots_share_directory_entry_budget(tmp_path, monkeypatch):
+    first, second, third = (tmp_path / name for name in ("first", "second", "third"))
+    for path in (first, second, third):
+        path.mkdir()
+    for name in ("unrelated-1", "unrelated-2"):
+        (first / name).write_text("other")
+        (second / name).write_text("other")
+    (third / "pr-7.round").write_text("1")
+    scanned: list[str] = []
+    original = review_activation.read_legacy_execution_state
+
+    def record_scan(path, root="review", *, _budget=None):
+        scanned.append(root)
+        return original(path, root, _budget=_budget)
+
+    monkeypatch.setattr(review_activation, "read_legacy_execution_state", record_scan)
+    monkeypatch.setattr(review_activation, "MAX_LEGACY_EXECUTION_FILE_ENTRIES", 3)
+    result = read_complete_legacy_execution_root_files((
+        ("first", str(first)), ("second", str(second)), ("third", str(third)),
+    ))
+
+    assert isinstance(result, BlockedLegacyExecutionFileValues)
+    assert scanned == ["first", "second"]
+
+
+def test_complete_legacy_file_roots_share_retained_byte_budget(tmp_path, monkeypatch):
+    first, second = tmp_path / "first", tmp_path / "second"
+    first.mkdir()
+    second.mkdir()
+    (first / "pr-7.round").write_text("12")
+    (second / "issue--7.infra-deaths").write_text("12")
+    monkeypatch.setattr(review_activation, "MAX_LEGACY_EXECUTION_FILE_BYTES", 3)
+
+    roots = (("first", str(first)), ("second", str(second)))
+    entries = read_legacy_execution_roots(roots)
+    result = read_complete_legacy_execution_root_files(roots)
+
+    assert any(isinstance(entry, UnmappedLegacyEntry) and "byte bound" in entry.reason for entry in entries)
+    assert isinstance(result, BlockedLegacyExecutionFileValues)
 
 
 OWNER = "o/r:review:owner"

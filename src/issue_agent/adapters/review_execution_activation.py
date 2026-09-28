@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import sqlite3
 import hashlib
 import json
@@ -21,6 +22,8 @@ from ..domain.review_execution_activation import (
     MAX_LEGACY_SQL_TEXT_BYTES, MAX_SQL_ROWID, MIN_SQL_ROWID, LegacyExecutionCounterRecord,
     LegacyExecutionEntry, LegacyExecutionPRRecord,
     MAX_LEGACY_EXECUTION_FILE_ENTRIES, MAX_LEGACY_EXECUTION_FILE_BYTES,
+    CompleteLegacyExecutionFileValues, BlockedLegacyExecutionFileValues,
+    classify_legacy_execution_file_values,
     LegacyExecutionRunPage, LegacyExecutionRunRecord, LegacyReviewRunState, UnreadableLegacyExecutionRun,
     CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
     MAX_LEGACY_RUN_INVENTORY_ROWS, MAX_LEGACY_RUN_INVENTORY_BYTES,
@@ -118,6 +121,7 @@ MAX_OUTCOME_RECEIPT_PAGE_BYTES = 2**24
 MAX_OUTCOME_RECEIPT_SCAN_ROWS = 1_000_000
 MAX_OUTCOME_RECEIPT_SCAN_CHUNK = 256
 MAX_LEGACY_GENERATION_RECEIPT_SCAN_ROWS = 1_000_000
+MAX_LEGACY_EXECUTION_ROOTS = 64
 _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
 _DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json")
 MAX_LEGACY_RECORDING_BYTES = 2**21
@@ -148,14 +152,26 @@ def _number(raw: str, pattern: re.Pattern[str]) -> int | None:
     return number if abs(number) <= _MAX_NUMBER else None
 
 
-def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[LegacyExecutionEntry, ...]:
+@dataclass
+class _LegacyExecutionFileBudget:
+    names: int
+    bytes: int
+
+
+def read_legacy_execution_state(
+    state_dir: str, root: str = "review", *, _budget: _LegacyExecutionFileBudget | None = None,
+) -> tuple[LegacyExecutionEntry, ...]:
     """Every legacy review execution key in one labelled root, without writes."""
+    budget = _budget if _budget is not None else _LegacyExecutionFileBudget(
+        MAX_LEGACY_EXECUTION_FILE_ENTRIES, MAX_LEGACY_EXECUTION_FILE_BYTES,
+    )
     try:
         names: list[str] = []
         with os.scandir(state_dir) as scan:
             for entry in scan:
-                if len(names) == MAX_LEGACY_EXECUTION_FILE_ENTRIES:
+                if budget.names == 0:
                     return (UnmappedLegacyEntry("<state-dir>", "legacy execution directory exceeds its entry bound", root),)
+                budget.names -= 1
                 names.append(entry.name)
         names.sort()
     except FileNotFoundError:
@@ -166,7 +182,6 @@ def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[L
     pr_files: dict[int, dict[str, LegacyFile]] = {}
     counters: list[LegacyExecutionCounterRecord] = []
     unmapped: list[UnmappedLegacyEntry] = []
-    total_bytes = 0
     for name in names:
         pr_match = _PR_NAME.fullmatch(name)
         if pr_match is not None:
@@ -179,8 +194,8 @@ def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[L
                 if isinstance(source, LegacyAbsent):
                     source = LegacyUnreadable("listed review file disappeared during inventory")
                 if isinstance(source, LegacyPresent):
-                    total_bytes += len(source.text.encode("utf-8"))
-                if total_bytes > MAX_LEGACY_EXECUTION_FILE_BYTES:
+                    budget.bytes -= len(source.text.encode("utf-8"))
+                if budget.bytes < 0:
                     return (UnmappedLegacyEntry("<state-dir>", "legacy execution files exceed their byte bound", root),)
                 pr_files.setdefault(pr, {})[suffix] = source
             continue
@@ -194,8 +209,8 @@ def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[L
                 if isinstance(source, LegacyAbsent):
                     source = LegacyUnreadable("listed review counter disappeared during inventory")
                 if isinstance(source, LegacyPresent):
-                    total_bytes += len(source.text.encode("utf-8"))
-                if total_bytes > MAX_LEGACY_EXECUTION_FILE_BYTES:
+                    budget.bytes -= len(source.text.encode("utf-8"))
+                if budget.bytes < 0:
                     return (UnmappedLegacyEntry("<state-dir>", "legacy execution files exceed their byte bound", root),)
                 counters.append(LegacyExecutionCounterRecord(key, source, root))
 
@@ -205,8 +220,119 @@ def read_legacy_execution_state(state_dir: str, root: str = "review") -> tuple[L
 
 
 def read_legacy_execution_roots(roots: LegacyRoots) -> tuple[LegacyExecutionEntry, ...]:
-    """Retain duplicate targets in distinct roots for later ambiguity checks."""
-    return tuple(entry for label, path in distinct_roots(roots) for entry in read_legacy_execution_state(path, label))
+    """Retain cross-root ambiguity while sharing one bounded scan budget."""
+    if len(roots) > MAX_LEGACY_EXECUTION_ROOTS:
+        return (UnmappedLegacyEntry("<state-dir>", "legacy execution root count exceeds its bound", "review"),)
+    budget = _LegacyExecutionFileBudget(MAX_LEGACY_EXECUTION_FILE_ENTRIES, MAX_LEGACY_EXECUTION_FILE_BYTES)
+    result: list[LegacyExecutionEntry] = []
+    for label, path in distinct_roots(roots):
+        entries = read_legacy_execution_state(path, label, _budget=budget)
+        result.extend(entries)
+        if any(isinstance(entry, UnmappedLegacyEntry) for entry in entries):
+            break
+    return tuple(result)
+
+
+@dataclass(frozen=True)
+class LegacyExecutionRootSource:
+    label: str
+    configured_path: str
+    resolved_path: str
+    directory_identity: tuple[int, int] | None
+
+    def __post_init__(self) -> None:
+        if (not all(isinstance(value, str) and value for value in (
+                self.label, self.configured_path, self.resolved_path))
+                or self.directory_identity is not None and (
+                    not isinstance(self.directory_identity, tuple) or len(self.directory_identity) != 2
+                    or any(type(value) is not int or value < 0 for value in self.directory_identity))):
+            raise ValueError("legacy execution root source is invalid")
+
+
+@dataclass(frozen=True)
+class CompleteLegacyExecutionRootFiles:
+    """Configured paths and their directory identities bind one complete file read."""
+
+    roots: tuple[LegacyExecutionRootSource, ...]
+    values: CompleteLegacyExecutionFileValues
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.roots, tuple) or len(self.roots) > MAX_LEGACY_EXECUTION_ROOTS
+                or any(not isinstance(root, LegacyExecutionRootSource) for root in self.roots)
+                or len({(root.label, root.configured_path) for root in self.roots}) != len(self.roots)
+                or not isinstance(self.values, CompleteLegacyExecutionFileValues)):
+            raise ValueError("complete legacy root files require bounded configured roots and parsed values")
+
+    @property
+    def source_digest(self) -> str:
+        source = (
+            tuple((root.label, root.configured_path, root.resolved_path, root.directory_identity)
+                  for root in self.roots),
+            self.values.source_digest,
+        )
+        return hashlib.sha256(json.dumps(source, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+def _legacy_execution_root_manifest(
+    roots: LegacyRoots,
+) -> tuple[LegacyExecutionRootSource, ...] | BlockedLegacyExecutionFileValues:
+    if (not isinstance(roots, tuple) or len(roots) > MAX_LEGACY_EXECUTION_ROOTS
+            or any(not isinstance(root, tuple) or len(root) != 2
+                   or not isinstance(root[0], str) or not root[0]
+                   or not isinstance(root[1], str) or not root[1] for root in roots)):
+        return BlockedLegacyExecutionFileValues("legacy execution root configuration is invalid")
+    sources: list[LegacyExecutionRootSource] = []
+    for label, path in roots:
+        try:
+            configured_path = os.path.abspath(path)
+            resolved_path = os.path.realpath(path)
+            try:
+                metadata = os.stat(path)
+            except FileNotFoundError:
+                identity = None
+            else:
+                if not stat.S_ISDIR(metadata.st_mode):
+                    return BlockedLegacyExecutionFileValues("legacy execution root is not a directory")
+                identity = (metadata.st_dev, metadata.st_ino)
+            sources.append(LegacyExecutionRootSource(label, configured_path, resolved_path, identity))
+        except (OSError, ValueError):
+            return BlockedLegacyExecutionFileValues("legacy execution root cannot be resolved")
+    if len({(root.label, root.configured_path) for root in sources}) != len(sources):
+        return BlockedLegacyExecutionFileValues("legacy execution root configuration is duplicated")
+    return tuple(sources)
+
+
+def read_complete_legacy_execution_root_files(
+    roots: LegacyRoots,
+) -> CompleteLegacyExecutionRootFiles | BlockedLegacyExecutionFileValues:
+    """Read each configured root with a stable path and directory identity."""
+    before = _legacy_execution_root_manifest(roots)
+    if isinstance(before, BlockedLegacyExecutionFileValues):
+        return before
+    try:
+        values = classify_legacy_execution_file_values(read_legacy_execution_roots(roots))
+    except (OSError, ValueError):
+        return BlockedLegacyExecutionFileValues("legacy execution root read failed")
+    if isinstance(values, BlockedLegacyExecutionFileValues):
+        return values
+    after = _legacy_execution_root_manifest(roots)
+    if before != after:
+        return BlockedLegacyExecutionFileValues("legacy execution roots changed during inventory")
+    return CompleteLegacyExecutionRootFiles(before, values)
+
+
+def revalidate_complete_legacy_execution_file_values(
+    roots: LegacyRoots, observed: CompleteLegacyExecutionRootFiles,
+) -> CompleteLegacyExecutionRootFiles | BlockedLegacyExecutionFileValues:
+    """Re-read all configured roots under the caller's activation barriers."""
+    if not isinstance(observed, CompleteLegacyExecutionRootFiles):
+        return BlockedLegacyExecutionFileValues("legacy execution file revalidation requires a complete observation")
+    current = read_complete_legacy_execution_root_files(roots)
+    if isinstance(current, BlockedLegacyExecutionFileValues):
+        return current
+    if current.source_digest != observed.source_digest or current != observed:
+        return BlockedLegacyExecutionFileValues("legacy execution roots or files changed or the supplied set was incomplete")
+    return current
 
 
 def _decode_run_source(

@@ -214,6 +214,27 @@ with `CLAUDE.md`, `AGENTS.md`, the
   supplied tuple is internally complete. Activation must re-read every
   configured root under its barriers, join issue counters to PRs and verify
   session provenance before granting authority.
+- Checkpoint 62 adds a configured-root file snapshot and revalidation reader.
+  Every configured path, resolved path and directory identity (including an
+  absent root) is bound to the parsed source digest. A read checks that root
+  identities stayed stable while scanning; a later read under caller-held
+  activation barriers must match the complete prior snapshot. Directory-entry
+  and retained-byte budgets are shared across all roots, so overflow stops the
+  scan before collecting every root. Tests cover partial held sets, added,
+  removed and changed files, ambiguous duplicates, empty-root changes and a
+  symlink retarget to a directory with identical file contents. This remains
+  an observational reader; the production activation transaction must hold
+  the barriers, resolve positive issue counters and prove session admission.
+
+Independent Sol review of checkpoint 62 found that the first implementation
+enforced row and byte bounds only after accumulating all configured roots.
+The scanner now shares one directory-entry and retained-byte budget across
+roots and stops on the first blocker. Multi-root overflow regressions and a
+second Sol pass found no remaining material issue. The full gate log is
+`/tmp/phase4-complete-root-files-gate.log` (ephemeral).
+The gate passed: 3,236 domain, 3,120 adapter and 2,866 app tests, plus
+hooks, governor, gate parity, four import contracts and both Pyrefly checks.
+Ten strict xfails remained expected.
 
 Independent Sol review of checkpoint 61 found that persisted session mode
 markers must be retained as distinct nonreusable evidence; this was fixed and
@@ -451,8 +472,8 @@ order a durable clock.
    block historical unregistered and old stale submissions. A completed
    agent run is not itself a productive review; unknown death or reset
    attribution blocks import with reviewable evidence.
-3. Re-read and compare the complete legacy file inventory across every
-   configured root under activation barriers. Join positive issue-keyed file
+3. Use the complete configured-root file revalidation reader inside the
+   activation barriers. Join positive issue-keyed file
    counters to PRs with fresh complete linked-issue observations; shared or
    ambiguous issue counters cannot be copied to multiple PRs. The typed
    session/round/counter parser keeps malformed values and mode markers

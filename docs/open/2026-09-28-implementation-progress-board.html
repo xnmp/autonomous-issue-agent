@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 28 Sep 2026, 20:50 AEST · Latest accepted checkpoint: legacy execution file value parsing</p>
+      <p class="meta">Updated 28 Sep 2026, 22:09 AEST · Latest accepted checkpoint: configured-root file revalidation</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Offline source replay, imported-origin hot-read checks and typed legacy file values are in place. Next: revalidate all file roots, map issue counters, prove session provenance, then build the production import writer and compaction audit. Refused ceilings and remote holds remain open. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Offline source replay, imported-origin hot-read checks and bounded legacy file-root revalidation are in place. Next: map issue counters, prove session provenance, then build the production import writer and compaction audit. Refused ceilings and remote holds remain open. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -122,6 +122,7 @@
           <li><time datetime="2026-09-28T19:38:00+10:00">28 Sep 2026, 19:38 AEST</time><strong>Source alias hardening accepted offline · 3 of 6 accepted</strong><p>The shared receipt reader now rejects matching BLOB aliases in namespace, scope or key through bounded composite-index seeks. Ceiling-gate mutations in all three columns block classification. Sol review and the full gate passed: 3,201 domain, 3,092 adapter and 2,866 app tests. Origin, compaction and remote hold evidence remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T20:22:00+10:00">28 Sep 2026, 20:22 AEST</time><strong>Imported origin read prerequisite accepted offline · 3 of 6 accepted</strong><p>A typed sequence-zero receipt and import decision now bind active execution hot reads to canonical activation ancestry. Missing, changed, oversized or aliased sources block. This is a read prerequisite; the production source-backed import writer and retired-prefix audit remain open. Sol review and the full gate passed: 3,202 domain, 3,105 adapter and 2,866 app tests. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-28T20:50:00+10:00">28 Sep 2026, 20:50 AEST</time><strong>Legacy execution file values accepted offline · 3 of 6 accepted</strong><p>Typed parsing binds supplied session, round and counter values to their file source and root. Mode markers and malformed or disappearing files remain explicit blockers; valid handles still require provenance. Sol review and the full gate passed: 3,236 domain, 3,108 adapter and 2,866 app tests. Configured-root completeness and issue-to-PR counter mapping remain open. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-28T22:09:00+10:00">28 Sep 2026, 22:09 AEST</time><strong>Configured-root file revalidation accepted offline · 3 of 6 accepted</strong><p>Each configured root's path and directory identity now bind the complete file-value snapshot; a fresh read under activation barriers must match it. One shared entry and byte budget stops cross-root overflow. Sol review found and verified the budget fix; the full gate passed: 3,236 domain, 3,120 adapter and 2,866 app tests. Issue-counter mapping, session provenance and the import writer remain open. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>
