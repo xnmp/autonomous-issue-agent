@@ -46,11 +46,14 @@ from ..domain.review_execution_activation import (
     CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
     VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
     BlockedLegacySubmissionSettlementStorage,
+    LegacyReviewGenerationReceiptSource, CompleteLegacyReviewGenerationReceipts,
+    BlockedLegacyReviewGenerationReceipts, MAX_LEGACY_GENERATION_RECEIPT_ROWS,
+    MAX_LEGACY_GENERATION_RECEIPT_BYTES, MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES,
 )
-from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
+from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, ReviewRoundOutcome,
-    PaidReviewProgress, CopiedReviewProgress,
+    PaidReviewProgress, CopiedReviewProgress, ReviewExecutionGenerationBoundary,
 )
 from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import ReviewSubmissionReceipt, CeilingProductivityDecision
@@ -60,9 +63,13 @@ from ..domain.review_rounds import (
     DeferredReviewPreparation, ReviewSubmissionConfirmed, finalize_review_round,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
-from ..domain.workflow import ObservedTransition, WorkflowMutation
+from ..domain.workflow import (
+    ObservedTransition, WorkflowMutation, AuthorizedOperatorCommand,
+    RequestRearm, ContinueGrantedRearm,
+)
 from ..domain.workflow_identity import (
-    PullRequestRef, WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
+    PullRequestRef, WorkflowBinding, WorkflowRevision, MAX_REARM_COMMANDS,
+    canonical_workflow_repository, validate_workflow_identifier,
 )
 from .control_store import CorruptControlStore, _encoded_payload_digest, _parse_stamp, _receipt_digest, load_bound_review_submission
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
@@ -91,6 +98,7 @@ MAX_OUTCOME_RECEIPT_SOURCE_PAGE = 16
 MAX_OUTCOME_RECEIPT_PAGE_BYTES = 2**24
 MAX_OUTCOME_RECEIPT_SCAN_ROWS = 1_000_000
 MAX_OUTCOME_RECEIPT_SCAN_CHUNK = 256
+MAX_LEGACY_GENERATION_RECEIPT_SCAN_ROWS = 1_000_000
 _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role", "retired_at")
 _DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json")
 MAX_LEGACY_RECORDING_BYTES = 2**21
@@ -1881,3 +1889,322 @@ def verify_legacy_stale_productivity_receipt_path(
         return VerifiedLegacyStaleProductivityReceiptPath(current, registered, sealed, stale)
     except ValueError as exc:
         return UnverifiedLegacyStaleProductivityReceiptPath(command_id, _printable(str(exc)))
+
+
+def read_complete_legacy_review_generation_receipts(
+    db: sqlite3.Connection, repository: str,
+) -> CompleteLegacyReviewGenerationReceipts | BlockedLegacyReviewGenerationReceipts:
+    """Read every generation receipt under one bounded SQL snapshot."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("generation receipt scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("generation receipt scan requires a canonical repository")
+    if db.execute(
+        "SELECT rowid FROM dedupe_keys NOT INDEXED ORDER BY rowid LIMIT 1 OFFSET ?",
+        (MAX_LEGACY_GENERATION_RECEIPT_SCAN_ROWS,),
+    ).fetchone() is not None:
+        return BlockedLegacyReviewGenerationReceipts(repository, "generation receipt table exceeds its scan bound")
+    repository_bytes = repository.encode()
+    namespace_bytes = b"review-execution-generation"
+    sources: list[LegacyReviewGenerationReceiptSource] = []
+    source_bytes = 0
+    cursor: int | None = None
+    while True:
+        predicate = "" if cursor is None else "WHERE rowid>?"
+        params = () if cursor is None else (cursor,)
+        rows = db.execute(
+            "SELECT rowid AS source_rowid,"
+            "CASE WHEN length(CAST(namespace AS BLOB))<=64 THEN CAST(namespace AS BLOB) END AS namespace_bytes,"
+            "CASE WHEN length(CAST(scope AS BLOB))<=? THEN CAST(scope AS BLOB) END AS scope_bytes "
+            f"FROM dedupe_keys NOT INDEXED {predicate} ORDER BY rowid LIMIT 256",
+            (max(len(repository_bytes) + 64, 64), *params),
+        ).fetchall()
+        if not rows:
+            break
+        cursor = rows[-1]["source_rowid"]
+        matching_ids: list[int] = []
+        for row in rows:
+            if row["namespace_bytes"] != namespace_bytes:
+                continue
+            scope = row["scope_bytes"]
+            if scope is None:
+                return BlockedLegacyReviewGenerationReceipts(
+                    repository, "generation receipt scope exceeds its attribution bound", row["source_rowid"],
+                )
+            if scope == repository_bytes:
+                matching_ids.append(row["source_rowid"])
+                continue
+            try:
+                alias = canonical_workflow_repository(scope.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                continue
+            if alias == repository:
+                return BlockedLegacyReviewGenerationReceipts(
+                    repository, "generation receipt uses a noncanonical repository alias", row["source_rowid"],
+                )
+        if not matching_ids:
+            continue
+        marks = ",".join("?" for _ in matching_ids)
+        other = ("namespace", "scope", "key", "claimed_at", "reusable_after")
+        sizes = [f"ifnull(length(CAST({column} AS BLOB)),0)" for column in other]
+        payload_size = "ifnull(length(CAST(payload_json AS BLOB)),0)"
+        metadata = db.execute(
+            f"SELECT rowid AS source_rowid,max({','.join(sizes)}) AS largest_other,"
+            f"{payload_size} AS payload_bytes,{'+'.join((*sizes, payload_size))} AS total_bytes "
+            f"FROM dedupe_keys WHERE rowid IN ({marks}) ORDER BY rowid",
+            matching_ids,
+        ).fetchall()
+        prospective_count = len(sources)
+        prospective_bytes = source_bytes
+        for row in metadata:
+            rowid = row["source_rowid"]
+            if (row["largest_other"] > MAX_LEGACY_SQL_TEXT_BYTES
+                    or row["payload_bytes"] > MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES
+                    or prospective_count >= MAX_LEGACY_GENERATION_RECEIPT_ROWS
+                    or prospective_bytes + row["total_bytes"] > MAX_LEGACY_GENERATION_RECEIPT_BYTES):
+                return BlockedLegacyReviewGenerationReceipts(
+                    repository, "generation receipt exceeds its source bound", rowid,
+                )
+            prospective_count += 1
+            prospective_bytes += row["total_bytes"]
+        columns = ",".join(
+            f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
+            for column in LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS
+        )
+        values = {row["source_rowid"]: row for row in db.execute(
+            f"SELECT rowid AS source_rowid,{columns} FROM dedupe_keys "
+            f"WHERE rowid IN ({marks}) ORDER BY rowid", matching_ids,
+        )}
+        for row in metadata:
+            rowid = row["source_rowid"]
+            source = values.get(rowid)
+            if source is None:
+                return BlockedLegacyReviewGenerationReceipts(
+                    repository, "generation receipt changed during its read", rowid,
+                )
+            try:
+                fields = tuple((column, _sql_text(source[f"type_{column}"], source[f"raw_{column}"]))
+                               for column in LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS)
+                observed = LegacyReviewGenerationReceiptSource(rowid, fields)
+                if dict(observed.fields)["scope"] != repository:
+                    raise ValueError("generation receipt scope changed")
+            except (TypeError, ValueError, UnicodeError) as exc:
+                return BlockedLegacyReviewGenerationReceipts(repository, _printable(str(exc)), rowid)
+            source_bytes += observed.source_bytes
+            sources.append(observed)
+    try:
+        return CompleteLegacyReviewGenerationReceipts(repository, tuple(sources))
+    except ValueError as exc:
+        return BlockedLegacyReviewGenerationReceipts(repository, _printable(str(exc)))
+
+
+def revalidate_complete_legacy_review_generation_receipts(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewGenerationReceipts,
+) -> CompleteLegacyReviewGenerationReceipts | BlockedLegacyReviewGenerationReceipts:
+    """Refuse a changed or partial caller-held generation receipt set."""
+    if not isinstance(observed, CompleteLegacyReviewGenerationReceipts):
+        raise ValueError("generation receipt revalidation requires a complete typed observation")
+    current = read_complete_legacy_review_generation_receipts(db, observed.repository)
+    if isinstance(current, BlockedLegacyReviewGenerationReceipts):
+        return current
+    if current.source_digest != observed.source_digest:
+        return BlockedLegacyReviewGenerationReceipts(
+            observed.repository, "generation receipt sources changed after inventory",
+        )
+    return current
+
+
+@dataclass(frozen=True)
+class MatchedLegacyReviewGenerationBoundarySources:
+    """Observed content match; SQL provenance must be rechecked before authority use."""
+
+    complete_receipts: CompleteLegacyReviewGenerationReceipts
+    receipt_source: LegacyReviewGenerationReceiptSource
+    boundary: ReviewExecutionGenerationBoundary
+    accepted_rowid: int
+    accepted_fields: tuple[tuple[str, str | None], ...]
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.complete_receipts, CompleteLegacyReviewGenerationReceipts)
+                or not isinstance(self.receipt_source, LegacyReviewGenerationReceiptSource)
+                or not isinstance(self.boundary, ReviewExecutionGenerationBoundary)
+                or self.receipt_source not in self.complete_receipts.receipts
+                or type(self.accepted_rowid) is not int or self.accepted_rowid <= 0
+                or not isinstance(self.accepted_fields, tuple)
+                or tuple(name for name, _ in self.accepted_fields) != _DEDUPE_SOURCE_COLUMNS
+                or any(value is not None and (not isinstance(value, str)
+                       or len(value.encode("utf-8", "surrogatepass")) > MAX_LEGACY_RECORDING_BYTES)
+                       for _, value in self.accepted_fields)):
+            raise ValueError("generation boundary requires complete typed source evidence")
+        source = dict(self.receipt_source.fields)
+        accepted = dict(self.accepted_fields)
+        if (self.receipt_source.source_rowid <= self.accepted_rowid
+                or source["scope"] != self.complete_receipts.repository
+                or source["key"] != self.boundary.receipt_id
+                or source["reusable_after"] is not None
+                or accepted["scope"] != self.complete_receipts.repository
+                or accepted["reusable_after"] is not None
+                or accepted["namespace"] not in {"workflow-request", "workflow-transition"}
+                or accepted["payload_json"] is None
+                or source["payload_json"] != encode_workflow((
+                    self.boundary, accepted["namespace"], accepted["key"], accepted["payload_json"],
+                ))):
+            raise ValueError("generation boundary and accepted receipt disagree")
+        _parse_stamp(source["claimed_at"])
+        _parse_stamp(accepted["claimed_at"])
+        key = self.boundary.from_revision.fence.key
+        if not isinstance(key.target, PullRequestRef):
+            raise ValueError("generation boundary requires a review PR")
+        identity = (
+            f"{key.repository}:{key.target.number}:"
+            f"{self.boundary.before.binding.execution_epoch}:"
+            f"{self.boundary.before.binding.execution_episode}:"
+            f"{self.boundary.to_revision.fence.generation}"
+        )
+        derived_id = "review-generation:" + hashlib.sha256(identity.encode()).hexdigest()
+        if (self.boundary.receipt_id != derived_id
+                or self.boundary.from_revision.fence.key != self.boundary.to_revision.fence.key
+                or key.repository != self.complete_receipts.repository):
+            raise ValueError("generation boundary has a changed derived identity")
+        try:
+            raw = accepted["payload_json"]
+            payload = json.loads(raw, object_pairs_hook=_unique_receipt_object, parse_constant=_reject_nonfinite)
+            if (not isinstance(payload, dict)
+                    or set(payload) != {"mutation", "expected", "snapshot", "audit", "commands"}
+                    or json.dumps(payload, sort_keys=True, separators=(",", ":")) != raw
+                    or not isinstance(payload["commands"], list)):
+                raise ValueError("accepted generation transition has malformed fields")
+            expected = decode_workflow(payload["expected"], WorkflowRevision)
+            snapshot = decode_workflow(payload["snapshot"], ReviewWorkflowSnapshot)
+            if (payload["mutation"] != self.boundary.mutation.value
+                    or expected != self.boundary.from_revision
+                    or snapshot.revision != self.boundary.to_revision
+                    or not isinstance(snapshot.execution, ActivatedReviewExecution)
+                    or not snapshot.execution.boundaries
+                    or snapshot.execution.boundaries[-1] != self.boundary
+                    or snapshot.execution.binding != self.boundary.after.binding
+                    or snapshot.execution.state != self.boundary.after
+                    or snapshot.binding.fence != self.boundary.to_revision.fence):
+                raise ValueError("accepted generation transition disagrees with its boundary")
+            commands = payload["commands"]
+            if len(commands) > MAX_REARM_COMMANDS:
+                raise ValueError("accepted generation transition has too many commands")
+            decoded_commands: list[LifecycleCommand] = []
+            for item in commands:
+                if (not isinstance(item, dict) or set(item) != {
+                    "id", "idempotency", "kind", "target", "revision", "payload",
+                    "config", "repository", "owner", "workflow",
+                } or not isinstance(item["payload"], dict)
+                        or any(not isinstance(item[name], str) for name in (
+                            "id", "idempotency", "kind", "target", "config",
+                            "repository", "owner", "workflow",
+                        ))
+                        or (item["revision"] is not None and not isinstance(item["revision"], str))):
+                    raise ValueError("accepted generation transition has malformed commands")
+                command = LifecycleCommand(
+                    item["id"], item["idempotency"], CommandKind(item["kind"]),
+                    item["target"], item["revision"], item["payload"], item["config"],
+                    item["repository"], item["owner"],
+                    decode_workflow(item["workflow"], WorkflowBinding),
+                )
+                if (command.repository != self.complete_receipts.repository
+                        or command.workflow != snapshot.binding
+                        or command.repository != item["repository"]):
+                    raise ValueError("accepted generation command has a changed workflow binding")
+                decoded_commands.append(command)
+            if len({command.command_id for command in decoded_commands}) != len(decoded_commands):
+                raise ValueError("accepted generation transition repeats a command")
+            if self.boundary.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM):
+                audit = decode_workflow(payload["audit"], AuthorizedOperatorCommand)
+                audit_kind = (RequestRearm if self.boundary.mutation is WorkflowMutation.REQUEST_REARM
+                              else ContinueGrantedRearm)
+                if (accepted["namespace"] != "workflow-request"
+                        or not isinstance(audit.command, audit_kind)
+                        or accepted["key"] != audit.command.request_id
+                        or audit.command.expected != self.boundary.from_revision):
+                    raise ValueError("generation request identity disagrees with accepted operator command")
+            else:
+                audit = decode_workflow(payload["audit"], ObservedTransition)
+                if (not audit.evidence_ids or accepted["namespace"] != "workflow-transition"
+                        or accepted["key"] != hashlib.sha256(
+                            encode_workflow(self.boundary.from_revision).encode(),
+                        ).hexdigest()):
+                    raise ValueError("generation release identity disagrees with accepted transition")
+        except (KeyError, TypeError, ValueError, UnicodeError, RecursionError) as exc:
+            raise ValueError("generation boundary lacks an exact accepted transition") from exc
+
+    @property
+    def source_digest(self) -> str:
+        parts = (self.complete_receipts.source_digest, self.receipt_source.source_digest,
+                 self.accepted_rowid, self.accepted_fields)
+        return hashlib.sha256(json.dumps(parts, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class UnmatchedLegacyReviewGenerationBoundarySources:
+    receipt_id: str
+    reason: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.receipt_id, "unverified generation receipt")
+        if not self.reason:
+            raise ValueError("unverified generation receipt requires a reason")
+
+
+def match_legacy_review_generation_boundary_sources(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewGenerationReceipts, receipt_id: str,
+) -> MatchedLegacyReviewGenerationBoundarySources | UnmatchedLegacyReviewGenerationBoundarySources:
+    """Observe a source match in SQL; callers must recheck at authority use."""
+    validate_workflow_identifier(receipt_id, "generation receipt")
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("generation boundary verification requires an explicit SQL transaction")
+    if not isinstance(observed, CompleteLegacyReviewGenerationReceipts):
+        raise ValueError("generation boundary verification requires complete typed sources")
+    current = revalidate_complete_legacy_review_generation_receipts(db, observed)
+    if isinstance(current, BlockedLegacyReviewGenerationReceipts):
+        return UnmatchedLegacyReviewGenerationBoundarySources(receipt_id, current.reason)
+    source = next((entry for entry in current.receipts if dict(entry.fields)["key"] == receipt_id), None)
+    if source is None:
+        return UnmatchedLegacyReviewGenerationBoundarySources(receipt_id, "generation receipt is absent")
+    try:
+        values = dict(source.fields)
+        captured = decode_workflow(values["payload_json"], tuple)
+        if (len(captured) != 4 or not isinstance(captured[0], ReviewExecutionGenerationBoundary)
+                or not isinstance(captured[1], str) or not isinstance(captured[2], str)
+                or not isinstance(captured[3], str)):
+            raise ValueError("generation receipt has malformed accepted transition fields")
+        boundary, namespace, key, accepted_payload = captured
+        rows = db.execute(
+            "SELECT rowid,CASE WHEN length(CAST(scope AS BLOB))<=? "
+            "THEN CAST(scope AS BLOB) END AS scope_bytes FROM dedupe_keys NOT INDEXED "
+            "WHERE namespace IN (?,?) AND key IN (?,?) ORDER BY rowid LIMIT ?",
+            (max(len(current.repository.encode()) + 64, 64), namespace, namespace.encode(),
+             key, key.encode(), MAX_LEGACY_GENERATION_RECEIPT_ROWS + 1),
+        ).fetchall()
+        if len(rows) > MAX_LEGACY_GENERATION_RECEIPT_ROWS:
+            raise ValueError("accepted generation transition exceeds its alias scan bound")
+        accepted_rows: list[int] = []
+        for row in rows:
+            scope = row["scope_bytes"]
+            if scope is None:
+                raise ValueError("accepted generation transition scope exceeds its attribution bound")
+            if scope == current.repository.encode():
+                accepted_rows.append(row["rowid"])
+                continue
+            try:
+                alias = canonical_workflow_repository(scope.decode("utf-8"))
+            except (UnicodeError, ValueError):
+                continue
+            if alias == current.repository:
+                raise ValueError("accepted generation transition uses a repository alias")
+        if len(accepted_rows) != 1:
+            raise ValueError("generation boundary lacks one exact accepted transition")
+        accepted_rowid = accepted_rows[0]
+        accepted_fields, _ = _read_recording_source(db, namespace, current.repository, key)
+        if dict(accepted_fields)["payload_json"] != accepted_payload:
+            raise ValueError("accepted generation transition changed")
+        return MatchedLegacyReviewGenerationBoundarySources(
+            current, source, boundary, accepted_rowid, accepted_fields,
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError, WorkflowAuthorityError) as exc:
+        return UnmatchedLegacyReviewGenerationBoundarySources(receipt_id, _printable(str(exc)))

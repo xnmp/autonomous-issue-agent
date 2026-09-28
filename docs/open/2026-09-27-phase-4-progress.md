@@ -1236,3 +1236,30 @@ Full `make test` passed: 3,198 domain, 3,000 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-stale-receipt-path-gate.log` (ephemeral).
+
+## Checkpoint 50 — review generation receipt sources and transition match (offline)
+
+A read-only scanner now inventories every review-execution generation receipt
+for one repository in a bounded SQL snapshot. It retains source rowids, all
+dedupe columns and a rowid-aware digest, blocks malformed text and repository
+aliases, and caps both matching source bytes and the shared table scan. A
+second SQL read rejects changed or partial caller-held inventories.
+
+For one receipt, a source matcher checks the permanent receipt against its
+captured accepted workflow transition, including exact payload, derived
+identity, generation boundary, mutation-specific audit, retained command
+shape, repository and binding. It requires the accepted transition's source
+rowid to precede the generation receipt's rowid and rejects duplicate scope
+aliases. The matched value is an observation: its direct constructor cannot
+prove SQL existence, arbitrary imported rowids do not establish chronology,
+and the command plan still needs a durable command-row join. A stale
+productivity receipt therefore remains unclassified as historically stale.
+
+Independent Sol review found initial gaps in scope alias detection, audit
+matching and the result's authority claim. The revised scanner and matcher
+address those gaps, with focused regressions; a second pass found no medium
+or high issue in the narrowed source-match claim.
+Full `make test` passed: 3,198 domain, 3,022 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-generation-boundary-gate.log` (ephemeral).

@@ -752,6 +752,89 @@ class BlockedLegacyReviewOutcomeReceipts:
             _rowid(self.source_rowid, "blocked outcome receipt cursor")
 
 
+MAX_LEGACY_GENERATION_RECEIPT_ROWS = 65536
+MAX_LEGACY_GENERATION_RECEIPT_BYTES = 2**26
+MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES = 2**21
+
+
+@dataclass(frozen=True)
+class LegacyReviewGenerationReceiptSource:
+    """A raw generation boundary receipt; its rowid is retained for causal joins."""
+
+    source_rowid: int
+    fields: tuple[tuple[str, str | None], ...]
+
+    def __post_init__(self) -> None:
+        _rowid(self.source_rowid, "review generation receipt rowid")
+        if (not isinstance(self.fields, tuple)
+                or any(not isinstance(field, tuple) or len(field) != 2 for field in self.fields)
+                or tuple(name for name, _ in self.fields) != LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS):
+            raise ValueError("review generation receipt requires exact source fields")
+        for name, value in self.fields:
+            if value is None and name == "reusable_after":
+                continue
+            if (not isinstance(value, str)
+                    or len(value.encode("utf-8", "surrogatepass")) > (
+                        MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES
+                        if name == "payload_json" else MAX_LEGACY_SQL_TEXT_BYTES
+                    )):
+                raise ValueError(f"review generation receipt {name} must be bounded text")
+        values = dict(self.fields)
+        if (values["namespace"] != "review-execution-generation"
+                or canonical_workflow_repository(values["scope"]) != values["scope"]
+                or not values["key"] or not values["claimed_at"] or not values["payload_json"]):
+            raise ValueError("review generation receipt lacks its canonical source identity")
+
+    @property
+    def source_bytes(self) -> int:
+        return sum(len(value.encode("utf-8", "surrogatepass")) for _, value in self.fields if value is not None)
+
+    @property
+    def source_digest(self) -> str:
+        return hashlib.sha256(json.dumps((self.source_rowid, self.fields),
+                                         separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class CompleteLegacyReviewGenerationReceipts:
+    """Bounded whole-repository receipt observation requiring SQL revalidation."""
+
+    repository: str
+    receipts: tuple[LegacyReviewGenerationReceiptSource, ...]
+
+    def __post_init__(self) -> None:
+        if (canonical_workflow_repository(self.repository) != self.repository
+                or not isinstance(self.receipts, tuple)
+                or len(self.receipts) > MAX_LEGACY_GENERATION_RECEIPT_ROWS
+                or any(not isinstance(source, LegacyReviewGenerationReceiptSource)
+                       or dict(source.fields)["scope"] != self.repository for source in self.receipts)
+                or sum(source.source_bytes for source in self.receipts) > MAX_LEGACY_GENERATION_RECEIPT_BYTES):
+            raise ValueError("complete generation receipts require bounded repository sources")
+        rowids = [source.source_rowid for source in self.receipts]
+        keys = [dict(source.fields)["key"] for source in self.receipts]
+        if rowids != sorted(set(rowids)) or len(keys) != len(set(keys)):
+            raise ValueError("complete generation receipts require ordered unique sources")
+
+    @property
+    def source_digest(self) -> str:
+        return hashlib.sha256(json.dumps((self.repository, tuple(source.source_digest for source in self.receipts)),
+                                         separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewGenerationReceipts:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked generation receipts require a canonical repository")
+        validate_workflow_text(self.reason, "blocked generation receipt reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked generation receipt rowid")
+
+
 @dataclass(frozen=True)
 class VerifiedLegacyRoundOutcomeStorage:
     """One typed round outcome is paired with its exact durable receipt."""

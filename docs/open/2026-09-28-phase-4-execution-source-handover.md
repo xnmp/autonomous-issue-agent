@@ -111,6 +111,14 @@ with `CLAUDE.md`, `AGENTS.md`, the
   result proves a recorded receipt path;
   historical generation ordering and reset order remain separate source-backed
   obligations.
+- Checkpoint 50 inventories every generation receipt in one bounded SQL
+  snapshot, with repository-alias refusal and rowid-aware revalidation. A
+  source matcher checks one permanent receipt against its accepted transition,
+  derived boundary identity, mutation-specific audit and command shape. Its
+  rowid relation records writer insertion order; the result is an observation
+  that must be rechecked in SQL before authority use. It does not prove that
+  accepted commands were persisted, that arbitrary imported rowids establish
+  chronology, or that a stale productivity receipt crossed a generation.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -218,6 +226,16 @@ The gate passed: 3,198 domain, 3,000 adapter and 2,866 app tests, plus hooks,
 governor, gate parity, four import contracts and both Pyrefly checks. Ten
 strict xfails remained expected.
 
+Independent Sol review of checkpoint 50 found initial accepted-row alias,
+mutation-audit and constructible-authority gaps. The returned value is now an
+explicit source match, the bounded alias scan blocks canonical repository
+duplicates, and mutation-specific audits and command structure are checked.
+Its second pass found no medium or high issue within that observational
+scope. Full gate log: `/tmp/phase4-generation-boundary-gate.log` (ephemeral).
+The gate passed: 3,198 domain, 3,022 adapter and 2,866 app tests, plus hooks,
+governor, gate parity, four import contracts and both Pyrefly checks. Ten
+strict xfails remained expected.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -226,12 +244,21 @@ occurred.
 
 ## Next required boundary
 
-The next proof must join the stale receipt path to source-backed generation
-ordering at settlement, classify each successful command against its bound
+The next proof must join the stale receipt path to the now inventoried
+generation transition and source-backed settlement ordering, classify each
+successful command against its bound
 effect, recorded baseline, sealed outcome and productivity path, then replay
 ordered outcomes for each execution episode. Raw recorded markers and completed
 agent runs are observations, not reset authority. Keep unregistered historical
 commands explicit until their legacy provenance is resolved.
+
+The current stale receipt stores `(facts, outcome)` and the writer's claim time,
+but no settlement revision. The existing positive stale-path fixture advances
+the snapshot directly; a normal second preflight is held while its successful
+submission remains unresolved, so that fixture has no accepted generation
+transition or durable generation receipt. A future join must use a real
+source-backed crossing and settlement order, or leave this path blocked as
+unknown. Rowid order alone cannot supply authority for arbitrary imported SQL.
 
 1. Revalidate the bounded owner closure and run inventory under activation
    barriers before any import commit. Daemon boot's `adopt_legacy_owner`

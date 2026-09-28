@@ -28,6 +28,9 @@ from issue_agent.adapters.review_execution_activation import (
     VerifiedLegacySubmissionRegistrationStorage, CompleteLegacySubmissionSettlementStorage,
     verify_legacy_stale_productivity_receipt_path,
     VerifiedLegacyStaleProductivityReceiptPath, UnverifiedLegacyStaleProductivityReceiptPath,
+    read_complete_legacy_review_generation_receipts, revalidate_complete_legacy_review_generation_receipts,
+    match_legacy_review_generation_boundary_sources,
+    MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     read_legacy_recorded_review, read_review_submission_round_link,
     verify_legacy_plain_productive_round,
 )
@@ -53,14 +56,24 @@ from issue_agent.domain.review_execution_activation import (
     CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
     VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
     CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
+    LegacyReviewGenerationReceiptSource, CompleteLegacyReviewGenerationReceipts,
+    BlockedLegacyReviewGenerationReceipts, MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES,
     BlockedLegacySubmissionSettlementStorage,
     VerifiedLegacyRecordedReview, VerifiedReviewSubmissionRoundLink,
     VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
 )
 from tests.adapters.test_review_execution_control import rig, current, OWNER as CONTROL_OWNER
 from tests.adapters.test_review_productive_settlement import (
-    confirmed_copy, workflow_for, _advance_generation_with_open_round,
+    confirmed_copy, confirmed_escalation, workflow_for, _advance_generation_with_open_round,
 )
+from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+from issue_agent.domain.workflow_identity import WorkflowWriter
+from issue_agent.domain.workflow import (
+    RequestRearm, ContinueGrantedRearm, AuthorizedOperatorCommand,
+    ObservedTransition, OperatorActor, KeepGuidance, WorkflowCommitted,
+)
+from issue_agent.domain.review_rejection import CountingRule
+from issue_agent.domain.labels import Label
 from tests.adapters.test_review_preparation_finalization import stopped_round
 from tests.adapters.test_review_execution_admission import request
 from tests.adapters.test_review_execution_launch import register
@@ -917,6 +930,230 @@ def _complete_settlement_observations(db):
     storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcome_receipts)
     assert isinstance(storage, CompleteLegacyRoundOutcomeStorage)
     return commands, receipts, storage
+
+
+def _accepted_generation(rig):
+    store, gateway, selection, _, _, command = confirmed_escalation(rig, cause="ceiling")
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter("o/r", "review", CONTROL_OWNER), gateway=gateway,
+        ceiling=1, trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    before = current(store, selection)
+    request = RequestRearm("rearm:generation-inventory", before.revision, before.gates[0].gate_id,
+                           KeepGuidance(), expected_binding=before.binding)
+    assert isinstance(workflow.request_rearm(request, OperatorActor("operator", "test")), WorkflowCommitted)
+    return store
+
+
+def test_complete_generation_receipts_read_actual_accepted_boundary_without_writes(rig):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+        current_set = revalidate_complete_legacy_review_generation_receipts(db, observed)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(current_set, CompleteLegacyReviewGenerationReceipts)
+    assert len(observed.receipts) == 1
+    source = observed.receipts[0]
+    assert source.source_rowid > 0
+    boundary, namespace, key, accepted = decode_workflow(dict(source.fields)["payload_json"], tuple)
+    assert namespace == "workflow-request" and key == "rearm:generation-inventory"
+    assert boundary.from_revision.fence.generation + 1 == boundary.to_revision.fence.generation
+    assert isinstance(accepted, str) and len(source.source_digest) == 64
+
+
+def test_generation_boundary_proves_one_accepted_transition_and_causal_rows(rig):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+        receipt_id = dict(observed.receipts[0].fields)["key"]
+        before = db.total_changes
+        proof = match_legacy_review_generation_boundary_sources(db, observed, receipt_id)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(proof, MatchedLegacyReviewGenerationBoundarySources)
+    assert proof.accepted_rowid < proof.receipt_source.source_rowid
+    assert proof.boundary.to_revision.fence.generation == proof.boundary.from_revision.fence.generation + 1
+    assert len(proof.source_digest) == 64
+    with pytest.raises(ValueError, match="disagree"):
+        replace(proof, accepted_rowid=proof.receipt_source.source_rowid + 1)
+
+
+@pytest.mark.parametrize("damage", ["boundary_payload", "transition_payload", "boundary_reusable",
+                                    "transition_reusable", "transition_removed", "transition_alias",
+                                    "transition_scope_case_alias", "transition_scope_space_alias"])
+def test_generation_boundary_rejects_changed_or_contradictory_sources(rig, damage):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        db.rollback()
+    assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+    receipt_id = dict(observed.receipts[0].fields)["key"]
+    with store.transaction() as db:
+        if damage == "boundary_payload":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' "
+                       "WHERE namespace='review-execution-generation'")
+        elif damage == "transition_payload":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='workflow-request' "
+                       "AND key='rearm:generation-inventory'")
+        elif damage == "boundary_reusable":
+            db.execute("UPDATE dedupe_keys SET reusable_after='later' "
+                       "WHERE namespace='review-execution-generation'")
+        elif damage == "transition_reusable":
+            db.execute("UPDATE dedupe_keys SET reusable_after='later' WHERE namespace='workflow-request' "
+                       "AND key='rearm:generation-inventory'")
+        elif damage == "transition_removed":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-request' "
+                       "AND key='rearm:generation-inventory'")
+        elif damage in {"transition_scope_case_alias", "transition_scope_space_alias"}:
+            scope = "O/R" if damage == "transition_scope_case_alias" else " o/r "
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       "VALUES (?,?,?,?,?)",
+                       ("workflow-request", scope, "rearm:generation-inventory", "now", "{}"))
+        else:
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       "VALUES (?,?,?,?,?)",
+                       (b"workflow-request", "o/r", "rearm:generation-inventory", "now", "{}"))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = match_legacy_review_generation_boundary_sources(db, observed, receipt_id)
+        db.rollback()
+    assert isinstance(result, UnmatchedLegacyReviewGenerationBoundarySources)
+
+
+@pytest.mark.parametrize("damage", ["wrong_audit_variant", "release_audit", "malformed_commands"])
+def test_generation_boundary_rejects_mutated_accepted_transition_contents(rig, damage):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation'").fetchone()
+        boundary, namespace, key, accepted = decode_workflow(row["payload_json"], tuple)
+        payload = json.loads(accepted)
+        if damage == "wrong_audit_variant":
+            audit = decode_workflow(payload["audit"], AuthorizedOperatorCommand)
+            alternate = ContinueGrantedRearm(
+                audit.command.request_id, audit.command.expected, "stopped:other",
+                expected_binding=audit.command.expected_binding,
+            )
+            payload["audit"] = encode_workflow(replace(audit, command=alternate))
+        elif damage == "release_audit":
+            payload["audit"] = encode_workflow(ObservedTransition(("unrelated",)))
+        else:
+            payload["commands"] = [{"id": "truncated"}]
+        changed = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='workflow-request' AND key=?",
+                   (changed, key))
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-execution-generation'",
+                   (encode_workflow((boundary, namespace, key, changed)),))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+        result = match_legacy_review_generation_boundary_sources(db, observed, boundary.receipt_id)
+        db.rollback()
+    assert isinstance(result, UnmatchedLegacyReviewGenerationBoundarySources)
+
+
+@pytest.mark.parametrize("damage", ["blob_alias", "scope_case_alias", "scope_space_alias",
+                                    "invalid_utf8", "oversized", "reclaimable"])
+def test_complete_generation_receipts_block_unreadable_or_contradictory_rows(rig, damage):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        if damage == "blob_alias":
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (b"review-execution-generation", "o/r", "alias", "now", "{}"),
+            )
+        elif damage in {"scope_case_alias", "scope_space_alias"}:
+            scope = "O/R" if damage == "scope_case_alias" else " o/r "
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                ("review-execution-generation", scope, "alias", "now", "{}"),
+            )
+        elif damage == "invalid_utf8":
+            db.execute("UPDATE dedupe_keys SET payload_json=CAST(x'FF' AS TEXT) "
+                       "WHERE namespace='review-execution-generation'")
+        elif damage == "oversized":
+            db.execute("UPDATE dedupe_keys SET payload_json=? "
+                       "WHERE namespace='review-execution-generation'",
+                       ("x" * (MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES + 1),))
+        else:
+            db.execute("UPDATE dedupe_keys SET reusable_after='later' "
+                       "WHERE namespace='review-execution-generation'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = read_complete_legacy_review_generation_receipts(db, "o/r")
+        db.rollback()
+
+    if damage == "reclaimable":
+        assert isinstance(result, CompleteLegacyReviewGenerationReceipts)
+        assert dict(result.receipts[0].fields)["reusable_after"] == "later"
+    else:
+        assert isinstance(result, BlockedLegacyReviewGenerationReceipts)
+
+
+def test_generation_receipts_revalidation_rejects_partial_changed_or_reordered_sources(rig):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_generation_receipts(db, "o/r")
+        db.rollback()
+    assert isinstance(observed, CompleteLegacyReviewGenerationReceipts)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        assert isinstance(revalidate_complete_legacy_review_generation_receipts(
+            db, CompleteLegacyReviewGenerationReceipts("o/r", ()),
+        ), BlockedLegacyReviewGenerationReceipts)
+        db.rollback()
+    with store.transaction() as db:
+        fields = db.execute("SELECT namespace,scope,key,claimed_at,reusable_after,payload_json "
+                            "FROM dedupe_keys WHERE namespace='review-execution-generation'").fetchone()
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-generation'")
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,reusable_after,payload_json) "
+                   "VALUES (?,?,?,?,?,?)", tuple(fields))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        changed = revalidate_complete_legacy_review_generation_receipts(db, observed)
+        db.rollback()
+    assert isinstance(changed, BlockedLegacyReviewGenerationReceipts)
+
+
+def test_generation_receipt_scan_bounds_unrelated_shared_rows(tmp_path, monkeypatch):
+    store = _control(tmp_path)
+    monkeypatch.setattr(review_activation, "MAX_LEGACY_GENERATION_RECEIPT_SCAN_ROWS", 3)
+    with store.transaction() as db:
+        for number in range(4):
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                       "VALUES ('other','o/r',?,'now','{}')", (str(number),))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = read_complete_legacy_review_generation_receipts(db, "o/r")
+        db.rollback()
+    assert isinstance(result, BlockedLegacyReviewGenerationReceipts)
+
+
+def test_generation_receipt_scan_preserves_negative_and_zero_rowids(tmp_path):
+    store = _control(tmp_path)
+    with store.transaction() as db:
+        for rowid in (-1, 0):
+            db.execute("INSERT INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
+                       "VALUES (?,'review-execution-generation','o/r',?,'now','{}')",
+                       (rowid, f"generation:{rowid}"))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = read_complete_legacy_review_generation_receipts(db, "o/r")
+        db.rollback()
+    assert isinstance(result, CompleteLegacyReviewGenerationReceipts)
+    assert [source.source_rowid for source in result.receipts] == [-1, 0]
+    assert all(isinstance(source, LegacyReviewGenerationReceiptSource) for source in result.receipts)
 
 
 def _stale_settlement(rig):
