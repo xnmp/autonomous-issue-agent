@@ -317,6 +317,26 @@ with `CLAUDE.md`, `AGENTS.md`, the
   This reduces duplicate stored payloads and prepares a compact transition
   proof. The hot read still decodes each accepted snapshot, so it is not yet
   bounded by the active suffix and compaction remains unimplemented.
+- Design checkpoint 73 fixes the compaction rollout order: a source-backed
+  checkpoint writer cannot run before the typed hot reader and durable paged
+  audit gate are installed. The checkpoint manifest binds contiguous retired
+  round and generation source streams; deterministic generation receipt IDs
+  and the episode/sequence round index permit bounded audit pages. An overdue
+  audit or discrepancy blocks new execution authority, while terminal
+  settlement remains available. Open-prefix byte exhaustion must refuse an
+  advance before writing any partial receipt. This is a reviewed contract,
+  not a production writer or bounded hot read.
+
+Independent Sol review of design checkpoint 73 identified an unsafe initial
+rollout order, an omitted open-prefix codec refusal and an incomplete authority
+gate. The corrected contract requires the reader and audit before compaction,
+specifies bounded page membership checks and source identity derivation, and
+blocks generation advance, renewal and compaction when audit is overdue or
+discrepant. The reviewer's final pass found no remaining medium or high design
+issue. The full `make test` gate passed: 3,274 domain, 3,189 adapter and 2,876
+app tests, plus hooks, governor, gate parity, four import contracts and both
+Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-compaction-manifest-design-gate.log` (ephemeral).
 
 Independent Sol review of checkpoint 72 identified the remaining hot-read
 cost: each active generation boundary still reloads the full historical

@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 01:23 AEST · Latest checkpoint: digest-bound generation receipts</p>
+      <p class="meta">Updated 29 Sep 2026, 01:52 AEST · Latest checkpoint: source-backed compaction contract</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>New generation receipts bind accepted transitions by digest and retain legacy reads. Hot reads still decode historical snapshots. Next: prove historical resets and session producers, build the production import writer, then add renewed origins and bounded compaction with archived audit. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>The source-backed compaction contract now fixes the writer, reader and audit cutover order. Next: prove historical resets and session producers, build the production import writer, then implement renewed origins and the checkpoint writer with its paged audit gate. Hot reads remain unbounded. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -134,6 +134,7 @@
           <li><time datetime="2026-09-29T00:36:00+10:00">29 Sep 2026, 00:36 AEST</time><strong>Barrier-held death attribution join accepted offline · 3 of 6 accepted</strong><p>The SQL import source verifier now binds complete death attribution to revalidated owner runs and the held counter mapping, blocking opaque abandonments and substitute evidence. Sol found no concrete issue. An initial full gate hit host disk exhaustion; the unchanged rerun passed: 3,270 domain, 3,173 adapter and 2,872 app tests, plus contracts and Pyrefly. Reset and inherited-debit proof remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T01:05:00+10:00">29 Sep 2026, 01:05 AEST</time><strong>Review execution root scoping accepted offline · 3 of 6 accepted</strong><p>Current review counters now come only from the physical review directory; fix and steward files stay in the full audit. Foreign roots with evidence for an open PR block pending producer provenance, and duplicate session sources block direct planning. Sol review found and verified fixes for cross-role key collisions and caller-controlled root labels. Full gate passed: 3,273 domain, 3,187 adapter and 2,876 app tests, plus contracts and Pyrefly. Historical resets and inherited debit remain open. Active work since the previous entry: About 29 minutes.</p></li>
           <li><time datetime="2026-09-29T01:23:00+10:00">29 Sep 2026, 01:23 AEST</time><strong>Digest-bound generation receipts accepted offline · 3 of 6 accepted</strong><p>New receipts store a digest of the accepted transition instead of copying its growing snapshot. Canonical and source reads still verify the retained row, and old full-payload receipts remain readable. Independent Sol review confirmed historical snapshot decoding remains an open bounded-read gap. Full gate passed: 3,274 domain, 3,189 adapter and 2,876 app tests, plus contracts and Pyrefly. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-29T01:52:00+10:00">29 Sep 2026, 01:52 AEST</time><strong>Compaction source contract reviewed · 3 of 6 accepted</strong><p>The checkpoint source stream, deterministic boundary enumeration and paged audit cutover are specified. Sol review corrected the unsafe writer-first rollout, open-prefix codec refusal and audit authority gate; re-review found no remaining medium or high issue. Full gate passed: 3,274 domain, 3,189 adapter and 2,876 app tests, plus contracts and Pyrefly. The writer, audit and bounded hot reader remain to implement. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

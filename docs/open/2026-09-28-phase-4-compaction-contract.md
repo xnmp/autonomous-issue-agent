@@ -109,6 +109,59 @@ specific to this repository.
   it complete. Recovery advances its cursor rather than rereading every
   historical PR on each tick.
 
+## Checkpoint source manifest and cutover order
+
+The checkpoint receipt must bind its origin, previous checkpoint receipt (or
+the initial origin), previous and new `(sequence, boundary revision/receipt)`
+frontiers, projected checkpoint, and two ordered source digests. One digest
+folds each retired round's episode, sequence, round identity, exact indexed
+row fields and verified receipt identities/digests. The other folds each
+retired generation number, boundary receipt identity/digest and accepted
+transition identity/digest. These are digests of the *source stream*, not of
+the projected state alone. The writer derives both streams from the same
+transaction-local canonical load and verifies their exact contiguous ranges;
+the audit later reconstructs those ranges from the origin and checkpoint
+chain. This keeps the receipt small even for thousands of retired sources
+without trusting a count or an arbitrary caller-supplied source list.
+
+The generation receipt identity is derived from repository, PR, execution
+epoch/episode and destination generation. The audit enumerates every expected
+generation from the previous to the new frontier and verifies its derived key
+by bounded point lookup; a separate sweep pages by `(scope, key)` and decodes
+every matching namespace row to detect unclaimed or unreadable receipts. Both
+reject a missing, repeated or foreign boundary.
+
+The checkpoint writer, typed checkpoint reader and durable paged audit gate
+must be installed before any production compaction can commit. The writer
+verifies the newly retired source stream and initializes its audit state in
+the same transaction as the checkpoint and active-suffix update. Subsequent
+audit pages verify retained membership and payloads, including full historical
+accepted transitions, and persist a cursor, rolling digest, due state and any
+discrepancy. The current loader checks only the raw checkpoint value and cannot
+verify sources after their boundaries leave the active component; it is not a
+safe reader for a compacted writer. The new hot reader checks the typed receipt,
+immediate source anchor, bounded active suffix and audit gate without decoding
+historical accepted snapshots or scanning the compacted prefix. Older
+full-payload generation receipts require retirement into an audited checkpoint
+or an explicit bounded refusal before a universal hot-read bound is claimed.
+
+An audit discrepancy or overdue pass blocks new execution admission,
+generation advance, episode renewal and further compaction. Terminal money
+settlement and evidence-preserving recovery remain allowed so a hold cannot
+strand an already launched operation. Archived tampering after a checked page
+is found on the next pass; the due bound prevents indefinite unchecked use.
+
+Pre-transition compaction must run before a new accepted workflow snapshot
+would exceed the codec limit, including repeated zero-round advances. It must
+also run before the round or boundary suffix reaches its 4,096-entry ceiling
+when a verified contiguous prefix is available. If an open early round leaves
+no compactable frontier and the next snapshot would exceed the byte limit,
+the new advance refuses before writing an accepted transition and records a
+reviewable bounded-capacity reason. A refused compaction leaves existing
+authority and receipts unchanged; it cannot discard an open round or use the
+new transition as evidence for an older source. The recovery sweep uses the
+same writer and frontier rules.
+
 ## Acceptance evidence
 
 - Imported and fresh origins replay from their exact activation sources;
@@ -126,7 +179,10 @@ specific to this repository.
   hot-read guarantee.
 - More than 4,096 finalized rounds and more than 4,096 generation advances
   remain operable through compaction. A deliberately open prefix still hits a
-  bounded refusal without losing charge or closure evidence.
+  bounded refusal without losing charge or closure evidence. Exercise a long
+  zero-round advance series behind one open early round until the encoded
+  accepted snapshot approaches the codec byte ceiling; the next advance must
+  refuse without a partial receipt or lost prior state.
 - A benchmark compares identical bounded suffixes after 10, 1,000 and more
   than 5,000 lifetime transitions, including zero-round advances. It records
   rows visited, bytes decoded and latency/CPU, showing that hot load and
