@@ -106,17 +106,21 @@ def read_review_round_receipt_sweep_page(
     db: sqlite3.Connection,
     *, after: ReviewRoundReceiptSweepCursor | None = None,
     upper: ReviewRoundReceiptSweepCursor | None = None,
+    limit: int | None = None,
 ) -> ObservedReviewRoundReceiptSweepPage | BlockedReviewRoundReceiptSweepPage:
     """Observe all selected namespaces across repositories in indexed key order.
 
     A page is source evidence only. A durable pass and expected-source join
     must independently account for all returned fingerprints.
     """
+    page_limit = MAX_ROUND_RECEIPT_SWEEP_PAGE if limit is None else limit
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or after is not None and not isinstance(after, ReviewRoundReceiptSweepCursor)
             or upper is not None and not isinstance(upper, ReviewRoundReceiptSweepCursor)
             or after is not None and upper is None
-            or after is not None and upper is not None and after > upper):
+            or after is not None and upper is not None and after > upper
+            or type(page_limit) is not int
+            or not 1 <= page_limit <= MAX_ROUND_RECEIPT_SWEEP_PAGE):
         raise ValueError("round receipt sweep requires a transaction and typed cursor")
     current_rowid: int | None = None
     names = ",".join("?" for _ in ROUND_RECEIPT_NAMESPACES)
@@ -175,15 +179,15 @@ def read_review_round_receipt_sweep_page(
                 f"WHERE namespace=? {lower}{ceiling}"
                 "ORDER BY scope,key LIMIT ?",
                 (MAX_ROUND_RECEIPT_IDENTITY_BYTES, MAX_ROUND_RECEIPT_IDENTITY_BYTES,
-                 *parameters, MAX_ROUND_RECEIPT_SWEEP_PAGE + 1 - len(rows)),
+                 *parameters, page_limit + 1 - len(rows)),
             ).fetchall())
-            if len(rows) > MAX_ROUND_RECEIPT_SWEEP_PAGE:
+            if len(rows) > page_limit:
                 break
         sources: list[ObservedReviewRoundReceiptSweepSource] = []
         cursor = after
         source_bytes = 0
         processed = 0
-        for row in rows[:MAX_ROUND_RECEIPT_SWEEP_PAGE]:
+        for row in rows[:page_limit]:
             current_rowid = row["rowid"]
             if (row["namespace_type"] != "text" or row["scope_type"] != "text"
                     or row["key_type"] != "text" or row["scope_value"] is None
@@ -311,13 +315,14 @@ def read_classified_review_round_receipt_sweep_page(
     db: sqlite3.Connection,
     *, after: ReviewRoundReceiptSweepCursor | None = None,
     upper: ReviewRoundReceiptSweepCursor | None = None,
+    limit: int | None = None,
 ) -> ClassifiedReviewRoundReceiptSweepPage | BlockedReviewRoundReceiptSweepPage:
     """Decode each bounded source and identify its local round or command reference.
 
     The reference has no episode or checkpoint authority until joined to
     canonical round, command and accepted-transition sources.
     """
-    page = read_review_round_receipt_sweep_page(db, after=after, upper=upper)
+    page = read_review_round_receipt_sweep_page(db, after=after, upper=upper, limit=limit)
     if isinstance(page, BlockedReviewRoundReceiptSweepPage):
         return page
     classified: list[ClassifiedReviewRoundReceiptSweepSource] = []

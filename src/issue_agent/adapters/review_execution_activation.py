@@ -1886,12 +1886,14 @@ class BlockedReviewCheckpointRoundSweepPage:
 def read_checkpoint_round_sweep_page(
     db: sqlite3.Connection, binding: ReviewExecutionBinding,
     *, after_rowid: int | None = None, upper_rowid: int | None = None,
+    limit: int | None = None,
 ) -> ObservedReviewCheckpointRoundSweepPage | BlockedReviewCheckpointRoundSweepPage:
     """Sweep all repository rows so malformed or extra episode keys cannot hide.
 
     The upper rowid fixes a pass frontier; a later pass must recheck earlier
     rows and discover newer ones. Pages alone do not prove a complete census.
     """
+    page_limit = MAX_CHECKPOINT_ROUND_SWEEP_PAGE if limit is None else limit
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or not isinstance(binding, ReviewExecutionBinding)
             or (after_rowid is not None
@@ -1901,7 +1903,9 @@ def read_checkpoint_round_sweep_page(
                 and (type(upper_rowid) is not int
                      or not MIN_SQL_ROWID <= upper_rowid <= MAX_SQL_ROWID))
             or (after_rowid is not None
-                and (upper_rowid is None or after_rowid > upper_rowid))):
+                and (upper_rowid is None or after_rowid > upper_rowid))
+            or type(page_limit) is not int
+            or not 1 <= page_limit <= MAX_CHECKPOINT_ROUND_SWEEP_PAGE):
         raise ValueError("checkpoint round sweep requires a transaction and bounded cursor")
     repository = binding.rejection.fence.key.repository
     current_rowid: int | None = None
@@ -1936,11 +1940,11 @@ def read_checkpoint_round_sweep_page(
             f"{'+'.join(json_sizes + other_sizes)} AS total_bytes "
             "FROM review_execution_rounds INDEXED BY review_execution_rounds_repository "
             f"WHERE repository=? AND rowid<=? {position}ORDER BY rowid LIMIT ?",
-            (*parameters, MAX_CHECKPOINT_ROUND_SWEEP_PAGE + 1),
+            (*parameters, page_limit + 1),
         ).fetchall()
         selected: list[sqlite3.Row] = []
         source_bytes = 0
-        for row in metadata[:MAX_CHECKPOINT_ROUND_SWEEP_PAGE]:
+        for row in metadata[:page_limit]:
             current_rowid = row["source_rowid"]
             if (type(row["largest_json"]) is not int
                     or type(row["largest_other"]) is not int

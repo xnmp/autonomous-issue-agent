@@ -684,6 +684,31 @@ def test_checkpoint_round_sweep_pages_retain_a_fixed_repository_frontier(active)
         assert any("review_execution_rounds_repository" in row["detail"] for row in plan)
 
 
+def test_checkpoint_round_sweep_accepts_a_smaller_bounded_page(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        for sequence in (1, 2):
+            facts, _ = round_facts(snapshot, sequence)
+            insert_round(db, facts)
+        first = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding, limit=1,
+        )
+        assert isinstance(first, ObservedReviewCheckpointRoundSweepPage)
+        assert len(first.sources) == 1 and first.has_more
+        second = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding, after_rowid=first.next_rowid,
+            upper_rowid=first.upper_rowid, limit=1,
+        )
+        assert isinstance(second, ObservedReviewCheckpointRoundSweepPage)
+        assert [dict(source.fields)["sequence"] for source in second.sources] == [2]
+        assert not second.has_more
+        for invalid in (0, 17, True):
+            with pytest.raises(ValueError, match="bounded cursor"):
+                read_checkpoint_round_sweep_page(
+                    db, snapshot.execution.binding, limit=invalid,
+                )
+
+
 def test_v26_round_sweep_index_migrates_without_losing_existing_rounds(active):
     store, snapshot = active
     facts, _ = round_facts(snapshot, 1)

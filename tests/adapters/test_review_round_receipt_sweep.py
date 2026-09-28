@@ -75,6 +75,24 @@ def test_round_receipt_sweep_resumes_fixed_upper_and_revisits_later_insert(activ
     assert not final.has_more
 
 
+def test_round_receipt_sweep_accepts_a_smaller_bounded_page(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert(db, "review-round-preflight", "o/r", "round:1")
+        _insert(db, "review-round-stage", "o/r", "stage:1")
+        first = read_review_round_receipt_sweep_page(db, limit=1)
+        assert isinstance(first, ObservedReviewRoundReceiptSweepPage)
+        assert len(first.sources) == 1 and first.has_more
+        second = read_review_round_receipt_sweep_page(
+            db, after=first.next_cursor, upper=first.upper_cursor, limit=1,
+        )
+        assert isinstance(second, ObservedReviewRoundReceiptSweepPage)
+        assert len(second.sources) == 1 and not second.has_more
+        for invalid in (0, 17, True):
+            with pytest.raises(ValueError, match="typed cursor"):
+                read_review_round_receipt_sweep_page(db, limit=invalid)
+
+
 def test_round_receipt_sweep_observes_payload_digest_change(active):
     store, _ = active
     with store.transaction() as db:
@@ -162,6 +180,9 @@ def test_classified_receipt_sweep_attributes_real_finalized_round(rig):
     store, gateway, _, _, plan, command = confirmed_copy(rig)
     workflow_for(store, gateway).settle_submission(command.command_id)
     with store.transaction() as db:
+        bounded = read_classified_review_round_receipt_sweep_page(db, limit=1)
+        assert isinstance(bounded, ClassifiedReviewRoundReceiptSweepPage)
+        assert len(bounded.sources) == 1 and bounded.has_more
         cursor = upper = None
         classified = []
         before = db.total_changes
