@@ -1072,3 +1072,21 @@ Full `make test` passed: 3,192 domain, 2,919 adapter and 2,866 app tests,
 plus hooks, governor, gate parity, four import contracts and both Pyrefly
 checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-outcome-receipt-gate.log` (ephemeral).
+
+## Checkpoint 42 — complete bounded outcome receipt inventory (offline)
+
+The execution activation reader now exhausts the five outcome/productivity
+receipt namespaces for one repository in a single SQL snapshot. It returns a
+complete typed set only when every source is readable, at most 65,536 matching
+receipts and 64 MiB of source text are retained, and the shared `dedupe_keys`
+table has at most one million total rows. Unrelated namespaces and repositories
+count toward that table ceiling. Duplicate namespace/key identities, malformed
+sources and exceeded bounds produce a blocker. A second read compares the
+caller-held set against current SQL, so a partial or changed observation cannot
+be accepted as complete. Receipt payloads remain uninterpreted; productivity,
+ordered reset and escalated hold provenance require separate joined proof.
+Independent Sol review found no medium or high issue.
+Full `make test` passed: 3,198 domain, 2,923 adapter and 2,866 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-complete-outcome-receipt-gate.log` (ephemeral).

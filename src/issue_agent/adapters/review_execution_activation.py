@@ -36,6 +36,8 @@ from ..domain.review_execution_activation import (
     LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES, MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES,
     LegacyReviewOutcomeReceiptPage, LegacyReviewOutcomeReceiptSource,
     UnreadableLegacyReviewOutcomeReceipt, BlockedLegacyReviewOutcomeReceiptPage,
+    CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
+    MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS, MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES,
 )
 from ..domain.contracts import CommandId, EffectReceipt, EffectStatus
 from ..domain.review_execution import ExecutionNotActivated
@@ -565,6 +567,59 @@ def read_legacy_review_outcome_receipt_page(
         tuple(entries), selected[-1]["source_rowid"] if selected else after_rowid,
         len(metadata) > len(selected),
     )
+
+
+def read_complete_legacy_review_outcome_receipts(
+    db: sqlite3.Connection, repository: str,
+) -> CompleteLegacyReviewOutcomeReceipts | BlockedLegacyReviewOutcomeReceipts:
+    """Exhaust receipt pages within one SQL snapshot and shared-table bound."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("complete outcome receipt scan requires an explicit SQL transaction")
+    if canonical_workflow_repository(repository) != repository:
+        raise ValueError("complete outcome receipt scan requires a canonical repository")
+    if db.execute(
+        "SELECT rowid FROM dedupe_keys NOT INDEXED ORDER BY rowid LIMIT 1 OFFSET ?",
+        (MAX_OUTCOME_RECEIPT_SCAN_ROWS,),
+    ).fetchone() is not None:
+        return BlockedLegacyReviewOutcomeReceipts(repository, "outcome receipt table exceeds its total scan bound")
+    receipts: list[LegacyReviewOutcomeReceiptSource] = []
+    source_bytes = 0
+    cursor = None
+    while True:
+        page = read_legacy_review_outcome_receipt_page(db, repository, after_rowid=cursor)
+        if isinstance(page, BlockedLegacyReviewOutcomeReceiptPage):
+            return BlockedLegacyReviewOutcomeReceipts(repository, page.reason, page.source_rowid)
+        for entry in page.entries:
+            if isinstance(entry, UnreadableLegacyReviewOutcomeReceipt):
+                return BlockedLegacyReviewOutcomeReceipts(repository, entry.reason, entry.source_rowid)
+            source_bytes += entry.source_bytes
+            if (len(receipts) >= MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS
+                    or source_bytes > MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES):
+                return BlockedLegacyReviewOutcomeReceipts(
+                    repository, "outcome receipt inventory exceeds its total bound", entry.source_rowid,
+                )
+            receipts.append(entry)
+        if not page.has_more:
+            break
+        cursor = page.next_rowid
+    try:
+        return CompleteLegacyReviewOutcomeReceipts(repository, tuple(receipts))
+    except ValueError as exc:
+        return BlockedLegacyReviewOutcomeReceipts(repository, str(exc)[:512])
+
+
+def revalidate_complete_legacy_review_outcome_receipts(
+    db: sqlite3.Connection, observed: CompleteLegacyReviewOutcomeReceipts,
+) -> CompleteLegacyReviewOutcomeReceipts | BlockedLegacyReviewOutcomeReceipts:
+    """Re-read the whole receipt set before accepting a caller-held inventory."""
+    if not isinstance(observed, CompleteLegacyReviewOutcomeReceipts):
+        raise ValueError("outcome receipt revalidation requires a complete observed inventory")
+    current = read_complete_legacy_review_outcome_receipts(db, observed.repository)
+    if isinstance(current, BlockedLegacyReviewOutcomeReceipts):
+        return current
+    if current.source_digest != observed.source_digest:
+        return BlockedLegacyReviewOutcomeReceipts(observed.repository, "outcome receipt sources changed after inventory")
+    return current
 
 
 def read_legacy_review_round_page(

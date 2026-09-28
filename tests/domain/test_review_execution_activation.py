@@ -15,6 +15,7 @@ from issue_agent.domain.review_execution_activation import (
     LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
     LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
     CompleteLegacyReviewRuns,
+    LegacyReviewOutcomeReceiptSource, CompleteLegacyReviewOutcomeReceipts,
 )
 
 
@@ -202,6 +203,35 @@ def test_submission_receipt_source_digest_and_page_cursor():
 def test_submission_receipt_source_rejects_bad_identity_or_text(changes):
     with pytest.raises(ValueError):
         receipt_source(**changes)
+
+
+def outcome_receipt_source(**changes):
+    fields = dict.fromkeys(LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, "value")
+    fields.update(namespace="review-round-outcome", scope="o/r", key="round-1",
+                  reusable_after=None, payload_json="{}")
+    fields.update(changes)
+    return LegacyReviewOutcomeReceiptSource(5, tuple(fields.items()))
+
+
+def test_complete_outcome_receipt_sources_require_unique_repository_identities():
+    source = outcome_receipt_source()
+    complete = CompleteLegacyReviewOutcomeReceipts("o/r", (source,))
+    assert complete.source_digest == CompleteLegacyReviewOutcomeReceipts(
+        "o/r", (replace(source, source_rowid=-5),),
+    ).source_digest
+    with pytest.raises(ValueError, match="unique"):
+        CompleteLegacyReviewOutcomeReceipts("o/r", (source, replace(source, source_rowid=6)))
+    with pytest.raises(ValueError, match="repository"):
+        CompleteLegacyReviewOutcomeReceipts("o/r", (outcome_receipt_source(scope="other/repo"),))
+
+
+@pytest.mark.parametrize("changes", [
+    {"namespace": "other"}, {"scope": "Other/R"}, {"key": ""},
+    {"payload_json": None}, {"payload_json": "x" * (2**21 + 1)},
+])
+def test_outcome_receipt_source_rejects_untrusted_identity_and_payload(changes):
+    with pytest.raises(ValueError):
+        outcome_receipt_source(**changes)
 
 
 def test_review_owner_lineage_binds_retirement_sources_without_rowid():

@@ -602,6 +602,50 @@ class BlockedLegacyReviewOutcomeReceiptPage:
             _rowid(self.source_rowid, "blocked outcome receipt scan cursor")
 
 
+MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS = 65536
+MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES = 2**26
+
+
+@dataclass(frozen=True)
+class CompleteLegacyReviewOutcomeReceipts:
+    """A bounded whole-repository observation; activation must recheck SQL."""
+
+    repository: str
+    receipts: tuple[LegacyReviewOutcomeReceiptSource, ...]
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository or not isinstance(self.receipts, tuple):
+            raise ValueError("complete outcome receipts require a canonical repository and tuple")
+        if (len(self.receipts) > MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS
+                or any(not isinstance(source, LegacyReviewOutcomeReceiptSource)
+                       or dict(source.fields)["scope"] != self.repository for source in self.receipts)
+                or sum(source.source_bytes for source in self.receipts) > MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES):
+            raise ValueError("complete outcome receipts require bounded readable repository sources")
+        identities = [(dict(source.fields)["namespace"], dict(source.fields)["key"]) for source in self.receipts]
+        if len(set(identities)) != len(identities):
+            raise ValueError("complete outcome receipts require unique namespace and key identities")
+
+    @property
+    def source_digest(self) -> str:
+        parts = tuple(sorted((dict(source.fields)["namespace"], dict(source.fields)["key"], source.source_digest)
+                             for source in self.receipts))
+        return hashlib.sha256(json.dumps((self.repository, parts), separators=(",", ":")).encode()).hexdigest()
+
+
+@dataclass(frozen=True)
+class BlockedLegacyReviewOutcomeReceipts:
+    repository: str
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if canonical_workflow_repository(self.repository) != self.repository:
+            raise ValueError("blocked outcome receipts require a canonical repository")
+        validate_workflow_text(self.reason, "blocked outcome receipt reason")
+        if self.source_rowid is not None:
+            _rowid(self.source_rowid, "blocked outcome receipt cursor")
+
+
 MAX_LEGACY_REVIEW_OWNERS = 64
 
 

@@ -16,6 +16,7 @@ from issue_agent.adapters.review_execution_activation import (
     read_legacy_review_round_page, MAX_REVIEW_ROUND_SOURCE_PAGE,
     read_complete_legacy_review_rounds, revalidate_complete_legacy_review_rounds,
     read_legacy_review_outcome_receipt_page, MAX_OUTCOME_RECEIPT_SOURCE_PAGE,
+    read_complete_legacy_review_outcome_receipts, revalidate_complete_legacy_review_outcome_receipts,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
@@ -31,6 +32,7 @@ from issue_agent.domain.review_execution_activation import (
     LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES, MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES,
     LegacyReviewOutcomeReceiptPage, LegacyReviewOutcomeReceiptSource, UnreadableLegacyReviewOutcomeReceipt,
     BlockedLegacyReviewOutcomeReceiptPage,
+    CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
 )
 from tests.adapters.test_review_execution_control import rig
 from tests.adapters.test_review_productive_settlement import confirmed_copy, workflow_for
@@ -366,6 +368,7 @@ def test_outcome_receipt_inventory_keeps_all_namespace_and_cursor_sources(rig):
         db.execute("BEGIN")
         first = read_legacy_review_outcome_receipt_page(db, "o/r")
         second = read_legacy_review_outcome_receipt_page(db, "o/r", after_rowid=first.next_rowid)
+        complete = read_complete_legacy_review_outcome_receipts(db, "o/r")
         db.rollback()
 
     assert len(first.entries) == MAX_OUTCOME_RECEIPT_SOURCE_PAGE and first.has_more
@@ -374,6 +377,8 @@ def test_outcome_receipt_inventory_keeps_all_namespace_and_cursor_sources(rig):
     assert all(isinstance(entry, LegacyReviewOutcomeReceiptSource) for entry in all_entries)
     assert {dict(entry.fields)["namespace"] for entry in all_entries} == set(namespaces)
     assert {entry.source_rowid for entry in all_entries} >= {-2, -1, 0}
+    assert isinstance(complete, CompleteLegacyReviewOutcomeReceipts)
+    assert len(complete.receipts) == len(all_entries)
 
 
 @pytest.mark.parametrize("damage", ["oversized", "null_payload", "blob_scope", "blob_namespace"])
@@ -424,6 +429,88 @@ def test_outcome_receipt_page_bounds_unrelated_row_scans(monkeypatch):
     assert isinstance(page, LegacyReviewOutcomeReceiptPage)
     assert len(page.entries) == 1
     assert isinstance(page.entries[0], LegacyReviewOutcomeReceiptSource)
+
+
+def test_complete_outcome_receipts_revalidate_real_settlement_without_writes(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        observed = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewOutcomeReceipts)
+        revalidated = revalidate_complete_legacy_review_outcome_receipts(db, observed)
+        assert db.total_changes == before
+        db.rollback()
+
+    assert isinstance(revalidated, CompleteLegacyReviewOutcomeReceipts)
+    assert revalidated.source_digest == observed.source_digest
+    assert [(dict(source.fields)["namespace"], dict(source.fields)["key"])
+            for source in revalidated.receipts] == [("review-round-outcome", plan.round.round_id)]
+
+
+def test_complete_outcome_receipts_reject_partial_and_changed_sources(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        observed = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        assert isinstance(observed, CompleteLegacyReviewOutcomeReceipts)
+        partial = CompleteLegacyReviewOutcomeReceipts("o/r", ())
+        assert isinstance(revalidate_complete_legacy_review_outcome_receipts(db, partial),
+                          BlockedLegacyReviewOutcomeReceipts)
+        db.rollback()
+    with store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-outcome'",
+                   ('{"changed":true}',))
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = revalidate_complete_legacy_review_outcome_receipts(db, observed)
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewOutcomeReceipts)
+    assert "changed" in result.reason
+
+
+def test_complete_outcome_receipts_blocks_unreadable_source(rig):
+    store, gateway, _, control, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).record_review(command.command_id)
+    control.finalize_completed_round(plan.round.round_id)
+    with store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json=NULL WHERE namespace='review-round-outcome'")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        result = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        db.rollback()
+
+    assert isinstance(result, BlockedLegacyReviewOutcomeReceipts)
+    assert result.source_rowid is not None
+
+
+def test_complete_outcome_receipts_bounds_shared_table_and_retained_bytes(monkeypatch):
+    with closing(sqlite3.connect(":memory:")) as db:
+        db.row_factory = sqlite3.Row
+        db.execute("CREATE TABLE dedupe_keys (namespace TEXT,scope TEXT,key TEXT,claimed_at TEXT,"
+                   "reusable_after TEXT,payload_json TEXT,PRIMARY KEY(namespace,scope,key))")
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                   "VALUES ('unrelated','other/repo','one','now','{}')")
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                   "VALUES ('review-round-outcome','o/r','round-1','now','{}')")
+        db.commit()
+        db.execute("BEGIN")
+        monkeypatch.setattr(review_activation, "MAX_OUTCOME_RECEIPT_SCAN_ROWS", 1)
+        scan_blocked = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        monkeypatch.setattr(review_activation, "MAX_OUTCOME_RECEIPT_SCAN_ROWS", 2)
+        monkeypatch.setattr(review_activation, "MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES", 1)
+        bytes_blocked = read_complete_legacy_review_outcome_receipts(db, "o/r")
+        db.rollback()
+
+    assert isinstance(scan_blocked, BlockedLegacyReviewOutcomeReceipts)
+    assert "total scan bound" in scan_blocked.reason
+    assert isinstance(bytes_blocked, BlockedLegacyReviewOutcomeReceipts)
+    assert "total bound" in bytes_blocked.reason
 
 
 def _control(tmp_path):

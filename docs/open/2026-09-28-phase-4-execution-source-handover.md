@@ -64,6 +64,11 @@ with `CLAUDE.md`, `AGENTS.md`, the
   source columns and explicit malformed or oversized entries. A one-million-row
   shared-table scan ceiling blocks unbounded work. Pages alone do not prove a
   complete receipt inventory, productivity or ordered resets.
+- Checkpoint 42 exhausts those pages within 65,536 matched rows, 64 MiB of
+  source text and a one-million-row bound on the shared `dedupe_keys` table.
+  Unreadable and duplicate sources block a complete set. A second SQL read
+  rejects partial or changed caller-held inventories. This is still raw
+  evidence; it does not certify a productive outcome or execution reset.
 
 The checkpoint-37 full `make test` gate passed: 3,192 domain, 2,885 adapter
 and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
@@ -105,6 +110,13 @@ tests, plus hooks, governor, gate parity, four import contracts and both
 Pyrefly checks. Ten strict xfails remained expected. Log:
 `/tmp/phase4-outcome-receipt-gate.log` (ephemeral).
 
+The checkpoint-42 full `make test` gate passed: 3,198 domain, 2,923 adapter
+and 2,866 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-complete-outcome-receipt-gate.log` (ephemeral). Independent Sol
+review found no medium or high issue in the complete inventory and SQL
+revalidation.
+
 These are offline source readers and a classifier. None creates an execution
 episode or changes production review eligibility. The current review runtime
 still reads legacy session/round files and counters. No execution-family
@@ -118,8 +130,8 @@ occurred.
    rewrites some prior run owners, so neither the current owner nor configured
    owners alone establish complete historical run evidence. Caller-held
    complete values are observational until this SQL recheck succeeds.
-2. Complete and revalidate the bounded outcome receipt inventory. Join it to
-   the complete round inventory, then use
+2. Join the complete, revalidated outcome receipt inventory to the complete
+   round inventory, then use
    verified command-to-round links with plain recorded baselines to prove
    confirmed productive outcomes and ordered resets. Verify escalated verdict
    hold provenance and classify unrecorded or stale successful commands
