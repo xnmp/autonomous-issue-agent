@@ -168,6 +168,16 @@ last-round source; the future writer must verify member payload semantics and
 commit the same digest, while the paged audit must reconstruct all retired
 round sets and unclaimed global receipts.
 
+The retired-round archive reader can now resolve each expected sequence by
+the episode index and return a two-round page of finalized outcomes and row
+plus receipt-set fingerprints. It preflights row identity and outcome bytes,
+rejects canonical TEXT/BLOB identity aliases, and fails at the first missing
+or malformed sequence. This page is an observation for the writer and audit,
+not a complete archive proof: the writer must join it to the canonical
+projection and verify member payload semantics, and the audit must separately
+census unclaimed rows, including noncanonical numeric BLOB encodings that an
+exact indexed point lookup cannot enumerate.
+
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money
 settlement and evidence-preserving recovery remain allowed so a hold cannot

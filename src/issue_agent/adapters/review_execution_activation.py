@@ -140,6 +140,7 @@ _RETIRED_OWNER_COLUMNS = ("owner_id", "successor_owner_id", "repository", "role"
 _DEDUPE_SOURCE_COLUMNS = ("namespace", "scope", "key", "claimed_at", "reusable_after", "payload_json")
 MAX_LEGACY_RECORDING_BYTES = 2**21
 MAX_CHECKPOINT_ROUND_RECEIPT_BYTES = 2**25
+MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE = 2
 _RUN_COLUMNS = (
     "run_id", "dispatch_id", "kind", "state", "config_version", "started_at", "completed_at", "outcome",
     "provider_receipt_id", "workflow_binding_json", "workflow_episode_key", "review_round_id", "review_child_id",
@@ -1645,6 +1646,128 @@ def read_checkpoint_round_receipt_source(
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error, WorkflowEncodingError) as exc:
         raise WorkflowAuthorityError("review execution checkpoint round receipt set is unreadable") from exc
+
+
+@dataclass(frozen=True)
+class ObservedReviewCheckpointRound:
+    """One sequence-indexed finalized outcome and its retained source fingerprint."""
+
+    outcome: ReviewRoundOutcome
+    source: ReviewExecutionCompactionRoundSource
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.outcome, ReviewRoundOutcome)
+                or not isinstance(self.source, ReviewExecutionCompactionRoundSource)
+                or self.outcome.round != self.source.round):
+            raise ValueError("checkpoint round observation requires one exact outcome source")
+
+
+def read_checkpoint_round_by_sequence(
+    db: sqlite3.Connection, binding: ReviewExecutionBinding, sequence: int,
+) -> ObservedReviewCheckpointRound:
+    """Point-read one allocated sequence before assembling a retired source stream."""
+    if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
+            or not isinstance(binding, ReviewExecutionBinding)
+            or type(sequence) is not int or not 1 <= sequence <= MAX_SQL_ROWID):
+        raise ValueError("checkpoint round sequence requires a transaction and typed episode")
+    repository = binding.rejection.fence.key.repository
+    number = binding.rejection.fence.key.target.number
+    try:
+        rows = db.execute(
+            "SELECT rowid AS source_rowid,typeof(repository) AS repository_type,"
+            "typeof(target_number) AS number_type,typeof(execution_epoch) AS epoch_type,"
+            "typeof(execution_episode) AS episode_type,typeof(round_id) AS round_id_type,"
+            "typeof(sequence) AS sequence_type,"
+            "typeof(outcome_json) AS outcome_type,"
+            "length(CAST(round_id AS BLOB)) AS round_id_bytes,"
+            "length(CAST(outcome_json AS BLOB)) AS outcome_bytes "
+            "FROM review_execution_rounds WHERE repository IN (?,CAST(? AS BLOB)) "
+            "AND target_number IN (?,CAST(? AS BLOB)) "
+            "AND execution_epoch IN (?,CAST(? AS BLOB)) "
+            "AND execution_episode IN (?,CAST(? AS BLOB)) "
+            "AND sequence IN (?,CAST(? AS BLOB)) LIMIT 2",
+            (repository, repository, number, str(number), binding.execution_epoch,
+             str(binding.execution_epoch), binding.execution_episode, binding.execution_episode,
+             sequence, str(sequence)),
+        ).fetchall()
+        if (len(rows) != 1 or any(rows[0][f"{field}_type"] != "text" for field in (
+            "repository", "episode", "round_id", "outcome",
+        )) or any(rows[0][f"{field}_type"] != "integer" for field in (
+            "number", "epoch", "sequence",
+        )) or rows[0]["round_id_bytes"] > MAX_LEGACY_SQL_TEXT_BYTES
+                or rows[0]["outcome_bytes"] > MAX_LEGACY_ROUND_JSON_BYTES):
+            raise ValueError("checkpoint round sequence is absent, aliased or oversized")
+        row = db.execute(
+            "SELECT round_id,outcome_json FROM review_execution_rounds WHERE rowid=? "
+            "AND repository=? AND target_number=? AND execution_epoch=? "
+            "AND execution_episode=? AND sequence=?",
+            (rows[0]["source_rowid"], repository, number, binding.execution_epoch,
+             binding.execution_episode, sequence),
+        ).fetchone()
+        if row is None:
+            raise ValueError("checkpoint round sequence changed during its bounded read")
+        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+        if (outcome.round.round_id != row["round_id"] or outcome.round.sequence != sequence
+                or not same_execution_episode(binding, outcome.round.binding)):
+            raise ValueError("checkpoint round outcome has a foreign indexed identity")
+        return ObservedReviewCheckpointRound(
+            outcome, read_checkpoint_round_receipt_source(db, outcome.round),
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            sqlite3.Error, WorkflowEncodingError) as exc:
+        raise WorkflowAuthorityError("review execution checkpoint round sequence is unreadable") from exc
+
+
+@dataclass(frozen=True)
+class ObservedReviewCheckpointRoundPage:
+    rounds: tuple[ObservedReviewCheckpointRound, ...]
+    next_sequence: int
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.rounds, tuple)
+                or not 1 <= len(self.rounds) <= MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE
+                or any(not isinstance(item, ObservedReviewCheckpointRound) for item in self.rounds)
+                or type(self.next_sequence) is not int or not 1 <= self.next_sequence <= MAX_SQL_ROWID + 1
+                or type(self.has_more) is not bool
+                or any(item.source.round.sequence != self.next_sequence - len(self.rounds) + index
+                       for index, item in enumerate(self.rounds))):
+            raise ValueError("checkpoint round page requires bounded typed observations")
+
+
+@dataclass(frozen=True)
+class BlockedReviewCheckpointRoundPage:
+    sequence: int
+    reason: str
+
+    def __post_init__(self) -> None:
+        if (type(self.sequence) is not int or self.sequence < 1
+                or not isinstance(self.reason, str) or not self.reason):
+            raise ValueError("blocked checkpoint round page requires a sequence and reason")
+
+
+def read_checkpoint_round_archive_page(
+    db: sqlite3.Connection, binding: ReviewExecutionBinding,
+    first_sequence: int, through_sequence: int,
+    *, limit: int = MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE,
+) -> ObservedReviewCheckpointRoundPage | BlockedReviewCheckpointRoundPage:
+    """Read the next small contiguous slice of retained round source identities."""
+    if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
+            or not isinstance(binding, ReviewExecutionBinding)
+            or type(first_sequence) is not int or type(through_sequence) is not int
+            or not 1 <= first_sequence <= through_sequence <= MAX_SQL_ROWID
+            or type(limit) is not int or not 1 <= limit <= MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE):
+        raise ValueError("checkpoint round archive page requires a bounded episode range")
+    rounds: list[ObservedReviewCheckpointRound] = []
+    for sequence in range(first_sequence, min(through_sequence + 1, first_sequence + limit)):
+        try:
+            rounds.append(read_checkpoint_round_by_sequence(db, binding, sequence))
+        except WorkflowAuthorityError as exc:
+            return BlockedReviewCheckpointRoundPage(sequence, str(exc)[:512])
+    next_sequence = first_sequence + len(rounds)
+    return ObservedReviewCheckpointRoundPage(
+        tuple(rounds), next_sequence, next_sequence <= through_sequence,
+    )
 
 
 def _bounded_identity_row(

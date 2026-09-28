@@ -458,12 +458,43 @@ with no remaining medium or high finding. Final `make test` passed: 3,280
 domain, 3,250 adapter and 2,876 app tests, plus hooks, governor, gate parity,
 four import contracts and both Pyrefly checks. Ten strict xfails remained
 expected. Log: `/tmp/phase4-checkpoint-round-receipts-gate.log` (ephemeral).
-The next seam is the transactional
-checkpoint writer: it must verify the full retired stream, use this identical
-round receipt-set definition, bind the ordered source digests, and publish the
-aggregate and checkpoint atomically. The paged audit must reconstruct all
-retired member payloads and unclaimed receipts and supply the admission gate.
-Keep the canonical compaction refusal until both are complete.
+
+- Checkpoint 85 adds an indexed, transaction-local reader for an expected
+  finalized round sequence and a two-round archive page over a contiguous
+  range. It preflights the round ID and outcome before decoding, verifies the
+  outcome's episode/sequence identity, and obtains the same bounded row and
+  receipt-set fingerprint used by the hot checkpoint anchor. A missing,
+  malformed or aliased sequence blocks the page. The lookup includes canonical
+  BLOB aliases of the repository, target number, epoch, episode and sequence;
+  SQL query-plan inspection confirms the full episode index is used. Tests
+  cover a gap, open or oversized outcome, foreign binding, changed outcome,
+  BLOB row/episode identity and duplicate BLOB sequence/epoch rows. This is a
+  source observation, not a complete census: noncanonical numeric BLOB
+  spellings and unrelated unclaimed rows still require the archive sweep.
+
+Independent Sol review of checkpoint 85 reproduced a duplicate BLOB sequence
+and epoch gap; the alias-inclusive indexed query and regression tests passed
+re-review with no remaining medium or high finding. Final `make test` passed:
+3,280 domain, 3,263 adapter and 2,876 app tests, plus hooks, governor, gate
+parity, four import contracts and both Pyrefly checks. Ten strict xfails
+remained expected. Log: `/tmp/phase4-checkpoint-round-archive-page-gate.log`
+(ephemeral).
+
+The next seam is the transactional checkpoint writer: it must verify the full
+retired stream, use this identical round receipt-set definition, bind the
+ordered source digests, and publish the aggregate and checkpoint atomically.
+The paged audit must reconstruct all retired member payloads and unclaimed
+receipts and supply the admission gate. Keep the canonical compaction refusal
+until both are complete.
+
+With checkpoint 85, the writer can enumerate a retired round range from
+stored sequence keys without accepting a caller-supplied source list. Next,
+assemble the entire bounded retired round and generation streams inside one
+write transaction, set an explicit cumulative byte budget, and compare them
+to a fresh canonical replay before minting a checkpoint receipt. This must
+handle generation-only advances and later checkpoints as well as an initial
+round prefix. The audit still needs a separate sweep of unclaimed round rows,
+including noncanonical BLOB numeric encodings that no point lookup can find.
 
 The intended read metric is bytes and latency per canonical load as archived
 generations grow; the guardrail is refusal on changed immediate sources. The

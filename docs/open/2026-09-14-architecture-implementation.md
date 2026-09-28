@@ -23,6 +23,9 @@ and bounded identity/predecessor read now exist. Canonical reads point-check
 the final retired generation source pair and the final retired round's row and
 bounded receipt set, but refuse all compacted components until the checkpoint
 writer and audit gate are installed.
+A bounded transaction-local archive page now observes expected finalized round
+sequences and their row/receipt fingerprints for future writer and audit joins;
+an independent unclaimed-row census remains necessary.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

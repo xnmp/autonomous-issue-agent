@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 05:48 AEST · Latest accepted checkpoint: retired round receipt anchor</p>
+      <p class="meta">Updated 29 Sep 2026, 06:07 AEST · Latest accepted checkpoint: retired round archive page</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Canonical reads check the typed checkpoint, its final retired generation pair, and the final round's row and bounded receipt set. Compacted loads still refuse. Next: transactional checkpoint writer, retired archive audit and gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Canonical reads check the typed checkpoint and final retired source anchors; bounded pages now observe expected retired round sequences. Compacted loads still refuse. Next: transactional checkpoint writer, full archive census and gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -146,6 +146,7 @@
           <li><time datetime="2026-09-29T05:12:00+10:00">29 Sep 2026, 05:12 AEST</time><strong>Generation checkpoint anchor accepted offline · 3 of 6 accepted</strong><p>A bounded point check compares the final retired generation receipt and accepted-row digests without decoding the historical accepted snapshot. Real canonical-load and source-tamper fixtures pass; Sol review found no medium or high issue. The loader still refuses every compacted component until round source and audit proofs are installed. Full gate passed: 3,280 domain, 3,237 adapter and 2,876 app tests, plus contracts and Pyrefly. Active work since the previous entry: About 27 minutes.</p></li>
           <li><time datetime="2026-09-29T05:27:00+10:00">29 Sep 2026, 05:27 AEST</time><strong>Retired round row anchor accepted offline · 3 of 6 accepted</strong><p>A bounded indexed point read now matches the final retired round row to the checkpoint digest and rejects missing, aliased, oversized or foreign rows. Sol review and full gate passed: 3,280 domain, 3,241 adapter and 2,876 app tests, plus contracts and Pyrefly. The receipt-set digest and audit gate remain open; compacted loads still refuse. Active work since the previous entry: About 15 minutes.</p></li>
           <li><time datetime="2026-09-29T05:48:00+10:00">29 Sep 2026, 05:48 AEST</time><strong>Retired round receipt anchor accepted offline · 3 of 6 accepted</strong><p>Canonical reads compare the final round's exact bounded receipt-set digest after its row and generation anchors, then retain the compaction refusal. A Sol review found and verified the fix for an unbounded key fetch; a query-plan check led to separate indexed TEXT/BLOB range reads. Full gate passed: 3,280 domain, 3,250 adapter and 2,876 app tests, plus contracts and Pyrefly. The writer and archived audit remain open. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-29T06:07:00+10:00">29 Sep 2026, 06:07 AEST</time><strong>Retired round archive page accepted offline · 3 of 6 accepted</strong><p>An indexed point read and two-round page now return expected finalized outcomes with row and receipt-set fingerprints. Sol review reproduced a duplicate BLOB sequence gap; the alias-inclusive query passed re-review. Full gate passed: 3,280 domain, 3,263 adapter and 2,876 app tests, plus contracts and Pyrefly. An unclaimed-row census, writer and audit gate remain open. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

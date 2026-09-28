@@ -12,6 +12,8 @@ import pytest
 
 from issue_agent.adapters.workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, encode_workflow
 from issue_agent.adapters.review_execution_activation import (
+    BlockedReviewCheckpointRoundPage, ObservedReviewCheckpointRoundPage,
+    read_checkpoint_round_archive_page, read_checkpoint_round_by_sequence,
     read_checkpoint_round_receipt_source, read_checkpoint_round_row_source,
 )
 from issue_agent.domain.review_execution_activation import MAX_LEGACY_ROUND_JSON_BYTES
@@ -522,6 +524,116 @@ def test_compacted_abandoned_round_binds_its_fence_receipt(active):
         with pytest.raises(WorkflowAuthorityError, match="checkpoint round receipt set"):
             read_checkpoint_round_receipt_source(db, facts.plan.round)
         assert source.receipt_set_sha256
+
+
+def test_checkpoint_sequence_read_derives_retired_source_from_index(active):
+    store, snapshot = active
+    facts, outcome = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts, outcome)
+        before = db.total_changes
+        observed = read_checkpoint_round_by_sequence(db, snapshot.execution.binding, 1)
+        assert observed.outcome == outcome
+        assert observed.source == read_checkpoint_round_receipt_source(db, facts.plan.round)
+        assert db.total_changes == before
+
+
+@pytest.mark.parametrize("corruption", [
+    "missing", "open", "oversized_outcome", "aliased_round_id", "aliased_episode", "foreign_binding",
+    "changed_outcome_round",
+])
+def test_checkpoint_sequence_read_refuses_untrustworthy_round(active, corruption):
+    store, snapshot = active
+    facts, outcome = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts, outcome)
+        binding = snapshot.execution.binding
+        if corruption == "missing":
+            db.execute("DELETE FROM review_execution_rounds WHERE round_id=?", (facts.plan.round.round_id,))
+        elif corruption == "open":
+            db.execute("UPDATE review_execution_rounds SET outcome_json=NULL WHERE round_id=?",
+                       (facts.plan.round.round_id,))
+        elif corruption == "oversized_outcome":
+            db.execute("UPDATE review_execution_rounds SET outcome_json=? WHERE round_id=?",
+                       ("x" * (MAX_LEGACY_ROUND_JSON_BYTES + 1), facts.plan.round.round_id))
+        elif corruption == "aliased_round_id":
+            db.execute("UPDATE review_execution_rounds SET round_id=CAST(round_id AS BLOB) WHERE round_id=?",
+                       (facts.plan.round.round_id,))
+        elif corruption == "aliased_episode":
+            db.execute("UPDATE review_execution_rounds SET execution_episode=CAST(execution_episode AS BLOB) "
+                       "WHERE round_id=?", (facts.plan.round.round_id,))
+        elif corruption == "foreign_binding":
+            binding = replace(binding, execution_episode="foreign-episode")
+        else:
+            changed = encode_workflow(outcome).replace("round:1", "foreign-round", 1)
+            db.execute("UPDATE review_execution_rounds SET outcome_json=? WHERE round_id=?",
+                       (changed, facts.plan.round.round_id))
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint round sequence"):
+            read_checkpoint_round_by_sequence(db, binding, 1)
+        assert tuple(db.iterdump()) == before
+
+
+def test_checkpoint_round_archive_pages_preserve_exact_sequence_and_detect_a_gap(active):
+    store, snapshot = active
+    first, first_outcome = round_facts(snapshot, 1)
+    second, second_outcome = round_facts(snapshot, 2)
+    with store.transaction() as db:
+        insert_round(db, first, first_outcome)
+        insert_round(db, second, second_outcome)
+        binding = snapshot.execution.binding
+        before = db.total_changes
+        page = read_checkpoint_round_archive_page(db, binding, 1, 2, limit=1)
+        assert isinstance(page, ObservedReviewCheckpointRoundPage)
+        assert (page.rounds[0].outcome, page.next_sequence, page.has_more) == (
+            first_outcome, 2, True,
+        )
+        final = read_checkpoint_round_archive_page(db, binding, page.next_sequence, 2)
+        assert isinstance(final, ObservedReviewCheckpointRoundPage)
+        assert (tuple(item.outcome for item in final.rounds), final.next_sequence, final.has_more) == (
+            (second_outcome,), 3, False,
+        )
+        assert db.total_changes == before
+        db.execute("DELETE FROM review_execution_rounds WHERE round_id=?", (second.plan.round.round_id,))
+        blocked = read_checkpoint_round_archive_page(db, binding, 1, 2)
+        assert isinstance(blocked, BlockedReviewCheckpointRoundPage)
+        assert blocked.sequence == 2
+
+
+def test_checkpoint_round_archive_page_rejects_invalid_bounds(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        for first, through, limit in ((0, 1, 1), (2, 1, 1), (1, 1, 0), (1, 1, 3)):
+            with pytest.raises(ValueError, match="bounded episode range"):
+                read_checkpoint_round_archive_page(
+                    db, snapshot.execution.binding, first, through, limit=limit,
+                )
+
+
+@pytest.mark.parametrize("aliased", ["sequence", "execution_epoch"])
+def test_checkpoint_sequence_read_rejects_duplicate_numeric_blob_alias(active, aliased):
+    store, snapshot = active
+    facts, outcome = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts, outcome)
+        columns = (
+            "round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
+            "generation,sequence,claim_occurrence_id,plan_json,planning_json,closure_json,outcome_json"
+        )
+        selected = tuple(
+            f"CAST({column} AS BLOB)" if column == aliased else column
+            for column in columns.split(",")
+        )
+        selected = ("?", *selected[1:])
+        db.execute(
+            f"INSERT INTO review_execution_rounds({columns}) "
+            f"SELECT {','.join(selected)} FROM review_execution_rounds WHERE round_id=?",
+            ("alias:round", facts.plan.round.round_id),
+        )
+        before = tuple(db.iterdump())
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint round sequence"):
+            read_checkpoint_round_by_sequence(db, snapshot.execution.binding, 1)
+        assert tuple(db.iterdump()) == before
 
 
 def test_indexed_round_high_water_does_not_hide_a_missing_suffix_middle(active):
