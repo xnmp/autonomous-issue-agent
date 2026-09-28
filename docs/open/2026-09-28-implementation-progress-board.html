@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 04:45 AEST · Latest accepted checkpoint: typed checkpoint receipt contract</p>
+      <p class="meta">Updated 29 Sep 2026, 05:12 AEST · Latest accepted checkpoint: generation checkpoint anchor</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>A typed checkpoint receipt binds ordered retired source digests and the prior frontier. The canonical reader checks its scoped identity and immediate predecessor, then refuses compaction until source anchors and the audit gate can be verified. The durable generation census remains observational. Next: source anchors, retired round audit, historical reset/session proof, and production import and checkpoint writers. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>A typed checkpoint receipt binds ordered retired source digests and the prior frontier. Canonical reads now check its scoped identity, immediate predecessor and final retired generation source pair, then refuse compaction until the round anchor and audit gate are verified. The durable generation census remains observational. Next: round source proof, retired archive audit, historical reset/session proof, and production import and checkpoint writers. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -143,6 +143,7 @@
           <li><time datetime="2026-09-29T04:08:00+10:00">29 Sep 2026, 04:08 AEST</time><strong>Durable generation archive scan accepted offline · 3 of 6 accepted</strong><p>One transaction checks a bounded source page and persists a small cursor or discrepancy. Origin mutation blocks on resume; new generations do not reset an incomplete pass. Sol review found both gaps and verified their fixes. Full gate passed: 3,278 domain, 3,212 adapter and 2,876 app tests, plus contracts and Pyrefly. Namespace reconciliation, checkpoint ancestry and the admission gate remain open. Active work since the previous entry: About 32 minutes.</p></li>
           <li><time datetime="2026-09-29T04:31:00+10:00">29 Sep 2026, 04:31 AEST</time><strong>Durable generation receipt census accepted offline · 3 of 6 accepted</strong><p>A fixed-upper-key namespace sweep now reconciles retained receipts with the expected generation pass. Missing, changed and unclaimed sources persist discrepancies; a prior-prefix digest detects valid source drift on the next pass, including after frontier growth. Sol review, regressions and the full gate passed: 3,279 domain, 3,220 adapter and 2,876 app tests, plus contracts and Pyrefly. Checkpoint ancestry, retired rounds, admission and hot-read bounds remain open. Active work since the previous entry: About 23 minutes.</p></li>
           <li><time datetime="2026-09-29T04:45:00+10:00">29 Sep 2026, 04:45 AEST</time><strong>Typed checkpoint receipt contract accepted offline · 3 of 6 accepted</strong><p>The pure manifest binds the previous and new frontiers and ordered retired source digests. Canonical reads check the scoped receipt identity and immediate predecessor but refuse every compacted component until retained source anchors and the audit gate are implemented. An indexed high-water replaces the lifetime round count. Independent Sol review caught fabricated anchors in the first reader; the fail-closed revision passed re-review. Full gate passed: 3,280 domain, 3,231 adapter and 2,876 app tests, plus contracts and Pyrefly. Active work since the previous entry: About 14 minutes.</p></li>
+          <li><time datetime="2026-09-29T05:12:00+10:00">29 Sep 2026, 05:12 AEST</time><strong>Generation checkpoint anchor accepted offline · 3 of 6 accepted</strong><p>A bounded point check compares the final retired generation receipt and accepted-row digests without decoding the historical accepted snapshot. Real canonical-load and source-tamper fixtures pass; Sol review found no medium or high issue. The loader still refuses every compacted component until round source and audit proofs are installed. Full gate passed: 3,280 domain, 3,237 adapter and 2,876 app tests, plus contracts and Pyrefly. Active work since the previous entry: About 27 minutes.</p></li>
         </ol>
       </div>
     </section>

@@ -675,6 +675,12 @@ def _check_execution_checkpoint_receipt(
         previous = predecessor.checkpoint
     if receipt.previous_checkpoint != previous:
         raise WorkflowAuthorityError("review execution checkpoint has a changed predecessor")
+    if receipt.last_generation_source is not None:
+        from .review_execution_activation import verify_checkpoint_generation_anchor
+
+        verify_checkpoint_generation_anchor(
+            db, receipt.previous_checkpoint.state.binding, receipt.last_generation_source,
+        )
 
 
 def _check_initialized_execution_origin(

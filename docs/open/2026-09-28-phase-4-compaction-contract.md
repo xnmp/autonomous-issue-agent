@@ -4,8 +4,9 @@ Date: 2026-09-28 Australia/Sydney. Contract for offline implementation;
 the pure prefix planner, checkpoint cursor, imported-origin read prerequisite,
 fresh first-observation origin, digest-bound generation receipts and typed
 checkpoint source manifest are implemented. The canonical reader verifies
-checkpoint row identity and one predecessor but refuses every compacted
-component until immediate source anchors and the audit gate can be verified.
+checkpoint row identity, one predecessor and the final retired generation
+source pair, but refuses every compacted component until the round anchor
+and audit gate can be verified.
 Production import and renewal writers, the checkpoint writer, bounded
 compacted hot reads and the complete audit remain pending. A durable offline
 cursor now scans expected generation sources and the retained receipt
@@ -143,9 +144,10 @@ verifies the newly retired source stream and initializes its audit state in
 the same transaction as the checkpoint and active-suffix update. Subsequent
 audit pages verify retained membership and payloads, including full historical
 accepted transitions, and persist a cursor, rolling digest, due state and any
-discrepancy. The current loader checks only the raw checkpoint value and cannot
-verify sources after their boundaries leave the active component; it is not a
-safe reader for a compacted writer. The new hot reader checks the typed receipt,
+discrepancy. The current loader checks typed checkpoint ancestry and the last
+retired generation source pair, then refuses every compacted component because
+the final round anchor and audit gate are absent. It cannot yet serve a
+compacted writer. The completed hot reader checks the typed receipt,
 immediate source anchor, bounded active suffix and audit gate without decoding
 historical accepted snapshots or scanning the compacted prefix. Older
 full-payload generation receipts require retirement into an audited checkpoint

@@ -33,7 +33,7 @@ from issue_agent.adapters.review_execution_activation import (
     read_complete_legacy_review_generation_receipts, revalidate_complete_legacy_review_generation_receipts,
     match_legacy_review_generation_boundary_sources,
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
-    read_review_generation_archive_page,
+    read_review_generation_archive_page, verify_checkpoint_generation_anchor,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
     read_review_generation_receipt_sweep_page, read_reconciled_review_generation_receipt_sweep_page,
     ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
@@ -59,15 +59,20 @@ from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
 )
 from issue_agent.domain.review_execution import (
-    CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome,
+    ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress, ReviewUnlaunchedRound, ReviewRoundOutcome,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
-    ReviewExecutionBoundaryCursor,
+    ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint,
+    ReviewExecutionCompactionRoundSource, build_review_execution_checkpoint_receipt,
+    plan_review_execution_compaction,
     accepted_review_transition_source,
     review_generation_chain_digest,
 )
 from issue_agent.domain.review_rounds import ReviewRoundFacts, ReviewRoundPlan, StaleReviewProductivitySettlement
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
-from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
+from issue_agent.adapters.workflow_rows import (
+    WorkflowAuthorityError, encode_workflow_episodes, load_review_workflow_row,
+    review_execution_checkpoint_receipt_id,
+)
 from issue_agent.domain.review_execution_activation import (
     LegacyExecutionCounterRecord, LegacyExecutionNumber, LegacyExecutionPRRecord,
     LegacyExecutionRunRecord, LegacyReviewRunState, LegacyReviewSessionCandidate,
@@ -1356,6 +1361,155 @@ def test_generation_archive_page_reads_exact_expected_source_without_writes(rig)
     assert page.next_generation == generation + 1 and not page.has_more
     assert isinstance(foreign, BlockedReviewGenerationArchivePage)
     assert foreign.generation == generation and "absent" in foreign.reason
+
+
+def test_checkpoint_generation_anchor_matches_retained_pair_without_writes(rig):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        workflow = load_review_workflow_row(db, rig[1].revision.fence.key)
+        assert workflow is not None
+        boundary = workflow.execution.boundaries[0]
+        binding = boundary.before.binding
+        generation = boundary.to_revision.fence.generation
+        page = read_review_generation_archive_page(db, binding, generation, generation)
+        assert isinstance(page, ObservedReviewGenerationArchivePage)
+        source = page.sources[0]
+        fingerprint = ReviewGenerationArchiveFingerprint(
+            ReviewExecutionBoundaryCursor(source.boundary.receipt_id, source.boundary.to_revision),
+            source.receipt_digest, source.accepted_namespace, source.accepted_key,
+            source.accepted_digest,
+        )
+        before = db.total_changes
+        assert verify_checkpoint_generation_anchor(db, binding, fingerprint) == fingerprint
+        assert db.total_changes == before
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint generation anchor"):
+            verify_checkpoint_generation_anchor(
+                db, binding, replace(fingerprint, accepted_sha256="a" * 64),
+            )
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint generation anchor"):
+            verify_checkpoint_generation_anchor(
+                db, replace(binding, execution_episode="foreign-episode"), fingerprint,
+            )
+        db.rollback()
+
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00+00:00' "
+            "WHERE namespace=? AND scope='o/r' AND key=?",
+            (source.accepted_namespace, source.accepted_key),
+        )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint generation anchor"):
+            verify_checkpoint_generation_anchor(db, binding, fingerprint)
+        db.rollback()
+
+
+def test_staged_checkpoint_load_checks_generation_anchor_before_global_refusal(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        workflow = load_review_workflow_row(db, key)
+        assert workflow is not None
+        execution = workflow.execution
+        assert isinstance(execution, ActivatedReviewExecution)
+        assert execution.last_sequence == 1 and len(execution.boundaries) == 1
+        outcome_row = db.execute(
+            "SELECT outcome_json FROM review_execution_rounds WHERE repository='o/r' AND sequence=1",
+        ).fetchone()
+        outcome = decode_workflow(outcome_row["outcome_json"], ReviewRoundOutcome)
+        plan = plan_review_execution_compaction(execution, (outcome,), 1)
+        boundary = execution.boundaries[0]
+        page = read_review_generation_archive_page(
+            db, boundary.before.binding, boundary.to_revision.fence.generation,
+            boundary.to_revision.fence.generation,
+        )
+        assert isinstance(page, ObservedReviewGenerationArchivePage)
+        source = page.sources[0]
+        fingerprint = ReviewGenerationArchiveFingerprint(
+            ReviewExecutionBoundaryCursor(source.boundary.receipt_id, source.boundary.to_revision),
+            source.receipt_digest, source.accepted_namespace, source.accepted_key,
+            source.accepted_digest,
+        )
+        receipt = build_review_execution_checkpoint_receipt(
+            execution, plan,
+            (ReviewExecutionCompactionRoundSource(outcome.round, "a" * 64, "b" * 64),),
+            (fingerprint,),
+        )
+        receipt_id = review_execution_checkpoint_receipt_id(receipt)
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-execution-checkpoint','o/r',?,'2026-09-29T00:00:00+00:00',?)",
+            (receipt_id, encode_workflow(receipt)),
+        )
+        compacted = replace(workflow, execution=replace(
+            execution, checkpoint=plan.checkpoint, state=plan.checkpoint.state,
+            checkpoint_receipt=receipt_id, boundaries=plan.remaining_boundaries,
+        ))
+        db.execute(
+            "UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='pr'",
+            (encode_workflow_episodes(compacted),),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="source anchors"):
+            load_review_workflow_row(db, key)
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-09-30T00:00:00+00:00' "
+            "WHERE namespace=? AND scope='o/r' AND key=?",
+            (fingerprint.accepted_namespace, fingerprint.accepted_key),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint generation anchor"):
+            load_review_workflow_row(db, key)
+
+
+@pytest.mark.parametrize("corruption", ["missing", "blob_alias", "naive_claim", "pair_budget"])
+def test_checkpoint_generation_anchor_refuses_incomplete_or_unbounded_source_pair(rig, monkeypatch, corruption):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        workflow = load_review_workflow_row(db, rig[1].revision.fence.key)
+        assert workflow is not None
+        boundary = workflow.execution.boundaries[0]
+        binding = boundary.before.binding
+        generation = boundary.to_revision.fence.generation
+        page = read_review_generation_archive_page(db, binding, generation, generation)
+        assert isinstance(page, ObservedReviewGenerationArchivePage)
+        source = page.sources[0]
+        fingerprint = ReviewGenerationArchiveFingerprint(
+            ReviewExecutionBoundaryCursor(source.boundary.receipt_id, source.boundary.to_revision),
+            source.receipt_digest, source.accepted_namespace, source.accepted_key,
+            source.accepted_digest,
+        )
+        if corruption == "missing":
+            db.execute(
+                "DELETE FROM dedupe_keys WHERE namespace=? AND scope='o/r' AND key=?",
+                (source.accepted_namespace, source.accepted_key),
+            )
+        elif corruption == "blob_alias":
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (CAST(? AS BLOB),'o/r',?,'2026-09-29T00:00:00+00:00','{}')",
+                (source.accepted_namespace, source.accepted_key),
+            )
+        elif corruption == "naive_claim":
+            db.execute(
+                "UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00' "
+                "WHERE namespace=? AND scope='o/r' AND key=?",
+                (source.accepted_namespace, source.accepted_key),
+            )
+        else:
+            receipt_size = review_activation._recording_source_size(
+                db, "review-execution-generation", "o/r", source.boundary.receipt_id,
+            )
+            accepted_size = review_activation._recording_source_size(
+                db, source.accepted_namespace, "o/r", source.accepted_key,
+            )
+            assert receipt_size is not None and accepted_size is not None
+            monkeypatch.setattr(
+                review_activation, "MAX_GENERATION_ARCHIVE_PAGE_BYTES",
+                receipt_size + accepted_size - 1,
+            )
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint generation anchor"):
+            verify_checkpoint_generation_anchor(db, binding, fingerprint)
 
 
 def test_generation_archive_page_is_bounded_and_requires_every_expected_receipt(rig, monkeypatch):

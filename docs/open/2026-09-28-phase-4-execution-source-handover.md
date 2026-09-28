@@ -416,6 +416,30 @@ with `CLAUDE.md`, `AGENTS.md`, the
   current suffix rows remain checked in sequence within their limit. The
   production writer, source anchor verifier and audit gate remain required
   before compaction can be used.
+- Checkpoint 82 point-checks the final retired generation source pair named by
+  a typed checkpoint receipt. It derives the generation receipt key from the
+  execution episode, bounds both retained rows before reading, rejects TEXT
+  and BLOB identity aliases, compares every stored field digest, verifies the
+  boundary cursor and accepted-row payload binding, and parses both claim
+  times. The check does not decode the accepted historical snapshot; full
+  transition semantics and older source membership remain for the paged audit.
+  Canonical loads invoke this check before their standing refusal of all
+  compacted components. A real accepted-generation fixture covers that call
+  path and detects changed source metadata; direct tests cover foreign
+  episodes, missing and aliased rows, malformed claim time and pair byte cap.
+  The remaining round anchor and audit gate still prevent compaction use.
+
+The intended read metric is bytes and latency per canonical load as archived
+generations grow; the guardrail is refusal on changed immediate sources. The
+next measurement is the planned >4,096-boundary stress and latency comparison
+once the round anchor, audit gate and writer are available.
+
+Independent Sol review found no medium or high issue after the canonical-load
+integration fixture was added. Full `make test` passed: 3,280 domain, 3,237
+adapter and 2,876 app tests, plus hooks, governor, gate parity, four import
+contracts and both Pyrefly checks. Ten strict xfails remained expected. Log:
+`/tmp/phase4-generation-checkpoint-anchor-gate.log` (ephemeral). All four
+watched services were inactive; no live authority was activated.
 
 Independent Sol review of checkpoint 81 caught the first reader accepting
 fabricated anchor digests and retaining lifetime prefix scans. The revised

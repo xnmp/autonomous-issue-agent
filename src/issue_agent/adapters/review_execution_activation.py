@@ -64,7 +64,7 @@ from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStat
 from ..domain.review_execution import (
     ExecutionNotActivated, ActivatedReviewExecution, NoReviewSession, ReviewRoundIdentity, ReviewRoundOutcome,
     PaidReviewProgress, CopiedReviewProgress, ReviewExecutionBinding, ReviewExecutionGenerationBoundary,
-    ReviewExecutionBoundaryCursor, ReviewGenerationReceiptSweepCursor,
+    ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint, ReviewGenerationReceiptSweepCursor,
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
     matches_accepted_review_transition_source,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
@@ -2897,6 +2897,57 @@ def _recording_source_size(
         (namespace, repository, key),
     ).fetchone()
     return row["source_bytes"] if row is not None else None
+
+
+def verify_checkpoint_generation_anchor(
+    db: sqlite3.Connection, binding: ReviewExecutionBinding,
+    fingerprint: ReviewGenerationArchiveFingerprint,
+) -> ReviewGenerationArchiveFingerprint:
+    """Point-check a retained source pair without decoding its accepted snapshot."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("checkpoint generation anchor requires an explicit SQL transaction")
+    if not isinstance(binding, ReviewExecutionBinding) or not isinstance(
+        fingerprint, ReviewGenerationArchiveFingerprint,
+    ):
+        raise ValueError("checkpoint generation anchor requires typed episode and fingerprint")
+    generation = fingerprint.cursor.revision.fence.generation
+    repository = binding.rejection.fence.key.repository
+    try:
+        receipt_id = review_generation_receipt_id(binding, generation)
+        receipt_size = _recording_source_size(db, "review-execution-generation", repository, receipt_id)
+        if receipt_size is None or receipt_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES:
+            raise ValueError("checkpoint generation receipt is absent or oversized")
+        receipt_fields, receipt_digest = _read_recording_source(
+            db, "review-execution-generation", repository, receipt_id,
+        )
+        receipt = dict(receipt_fields)
+        boundary, namespace, key, captured = _generation_receipt_parts(receipt["payload_json"])
+        if (receipt["reusable_after"] is not None
+                or receipt_digest != fingerprint.receipt_sha256
+                or boundary.receipt_id != receipt_id
+                or ReviewExecutionBoundaryCursor(boundary.receipt_id, boundary.to_revision) != fingerprint.cursor
+                or not same_execution_episode(binding, boundary.before.binding)
+                or namespace != fingerprint.accepted_namespace
+                or key != fingerprint.accepted_key):
+            raise ValueError("checkpoint generation receipt disagrees with its anchor")
+        accepted_size = _recording_source_size(db, namespace, repository, key)
+        if (accepted_size is None
+                or receipt_size + accepted_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES):
+            raise ValueError("checkpoint accepted transition is absent or oversized")
+        accepted_fields, accepted_digest = _read_recording_source(db, namespace, repository, key)
+        accepted = dict(accepted_fields)
+        if (accepted["reusable_after"] is not None
+                or accepted_digest != fingerprint.accepted_sha256
+                or not matches_accepted_review_transition_source(
+                    captured, boundary, namespace, key, accepted["payload_json"],
+                )):
+            raise ValueError("checkpoint generation accepted source disagrees with its anchor")
+        _parse_stamp(receipt["claimed_at"])
+        _parse_stamp(accepted["claimed_at"])
+        return fingerprint
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            sqlite3.Error, WorkflowAuthorityError) as exc:
+        raise WorkflowAuthorityError("review execution checkpoint generation anchor is unreadable") from exc
 
 
 def read_review_generation_archive_page(
