@@ -35,7 +35,7 @@ from issue_agent.adapters.review_execution_activation import (
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     read_review_generation_archive_page,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
-    read_review_generation_receipt_sweep_page,
+    read_review_generation_receipt_sweep_page, read_reconciled_review_generation_receipt_sweep_page,
     ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
     match_legacy_stale_productivity_generation_sources,
     MatchedLegacyStaleProductivityGenerationSources, UnmatchedLegacyStaleProductivityGenerationSources,
@@ -1451,6 +1451,56 @@ def test_generation_receipt_sweep_observes_source_without_writes(rig):
     assert sweep.next_cursor == sweep.upper_cursor
     assert sweep.sources[0].boundary == boundary
     assert sweep.sources[0].receipt_digest == archive.sources[0].receipt_digest
+
+
+def test_generation_receipt_reconciliation_blocks_an_extra_valid_advance(rig, monkeypatch):
+    store, _, selection, _, _, _, workflow = accepted_generation_with_open_submission(rig)
+    first = current(store, selection)
+    actor = OperatorActor("operator", "test")
+    assert isinstance(workflow.cancel_rearm(
+        CancelRearm("cancel:reconcile", first.revision, "rearm:with-older-submission", "stop",
+                    expected_binding=first.binding), actor,
+    ), WorkflowCommitted)
+    stopped = current(store, selection)
+    assert isinstance(workflow.continue_rearm(
+        ContinueGrantedRearm("rearm:reconcile", stopped.revision,
+                             "rearm:with-older-submission", expected_binding=stopped.binding), actor,
+    ), WorkflowCommitted)
+    execution = current(store, selection).execution
+    origin = execution.boundaries[0].before.binding
+    first_generation = execution.boundaries[0].to_revision.fence.generation
+    last_generation = execution.binding.rejection.fence.generation
+    monkeypatch.setattr(review_activation, "MAX_GENERATION_RECEIPT_SWEEP_PAGE", 1)
+
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        before = db.total_changes
+        cursor = upper = None
+        observed = []
+        while True:
+            page = read_reconciled_review_generation_receipt_sweep_page(
+                db, origin, last_generation, after=cursor, upper=upper,
+            )
+            assert isinstance(page, ObservedReviewGenerationReceiptSweepPage)
+            observed.extend(page.sources)
+            if not page.has_more:
+                break
+            cursor, upper = page.next_cursor, page.upper_cursor
+        assert len(observed) == 2
+
+        cursor = upper = None
+        while True:
+            limited = read_reconciled_review_generation_receipt_sweep_page(
+                db, origin, first_generation, after=cursor, upper=upper,
+            )
+            if isinstance(limited, BlockedReviewGenerationReceiptSweepPage):
+                break
+            assert limited.has_more
+            cursor, upper = limited.next_cursor, limited.upper_cursor
+        assert db.total_changes == before
+        db.rollback()
+    assert "outside the expected episode frontier" in limited.reason
+    assert limited.source_rowid is not None
 
 
 @pytest.mark.parametrize("damage", ["blob_namespace", "blob_scope", "blob_key", "scope_alias",

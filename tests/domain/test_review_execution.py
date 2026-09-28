@@ -24,7 +24,7 @@ from issue_agent.domain.review_execution import (
     ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
     SetDisplayedRound, advance_review_execution_generation, carry_review_execution_generation,
     compatible_review_session, matches_accepted_review_transition_source,
-    review_generation_chain_digest, review_generation_receipt_id,
+    review_generation_chain_digest, review_generation_receipt_id, review_generation_within_frontier,
     plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
@@ -344,6 +344,24 @@ def test_generation_receipt_identity_is_reconstructible_from_episode_and_destina
     assert review_generation_receipt_id(episode, 1) != review_generation_receipt_id(episode, 2)
     with pytest.raises(ValueError, match="generation"):
         review_generation_receipt_id(episode, 0)
+
+
+def test_generation_frontier_classifies_swept_episode_receipts():
+    initial = checkpoint()
+    origin = initial.state.binding
+    after = carry_review_execution_generation(initial.state, binding(1), 0)
+    boundary = generation_boundary(initial.state, after, 0, (), "boundary:frontier")
+
+    assert review_generation_within_frontier(origin, 1, boundary)
+    assert not review_generation_within_frontier(origin, 0, boundary)
+    assert not review_generation_within_frontier(binding(1), 1, boundary)
+    assert not review_generation_within_frontier(
+        replace(origin, execution_episode="other-episode"), 1, boundary,
+    )
+    with pytest.raises(ValueError, match="generation frontier"):
+        review_generation_within_frontier(origin, -1, boundary)
+    with pytest.raises(ValueError, match="typed episode"):
+        review_generation_within_frontier(origin, 1, "untyped")
 
 
 def test_active_generation_advance_preserves_imported_allowance_without_rounds():

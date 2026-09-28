@@ -1161,6 +1161,18 @@ def review_generation_receipt_id(binding: ReviewExecutionBinding, to_generation:
     return "review-generation:" + hashlib.sha256(identity.encode()).hexdigest()
 
 
+def review_generation_within_frontier(
+    origin: ReviewExecutionBinding, through_generation: int,
+    boundary: ReviewExecutionGenerationBoundary,
+) -> bool:
+    """Classify one swept receipt against an episode's expected generation range."""
+    if not isinstance(origin, ReviewExecutionBinding) or not isinstance(boundary, ReviewExecutionGenerationBoundary):
+        raise ValueError("generation frontier requires a typed episode and boundary")
+    integer(through_generation, "generation frontier", minimum=origin.rejection.fence.generation)
+    return (same_execution_episode(origin, boundary.before.binding)
+            and origin.rejection.fence.generation < boundary.to_revision.fence.generation <= through_generation)
+
+
 def plan_review_execution_compaction(
     execution: ActivatedReviewExecution, outcomes: tuple[ReviewRoundOutcome, ...],
     through_sequence: int,

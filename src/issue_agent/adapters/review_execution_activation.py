@@ -67,7 +67,8 @@ from ..domain.review_execution import (
     ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
     matches_accepted_review_transition_source,
     MAX_EXECUTION_SUFFIX, replay_review_execution_generations,
-    review_generation_chain_digest, review_generation_receipt_id, same_execution_episode,
+    review_generation_chain_digest, review_generation_receipt_id, review_generation_within_frontier,
+    same_execution_episode,
 )
 from ..domain.review_execution_session_import import (
     BlockedLegacyReviewSessionImport, UnprovenLegacyReviewSession, plan_legacy_review_session_import,
@@ -3169,6 +3170,31 @@ def read_review_generation_receipt_sweep_page(
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error, WorkflowAuthorityError) as exc:
         return BlockedReviewGenerationReceiptSweepPage(_printable(str(exc)), current_rowid)
+
+
+def read_reconciled_review_generation_receipt_sweep_page(
+    db: sqlite3.Connection, origin: ReviewExecutionBinding, through_generation: int,
+    *, after: ReviewGenerationReceiptSweepCursor | None = None,
+    upper: ReviewGenerationReceiptSweepCursor | None = None,
+) -> ObservedReviewGenerationReceiptSweepPage | BlockedReviewGenerationReceiptSweepPage:
+    """Reject swept episode receipts outside the expected generation range.
+
+    Expected point reads establish missing sources separately. This read-only
+    page is not a durable audit cursor or an execution admission proof.
+    """
+    if (not isinstance(origin, ReviewExecutionBinding)
+            or type(through_generation) is not int
+            or not origin.rejection.fence.generation <= through_generation <= MAX_SQL_ROWID):
+        raise ValueError("generation sweep reconciliation requires an expected frontier")
+    page = read_review_generation_receipt_sweep_page(db, origin, after=after, upper=upper)
+    if isinstance(page, BlockedReviewGenerationReceiptSweepPage):
+        return page
+    for source in page.sources:
+        if not review_generation_within_frontier(origin, through_generation, source.boundary):
+            return BlockedReviewGenerationReceiptSweepPage(
+                "generation receipt is outside the expected episode frontier", source.source_rowid,
+            )
+    return page
 
 
 @dataclass(frozen=True)

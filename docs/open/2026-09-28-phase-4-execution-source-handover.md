@@ -366,6 +366,24 @@ with `CLAUDE.md`, `AGENTS.md`, the
   transition bytes are unchanged. The proof stores no preflight or accepted
   snapshot, so a large operator audit cannot enlarge this receipt. It is a
   prerequisite for bounded hot reads, not a source-audit or compaction gate.
+- Checkpoint 78 compares each bounded sweep page with a supplied episode
+  generation frontier. The pure classifier rejects same-episode receipts
+  before the supplied origin generation or after the supplied current
+  generation. The adapter rereads the namespace page in the current SQL
+  transaction and returns a typed blocker for an extra valid receipt; the
+  expected-generation archive pages separately find missing receipts. A
+  real two-advance history passes with its full frontier and blocks with a
+  frontier ending at the first advance. The frontier and page cursor remain
+  caller-supplied observations. Checkpoint ancestry and a durable audit-owned
+  cursor must bind them before execution admission can depend on this check.
+
+Independent Sol review of checkpoint 78 found no medium or high severity
+issue. A lower-bound case was added to the pure test after review. Focused
+tests and the full `make test` gate passed: 3,277 domain, 3,204 adapter and
+2,876 app tests, plus hooks, governor, gate parity, four import contracts
+and both Pyrefly checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-generation-frontier-reconciliation-gate.log` (ephemeral). No
+live service or workflow family was activated.
 
 Independent Sol review of checkpoint 77 found no medium or high severity
 issue in the fixed-size proof, writer or readers. Focused tests and the full
