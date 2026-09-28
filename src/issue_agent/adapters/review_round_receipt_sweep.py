@@ -12,9 +12,10 @@ from ..domain.review_receipt_attribution import (
 )
 from ..domain.review_execution import ReviewRoundIdentity
 from ..domain.review_rounds import ReviewSubmissionRegistration, StaleReviewProductivitySettlement
-from ..domain.workflow_identity import (
-    WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
+from ..domain.review_round_receipt_archive import (
+    ROUND_RECEIPT_NAMESPACES, ReviewRoundReceiptSweepCursor,
 )
+from ..domain.workflow_identity import WorkflowRevision
 from .review_execution_activation import (
     MAX_LEGACY_RECORDING_BYTES, ObservedReviewCheckpointRoundReceiptMember,
     ObservedReviewCheckpointRoundReceiptSet, _DEDUPE_SOURCE_COLUMNS, _printable,
@@ -27,24 +28,9 @@ from .workflow_rows import (
 )
 
 
-ROUND_RECEIPT_NAMESPACES = tuple(sorted(item.value for item in ReviewRoundReceiptNamespace))
 MAX_ROUND_RECEIPT_SWEEP_PAGE = 16
 MAX_ROUND_RECEIPT_SWEEP_BYTES = 2**24
 MAX_ROUND_RECEIPT_IDENTITY_BYTES = 512
-
-
-@dataclass(frozen=True, order=True)
-class ReviewRoundReceiptSweepCursor:
-    namespace: str
-    scope: str
-    key: str
-
-    def __post_init__(self) -> None:
-        if self.namespace not in ROUND_RECEIPT_NAMESPACES:
-            raise ValueError("round receipt cursor requires a selected namespace")
-        if canonical_workflow_repository(self.scope) != self.scope:
-            raise ValueError("round receipt cursor requires a canonical repository")
-        validate_workflow_identifier(self.key, "round receipt cursor key")
 
 
 @dataclass(frozen=True)

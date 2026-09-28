@@ -600,6 +600,21 @@ the complete audit benchmark.
   issue. The full gate passed: 3,291 domain, 3,334 adapter and 2,876 app
   tests, four import contracts and Pyrefly. Neither commit changes live
   authority, activates a family or permits a compacted load.
+- Checkpoint 96 adds a persisted, observational receipt census for the
+  contiguous finalized prefix of one execution episode. It advances one
+  expected round or one indexed namespace source per transaction. The
+  expected pass checks each finalized round's exact retained member payloads;
+  the global namespace pass resolves every source to a finalized owner or a
+  typed pending open owner, then compares the finalized member count and
+  fingerprint. Later passes recheck the prior prefix. Missing, changed,
+  aliased and orphaned sources block; a round that closes during the sweep is
+  deferred to the next pass. The source-read ceiling is a conservative
+  roughly 157 MiB derivation from nested reader limits, not a runtime byte
+  meter. This census has no checkpoint ancestry or admission authority.
+  Focused tests and independent Sol review found no remaining medium or high
+  issue after malformed-frontier persistence and cumulative-bound fixes. The
+  full gate passed: 3,296 domain, 3,347 adapter and 2,876 app tests, four
+  import contracts and both Pyrefly checks.
 
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
@@ -608,21 +623,12 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–95, the durable round cursor completes a bounded row
-sweep, one indexed namespace source can be matched to an exact finalized
-round member, and valid open-round receipts remain explicitly pending. Next,
-persist and reconcile a complete receipt-namespace pass, then bind the retired
-member stream to checkpoint ancestry. The expected pass should capture a
-fixed contiguous finalized sequence frontier so an open round cannot be
-mistaken for a missing archived member. It must revisit a prior finalized
-prefix on later passes and detect changed source digests even when newer
-rounds are appended. Sweep every retained receipt namespace, resolve each
-source to a finalized or pending owner, and compare the finalized expected
-member count and source fingerprint with the namespace census. Include
-unclaimed global receipts, missing tails, malformed aliases, open-to-final
-growth between transactions, origin drift and due-state regressions. A
-completed observational pass is still not admission or checkpoint authority.
-Before a writer can use the checkpoint-86
+With checkpoints 88–96, the bounded round and receipt cursors can reconcile
+the finalized prefix against the complete retained receipt namespace. Valid
+open-round receipts remain pending. Next, bind the retired member stream to
+checkpoint ancestry. The census does not prove missing open receipts,
+external command, effect, claim or accepted-transition evidence, or the
+checkpoint lineage. Before a writer can use the checkpoint-86
 proposal, establish a true cumulative read bound around canonical load and
 each source reader; prove generation-only and later-checkpoint paths; verify
 every retired receipt payload; and publish the checkpoint and initialized

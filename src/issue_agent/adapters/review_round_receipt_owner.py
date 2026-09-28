@@ -16,11 +16,12 @@ from ..domain.review_rounds import (
     ReviewRoundPlan, ReviewSealedParentAbandoned,
 )
 from .review_execution_activation import (
-    _printable, _read_recording_source, read_checkpoint_round_row_source,
+    _printable, _read_recording_source, read_checkpoint_round_receipt_members,
+    read_checkpoint_round_row_source,
 )
 from .review_round_receipt_sweep import (
     ClassifiedReviewRoundReceiptSweepSource, ReviewRoundReceiptSweepCursor,
-    _classify_source_payload, read_classified_checkpoint_round_receipt_members,
+    _classify_source_payload,
 )
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, decode_workflow, encode_workflow
 from .workflow_rows import (
@@ -212,15 +213,14 @@ def reconcile_review_round_receipt_owner(
             if current_digest != source.source.source_sha256:
                 raise ValueError("open round receipt changed after its sweep")
             return PendingOpenReviewRoundReceiptOwner(source, round_id, row.source_digest)
-        members = read_classified_checkpoint_round_receipt_members(db, round_id)
-        exact = next((item for item in members.receipts
-                      if (item.member.namespace, item.member.key)
+        members = read_checkpoint_round_receipt_members(db, round_id)
+        exact = next((item for item in members.members
+                      if (item.namespace, item.key)
                       == (cursor.namespace, cursor.key)), None)
-        if (exact is None or exact.member.source_sha256 != source.source.source_sha256
-                or exact.reference != reference):
+        if exact is None or exact.source_sha256 != source.source.source_sha256:
             raise ValueError("receipt is absent or changed in its round member set")
         return MatchedReviewRoundReceiptOwner(
-            source, round_id, members.source.source, registration_digest,
+            source, round_id, members.source, registration_digest,
         )
     except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
             RecursionError, sqlite3.Error, WorkflowAuthorityError) as exc:

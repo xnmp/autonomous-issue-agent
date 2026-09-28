@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 09:15 AEST · Latest accepted checkpoint: bounded census page size</p>
+      <p class="meta">Updated 29 Sep 2026, 09:46 AEST · Latest accepted checkpoint: finalized-prefix receipt census</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>A durable round archive census resumes bounded repository pages; indexed receipts join finalized members or remain explicitly pending for valid open rounds. Both source sweeps now support one-row pages for the next audit. Compacted loads still refuse. Next: complete receipt census and checkpoint reconciliation, actual cumulative read bounds, checkpoint writer and gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>A durable observational census now compares each finalized round's exact receipt members with the complete retained namespace, one source per transaction; valid open-round receipts remain pending. Compacted loads still refuse. Next: checkpoint ancestry and admission gate, actual cumulative hot-read and writer bounds, checkpoint writer, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -157,6 +157,7 @@
           <li><time datetime="2026-09-29T08:45:00+10:00">29 Sep 2026, 08:45 AEST</time><strong>Receipt source-to-round ownership accepted offline · 3 of 6 accepted</strong><p>One classified receipt now joins through a bounded round row or submission registration to the exact finalized-round member and source digest. Real copied and named ceiling receipts pass; orphaned, aliased and changed sources block. Independent Sol review found no remaining material issue. Full gate passed: 3,291 domain, 3,330 adapter and 2,876 app tests, plus four import contracts and Pyrefly. Open-round treatment, complete namespace census, checkpoint ancestry and admission authority remain open. Active work since the previous entry: About 19 minutes.</p></li>
           <li><time datetime="2026-09-29T09:00:00+10:00">29 Sep 2026, 09:00 AEST</time><strong>Open-round receipt treatment accepted offline · 3 of 6 accepted</strong><p>A classified receipt in a valid unfinished round now has a typed pending result after bounded round-row and source rechecks. Unplanned receipts and changed sources block; no pending result grants finalized ownership. Sol review found a contradictory seal state, fixed with a regression and verified on re-review. Full gate passed: 3,291 domain, 3,332 adapter and 2,876 app tests, plus four import contracts and Pyrefly. Complete namespace census, checkpoint ancestry and admission authority remain open. Active work since the previous entry: About 15 minutes.</p></li>
           <li><time datetime="2026-09-29T09:15:00+10:00">29 Sep 2026, 09:15 AEST</time><strong>One-source census pages accepted offline · 3 of 6 accepted</strong><p>The indexed round and receipt sweeps now accept caller-selected limits from one through sixteen while preserving fixed upper cursors, lookahead and source byte checks. One-source pages bound each future audit transaction's row and receipt reads. Sol review found no issue; the full gate passed: 3,291 domain, 3,334 adapter and 2,876 app tests, plus four import contracts and Pyrefly. The durable expected-member and namespace reconciliation pass remains open. Active work since the previous entry: About 15 minutes.</p></li>
+          <li><time datetime="2026-09-29T09:46:00+10:00">29 Sep 2026, 09:46 AEST</time><strong>Finalized-prefix receipt census accepted offline · 3 of 6 accepted</strong><p>A persisted pass checks exact finalized-round members against every retained receipt source, one source per transaction. Valid open-round receipts remain pending; missing, changed, aliased and orphaned sources block. The cumulative source-read ceiling is a derived conservative bound of about 157 MiB per step, not a runtime meter. Sol review verified fixes for malformed-frontier persistence and the nested-read bound. Full gate passed: 3,296 domain, 3,347 adapter and 2,876 app tests, four import contracts and Pyrefly. Checkpoint ancestry, admission authority and compacted loads remain open. Active work since the previous entry: About 31 minutes.</p></li>
         </ol>
       </div>
     </section>
