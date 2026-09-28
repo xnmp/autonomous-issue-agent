@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 02:31 AEST · Latest accepted checkpoint: generation archive transition semantics</p>
+      <p class="meta">Updated 29 Sep 2026, 02:54 AEST · Latest accepted checkpoint: generation receipt namespace sweep</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Bounded generation archive pages now check retained accepted-transition semantics and revision order. Next: checkpoint ancestry, historical reset/session proof, and the production import and checkpoint writers. Hot reads remain unbounded. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Bounded archive pages check expected transition pairs, and a namespace sweep exposes extra or malformed generation receipts. Next: durable audit reconciliation, checkpoint ancestry, historical reset/session proof, and the production import and checkpoint writers. Hot reads remain unbounded. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -137,6 +137,7 @@
           <li><time datetime="2026-09-29T01:52:00+10:00">29 Sep 2026, 01:52 AEST</time><strong>Compaction source contract reviewed · 3 of 6 accepted</strong><p>The checkpoint source stream, deterministic boundary enumeration and paged audit cutover are specified. Sol review corrected the unsafe writer-first rollout, open-prefix codec refusal and audit authority gate; re-review found no remaining medium or high issue. Full gate passed: 3,274 domain, 3,189 adapter and 2,876 app tests, plus contracts and Pyrefly. The writer, audit and bounded hot reader remain to implement. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T02:13:00+10:00">29 Sep 2026, 02:13 AEST</time><strong>Bounded generation archive source pages accepted offline · 3 of 6 accepted</strong><p>Expected generation IDs now support read-only pages capped at 16 sources and 8 MiB of fields, with byte preflight before decoding. Missing, changed, malformed and foreign-episode sources block; legacy receipts remain observable. Sol review found no remaining medium or high issue. Full gate passed: 3,275 domain, 3,191 adapter and 2,876 app tests, plus contracts and Pyrefly. Semantic audit, checkpoint ancestry and bounded hot reads remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T02:31:00+10:00">29 Sep 2026, 02:31 AEST</time><strong>Generation archive transition semantics accepted offline · 3 of 6 accepted</strong><p>Each bounded source pair now checks its canonical accepted transition, audit and command identity, claim times, and contiguous generation and revision order. A following page requires the observed predecessor. Sol found no concrete medium or high issue; full gate passed: 3,275 domain, 3,191 adapter and 2,876 app tests, plus contracts and Pyrefly. Checkpoint ancestry, unclaimed-row detection and bounded hot reads remain open. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-29T02:54:00+10:00">29 Sep 2026, 02:54 AEST</time><strong>Generation receipt namespace sweep accepted offline · 3 of 6 accepted</strong><p>A read-only indexed sweep pages retained generation receipts under a fixed upper key, rejects malformed and aliased sources, and returns episode rows for later reconciliation. A later insert is caught on the next pass. Sol found no concrete medium or high issue; full gate passed: 3,275 domain, 3,201 adapter and 2,876 app tests, plus contracts and Pyrefly. The durable audit cursor, expected-source reconciliation and bounded hot reader remain open. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

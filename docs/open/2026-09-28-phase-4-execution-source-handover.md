@@ -344,6 +344,26 @@ with `CLAUDE.md`, `AGENTS.md`, the
   observation, so this still does not prove checkpoint ancestry, replay a
   retired prefix, find unclaimed rows or authorize execution. Historical
   snapshot decoding also remains outside the bounded hot-read target.
+- Checkpoint 76 adds a read-only sweep over the existing generation-receipt
+  namespace index. It pages up to 16 `(scope,key)` rows and 8 MiB of source
+  fields, with a fixed upper key for continuation and byte preflight before
+  decoding. It rejects BLOB namespace/scope/key aliases, noncanonical scope,
+  malformed payloads, changed derived receipt IDs and invalid claim times,
+  then returns only rows for the requested execution episode. The sweep spans
+  other repositories because the episode is inside the hashed-key payload;
+  malformed foreign rows conservatively block it. Caller-supplied cursors and
+  observed rows still have no authority. A durable audit must persist its own
+  cursor and reconcile the sweep with every expected generation pair to find
+  unclaimed or missing sources before admission can depend on it.
+
+Independent Sol review of checkpoint 76 found no concrete medium or high
+issue. The final focused sweep and archive tests passed (12 cases), including
+aliases, oversized payloads and an insert detected on the next pass. The full
+`make test` gate passed: 3,275 domain, 3,201 adapter and 2,876 app tests,
+plus hooks, governor, gate parity, four import contracts and both Pyrefly
+checks. Ten strict xfails remained expected. The log is
+`/tmp/phase4-generation-receipt-sweep-gate.log` (ephemeral). No live service
+or workflow family was activated.
 
 Independent Sol review of checkpoint 75 found no concrete medium or high
 issue in this observational slice. Prefix comparison cannot be required

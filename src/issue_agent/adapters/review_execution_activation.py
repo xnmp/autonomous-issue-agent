@@ -2979,6 +2979,187 @@ def read_review_generation_archive_page(
     )
 
 
+MAX_GENERATION_RECEIPT_SWEEP_PAGE = 16
+MAX_GENERATION_RECEIPT_SWEEP_BYTES = 2**23
+
+
+@dataclass(frozen=True)
+class ReviewGenerationReceiptSweepCursor:
+    scope: str
+    key: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.scope, str)
+                or canonical_workflow_repository(self.scope) != self.scope):
+            raise ValueError("generation receipt sweep cursor requires a canonical repository")
+        validate_workflow_identifier(self.key, "generation receipt sweep key")
+
+
+@dataclass(frozen=True)
+class ObservedReviewGenerationReceiptSweepSource:
+    source_rowid: int
+    boundary: ReviewExecutionGenerationBoundary
+    accepted_namespace: str
+    accepted_key: str
+    receipt_digest: str
+
+    def __post_init__(self) -> None:
+        if (type(self.source_rowid) is not int or not -MAX_SQL_ROWID - 1 <= self.source_rowid <= MAX_SQL_ROWID
+                or not isinstance(self.boundary, ReviewExecutionGenerationBoundary)
+                or self.accepted_namespace not in {"workflow-request", "workflow-transition"}
+                or not isinstance(self.receipt_digest, str) or len(self.receipt_digest) != 64
+                or any(char not in "0123456789abcdef" for char in self.receipt_digest)):
+            raise ValueError("generation receipt sweep source requires a bounded typed identity")
+        validate_workflow_identifier(self.accepted_key, "swept accepted transition key")
+
+
+@dataclass(frozen=True)
+class ObservedReviewGenerationReceiptSweepPage:
+    sources: tuple[ObservedReviewGenerationReceiptSweepSource, ...]
+    next_cursor: ReviewGenerationReceiptSweepCursor | None
+    upper_cursor: ReviewGenerationReceiptSweepCursor | None
+    has_more: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.sources, tuple)
+                or any(not isinstance(source, ObservedReviewGenerationReceiptSweepSource)
+                       for source in self.sources)
+                or (self.next_cursor is not None
+                    and not isinstance(self.next_cursor, ReviewGenerationReceiptSweepCursor))
+                or (self.upper_cursor is not None
+                    and not isinstance(self.upper_cursor, ReviewGenerationReceiptSweepCursor))
+                or type(self.has_more) is not bool
+                or (self.upper_cursor is None
+                    and (self.sources or self.next_cursor is not None or self.has_more))
+                or (self.sources and self.next_cursor is None)
+                or (self.has_more and self.next_cursor is None)):
+            raise ValueError("generation receipt sweep page requires typed observations")
+
+
+@dataclass(frozen=True)
+class BlockedReviewGenerationReceiptSweepPage:
+    reason: str
+    source_rowid: int | None = None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.reason, str) or not self.reason
+                or (self.source_rowid is not None
+                    and (type(self.source_rowid) is not int
+                         or not -MAX_SQL_ROWID - 1 <= self.source_rowid <= MAX_SQL_ROWID))):
+            raise ValueError("blocked generation receipt sweep requires a bounded reason")
+
+
+def read_review_generation_receipt_sweep_page(
+    db: sqlite3.Connection, binding: ReviewExecutionBinding,
+    *, after: ReviewGenerationReceiptSweepCursor | None = None,
+    upper: ReviewGenerationReceiptSweepCursor | None = None,
+) -> ObservedReviewGenerationReceiptSweepPage | BlockedReviewGenerationReceiptSweepPage:
+    """Observe one bounded namespace page, including foreign repository rows.
+
+    The snapshot's upper key is returned for later pages. Caller-held cursors
+    and these observations have no audit or execution authority on their own.
+    """
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("generation receipt sweep requires an explicit SQL transaction")
+    if (not isinstance(binding, ReviewExecutionBinding)
+            or (after is not None and not isinstance(after, ReviewGenerationReceiptSweepCursor))
+            or (upper is not None and not isinstance(upper, ReviewGenerationReceiptSweepCursor))
+            or (after is not None and upper is None)):
+        raise ValueError("generation receipt sweep requires a typed bounded cursor")
+    namespace = "review-execution-generation"
+    current_rowid: int | None = None
+    try:
+        alias = db.execute(
+            "SELECT rowid FROM dedupe_keys WHERE namespace=CAST(? AS BLOB) LIMIT 1", (namespace,),
+        ).fetchone()
+        if alias is not None:
+            raise ValueError("generation receipt namespace has a BLOB alias")
+        if upper is None:
+            edge = db.execute(
+                "SELECT rowid,typeof(scope) AS scope_type,typeof(key) AS key_type,"
+                "CASE WHEN length(CAST(scope AS BLOB))<=512 THEN scope END AS scope_value,"
+                "CASE WHEN length(CAST(key AS BLOB))<=512 THEN key END AS key_value "
+                "FROM dedupe_keys WHERE namespace=? ORDER BY scope DESC,key DESC LIMIT 1",
+                (namespace,),
+            ).fetchone()
+            if edge is None:
+                return ObservedReviewGenerationReceiptSweepPage((), None, None, False)
+            if (edge["scope_type"] != "text" or edge["key_type"] != "text"
+                    or edge["scope_value"] is None or edge["key_value"] is None):
+                return BlockedReviewGenerationReceiptSweepPage(
+                    "generation receipt sweep has an unreadable upper key", edge["rowid"],
+                )
+            current_rowid = edge["rowid"]
+            upper = ReviewGenerationReceiptSweepCursor(edge["scope_value"], edge["key_value"])
+        position = "" if after is None else "AND (scope,key)>(?,?) "
+        parameters: tuple[object, ...] = (namespace, upper.scope, upper.key)
+        if after is not None:
+            parameters = (*parameters, after.scope, after.key)
+        sizes = "+".join(
+            f"ifnull(length(CAST({column} AS BLOB)),0)" for column in _DEDUPE_SOURCE_COLUMNS
+        )
+        rows = db.execute(
+            "SELECT rowid,typeof(scope) AS scope_type,typeof(key) AS key_type,"
+            "CASE WHEN length(CAST(scope AS BLOB))<=512 THEN scope END AS scope_value,"
+            "CASE WHEN length(CAST(key AS BLOB))<=512 THEN key END AS key_value,"
+            f"{sizes} AS source_bytes FROM dedupe_keys "
+            "WHERE namespace=? AND (scope,key)<=(?,?) "
+            f"{position}ORDER BY scope,key LIMIT ?",
+            (*parameters, MAX_GENERATION_RECEIPT_SWEEP_PAGE + 1),
+        ).fetchall()
+        sources: list[ObservedReviewGenerationReceiptSweepSource] = []
+        cursor = after
+        bytes_read = 0
+        processed = 0
+        for row in rows[:MAX_GENERATION_RECEIPT_SWEEP_PAGE]:
+            rowid = row["rowid"]
+            current_rowid = rowid
+            if (row["scope_type"] != "text" or row["key_type"] != "text"
+                    or row["scope_value"] is None or row["key_value"] is None):
+                return BlockedReviewGenerationReceiptSweepPage(
+                    "generation receipt sweep has a malformed source identity", rowid,
+                )
+            scope, key = row["scope_value"], row["key_value"]
+            source_bytes = row["source_bytes"]
+            if bytes_read + source_bytes > MAX_GENERATION_RECEIPT_SWEEP_BYTES:
+                if processed:
+                    break
+                return BlockedReviewGenerationReceiptSweepPage(
+                    "generation receipt exceeds the sweep page byte bound", rowid,
+                )
+            if canonical_workflow_repository(scope) != scope:
+                return BlockedReviewGenerationReceiptSweepPage(
+                    "generation receipt sweep has a repository alias", rowid,
+                )
+            validate_workflow_identifier(key, "generation receipt sweep key")
+            fields, digest = _read_recording_source(db, namespace, scope, key)
+            receipt = dict(fields)
+            boundary, accepted_namespace, accepted_key, _ = _generation_receipt_parts(receipt["payload_json"])
+            derived = review_generation_receipt_id(
+                boundary.before.binding, boundary.to_revision.fence.generation,
+            )
+            if (receipt["reusable_after"] is not None or boundary.receipt_id != key
+                    or derived != key or boundary.before.binding.rejection.fence.key.repository != scope
+                    or accepted_namespace not in {"workflow-request", "workflow-transition"}):
+                return BlockedReviewGenerationReceiptSweepPage(
+                    "generation receipt sweep found a changed source identity", rowid,
+                )
+            _parse_stamp(receipt["claimed_at"])
+            if same_execution_episode(binding, boundary.before.binding):
+                sources.append(ObservedReviewGenerationReceiptSweepSource(
+                    rowid, boundary, accepted_namespace, accepted_key, digest,
+                ))
+            bytes_read += source_bytes
+            cursor = ReviewGenerationReceiptSweepCursor(scope, key)
+            processed += 1
+        return ObservedReviewGenerationReceiptSweepPage(
+            tuple(sources), cursor, upper, processed < len(rows),
+        )
+    except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
+            sqlite3.Error, WorkflowAuthorityError) as exc:
+        return BlockedReviewGenerationReceiptSweepPage(_printable(str(exc)), current_rowid)
+
+
 @dataclass(frozen=True)
 class MatchedLegacyStaleProductivityGenerationSources:
     """Observed stale path and its complete accepted generation crossing.

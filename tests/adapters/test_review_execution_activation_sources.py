@@ -35,6 +35,8 @@ from issue_agent.adapters.review_execution_activation import (
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     read_review_generation_archive_page,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
+    read_review_generation_receipt_sweep_page,
+    ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
     match_legacy_stale_productivity_generation_sources,
     MatchedLegacyStaleProductivityGenerationSources, UnmatchedLegacyStaleProductivityGenerationSources,
     classify_complete_legacy_review_successes,
@@ -1391,6 +1393,126 @@ def test_generation_archive_page_is_bounded_and_requires_every_expected_receipt(
         db.rollback()
     assert isinstance(missing, BlockedReviewGenerationArchivePage)
     assert missing.generation == last and "absent" in missing.reason
+
+
+def test_generation_receipt_sweep_observes_source_without_writes(rig):
+    store = _accepted_generation(rig)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        workflow = load_review_workflow_row(db, rig[1].revision.fence.key)
+        assert workflow is not None
+        boundary = workflow.execution.boundaries[0]
+        before = db.total_changes
+        sweep = read_review_generation_receipt_sweep_page(db, boundary.before.binding)
+        archive = read_review_generation_archive_page(
+            db, boundary.before.binding,
+            boundary.to_revision.fence.generation,
+            boundary.to_revision.fence.generation,
+        )
+        assert db.total_changes == before
+        db.rollback()
+    assert isinstance(sweep, ObservedReviewGenerationReceiptSweepPage)
+    assert isinstance(archive, ObservedReviewGenerationArchivePage)
+    assert len(sweep.sources) == 1 and not sweep.has_more
+    assert sweep.next_cursor == sweep.upper_cursor
+    assert sweep.sources[0].boundary == boundary
+    assert sweep.sources[0].receipt_digest == archive.sources[0].receipt_digest
+
+
+@pytest.mark.parametrize("damage", ["blob_namespace", "blob_scope", "blob_key", "scope_alias",
+                                    "wrong_key", "foreign_scope", "malformed_payload", "oversized_payload"])
+def test_generation_receipt_sweep_blocks_unclaimed_or_malformed_source(rig, damage):
+    store = _accepted_generation(rig)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT namespace,scope,key,claimed_at,reusable_after,payload_json "
+            "FROM dedupe_keys WHERE namespace='review-execution-generation'",
+        ).fetchone()
+        if damage in {"malformed_payload", "oversized_payload"}:
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json=? "
+                "WHERE namespace='review-execution-generation'",
+                ("{}" if damage == "malformed_payload" else "x" * (2**21 + 1),),
+            )
+        else:
+            values = tuple(row)
+            if damage == "blob_namespace":
+                values = (b"review-execution-generation", *values[1:])
+            elif damage == "blob_scope":
+                values = (values[0], b"o/r", *values[2:])
+            elif damage == "blob_key":
+                values = (*values[:2], values[2].encode(), *values[3:])
+            elif damage == "scope_alias":
+                values = (values[0], "O/R", *values[2:])
+            elif damage == "wrong_key":
+                values = (*values[:2], "unclaimed:generation", *values[3:])
+            else:
+                values = (values[0], "x/y", *values[2:])
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,reusable_after,payload_json) "
+                "VALUES (?,?,?,?,?,?)", values,
+            )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        binding = decode_workflow(row["payload_json"], ReviewExecutionAcceptedTransitionSource).boundary.before.binding
+        sweep = read_review_generation_receipt_sweep_page(db, binding)
+        db.rollback()
+    assert isinstance(sweep, BlockedReviewGenerationReceiptSweepPage)
+
+
+def test_generation_receipt_sweep_pages_to_fixed_upper_and_catches_later_insert(rig, monkeypatch):
+    store, _, selection, _, _, _, workflow = accepted_generation_with_open_submission(rig)
+    first = current(store, selection)
+    actor = OperatorActor("operator", "test")
+    assert isinstance(workflow.cancel_rearm(
+        CancelRearm("cancel:sweep-page", first.revision, "rearm:with-older-submission", "stop",
+                    expected_binding=first.binding), actor,
+    ), WorkflowCommitted)
+    stopped = current(store, selection)
+    assert isinstance(workflow.continue_rearm(
+        ContinueGrantedRearm("rearm:sweep-page", stopped.revision,
+                             "rearm:with-older-submission", expected_binding=stopped.binding), actor,
+    ), WorkflowCommitted)
+    binding = current(store, selection).execution.boundaries[0].before.binding
+    monkeypatch.setattr(review_activation, "MAX_GENERATION_RECEIPT_SWEEP_PAGE", 1)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        first_page = read_review_generation_receipt_sweep_page(db, binding)
+        assert isinstance(first_page, ObservedReviewGenerationReceiptSweepPage)
+        db.rollback()
+    assert first_page.has_more and first_page.next_cursor != first_page.upper_cursor
+    with store.transaction() as db:
+        source = db.execute(
+            "SELECT namespace,scope,claimed_at,reusable_after,payload_json FROM dedupe_keys "
+            "WHERE namespace='review-execution-generation' LIMIT 1",
+        ).fetchone()
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,reusable_after,payload_json) "
+            "VALUES (?,?,?,?,?,?)", (source["namespace"], source["scope"], "zzzz:unclaimed",
+                                  source["claimed_at"], source["reusable_after"], source["payload_json"]),
+        )
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        second_page = read_review_generation_receipt_sweep_page(
+            db, binding, after=first_page.next_cursor, upper=first_page.upper_cursor,
+        )
+        db.rollback()
+    assert isinstance(second_page, ObservedReviewGenerationReceiptSweepPage)
+    assert len(second_page.sources) == 1 and not second_page.has_more
+    assert second_page.next_cursor == first_page.upper_cursor
+
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        cursor = None
+        upper = None
+        while True:
+            page = read_review_generation_receipt_sweep_page(db, binding, after=cursor, upper=upper)
+            if isinstance(page, BlockedReviewGenerationReceiptSweepPage):
+                break
+            assert page.has_more
+            cursor, upper = page.next_cursor, page.upper_cursor
+        db.rollback()
+    assert "identity" in page.reason
 
 
 def test_generation_source_match_does_not_infer_time_from_sql_rowids(rig):
