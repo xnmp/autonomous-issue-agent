@@ -109,6 +109,7 @@ _VALUES = (
     round_archive.ReviewRoundArchiveScan,
     round_archive.CompletedReviewRoundArchiveScan,
     round_archive.BlockedReviewRoundArchiveScan,
+    round_archive.ReviewRoundArchiveCursor,
     receipt_archive.ReviewRoundReceiptSweepCursor,
     receipt_archive.ReviewRoundReceiptArchiveMember,
     receipt_archive.ReviewRoundReceiptArchiveSource,

@@ -43,6 +43,10 @@ charges foreign episode rows; a complete source census still needs a
 resumable freshness witness.
 The retained receipt namespace sweep has the same caller-selected byte
 ceiling and reports the bytes charged through raw and classified pages.
+Schema v27 maintains repository round-row and global retained-receipt mutation
+revisions. The durable round-row census now captures its revision across pages,
+and the read-only archive join rejects a stale completed round pass. The
+receipt census still needs both revisions; this does not authorize compaction.
 A transaction-local cursor now persists one bounded sweep page at a time,
 checks that the episode has exactly its allocated sequence count, and compares
 the prior pass's source membership when the frontier grows or a scheduled

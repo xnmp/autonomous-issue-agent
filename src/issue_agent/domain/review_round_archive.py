@@ -161,6 +161,20 @@ RoundArchiveState = (
 )
 
 
+@dataclass(frozen=True)
+class ReviewRoundArchiveCursor:
+    state: RoundArchiveState
+    round_rows_version: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.state, (
+            ReviewRoundArchiveScan, CompletedReviewRoundArchiveScan,
+            BlockedReviewRoundArchiveScan,
+        )) or type(self.round_rows_version) is not int
+                or not 0 <= self.round_rows_version < MAX_SQL_ROWID):
+            raise ValueError("round archive cursor requires a bounded source revision")
+
+
 def begin_review_round_archive_scan(
     origin: ReviewExecutionBinding, origin_receipt: ReviewExecutionOrigin,
     origin_source_sha256: str, through_sequence: int,

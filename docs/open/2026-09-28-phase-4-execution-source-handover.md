@@ -878,6 +878,22 @@ the complete audit benchmark.
   `/tmp/review-archive-source-witness-gate.log` (ephemeral). The CLI rehearsal
   fixture now settles its source WAL before asserting physical file-byte
   preservation, matching the existing app-level rehearsal fixture.
+- Checkpoint 118 stores the repository round-row mutation revision with every
+  durable round census state. A changed revision restarts a bounded pass in a
+  fresh SQL snapshot; completed and in-progress passes retain their prior
+  membership baseline so a changed historical source still blocks. Old
+  unversioned cursors are re-censused, and old blocked cursors remain blocked.
+  The read-only four-audit join rejects a completed round pass when its stored
+  revision differs from the current schema witness. Tests cover a new round
+  during paging, a missing or malformed later source, a post-completion row
+  update, legacy cursor migration, changed legacy membership, and malformed
+  revision values. Independent Sol review found the legacy-baseline gap, then
+  verified the fix. Full `make test` passed: 3,302 domain, 3,450 adapter and
+  2,876 app tests, hooks, governor, four import contracts and both Pyrefly
+  checks. Log: `/tmp/review-round-archive-versioned-gate.log` (ephemeral).
+  The receipt census still has no captured row/receipt mutation revisions;
+  checkpoint, generation, origin and workflow sources also remain outside a
+  complete lifetime freshness proof. No admission authority changed.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
@@ -902,8 +918,9 @@ witness. A complete schema-maintained revision needs exact trigger coverage of
 every source table and namespace, including updates, deletes and rekeys;
 [SQLite triggers](https://www.sqlite.org/lang_createtrigger.html) fire per row.
 The first schema revision now covers round rows and retained round receipts.
-Persisted audit cursors must capture and compare these revisions across each
-bounded pass before their completed results can support a freshness claim.
+The round-row audit captures and compares its revision across bounded pages;
+the receipt audit must capture both revisions before its completed result can
+support a freshness claim. Other source groups still need mutation coverage.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

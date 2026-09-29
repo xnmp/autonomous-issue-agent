@@ -19,6 +19,7 @@ from .review_execution_archive_audit import (
     _audit_key as _generation_key, _read_state as _generation_state,
 )
 from .review_execution_activation import _read_recording_source
+from .review_archive_source_versions import read_review_archive_source_versions
 from .review_checkpoint_application_source import read_review_checkpoint_application_source
 from .review_checkpoint_following_source import read_checkpoint_following_application_source
 from .review_round_archive_audit import (
@@ -53,7 +54,9 @@ def observe_review_execution_archive_evidence(
             or _v3_discrepancy(db, key.repository, checkpoint_key)):
         raise WorkflowAuthorityError("execution archive has an unresolved prior checkpoint cursor")
     _, checkpoint = _checkpoint_state(db, key.repository, checkpoint_key)
-    _, rounds = _round_state(db, key.repository, _round_key(key, epoch, episode))
+    _, rounds, round_rows_version = _round_state(
+        db, key.repository, _round_key(key, epoch, episode),
+    )
     _, receipts = _receipt_state(db, key.repository, _receipt_key(key, epoch, episode))
     _, generations = _generation_state(
         db, key.repository, _generation_key(key, epoch, episode),
@@ -63,6 +66,8 @@ def observe_review_execution_archive_evidence(
             or not isinstance(receipts, CompletedReviewRoundReceiptArchiveAudit)
             or not isinstance(generations, CompletedReviewGenerationArchiveAudit)):
         raise WorkflowAuthorityError("execution archive awaits complete source and census passes")
+    if round_rows_version != read_review_archive_source_versions(db, key.repository).round_rows:
+        raise WorkflowAuthorityError("execution archive round-row census is stale")
     origin, _ = _read_execution_origin(db, scope, execution)
     _, origin_digest = _read_recording_source(
         db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,

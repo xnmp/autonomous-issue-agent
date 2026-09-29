@@ -17,7 +17,7 @@ from issue_agent.adapters.review_execution_archive_evidence import (
 from issue_agent.adapters.review_checkpoint_application_source import (
     REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, read_review_checkpoint_application_source,
 )
-from issue_agent.adapters.workflow_codec import encode_workflow
+from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.review_round_archive_audit import advance_review_round_archive_audit
 from issue_agent.adapters.review_round_receipt_archive_audit import (
     advance_review_round_receipt_archive_audit,
@@ -30,7 +30,9 @@ from issue_agent.domain.review_execution import CompletedReviewGenerationArchive
 from issue_agent.domain.review_execution_archive_evidence import (
     ObservedReviewExecutionArchiveEvidence,
 )
-from issue_agent.domain.review_round_archive import CompletedReviewRoundArchiveScan
+from issue_agent.domain.review_round_archive import (
+    CompletedReviewRoundArchiveScan, ReviewRoundArchiveCursor,
+)
 from issue_agent.domain.review_round_receipt_archive import CompletedReviewRoundReceiptArchiveAudit
 from tests.adapters.test_review_checkpoint_archive_audit import (
     _generation_checkpoint, _real_selected_checkpoint, _two_valid_checkpoints,
@@ -136,6 +138,40 @@ def test_archive_join_rechecks_current_origin_source(active):
              observed.execution.origin.evidence_id),
         )
         with pytest.raises(WorkflowAuthorityError):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_round_mutation_after_completed_pass(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        changed = db.execute(
+            "UPDATE review_execution_rounds SET planning_json=planning_json "
+            "WHERE repository=?",
+            (key.repository,),
+        )
+        assert changed.rowcount > 0
+        with pytest.raises(WorkflowAuthorityError, match="round-row census is stale"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_unversioned_round_completion(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM level_state "
+            "WHERE namespace='review-round-archive-scan'",
+        ).fetchone()
+        completed = decode_workflow(row["payload_json"], ReviewRoundArchiveCursor).state
+        db.execute(
+            "UPDATE level_state SET payload_json=? "
+            "WHERE namespace='review-round-archive-scan'",
+            (encode_workflow(completed),),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="round-row census is stale"):
             observe_review_execution_archive_evidence(db, key, now=now)
 
 

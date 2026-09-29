@@ -11,7 +11,8 @@ from ..domain.review_execution import ActivatedReviewExecution, same_execution_e
 from ..domain.review_round_archive import (
     MAX_ROUND_ARCHIVE_DUE_SECONDS, BlockedReviewRoundArchiveScan,
     CompletedReviewRoundArchiveScan, ReviewRoundArchiveBaseline,
-    ReviewRoundArchiveFingerprint, ReviewRoundArchiveScan, RoundArchiveState,
+    ReviewRoundArchiveCursor, ReviewRoundArchiveFingerprint,
+    ReviewRoundArchiveScan, RoundArchiveState,
     advance_review_round_archive_scan, begin_review_round_archive_scan,
 )
 from ..domain.review_workflow import ReviewFamilyEpisodes
@@ -20,6 +21,7 @@ from .review_execution_activation import (
     BlockedReviewCheckpointRoundSweepPage, ObservedReviewCheckpointRoundSweepPage,
     _read_recording_source, read_checkpoint_round_sweep_page,
 )
+from .review_archive_source_versions import read_review_archive_source_versions
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, decode_workflow, encode_workflow
 from .workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError, _read_execution_origin,
@@ -87,7 +89,7 @@ def _current_execution(db: sqlite3.Connection, key: WorkflowKey) -> ActivatedRev
 
 def _read_state(
     db: sqlite3.Connection, repository: str, audit_key: str,
-) -> tuple[int | None, RoundArchiveState | None]:
+) -> tuple[int | None, RoundArchiveState | None, int | None]:
     rows = db.execute(
         "SELECT rowid,typeof(namespace) AS namespace_type,typeof(scope) AS scope_type,"
         "typeof(key) AS key_type,typeof(payload_json) AS payload_type,"
@@ -97,7 +99,7 @@ def _read_state(
         (_AUDIT_NAMESPACE, _AUDIT_NAMESPACE, repository, repository, audit_key, audit_key),
     ).fetchall()
     if not rows:
-        return None, None
+        return None, None, None
     if (len(rows) != 1 or any(rows[0][f"{name}_type"] != "text" for name in (
         "namespace", "scope", "key", "payload",
     )) or type(rows[0]["payload_bytes"]) is not int
@@ -112,19 +114,28 @@ def _read_state(
         raise WorkflowAuthorityError("round archive scan cursor changed during its bounded read")
     raw = row["payload_json"]
     try:
-        state = decode_workflow(raw, RoundArchiveState)
-        if encode_workflow(state) != raw:
+        decoded = decode_workflow(raw, object)
+        if encode_workflow(decoded) != raw:
             raise ValueError("noncanonical cursor")
+        if isinstance(decoded, ReviewRoundArchiveCursor):
+            state, version = decoded.state, decoded.round_rows_version
+        elif isinstance(decoded, (
+            ReviewRoundArchiveScan, CompletedReviewRoundArchiveScan,
+            BlockedReviewRoundArchiveScan,
+        )):
+            state, version = decoded, None
+        else:
+            raise ValueError("wrong round archive cursor variant")
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise WorkflowAuthorityError("round archive scan cursor is malformed") from exc
-    return rows[0]["rowid"], state
+    return rows[0]["rowid"], state, version
 
 
 def _persist_state(
     db: sqlite3.Connection, repository: str, audit_key: str, rowid: int | None,
-    state: RoundArchiveState, now: datetime,
+    state: RoundArchiveState, round_rows_version: int, now: datetime,
 ) -> None:
-    encoded = encode_workflow(state)
+    encoded = encode_workflow(ReviewRoundArchiveCursor(state, round_rows_version))
     if rowid is None:
         db.execute(
             "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) VALUES (?,?,?,?,?)",
@@ -153,18 +164,9 @@ def advance_review_round_archive_audit(
         raise ValueError("round archive audit requires a PR workflow")
     execution = _current_execution(db, key)
     audit_key = _audit_key(key, execution.binding.execution_epoch, execution.binding.execution_episode)
-    rowid, state = _read_state(db, key.repository, audit_key)
-    if state is None:
-        origin_receipt, _ = _read_execution_origin(db, scope, execution)
-        _, origin_digest = _read_recording_source(
-            db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,
-            origin_receipt.origin.evidence_id,
-        )
-        state = begin_review_round_archive_scan(
-            origin_receipt.checkpoint.state.binding, origin_receipt.origin,
-            origin_digest, execution.last_sequence, now, due_seconds,
-        )
-    else:
+    round_rows_version = read_review_archive_source_versions(db, key.repository).round_rows
+    rowid, state, stored_version = _read_state(db, key.repository, audit_key)
+    if state is not None:
         prior = state.prior if isinstance(state, BlockedReviewRoundArchiveScan) else state
         if (not same_execution_episode(prior.origin, execution.binding)
                 or prior.origin_receipt != execution.origin):
@@ -176,22 +178,43 @@ def advance_review_round_archive_audit(
         try:
             _, origin_digest = _read_recording_source(
                 db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,
-                prior.origin_receipt.evidence_id,
+                state.origin_receipt.evidence_id,
             )
         except (TypeError, ValueError, UnicodeError, sqlite3.Error):
             origin_digest = None
-        if origin_digest != prior.origin_source_sha256:
+        if origin_digest != state.origin_source_sha256:
             result: RoundArchiveState = BlockedReviewRoundArchiveScan(
                 state, "execution origin source changed or is unreadable", None, now,
             )
-            _persist_state(db, key.repository, audit_key, rowid, result, now)
+            _persist_state(db, key.repository, audit_key, rowid, result, round_rows_version, now)
             return result
         if execution.last_sequence < state.through_sequence:
             result = BlockedReviewRoundArchiveScan(
                 state, "indexed round frontier moved backwards", None, now,
             )
-            _persist_state(db, key.repository, audit_key, rowid, result, now)
+            _persist_state(db, key.repository, audit_key, rowid, result, round_rows_version, now)
             return result
+    if state is None or stored_version != round_rows_version:
+        baseline = None
+        deadline = None
+        if state is not None:
+            if isinstance(state, CompletedReviewRoundArchiveScan):
+                baseline = ReviewRoundArchiveBaseline(
+                    state.through_sequence, state.membership_xor,
+                )
+            else:
+                baseline, deadline = state.baseline, state.due_at
+        origin_receipt, _ = _read_execution_origin(db, scope, execution)
+        _, origin_digest = _read_recording_source(
+            db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,
+            origin_receipt.origin.evidence_id,
+        )
+        state = begin_review_round_archive_scan(
+            origin_receipt.checkpoint.state.binding, origin_receipt.origin,
+            origin_digest, execution.last_sequence, now, due_seconds,
+            baseline, deadline,
+        )
+    else:
         if isinstance(state, CompletedReviewRoundArchiveScan):
             if execution.last_sequence == state.through_sequence and now < state.next_due_at:
                 return state
@@ -221,5 +244,5 @@ def advance_review_round_archive_audit(
         )
     else:
         raise WorkflowAuthorityError("round archive sweep returned an untyped page")
-    _persist_state(db, key.repository, audit_key, rowid, result, now)
+    _persist_state(db, key.repository, audit_key, rowid, result, round_rows_version, now)
     return result
