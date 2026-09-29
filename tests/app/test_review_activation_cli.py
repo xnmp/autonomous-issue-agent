@@ -7,7 +7,7 @@ import pytest
 
 from issue_agent.app import cli, review_activation
 from tests.app.test_resolve_activation_cli import deployment, dump, heartbeat, write_snapshot
-from tests.app.test_review_activation_app import BOT, Remote, seed
+from tests.app.test_review_activation_app import BOT, Remote, seed, settle
 
 
 @pytest.fixture
@@ -77,6 +77,7 @@ def test_review_cli_rehearsal_writes_only_the_requested_copy(review_launch, caps
     _state, control, _env, _remote = review_launch
     before = dump(control)
     assert run(capsys, "rehearse")[0] == 2
+    settle(control)
     code, result, error = run(capsys, "rehearse", "--copy-to", str(tmp_path / "rehearsal"))
     assert code == 0 and result["status"] == "rehearsed", error
     assert dump(control) == before

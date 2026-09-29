@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 26
+SCHEMA_VERSION = 27
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1594,6 +1594,145 @@ BEGIN SELECT RAISE(ABORT,'dispatch claim occurrence is immutable'); END;
     SchemaMigration(26, """
 CREATE INDEX review_execution_rounds_repository
 ON review_execution_rounds(repository);
+"""),
+    SchemaMigration(27, """
+CREATE TABLE review_archive_source_versions (
+    source TEXT NOT NULL CHECK (typeof(source)='text' AND length(source) BETWEEN 1 AND 64),
+    scope BLOB NOT NULL CHECK (typeof(scope)='blob'),
+    version INTEGER NOT NULL CHECK (
+        typeof(version)='integer' AND version BETWEEN 0 AND 9223372036854775806
+    ),
+    PRIMARY KEY (source,scope)
+) WITHOUT ROWID;
+INSERT INTO review_archive_source_versions(source,scope,version)
+VALUES ('round_receipts',X'',0);
+INSERT INTO review_archive_source_versions(source,scope,version)
+SELECT 'round_rows',CAST(repository AS BLOB),0
+FROM workflows GROUP BY CAST(repository AS BLOB);
+CREATE TRIGGER review_workflow_round_source_insert AFTER INSERT ON workflows
+WHEN NOT EXISTS (
+    SELECT 1 FROM review_archive_source_versions
+    WHERE source='round_rows' AND scope=CAST(NEW.repository AS BLOB)
+)
+BEGIN
+    SELECT RAISE(ABORT,'existing workflow repository lost its round source witness')
+    WHERE EXISTS (
+        SELECT 1 FROM workflows
+        WHERE repository IN (
+            NEW.repository,CAST(NEW.repository AS BLOB),CAST(NEW.repository AS TEXT)
+        ) AND rowid<>NEW.rowid LIMIT 1
+    );
+    INSERT INTO review_archive_source_versions(source,scope,version)
+    VALUES ('round_rows',CAST(NEW.repository AS BLOB),0);
+END;
+-- REPLACE may remove a conflicting row without firing its DELETE trigger.
+CREATE TRIGGER review_round_source_no_replace_insert BEFORE INSERT ON review_execution_rounds
+WHEN EXISTS (
+    SELECT 1 FROM review_execution_rounds
+    WHERE round_id=NEW.round_id OR (
+        repository=NEW.repository AND target_number=NEW.target_number
+        AND execution_epoch=NEW.execution_epoch AND execution_episode=NEW.execution_episode
+        AND sequence=NEW.sequence
+    ) LIMIT 1
+)
+BEGIN
+    SELECT RAISE(ABORT,'review round replacement would hide a source mutation');
+END;
+CREATE TRIGGER review_round_source_no_replace_update BEFORE UPDATE ON review_execution_rounds
+WHEN (
+    NEW.round_id IS NOT OLD.round_id OR NEW.repository IS NOT OLD.repository
+    OR NEW.target_number IS NOT OLD.target_number
+    OR NEW.execution_epoch IS NOT OLD.execution_epoch
+    OR NEW.execution_episode IS NOT OLD.execution_episode
+    OR NEW.sequence IS NOT OLD.sequence
+) AND EXISTS (
+    SELECT 1 FROM review_execution_rounds
+    WHERE rowid<>OLD.rowid AND (
+        round_id=NEW.round_id OR (
+            repository=NEW.repository AND target_number=NEW.target_number
+            AND execution_epoch=NEW.execution_epoch AND execution_episode=NEW.execution_episode
+            AND sequence=NEW.sequence
+        )
+    ) LIMIT 1
+)
+BEGIN
+    SELECT RAISE(ABORT,'review round replacement would hide a source mutation');
+END;
+CREATE TRIGGER review_round_source_insert AFTER INSERT ON review_execution_rounds
+BEGIN
+    SELECT RAISE(ABORT,'round source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_rows' AND scope=CAST(NEW.repository AS BLOB)
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='round_rows' AND scope=CAST(NEW.repository AS BLOB);
+END;
+CREATE TRIGGER review_round_source_update AFTER UPDATE ON review_execution_rounds
+BEGIN
+    SELECT RAISE(ABORT,'prior round source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_rows' AND scope=CAST(OLD.repository AS BLOB)
+    );
+    SELECT RAISE(ABORT,'new round source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_rows' AND scope=CAST(NEW.repository AS BLOB)
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='round_rows' AND scope IN (
+        CAST(OLD.repository AS BLOB),CAST(NEW.repository AS BLOB)
+    );
+END;
+CREATE TRIGGER review_round_source_delete AFTER DELETE ON review_execution_rounds
+BEGIN
+    SELECT RAISE(ABORT,'round source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_rows' AND scope=CAST(OLD.repository AS BLOB)
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='round_rows' AND scope=CAST(OLD.repository AS BLOB);
+END;
+CREATE TRIGGER review_receipt_source_insert AFTER INSERT ON dedupe_keys
+WHEN substr(CAST(NEW.namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+    OR CAST(NEW.namespace AS BLOB)=CAST('review-recorded-submission' AS BLOB)
+BEGIN
+    SELECT RAISE(ABORT,'round receipt source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_receipts' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='round_receipts' AND scope=X'';
+END;
+CREATE TRIGGER review_receipt_source_update AFTER UPDATE ON dedupe_keys
+WHEN substr(CAST(OLD.namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+    OR CAST(OLD.namespace AS BLOB)=CAST('review-recorded-submission' AS BLOB)
+    OR substr(CAST(NEW.namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+    OR CAST(NEW.namespace AS BLOB)=CAST('review-recorded-submission' AS BLOB)
+BEGIN
+    SELECT RAISE(ABORT,'round receipt source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_receipts' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='round_receipts' AND scope=X'';
+END;
+CREATE TRIGGER review_receipt_source_delete AFTER DELETE ON dedupe_keys
+WHEN substr(CAST(OLD.namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+    OR CAST(OLD.namespace AS BLOB)=CAST('review-recorded-submission' AS BLOB)
+BEGIN
+    SELECT RAISE(ABORT,'round receipt source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_receipts' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='round_receipts' AND scope=X'';
+END;
 """),
 )
 

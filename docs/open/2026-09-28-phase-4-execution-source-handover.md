@@ -860,6 +860,24 @@ the complete audit benchmark.
   four import contracts and both Pyrefly checks. Log:
   `/tmp/checkpoint-receipt-sweep-byte-budget-final-gate.log` (ephemeral).
   This remains read-only source evidence.
+- Checkpoint 117 adds schema-maintained mutation witnesses for repository
+  review-round rows and the global retained round-receipt namespace. Migration
+  27 seeds existing repositories, and row triggers advance bounded revisions
+  for inserts, updates, deletes and repository rekeys. Missing witnesses and
+  version overflow abort source writes; a workflow alias cannot silently
+  reseed a lost round witness. Round-row replacement conflicts are rejected
+  because SQLite can otherwise delete the replaced row without a DELETE
+  trigger. A transaction-local reader validates both witnesses and catches
+  missing BLOB-alias workflow authority. Migration, rollback, mutation,
+  replacement, alias and overflow regressions pass. Independent Sol review
+  exposed the replacement and alias gaps, which are fixed. This is an
+  observational primitive: audit cursors do not yet capture it, and generation,
+  checkpoint, origin and workflow sources still need mutation coverage. Full
+  `make test` passed: 3,302 domain, 3,441 adapter and 2,876 app tests, hooks,
+  governor, four import contracts and both Pyrefly checks. Log:
+  `/tmp/review-archive-source-witness-gate.log` (ephemeral). The CLI rehearsal
+  fixture now settles its source WAL before asserting physical file-byte
+  preservation, matching the existing app-level rehearsal fixture.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
@@ -880,9 +898,12 @@ writer or admission gate.
 [SQLite `data_version`](https://www.sqlite.org/pragma.html#pragma_data_version)
 does not advance for writes made through the same connection and is comparable
 only on one connection, so it cannot serve as a durable cross-transaction
-witness. A schema-maintained revision would need exact trigger coverage of
+witness. A complete schema-maintained revision needs exact trigger coverage of
 every source table and namespace, including updates, deletes and rekeys;
 [SQLite triggers](https://www.sqlite.org/lang_createtrigger.html) fire per row.
+The first schema revision now covers round rows and retained round receipts.
+Persisted audit cursors must capture and compare these revisions across each
+bounded pass before their completed results can support a freshness claim.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid
