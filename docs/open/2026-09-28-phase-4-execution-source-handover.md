@@ -1120,6 +1120,24 @@ whole-repository anti-join inside each checkpoint proposal would grow with
 repository lifetime. Keep the initial archive join observational until this
 expected-source proof and settlement provenance are present.
 
+- Checkpoint 130 adds a bounded global page of `review-round-submission`
+  registration receipts. It walks at most 64 dedupe rowids plus a continuation
+  probe, fixes an upper rowid, applies a selected-source byte budget before
+  payload reads, and carries the schema round-receipt mutation revision.
+  Selected BLOB namespace or repository aliases, noncanonical payloads,
+  malformed claim times and oversized sources block. Foreign repositories and
+  unrelated dedupe rows advance without being mistaken for registrations.
+  Focused tests cover real registered submissions, unrelated global pages,
+  aliases, malformed payloads, foreign scope and byte limits. Independent Sol
+  review found no concrete issue within this page's observational contract.
+  The page alone does not establish registration-to-command/round linkage or
+  exact expected lifecycle membership; the durable matching cursor and
+  settlement proof remain next. Full `make test` passed: 3,302 domain, 3,595
+  adapter and 2,876 app tests, hooks, governor, four import contracts and
+  both Pyrefly checks. Ten strict xfails remained expected. Log:
+  `/tmp/review-lifecycle-registration-page-gate.log` (ephemeral). The four
+  paused services remained inactive.
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round

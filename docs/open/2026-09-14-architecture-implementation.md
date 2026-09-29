@@ -514,6 +514,10 @@ checks checkpoint receipts and paired application sources under the
 checkpoint-source mutation revision, blocking an existing receipt for this
 execution or an unreadable source. The join requires that pass to be current.
 This bootstrap observation also has no production write or admission authority.
+A bounded global registration page now exposes canonical review submission
+registrations under the round-receipt mutation revision. It is an input to a
+future expected-command census; it does not yet link registrations to command
+and round sources or close the unregistered-command gap.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched
