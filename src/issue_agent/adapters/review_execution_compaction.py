@@ -5,6 +5,9 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 
+from ..domain.review_checkpoint_application import (
+    ReviewCheckpointApplicationProposal, build_review_checkpoint_application_proposal,
+)
 from ..domain.review_execution import (
     ActivatedReviewExecution, MAX_EXECUTION_SUFFIX, ReviewExecutionBoundaryCursor,
     ReviewExecutionCheckpointReceipt, ReviewExecutionCompactionPlan, ReviewRoundOutcome,
@@ -35,6 +38,7 @@ class ObservedReviewCheckpointManifest:
     revision: WorkflowRevision
     plan: ReviewExecutionCompactionPlan
     receipt: ReviewExecutionCheckpointReceipt
+    application: ReviewCheckpointApplicationProposal
     source_bytes: int
 
     def __post_init__(self) -> None:
@@ -42,6 +46,10 @@ class ObservedReviewCheckpointManifest:
                 or not isinstance(self.plan, ReviewExecutionCompactionPlan)
                 or not isinstance(self.receipt, ReviewExecutionCheckpointReceipt)
                 or self.receipt.checkpoint != self.plan.checkpoint
+                or not isinstance(self.application, ReviewCheckpointApplicationProposal)
+                or self.application.checkpoint != self.plan.checkpoint
+                or self.application.previous_checkpoint != self.receipt.previous_checkpoint
+                or self.application.captured_revision != self.revision
                 or type(self.source_bytes) is not int
                 or not 0 <= self.source_bytes <= MAX_CHECKPOINT_MANIFEST_SOURCE_BYTES):
             raise ValueError("checkpoint manifest requires a bounded typed source proposal")
@@ -188,10 +196,41 @@ def observe_review_checkpoint_manifest(
             boundary.receipt_id for boundary in plan.retired_boundaries
         ):
             raise WorkflowAuthorityError("checkpoint manifest retired generations changed their replay")
+        following_source = None
+        if plan.remaining_boundaries:
+            next_generation = plan.checkpoint.state.binding.rejection.fence.generation + 1
+            following_page = read_review_generation_archive_page(
+                db, origin_binding, next_generation, next_generation,
+                preceding=plan.checkpoint.boundary_cursor, limit=1,
+            )
+            if (isinstance(following_page, BlockedReviewGenerationArchivePage)
+                    or not isinstance(following_page, ObservedReviewGenerationArchivePage)
+                    or len(following_page.sources) != 1
+                    or following_page.sources[0].boundary != plan.remaining_boundaries[0]):
+                raise WorkflowAuthorityError("checkpoint manifest following boundary is unreadable")
+            observed_following = following_page.sources[0]
+            source_bytes += observed_following.source_bytes
+            if source_bytes > max_source_bytes:
+                raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
+            following_source = ReviewGenerationArchiveFingerprint(
+                ReviewExecutionBoundaryCursor(
+                    observed_following.boundary.receipt_id,
+                    observed_following.boundary.to_revision,
+                ),
+                observed_following.receipt_digest,
+                observed_following.accepted_namespace,
+                observed_following.accepted_key,
+                observed_following.accepted_digest,
+            )
         receipt = build_review_execution_checkpoint_receipt(
             execution, plan, tuple(round_sources), tuple(generation_sources),
         )
-        return ObservedReviewCheckpointManifest(snapshot.revision, plan, receipt, source_bytes)
+        application = build_review_checkpoint_application_proposal(
+            execution, plan, snapshot.revision, following_source,
+        )
+        return ObservedReviewCheckpointManifest(
+            snapshot.revision, plan, receipt, application, source_bytes,
+        )
     except (TypeError, ValueError, UnicodeError, RecursionError, sqlite3.Error) as exc:
         if isinstance(exc, WorkflowAuthorityError):
             raise

@@ -678,15 +678,29 @@ the complete audit benchmark.
   independently verified the false-block and timing issue are absent after
   withdrawal. The full gate passed: 3,296 domain, 3,365 adapter and 2,876 app
   tests, four import contracts and both Pyrefly checks.
+- Checkpoint 103 adds a typed, transaction-local applicability proposal for
+  the checkpoint writer. The compaction plan selects either all tail outcomes
+  after its last retired boundary or the first remaining accepted generation
+  boundary's applied-sequence set. The manifest reads that exact following
+  boundary pair under its SQL snapshot, records its source fingerprints and
+  applied-sequence digest, and charges the pair to its source-byte ceiling.
+  A real late-settlement partial compaction exercises the selected path;
+  missing or malformed retained sources block, and an equivalent claim-time
+  spelling change changes the captured fingerprint. The proposal is neither
+  a durable sidecar nor proof of checkpoint state. The writer must mint it
+  atomically with a checkpoint, and the paged audit must re-read and replay it
+  before an admission gate can use it. Independent Sol review found no
+  remaining material issue. The full gate passed: 3,297 domain, 3,368
+  adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
 
-The next seam is a source-backed applicability witness for each checkpoint
-segment. The writer must record whether all retired outcomes were applied or
-which retained following boundary selected them, then verify the full retired
-stream, use this identical round receipt-set definition, bind the ordered
-source digests, and publish the aggregate and checkpoint atomically. The paged
-audit must replay those outcomes, reconstruct retired member payloads and
-unclaimed receipts, and supply the admission gate. Keep the canonical
-compaction refusal until these checks are complete.
+The next seam is durable checkpoint authority. The writer must mint the
+transaction-local applicability proposal with its checkpoint, verify the full
+retired stream using the identical round receipt-set definition, bind the
+ordered source digests, and publish the aggregate and checkpoint atomically.
+The paged audit must re-read the selected boundary, replay outcomes,
+reconstruct retired member payloads and unclaimed receipts, and supply the
+admission gate. Keep the canonical compaction refusal until these checks are
+complete.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

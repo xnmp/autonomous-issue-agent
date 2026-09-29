@@ -50,9 +50,11 @@ stream digests, and compares the prior completed chain after tip growth.
 A proposed sequential state replay was withdrawn after a valid partial
 compaction showed that a later boundary can leave earlier finalized rounds
 unapplied. The scan currently verifies source streams, not checkpoint state;
-it needs source-backed boundary applicability, unclaimed row and receipt
-census, a transactional writer, cumulative hot-read bounds and the atomic
-admission gate.
+the transaction-local checkpoint manifest now proposes a typed tail
+application choice and fingerprints the exact first remaining accepted
+boundary when one selected the outcomes. This proposal still needs an atomic
+writer, durable audit replay, unclaimed row and receipt census, cumulative
+hot-read bounds and the admission gate.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

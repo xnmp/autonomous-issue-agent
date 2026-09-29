@@ -233,6 +233,18 @@ result can gate authority. The production writer and canonical compacted read
 remain disabled until those checks, cumulative bounds and the atomic audit
 gate exist.
 
+The transaction-local manifest now proposes a typed tail application choice
+from the compaction plan: all outcomes after the last retired boundary apply,
+or the first remaining accepted generation boundary selects them. In the
+second case it reads that exact retained boundary pair in the same SQL
+transaction, binds its source fingerprints and the digest of its ordered
+applied sequences, and charges its bytes to the manifest ceiling. This is a
+writer input, not a persisted receipt or state proof. The writer must mint the
+choice with its checkpoint atomically; the audit must re-read the named source
+and replay outcomes before a compacted load can use it. The event stream
+remains the source of truth for snapshots, consistent with the
+[event-sourcing pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing).
+
 A read-only receipt sweep page now covers the twelve namespaces used by the
 round receipt-set definition, including command-keyed submission and recorded
 review receipts. It scans all repositories in indexed namespace, scope and

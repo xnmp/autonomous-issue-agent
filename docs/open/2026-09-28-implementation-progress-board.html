@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 11:38 AEST · Latest accepted checkpoint: durable observational checkpoint archive scan</p>
+      <p class="meta">Updated 29 Sep 2026, 12:01 AEST · Latest accepted checkpoint: checkpoint tail applicability proposal</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>The durable observational scan follows checkpoint predecessors and matches retired source streams, one source per transaction. A proposed state replay was withdrawn after a valid partial compaction exposed ambiguous outcome applicability across a later generation boundary. Source-backed boundary timing, state replay and unclaimed source census remain required before admission; compacted loads still refuse. Next: those proofs, cumulative hot-read and writer bounds, checkpoint writer, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>The checkpoint manifest now captures a typed tail applicability proposal and fingerprints the first remaining accepted boundary when it selects outcomes. This remains a writer input; compacted loads still refuse. Next: atomic checkpoint writer, archived replay and receipt census, cumulative read bounds, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -164,6 +164,7 @@
           <li><time datetime="2026-09-29T11:02:00+10:00">29 Sep 2026, 11:02 AEST</time><strong>Checkpoint archive stream scan accepted offline · 3 of 6 accepted</strong><p>A persisted cursor follows checkpoint receipts and matches each retired round and accepted generation stream, one source per transaction. A new tip retains the prior completed chain as a baseline; changed or missing earlier sources block. Sol review found no cursor regression and confirmed that retired state replay and unclaimed source census remain required before admission. Full gate passed: 3,296 domain, 3,364 adapter and 2,876 app tests, four import contracts and Pyrefly. Compacted loads still refuse. Active work since the previous entry: About 23 minutes.</p></li>
           <li><time datetime="2026-09-29T11:18:00+10:00">29 Sep 2026, 11:18 AEST</time><strong>Round-only checkpoint replay explored, later withdrawn · 3 of 6 accepted</strong><p>A forged checkpoint exposed a missing state check, and a sequential replay attempt passed the full gate: 3,296 domain, 3,366 adapter and 2,876 app tests, four import contracts and Pyrefly. A subsequent valid partial-compaction fixture and independent Sol review showed that the rule could falsely block or miss historical state changes. The replay is withdrawn in the following entry; no admission or compaction authority was granted. Active work since the previous entry: About 16 minutes.</p></li>
           <li><time datetime="2026-09-29T11:38:00+10:00">29 Sep 2026, 11:38 AEST</time><strong>Unsound checkpoint replay withdrawn · 3 of 6 accepted</strong><p>A valid partial compaction can leave an earlier finalized round unapplied, while live generation alone cannot identify applied historical rounds. The source-only checkpoint scan is restored, and an adapter regression preserves this case. Sol verified the false block is gone. Full gate passed: 3,296 domain, 3,365 adapter and 2,876 app tests, four import contracts and Pyrefly. Next: a source-backed applicability witness and boundary replay before any admission gate. Active work since the previous entry: About 20 minutes.</p></li>
+          <li><time datetime="2026-09-29T12:01:00+10:00">29 Sep 2026, 12:01 AEST</time><strong>Checkpoint tail applicability proposal accepted offline · 3 of 6 accepted</strong><p>The transaction-local manifest now selects all tail outcomes or fingerprints the exact first remaining accepted generation boundary and its applied-sequence digest. A real partial-compaction path and changed source metadata exercise the selection. Sol review found no material issue; the full gate passed: 3,297 domain, 3,368 adapter and 2,876 app tests, four import contracts and Pyrefly. Atomic writer, archived replay, receipt census and admission authority remain open. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

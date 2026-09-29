@@ -1,5 +1,6 @@
 """Review execution legacy file and owner-run inventories are bounded and read-only."""
 
+import hashlib
 import sqlite3
 import json
 from contextlib import closing
@@ -7,6 +8,9 @@ from dataclasses import replace
 
 import pytest
 
+from issue_agent.domain.review_checkpoint_application import (
+    ApplyAllCheckpointTailOutcomes, ApplyCheckpointTailByFollowingBoundary,
+)
 import issue_agent.adapters.review_execution_activation as review_activation
 from issue_agent.adapters.control_store import SQLiteControlStore, _encoded_payload_digest
 from issue_agent.domain.contracts import EffectReceipt, EffectStatus
@@ -1427,6 +1431,9 @@ def test_checkpoint_manifest_observes_real_round_and_generation_sources(rig):
         assert observed.receipt.last_generation_source.cursor.receipt_id == (
             observed.plan.retired_boundaries[0].receipt_id
         )
+        assert isinstance(observed.application.tail, ApplyAllCheckpointTailOutcomes)
+        assert observed.application.checkpoint == observed.receipt.checkpoint
+        assert observed.application.captured_revision == observed.revision
         assert observed.source_bytes > 0
         assert db.total_changes == before
         assert observe_review_checkpoint_manifest(
@@ -1436,6 +1443,84 @@ def test_checkpoint_manifest_observes_real_round_and_generation_sources(rig):
             observe_review_checkpoint_manifest(
                 db, key, 1, max_source_bytes=observed.source_bytes - 1,
             )
+
+
+@pytest.mark.parametrize("damage", ("generation_receipt", "accepted_payload"))
+def test_checkpoint_manifest_captures_real_following_boundary_selection(rig, damage):
+    store, stale_plan, _, _ = _stale_settlement(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        before = db.total_changes
+        observed = observe_review_checkpoint_manifest(db, key, stale_plan.round.sequence)
+        assert observed.plan.retired_boundaries == ()
+        assert len(observed.plan.remaining_boundaries) == 1
+        assert isinstance(observed.application.tail, ApplyCheckpointTailByFollowingBoundary)
+        following = observed.plan.remaining_boundaries[0]
+        source = observed.application.tail.source
+        generation = following.to_revision.fence.generation
+        archive = read_review_generation_archive_page(
+            db, observed.receipt.previous_checkpoint.state.binding,
+            generation, generation,
+            preceding=observed.plan.checkpoint.boundary_cursor, limit=1,
+        )
+        assert isinstance(archive, ObservedReviewGenerationArchivePage)
+        assert archive.sources[0].boundary == following
+        assert source.cursor.receipt_id == following.receipt_id
+        assert source.cursor.revision == following.to_revision
+        assert source.receipt_sha256 == archive.sources[0].receipt_digest
+        assert source.accepted_sha256 == archive.sources[0].accepted_digest
+        assert observed.application.tail.applied_sequences_sha256 == hashlib.sha256(
+            "\0".join(str(sequence) for sequence in following.applied_sequences).encode(),
+        ).hexdigest()
+        assert observed.source_bytes > 0 and db.total_changes == before
+        assert observe_review_checkpoint_manifest(
+            db, key, stale_plan.round.sequence, max_source_bytes=observed.source_bytes,
+        ).application == observed.application
+        with pytest.raises(WorkflowAuthorityError, match="byte bound"):
+            observe_review_checkpoint_manifest(
+                db, key, stale_plan.round.sequence,
+                max_source_bytes=observed.source_bytes - 1,
+            )
+    with store.transaction() as db:
+        if damage == "generation_receipt":
+            db.execute(
+                "DELETE FROM dedupe_keys WHERE namespace='review-execution-generation' AND key=?",
+                (source.cursor.receipt_id,),
+            )
+        else:
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json='{}' WHERE namespace=? AND key=?",
+                (source.accepted_namespace, source.accepted_key),
+            )
+    with store.transaction() as db:
+        with pytest.raises(WorkflowAuthorityError):
+            observe_review_checkpoint_manifest(db, key, stale_plan.round.sequence)
+
+
+def test_checkpoint_manifest_tracks_following_boundary_source_metadata(rig):
+    store, stale_plan, _, _ = _stale_settlement(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        original = observe_review_checkpoint_manifest(db, key, stale_plan.round.sequence)
+        assert isinstance(original.application.tail, ApplyCheckpointTailByFollowingBoundary)
+        source = original.application.tail.source
+        row = db.execute(
+            "SELECT claimed_at FROM dedupe_keys WHERE namespace=? AND key=?",
+            (source.accepted_namespace, source.accepted_key),
+        ).fetchone()
+        assert row["claimed_at"].endswith("+00:00")
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at=? WHERE namespace=? AND key=?",
+            (row["claimed_at"].removesuffix("+00:00") + "Z",
+             source.accepted_namespace, source.accepted_key),
+        )
+    with store.transaction() as db:
+        changed = observe_review_checkpoint_manifest(db, key, stale_plan.round.sequence)
+
+    assert changed.receipt == original.receipt
+    assert isinstance(changed.application.tail, ApplyCheckpointTailByFollowingBoundary)
+    assert changed.application.tail.source.receipt_sha256 == source.receipt_sha256
+    assert changed.application.tail.source.accepted_sha256 != source.accepted_sha256
 
 
 def test_checkpoint_round_receipt_members_match_the_indexed_source_sweep(rig):
