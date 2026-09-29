@@ -753,16 +753,34 @@ the complete audit benchmark.
   passed: 3,302 domain, 3,395 adapter and 2,876 app tests, four import
   contracts and both Pyrefly checks. Log:
   `/tmp/checkpoint-state-replay-final-gate.log` (ephemeral).
+- Checkpoint 109 moves the replay into the durable checkpoint archive scan.
+  The `-v3` cursor stores its generation, round and tail frontier, advances by
+  one new retired source per transaction, and checks the projected checkpoint state
+  before completing each chain segment. It rechecks the checkpoint receipt,
+  application sidecar and first following generation on resume. A pending
+  boundary stores only its source fingerprint and is re-read at each step;
+  cursor storage excess persists a fixed-size blocker anchor in initial,
+  resumed and discrepancy paths. Valid `-v2`
+  cursors restart at the origin; blocked and malformed prior cursors remain
+  blockers. The harness-owned cursor's accumulated state is trusted between
+  transactions, so future admission authority must settle that trust boundary.
+  This remains observational: a complete retired member payload and
+  unclaimed source census, atomic writer, cumulative hot-read bound and
+  admission gate are still required. Independent Sol review found no
+  remaining confirmed medium or high issue. The full gate passed: 3,302
+  domain, 3,402 adapter and 2,876 app tests, four import contracts and both
+  Pyrefly checks. Log: `/tmp/checkpoint-paged-replay-final-gate.log`
+  (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round
 receipt-set definition, bind the ordered source digests, and publish the
 aggregate and checkpoint atomically.
-The paged audit must carry the state replay across bounded transactions,
-reconstruct retired member payloads and unclaimed receipts, and supply the
-admission gate. Keep the canonical compaction refusal until these checks are
-complete.
+The paged audit now carries state replay across bounded transactions. It must
+still reconstruct retired member payloads and unclaimed receipts, and supply
+the admission gate. Keep the canonical compaction refusal until these checks
+are complete.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 12:58 AEST · Latest accepted checkpoint: application-aware checkpoint archive scan</p>
+      <p class="meta">Updated 29 Sep 2026, 14:18 AEST · Latest accepted checkpoint: paged checkpoint state replay</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>The durable observational scan now binds each checkpoint to its recorded tail choice and retains the source fingerprint across passes. It still does not verify the selected following boundary or replay checkpoint state; compacted loads refuse. Next: those archived proofs, receipt census, cumulative read bounds, atomic checkpoint writer, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>The durable checkpoint scan now replays retired state across bounded transactions. Compacted loads still refuse. Next: complete source census, cumulative read bounds, atomic writer, admission gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -170,6 +170,7 @@
           <li><time datetime="2026-09-29T12:58:00+10:00">29 Sep 2026, 12:58 AEST</time><strong>Application-aware archive scan accepted offline · 3 of 6 accepted</strong><p>The durable checkpoint scan now rechecks each application sidecar and includes its six-field digest in the chain baseline. Valid prior-version cursors restart; prior blocked or malformed cursors remain blockers. Sol found and verified fixes for two migration gaps. The full gate passed: 3,297 domain, 3,389 adapter and 2,876 app tests, four import contracts and Pyrefly. The new scan does not certify continuity with a completed prior-version digest or replay checkpoint state; no admission authority changed. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T13:14:00+10:00">29 Sep 2026, 13:14 AEST</time><strong>Following-boundary application check accepted offline · 3 of 6 accepted</strong><p>Each active checkpoint scan step now reads the first following accepted generation and checks its retained source against the recorded tail choice. Real partial compaction passes; missing and changed sources block. Independent Sol review and the full gate passed: 3,297 domain, 3,391 adapter and 2,876 app tests, four import contracts and Pyrefly. Retired checkpoint state replay and admission authority remain open. Active work since the previous entry: About 16 minutes.</p></li>
           <li><time datetime="2026-09-29T13:50:00+10:00">29 Sep 2026, 13:50 AEST</time><strong>Archived checkpoint state replay accepted offline · 3 of 6 accepted</strong><p>A pure streaming reducer and transaction-local SQL observer now check one compacted segment's retired round and generation sources, source digests, recorded tail choice and projected state. Real selected, round-only and mixed cases pass. Sol reviews and the full gate passed: 3,302 domain, 3,395 adapter and 2,876 app tests, four import contracts and Pyrefly. Durable paged replay, source census, chain proof and admission authority remain open. Active work since the previous entry: About 36 minutes.</p></li>
+          <li><time datetime="2026-09-29T14:18:00+10:00">29 Sep 2026, 14:18 AEST</time><strong>Paged checkpoint state replay accepted offline · 3 of 6 accepted</strong><p>The versioned checkpoint audit now interleaves archived generation boundaries and round outcomes across transactions, checks projected checkpoint state, and re-reads a pending boundary by fingerprint. Valid v2 cursors restart; prior discrepancies remain blockers. Every cursor write has a fixed-size storage-overflow blocker. Independent Sol review and the full gate passed: 3,302 domain, 3,402 adapter and 2,876 app tests, four import contracts and Pyrefly. Source census, atomic writer and admission authority remain open. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

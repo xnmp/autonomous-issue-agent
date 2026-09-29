@@ -5,6 +5,7 @@ from dataclasses import replace
 
 import pytest
 
+from issue_agent.adapters import review_checkpoint_archive_audit as archive_audit
 from issue_agent.adapters.review_checkpoint_archive_audit import (
     _audit_key, advance_review_checkpoint_archive_audit,
 )
@@ -20,13 +21,18 @@ from issue_agent.adapters.review_checkpoint_state_replay import (
 from issue_agent.adapters.review_execution_activation import read_checkpoint_round_receipt_source
 from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.adapters.review_round_archive_audit import _current_execution
-from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
+from issue_agent.adapters.workflow_codec import (
+    MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow,
+)
 from issue_agent.adapters.workflow_rows import (
     WorkflowAuthorityError, review_execution_checkpoint_receipt_id,
 )
 from issue_agent.domain.review_checkpoint_archive import (
     BlockedReviewCheckpointArchiveAudit, CompletedReviewCheckpointArchiveAudit,
     ReviewCheckpointArchiveAwaiting, ReviewCheckpointArchiveSegment,
+    ReviewCheckpointArchivePendingBoundary,
+    ReviewCheckpointArchiveReplaySegment,
+    ReviewCheckpointArchiveStorageAnchor,
     ReviewCheckpointArchiveState, begin_review_checkpoint_archive_scan,
     review_checkpoint_archive_overdue,
 )
@@ -155,7 +161,7 @@ def _advance(store, key, now):
 
 
 def _complete(store, key, now):
-    for _ in range(32):
+    for _ in range(64):
         state = _advance(store, key, now)
         if isinstance(state, (CompletedReviewCheckpointArchiveAudit,
                               BlockedReviewCheckpointArchiveAudit)):
@@ -167,7 +173,7 @@ def _stored(store):
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM level_state "
-            "WHERE namespace='review-checkpoint-archive-scan-v2'",
+            "WHERE namespace='review-checkpoint-archive-scan-v3'",
         ).fetchone()
         assert row is not None
         return decode_workflow(row["payload_json"], ReviewCheckpointArchiveState)
@@ -177,8 +183,8 @@ def test_two_checkpoint_segments_reach_origin_with_exact_streams(active):
     store, key, _, tip = _two_valid_checkpoints(active)
     now = store.now()
     first = _advance(store, key, now)
-    assert isinstance(first, ReviewCheckpointArchiveSegment)
-    assert first.source.receipt_id == tip
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    assert first.segment.source.receipt_id == tip
     result = _complete(store, key, now)
     assert isinstance(result, CompletedReviewCheckpointArchiveAudit)
     assert result.source_count == 2 and result.tip_receipt_id == tip
@@ -189,7 +195,7 @@ def test_two_checkpoint_segments_reach_origin_with_exact_streams(active):
 def test_changed_round_source_blocks_and_persists(active):
     store, key, _, _ = _two_valid_checkpoints(active)
     now = store.now()
-    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveSegment)
+    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveReplaySegment)
     with store.transaction() as db:
         db.execute(
             "UPDATE dedupe_keys SET claimed_at='2026-01-01T00:00:00+00:00' "
@@ -262,8 +268,8 @@ def test_prior_cursor_version_starts_new_application_aware_scan(active):
             (audit_key, encode_workflow(prior), now.isoformat()),
         )
     result = _advance(store, key, now)
-    assert isinstance(result, ReviewCheckpointArchiveSegment)
-    assert result.source.receipt_id == tip
+    assert isinstance(result, ReviewCheckpointArchiveReplaySegment)
+    assert result.segment.source.receipt_id == tip
     assert isinstance(_complete(store, key, now), CompletedReviewCheckpointArchiveAudit)
 
 
@@ -293,6 +299,41 @@ def test_prior_blocked_cursor_remains_a_persisted_blocker(active):
     assert _advance(store, key, now) == result
 
 
+@pytest.mark.parametrize("prior_kind", ("valid", "blocked", "malformed"))
+def test_v2_cursor_migrates_without_losing_prior_discrepancy(active, prior_kind):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    now = store.now()
+    first = _advance(store, key, now)
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    prior = (
+        BlockedReviewCheckpointArchiveAudit(first.segment, "prior discrepancy", now)
+        if prior_kind == "blocked" else first.segment
+    )
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+        ).fetchone()
+        db.execute(
+            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+        )
+        db.execute(
+            "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+            "VALUES ('review-checkpoint-archive-scan-v2','o/r',?,?,?)",
+            (row["key"], "{}" if prior_kind == "malformed" else encode_workflow(prior),
+             now.isoformat()),
+        )
+    resumed = _advance(store, key, now)
+    if prior_kind == "valid":
+        assert isinstance(resumed, ReviewCheckpointArchiveReplaySegment)
+        assert resumed.segment.source.receipt_id == tip
+        assert isinstance(_complete(store, key, now), CompletedReviewCheckpointArchiveAudit)
+    else:
+        assert isinstance(resumed, BlockedReviewCheckpointArchiveAudit)
+        assert "prior checkpoint audit" in resumed.reason
+        assert _stored(store) == resumed
+        assert _advance(store, key, now) == resumed
+
+
 @pytest.mark.parametrize("damage", (
     "none", "source", "frontier", "nested_encoding",
 ))
@@ -300,8 +341,8 @@ def test_prior_segment_is_restarted_only_when_well_formed(active, damage):
     store, key, _, tip = _two_valid_checkpoints(active)
     now = store.now()
     first = _advance(store, key, now)
-    assert isinstance(first, ReviewCheckpointArchiveSegment)
-    encoded = json.loads(encode_workflow(first))
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    encoded = json.loads(encode_workflow(first.segment))
     fields = encoded["value"]["fields"]
     del fields["application"]
     del fields["application_source_sha256"]
@@ -320,10 +361,10 @@ def test_prior_segment_is_restarted_only_when_well_formed(active, damage):
     )
     with store.transaction() as db:
         row = db.execute(
-            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v2'",
+            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
         ).fetchone()
         db.execute(
-            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v2'",
+            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
         )
         db.execute(
             "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
@@ -335,14 +376,14 @@ def test_prior_segment_is_restarted_only_when_well_formed(active, damage):
         assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
         assert "prior checkpoint audit cursor is malformed" in result.reason
     else:
-        assert isinstance(result, ReviewCheckpointArchiveSegment)
-        assert result.source.receipt_id == tip
+        assert isinstance(result, ReviewCheckpointArchiveReplaySegment)
+        assert result.segment.source.receipt_id == tip
 
 
 def test_changed_application_source_blocks_segment_resume(active):
     store, key, _, tip = _two_valid_checkpoints(active)
     now = store.now()
-    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveSegment)
+    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveReplaySegment)
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND key=?",
@@ -494,7 +535,7 @@ def test_checkpoint_state_replay_blocks_changed_archived_outcome(active):
 def test_changed_selected_following_source_blocks_segment_resume(rig):
     store, key, manifest = _real_selected_checkpoint(rig)
     now = store.now()
-    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveSegment)
+    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveReplaySegment)
     assert manifest.plan.remaining_boundaries
     assert isinstance(manifest.application.tail, ApplyCheckpointTailByFollowingBoundary)
     with store.transaction() as db:
@@ -575,8 +616,10 @@ def test_new_tip_retains_prior_completed_chain_as_baseline(active):
 def test_missing_predecessor_blocks_on_its_page(active):
     store, key, first_id, _ = _two_valid_checkpoints(active)
     now = store.now()
-    for _ in range(3):
+    for _ in range(8):
         state = _advance(store, key, now)
+        if isinstance(state, ReviewCheckpointArchiveAwaiting):
+            break
     assert isinstance(state, ReviewCheckpointArchiveAwaiting)
     with store.transaction() as db:
         db.execute("DELETE FROM dedupe_keys WHERE key=?", (first_id,))
@@ -585,7 +628,7 @@ def test_missing_predecessor_blocks_on_its_page(active):
     assert _stored(store) == result
 
 
-def test_generation_and_round_segment_match_real_initial_checkpoint(rig):
+def _generation_checkpoint(rig):
     store = _accepted_generation(rig)
     key = rig[1].revision.fence.key
     with store.transaction() as db:
@@ -608,12 +651,109 @@ def test_generation_and_round_segment_match_real_initial_checkpoint(rig):
             "UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='pr'",
             (encode_workflow(updated),),
         )
+    return store, key, receipt_id, manifest
+
+
+def test_generation_and_round_segment_match_real_initial_checkpoint(rig):
+    store, key, receipt_id, manifest = _generation_checkpoint(rig)
     with store.transaction() as db:
         observed = observe_review_checkpoint_state_replay(db, key, receipt_id)
         assert observed.checkpoint == manifest.plan.checkpoint
+    first = _advance(store, key, store.now())
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    pending = _advance(store, key, store.now())
+    assert isinstance(pending, ReviewCheckpointArchiveReplaySegment)
+    assert isinstance(pending.replay, ReviewCheckpointArchivePendingBoundary)
+    encoded = encode_workflow(pending)
+    assert len(encoded.encode()) <= MAX_WORKFLOW_PAYLOAD_BYTES
+    assert "ReviewExecutionGenerationBoundary" not in encoded
     result = _complete(store, key, store.now())
     assert isinstance(result, CompletedReviewCheckpointArchiveAudit)
     assert result.source_count == 1
+
+
+def test_pending_generation_source_change_blocks_resume(rig):
+    store, key, _, _ = _generation_checkpoint(rig)
+    _advance(store, key, store.now())
+    pending = _advance(store, key, store.now())
+    assert isinstance(pending, ReviewCheckpointArchiveReplaySegment)
+    assert isinstance(pending.replay, ReviewCheckpointArchivePendingBoundary)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-01-01T00:00:00+00:00' "
+            "WHERE namespace=? AND key=?",
+            (pending.replay.source.accepted_namespace, pending.replay.source.accepted_key),
+        )
+    result = _advance(store, key, store.now())
+    assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
+    assert "pending generation source changed" in result.reason
+    assert _stored(store) == result
+
+
+@pytest.mark.parametrize("phase", ("first_page", "resume"))
+def test_cursor_storage_excess_persists_a_bounded_blocker(active, monkeypatch, phase):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    first = _advance(store, key, now)
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    anchor = ReviewCheckpointArchiveStorageAnchor(
+        first.segment.parent.cursor.tip_receipt_id,
+        first.segment.parent.origin_source_sha256,
+    )
+    compact_blocker = BlockedReviewCheckpointArchiveAudit(
+        anchor, "checkpoint archive audit cursor exceeds its storage bound", now,
+    )
+    limit = len(encode_workflow(compact_blocker).encode()) + 32
+    assert len(encode_workflow(first).encode()) > limit
+    if phase == "first_page":
+        with store.transaction() as db:
+            db.execute(
+                "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+            )
+    original = archive_audit.encode_workflow
+
+    def bounded(value):
+        encoded = original(value)
+        if (phase == "first_page" or value != first) and len(encoded.encode()) > limit:
+            raise WorkflowEncodingError("workflow payload is too large")
+        return encoded
+
+    monkeypatch.setattr(archive_audit, "encode_workflow", bounded)
+    blocked = _advance(store, key, now)
+    assert isinstance(blocked, BlockedReviewCheckpointArchiveAudit)
+    assert blocked.prior == anchor
+    assert "storage bound" in blocked.reason
+    assert _stored(store) == blocked
+    assert _advance(store, key, now) == blocked
+
+
+def test_prior_discrepancy_storage_excess_persists_anchor(active, monkeypatch):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    with store.transaction() as db:
+        execution = _current_execution(db, key)
+        audit_key = _audit_key(
+            key, execution.binding.execution_epoch, execution.binding.execution_episode,
+        )
+        db.execute(
+            "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+            "VALUES ('review-checkpoint-archive-scan-v2','o/r',?,'{}',?)",
+            (audit_key, now.isoformat()),
+        )
+    original = archive_audit.encode_workflow
+
+    def bounded(value):
+        if (isinstance(value, BlockedReviewCheckpointArchiveAudit)
+                and isinstance(value.prior, ReviewCheckpointArchiveAwaiting)):
+            raise WorkflowEncodingError("workflow payload is too large")
+        return original(value)
+
+    monkeypatch.setattr(archive_audit, "encode_workflow", bounded)
+    blocked = _advance(store, key, now)
+    assert isinstance(blocked, BlockedReviewCheckpointArchiveAudit)
+    assert isinstance(blocked.prior, ReviewCheckpointArchiveStorageAnchor)
+    assert "storage bound" in blocked.reason
+    assert _stored(store) == blocked
 
 
 def test_malformed_persisted_cursor_refuses_resume(active):
@@ -623,7 +763,7 @@ def test_malformed_persisted_cursor_refuses_resume(active):
     with store.transaction() as db:
         db.execute(
             "UPDATE level_state SET payload_json='{}' "
-            "WHERE namespace='review-checkpoint-archive-scan-v2'",
+            "WHERE namespace='review-checkpoint-archive-scan-v3'",
         )
     with store.transaction() as db:
         with pytest.raises(WorkflowAuthorityError, match="malformed"):

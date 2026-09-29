@@ -21,6 +21,7 @@ from ..domain import review_round_archive as round_archive
 from ..domain import review_round_receipt_archive as receipt_archive
 from ..domain import review_checkpoint_chain as checkpoint_chain
 from ..domain import review_checkpoint_archive as checkpoint_archive
+from ..domain import review_checkpoint_stream_replay as checkpoint_replay
 from ..domain import review_checkpoint_application as checkpoint_application
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
@@ -124,11 +125,18 @@ _VALUES = (
     checkpoint_archive.ReviewCheckpointArchiveBaseline,
     checkpoint_archive.ReviewCheckpointArchiveAwaiting,
     checkpoint_archive.ReviewCheckpointArchiveSegment,
+    checkpoint_archive.ReviewCheckpointArchiveReplaySegment,
+    checkpoint_archive.ReviewCheckpointArchivePendingBoundary,
+    checkpoint_archive.ReviewCheckpointArchiveStorageAnchor,
+    checkpoint_replay._CheckpointReplayBetweenBoundaries,
+    checkpoint_replay._CheckpointReplayWithinBoundary,
+    checkpoint_replay._CheckpointReplayTail,
     checkpoint_archive.CompletedReviewCheckpointArchiveAudit,
     checkpoint_archive.BlockedReviewCheckpointArchiveAudit,
     checkpoint_application.ApplyAllCheckpointTailOutcomes,
     checkpoint_application.ApplyCheckpointTailByFollowingBoundary,
     checkpoint_application.ReviewCheckpointApplicationReceipt,
+    checkpoint_application.ReviewCheckpointApplicationProposal,
     rx.ReviewExecutionCheckpoint, rx.ReviewExecutionCompactionRoundSource,
     rx.ReviewExecutionCheckpointReceipt,
     rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,

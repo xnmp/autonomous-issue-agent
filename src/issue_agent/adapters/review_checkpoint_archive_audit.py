@@ -5,15 +5,25 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from dataclasses import replace
 from datetime import datetime
 
 from ..domain.review_checkpoint_archive import (
     BlockedReviewCheckpointArchiveAudit, CompletedReviewCheckpointArchiveAudit,
     MAX_CHECKPOINT_ARCHIVE_DUE_SECONDS, ReviewCheckpointArchiveAwaiting,
     ReviewCheckpointArchiveBaseline, ReviewCheckpointArchiveSegment,
-    ReviewCheckpointArchiveState, advance_review_checkpoint_archive_generation,
+    ReviewCheckpointArchivePendingBoundary, ReviewCheckpointArchiveReplaySegment,
+    ReviewCheckpointArchiveState, ReviewCheckpointArchiveStorageAnchor,
     advance_review_checkpoint_archive_round, begin_review_checkpoint_archive_scan,
-    finish_review_checkpoint_archive_segment, start_review_checkpoint_archive_segment,
+    finish_review_checkpoint_archive_replay_segment,
+    fold_checkpoint_generation_stream, start_review_checkpoint_archive_segment,
+)
+from ..domain.review_checkpoint_stream_replay import (
+    _CheckpointReplayBetweenBoundaries, _CheckpointReplayWithinBoundary,
+    _CheckpointReplayTail, advance_checkpoint_replay_boundary_round,
+    advance_checkpoint_replay_tail_round, begin_checkpoint_stream_replay,
+    finish_checkpoint_replay_boundary, start_checkpoint_replay_boundary,
+    start_checkpoint_replay_tail,
 )
 from ..domain.review_checkpoint_chain import (
     ObservedReviewCheckpointChainSource, ReviewCheckpointChainCursor,
@@ -23,12 +33,13 @@ from ..domain.review_checkpoint_application import (
 )
 from ..domain.review_execution import (
     ReviewExecutionBoundaryCursor,
-    ReviewGenerationArchiveFingerprint,
 )
 from ..domain.workflow_identity import WorkflowKey, validate_workflow_identifier
 from .review_checkpoint_chain import read_review_checkpoint_chain_page
 from .review_checkpoint_application_source import read_review_checkpoint_application_source
-from .review_checkpoint_following_source import read_checkpoint_following_application_source
+from .review_checkpoint_following_source import (
+    checkpoint_following_fingerprint, read_checkpoint_following_application_source,
+)
 from .review_execution_activation import (
     BlockedReviewGenerationArchivePage, ObservedReviewGenerationArchivePage,
     _read_recording_source, read_checkpoint_round_by_sequence,
@@ -38,7 +49,7 @@ from .review_round_archive_audit import _current_execution
 from .review_round_receipt_sweep import read_classified_checkpoint_round_receipt_members
 from .workflow_codec import (
     MAX_WORKFLOW_PAYLOAD_BYTES, _decode, _encode, _unique_object,
-    decode_workflow, encode_workflow,
+    WorkflowEncodingError, decode_workflow, encode_workflow,
 )
 from .workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError,
@@ -46,7 +57,8 @@ from .workflow_rows import (
 )
 
 
-_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v2"
+_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v3"
+_V2_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v2"
 _LEGACY_AUDIT_NAMESPACE = "review-checkpoint-archive-scan"
 _LEGACY_SEGMENT_FIELDS = frozenset((
     "parent", "source", "next_cursor", "next_round_sequence", "next_generation",
@@ -67,6 +79,7 @@ def _audit_key(key: WorkflowKey, epoch: int, episode: str) -> str:
 
 def _read_state(
     db: sqlite3.Connection, repository: str, audit_key: str,
+    namespace: str = _AUDIT_NAMESPACE,
 ) -> tuple[int | None, ReviewCheckpointArchiveState | None]:
     rows = db.execute(
         "SELECT rowid,typeof(namespace) AS namespace_type,typeof(scope) AS scope_type,"
@@ -74,7 +87,7 @@ def _read_state(
         "length(CAST(payload_json AS BLOB)) AS payload_bytes "
         "FROM level_state WHERE namespace IN (?,CAST(? AS BLOB)) "
         "AND scope IN (?,CAST(? AS BLOB)) AND key IN (?,CAST(? AS BLOB)) LIMIT 2",
-        (_AUDIT_NAMESPACE, _AUDIT_NAMESPACE, repository, repository, audit_key, audit_key),
+        (namespace, namespace, repository, repository, audit_key, audit_key),
     ).fetchall()
     if not rows:
         return None, None
@@ -86,7 +99,7 @@ def _read_state(
     row = db.execute(
         "SELECT payload_json FROM level_state WHERE rowid=? AND namespace=? AND scope=? "
         "AND key=? AND length(CAST(payload_json AS BLOB))<=?",
-        (rows[0]["rowid"], _AUDIT_NAMESPACE, repository, audit_key, MAX_WORKFLOW_PAYLOAD_BYTES),
+        (rows[0]["rowid"], namespace, repository, audit_key, MAX_WORKFLOW_PAYLOAD_BYTES),
     ).fetchone()
     if row is None:
         raise WorkflowAuthorityError("checkpoint audit cursor changed during bounded read")
@@ -98,6 +111,18 @@ def _read_state(
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise WorkflowAuthorityError("checkpoint audit cursor is malformed") from exc
     return rows[0]["rowid"], state
+
+
+def _v2_discrepancy(db: sqlite3.Connection, repository: str, audit_key: str) -> str | None:
+    try:
+        _, state = _read_state(db, repository, audit_key, _V2_AUDIT_NAMESPACE)
+    except WorkflowAuthorityError:
+        return "prior checkpoint audit cursor is malformed or unreadable"
+    if isinstance(state, BlockedReviewCheckpointArchiveAudit):
+        return "prior checkpoint audit recorded an unresolved discrepancy"
+    if isinstance(state, ReviewCheckpointArchiveReplaySegment):
+        return "prior checkpoint audit cursor has an invalid version"
+    return None
 
 
 def _legacy_discrepancy(
@@ -219,11 +244,31 @@ def _persist_state(
         raise WorkflowAuthorityError("checkpoint audit cursor changed during update")
 
 
+def _persist_bounded_state(
+    db: sqlite3.Connection, repository: str, audit_key: str, rowid: int | None,
+    state: ReviewCheckpointArchiveState, tip_id: str, origin_digest: str,
+    now: datetime,
+) -> ReviewCheckpointArchiveState:
+    try:
+        _persist_state(db, repository, audit_key, rowid, state, now)
+    except WorkflowEncodingError:
+        # Source and cursor limits differ; the fixed-size anchor also covers
+        # blockers constructed from an already large prior cursor.
+        state = BlockedReviewCheckpointArchiveAudit(
+            ReviewCheckpointArchiveStorageAnchor(tip_id, origin_digest),
+            "checkpoint archive audit cursor exceeds its storage bound", now,
+        )
+        _persist_state(db, repository, audit_key, rowid, state, now)
+    return state
+
+
 def _cursor(state: ReviewCheckpointArchiveState) -> ReviewCheckpointChainCursor | None:
     if isinstance(state, ReviewCheckpointArchiveAwaiting):
         return state.cursor
     if isinstance(state, ReviewCheckpointArchiveSegment):
         return state.parent.cursor
+    if isinstance(state, ReviewCheckpointArchiveReplaySegment):
+        return state.segment.parent.cursor
     return None
 
 
@@ -232,8 +277,12 @@ def _origin_source_sha256(state: ReviewCheckpointArchiveState) -> str:
         return state.origin_source_sha256
     if isinstance(state, ReviewCheckpointArchiveSegment):
         return state.parent.origin_source_sha256
+    if isinstance(state, ReviewCheckpointArchiveReplaySegment):
+        return state.segment.parent.origin_source_sha256
     if isinstance(state, CompletedReviewCheckpointArchiveAudit):
         return state.origin_source_sha256
+    if isinstance(state.prior, ReviewCheckpointArchiveStorageAnchor):
+        return state.prior.origin_source_sha256
     return _origin_source_sha256(state.prior)
 
 
@@ -267,7 +316,10 @@ def advance_review_checkpoint_archive_audit(
     rowid, state = _read_state(db, key.repository, audit_key)
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
         return state
-    legacy_reason = _legacy_discrepancy(db, key.repository, audit_key)
+    if isinstance(state, ReviewCheckpointArchiveSegment):
+        raise WorkflowAuthorityError("checkpoint audit cursor has an invalid version")
+    legacy_reason = (_legacy_discrepancy(db, key.repository, audit_key)
+                     or _v2_discrepancy(db, key.repository, audit_key))
     if legacy_reason is not None:
         if state is None:
             initial = ReviewCheckpointChainCursor(
@@ -278,14 +330,16 @@ def advance_review_checkpoint_archive_audit(
                 initial, origin_digest, now, due_seconds,
             )
         blocked = BlockedReviewCheckpointArchiveAudit(state, legacy_reason, now)
-        _persist_state(db, key.repository, audit_key, rowid, blocked, now)
-        return blocked
+        return _persist_bounded_state(
+            db, key.repository, audit_key, rowid, blocked, tip_id, origin_digest, now,
+        )
     if state is not None and _origin_source_sha256(state) != origin_digest:
         result: ReviewCheckpointArchiveState = BlockedReviewCheckpointArchiveAudit(
             state, "checkpoint origin source changed since audit start", now,
         )
-        _persist_state(db, key.repository, audit_key, rowid, result, now)
-        return result
+        return _persist_bounded_state(
+            db, key.repository, audit_key, rowid, result, tip_id, origin_digest, now,
+        )
     cursor = _cursor(state) if state is not None else None
     if cursor is not None and (
         cursor.tip_receipt_id != tip_id
@@ -295,8 +349,9 @@ def advance_review_checkpoint_archive_audit(
         result = BlockedReviewCheckpointArchiveAudit(
             state, "checkpoint tip changed during audit", now,
         )
-        _persist_state(db, key.repository, audit_key, rowid, result, now)
-        return result
+        return _persist_bounded_state(
+            db, key.repository, audit_key, rowid, result, tip_id, origin_digest, now,
+        )
     if isinstance(state, CompletedReviewCheckpointArchiveAudit):
         if (state.tip_receipt_id == tip_id and state.origin == execution.origin
                 and now < state.next_due_at):
@@ -329,62 +384,124 @@ def advance_review_checkpoint_archive_audit(
                 db, origin.checkpoint.state.binding,
                 execution.binding.rejection.fence.generation, application.application,
             )
-            result = start_review_checkpoint_archive_segment(
+            segment = start_review_checkpoint_archive_segment(
                 state, page, application.recorded, application.source_sha256,
             )
-        elif isinstance(state, ReviewCheckpointArchiveSegment):
-            page = read_review_checkpoint_chain_page(
-                db, key, after=state.parent.cursor, limit=1,
+            result = ReviewCheckpointArchiveReplaySegment(
+                segment, begin_checkpoint_stream_replay(application.application),
             )
-            if page.sources != (state.source,) or page.next_cursor != state.next_cursor:
+        elif isinstance(state, ReviewCheckpointArchiveReplaySegment):
+            segment = state.segment
+            page = read_review_checkpoint_chain_page(
+                db, key, after=segment.parent.cursor, limit=1,
+            )
+            if page.sources != (segment.source,) or page.next_cursor != segment.next_cursor:
                 raise WorkflowAuthorityError("checkpoint segment source changed after its page")
             application = read_review_checkpoint_application_source(
-                db, key.repository, state.source.receipt_id,
+                db, key.repository, segment.source.receipt_id,
             )
-            if (application.checkpoint != state.source.receipt
-                    or application.recorded != state.application
+            if (application.checkpoint != segment.source.receipt
+                    or application.recorded != segment.application
                     or application.application != application_proposal_from_receipt(
-                        state.source.receipt, state.application,
-                    ) or application.source_sha256 != state.application_source_sha256):
+                        segment.source.receipt, segment.application,
+                    ) or application.source_sha256 != segment.application_source_sha256):
                 raise WorkflowAuthorityError("checkpoint application changed after its page")
-            read_checkpoint_following_application_source(
+            following = read_checkpoint_following_application_source(
                 db, origin.checkpoint.state.binding,
                 execution.binding.rejection.fence.generation, application.application,
             )
-            receipt = state.source.receipt
-            if state.next_round_sequence <= receipt.checkpoint.through_sequence:
+            receipt = segment.source.receipt
+            replay = state.replay
+            if isinstance(replay, _CheckpointReplayBetweenBoundaries) and (
+                replay.next_generation
+                <= receipt.checkpoint.state.binding.rejection.fence.generation
+            ):
+                generation = replay.next_generation
+                generation_page = read_review_generation_archive_page(
+                    db, origin.checkpoint.state.binding, generation, generation,
+                    preceding=replay.preceding, limit=1,
+                )
+                if isinstance(generation_page, BlockedReviewGenerationArchivePage):
+                    raise WorkflowAuthorityError(generation_page.reason)
+                if (not isinstance(generation_page, ObservedReviewGenerationArchivePage)
+                        or len(generation_page.sources) != 1):
+                    raise WorkflowAuthorityError("checkpoint generation page omitted its source")
+                source = generation_page.sources[0]
+                fingerprint = checkpoint_following_fingerprint(source)
+                pending = start_checkpoint_replay_boundary(replay, source.boundary)
+                result = ReviewCheckpointArchiveReplaySegment(
+                    replace(segment, generation_stream_sha256=fold_checkpoint_generation_stream(
+                        segment.generation_stream_sha256, generation, fingerprint,
+                    )), ReviewCheckpointArchivePendingBoundary(
+                        pending.progress, fingerprint, source.boundary.through_sequence,
+                    ),
+                )
+            elif isinstance(replay, ReviewCheckpointArchivePendingBoundary):
+                generation_page = read_review_generation_archive_page(
+                    db, origin.checkpoint.state.binding, replay.progress.next_generation,
+                    replay.progress.next_generation, preceding=replay.progress.preceding,
+                    limit=1,
+                )
+                if isinstance(generation_page, BlockedReviewGenerationArchivePage):
+                    raise WorkflowAuthorityError(generation_page.reason)
+                if (not isinstance(generation_page, ObservedReviewGenerationArchivePage)
+                        or len(generation_page.sources) != 1):
+                    raise WorkflowAuthorityError("checkpoint pending generation source is missing")
+                source = generation_page.sources[0]
+                if (checkpoint_following_fingerprint(source) != replay.source
+                        or source.boundary.through_sequence != replay.through_sequence):
+                    raise WorkflowAuthorityError("checkpoint pending generation source changed")
+                pending = _CheckpointReplayWithinBoundary(replay.progress, source.boundary)
+                if pending.progress.next_round_sequence > pending.boundary.through_sequence:
+                    progressed = finish_checkpoint_replay_boundary(pending)
+                    result = ReviewCheckpointArchiveReplaySegment(
+                        replace(segment, next_generation=progressed.next_generation,
+                                preceding=progressed.preceding), progressed,
+                    )
+                else:
+                    observed = read_checkpoint_round_by_sequence(
+                        db, origin.checkpoint.state.binding, segment.next_round_sequence,
+                    )
+                    classified = read_classified_checkpoint_round_receipt_members(
+                        db, observed.source.round,
+                    )
+                    if classified.source.source != observed.source:
+                        raise WorkflowAuthorityError(
+                            "checkpoint round changed during classification"
+                        )
+                    advanced = advance_checkpoint_replay_boundary_round(
+                        pending, observed.outcome,
+                    )
+                    result = ReviewCheckpointArchiveReplaySegment(
+                        advance_review_checkpoint_archive_round(segment, observed.source),
+                        ReviewCheckpointArchivePendingBoundary(
+                            advanced.progress, replay.source, replay.through_sequence,
+                        ),
+                    )
+            elif isinstance(replay, _CheckpointReplayBetweenBoundaries):
+                result = ReviewCheckpointArchiveReplaySegment(
+                    segment, start_checkpoint_replay_tail(
+                        replay, following.boundary if following is not None else None,
+                        checkpoint_following_fingerprint(following)
+                        if following is not None else None,
+                    ),
+                )
+            elif (isinstance(replay, _CheckpointReplayTail)
+                  and replay.progress.next_round_sequence <= receipt.checkpoint.through_sequence):
                 observed = read_checkpoint_round_by_sequence(
-                    db, origin.checkpoint.state.binding, state.next_round_sequence,
+                    db, origin.checkpoint.state.binding, segment.next_round_sequence,
                 )
                 classified = read_classified_checkpoint_round_receipt_members(
                     db, observed.source.round,
                 )
                 if classified.source.source != observed.source:
                     raise WorkflowAuthorityError("checkpoint round changed during classification")
-                result = advance_review_checkpoint_archive_round(state, observed.source)
-            elif (state.next_generation
-                  <= receipt.checkpoint.state.binding.rejection.fence.generation):
-                page = read_review_generation_archive_page(
-                    db, origin.checkpoint.state.binding, state.next_generation,
-                    receipt.checkpoint.state.binding.rejection.fence.generation,
-                    preceding=state.preceding, limit=1,
+                result = ReviewCheckpointArchiveReplaySegment(
+                    advance_review_checkpoint_archive_round(segment, observed.source),
+                    advance_checkpoint_replay_tail_round(replay, observed.outcome),
                 )
-                if isinstance(page, BlockedReviewGenerationArchivePage):
-                    raise WorkflowAuthorityError(page.reason)
-                if (not isinstance(page, ObservedReviewGenerationArchivePage)
-                        or len(page.sources) != 1):
-                    raise WorkflowAuthorityError("checkpoint generation page omitted its source")
-                source = page.sources[0]
-                fingerprint = ReviewGenerationArchiveFingerprint(
-                    ReviewExecutionBoundaryCursor(
-                        source.boundary.receipt_id, source.boundary.to_revision,
-                    ),
-                    source.receipt_digest, source.accepted_namespace,
-                    source.accepted_key, source.accepted_digest,
-                )
-                result = advance_review_checkpoint_archive_generation(state, fingerprint)
             else:
-                result = finish_review_checkpoint_archive_segment(state, now, due_seconds)
+                result = finish_review_checkpoint_archive_replay_segment(state, now, due_seconds)
         else:
             raise WorkflowAuthorityError("checkpoint audit has an invalid persisted phase")
     except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
@@ -392,5 +509,6 @@ def advance_review_checkpoint_archive_audit(
         result = BlockedReviewCheckpointArchiveAudit(
             state, (str(exc) or "checkpoint archived source is unreadable")[:512], now,
         )
-    _persist_state(db, key.repository, audit_key, rowid, result, now)
-    return result
+    return _persist_bounded_state(
+        db, key.repository, audit_key, rowid, result, tip_id, origin_digest, now,
+    )

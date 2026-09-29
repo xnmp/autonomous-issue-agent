@@ -18,6 +18,10 @@ from .review_execution import (
     ReviewExecutionOrigin, ReviewGenerationArchiveFingerprint,
     same_execution_episode,
 )
+from .review_checkpoint_stream_replay import (
+    _CheckpointReplayBetweenBoundaries,
+    _CheckpointReplayTail, finish_checkpoint_stream_replay,
+)
 from .workflow_identity import validate_workflow_identifier
 
 
@@ -136,6 +140,63 @@ class ReviewCheckpointArchiveSegment:
 
 
 @dataclass(frozen=True)
+class ReviewCheckpointArchivePendingBoundary:
+    progress: _CheckpointReplayBetweenBoundaries
+    source: ReviewGenerationArchiveFingerprint
+    through_sequence: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.progress, _CheckpointReplayBetweenBoundaries)
+                or not isinstance(self.source, ReviewGenerationArchiveFingerprint)
+                or self.source.cursor.revision.fence.generation
+                != self.progress.next_generation
+                or self.source.cursor.revision.fence.key
+                != self.progress.state.binding.rejection.fence.key
+                or type(self.through_sequence) is not int
+                or not self.progress.next_round_sequence - 1
+                <= self.through_sequence
+                <= self.progress.application.checkpoint.through_sequence):
+            raise ValueError("checkpoint replay audit requires a bounded pending source")
+
+
+@dataclass(frozen=True)
+class ReviewCheckpointArchiveReplaySegment:
+    segment: ReviewCheckpointArchiveSegment
+    replay: (_CheckpointReplayBetweenBoundaries | ReviewCheckpointArchivePendingBoundary
+             | _CheckpointReplayTail)
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.segment, ReviewCheckpointArchiveSegment):
+            raise ValueError("checkpoint replay audit requires a typed segment")
+        progress = (
+            self.replay.progress
+            if isinstance(self.replay, (ReviewCheckpointArchivePendingBoundary, _CheckpointReplayTail))
+            else self.replay
+        )
+        if (not isinstance(progress, _CheckpointReplayBetweenBoundaries)
+                or progress.application != application_proposal_from_receipt(
+                    self.segment.source.receipt, self.segment.application,
+                )
+                or progress.next_round_sequence != self.segment.next_round_sequence
+                or progress.next_generation != self.segment.next_generation
+                or progress.preceding != self.segment.preceding):
+            raise ValueError("checkpoint replay audit lost its source frontier")
+        previous = self.segment.source.receipt.previous_checkpoint
+        initial_round = previous.through_sequence + 1
+        initial_generation = previous.state.binding.rejection.fence.generation + 1
+        if (progress.next_generation == initial_generation
+                and isinstance(self.replay, _CheckpointReplayBetweenBoundaries)
+                and progress.next_round_sequence != initial_round
+                or (progress.next_round_sequence == initial_round)
+                != (self.segment.round_stream_sha256 == EMPTY_CHECKPOINT_ARCHIVE_SHA256)
+                or (progress.next_generation == initial_generation
+                    and not isinstance(self.replay, ReviewCheckpointArchivePendingBoundary))
+                != (self.segment.generation_stream_sha256
+                    == EMPTY_CHECKPOINT_ARCHIVE_SHA256)):
+            raise ValueError("checkpoint replay audit has inconsistent source progress")
+
+
+@dataclass(frozen=True)
 class CompletedReviewCheckpointArchiveAudit:
     tip_receipt_id: str
     origin: ReviewExecutionOrigin
@@ -160,8 +221,20 @@ class CompletedReviewCheckpointArchiveAudit:
 
 
 @dataclass(frozen=True)
+class ReviewCheckpointArchiveStorageAnchor:
+    tip_receipt_id: str
+    origin_source_sha256: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.tip_receipt_id, "checkpoint audit storage tip")
+        _digest(self.origin_source_sha256, "checkpoint audit storage origin")
+
+
+@dataclass(frozen=True)
 class BlockedReviewCheckpointArchiveAudit:
     prior: (ReviewCheckpointArchiveAwaiting | ReviewCheckpointArchiveSegment
+            | ReviewCheckpointArchiveReplaySegment
+            | ReviewCheckpointArchiveStorageAnchor
             | CompletedReviewCheckpointArchiveAudit)
     reason: str
     detected_at: datetime
@@ -169,6 +242,8 @@ class BlockedReviewCheckpointArchiveAudit:
     def __post_init__(self) -> None:
         if (not isinstance(self.prior, (
             ReviewCheckpointArchiveAwaiting, ReviewCheckpointArchiveSegment,
+            ReviewCheckpointArchiveReplaySegment,
+            ReviewCheckpointArchiveStorageAnchor,
             CompletedReviewCheckpointArchiveAudit,
         )) or not isinstance(self.reason, str) or not 1 <= len(self.reason) <= 512):
             raise ValueError("blocked checkpoint audit requires a discrepancy")
@@ -177,6 +252,7 @@ class BlockedReviewCheckpointArchiveAudit:
 
 ReviewCheckpointArchiveState = (
     ReviewCheckpointArchiveAwaiting | ReviewCheckpointArchiveSegment
+    | ReviewCheckpointArchiveReplaySegment
     | CompletedReviewCheckpointArchiveAudit | BlockedReviewCheckpointArchiveAudit
 )
 
@@ -338,6 +414,17 @@ def finish_review_checkpoint_archive_segment(
     )
 
 
+def finish_review_checkpoint_archive_replay_segment(
+    state: ReviewCheckpointArchiveReplaySegment, now: datetime, due_seconds: int,
+) -> ReviewCheckpointArchiveAwaiting | CompletedReviewCheckpointArchiveAudit | BlockedReviewCheckpointArchiveAudit:
+    if not isinstance(state, ReviewCheckpointArchiveReplaySegment):
+        raise ValueError("checkpoint replay audit requires a typed segment")
+    if not isinstance(state.replay, _CheckpointReplayTail):
+        raise ValueError("checkpoint replay audit has an unfinished source")
+    finish_checkpoint_stream_replay(state.replay)
+    return finish_review_checkpoint_archive_segment(state.segment, now, due_seconds)
+
+
 def review_checkpoint_archive_overdue(state: ReviewCheckpointArchiveState, now: datetime) -> bool:
     _aware(now, "checkpoint audit due check")
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
@@ -346,6 +433,8 @@ def review_checkpoint_archive_overdue(state: ReviewCheckpointArchiveState, now: 
         return now >= state.due_at
     if isinstance(state, ReviewCheckpointArchiveSegment):
         return now >= state.parent.due_at
+    if isinstance(state, ReviewCheckpointArchiveReplaySegment):
+        return now >= state.segment.parent.due_at
     if isinstance(state, CompletedReviewCheckpointArchiveAudit):
         return now >= state.next_due_at
     raise ValueError("checkpoint audit due check requires a typed state")

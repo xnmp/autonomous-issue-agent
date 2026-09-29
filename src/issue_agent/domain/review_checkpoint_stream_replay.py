@@ -2,7 +2,8 @@
 
 The reducer checks projection semantics but cannot prove source membership,
 fingerprints or durable ancestry from caller-supplied objects by itself. Its
-intermediate states are private in-memory values, not persisted audit cursors.
+intermediate states are persisted only inside a versioned archive-audit cursor;
+the adapter must recheck its source anchors when resuming.
 """
 
 from __future__ import annotations
