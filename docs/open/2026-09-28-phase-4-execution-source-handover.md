@@ -784,6 +784,18 @@ the complete audit benchmark.
   found no concrete medium or high issue. The full gate passed: 3,302 domain,
   3,410 adapter and 2,876 app tests, four import contracts and both Pyrefly
   checks. Log: `/tmp/archive-evidence-full-gate.log` (ephemeral).
+- Checkpoint 111 passes the manifest's remaining byte budget into the retired
+  round and generation source readers. Metadata checks now refuse an overbudget
+  row, receipt or accepted transition before fetching its payload. Repeat
+  fetches of the same field are not charged to that retained-field budget. A boundary
+  regression covers the round lookup's combined round ID and outcome payload;
+  Sol found and verified that fix. This bounds those page reads only: the
+  canonical workflow load, origin read and overall peak memory remain outside
+  the budget. The writer and admission gate remain absent. Independent Sol
+  re-review found no remaining medium or high defect. Full `make test` passed:
+  3,302 domain, 3,411 adapter and 2,876 app tests, four import contracts and
+  both Pyrefly checks. Log: `/tmp/checkpoint-source-budget-full-gate.log`
+  (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

@@ -39,7 +39,8 @@ from issue_agent.adapters.review_execution_activation import (
     MatchedLegacyReviewGenerationBoundarySources, UnmatchedLegacyReviewGenerationBoundarySources,
     read_review_generation_archive_page, verify_checkpoint_generation_anchor,
     read_checkpoint_round_row_source, read_checkpoint_round_receipt_source,
-    read_checkpoint_round_receipt_members,
+    read_checkpoint_round_receipt_members, read_checkpoint_round_archive_page,
+    BlockedReviewCheckpointRoundPage,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
     read_review_generation_receipt_sweep_page, read_reconciled_review_generation_receipt_sweep_page,
     ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
@@ -1443,6 +1444,50 @@ def test_checkpoint_manifest_observes_real_round_and_generation_sources(rig):
             observe_review_checkpoint_manifest(
                 db, key, 1, max_source_bytes=observed.source_bytes - 1,
             )
+
+
+def test_checkpoint_source_pages_refuse_exhausted_budget_before_payload_read(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        manifest = observe_review_checkpoint_manifest(db, key, 1)
+        binding = manifest.receipt.previous_checkpoint.state.binding
+        statements = []
+        db.set_trace_callback(statements.append)
+        try:
+            round_page = read_checkpoint_round_archive_page(
+                db, binding, 1, 1, max_source_bytes=1,
+            )
+            generation = binding.rejection.fence.generation + 1
+            generation_page = read_review_generation_archive_page(
+                db, binding, generation, generation, max_source_bytes=1,
+            )
+        finally:
+            db.set_trace_callback(None)
+        assert isinstance(round_page, BlockedReviewCheckpointRoundPage)
+        assert isinstance(generation_page, BlockedReviewGenerationArchivePage)
+        assert not any(
+            "SELECT round_id,outcome_json FROM review_execution_rounds" in statement
+            or " AS raw_" in statement
+            for statement in statements
+        )
+        outcome_bytes = db.execute(
+            "SELECT length(CAST(outcome_json AS BLOB)) FROM review_execution_rounds "
+            "WHERE round_id=?", (manifest.plan.retired_outcomes[0].round.round_id,),
+        ).fetchone()[0]
+        statements.clear()
+        db.set_trace_callback(statements.append)
+        try:
+            boundary_page = read_checkpoint_round_archive_page(
+                db, binding, 1, 1, max_source_bytes=outcome_bytes,
+            )
+        finally:
+            db.set_trace_callback(None)
+        assert isinstance(boundary_page, BlockedReviewCheckpointRoundPage)
+        assert not any(
+            "SELECT round_id,outcome_json FROM review_execution_rounds" in statement
+            for statement in statements
+        )
 
 
 @pytest.mark.parametrize("damage", ("generation_receipt", "accepted_payload"))

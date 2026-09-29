@@ -1234,12 +1234,15 @@ def read_legacy_review_round_page(
 
 def read_checkpoint_round_row_source(
     db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+    *, max_source_bytes: int | None = None,
 ) -> LegacyReviewRoundSource:
     """Point-read one exact indexed round row without scanning retired history."""
     if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
         raise ValueError("checkpoint round source requires an explicit SQL transaction")
     if not isinstance(round_id, ReviewRoundIdentity):
         raise ValueError("checkpoint round source requires a typed round identity")
+    if max_source_bytes is not None and (type(max_source_bytes) is not int or max_source_bytes < 1):
+        raise ValueError("checkpoint round source requires a positive byte budget")
     try:
         aliases = db.execute(
             "SELECT rowid,typeof(round_id) AS round_id_type FROM review_execution_rounds "
@@ -1262,7 +1265,8 @@ def read_checkpoint_round_row_source(
         if (metadata is None or metadata["largest_json"] is None
                 or metadata["largest_json"] > MAX_LEGACY_ROUND_JSON_BYTES
                 or metadata["largest_other"] > MAX_LEGACY_SQL_TEXT_BYTES
-                or metadata["total_bytes"] > MAX_LEGACY_ROUND_PAGE_BYTES):
+                or metadata["total_bytes"] > MAX_LEGACY_ROUND_PAGE_BYTES
+                or (max_source_bytes is not None and metadata["total_bytes"] > max_source_bytes)):
             raise ValueError("checkpoint round row exceeds its bounded source")
         columns = ",".join(
             f"typeof({column}) AS type_{column},CAST({column} AS BLOB) AS raw_{column}"
@@ -1597,11 +1601,17 @@ class ObservedReviewCheckpointRoundReceiptSet:
 
 def _read_checkpoint_round_receipt_observation(
     db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+    *, max_source_bytes: int | None = None,
 ) -> ObservedReviewCheckpointRoundReceiptSet:
     """Observe one finalized round's exact bounded receipt membership and fields."""
-    row = read_checkpoint_round_row_source(db, round_id)
+    row = read_checkpoint_round_row_source(db, round_id, max_source_bytes=max_source_bytes)
     values = dict(row.fields)
     try:
+        row_bytes = sum(
+            len(str(value).encode()) if isinstance(value, int)
+            else len(value.encode("utf-8", "surrogatepass"))
+            for _, value in row.fields if value is not None
+        )
         if values["closure_json"] is None or values["outcome_json"] is None:
             raise ValueError("checkpoint round is not finalized")
         plan = decode_workflow(values["plan_json"], ReviewRoundPlan)
@@ -1676,7 +1686,9 @@ def _read_checkpoint_round_receipt_observation(
         members: list[ObservedReviewCheckpointRoundReceiptMember] = []
         for namespace, source_key in sorted(required):
             size = _recording_source_size(db, namespace, repository, source_key)
-            if size is None or source_bytes + size > MAX_CHECKPOINT_ROUND_RECEIPT_BYTES:
+            if (size is None or source_bytes + size > MAX_CHECKPOINT_ROUND_RECEIPT_BYTES
+                    or (max_source_bytes is not None
+                        and row_bytes + source_bytes + size > max_source_bytes)):
                 raise ValueError("checkpoint round receipt set exceeds its byte bound")
             _, digest = _read_recording_source(db, namespace, repository, source_key)
             source_bytes += size
@@ -1685,11 +1697,6 @@ def _read_checkpoint_round_receipt_observation(
             [(item.namespace, item.key, item.source_sha256) for item in members],
             separators=(",", ":"), ensure_ascii=True,
         ).encode()).hexdigest()
-        row_bytes = sum(
-            len(str(value).encode()) if isinstance(value, int)
-            else len(value.encode("utf-8", "surrogatepass"))
-            for _, value in row.fields if value is not None
-        )
         return ObservedReviewCheckpointRoundReceiptSet(
             ReviewExecutionCompactionRoundSource(round_id, row.source_digest, receipt_digest),
             tuple(members), row_bytes + source_bytes,
@@ -1736,11 +1743,14 @@ class ObservedReviewCheckpointRound:
 
 def read_checkpoint_round_by_sequence(
     db: sqlite3.Connection, binding: ReviewExecutionBinding, sequence: int,
+    *, max_source_bytes: int | None = None,
 ) -> ObservedReviewCheckpointRound:
     """Point-read one allocated sequence before assembling a retired source stream."""
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or not isinstance(binding, ReviewExecutionBinding)
-            or type(sequence) is not int or not 1 <= sequence <= MAX_SQL_ROWID):
+            or type(sequence) is not int or not 1 <= sequence <= MAX_SQL_ROWID
+            or (max_source_bytes is not None
+                and (type(max_source_bytes) is not int or max_source_bytes < 1))):
         raise ValueError("checkpoint round sequence requires a transaction and typed episode")
     repository = binding.rejection.fence.key.repository
     number = binding.rejection.fence.key.target.number
@@ -1767,7 +1777,10 @@ def read_checkpoint_round_by_sequence(
         )) or any(rows[0][f"{field}_type"] != "integer" for field in (
             "number", "epoch", "sequence",
         )) or rows[0]["round_id_bytes"] > MAX_LEGACY_SQL_TEXT_BYTES
-                or rows[0]["outcome_bytes"] > MAX_LEGACY_ROUND_JSON_BYTES):
+                or rows[0]["outcome_bytes"] > MAX_LEGACY_ROUND_JSON_BYTES
+                or (max_source_bytes is not None
+                    and rows[0]["round_id_bytes"] + rows[0]["outcome_bytes"]
+                    > max_source_bytes)):
             raise ValueError("checkpoint round sequence is absent, aliased or oversized")
         row = db.execute(
             "SELECT round_id,outcome_json FROM review_execution_rounds WHERE rowid=? "
@@ -1782,7 +1795,9 @@ def read_checkpoint_round_by_sequence(
         if (outcome.round.round_id != row["round_id"] or outcome.round.sequence != sequence
                 or not same_execution_episode(binding, outcome.round.binding)):
             raise ValueError("checkpoint round outcome has a foreign indexed identity")
-        observation = _read_checkpoint_round_receipt_observation(db, outcome.round)
+        observation = _read_checkpoint_round_receipt_observation(
+            db, outcome.round, max_source_bytes=max_source_bytes,
+        )
         return ObservedReviewCheckpointRound(
             outcome, observation.source, observation.source_bytes,
         )
@@ -1823,18 +1838,30 @@ def read_checkpoint_round_archive_page(
     db: sqlite3.Connection, binding: ReviewExecutionBinding,
     first_sequence: int, through_sequence: int,
     *, limit: int = MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE,
+    max_source_bytes: int | None = None,
 ) -> ObservedReviewCheckpointRoundPage | BlockedReviewCheckpointRoundPage:
     """Read the next small contiguous slice of retained round source identities."""
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or not isinstance(binding, ReviewExecutionBinding)
             or type(first_sequence) is not int or type(through_sequence) is not int
             or not 1 <= first_sequence <= through_sequence <= MAX_SQL_ROWID
-            or type(limit) is not int or not 1 <= limit <= MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE):
+            or type(limit) is not int or not 1 <= limit <= MAX_CHECKPOINT_ROUND_ARCHIVE_PAGE
+            or (max_source_bytes is not None
+                and (type(max_source_bytes) is not int or max_source_bytes < 1))):
         raise ValueError("checkpoint round archive page requires a bounded episode range")
     rounds: list[ObservedReviewCheckpointRound] = []
+    source_bytes = 0
     for sequence in range(first_sequence, min(through_sequence + 1, first_sequence + limit)):
+        if max_source_bytes is not None and source_bytes >= max_source_bytes:
+            return BlockedReviewCheckpointRoundPage(sequence, "checkpoint round page exhausted its byte budget")
         try:
-            rounds.append(read_checkpoint_round_by_sequence(db, binding, sequence))
+            observed = read_checkpoint_round_by_sequence(
+                db, binding, sequence,
+                max_source_bytes=(None if max_source_bytes is None
+                                  else max_source_bytes - source_bytes),
+            )
+            rounds.append(observed)
+            source_bytes += observed.source_bytes
         except WorkflowAuthorityError as exc:
             return BlockedReviewCheckpointRoundPage(sequence, str(exc)[:512])
     next_sequence = first_sequence + len(rounds)
@@ -3553,6 +3580,7 @@ def read_review_generation_archive_page(
     first_generation: int, through_generation: int,
     *, preceding: ReviewExecutionGenerationBoundary | ReviewExecutionBoundaryCursor | None = None,
     limit: int = MAX_GENERATION_ARCHIVE_PAGE,
+    max_source_bytes: int | None = None,
 ) -> ObservedReviewGenerationArchivePage | BlockedReviewGenerationArchivePage:
     """Observe retained transition semantics in expected generation order.
 
@@ -3565,7 +3593,9 @@ def read_review_generation_archive_page(
     if (not isinstance(binding, ReviewExecutionBinding)
             or type(first_generation) is not int or type(through_generation) is not int
             or not 1 <= first_generation <= through_generation <= MAX_SQL_ROWID
-            or type(limit) is not int or not 1 <= limit <= MAX_GENERATION_ARCHIVE_PAGE):
+            or type(limit) is not int or not 1 <= limit <= MAX_GENERATION_ARCHIVE_PAGE
+            or (max_source_bytes is not None
+                and (type(max_source_bytes) is not int or max_source_bytes < 1))):
         raise ValueError("generation archive page requires a bounded episode range")
     if isinstance(preceding, ReviewExecutionGenerationBoundary):
         if not same_execution_episode(binding, preceding.before.binding):
@@ -3590,6 +3620,9 @@ def read_review_generation_archive_page(
     repository = binding.rejection.fence.key.repository
     sources: list[ObservedReviewGenerationArchiveSource] = []
     bytes_read = 0
+    page_bytes = min(MAX_GENERATION_ARCHIVE_PAGE_BYTES, max_source_bytes) if (
+        max_source_bytes is not None
+    ) else MAX_GENERATION_ARCHIVE_PAGE_BYTES
     stop = min(through_generation + 1, first_generation + limit)
     for generation in range(first_generation, stop):
         try:
@@ -3597,8 +3630,8 @@ def read_review_generation_archive_page(
             receipt_size = _recording_source_size(db, "review-execution-generation", repository, receipt_id)
             if receipt_size is None:
                 raise ValueError("generation receipt is absent")
-            if bytes_read + receipt_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES:
-                if sources:
+            if bytes_read + receipt_size > page_bytes:
+                if sources and bytes_read + receipt_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES:
                     break
                 raise ValueError("generation receipt exceeds the archive page byte bound")
             receipt_fields, receipt_digest = _read_recording_source(
@@ -3619,8 +3652,8 @@ def read_review_generation_archive_page(
             accepted_size = _recording_source_size(db, namespace, repository, key)
             if accepted_size is None:
                 raise ValueError("accepted generation transition is absent")
-            if bytes_read + receipt_size + accepted_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES:
-                if sources:
+            if bytes_read + receipt_size + accepted_size > page_bytes:
+                if sources and bytes_read + receipt_size + accepted_size > MAX_GENERATION_ARCHIVE_PAGE_BYTES:
                     break
                 raise ValueError("generation source pair exceeds the archive page byte bound")
             accepted_fields, accepted_digest = _read_recording_source(db, namespace, repository, key)

@@ -9,9 +9,11 @@ pair, and the final retired round row and receipt set, but refuses every
 compacted component until complete archive membership and the audit gate
 can be verified.
 The transaction-local manifest observer now reconstructs expected retired
-round and generation streams and a candidate receipt. Its retained-field byte
-limit is an accounting ceiling after source reads, not a canonical-load or
-peak-memory bound. It neither surveys unclaimed archive rows nor certifies
+round and generation streams and a candidate receipt. Its remaining byte
+budget is passed into retired round and generation page readers before payload
+fetch. Repeated reads of the same retained field, the canonical load and origin
+read are still outside that bound, and the budget is not a peak-memory guarantee.
+It neither surveys unclaimed archive rows nor certifies
 every retired receipt payload, so it cannot authorize a checkpoint write.
 Production import and renewal writers, the checkpoint writer, bounded
 compacted hot reads and the complete audit remain pending. A durable offline

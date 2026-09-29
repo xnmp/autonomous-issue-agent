@@ -29,8 +29,9 @@ the separate durable repository sweep accounts for unclaimed rows
 observationally.
 A read-only transaction-local manifest observer now joins expected retired
 round and generation sources to a canonical prefix replay and proposes a
-typed checkpoint receipt. Its byte ceiling accounts for retained fields after
-reads; the writer still needs a true cumulative read bound, an unclaimed-row
+typed checkpoint receipt. Retired round and generation pages now apply its
+remaining byte budget before payload reads; the writer still needs a bound
+around the canonical load and origin, an unclaimed-row
 and receipt census, payload audit and atomic audit gate.
 Schema v26 now supplies an indexed, read-only repository round sweep page
 that checks row and finalized-payload identities before selecting an episode.

@@ -117,8 +117,9 @@ def observe_review_checkpoint_manifest(
 
     A writer must still census unclaimed rows and receipts, verify every
     retired receipt's semantic payload, and publish an audit gate atomically.
-    The source-byte ceiling accounts for retained fields after bounded readers
-    return; it does not bound the canonical loader's reads or peak memory.
+    The retained-field ceiling is passed to retired round and generation page
+    readers before each payload fetch. It does not count repeat fetches or
+    bound the canonical loader, origin read, or peak memory.
     """
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or not isinstance(key, WorkflowKey)
@@ -138,8 +139,11 @@ def observe_review_checkpoint_manifest(
         round_sources = []
         next_sequence = execution.checkpoint.through_sequence + 1
         while next_sequence <= through_sequence:
+            if source_bytes >= max_source_bytes:
+                raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
             page = read_checkpoint_round_archive_page(
                 db, origin_binding, next_sequence, through_sequence,
+                max_source_bytes=max_source_bytes - source_bytes,
             )
             if isinstance(page, BlockedReviewCheckpointRoundPage):
                 raise WorkflowAuthorityError(
@@ -165,8 +169,11 @@ def observe_review_checkpoint_manifest(
         through_generation = plan.checkpoint.state.binding.rejection.fence.generation
         preceding = execution.checkpoint.boundary_cursor
         while next_generation <= through_generation:
+            if source_bytes >= max_source_bytes:
+                raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
             page = read_review_generation_archive_page(
                 db, origin_binding, next_generation, through_generation, preceding=preceding,
+                max_source_bytes=max_source_bytes - source_bytes,
             )
             if isinstance(page, BlockedReviewGenerationArchivePage):
                 raise WorkflowAuthorityError(
@@ -198,11 +205,17 @@ def observe_review_checkpoint_manifest(
             raise WorkflowAuthorityError("checkpoint manifest retired generations changed their replay")
         following_source = None
         if plan.remaining_boundaries:
+            if source_bytes >= max_source_bytes:
+                raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
             next_generation = plan.checkpoint.state.binding.rejection.fence.generation + 1
             following_page = read_review_generation_archive_page(
                 db, origin_binding, next_generation, next_generation,
                 preceding=plan.checkpoint.boundary_cursor, limit=1,
+                max_source_bytes=max_source_bytes - source_bytes,
             )
+            if (isinstance(following_page, BlockedReviewGenerationArchivePage)
+                    and "byte bound" in following_page.reason):
+                raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
             if (isinstance(following_page, BlockedReviewGenerationArchivePage)
                     or not isinstance(following_page, ObservedReviewGenerationArchivePage)
                     or len(following_page.sources) != 1
