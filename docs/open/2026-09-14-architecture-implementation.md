@@ -497,10 +497,11 @@ also makes witness overflow abort under SQLite conflict policies such as
 `OR IGNORE`, closing a mutation-without-revision bypass across all source
 groups. Phase 4 is still in progress; no production import or admission gate
 uses this lineage yet.
-The lifecycle command stream now has a fixed-size global rowid page that
-retains selected review submissions and their joined effect fields. Its
-captured source revision can support a resumable lineage census, but the page
-does not establish effect-receipt membership or archive authority by itself.
+The lifecycle command and effect streams now have separate fixed-size global
+rowid pages. They retain selected review submissions and receipts, block
+orphaned effects, and carry the same mutation revision. A resumable cursor
+must reconcile both streams before they can establish effect-receipt
+membership or archive authority.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched

@@ -1021,6 +1021,28 @@ the complete audit benchmark.
   four import contracts and both Pyrefly checks. Log:
   `/tmp/review-lifecycle-global-page-gate.log` (ephemeral). The four paused
   services remained inactive.
+- Checkpoint 126 adds an independent global `effect_receipts` rowid page under
+  the same schema v31 lifecycle revision. It processes at most 64 effect rows
+  plus one continuation probe per call, including unrelated, negative and zero
+  rowids. Each row first preflights its command identity, then uses an indexed
+  parent lookup. Non-TEXT, invalid UTF-8 or oversized identities and orphaned
+  effects block, including rows written with foreign keys disabled. A selected
+  effect returns its exact receipt fields, receipt and command rowids, and
+  canonical repository; selected parent BLOB aliases and malformed or oversized
+  receipt fields block before the payload read. Pages split at an 8 MiB retained
+  source budget, and an empty selected page still advances. A pure source
+  digest binds its rowids, repository and receipt fields. The SQLite 3.43+
+  metadata read avoids materializing oversized fields; the older fallback
+  retains the weaker read behavior documented at checkpoint 125. Independent
+  Sol review found the invalid UTF-8 identity gap in the initial code, verified
+  the typed blocker after its fix, and found no remaining medium/high issue.
+  Full `make test` passed: 3,302 domain, 3,567 adapter and 2,876 app tests,
+  hooks, governor, four import contracts and both Pyrefly checks. Log:
+  `/tmp/review-lifecycle-effect-page-gate.log` (ephemeral). The four paused
+  services remained inactive.
+  These are still separate observations: a durable cursor must reconcile the
+  command and effect member sets under one unchanged lifecycle revision before
+  lineage can contribute to archive or admission authority.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
