@@ -1138,6 +1138,24 @@ expected-source proof and settlement provenance are present.
   `/tmp/review-lifecycle-registration-page-gate.log` (ephemeral). The four
   paused services remained inactive.
 
+- Checkpoint 131 adds a transaction-local, bounded link from one registered
+  review submission to its lifecycle command and round plan. It rechecks the
+  registration rowid and digest, round index, preflight, indexed round row,
+  stage receipts, command payload and any effect digest and paid attempt.
+  Paid submissions require a planned stage; copied submissions followed by
+  paid stages require a definitive failed attempt. The byte charge includes
+  SQLite's full decimal representation of round-row integers. Regressions
+  cover real copied and paid sources, changed and replaced registrations,
+  missing or changed commands, altered indexes, missing stages, forged effects
+  and exact byte limits. Independent Sol review found no remaining medium or
+  high issue in this observational link. It does not match the complete
+  registration set against the global lifecycle census; an unregistered
+  historical command can still exist. The durable matching cursor and
+  settlement proof remain open. Full `make test` passed: 3,302 domain, 3,604
+  adapter and 2,876 app tests, hooks, governor, four import contracts and both
+  Pyrefly checks. Ten strict xfails remained expected. Log:
+  `/tmp/phase4-registration-link-gate.log` (ephemeral).
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round

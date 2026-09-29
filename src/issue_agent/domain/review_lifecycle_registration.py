@@ -2,7 +2,10 @@
 
 from dataclasses import dataclass
 
-from .review_execution_activation import MAX_SQL_ROWID, MIN_SQL_ROWID
+from .review_execution_activation import (
+    MAX_SQL_ROWID, MIN_SQL_ROWID, LegacyReviewRoundSource,
+    LegacyReviewSubmissionSource,
+)
 from .review_lifecycle_archive import (
     MAX_REVIEW_LIFECYCLE_PAGE_BYTES, _validate_page_progress,
 )
@@ -27,6 +30,38 @@ class ReviewLifecycleRegistrationSource:
                 or type(self.source_bytes) is not int
                 or not 1 <= self.source_bytes <= MAX_REVIEW_LIFECYCLE_PAGE_BYTES):
             raise ValueError("registration source requires a bounded identity and digest")
+
+
+@dataclass(frozen=True)
+class LinkedReviewLifecycleRegistration:
+    registration_source: ReviewLifecycleRegistrationSource
+    command_source: LegacyReviewSubmissionSource
+    round_source: LegacyReviewRoundSource
+    index_source_sha256: str
+    preflight_source_sha256: str
+    stage_source_sha256: str
+    source_bytes: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.registration_source, ReviewLifecycleRegistrationSource)
+                or not isinstance(self.command_source, LegacyReviewSubmissionSource)
+                or not isinstance(self.round_source, LegacyReviewRoundSource)
+                or type(self.source_bytes) is not int
+                or not 1 <= self.source_bytes <= MAX_REVIEW_LIFECYCLE_PAGE_BYTES):
+            raise ValueError("registration link requires bounded typed sources")
+        for digest in (self.index_source_sha256, self.preflight_source_sha256,
+                       self.stage_source_sha256):
+            if (not isinstance(digest, str) or len(digest) != 64
+                    or any(char not in "0123456789abcdef" for char in digest)):
+                raise ValueError("registration link requires recorded-source digests")
+        registration = self.registration_source.registration
+        command = dict(self.command_source.command_fields)
+        round_row = dict(self.round_source.fields)
+        if (command["command_id"] != registration.submission.command_id
+                or command["repository"]
+                != registration.round.binding.rejection.fence.key.repository
+                or round_row["round_id"] != registration.round.round_id):
+            raise ValueError("registration link disagrees on command or round identity")
 
 
 @dataclass(frozen=True)

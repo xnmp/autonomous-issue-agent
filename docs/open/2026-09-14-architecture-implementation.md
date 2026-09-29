@@ -516,8 +516,11 @@ execution or an unreadable source. The join requires that pass to be current.
 This bootstrap observation also has no production write or admission authority.
 A bounded global registration page now exposes canonical review submission
 registrations under the round-receipt mutation revision. It is an input to a
-future expected-command census; it does not yet link registrations to command
-and round sources or close the unregistered-command gap.
+future expected-command census. A bounded transaction-local link now rechecks
+each registration's rowid and payload against its round index, preflight,
+round plan, planned stage receipts, lifecycle command and any effect receipt.
+This link is observational: it does not establish complete expected-command
+membership or close the unregistered-command gap.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched
