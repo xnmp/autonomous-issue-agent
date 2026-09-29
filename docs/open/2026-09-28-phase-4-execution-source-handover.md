@@ -950,6 +950,22 @@ the complete audit benchmark.
   `/tmp/review-generation-archive-versioned-gate.log` (ephemeral). The four
   paused services remained inactive. Workflow/component, checkpoint, origin
   and admission freshness remain open.
+- Checkpoint 122 adds schema v30 mutation witnesses for the three checkpoint
+  receipt namespaces (`review-execution-origin`, `review-execution-checkpoint`
+  and `review-checkpoint-application`) and all `workflows` and
+  `workflow_components` rows. These global revisions cover foreign scopes and
+  rekeys as well as the indexed execution row. Checkpoint receipt triggers
+  reject implicit rowid replacement that would skip SQLite's DELETE trigger;
+  the `-1` rowid sentinel advances conservatively. Workflow/component INSERT,
+  UPDATE and DELETE advance their shared revision. Migration from v29,
+  rollback, BLOB namespace aliases, missing/overflowed witnesses and
+  replacement paths have behavioral regressions. Independent Sol review found
+  no trigger or migration bypass. Full `make test` passed: 3,302 domain, 3,506
+  adapter and 2,876 app tests, hooks, governor, four import contracts and both
+  Pyrefly checks. Log: `/tmp/review-checkpoint-workflow-witness-gate.log`
+  (ephemeral). The four paused services remained inactive. The new revisions
+  are observational until the paged checkpoint audit and read-only join
+  capture and compare them.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

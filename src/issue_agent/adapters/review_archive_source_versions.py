@@ -19,6 +19,8 @@ class ReviewArchiveSourceVersions:
     all_round_rows: int
     round_receipts: int
     generation_sources: int
+    checkpoint_sources: int
+    workflow_rows: int
 
     def __post_init__(self) -> None:
         if (canonical_workflow_repository(self.repository) != self.repository
@@ -29,7 +31,11 @@ class ReviewArchiveSourceVersions:
                 or type(self.round_receipts) is not int
                 or not 0 <= self.round_receipts <= MAX_ARCHIVE_SOURCE_VERSION
                 or type(self.generation_sources) is not int
-                or not 0 <= self.generation_sources <= MAX_ARCHIVE_SOURCE_VERSION):
+                or not 0 <= self.generation_sources <= MAX_ARCHIVE_SOURCE_VERSION
+                or type(self.checkpoint_sources) is not int
+                or not 0 <= self.checkpoint_sources <= MAX_ARCHIVE_SOURCE_VERSION
+                or type(self.workflow_rows) is not int
+                or not 0 <= self.workflow_rows <= MAX_ARCHIVE_SOURCE_VERSION):
             raise ValueError("archive source versions require canonical bounded witnesses")
 
 
@@ -65,12 +71,18 @@ def read_review_archive_source_versions(
     all_round_rows = _read_version(db, "all_round_rows", b"")
     round_receipts = _read_version(db, "round_receipts", b"")
     generation_sources = _read_version(db, "generation_sources", b"")
+    checkpoint_sources = _read_version(db, "checkpoint_sources", b"")
+    workflow_rows = _read_version(db, "workflow_rows", b"")
     if all_round_rows is None:
         raise WorkflowAuthorityError("global round row mutation witness is absent")
     if round_receipts is None:
         raise WorkflowAuthorityError("round receipt mutation witness is absent")
     if generation_sources is None:
         raise WorkflowAuthorityError("generation source mutation witness is absent")
+    if checkpoint_sources is None:
+        raise WorkflowAuthorityError("checkpoint source mutation witness is absent")
+    if workflow_rows is None:
+        raise WorkflowAuthorityError("workflow row mutation witness is absent")
     if round_rows is None:
         existing = db.execute(
             "SELECT 1 FROM review_execution_rounds INDEXED BY review_execution_rounds_repository "
@@ -86,4 +98,5 @@ def read_review_archive_source_versions(
         round_rows = 0
     return ReviewArchiveSourceVersions(
         repository, round_rows, all_round_rows, round_receipts, generation_sources,
+        checkpoint_sources, workflow_rows,
     )

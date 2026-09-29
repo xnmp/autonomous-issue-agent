@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 29
+SCHEMA_VERSION = 30
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1893,6 +1893,159 @@ BEGIN
     );
     UPDATE review_archive_source_versions SET version=version+1
     WHERE source='generation_sources' AND scope=X'';
+END;
+"""),
+    SchemaMigration(30, """
+INSERT INTO review_archive_source_versions(source,scope,version)
+VALUES ('checkpoint_sources',X'',0),('workflow_rows',X'',0);
+CREATE TRIGGER review_checkpoint_source_no_replace_insert BEFORE INSERT ON dedupe_keys
+WHEN NEW.rowid IS NOT -1 AND EXISTS (
+    SELECT 1 FROM dedupe_keys WHERE rowid=NEW.rowid AND CAST(namespace AS BLOB) IN (
+        CAST('review-execution-origin' AS BLOB),
+        CAST('review-execution-checkpoint' AS BLOB),
+        CAST('review-checkpoint-application' AS BLOB)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT,'checkpoint source replacement would hide a mutation');
+END;
+-- An automatic INSERT exposes NEW.rowid=-1 before SQLite allocates its rowid.
+CREATE TRIGGER review_checkpoint_source_minus_one_insert BEFORE INSERT ON dedupe_keys
+WHEN NEW.rowid=-1 AND EXISTS (
+    SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND CAST(namespace AS BLOB) IN (
+        CAST('review-execution-origin' AS BLOB),
+        CAST('review-execution-checkpoint' AS BLOB),
+        CAST('review-checkpoint-application' AS BLOB)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT,'checkpoint source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='checkpoint_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='checkpoint_sources' AND scope=X'';
+END;
+CREATE TRIGGER review_checkpoint_source_no_replace_update BEFORE UPDATE ON dedupe_keys
+WHEN NEW.rowid IS NOT OLD.rowid AND EXISTS (
+    SELECT 1 FROM dedupe_keys WHERE rowid=NEW.rowid AND CAST(namespace AS BLOB) IN (
+        CAST('review-execution-origin' AS BLOB),
+        CAST('review-execution-checkpoint' AS BLOB),
+        CAST('review-checkpoint-application' AS BLOB)
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT,'checkpoint source replacement would hide a mutation');
+END;
+CREATE TRIGGER review_checkpoint_source_insert AFTER INSERT ON dedupe_keys
+WHEN CAST(NEW.namespace AS BLOB) IN (
+    CAST('review-execution-origin' AS BLOB),
+    CAST('review-execution-checkpoint' AS BLOB),
+    CAST('review-checkpoint-application' AS BLOB)
+)
+BEGIN
+    SELECT RAISE(ABORT,'checkpoint source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='checkpoint_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='checkpoint_sources' AND scope=X'';
+END;
+CREATE TRIGGER review_checkpoint_source_update AFTER UPDATE ON dedupe_keys
+WHEN CAST(OLD.namespace AS BLOB) IN (
+    CAST('review-execution-origin' AS BLOB),
+    CAST('review-execution-checkpoint' AS BLOB),
+    CAST('review-checkpoint-application' AS BLOB)
+) OR CAST(NEW.namespace AS BLOB) IN (
+    CAST('review-execution-origin' AS BLOB),
+    CAST('review-execution-checkpoint' AS BLOB),
+    CAST('review-checkpoint-application' AS BLOB)
+)
+BEGIN
+    SELECT RAISE(ABORT,'checkpoint source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='checkpoint_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='checkpoint_sources' AND scope=X'';
+END;
+CREATE TRIGGER review_checkpoint_source_delete AFTER DELETE ON dedupe_keys
+WHEN CAST(OLD.namespace AS BLOB) IN (
+    CAST('review-execution-origin' AS BLOB),
+    CAST('review-execution-checkpoint' AS BLOB),
+    CAST('review-checkpoint-application' AS BLOB)
+)
+BEGIN
+    SELECT RAISE(ABORT,'checkpoint source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='checkpoint_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='checkpoint_sources' AND scope=X'';
+END;
+CREATE TRIGGER review_workflow_source_insert AFTER INSERT ON workflows
+BEGIN
+    SELECT RAISE(ABORT,'workflow source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='workflow_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='workflow_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_workflow_source_update AFTER UPDATE ON workflows
+BEGIN
+    SELECT RAISE(ABORT,'workflow source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='workflow_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='workflow_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_workflow_source_delete AFTER DELETE ON workflows
+BEGIN
+    SELECT RAISE(ABORT,'workflow source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='workflow_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='workflow_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_component_source_insert AFTER INSERT ON workflow_components
+BEGIN
+    SELECT RAISE(ABORT,'workflow source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='workflow_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='workflow_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_component_source_update AFTER UPDATE ON workflow_components
+BEGIN
+    SELECT RAISE(ABORT,'workflow source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='workflow_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='workflow_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_component_source_delete AFTER DELETE ON workflow_components
+BEGIN
+    SELECT RAISE(ABORT,'workflow source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='workflow_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='workflow_rows' AND scope=X'';
 END;
 """),
 )

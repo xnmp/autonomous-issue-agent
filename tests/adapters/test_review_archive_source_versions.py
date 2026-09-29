@@ -489,6 +489,199 @@ def test_archive_witness_handles_automatic_insert_with_negative_source_rowid(
         ).fetchone() is None
 
 
+def test_checkpoint_witness_covers_origin_checkpoint_and_application_sources(active):
+    store, _ = active
+    with store.transaction() as db:
+        before = read_review_archive_source_versions(db, "o/r")
+        for namespace, key in (
+            ("review-execution-origin", "origin:fixture"),
+            ("review-execution-checkpoint", "checkpoint:fixture"),
+            ("review-checkpoint-application", "application:fixture"),
+        ):
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,?,?,'2026-09-29T00:00:00+00:00','{}')",
+                (namespace, "other/repo", key),
+            )
+        inserted = read_review_archive_source_versions(db, "o/r")
+        assert inserted.checkpoint_sources == before.checkpoint_sources + 3
+        assert inserted.workflow_rows == before.workflow_rows
+        db.execute(
+            "UPDATE dedupe_keys SET namespace=CAST(namespace AS BLOB) "
+            "WHERE namespace='review-execution-origin' AND key='origin:fixture'",
+        )
+        aliased = read_review_archive_source_versions(db, "o/r")
+        assert aliased.checkpoint_sources == inserted.checkpoint_sources + 1
+        db.execute(
+            "UPDATE dedupe_keys SET namespace='unrelated' WHERE key='checkpoint:fixture'",
+        )
+        db.execute("DELETE FROM dedupe_keys WHERE key='application:fixture'")
+        assert read_review_archive_source_versions(db, "o/r").checkpoint_sources == (
+            aliased.checkpoint_sources + 2
+        )
+        _insert_receipt(db, "unrelated", "other:key")
+        assert read_review_archive_source_versions(db, "o/r").checkpoint_sources == (
+            aliased.checkpoint_sources + 2
+        )
+
+
+def test_workflow_witness_covers_workflow_and_component_rows(active):
+    store, _ = active
+    with store.transaction() as db:
+        before = read_review_archive_source_versions(db, "o/r")
+        _clone_workflow_repository(db, "other/repo")
+        db.execute(
+            "INSERT INTO workflow_components(repository,target_kind,target_number,family,epoch,episode_id) "
+            "SELECT 'other/repo',target_kind,target_number,family,epoch,episode_id "
+            "FROM workflow_components WHERE repository='o/r' AND family='review_execution'",
+        )
+        inserted = read_review_archive_source_versions(db, "o/r")
+        assert inserted.workflow_rows == before.workflow_rows + 2
+        db.execute(
+            "UPDATE workflows SET episode_json=episode_json WHERE repository='other/repo'",
+        )
+        db.execute(
+            "UPDATE workflow_components SET episode_id=episode_id WHERE repository='other/repo'",
+        )
+        updated = read_review_archive_source_versions(db, "o/r")
+        assert updated.workflow_rows == inserted.workflow_rows + 2
+        db.execute("DELETE FROM workflow_components WHERE repository='other/repo'")
+        db.execute("DELETE FROM workflows WHERE repository='other/repo'")
+        deleted = read_review_archive_source_versions(db, "o/r")
+        assert deleted.workflow_rows == updated.workflow_rows + 2
+        assert deleted.checkpoint_sources == before.checkpoint_sources
+
+
+@pytest.mark.parametrize("operation", ("insert", "update"))
+def test_checkpoint_witness_rejects_implicit_dedupe_replacement(active, operation):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_receipt(db, "review-checkpoint-application", "application:fixture")
+        source_rowid = db.execute(
+            "SELECT rowid FROM dedupe_keys WHERE namespace='review-checkpoint-application' "
+            "AND key='application:fixture'",
+        ).fetchone()[0]
+        before = read_review_archive_source_versions(db, "o/r")
+        if operation == "insert":
+            mutation = (
+                "INSERT OR REPLACE INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,'unrelated','o/r','replacement:fixture',"
+                "'2026-09-29T00:00:00+00:00','{}')"
+            )
+        else:
+            _insert_receipt(db, "unrelated", "replacement:fixture")
+            mutation = (
+                "UPDATE OR REPLACE dedupe_keys SET rowid=? "
+                "WHERE namespace='unrelated' AND key='replacement:fixture'"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="replacement would hide"):
+            db.execute(mutation, (source_rowid,))
+        assert read_review_archive_source_versions(db, "o/r") == before
+        assert db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE rowid=? "
+            "AND namespace='review-checkpoint-application'",
+            (source_rowid,),
+        ).fetchone() is not None
+
+
+def test_checkpoint_witness_handles_negative_rowid_and_ordinary_insert(active):
+    store, _ = active
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
+            "VALUES (-1,'review-checkpoint-application','o/r','negative:source',"
+            "'2026-09-29T00:00:00+00:00','{}')",
+        )
+        before = read_review_archive_source_versions(db, "o/r")
+        _insert_receipt(db, "unrelated", "unrelated:auto")
+        after_auto = read_review_archive_source_versions(db, "o/r")
+        assert after_auto.checkpoint_sources == before.checkpoint_sources + 1
+        assert db.execute("SELECT 1 FROM dedupe_keys WHERE rowid=-1").fetchone() is not None
+        db.execute(
+            "INSERT OR REPLACE INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
+            "VALUES (-1,'unrelated','o/r','unrelated:replacement',"
+            "'2026-09-29T00:00:00+00:00','{}')",
+        )
+        assert read_review_archive_source_versions(db, "o/r").checkpoint_sources == (
+            after_auto.checkpoint_sources + 1
+        )
+
+
+def test_checkpoint_and_workflow_witnesses_survive_v29_migration(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_receipt(db, "review-checkpoint-application", "application:fixture")
+    with closing(sqlite3.connect(store.path)) as db:
+        _historical_fixture(db, 29)
+        db.commit()
+    store.initialize()
+    with store.transaction() as db:
+        before = read_review_archive_source_versions(db, "o/r")
+        assert (before.checkpoint_sources, before.workflow_rows) == (0, 0)
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json='[]' "
+            "WHERE namespace='review-checkpoint-application' AND key='application:fixture'",
+        )
+        workflow_updates = db.execute(
+            "UPDATE workflows SET episode_json=episode_json WHERE repository='o/r'"
+        ).rowcount
+        after = read_review_archive_source_versions(db, "o/r")
+        assert workflow_updates > 0
+        assert (after.checkpoint_sources, after.workflow_rows) == (1, workflow_updates)
+
+
+def test_checkpoint_and_workflow_witnesses_rollback_with_source_mutations(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_receipt(db, "review-checkpoint-application", "application:fixture")
+        baseline = read_review_archive_source_versions(db, "o/r")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json='[]' "
+            "WHERE namespace='review-checkpoint-application' AND key='application:fixture'"
+        )
+        workflow_updates = db.execute(
+            "UPDATE workflows SET episode_json=episode_json WHERE repository='o/r'"
+        ).rowcount
+        changed = read_review_archive_source_versions(db, "o/r")
+        assert changed.checkpoint_sources == baseline.checkpoint_sources + 1
+        assert changed.workflow_rows == baseline.workflow_rows + workflow_updates
+        db.rollback()
+    with store.transaction() as db:
+        assert read_review_archive_source_versions(db, "o/r") == baseline
+        assert db.execute(
+            "SELECT payload_json FROM dedupe_keys "
+            "WHERE namespace='review-checkpoint-application' AND key='application:fixture'"
+        ).fetchone()[0] == "{}"
+
+
+@pytest.mark.parametrize("source,mutation", (
+    ("checkpoint_sources", "UPDATE dedupe_keys SET payload_json='[]' "
+                            "WHERE namespace='review-checkpoint-application' "
+                            "AND key='application:fixture'"),
+    ("workflow_rows", "UPDATE workflows SET episode_json=episode_json WHERE repository='o/r'"),
+))
+def test_checkpoint_and_workflow_witnesses_block_missing_and_overflow(active, source, mutation):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_receipt(db, "review-checkpoint-application", "application:fixture")
+        db.execute(
+            "UPDATE review_archive_source_versions SET version=? WHERE source=? AND scope=X''",
+            (MAX_ARCHIVE_SOURCE_VERSION, source),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(mutation)
+        db.execute(
+            "DELETE FROM review_archive_source_versions WHERE source=? AND scope=X''",
+            (source,),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="mutation witness is absent"):
+            read_review_archive_source_versions(db, "o/r")
+        with pytest.raises(sqlite3.IntegrityError, match="source witness is absent"):
+            db.execute(mutation)
+
+
 def test_review_archive_witness_requires_transaction(active):
     store, _ = active
     with closing(store._connect()) as db:

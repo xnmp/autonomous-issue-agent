@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 19:07 AEST · Latest accepted checkpoint: versioned generation archive audit</p>
+      <p class="meta">Updated 29 Sep 2026, 19:27 AEST · Latest accepted checkpoint: checkpoint and workflow source witnesses</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Round, receipt and generation censuses now capture schema revisions across pages. The read-only archive join rejects stale completed passes. Compacted loads still refuse. Next: cover checkpoint, origin and workflow/component sources, then finish lineage, the atomic writer, admission gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Round, receipt and generation censuses capture schema revisions across pages. Schema v30 now witnesses checkpoint, origin and workflow/component mutations. The read-only archive join rejects stale completed round, receipt and generation passes; compacted loads still refuse. Next: version the checkpoint audit and join, then finish lineage, the atomic writer, admission gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -183,6 +183,7 @@
           <li><time datetime="2026-09-29T18:26:00+10:00">29 Sep 2026, 18:26 AEST</time><strong>Versioned receipt archive audit · 3 of 6 accepted</strong><p>Migration 28 adds a global round-row revision for foreign-repository owner reads. The durable receipt census restarts on any captured source mutation, retains its prior membership baseline and rejects stale completed joins. Foreign-row, legacy-cursor, missing-source and migration regressions pass. Independent Sol review found no medium or high issue. Full gate passed: 3,302 domain, 3,474 adapter and 2,876 app tests, hooks, governor, four import contracts and Pyrefly. Checkpoint, generation, origin and workflow freshness, the atomic writer and admission gate remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T18:46:00+10:00">29 Sep 2026, 18:46 AEST</time><strong>Generation source mutation witness · 3 of 6 accepted</strong><p>Migration 29 adds a global revision for generation receipts and accepted request/transition rows. It also closes a rowid REPLACE bypass for retained receipt and generation sources, including the SQLite <code>-1</code> insert sentinel. Sol found both defects and verified the fixes. Full gate passed: 3,302 domain, 3,485 adapter and 2,876 app tests, hooks, governor, four import contracts and Pyrefly. The generation cursor, other source groups, writer and admission gate remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T19:07:00+10:00">29 Sep 2026, 19:07 AEST</time><strong>Versioned generation archive audit · 3 of 6 accepted</strong><p>The durable generation census restarts when its global source revision changes and retains the prior completed digest across paged rescans. The read-only join rejects stale or unversioned generation passes. Sol found a lost-baseline edge; the fix and regression passed. Full gate passed: 3,302 domain, 3,495 adapter and 2,876 app tests, hooks, governor, four import contracts and Pyrefly. Checkpoint, origin and workflow/component freshness, writer and admission gate remain open. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-29T19:27:00+10:00">29 Sep 2026, 19:27 AEST</time><strong>Checkpoint and workflow source witnesses · 3 of 6 accepted</strong><p>Schema v30 adds global mutation revisions for origin, checkpoint and application receipts, workflows and execution components. Missing or overflowed witnesses block writes; implicit checkpoint rowid replacement cannot hide a mutation. Sol review found no bypass. Full gate passed: 3,302 domain, 3,506 adapter and 2,876 app tests, hooks, governor, four import contracts and Pyrefly. The checkpoint cursor and read-only join must still compare these revisions before they have audit authority. All four services remain inactive. Active work since the previous entry: About 20 minutes.</p></li>
         </ol>
       </div>
     </section>
