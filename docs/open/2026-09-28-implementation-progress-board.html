@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 22:05 AEST · Latest accepted checkpoint: initial execution archive observation</p>
+      <p class="meta">Updated 29 Sep 2026, 22:29 AEST · Latest accepted checkpoint: initial execution archive observation</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Round, receipt, generation, checkpoint and lifecycle audits persist bounded, versioned source scans. A separate initial-execution observation now checks current checkpoint and application absence before the first writer commit. Compacted loads still refuse. Next: complete the atomic writer, admission gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Round, receipt, generation, checkpoint and lifecycle audits persist bounded, versioned source scans. A separate initial-execution observation checks current checkpoint and application absence. A writer candidate review exposed an unregistered successful command that the lifecycle census cannot yet match to expected rounds. Next: prove expected lifecycle source membership, then complete the atomic writer, admission gate, historical reset/session proof, and production import. Compacted loads still refuse. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 

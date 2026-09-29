@@ -1105,6 +1105,21 @@ the complete audit benchmark.
   `/tmp/initial-checkpoint-absence-gate.log` (ephemeral). The four paused
   services remained inactive.
 
+After checkpoint 129, an initial checkpoint candidate join was prototyped and
+withdrawn before commit. Independent Sol review reproduced a successful,
+unregistered `submit_review` command and effect in the same repository: the
+round and generation stream digests matched, and a fresh lifecycle census had
+internally matching command/effect sets, yet the candidate still passed. The
+prototype had no production caller and was removed; `f099d56` remains the
+accepted code state. A missing effect for a *registered* command was already
+refused by the canonical load, so that case does not cover the unregistered
+command gap. The next proof must reconcile every selected lifecycle command
+and effect with expected registered rounds or explicitly classified historical
+sources. It needs a resumable source scan and mutation witness; repeating a
+whole-repository anti-join inside each checkpoint proposal would grow with
+repository lifetime. Keep the initial archive join observational until this
+expected-source proof and settlement provenance are present.
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round
