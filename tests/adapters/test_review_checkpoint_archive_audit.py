@@ -1,5 +1,6 @@
 """Durable checkpoint segment audit over retained round and generation sources."""
 
+import json
 from dataclasses import replace
 
 import pytest
@@ -19,7 +20,8 @@ from issue_agent.domain.review_checkpoint_archive import (
     ReviewCheckpointArchiveState, review_checkpoint_archive_overdue,
 )
 from issue_agent.domain.review_execution import (
-    ActivatedReviewExecution, build_review_execution_checkpoint_receipt,
+    ActivatedReviewExecution, ReviewExecutionCheckpointReceipt,
+    build_review_execution_checkpoint_receipt,
     plan_review_execution_compaction,
     project_review_execution,
 )
@@ -126,7 +128,7 @@ def _stored(store):
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM level_state "
-            "WHERE namespace='review-checkpoint-archive-scan'",
+            "WHERE namespace='review-checkpoint-archive-scan-v2'",
         ).fetchone()
         assert row is not None
         return decode_workflow(row["payload_json"], ReviewCheckpointArchiveState)
@@ -158,6 +160,44 @@ def test_changed_round_source_blocks_and_persists(active):
     assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
     assert review_checkpoint_archive_overdue(result, now)
     assert _stored(store) == result
+
+
+def test_forged_round_only_checkpoint_state_blocks(active):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys "
+            "WHERE namespace='review-execution-checkpoint' AND key=?",
+            (tip,),
+        ).fetchone()
+        receipt = decode_workflow(row["payload_json"], ReviewExecutionCheckpointReceipt)
+        forged_state = replace(
+            receipt.checkpoint.state, failures=receipt.checkpoint.state.failures + 1,
+        )
+        forged_checkpoint = replace(receipt.checkpoint, state=forged_state)
+        forged_receipt = replace(receipt, checkpoint=forged_checkpoint)
+        forged_id = review_execution_checkpoint_receipt_id(forged_receipt)
+        db.execute(
+            "UPDATE dedupe_keys SET key=?,payload_json=? "
+            "WHERE namespace='review-execution-checkpoint' AND key=?",
+            (forged_id, encode_workflow(forged_receipt), tip),
+        )
+        row = db.execute(
+            "SELECT episode_json FROM workflows WHERE repository='o/r' AND target_kind='pr'",
+        ).fetchone()
+        from issue_agent.domain.review_workflow import ReviewFamilyEpisodes
+        episodes = decode_workflow(row["episode_json"], ReviewFamilyEpisodes)
+        assert isinstance(episodes.execution, ActivatedReviewExecution)
+        db.execute(
+            "UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='pr'",
+            (encode_workflow(replace(episodes, execution=replace(
+                episodes.execution, checkpoint=forged_checkpoint, state=forged_state,
+                checkpoint_receipt=forged_id,
+            ))),),
+        )
+    result = _complete(store, key, store.now())
+    assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
+    assert "projected state" in result.reason
 
 
 def test_prior_checkpoint_source_change_is_found_on_next_pass(active):
@@ -245,8 +285,38 @@ def test_malformed_persisted_cursor_refuses_resume(active):
     with store.transaction() as db:
         db.execute(
             "UPDATE level_state SET payload_json='{}' "
-            "WHERE namespace='review-checkpoint-archive-scan'",
+            "WHERE namespace='review-checkpoint-archive-scan-v2'",
         )
     with store.transaction() as db:
         with pytest.raises(WorkflowAuthorityError, match="malformed"):
             advance_review_checkpoint_archive_audit(db, key, now=now)
+
+
+def test_prior_cursor_schema_is_preserved_and_restarted(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    first = _advance(store, key, now)
+    assert isinstance(first, ReviewCheckpointArchiveSegment)
+    legacy_payload = json.loads(encode_workflow(first))
+    del legacy_payload["value"]["fields"]["round_replay_state"]
+    legacy_raw = json.dumps(legacy_payload, sort_keys=True, separators=(",", ":"))
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE level_state SET namespace='review-checkpoint-archive-scan',payload_json=? "
+            "WHERE namespace='review-checkpoint-archive-scan-v2'",
+            (legacy_raw,),
+        )
+
+    restarted = _advance(store, key, now)
+    assert isinstance(restarted, ReviewCheckpointArchiveSegment)
+    assert restarted.source == first.source
+    assert restarted.round_replay_state == first.round_replay_state
+    with store.transaction() as db:
+        rows = db.execute(
+            "SELECT namespace,payload_json FROM level_state "
+            "WHERE namespace LIKE 'review-checkpoint-archive-scan%' ORDER BY namespace",
+        ).fetchall()
+    assert [(row["namespace"], row["payload_json"]) for row in rows] == [
+        ("review-checkpoint-archive-scan", legacy_raw),
+        ("review-checkpoint-archive-scan-v2", encode_workflow(restarted)),
+    ]

@@ -35,7 +35,7 @@ from .workflow_rows import (
 )
 
 
-_AUDIT_NAMESPACE = "review-checkpoint-archive-scan"
+_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v2"
 
 
 def _audit_key(key: WorkflowKey, epoch: int, episode: str) -> str:
@@ -207,7 +207,9 @@ def advance_review_checkpoint_archive_audit(
                 )
                 if classified.source.source != observed.source:
                     raise WorkflowAuthorityError("checkpoint round changed during classification")
-                result = advance_review_checkpoint_archive_round(state, observed.source)
+                result = advance_review_checkpoint_archive_round(
+                    state, observed.source, observed.outcome,
+                )
             elif (state.next_generation
                   <= receipt.checkpoint.state.binding.rejection.fence.generation):
                 page = read_review_generation_archive_page(

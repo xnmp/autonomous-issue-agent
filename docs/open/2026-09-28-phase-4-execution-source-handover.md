@@ -658,6 +658,18 @@ the complete audit benchmark.
   review found no cursor regression and confirmed those two remaining
   authority gaps. The full repository gate passed: 3,296 domain, 3,364
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
+- Checkpoint 101 adds sequential projection for checkpoint segments without
+  generation transitions. A forged checkpoint state with otherwise matching
+  round source digests reproduced the missing check; the scan now blocks it
+  after replaying each retired outcome from the predecessor state. Segments
+  with generation transitions still need their ordered boundary and
+  applied-sequence replay, and unclaimed source census remains open. This
+  change is observational and does not lift the compacted-load refusal.
+  Sol review caught an incompatible persisted segment schema; a versioned
+  cursor namespace keeps the old row intact and starts a new pass. The full
+  repository gate passed: 3,296 domain, 3,366 adapter and 2,876 app tests,
+  four import contracts and both Pyrefly checks. Sol's follow-up found no
+  remaining medium or high issue.
 
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the

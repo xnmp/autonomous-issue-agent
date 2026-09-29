@@ -47,9 +47,10 @@ typed predecessor links, claim order and retained-row digests. Caller-held
 cursors now feed a durable observational scan that checks one predecessor or
 retired source per transaction, matches each checkpoint segment's ordered
 stream digests, and compares the prior completed chain after tip growth.
-Retired outcome replay, unclaimed row and receipt census, a transactional
-writer, cumulative hot-read bounds and the atomic admission gate remain to be
-implemented.
+Segments without generation transitions now also replay retired outcomes to
+their checkpoint state. Generation-boundary replay, unclaimed row and receipt
+census, a transactional writer, cumulative hot-read bounds and the atomic
+admission gate remain to be implemented.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

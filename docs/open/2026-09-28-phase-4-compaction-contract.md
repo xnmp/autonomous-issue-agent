@@ -222,10 +222,19 @@ folding the same ordered digests as the checkpoint receipt builder. It compares
 each segment frontier and digest, reaches the exact origin, and records a
 completed chain digest for the next due pass. A new tip preserves the previous
 chain as a tail baseline; changed or missing predecessors persist a blocker.
-Completion is not an admission verdict: the scan has not replayed retired
-outcomes against each checkpoint state or censused unclaimed round rows and
-receipt references. The production writer and canonical compacted read remain
-disabled until those checks, cumulative bounds and the atomic audit gate exist.
+Completion is not an admission verdict: full retired generation-boundary
+replay and a census of unclaimed round rows and receipt references are still
+missing. The production writer and canonical compacted read remain disabled
+until those checks, cumulative bounds and the atomic audit gate exist.
+
+For a checkpoint segment with no generation transition, the scan now also
+projects one finalized round outcome per transaction from its predecessor
+state. It rejects a final projected state that differs from the checkpoint,
+even if the ordered source fingerprints match. Segments containing generation
+transitions still need ordered boundary replay, including applied-sequence
+semantics; this partial replay remains observational. The replay cursor uses a
+versioned `review-checkpoint-archive-scan-v2` namespace so an in-progress
+cursor from the earlier schema remains intact while the new pass starts afresh.
 
 A read-only receipt sweep page now covers the twelve namespaces used by the
 round receipt-set definition, including command-keyed submission and recorded
