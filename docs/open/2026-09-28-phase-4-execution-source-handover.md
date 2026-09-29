@@ -771,16 +771,30 @@ the complete audit benchmark.
   domain, 3,402 adapter and 2,876 app tests, four import contracts and both
   Pyrefly checks. Log: `/tmp/checkpoint-paged-replay-final-gate.log`
   (ephemeral).
+- Checkpoint 110 joins the four completed archive observations for one current
+  execution. A read-only adapter checks the checkpoint tip and immediate
+  anchor, exact origin source, round-row and generation frontiers, receipt
+  prefix covering the compacted checkpoint, and all pass deadlines. The
+  round-row and generation audit bootstraps now use the bounded indexed
+  execution reader because the canonical loader intentionally refuses
+  compacted authority before the gate exists. Real round-only, retired
+  generation and selected-tail fixtures pass. The join remains observational:
+  independently timed passes are not one atomic snapshot, and the active
+  suffix, atomic writer and admission gate remain open. Independent Sol review
+  found no concrete medium or high issue. The full gate passed: 3,302 domain,
+  3,410 adapter and 2,876 app tests, four import contracts and both Pyrefly
+  checks. Log: `/tmp/archive-evidence-full-gate.log` (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round
 receipt-set definition, bind the ordered source digests, and publish the
 aggregate and checkpoint atomically.
-The paged audit now carries state replay across bounded transactions. It must
-still reconstruct retired member payloads and unclaimed receipts, and supply
-the admission gate. Keep the canonical compaction refusal until these checks
-are complete.
+The paged audit now carries state replay across bounded transactions, and a
+read-only join aligns its completed result with the separate source censuses.
+The writer must still revalidate its transaction-local sources, publish the
+checkpoint atomically, and supply the admission gate. Keep the canonical
+compaction refusal until these checks are complete.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

@@ -68,6 +68,13 @@ carries that replay across transactions, interleaving accepted generation
 boundaries with their retired round outcomes and comparing the final projected
 state. Complete source membership, the atomic writer and the admission gate
 remain open.
+A read-only archive observation now aligns completed checkpoint, round-row,
+receipt-member and generation census cursors with one current execution,
+including the origin source, checkpoint tip, frontiers and due times. The
+round-row and generation audits can bootstrap from the bounded indexed
+execution after compaction, while the canonical loader still refuses
+compacted authority. This observation does not establish a single atomic
+snapshot across the completed passes or authorize admission.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

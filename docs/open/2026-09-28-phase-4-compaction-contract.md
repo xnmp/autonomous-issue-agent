@@ -230,15 +230,17 @@ folding the same ordered digests as the checkpoint receipt builder. It compares
 each segment frontier and digest, reaches the exact origin, and records a
 completed chain digest for the next due pass. A new tip preserves the previous
 chain as a tail baseline; changed or missing predecessors persist a blocker.
-The versioned scan now also reads the paired checkpoint application source at
-each segment step and folds its six-field digest into the chain baseline.
+The versioned scan reads the paired checkpoint application source at each
+segment step, folds its six-field digest into the chain baseline, and checks
+the exact first following accepted generation. Its `-v3` cursor interleaves
+retired generation boundaries with classified round outcomes and compares the
+projected checkpoint state. Pending boundaries are re-read by fingerprint.
 Valid prior-version observational cursors restart at the origin; a prior
-blocked or malformed cursor persists as a new-version blocker. This source
-binding does not yet check the selected following boundary or replay state.
-The completed prior-version chain digest cannot be compared with the changed
-encoding, so this restart does not certify continuity across the upgrade.
-Completion is not an admission verdict: checkpoint state replay and a census
-of unclaimed round rows and receipt references are still missing. A proposed
+blocked or malformed cursor persists as a new-version blocker. The completed
+prior-version chain digest cannot be compared with the changed encoding, so
+this restart does not certify continuity across the upgrade. Completion is
+not an admission verdict: a writer and gate must use the separate row,
+receipt and generation censuses together. A proposed
 round-only replay was withdrawn because a later generation boundary can leave
 an earlier finalized round unapplied. The checkpoint receipt does not record
 whether that boundary existed when the checkpoint was written. Live generation
@@ -262,8 +264,8 @@ remains the source of truth for snapshots, consistent with the
 The pure replay check now verifies a complete caller-supplied segment against
 that choice and the checkpoint state. It enforces contiguous retired sources,
 the supplied following boundary fingerprint and applied-sequence digest, and
-the captured revision's ordering. The archived audit does not yet supply or
-persist this complete state proof, so this check grants no admission authority.
+the captured revision's ordering. The archived audit now persists this replay
+through bounded steps, but its completed result grants no admission authority.
 A compact codec-registered application receipt now records the checkpoint
 receipt identity, captured revision, tail start and typed selection. A bounded
 read joins its permanent source row to the exact checkpoint receipt, requires
@@ -292,8 +294,10 @@ member. Open rounds have no finalized member set. A persisted observational
 pass now compares a fixed contiguous finalized prefix with the complete
 retained receipt namespace, leaving valid open-round sources pending. Its
 round-source digest matches the initial checkpoint receipt builder's stream
-encoding, but later checkpoint segments, checkpoint ancestry and admission
-authority remain unimplemented.
+encoding. A read-only observation now aligns its completed result with the
+checkpoint, round-row and generation audit cursors for one current execution.
+That observation does not grant admission or prove that independently timed
+passes used one atomic snapshot.
 
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money

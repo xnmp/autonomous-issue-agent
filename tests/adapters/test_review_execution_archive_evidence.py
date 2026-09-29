@@ -1,0 +1,142 @@
+"""Completed archive passes must describe one current execution."""
+
+from dataclasses import replace
+from datetime import timedelta
+
+import pytest
+
+from issue_agent.adapters.review_checkpoint_archive_audit import (
+    advance_review_checkpoint_archive_audit,
+)
+from issue_agent.adapters.review_execution_archive_audit import (
+    advance_review_generation_archive_audit,
+)
+from issue_agent.adapters.review_execution_archive_evidence import (
+    observe_review_execution_archive_evidence,
+)
+from issue_agent.adapters.review_round_archive_audit import advance_review_round_archive_audit
+from issue_agent.adapters.review_round_receipt_archive_audit import (
+    advance_review_round_receipt_archive_audit,
+)
+from issue_agent.adapters.workflow_rows import (
+    REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError,
+)
+from issue_agent.domain.review_checkpoint_archive import CompletedReviewCheckpointArchiveAudit
+from issue_agent.domain.review_execution import CompletedReviewGenerationArchiveAudit
+from issue_agent.domain.review_execution_archive_evidence import (
+    ObservedReviewExecutionArchiveEvidence,
+)
+from issue_agent.domain.review_round_archive import CompletedReviewRoundArchiveScan
+from issue_agent.domain.review_round_receipt_archive import CompletedReviewRoundReceiptArchiveAudit
+from tests.adapters.test_review_checkpoint_archive_audit import (
+    _generation_checkpoint, _real_selected_checkpoint, _two_valid_checkpoints,
+)
+from tests.adapters.test_review_execution_control import rig
+from tests.adapters.test_review_execution_persistence import active
+
+
+def _complete(store, key, now):
+    for advance, completed in (
+        (advance_review_checkpoint_archive_audit, CompletedReviewCheckpointArchiveAudit),
+        (advance_review_round_archive_audit, CompletedReviewRoundArchiveScan),
+        (advance_review_round_receipt_archive_audit, CompletedReviewRoundReceiptArchiveAudit),
+        (advance_review_generation_archive_audit, CompletedReviewGenerationArchiveAudit),
+    ):
+        for _ in range(64):
+            with store.transaction() as db:
+                state = advance(db, key, now=now)
+            if isinstance(state, completed):
+                break
+        else:
+            raise AssertionError(f"{advance.__name__} did not complete")
+
+
+def test_current_completed_archive_passes_join_without_writes(active):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        before = db.total_changes
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+        assert db.total_changes == before
+    assert observed.checkpoints.tip_receipt_id == tip
+    assert observed.rounds.through_sequence == 2
+    assert observed.receipts.expected.through_sequence == 2
+    assert observed.generations.generation_scan.final_cursor is None
+
+
+def test_retired_generation_checkpoint_joins_its_final_source(rig):
+    store, key, _, manifest = _generation_checkpoint(rig)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+    assert observed.generations.generation_scan.final_cursor == manifest.plan.checkpoint.boundary_cursor
+
+
+def test_selected_tail_checkpoint_joins_remaining_generation(rig):
+    store, key, manifest = _real_selected_checkpoint(rig)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+    assert observed.execution.boundaries == manifest.plan.remaining_boundaries
+    assert observed.generations.generation_scan.final_cursor is not None
+
+
+def test_archive_join_requires_all_completed_passes(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    with store.transaction() as db:
+        with pytest.raises(WorkflowAuthorityError, match="awaits complete"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_overdue_and_future_completion(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+        with pytest.raises(WorkflowAuthorityError, match="disagree"):
+            observe_review_execution_archive_evidence(
+                db, key, now=observed.checkpoints.next_due_at,
+            )
+    with pytest.raises(ValueError, match="premature or overdue"):
+        replace(observed, observed_at=now - timedelta(seconds=1))
+
+
+def test_archive_join_rejects_mismatched_completed_frontier(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+    with pytest.raises(ValueError, match="source frontiers"):
+        replace(observed, rounds=replace(observed.rounds, through_sequence=3))
+    assert isinstance(observed, ObservedReviewExecutionArchiveEvidence)
+
+
+def test_archive_join_rechecks_current_origin_source(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-01-01T00:00:00+00:00' "
+            "WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,
+             observed.execution.origin.evidence_id),
+        )
+        with pytest.raises(WorkflowAuthorityError):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_naive_time(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    with store.transaction() as db:
+        with pytest.raises(ValueError, match="aware time"):
+            observe_review_execution_archive_evidence(
+                db, key, now=store.now().replace(tzinfo=None),
+            )

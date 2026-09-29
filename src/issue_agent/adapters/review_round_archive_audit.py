@@ -23,7 +23,7 @@ from .review_execution_activation import (
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, decode_workflow, encode_workflow
 from .workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError, _read_execution_origin,
-    load_review_workflow_row, workflow_scope,
+    workflow_scope,
 )
 
 
@@ -155,17 +155,14 @@ def advance_review_round_archive_audit(
     audit_key = _audit_key(key, execution.binding.execution_epoch, execution.binding.execution_episode)
     rowid, state = _read_state(db, key.repository, audit_key)
     if state is None:
-        snapshot = load_review_workflow_row(db, key)
-        if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
-            raise WorkflowAuthorityError("round archive audit requires active execution authority")
-        origin_receipt, _ = _read_execution_origin(db, scope, snapshot.execution)
+        origin_receipt, _ = _read_execution_origin(db, scope, execution)
         _, origin_digest = _read_recording_source(
             db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,
             origin_receipt.origin.evidence_id,
         )
         state = begin_review_round_archive_scan(
             origin_receipt.checkpoint.state.binding, origin_receipt.origin,
-            origin_digest, snapshot.execution.last_sequence, now, due_seconds,
+            origin_digest, execution.last_sequence, now, due_seconds,
         )
     else:
         prior = state.prior if isinstance(state, BlockedReviewRoundArchiveScan) else state

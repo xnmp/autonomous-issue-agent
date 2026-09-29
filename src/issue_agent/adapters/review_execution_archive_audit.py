@@ -9,7 +9,7 @@ from dataclasses import replace
 from datetime import datetime
 
 from ..domain.review_execution import (
-    ActivatedReviewExecution, BlockedReviewGenerationArchiveScan,
+    BlockedReviewGenerationArchiveScan,
     BlockedReviewGenerationArchiveSweep, CompletedReviewGenerationArchiveAudit,
     CompletedReviewGenerationArchiveScan, ReviewExecutionBoundaryCursor,
     ReviewGenerationArchiveBaseline, ReviewGenerationArchiveFingerprint,
@@ -27,9 +27,10 @@ from .review_execution_activation import (
     read_review_generation_archive_page,
 )
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, decode_workflow, encode_workflow
+from .review_round_archive_audit import _current_execution
 from .workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError, _read_execution_origin,
-    load_review_workflow_row, workflow_scope,
+    workflow_scope,
 )
 
 
@@ -162,19 +163,17 @@ def advance_review_generation_archive_audit(
     audit_key = _audit_key(key, epoch, episode)
     rowid, state = _read_state(db, key.repository, audit_key)
     if state is None:
-        snapshot = load_review_workflow_row(db, key)
-        if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
-            raise WorkflowAuthorityError("generation archive audit requires active execution authority")
-        origin_receipt, _ = _read_execution_origin(db, scope, snapshot.execution)
+        execution = _current_execution(db, key)
+        origin_receipt, _ = _read_execution_origin(db, scope, execution)
         _, origin_source_sha256 = _read_recording_source(
             db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,
             origin_receipt.origin.evidence_id,
         )
         origin = origin_receipt.checkpoint.state.binding
-        if (snapshot.execution.origin != origin_receipt.origin
-                or snapshot.execution.binding.execution_epoch != epoch
-                or snapshot.execution.binding.execution_episode != episode
-                or snapshot.revision.fence.generation != current_generation):
+        if (execution.origin != origin_receipt.origin
+                or execution.binding.execution_epoch != epoch
+                or execution.binding.execution_episode != episode
+                or execution.binding.rejection.fence.generation != current_generation):
             raise WorkflowAuthorityError("generation archive audit origin disagrees with active execution")
         state = begin_review_generation_archive_scan(
             origin, origin_receipt.origin, origin_source_sha256,
