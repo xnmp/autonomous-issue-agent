@@ -62,6 +62,7 @@ class ObservedReviewRoundReceiptSweepPage:
     next_cursor: ReviewRoundReceiptSweepCursor | None
     upper_cursor: ReviewRoundReceiptSweepCursor | None
     has_more: bool
+    source_bytes: int
 
     def __post_init__(self) -> None:
         if (not isinstance(self.sources, tuple)
@@ -73,7 +74,11 @@ class ObservedReviewRoundReceiptSweepPage:
                 or self.upper_cursor is not None and not isinstance(
                     self.upper_cursor, ReviewRoundReceiptSweepCursor)
                 or type(self.has_more) is not bool
-                or self.upper_cursor is None and (self.sources or self.next_cursor or self.has_more)
+                or type(self.source_bytes) is not int
+                or not 0 <= self.source_bytes <= MAX_ROUND_RECEIPT_SWEEP_BYTES
+                or self.upper_cursor is None and (
+                    self.sources or self.next_cursor or self.has_more or self.source_bytes
+                )
                 or self.sources and self.next_cursor != self.sources[-1].cursor
                 or self.has_more and self.next_cursor is None):
             raise ValueError("round receipt sweep page requires bounded typed observations")
@@ -95,11 +100,13 @@ def read_review_round_receipt_sweep_page(
     *, after: ReviewRoundReceiptSweepCursor | None = None,
     upper: ReviewRoundReceiptSweepCursor | None = None,
     limit: int | None = None,
+    max_source_bytes: int | None = None,
 ) -> ObservedReviewRoundReceiptSweepPage | BlockedReviewRoundReceiptSweepPage:
     """Observe all selected namespaces across repositories in indexed key order.
 
     A page is source evidence only. A durable pass and expected-source join
-    must independently account for all returned fingerprints.
+    must independently account for all returned fingerprints. The byte budget
+    includes every repository because the namespace census crosses scopes.
     """
     page_limit = MAX_ROUND_RECEIPT_SWEEP_PAGE if limit is None else limit
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
@@ -108,7 +115,9 @@ def read_review_round_receipt_sweep_page(
             or after is not None and upper is None
             or after is not None and upper is not None and after > upper
             or type(page_limit) is not int
-            or not 1 <= page_limit <= MAX_ROUND_RECEIPT_SWEEP_PAGE):
+            or not 1 <= page_limit <= MAX_ROUND_RECEIPT_SWEEP_PAGE
+            or (max_source_bytes is not None
+                and (type(max_source_bytes) is not int or max_source_bytes < 1))):
         raise ValueError("round receipt sweep requires a transaction and typed cursor")
     current_rowid: int | None = None
     names = ",".join("?" for _ in ROUND_RECEIPT_NAMESPACES)
@@ -132,7 +141,7 @@ def read_review_round_receipt_sweep_page(
                  *ROUND_RECEIPT_NAMESPACES),
             ).fetchone()
             if edge is None:
-                return ObservedReviewRoundReceiptSweepPage((), None, None, False)
+                return ObservedReviewRoundReceiptSweepPage((), None, None, False, 0)
             current_rowid = edge["rowid"]
             if (edge["scope_type"] != "text" or edge["key_type"] != "text"
                     or edge["scope_value"] is None or edge["key_value"] is None):
@@ -174,6 +183,8 @@ def read_review_round_receipt_sweep_page(
         sources: list[ObservedReviewRoundReceiptSweepSource] = []
         cursor = after
         source_bytes = 0
+        byte_limit = (MAX_ROUND_RECEIPT_SWEEP_BYTES if max_source_bytes is None
+                      else min(MAX_ROUND_RECEIPT_SWEEP_BYTES, max_source_bytes))
         processed = 0
         for row in rows[:page_limit]:
             current_rowid = row["rowid"]
@@ -188,7 +199,7 @@ def read_review_round_receipt_sweep_page(
                 return BlockedReviewRoundReceiptSweepPage(
                     "round receipt sweep has an oversized source", current_rowid,
                 )
-            if source_bytes + row["source_bytes"] > MAX_ROUND_RECEIPT_SWEEP_BYTES:
+            if source_bytes + row["source_bytes"] > byte_limit:
                 if processed:
                     break
                 return BlockedReviewRoundReceiptSweepPage(
@@ -209,7 +220,7 @@ def read_review_round_receipt_sweep_page(
             cursor = source_cursor
             processed += 1
         return ObservedReviewRoundReceiptSweepPage(
-            tuple(sources), cursor, upper, processed < len(rows),
+            tuple(sources), cursor, upper, processed < len(rows), source_bytes,
         )
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error) as exc:
@@ -236,6 +247,7 @@ class ClassifiedReviewRoundReceiptSweepPage:
     next_cursor: ReviewRoundReceiptSweepCursor | None
     upper_cursor: ReviewRoundReceiptSweepCursor | None
     has_more: bool
+    source_bytes: int
 
     def __post_init__(self) -> None:
         if (not isinstance(self.sources, tuple)
@@ -247,7 +259,11 @@ class ClassifiedReviewRoundReceiptSweepPage:
                 or self.upper_cursor is not None and not isinstance(
                     self.upper_cursor, ReviewRoundReceiptSweepCursor)
                 or type(self.has_more) is not bool
-                or self.upper_cursor is None and (self.sources or self.next_cursor or self.has_more)
+                or type(self.source_bytes) is not int
+                or not 0 <= self.source_bytes <= MAX_ROUND_RECEIPT_SWEEP_BYTES
+                or self.upper_cursor is None and (
+                    self.sources or self.next_cursor or self.has_more or self.source_bytes
+                )
                 or self.sources and self.next_cursor != self.sources[-1].source.cursor
                 or self.has_more and self.next_cursor is None):
             raise ValueError("classified round receipt page requires bounded typed observations")
@@ -304,13 +320,16 @@ def read_classified_review_round_receipt_sweep_page(
     *, after: ReviewRoundReceiptSweepCursor | None = None,
     upper: ReviewRoundReceiptSweepCursor | None = None,
     limit: int | None = None,
+    max_source_bytes: int | None = None,
 ) -> ClassifiedReviewRoundReceiptSweepPage | BlockedReviewRoundReceiptSweepPage:
     """Decode each bounded source and identify its local round or command reference.
 
     The reference has no episode or checkpoint authority until joined to
     canonical round, command and accepted-transition sources.
     """
-    page = read_review_round_receipt_sweep_page(db, after=after, upper=upper, limit=limit)
+    page = read_review_round_receipt_sweep_page(
+        db, after=after, upper=upper, limit=limit, max_source_bytes=max_source_bytes,
+    )
     if isinstance(page, BlockedReviewRoundReceiptSweepPage):
         return page
     classified: list[ClassifiedReviewRoundReceiptSweepSource] = []
@@ -325,6 +344,7 @@ def read_classified_review_round_receipt_sweep_page(
             classified.append(ClassifiedReviewRoundReceiptSweepSource(source, reference))
         return ClassifiedReviewRoundReceiptSweepPage(
             tuple(classified), page.next_cursor, page.upper_cursor, page.has_more,
+            page.source_bytes,
         )
     except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
             RecursionError, sqlite3.Error) as exc:

@@ -848,6 +848,18 @@ the complete audit benchmark.
   checks. Log: `/tmp/checkpoint-round-sweep-byte-budget-gate.log` (ephemeral).
   This is a bounded page primitive, not a completed source census or admission
   authority.
+- Checkpoint 116 gives the retained round-receipt namespace sweep the same
+  caller-selected source-byte ceiling and reports bytes used from both raw and
+  classified pages. It checks metadata before fetching receipt payloads;
+  budget-limited pages retain their fixed upper cursor across repositories.
+  Exact, insufficient and invalid budgets, classified propagation, and
+  two individually fitting receipts split across pages are covered. An
+  independent Sol review found no correctness issue and requested the
+  two-receipt continuation regression, which now passes. Full `make test`
+  passed: 3,302 domain, 3,430 adapter and 2,876 app tests, hooks, governor,
+  four import contracts and both Pyrefly checks. Log:
+  `/tmp/checkpoint-receipt-sweep-byte-budget-final-gate.log` (ephemeral).
+  This remains read-only source evidence.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
@@ -865,6 +877,12 @@ unrelated repository history passed 65,536 rows, and proposal cost would grow
 with repository lifetime. The source census needs resumable, bounded work and
 a mutation/freshness witness before a completed pass can support an atomic
 writer or admission gate.
+[SQLite `data_version`](https://www.sqlite.org/pragma.html#pragma_data_version)
+does not advance for writes made through the same connection and is comparable
+only on one connection, so it cannot serve as a durable cross-transaction
+witness. A schema-maintained revision would need exact trigger coverage of
+every source table and namespace, including updates, deletes and rekeys;
+[SQLite triggers](https://www.sqlite.org/lang_createtrigger.html) fire per row.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

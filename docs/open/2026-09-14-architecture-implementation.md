@@ -41,6 +41,8 @@ that checks row and finalized-payload identities before selecting an episode.
 The page accepts a caller-selected byte ceiling before payload fetch and
 charges foreign episode rows; a complete source census still needs a
 resumable freshness witness.
+The retained receipt namespace sweep has the same caller-selected byte
+ceiling and reports the bytes charged through raw and classified pages.
 A transaction-local cursor now persists one bounded sweep page at a time,
 checks that the episode has exactly its allocated sequence count, and compares
 the prior pass's source membership when the frontier grows or a scheduled

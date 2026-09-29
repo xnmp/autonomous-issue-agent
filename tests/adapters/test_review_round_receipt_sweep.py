@@ -93,6 +93,62 @@ def test_round_receipt_sweep_accepts_a_smaller_bounded_page(active):
                 read_review_round_receipt_sweep_page(db, limit=invalid)
 
 
+def test_round_receipt_sweep_budget_bounds_payload_reads_across_repositories(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert(db, "review-round-preflight", "o/r", "round:1")
+        _insert(db, "review-round-stage", "other/repo", "stage:2", payload="x" * 512)
+        first = read_review_round_receipt_sweep_page(db, limit=1)
+        assert isinstance(first, ObservedReviewRoundReceiptSweepPage)
+        assert first.source_bytes > 1 and first.has_more
+        exact = read_review_round_receipt_sweep_page(
+            db, max_source_bytes=first.source_bytes,
+        )
+        assert isinstance(exact, ObservedReviewRoundReceiptSweepPage)
+        assert exact.sources == first.sources and exact.has_more
+        assert exact.source_bytes == first.source_bytes
+        statements = []
+        db.set_trace_callback(statements.append)
+        try:
+            blocked = read_review_round_receipt_sweep_page(
+                db, max_source_bytes=first.source_bytes - 1,
+            )
+        finally:
+            db.set_trace_callback(None)
+        assert isinstance(blocked, BlockedReviewRoundReceiptSweepPage)
+        assert not any("AS raw_payload_json" in statement for statement in statements)
+        second = read_review_round_receipt_sweep_page(
+            db, after=exact.next_cursor, upper=exact.upper_cursor,
+        )
+        assert isinstance(second, ObservedReviewRoundReceiptSweepPage)
+        assert [source.cursor.scope for source in second.sources] == ["other/repo"]
+        assert second.source_bytes > exact.source_bytes and not second.has_more
+        for invalid in (0, -1, True, "1024"):
+            with pytest.raises(ValueError, match="typed cursor"):
+                read_review_round_receipt_sweep_page(db, max_source_bytes=invalid)
+
+
+def test_round_receipt_sweep_byte_limited_pages_resume_with_same_budget(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert(db, "review-round-stage", "o/r", "stage:1")
+        _insert(db, "review-round-stage", "o/r", "stage:2")
+        one = read_review_round_receipt_sweep_page(db, limit=1)
+        assert isinstance(one, ObservedReviewRoundReceiptSweepPage)
+        budget = one.source_bytes
+        first = read_review_round_receipt_sweep_page(db, max_source_bytes=budget)
+        assert isinstance(first, ObservedReviewRoundReceiptSweepPage)
+        assert [source.cursor.key for source in first.sources] == ["stage:1"]
+        assert first.source_bytes == budget and first.has_more
+        second = read_review_round_receipt_sweep_page(
+            db, after=first.next_cursor, upper=first.upper_cursor,
+            max_source_bytes=budget,
+        )
+        assert isinstance(second, ObservedReviewRoundReceiptSweepPage)
+        assert [source.cursor.key for source in second.sources] == ["stage:2"]
+        assert second.source_bytes == budget and not second.has_more
+
+
 def test_round_receipt_sweep_observes_payload_digest_change(active):
     store, _ = active
     with store.transaction() as db:
@@ -183,6 +239,17 @@ def test_classified_receipt_sweep_attributes_real_finalized_round(rig):
         bounded = read_classified_review_round_receipt_sweep_page(db, limit=1)
         assert isinstance(bounded, ClassifiedReviewRoundReceiptSweepPage)
         assert len(bounded.sources) == 1 and bounded.has_more
+        raw = read_review_round_receipt_sweep_page(db, limit=1)
+        assert isinstance(raw, ObservedReviewRoundReceiptSweepPage)
+        assert bounded.source_bytes == raw.source_bytes
+        exact = read_classified_review_round_receipt_sweep_page(
+            db, max_source_bytes=raw.source_bytes,
+        )
+        assert isinstance(exact, ClassifiedReviewRoundReceiptSweepPage)
+        assert exact.sources == bounded.sources and exact.source_bytes == raw.source_bytes
+        assert isinstance(read_classified_review_round_receipt_sweep_page(
+            db, max_source_bytes=raw.source_bytes - 1,
+        ), BlockedReviewRoundReceiptSweepPage)
         cursor = upper = None
         classified = []
         before = db.total_changes
