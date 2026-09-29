@@ -11,10 +11,9 @@ from .review_checkpoint_chain import (
     ReviewCheckpointChainCursor,
 )
 from .review_execution import (
-    ReviewExecutionBoundaryCursor, ReviewExecutionCheckpoint,
-    ReviewExecutionCompactionRoundSource, ReviewExecutionOrigin,
-    ReviewExecutionState, ReviewGenerationArchiveFingerprint, ReviewRoundOutcome,
-    project_review_execution, same_execution_episode,
+    ReviewExecutionBoundaryCursor, ReviewExecutionCompactionRoundSource,
+    ReviewExecutionOrigin, ReviewGenerationArchiveFingerprint,
+    same_execution_episode,
 )
 from .workflow_identity import validate_workflow_identifier
 
@@ -99,7 +98,6 @@ class ReviewCheckpointArchiveSegment:
     preceding: ReviewExecutionBoundaryCursor | None
     round_stream_sha256: str
     generation_stream_sha256: str
-    round_replay_state: ReviewExecutionState | None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.parent, ReviewCheckpointArchiveAwaiting)
@@ -126,13 +124,6 @@ class ReviewCheckpointArchiveSegment:
             raise ValueError("checkpoint segment requires bounded source frontiers")
         _digest(self.round_stream_sha256, "checkpoint segment round stream")
         _digest(self.generation_stream_sha256, "checkpoint segment generation stream")
-        replayable = (previous.state.binding.rejection.fence.generation
-                      == current.state.binding.rejection.fence.generation)
-        if ((self.round_replay_state is None) == replayable
-                or self.round_replay_state is not None
-                and (not isinstance(self.round_replay_state, ReviewExecutionState)
-                     or self.round_replay_state.binding != previous.state.binding)):
-            raise ValueError("checkpoint segment requires a valid replay state")
 
 
 @dataclass(frozen=True)
@@ -211,20 +202,15 @@ def start_review_checkpoint_archive_segment(
         previous.state.binding.rejection.fence.generation + 1,
         previous.boundary_cursor,
         EMPTY_CHECKPOINT_ARCHIVE_SHA256, EMPTY_CHECKPOINT_ARCHIVE_SHA256,
-        previous.state if previous.state.binding.rejection.fence.generation
-        == source.receipt.checkpoint.state.binding.rejection.fence.generation else None,
     )
 
 
 def advance_review_checkpoint_archive_round(
     segment: ReviewCheckpointArchiveSegment,
     source: ReviewExecutionCompactionRoundSource,
-    outcome: ReviewRoundOutcome,
 ) -> ReviewCheckpointArchiveSegment:
     if (not isinstance(segment, ReviewCheckpointArchiveSegment)
             or not isinstance(source, ReviewExecutionCompactionRoundSource)
-            or not isinstance(outcome, ReviewRoundOutcome)
-            or outcome.round != source.round
             or source.round.sequence != segment.next_round_sequence
             or not same_execution_episode(
                 segment.source.receipt.checkpoint.state.binding, source.round.binding,
@@ -237,20 +223,11 @@ def advance_review_checkpoint_archive_round(
         str(source.round.binding.rejection.fence.generation),
         source.row_sha256, source.receipt_set_sha256,
     )).encode()
-    replay_state = segment.round_replay_state
-    if replay_state is not None:
-        previous = segment.source.receipt.previous_checkpoint
-        replay_checkpoint = ReviewExecutionCheckpoint(
-            segment.next_round_sequence - 1, replay_state,
-            previous.policy, previous.boundary_cursor,
-        )
-        replay_state = project_review_execution(replay_checkpoint, (outcome,)).state
     return ReviewCheckpointArchiveSegment(
         segment.parent, segment.source, segment.next_cursor,
         segment.next_round_sequence + 1, segment.next_generation, segment.preceding,
         hashlib.sha256(bytes.fromhex(segment.round_stream_sha256) + encoded).hexdigest(),
         segment.generation_stream_sha256,
-        replay_state,
     )
 
 
@@ -274,7 +251,6 @@ def advance_review_checkpoint_archive_generation(
         segment.next_round_sequence, segment.next_generation + 1, source.cursor,
         segment.round_stream_sha256,
         hashlib.sha256(bytes.fromhex(segment.generation_stream_sha256) + encoded).hexdigest(),
-        segment.round_replay_state,
     )
 
 
@@ -296,11 +272,6 @@ def finish_review_checkpoint_archive_segment(
             or segment.preceding != receipt.checkpoint.boundary_cursor):
         return BlockedReviewCheckpointArchiveAudit(
             segment, "checkpoint retired source streams disagree with receipt", now,
-        )
-    if (segment.round_replay_state is not None
-            and segment.round_replay_state != receipt.checkpoint.state):
-        return BlockedReviewCheckpointArchiveAudit(
-            segment, "checkpoint projected state disagrees with retired rounds", now,
         )
     encoded = "\0".join((
         segment.source.receipt_id, segment.source.source_sha256,

@@ -658,25 +658,35 @@ the complete audit benchmark.
   review found no cursor regression and confirmed those two remaining
   authority gaps. The full repository gate passed: 3,296 domain, 3,364
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
-- Checkpoint 101 adds sequential projection for checkpoint segments without
-  generation transitions. A forged checkpoint state with otherwise matching
-  round source digests reproduced the missing check; the scan now blocks it
-  after replaying each retired outcome from the predecessor state. Segments
-  with generation transitions still need their ordered boundary and
-  applied-sequence replay, and unclaimed source census remains open. This
-  change is observational and does not lift the compacted-load refusal.
-  Sol review caught an incompatible persisted segment schema; a versioned
-  cursor namespace keeps the old row intact and starts a new pass. The full
-  repository gate passed: 3,296 domain, 3,366 adapter and 2,876 app tests,
-  four import contracts and both Pyrefly checks. Sol's follow-up found no
-  remaining medium or high issue.
+- Checkpoint 101 attempted sequential state replay for round-only checkpoint
+  segments. A forged checkpoint with matching source digests reproduced the
+  missing state check, and a versioned cursor resolved a persisted-schema
+  incompatibility found by Sol review. The full gate passed: 3,296 domain,
+  3,366 adapter and 2,876 app tests, four import contracts and Pyrefly. This
+  checkpoint was subsequently withdrawn: the replay rule was not valid for
+  every compactable prefix.
+- Checkpoint 102 withdraws that replay rule. A valid partial compaction can
+  retire an earlier finalized round that a later generation boundary leaves
+  unapplied. Applying every round falsely blocks that checkpoint. Skipping
+  replay based on the live generation also misses previously applied rounds;
+  Sol review found that the audit result would depend on scan timing. The
+  checkpoint receipt does not establish whether the later boundary existed
+  when the checkpoint was written. The restored observational scan still
+  checks retired source streams and ancestry, but makes no checkpoint-state
+  proof. Full boundary applicability and checkpoint timing must be bound in
+  source evidence before replay or admission can use this result. Sol
+  independently verified the false-block and timing issue are absent after
+  withdrawal. The full gate passed: 3,296 domain, 3,365 adapter and 2,876 app
+  tests, four import contracts and both Pyrefly checks.
 
-The next seam is the transactional checkpoint writer: it must verify the full
-retired stream, use this identical round receipt-set definition, bind the
-ordered source digests, and publish the aggregate and checkpoint atomically.
-The paged audit must reconstruct all retired member payloads and unclaimed
-receipts and supply the admission gate. Keep the canonical compaction refusal
-until both are complete.
+The next seam is a source-backed applicability witness for each checkpoint
+segment. The writer must record whether all retired outcomes were applied or
+which retained following boundary selected them, then verify the full retired
+stream, use this identical round receipt-set definition, bind the ordered
+source digests, and publish the aggregate and checkpoint atomically. The paged
+audit must replay those outcomes, reconstruct retired member payloads and
+unclaimed receipts, and supply the admission gate. Keep the canonical
+compaction refusal until these checks are complete.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

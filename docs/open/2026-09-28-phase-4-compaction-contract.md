@@ -222,19 +222,16 @@ folding the same ordered digests as the checkpoint receipt builder. It compares
 each segment frontier and digest, reaches the exact origin, and records a
 completed chain digest for the next due pass. A new tip preserves the previous
 chain as a tail baseline; changed or missing predecessors persist a blocker.
-Completion is not an admission verdict: full retired generation-boundary
-replay and a census of unclaimed round rows and receipt references are still
-missing. The production writer and canonical compacted read remain disabled
-until those checks, cumulative bounds and the atomic audit gate exist.
-
-For a checkpoint segment with no generation transition, the scan now also
-projects one finalized round outcome per transaction from its predecessor
-state. It rejects a final projected state that differs from the checkpoint,
-even if the ordered source fingerprints match. Segments containing generation
-transitions still need ordered boundary replay, including applied-sequence
-semantics; this partial replay remains observational. The replay cursor uses a
-versioned `review-checkpoint-archive-scan-v2` namespace so an in-progress
-cursor from the earlier schema remains intact while the new pass starts afresh.
+Completion is not an admission verdict: checkpoint state replay and a census
+of unclaimed round rows and receipt references are still missing. A proposed
+round-only replay was withdrawn because a later generation boundary can leave
+an earlier finalized round unapplied. The checkpoint receipt does not record
+whether that boundary existed when the checkpoint was written. Live generation
+alone cannot determine which earlier outcomes were applied. State proof needs
+source-backed boundary applicability and checkpoint timing before any audit
+result can gate authority. The production writer and canonical compacted read
+remain disabled until those checks, cumulative bounds and the atomic audit
+gate exist.
 
 A read-only receipt sweep page now covers the twelve namespaces used by the
 round receipt-set definition, including command-keyed submission and recorded
