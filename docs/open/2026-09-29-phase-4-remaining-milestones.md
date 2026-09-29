@@ -44,6 +44,21 @@ four architecture contracts and both Pyrefly checks). Legacy scalar files do
 not retain multi-round chronology or reset order, and the SQL-era replay still
 lacks a proved imported sequence-zero origin. The required valid multi-round
 import fixture and production decision remain open; the milestone stays Doing.
+Checkpoint 135 adds a bounded transaction-local census of retained rejection
+workflows and a source-bound, fresh remote screen for the strictly empty-history
+case. An observational whole-repository plan now derives deterministic
+imported sequence-zero decisions only if every listed open PR has a canonical
+inactive workflow, matching counter linkage, complete current reviews, no
+review marker, external hold, or prior review, revision, rearm intent or verdict
+label. Fresh rereads of unchanged facts retain the same plan identity. It carries
+the complete legacy source, workflow and inventory digests but writes no
+authority. Retained terminal PR workflows currently block the whole import;
+they cannot be inferred absent from an open-only listing. The production writer,
+historical multi-round proof, reset order and delivered verdict-hold evidence
+remain open. Luna's independent review found no false-eligible path; the final
+full gate passed (3,332 domain, 3,625 adapter, 2,881 app tests, four
+architecture contracts and both Pyrefly checks). The milestone count is
+unchanged.
 
 ## Progress rule
 

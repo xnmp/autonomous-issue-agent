@@ -489,6 +489,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_execution_counter_mapping.py` (offline attribution of legacy issue and negated-PR counter files from complete open-PR linkage observations; shared issue keys block),
 `domain/review_execution_death_import.py` (observational whole-set attribution of abandoned owner runs and current counter files; ambiguous or cross-PR deaths block),
 `domain/review_execution_history_import.py` (pure per-PR classification of inherited review evidence; empty observations remain nonauthoritative and historical sources retain specific blockers),
+`domain/review_execution_import_plan.py` (pure source-bound zero-history screening and deterministic observational whole-repository import proposals; no authority writer),
 `domain/review_execution_session_import.py` (fail-closed classification of legacy session files; real handles retain source evidence but cannot yet grant reuse),
 `domain/review_rounds.py` (pure outer-round plans, verified evidence and finalization),
 `domain/review_archive_source_versions.py` (pure canonical revision value for paged archive source witnesses),
@@ -565,6 +566,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_execution_compaction.py` (transaction-local retired-source proposal and checkpoint receipt reconstruction; no compaction authority),
 `adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
 `adapters/review_execution_import_sources.py` (barrier-held legacy file/PR-link and SQL source revalidation, including current registration/lifecycle command membership before counter attribution),
+`adapters/review_execution_workflow_census.py` (bounded transaction-local census of every retained review PR workflow against the complete open listing; terminal rows currently block import),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
@@ -593,7 +595,7 @@ adapters live under `adapters/dashweb/`.
 `app/loop.py`, `app/main.py`,
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
-`app/review_execution_import.py` (configuration-bound legacy owner source checks),
+`app/review_execution_import.py` (configuration-bound legacy source checks and observational whole-repository zero-history import planning),
 `app/review_runtime.py` (the active review family's dispatch plan, bound
 submission authority, trusted external holds and fix-side guidance read, and the
 one review-control composition the daemon and the operator transport share),

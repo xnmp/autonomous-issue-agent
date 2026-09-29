@@ -132,6 +132,18 @@ because prior issue linkage is unresolved. Independent Luna review and full
 tests; four architecture contracts and both Pyrefly checks). A source-backed
 imported origin, ordered reset proof and genuine multi-round import fixture
 remain open. Phase 4 and the six-phase acceptance counts are unchanged.
+Checkpoint 135 inventories all retained rejection workflows
+in a bounded transaction-local census and screens the strictly empty-history
+case against complete fresh remote PR reviews, head, labels and workflow state.
+A whole-repository plan derives deterministic imported sequence-zero proposals
+only when every open PR is eligible; it is observational and has no writer.
+Retained terminal PR rows block this open-only census until a complete terminal
+source is joined. The production writer, source-backed multi-round origin,
+ordered resets, current delivered verdict holds and archive admission gate
+remain open. Independent Luna review found no false-eligible path. The final
+full `make test` passed: 3,332 domain, 3,625 adapter and 2,881 app tests,
+gate parity, four architecture contracts and both Pyrefly checks. Phase 4
+and the acceptance counts remain unchanged.
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 

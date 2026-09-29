@@ -1225,6 +1225,34 @@ expected-source proof and settlement provenance are present.
   open; milestone 1 is still Doing, with 0 of 7 phase-4 milestones and 3 of
   6 architecture phases accepted. No live authority was activated.
 
+- Checkpoint 135 adds a bounded transaction-local census of every retained
+  rejection PR workflow. It compares canonical inactive rows to the complete
+  open-PR listing and refuses missing, extra or terminal rows, repository
+  aliases, malformed metadata, oversized payloads and global scan exhaustion.
+  The configuration-bound import composition now joins that census to the
+  rechecked legacy source set and screens each PR against a complete, fresh
+  remote observation, linked head, workflow history, review markers, rearm
+  state, external holds and current verdict label. Nonzero rejection workflow
+  generation or version blocks this first import case because the current
+  snapshot cannot prove the earlier transition chain. A fresh reread of
+  unchanged remote facts retains the same source and plan identity, while
+  observation freshness remains separately enforced; order-only changes in
+  the complete review list also retain that identity. A pure whole-repository plan produces
+  deterministic imported sequence-zero decisions for the strictly empty
+  history case, bound to source and inventory digests. It writes no authority.
+  Luna's independent review found no remaining false-eligible path in this
+  observational slice; it confirmed that retained closed or merged workflow
+  rows currently block the whole repository. That requires a separate
+  terminal-state source before production import. A real multi-round legacy
+  fixture, reset proof, delivered verdict-hold evidence and the atomic writer
+  remain open; milestone 1 and phase 4 are not accepted. The final full
+  `make test` passed: 3,332 domain, 3,625 adapter and 2,881 app tests, gate
+  parity, four architecture contracts and both Pyrefly checks. Log:
+  `/tmp/phase4-zero-history-plan-verified.log` (ephemeral). The first two
+  gate attempts were interrupted: a digest-contract correction stopped the
+  first, and stopped pytest temporary directories exhausted sandbox quota in
+  the second. The final run is the passing evidence.
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round

@@ -26,10 +26,14 @@ from issue_agent.adapters.review_execution_import_sources import (
     ObservedLegacyExecutionSqlImportSources, RevalidatedLegacyExecutionImportSources,
     held_legacy_execution_counter_sources,
 )
+from issue_agent.adapters.review_execution_workflow_census import BlockedRetainedReviewWorkflows
+from issue_agent.adapters.workflow_rows import encode_workflow_episodes, insert_workflow_component
 from issue_agent.app.config import (
     HarnessConfig, configured_prior_owner_ids, owner_identity_for_target,
 )
 from issue_agent.app.review_execution_import import (
+    BlockedReviewImportObservationSet, ObservedReviewExecutionImportCandidates,
+    assess_configured_review_execution_import_candidates, plan_configured_empty_review_execution_import,
     classify_configured_legacy_review_import_history,
     verify_configured_legacy_execution_import_sources,
 )
@@ -38,8 +42,17 @@ from issue_agent.domain.review_execution_counter_mapping import CompleteLegacyOp
 from issue_agent.domain.review_execution_history_import import (
     ReviewImportBlockerKind, ReviewImportHistoryBlocked, ReviewImportNoHistoryObserved,
 )
+from issue_agent.domain.review_execution_import_plan import (
+    BlockedZeroHistoryReviewImport, EligibleZeroHistoryReviewImport,
+    EmptyReviewExecutionImportPlan, ZeroHistoryImportBlockerKind,
+)
+from issue_agent.domain.resolve_activation import DeploymentInventory
 from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
 from issue_agent.domain.review_registration_membership_audit import CompletedReviewRegistrationMembership
+from issue_agent.domain.labels import Label
+from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState, RecordedPullRequest
+from issue_agent.domain.review_workflow_policy import initial_review_workflow
+from issue_agent.domain.workflow_identity import FamilyAuthority, PullRequestRef, WorkflowFamily, WorkflowKey
 from issue_agent.domain.world import PRView
 
 
@@ -213,6 +226,118 @@ def test_configured_history_blocks_real_legacy_round_file(sources):
     assert isinstance(result[0], ReviewImportHistoryBlocked)
     assert result[0].pr == 9
     assert [blocker.kind for blocker in result[0].blockers] == [ReviewImportBlockerKind.ORIGIN]
+
+
+def _record_review_workflow(control, pr):
+    key = WorkflowKey("o/r", PullRequestRef(pr))
+    snapshot = initial_review_workflow(key, FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1))
+    with control.transaction() as db:
+        if pr == 9:
+            db.execute(
+                "INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
+                ("o/r", WorkflowFamily.REVIEW_REJECTIONS.value, 1,
+                 "a" * 64, "b" * 64, "2026-09-30T00:00:00+00:00"),
+            )
+        db.execute(
+            "INSERT INTO workflows VALUES (?,?,?,?,?,?)",
+            ("o/r", "pr", pr, 0, 0, encode_workflow_episodes(snapshot)),
+        )
+        insert_workflow_component(db, key, snapshot.authority, snapshot.episode.episode_id)
+    return key
+
+
+def test_configured_candidate_joins_every_retained_row_to_current_open_pr(sources):
+    cfg, control, _gateway, roots, files, _links = sources
+    gateway = OnePRGateway()
+    key = _record_review_workflow(control, 9)
+    links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
+    observed = _sql_sources(cfg, control, include_prior=True)
+    assert isinstance(links, CompleteLegacyOpenCounterLinks)
+    recorded = RecordedPullRequest(ObservedPullRequest(
+        key, "a" * 40, PullRequestState.OPEN, frozenset({Label.AI_PR_OPEN}),
+        CompleteReviews(()), datetime.now(timezone.utc),
+    ))
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, cfg.repo, roots, files, links,
+        review_state_dir=cfg.review_state_dir,
+        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+    ) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = assess_configured_review_execution_import_candidates(
+                cfg, db, held, observed, (recorded,),
+            )
+
+    assert isinstance(result, ObservedReviewExecutionImportCandidates)
+    assert result.source_digest is not None
+    assert len(result.candidates) == 1
+    assert isinstance(result.candidates[0], EligibleZeroHistoryReviewImport)
+    assert result.candidates[0].pr == 9
+    plan = plan_configured_empty_review_execution_import(result, DeploymentInventory("o/r"), 1)
+    assert isinstance(plan, EmptyReviewExecutionImportPlan)
+    assert plan.source_digest == result.source_digest
+    assert plan.decisions_at(datetime.now(timezone.utc))[0].checkpoint.state.binding.rejection == result.candidates[0].workflow.binding
+    assert isinstance(plan_configured_empty_review_execution_import(
+        result, DeploymentInventory("o/r", active_runs=("run-1",)), 1,
+    ), BlockedReviewImportObservationSet)
+
+
+def test_configured_candidate_refuses_a_second_retained_workflow(sources):
+    cfg, control, _gateway, roots, files, _links = sources
+    gateway = OnePRGateway()
+    key = _record_review_workflow(control, 9)
+    _record_review_workflow(control, 10)
+    links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
+    observed = _sql_sources(cfg, control, include_prior=True)
+    assert isinstance(links, CompleteLegacyOpenCounterLinks)
+    recorded = RecordedPullRequest(ObservedPullRequest(
+        key, "a" * 40, PullRequestState.OPEN, frozenset({Label.AI_PR_OPEN}),
+        CompleteReviews(()), datetime.now(timezone.utc),
+    ))
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, cfg.repo, roots, files, links,
+        review_state_dir=cfg.review_state_dir,
+        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+    ) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = assess_configured_review_execution_import_candidates(
+                cfg, db, held, observed, (recorded,),
+            )
+
+    assert isinstance(result, BlockedRetainedReviewWorkflows)
+    assert "terminal_or_extra=(10,)" in result.reason
+
+
+def test_configured_candidate_keeps_missing_remote_read_as_a_pr_blocker(sources):
+    cfg, control, _gateway, roots, files, _links = sources
+    gateway = OnePRGateway()
+    _record_review_workflow(control, 9)
+    links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
+    observed = _sql_sources(cfg, control, include_prior=True)
+    assert isinstance(links, CompleteLegacyOpenCounterLinks)
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, cfg.repo, roots, files, links,
+        review_state_dir=cfg.review_state_dir,
+        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+    ) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = assess_configured_review_execution_import_candidates(
+                cfg, db, held, observed, (),
+            )
+
+    assert isinstance(result, ObservedReviewExecutionImportCandidates)
+    assert result.source_digest is None
+    assert result.candidates == (
+        BlockedZeroHistoryReviewImport(9, ZeroHistoryImportBlockerKind.REMOTE_UNAVAILABLE),
+    )
+    assert isinstance(plan_configured_empty_review_execution_import(
+        result, DeploymentInventory("o/r"), 1,
+    ), BlockedReviewImportObservationSet)
 
 
 def test_configured_import_refuses_a_substituted_legacy_root(sources, tmp_path):
