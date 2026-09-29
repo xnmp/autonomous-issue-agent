@@ -14,6 +14,9 @@ from issue_agent.adapters.review_execution_archive_audit import (
 from issue_agent.adapters.review_execution_archive_evidence import (
     observe_review_execution_archive_evidence,
 )
+from issue_agent.adapters.review_lifecycle_archive_audit import (
+    advance_review_lifecycle_archive_audit,
+)
 from issue_agent.adapters.review_archive_source_versions import read_review_archive_source_versions
 from issue_agent.adapters.review_checkpoint_application_source import (
     REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, read_review_checkpoint_application_source,
@@ -35,6 +38,7 @@ from issue_agent.domain.review_execution import (
 from issue_agent.domain.review_execution_archive_evidence import (
     ObservedReviewExecutionArchiveEvidence,
 )
+from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
 from issue_agent.domain.review_round_archive import (
     CompletedReviewRoundArchiveScan, ReviewRoundArchiveCursor,
 )
@@ -44,6 +48,7 @@ from tests.adapters.test_review_checkpoint_archive_audit import (
 )
 from tests.adapters.test_review_execution_control import rig
 from tests.adapters.test_review_execution_persistence import active
+from tests.adapters.test_review_archive_source_versions import _insert_lifecycle_command
 
 
 def _complete(store, key, now):
@@ -60,6 +65,13 @@ def _complete(store, key, now):
                 break
         else:
             raise AssertionError(f"{advance.__name__} did not complete")
+    for _ in range(64):
+        with store.transaction() as db:
+            state = advance_review_lifecycle_archive_audit(db, key.repository, now=now)
+        if isinstance(state, CompletedReviewLifecycleArchiveAudit):
+            break
+    else:
+        raise AssertionError("lifecycle audit did not complete")
 
 
 def test_current_completed_archive_passes_join_without_writes(active):
@@ -103,6 +115,61 @@ def test_archive_join_requires_all_completed_passes(active):
     with store.transaction() as db:
         with pytest.raises(WorkflowAuthorityError, match="awaits complete"):
             observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_requires_completed_lifecycle_census(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        db.execute("DELETE FROM level_state WHERE namespace='review-lifecycle-archive-scan-v1'")
+        with pytest.raises(WorkflowAuthorityError, match="awaits complete"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_mutated_lifecycle_source_until_recensus(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        _insert_lifecycle_command(db, "foreign:after-census", kind="other")
+        with pytest.raises(WorkflowAuthorityError, match="lifecycle census is stale"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+    for _ in range(64):
+        with store.transaction() as db:
+            state = advance_review_lifecycle_archive_audit(db, key.repository, now=now)
+        if isinstance(state, CompletedReviewLifecycleArchiveAudit):
+            break
+    else:
+        raise AssertionError("changed lifecycle audit did not complete")
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+    assert observed.lifecycle.source_version == state.source_version
+
+
+def test_archive_join_rejects_lifecycle_census_from_another_repository(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+    with pytest.raises(ValueError, match="another repository"):
+        replace(observed, lifecycle=replace(observed.lifecycle, repository="other/repo"))
+
+
+def test_archive_join_rejects_overdue_lifecycle_census(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        observed = observe_review_execution_archive_evidence(db, key, now=now)
+    due = now + timedelta(seconds=1)
+    with pytest.raises(ValueError, match="premature or overdue"):
+        replace(
+            observed,
+            lifecycle=replace(observed.lifecycle, next_due_at=due),
+            observed_at=due,
+        )
 
 
 def test_archive_join_rejects_overdue_and_future_completion(active):

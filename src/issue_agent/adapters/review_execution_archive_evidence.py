@@ -1,4 +1,4 @@
-"""Read-only join of the four completed execution archive observations."""
+"""Read-only join of completed execution and lifecycle archive observations."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from datetime import datetime
 from ..domain.review_checkpoint_archive import CompletedReviewCheckpointArchiveAudit
 from ..domain.review_execution import CompletedReviewGenerationArchiveAudit
 from ..domain.review_execution_archive_evidence import ObservedReviewExecutionArchiveEvidence
+from ..domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
 from ..domain.review_round_archive import CompletedReviewRoundArchiveScan
 from ..domain.review_round_receipt_archive import CompletedReviewRoundReceiptArchiveAudit
 from ..domain.workflow_identity import WorkflowKey
@@ -19,7 +20,9 @@ from .review_execution_archive_audit import (
     _audit_key as _generation_key, _read_state as _generation_state,
 )
 from .review_execution_activation import _read_recording_source
-from .review_archive_source_versions import read_review_archive_source_versions
+from .review_archive_source_versions import (
+    read_review_archive_source_versions, read_review_lifecycle_source_version,
+)
 from .review_checkpoint_application_source import read_review_checkpoint_application_source
 from .review_checkpoint_following_source import read_checkpoint_following_application_source
 from .review_round_archive_audit import (
@@ -28,6 +31,7 @@ from .review_round_archive_audit import (
 from .review_round_receipt_archive_audit import (
     _audit_key as _receipt_key, _read_state as _receipt_state,
 )
+from .review_lifecycle_archive_audit import read_review_lifecycle_archive_state
 from .workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError,
     _check_execution_checkpoint_receipt, _read_execution_origin, workflow_scope,
@@ -65,10 +69,12 @@ def observe_review_execution_archive_evidence(
     _, generations, generation_sources_version, _ = _generation_state(
         db, key.repository, _generation_key(key, epoch, episode),
     )
+    lifecycle = read_review_lifecycle_archive_state(db, key.repository)
     if (not isinstance(checkpoint, CompletedReviewCheckpointArchiveAudit)
             or not isinstance(rounds, CompletedReviewRoundArchiveScan)
             or not isinstance(receipts, CompletedReviewRoundReceiptArchiveAudit)
-            or not isinstance(generations, CompletedReviewGenerationArchiveAudit)):
+            or not isinstance(generations, CompletedReviewGenerationArchiveAudit)
+            or not isinstance(lifecycle, CompletedReviewLifecycleArchiveAudit)):
         raise WorkflowAuthorityError("execution archive awaits complete source and census passes")
     current_versions = read_review_archive_source_versions(db, key.repository)
     if round_rows_version != current_versions.round_rows:
@@ -78,6 +84,8 @@ def observe_review_execution_archive_evidence(
         raise WorkflowAuthorityError("execution archive receipt census is stale")
     if generation_sources_version != current_versions.generation_sources:
         raise WorkflowAuthorityError("execution archive generation census is stale")
+    if lifecycle.source_version != read_review_lifecycle_source_version(db):
+        raise WorkflowAuthorityError("execution archive lifecycle census is stale")
     origin, _ = _read_execution_origin(db, scope, execution)
     _, origin_digest = _read_recording_source(
         db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,
@@ -100,7 +108,7 @@ def observe_review_execution_archive_evidence(
         raise WorkflowAuthorityError("execution archive checkpoint census is stale")
     try:
         evidence = ObservedReviewExecutionArchiveEvidence(
-            execution, checkpoint, rounds, receipts, generations, now,
+            execution, checkpoint, rounds, receipts, generations, lifecycle, now,
         )
         if evidence.rounds.origin_source_sha256 != origin_digest:
             raise ValueError("execution archive origin source changed since its passes")

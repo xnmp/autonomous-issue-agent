@@ -1064,6 +1064,23 @@ the complete audit benchmark.
   This is an observational census only: no production writer, read-only
   archive join or admission gate consumes it yet. It does not establish
   historical reset/session proof.
+- Checkpoint 128 makes the read-only execution archive join require the
+  completed repository lifecycle census alongside the checkpoint, round,
+  receipt and generation passes. It compares the lifecycle revision with the
+  current schema witness in the same SQL transaction, and the pure joined
+  evidence checks repository binding and the completion window. Missing,
+  changed or overdue lifecycle observations refuse the join; a full recensus
+  after an unrelated global command mutation restores it. This remains an
+  observation, with no admission or production writer authority. The lifecycle
+  cursor checks current membership only: it accepts a newly consistent census
+  after mutation without preserving the prior completed member set. The writer
+  and admission gate must bind expected archived sources before treating this
+  joined observation as authority. Independent Sol review found no concrete
+  join defect and confirmed this existing authority limit. Full `make test`
+  passed: 3,302 domain, 3,579 adapter and 2,876 app tests, hooks, governor,
+  four import contracts and both Pyrefly checks. Ten strict xfails remained
+  expected. Log: `/tmp/review-lifecycle-join-gate.log` (ephemeral). The four
+  paused services remained inactive.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

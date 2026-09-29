@@ -491,10 +491,12 @@ The phase-4 archive source audit now has schema-maintained mutation revisions
 for round rows, round receipts, generation and checkpoint sources, workflows,
 and lifecycle command/effect rows. Paged round, receipt, generation and
 checkpoint audits consume the applicable revisions and a read-only join
-rejects stale completions. A durable lifecycle audit now reconciles selected
-command and effect membership under the shared mutation revision; it remains
-observational until the atomic checkpoint writer and admission join consume
-it. Schema v31 also makes witness overflow abort under SQLite conflict policies such as
+rejects stale completions. A durable lifecycle audit reconciles selected
+command and effect membership under the shared mutation revision, and the
+read-only join rejects a missing, stale or overdue lifecycle completion. This
+remains observational until the atomic checkpoint writer and admission gate
+consume it. Schema v31 also makes witness overflow abort under SQLite conflict
+policies such as
 `OR IGNORE`, closing a mutation-without-revision bypass across all source
 groups. Phase 4 is still in progress; no production import or admission gate
 uses this lineage yet.
@@ -502,7 +504,8 @@ The lifecycle command and effect streams have separate fixed-size global
 rowid pages. A resumable cursor persists their selected review membership
 across transactions, compares effect links with command-joined receipts, and
 restarts after a source mutation. A repaired blocked source is rescanned when
-its revision changes. No production writer or admission gate uses this result.
+its revision changes. The read-only archive join consumes the result; no
+production writer or admission gate does.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched

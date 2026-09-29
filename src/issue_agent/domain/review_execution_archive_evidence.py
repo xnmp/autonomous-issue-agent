@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 
 from .review_checkpoint_archive import CompletedReviewCheckpointArchiveAudit
+from .review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
 from .review_execution import (
     ActivatedReviewExecution, CompletedReviewGenerationArchiveAudit,
     ReviewExecutionBoundaryCursor, same_execution_episode,
@@ -23,6 +24,7 @@ class ObservedReviewExecutionArchiveEvidence:
     rounds: CompletedReviewRoundArchiveScan
     receipts: CompletedReviewRoundReceiptArchiveAudit
     generations: CompletedReviewGenerationArchiveAudit
+    lifecycle: CompletedReviewLifecycleArchiveAudit
     observed_at: datetime
 
     def __post_init__(self) -> None:
@@ -31,6 +33,7 @@ class ObservedReviewExecutionArchiveEvidence:
                 or not isinstance(self.rounds, CompletedReviewRoundArchiveScan)
                 or not isinstance(self.receipts, CompletedReviewRoundReceiptArchiveAudit)
                 or not isinstance(self.generations, CompletedReviewGenerationArchiveAudit)
+                or not isinstance(self.lifecycle, CompletedReviewLifecycleArchiveAudit)
                 or not isinstance(self.observed_at, datetime)
                 or self.observed_at.tzinfo is None
                 or self.observed_at.utcoffset() is None):
@@ -59,6 +62,8 @@ class ObservedReviewExecutionArchiveEvidence:
                 or receipt_scan.origin_source_sha256 != digest
                 or generation_scan.origin_source_sha256 != digest):
             raise ValueError("execution archive passes disagree on origin or checkpoint tip")
+        if self.lifecycle.repository != execution.binding.rejection.fence.key.repository:
+            raise ValueError("execution archive lifecycle census belongs to another repository")
         if (self.rounds.through_sequence != execution.last_sequence
                 or not execution.checkpoint.through_sequence
                 <= receipt_scan.through_sequence <= execution.last_sequence
@@ -69,10 +74,12 @@ class ObservedReviewExecutionArchiveEvidence:
         completed = (
             self.checkpoints.completed_at, self.rounds.completed_at,
             self.receipts.completed_at, self.generations.completed_at,
+            self.lifecycle.completed_at,
         )
         due = (
             self.checkpoints.next_due_at, self.rounds.next_due_at,
             self.receipts.next_due_at, self.generations.next_due_at,
+            self.lifecycle.next_due_at,
         )
         if any(time > self.observed_at for time in completed) or any(
             self.observed_at >= time for time in due
