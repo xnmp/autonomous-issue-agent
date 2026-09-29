@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 30
+SCHEMA_VERSION = 31
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2046,6 +2046,77 @@ BEGIN
     );
     UPDATE review_archive_source_versions SET version=version+1
     WHERE source='workflow_rows' AND scope=X'';
+END;
+"""),
+    SchemaMigration(31, """
+INSERT INTO review_archive_source_versions(source,scope,version)
+VALUES ('lifecycle_rows',X'',0);
+CREATE TRIGGER review_archive_source_version_overflow
+BEFORE UPDATE OF version ON review_archive_source_versions
+WHEN typeof(NEW.version)!='integer'
+    OR NEW.version NOT BETWEEN 0 AND 9223372036854775806
+BEGIN
+    SELECT RAISE(ABORT,'archive source witness version overflow');
+END;
+CREATE TRIGGER review_lifecycle_command_source_insert AFTER INSERT ON lifecycle_commands
+BEGIN
+    SELECT RAISE(ABORT,'lifecycle source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='lifecycle_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='lifecycle_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_lifecycle_command_source_update AFTER UPDATE ON lifecycle_commands
+BEGIN
+    SELECT RAISE(ABORT,'lifecycle source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='lifecycle_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='lifecycle_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_lifecycle_command_source_delete AFTER DELETE ON lifecycle_commands
+BEGIN
+    SELECT RAISE(ABORT,'lifecycle source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='lifecycle_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='lifecycle_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_lifecycle_effect_source_insert AFTER INSERT ON effect_receipts
+BEGIN
+    SELECT RAISE(ABORT,'lifecycle source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='lifecycle_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='lifecycle_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_lifecycle_effect_source_update AFTER UPDATE ON effect_receipts
+BEGIN
+    SELECT RAISE(ABORT,'lifecycle source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='lifecycle_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='lifecycle_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_lifecycle_effect_source_delete AFTER DELETE ON effect_receipts
+BEGIN
+    SELECT RAISE(ABORT,'lifecycle source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='lifecycle_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='lifecycle_rows' AND scope=X'';
 END;
 """),
 )

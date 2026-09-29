@@ -1,12 +1,14 @@
 """Durable mutation witnesses for paged review archive sources."""
 
 from contextlib import closing
+import hashlib
 import sqlite3
 
 import pytest
 
 from issue_agent.adapters.review_archive_source_versions import (
     MAX_ARCHIVE_SOURCE_VERSION, read_review_archive_source_versions,
+    read_review_lifecycle_source_version,
 )
 from issue_agent.adapters.review_round_receipt_sweep import ROUND_RECEIPT_NAMESPACES
 from issue_agent.adapters.workflow_codec import encode_workflow
@@ -47,6 +49,28 @@ def _clone_workflow_repository(db, repository):
         "SELECT ?,target_kind,target_number,generation,version,episode_json FROM workflows "
         "WHERE repository='o/r' AND target_kind='pr'",
         (repository,),
+    )
+
+
+def _insert_lifecycle_command(
+    db, command_id="fixture:command", kind="submit_review", state="succeeded",
+):
+    db.execute(
+        "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,kind,target,"
+        "payload_json,payload_digest,state,created_at,updated_at) "
+        "VALUES (?,?,?,?,'pr:1','{}',?,?,"
+        "'2026-09-29T00:00:00+00:00','2026-09-29T00:00:00+00:00')",
+        (command_id, command_id, command_id, kind,
+         hashlib.sha256(b"{}").hexdigest(), state),
+    )
+
+
+def _insert_lifecycle_effect(db, command_id="fixture:command"):
+    db.execute(
+        "INSERT INTO effect_receipts(command_id,executor_identity,started_at,completed_at,"
+        "status,receipt_digest) VALUES (?,'fixture',"
+        "'2026-09-29T00:00:00+00:00','2026-09-29T00:00:00+00:00','succeeded',?)",
+        (command_id, "b" * 64),
     )
 
 
@@ -680,6 +704,235 @@ def test_checkpoint_and_workflow_witnesses_block_missing_and_overflow(active, so
             read_review_archive_source_versions(db, "o/r")
         with pytest.raises(sqlite3.IntegrityError, match="source witness is absent"):
             db.execute(mutation)
+
+
+def test_lifecycle_witness_covers_command_and_effect_mutations(active):
+    store, _ = active
+    with store.transaction() as db:
+        before = read_review_lifecycle_source_version(db)
+        _insert_lifecycle_command(db)
+        _insert_lifecycle_effect(db)
+        inserted = read_review_lifecycle_source_version(db)
+        assert inserted == before + 2
+        db.execute(
+            "UPDATE lifecycle_commands SET repository=CAST('other/repo' AS BLOB) "
+            "WHERE command_id='fixture:command'"
+        )
+        db.execute(
+            "UPDATE effect_receipts SET remote_revision=remote_revision "
+            "WHERE command_id='fixture:command'"
+        )
+        assert read_review_lifecycle_source_version(db) == inserted + 2
+        db.execute("DELETE FROM effect_receipts WHERE command_id='fixture:command'")
+        db.execute("DELETE FROM lifecycle_commands WHERE command_id='fixture:command'")
+        assert read_review_lifecycle_source_version(db) == inserted + 4
+
+
+def test_lifecycle_witness_catches_implicit_replacement(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_lifecycle_command(db)
+        before = read_review_lifecycle_source_version(db)
+        db.execute(
+            "INSERT OR REPLACE INTO lifecycle_commands(command_id,idempotency_key,logical_key,"
+            "kind,target,payload_json,payload_digest,state,created_at,updated_at) "
+            "VALUES ('replacement:command','fixture:command','replacement:command',"
+            "'other','pr:1','{}',?,'succeeded',"
+            "'2026-09-29T00:00:00+00:00','2026-09-29T00:00:00+00:00')",
+            ("a" * 64,),
+        )
+        assert read_review_lifecycle_source_version(db) == before + 1
+        assert db.execute(
+            "SELECT command_id FROM lifecycle_commands WHERE idempotency_key='fixture:command'"
+        ).fetchone()[0] == "replacement:command"
+        _insert_lifecycle_effect(db, "replacement:command")
+        with_effect = read_review_lifecycle_source_version(db)
+        db.execute(
+            "INSERT OR REPLACE INTO effect_receipts(command_id,executor_identity,started_at,"
+            "completed_at,status,receipt_digest) VALUES ('replacement:command','fixture',"
+            "'2026-09-29T00:00:00+00:00','2026-09-29T00:00:00+00:00','succeeded',?)",
+            ("c" * 64,),
+        )
+        assert read_review_lifecycle_source_version(db) == with_effect + 1
+
+
+def test_lifecycle_witness_catches_implicit_update_replacement(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_lifecycle_command(db, "fixture:first", state="pending")
+        _insert_lifecycle_command(db, "fixture:second", state="pending")
+        before = read_review_lifecycle_source_version(db)
+        db.execute(
+            "UPDATE OR REPLACE lifecycle_commands SET idempotency_key='fixture:first' "
+            "WHERE command_id='fixture:second'"
+        )
+        assert read_review_lifecycle_source_version(db) == before + 1
+        assert db.execute(
+            "SELECT command_id FROM lifecycle_commands WHERE idempotency_key='fixture:first'"
+        ).fetchone()[0] == "fixture:second"
+
+
+def test_lifecycle_witness_survives_v30_migration_with_existing_rows(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_lifecycle_command(db)
+        _insert_lifecycle_effect(db)
+    with closing(sqlite3.connect(store.path)) as db:
+        _historical_fixture(db, 30)
+        db.commit()
+    store.initialize()
+    with store.transaction() as db:
+        assert read_review_lifecycle_source_version(db) == 0
+        db.execute(
+            "UPDATE lifecycle_commands SET repository='o/r' WHERE command_id='fixture:command'"
+        )
+        db.execute(
+            "UPDATE effect_receipts SET remote_revision='fixture' "
+            "WHERE command_id='fixture:command'"
+        )
+        assert read_review_lifecycle_source_version(db) == 2
+
+
+def test_lifecycle_witness_rollback_is_atomic(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_lifecycle_command(db)
+        _insert_lifecycle_effect(db)
+        baseline = read_review_lifecycle_source_version(db)
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        db.execute(
+            "UPDATE lifecycle_commands SET repository='other/repo' "
+            "WHERE command_id='fixture:command'"
+        )
+        db.execute(
+            "UPDATE effect_receipts SET remote_revision='changed' "
+            "WHERE command_id='fixture:command'"
+        )
+        assert read_review_lifecycle_source_version(db) == baseline + 2
+        db.rollback()
+    with store.transaction() as db:
+        assert read_review_lifecycle_source_version(db) == baseline
+        assert db.execute(
+            "SELECT remote_revision FROM effect_receipts WHERE command_id='fixture:command'"
+        ).fetchone()[0] is None
+
+
+@pytest.mark.parametrize("table,column", (
+    ("lifecycle_commands", "repository"),
+    ("effect_receipts", "remote_revision"),
+))
+def test_lifecycle_witness_blocks_missing_and_overflow(active, table, column):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_lifecycle_command(db)
+        _insert_lifecycle_effect(db)
+        db.execute(
+            "UPDATE review_archive_source_versions SET version=? "
+            "WHERE source='lifecycle_rows' AND scope=X''",
+            (MAX_ARCHIVE_SOURCE_VERSION,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(f"UPDATE {table} SET {column}={column} WHERE command_id='fixture:command'")
+        db.execute(
+            "DELETE FROM review_archive_source_versions "
+            "WHERE source='lifecycle_rows' AND scope=X''"
+        )
+        with pytest.raises(WorkflowAuthorityError, match="lifecycle row mutation witness"):
+            read_review_lifecycle_source_version(db)
+        with pytest.raises(sqlite3.IntegrityError, match="lifecycle source witness"):
+            db.execute(f"UPDATE {table} SET {column}={column} WHERE command_id='fixture:command'")
+
+
+@pytest.mark.parametrize("source,scope,mutation,unchanged", (
+    ("round_rows", b"o/r",
+     "UPDATE OR IGNORE review_execution_rounds SET planning_json='[]' WHERE round_id=?",
+     "SELECT planning_json FROM review_execution_rounds WHERE round_id=?"),
+    ("all_round_rows", b"",
+     "UPDATE OR IGNORE review_execution_rounds SET planning_json='[]' WHERE round_id=?",
+     "SELECT planning_json FROM review_execution_rounds WHERE round_id=?"),
+    ("round_receipts", b"",
+     "UPDATE OR IGNORE dedupe_keys SET payload_json='[]' WHERE key='stage:fixture'",
+     "SELECT payload_json FROM dedupe_keys WHERE key='stage:fixture'"),
+    ("generation_sources", b"",
+     "UPDATE OR IGNORE dedupe_keys SET payload_json='[]' WHERE key='generation:fixture'",
+     "SELECT payload_json FROM dedupe_keys WHERE key='generation:fixture'"),
+    ("checkpoint_sources", b"",
+     "UPDATE OR IGNORE dedupe_keys SET payload_json='[]' WHERE key='checkpoint:fixture'",
+     "SELECT payload_json FROM dedupe_keys WHERE key='checkpoint:fixture'"),
+    ("workflow_rows", b"",
+     "UPDATE OR IGNORE workflows SET episode_json='[]' WHERE repository='o/r'",
+     "SELECT episode_json FROM workflows WHERE repository='o/r'"),
+    ("lifecycle_rows", b"",
+     "UPDATE OR IGNORE lifecycle_commands SET repository='other/repo' "
+     "WHERE command_id='fixture:command'",
+     "SELECT repository FROM lifecycle_commands WHERE command_id='fixture:command'"),
+))
+def test_archive_witness_rejects_or_ignore_overflow_for_every_source(
+    active, source, scope, mutation, unchanged,
+):
+    store, snapshot = active
+    with store.transaction() as db:
+        round_id = _insert_round(db, snapshot, 1)
+        _insert_receipt(db, "review-round-stage", "stage:fixture")
+        _insert_receipt(db, "workflow-request", "generation:fixture")
+        _insert_receipt(db, "review-checkpoint-application", "checkpoint:fixture")
+        _insert_lifecycle_command(db)
+        params = (round_id,) if "round_id=?" in mutation else ()
+        before = db.execute(unchanged, params).fetchone()[0]
+        db.execute(
+            "UPDATE review_archive_source_versions SET version=? WHERE source=? AND scope=?",
+            (MAX_ARCHIVE_SOURCE_VERSION, source, scope),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="witness version overflow"):
+            db.execute(mutation, params)
+        assert db.execute(unchanged, params).fetchone()[0] == before
+        assert db.execute(
+            "SELECT version FROM review_archive_source_versions WHERE source=? AND scope=?",
+            (source, scope),
+        ).fetchone()[0] == MAX_ARCHIVE_SOURCE_VERSION
+
+
+@pytest.mark.parametrize("table", ("lifecycle_commands", "effect_receipts"))
+def test_lifecycle_witness_rejects_or_ignore_insert_at_overflow(active, table):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_lifecycle_command(db)
+        if table == "lifecycle_commands":
+            mutation = (
+                "INSERT OR IGNORE INTO lifecycle_commands(command_id,idempotency_key,logical_key,"
+                "kind,target,payload_json,payload_digest,state,created_at,updated_at) "
+                "VALUES ('fixture:extra','fixture:extra','fixture:extra','submit_review',"
+                "'pr:1','{}',?,'succeeded',"
+                "'2026-09-29T00:00:00+00:00','2026-09-29T00:00:00+00:00')"
+            )
+            params = (hashlib.sha256(b"{}").hexdigest(),)
+            absent = "SELECT 1 FROM lifecycle_commands WHERE command_id='fixture:extra'"
+        else:
+            mutation = (
+                "INSERT OR IGNORE INTO effect_receipts(command_id,executor_identity,"
+                "started_at,completed_at,status,receipt_digest) VALUES ('fixture:command',"
+                "'fixture','2026-09-29T00:00:00+00:00',"
+                "'2026-09-29T00:00:00+00:00','succeeded',?)"
+            )
+            params = ("b" * 64,)
+            absent = "SELECT 1 FROM effect_receipts WHERE command_id='fixture:command'"
+        db.execute(
+            "UPDATE review_archive_source_versions SET version=? "
+            "WHERE source='lifecycle_rows' AND scope=X''",
+            (MAX_ARCHIVE_SOURCE_VERSION,),
+        )
+        with pytest.raises(sqlite3.IntegrityError, match="witness version overflow"):
+            db.execute(mutation, params)
+        assert db.execute(absent).fetchone() is None
+        assert read_review_lifecycle_source_version(db) == MAX_ARCHIVE_SOURCE_VERSION
+
+
+def test_lifecycle_witness_requires_transaction(active):
+    store, _ = active
+    with closing(store._connect()) as db:
+        with pytest.raises(ValueError, match="transaction"):
+            read_review_lifecycle_source_version(db)
 
 
 def test_review_archive_witness_requires_transaction(active):

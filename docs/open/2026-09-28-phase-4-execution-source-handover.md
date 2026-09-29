@@ -982,6 +982,25 @@ the complete audit benchmark.
   `/tmp/review-checkpoint-archive-versioned-gate.log` (ephemeral). The four
   paused services remained inactive. This remains observational: the
   production writer and admission gate do not yet consume the completed pass.
+- Checkpoint 124 adds schema v31's global lifecycle-row mutation witness for
+  `lifecycle_commands` and `effect_receipts`. Every insert, update and delete
+  advances it, including foreign repository rows, BLOB aliases and SQLite's
+  implicit replacement paths. Migration from v30 starts a fresh revision over
+  retained historical rows. A transaction-local reader exposes this witness
+  for a future paged external-lineage audit; it is deliberately separate from
+  the checkpoint cursor's six-source revision set. Independent Sol review
+  reproduced an `INSERT OR IGNORE` overflow bypass in the original trigger:
+  the source row committed while the witness stayed fixed. The v31 migration
+  now adds an explicit version-update abort guard shared by every archive
+  witness, and the reviewer verified it against `OR IGNORE`, `OR REPLACE` and
+  `ON CONFLICT DO NOTHING`. Behavioral regressions cover each existing source
+  group plus both lifecycle tables at overflow, migration, rollback, missing
+  state and ordinary/replacement mutations. Full `make test` passed: 3,302
+  domain, 3,537 adapter and 2,876 app tests, hooks, governor, four import
+  contracts and both Pyrefly checks. Log:
+  `/tmp/review-lifecycle-source-witness-gate-v31.log` (ephemeral). The four
+  paused services remained inactive. This remains observational; no lineage
+  cursor, writer or admission authority changed.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

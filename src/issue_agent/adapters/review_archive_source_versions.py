@@ -28,6 +28,16 @@ def _read_version(db: sqlite3.Connection, source: str, scope: bytes) -> int | No
     return value
 
 
+def read_review_lifecycle_source_version(db: sqlite3.Connection) -> int:
+    """Read the global command/effect witness without changing archive census scope."""
+    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
+        raise ValueError("lifecycle source version requires a transaction")
+    version = _read_version(db, "lifecycle_rows", b"")
+    if version is None:
+        raise WorkflowAuthorityError("lifecycle row mutation witness is absent")
+    return version
+
+
 def read_review_archive_source_versions(
     db: sqlite3.Connection, repository: str,
 ) -> ReviewArchiveSourceVersions:

@@ -487,6 +487,17 @@ not budget exhaustion. This is not yet full resolve-slice acceptance.
    and inventory. Live activation and soak remain separately blocked by the
    deployment pause, not simulated as completed.
 
+The phase-4 archive source audit now has schema-maintained mutation revisions
+for round rows, round receipts, generation and checkpoint sources, workflows,
+and lifecycle command/effect rows. Paged round, receipt, generation and
+checkpoint audits consume the applicable revisions and a read-only join
+rejects stale completions. Lifecycle lineage remains observational until its
+own paged audit and the atomic checkpoint writer are implemented. Schema v31
+also makes witness overflow abort under SQLite conflict policies such as
+`OR IGNORE`, closing a mutation-without-revision bypass across all source
+groups. Phase 4 is still in progress; no production import or admission gate
+uses this lineage yet.
+
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched
 exclusions without another counter. Independent review and full `make test`
