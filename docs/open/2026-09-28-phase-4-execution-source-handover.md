@@ -1001,6 +1001,26 @@ the complete audit benchmark.
   `/tmp/review-lifecycle-source-witness-gate-v31.log` (ephemeral). The four
   paused services remained inactive. This remains observational; no lineage
   cursor, writer or admission authority changed.
+- Checkpoint 125 adds a global `lifecycle_commands` rowid page for the review
+  submission lineage census. It processes at most 64 consecutive command rows
+  plus one continuation probe per call, including negative and zero rowids and
+  unrelated commands, while retaining only selected `submit_review` rows for
+  one canonical repository.
+  A fixed upper rowid and the schema v31 lifecycle revision travel with each
+  page; a durable cursor must restart if that revision changes. Selected BLOB
+  repository/kind aliases, malformed fields and oversized command/effect
+  sources block. The 8 MiB page budget is preflighted before selected payload
+  fetches; SQLite 3.43+ uses `octet_length` metadata and older runtimes retain
+  a weaker `length(CAST(... AS BLOB))` fallback. An empty selected page still
+  advances across unrelated rowids. The page does not census independent
+  `effect_receipts` rowids, so orphaned/rekeyed effect membership, durable
+  cursor state, expected-source reconciliation and admission authority remain
+  open. Independent Sol review found no concrete medium/high issue in the
+  bounded page or the final length-gated alias predicates. Full `make test`
+  passed: 3,302 domain, 3,550 adapter and 2,876 app tests, hooks, governor,
+  four import contracts and both Pyrefly checks. Log:
+  `/tmp/review-lifecycle-global-page-gate.log` (ephemeral). The four paused
+  services remained inactive.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
