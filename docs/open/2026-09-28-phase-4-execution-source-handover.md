@@ -634,6 +634,18 @@ the complete audit benchmark.
   not a persisted checkpoint-chain join or authority to compact. The full
   gate passed: 3,296 domain, 3,349 adapter and 2,876 app tests, four import
   contracts and both Pyrefly checks.
+- Checkpoint 99 adds a bounded, read-only checkpoint predecessor page. From
+  the current component's checkpoint tip it follows one to sixteen typed
+  receipt links toward the exact origin checkpoint, checking each retained
+  receipt's canonical identity, previous frontier, claim order and six-field
+  source digest. A changed claim spelling changes the source digest even if
+  its parsed instant is equal. Missing or aliased predecessors block. The
+  caller-held page cursor is not proof of the path already traversed; a
+  durable audit must own and revalidate it before any admission decision.
+  Sol review found no remaining medium or high issue. Compacted loads still
+  refuse and no writer uses these pages. The full gate passed: 3,296 domain,
+  3,357 adapter and 2,876 app tests, four import contracts and both Pyrefly
+  checks.
 
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
@@ -642,7 +654,7 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–98, the bounded round and receipt cursors can reconcile
+With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid
 open-round receipts remain pending. Next, bind the retired member stream to
 checkpoint ancestry. The census does not prove missing open receipts,

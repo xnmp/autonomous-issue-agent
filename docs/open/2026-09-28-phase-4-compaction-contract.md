@@ -206,6 +206,15 @@ malformed rows persist a blocked state. This census does not yet join expected
 checkpoint entries or the round receipt namespace. It cannot authorize
 compaction or admission.
 
+A read-only checkpoint-chain page now walks one to sixteen canonical
+checkpoint receipts backward from the current component's tip toward the
+exact origin frontier. It rechecks the current tip, each predecessor link,
+claim order and the digest of all six retained receipt fields. A caller-held
+page cursor does not prove the earlier path; the durable audit must persist
+and revalidate that path, then match each checkpoint's segmented retired
+round and generation streams. This page does not authorize compaction,
+admission or a compacted hot read.
+
 A read-only receipt sweep page now covers the twelve namespaces used by the
 round receipt-set definition, including command-keyed submission and recorded
 review receipts. It scans all repositories in indexed namespace, scope and

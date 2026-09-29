@@ -19,13 +19,14 @@ production writers and the complete archived audit. An offline durable cursor
 now scans expected generation sources and the retained receipt namespace in
 bounded pages, comparing the set and a prior pass digest. Checkpoint ancestry
 and retired round sources are not yet joined to it. A typed checkpoint receipt
-and bounded identity/predecessor read now exist. Canonical reads point-check
+and bounded predecessor-chain pages now exist. Canonical reads point-check
 the final retired generation source pair and the final retired round's row and
 bounded receipt set, but refuse all compacted components until the checkpoint
 writer and audit gate are installed.
 A bounded transaction-local archive page now observes expected finalized round
 sequences and their row/receipt fingerprints for future writer and audit joins;
-an independent unclaimed-row census remains necessary.
+the separate durable repository sweep accounts for unclaimed rows
+observationally.
 A read-only transaction-local manifest observer now joins expected retired
 round and generation sources to a canonical prefix replay and proposes a
 typed checkpoint receipt. Its byte ceiling accounts for retained fields after
@@ -37,19 +38,15 @@ A transaction-local cursor now persists one bounded sweep page at a time,
 checks that the episode has exactly its allocated sequence count, and compares
 the prior pass's source membership when the frontier grows or a scheduled
 rescan begins. It records a missing, changed or malformed source as a blocked
-audit state. The scan is observational: checkpoint ancestry, expected retired
-round source and payload joins, a separate unclaimed-receipt pass, and the
-atomic admission gate remain to be implemented.
-A read-only indexed receipt page now observes all twelve retained round
-receipt namespaces across repositories in bounded key order. It preflights
-source bytes, rejects malformed and aliased identities, and fixes an upper
-key for a future durable pass. The complete receipt census and expected
-round membership join are still pending.
-The finalized-round point reader now exposes its bounded, sorted receipt
-members with the same source digests used by the sweep. Its aggregate hash is
-checked against the retained round fingerprint. These members provide the
-expected side of a future join; no complete census or payload proof follows
-from one observed round.
+audit state. A separate durable observational pass now compares a fixed
+finalized-round prefix and its exact classified receipt members with every
+retained receipt namespace source, leaving valid open-round receipts pending.
+The ordered round and generation stream digests each match the initial
+checkpoint builder in real-source tests. Bounded checkpoint-chain pages check
+typed predecessor links, claim order and retained-row digests. Caller-held
+cursors do not prove earlier pages: segmented checkpoint ancestry, a
+transactional writer, cumulative hot-read bounds and the atomic admission
+gate remain to be implemented.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the
