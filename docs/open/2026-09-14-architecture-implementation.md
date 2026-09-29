@@ -59,8 +59,9 @@ receipt census, cumulative hot-read bounds and the admission gate.
 A compact application receipt format and bounded source reader now pair a
 retained tail choice with its exact checkpoint receipt, pending the writer.
 The versioned observational archive scan binds that recorded choice and its
-full source digest through each checkpoint segment, but still needs selected
-boundary verification and archived state replay.
+full source digest through each checkpoint segment. It also re-reads the exact
+first following accepted generation and checks that source against the recorded
+tail choice on every active step. Archived checkpoint state replay remains open.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

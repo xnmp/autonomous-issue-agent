@@ -178,6 +178,42 @@ def build_review_checkpoint_application_proposal(
     )
 
 
+def validate_checkpoint_following_boundary(
+    application: ReviewCheckpointApplicationProposal,
+    following_boundary: ReviewExecutionGenerationBoundary | None,
+    following_source: ReviewGenerationArchiveFingerprint | None,
+) -> None:
+    """Check the first retained boundary against a recorded checkpoint tail choice."""
+    if not isinstance(application, ReviewCheckpointApplicationProposal):
+        raise ValueError("checkpoint application requires a typed proposal")
+    checkpoint = application.checkpoint
+    if following_boundary is not None and (
+        not isinstance(following_boundary, ReviewExecutionGenerationBoundary)
+        or not isinstance(following_source, ReviewGenerationArchiveFingerprint)
+        or following_source.cursor != ReviewExecutionBoundaryCursor(
+            following_boundary.receipt_id, following_boundary.to_revision,
+        ) or following_boundary.before.binding != checkpoint.state.binding
+        or following_boundary.to_revision.fence.generation
+        != checkpoint.state.binding.rejection.fence.generation + 1
+        or following_boundary.through_sequence < checkpoint.through_sequence
+    ):
+        raise ValueError("checkpoint replay has an invalid following boundary source")
+    if following_boundary is None and following_source is not None:
+        raise ValueError("checkpoint replay has an unpaired following source")
+    if isinstance(application.tail, ApplyAllCheckpointTailOutcomes):
+        if (following_boundary is not None
+                and following_boundary.to_revision.version
+                <= application.captured_revision.version):
+            raise ValueError("checkpoint replay missed a captured following boundary")
+    elif (following_boundary is None
+          or following_source != application.tail.source
+          or following_boundary.to_revision.version
+          > application.captured_revision.version
+          or _applied_digest(following_boundary.applied_sequences)
+          != application.tail.applied_sequences_sha256):
+        raise ValueError("checkpoint replay changed its captured tail selection")
+
+
 def replay_review_checkpoint_application(
     application: ReviewCheckpointApplicationProposal,
     retired_outcomes: tuple[ReviewRoundOutcome, ...],
@@ -226,30 +262,11 @@ def replay_review_checkpoint_application(
     if (checkpoint.boundary_cursor != last_cursor
             or application.tail_start_sequence != tail_start):
         raise ValueError("checkpoint replay lost its retired frontier")
-    if following_boundary is not None and (
-        not isinstance(following_boundary, ReviewExecutionGenerationBoundary)
-        or not isinstance(following_source, ReviewGenerationArchiveFingerprint)
-        or following_source.cursor != ReviewExecutionBoundaryCursor(
-            following_boundary.receipt_id, following_boundary.to_revision,
-        ) or following_boundary.before.binding != checkpoint.state.binding
-        or following_boundary.through_sequence < checkpoint.through_sequence
-    ):
-        raise ValueError("checkpoint replay has an invalid following boundary source")
-    if following_boundary is None and following_source is not None:
-        raise ValueError("checkpoint replay has an unpaired following source")
+    validate_checkpoint_following_boundary(application, following_boundary, following_source)
     if isinstance(application.tail, ApplyAllCheckpointTailOutcomes):
-        if (following_boundary is not None
-                and following_boundary.to_revision.version
-                <= application.captured_revision.version):
-            raise ValueError("checkpoint replay missed a captured following boundary")
         selected = retired_outcomes
     else:
-        if (following_boundary is None
-                or following_source != application.tail.source
-                or following_boundary.to_revision.version
-                > application.captured_revision.version
-                or _applied_digest(following_boundary.applied_sequences)
-                != application.tail.applied_sequences_sha256):
+        if following_boundary is None:
             raise ValueError("checkpoint replay changed its captured tail selection")
         applied = frozenset(following_boundary.applied_sequences)
         selected = tuple(

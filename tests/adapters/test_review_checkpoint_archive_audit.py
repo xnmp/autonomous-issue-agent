@@ -26,7 +26,8 @@ from issue_agent.domain.review_checkpoint_archive import (
 )
 from issue_agent.domain.review_checkpoint_chain import ReviewCheckpointChainCursor
 from issue_agent.domain.review_checkpoint_application import (
-    ApplyAllCheckpointTailOutcomes, ReviewCheckpointApplicationReceipt,
+    ApplyAllCheckpointTailOutcomes, ApplyCheckpointTailByFollowingBoundary,
+    ReviewCheckpointApplicationReceipt,
     application_receipt_from_proposal, build_review_checkpoint_application_proposal,
 )
 from issue_agent.domain.review_execution import (
@@ -38,7 +39,9 @@ from issue_agent.domain.review_execution import (
 )
 from issue_agent.domain.workflow import WorkflowMutation
 from issue_agent.domain.workflow_identity import WorkflowRevision
-from tests.adapters.test_review_execution_activation_sources import _accepted_generation
+from tests.adapters.test_review_execution_activation_sources import (
+    _accepted_generation, _stale_settlement,
+)
 from tests.adapters.test_review_execution_control import rig
 from tests.adapters.test_review_execution_persistence import (
     active, insert_round, round_facts, set_projection,
@@ -325,7 +328,7 @@ def test_changed_application_source_blocks_segment_resume(active):
     assert _stored(store) == result
 
 
-def test_later_boundary_can_leave_a_retired_round_unapplied(active):
+def test_selected_tail_requires_its_retained_following_source(active):
     store, snapshot = active
     key = snapshot.revision.fence.key
     first, first_outcome = round_facts(snapshot, 1)
@@ -378,7 +381,60 @@ def test_later_boundary_can_leave_a_retired_round_unapplied(active):
             ))), next_fence.generation),
         )
     result = _complete(store, key, store.now())
+    assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
+    assert "following generation" in result.reason
+
+
+def _real_selected_checkpoint(rig):
+    store, stale_plan, _, _ = _stale_settlement(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        manifest = observe_review_checkpoint_manifest(db, key, stale_plan.round.sequence)
+        receipt_id = _insert_receipt(
+            db, manifest.receipt, store.now(), manifest.application,
+        )
+        row = db.execute(
+            "SELECT episode_json FROM workflows WHERE repository='o/r' AND target_kind='pr'",
+        ).fetchone()
+        from issue_agent.domain.review_workflow import ReviewFamilyEpisodes
+        episodes = decode_workflow(row["episode_json"], ReviewFamilyEpisodes)
+        assert isinstance(episodes.execution, ActivatedReviewExecution)
+        db.execute(
+            "UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='pr'",
+            (encode_workflow(replace(episodes, execution=replace(
+                episodes.execution, checkpoint=manifest.plan.checkpoint,
+                checkpoint_receipt=receipt_id,
+            ))),),
+        )
+    return store, key, manifest
+
+
+def test_real_selected_tail_matches_first_retained_generation(rig):
+    store, key, manifest = _real_selected_checkpoint(rig)
+    assert manifest.plan.retired_boundaries == ()
+    assert len(manifest.plan.remaining_boundaries) == 1
+    result = _complete(store, key, store.now())
     assert isinstance(result, CompletedReviewCheckpointArchiveAudit)
+    assert result.source_count == 1
+
+
+def test_changed_selected_following_source_blocks_segment_resume(rig):
+    store, key, manifest = _real_selected_checkpoint(rig)
+    now = store.now()
+    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveSegment)
+    assert manifest.plan.remaining_boundaries
+    assert isinstance(manifest.application.tail, ApplyCheckpointTailByFollowingBoundary)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-01-01T00:00:00+00:00' "
+            "WHERE namespace=? AND key=?",
+            (manifest.application.tail.source.accepted_namespace,
+             manifest.application.tail.source.accepted_key),
+        )
+    result = _advance(store, key, now)
+    assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
+    assert "captured tail selection" in result.reason
+    assert _stored(store) == result
 
 
 def test_prior_checkpoint_source_change_is_found_on_next_pass(active):

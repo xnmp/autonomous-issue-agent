@@ -727,14 +727,26 @@ the complete audit benchmark.
   outside admission authority. Sol review found two migration gaps; both
   are fixed with regressions. The full gate passed: 3,297 domain, 3,389
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
+- Checkpoint 107 makes each active checkpoint scan step read the exact first
+  following accepted generation from retained SQL when one exists. The pure
+  application rule compares its receipt and accepted-source fingerprints,
+  applied sequences and capture revision with the recorded tail choice. A
+  selected choice without that source blocks; an all-tail choice blocks if a
+  following boundary had already been captured. A real partial-compaction
+  fixture passes; absent and changed following sources persist blockers. This
+  checks applicability only: retired outcome state replay, complete source
+  membership and admission authority remain open. Independent Sol review
+  found no medium or high issue in this slice. The full gate passed: 3,297
+  domain, 3,391 adapter and 2,876 app tests, four import contracts and both
+  Pyrefly checks. Log: `/tmp/checkpoint-following-source-gate.log` (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round
 receipt-set definition, bind the ordered source digests, and publish the
 aggregate and checkpoint atomically.
-The paged audit must re-read the selected boundary, replay outcomes,
-reconstruct retired member payloads and unclaimed receipts, and supply the
+The paged audit must replay outcomes, reconstruct retired member payloads and
+unclaimed receipts, and supply the
 admission gate. Keep the canonical compaction refusal until these checks are
 complete.
 
