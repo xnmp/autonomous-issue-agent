@@ -1,6 +1,6 @@
 # Phase 4 handover — execution activation sources
 
-Date: 2026-09-29 Australia/Sydney. Branch `dev`. The six-phase goal remains
+Date: 2026-09-30 Australia/Sydney. Branch `dev`. The six-phase goal remains
 active: phases 1–3 accepted, phase 4 in progress, phases 5–6 pending. Start
 with `CLAUDE.md`, `AGENTS.md`, the
 [phase-4 progress record](2026-09-27-phase-4-progress.md), the
@@ -1180,6 +1180,25 @@ expected-source proof and settlement provenance are present.
   2,876 app tests, hooks, governor, four import contracts and both Pyrefly
   checks. Ten strict xfails remained expected. Log:
   `/tmp/phase4-registration-membership-gate.log` (ephemeral).
+
+- Checkpoint 133 makes the offline, barrier-held execution import-source
+  verifier require the completed registration/lifecycle census. It compares
+  the current census with the caller-held one and folds the independently
+  revalidated complete submission inventory into the same command membership
+  inside one SQL transaction. The verifier checks trusted UTC time both before
+  and immediately before minting its result; a caller time can only make the
+  deadline stricter. A real registered command succeeds, while a newly
+  unregistered command, expired census and backdated expiry attempt refuse.
+  Independent Sol review found the backdated-time bypass in the first pass;
+  the fix and regression passed re-review. This is still source revalidation,
+  not an import decision or production admission. Refused-ceiling prior state
+  remains unproved: workflow versions also advance outside accepted
+  `workflow-transition` receipts, so those receipts alone cannot replay its
+  historical prior snapshot. The final full `make test` passed: 3,302 domain,
+  3,617 adapter and 2,876 app tests, hooks, governor, gate parity, four import
+  contracts and both Pyrefly checks. Ten strict xfails remained expected.
+  Log: `/tmp/phase4-import-membership-final-gate.log` (ephemeral). All seven
+  installed issue-agent user services were inactive before commit.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

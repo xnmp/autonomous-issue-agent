@@ -235,6 +235,8 @@ def observe_matched_review_registration_membership(
             or state.round_receipts_version != versions.round_receipts
             or state.lifecycle_source_version != read_review_lifecycle_source_version(db)):
         raise WorkflowAuthorityError("review registration membership lacks current completed censuses")
+    if now >= state.next_due_at or now >= lifecycle.next_due_at:
+        raise WorkflowAuthorityError("review registration or lifecycle census is overdue")
     try:
         return MatchedReviewRegistrationMembership(state, lifecycle, now)
     except ValueError as exc:

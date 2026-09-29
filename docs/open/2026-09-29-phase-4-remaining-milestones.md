@@ -27,8 +27,11 @@ Milestone 1 evidence in progress: checkpoint 131 links one bounded
 registration to its recorded command, effect, preflight, round, and planned
 stage sources in a transaction. Checkpoint 132 adds a durable, bounded
 registration census that compares expected command membership with the
-independent lifecycle command census. Unregistered commands now refuse this
-read-only match. Historical submission decisions and the other source
+independent lifecycle command census. Checkpoint 133 requires that current
+match in the barrier-held import-source verifier and checks its membership
+against the complete submission inventory; expiry and changed sources refuse.
+Unregistered commands now refuse this read-only boundary. Historical
+submission decisions and the other source
 families in milestone 1 remain open, so this does not accept the milestone.
 
 ## Progress rule

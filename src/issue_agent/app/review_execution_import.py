@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from datetime import datetime
 
 from ..adapters.review_execution_import_sources import (
     BlockedLegacyExecutionSqlImportSources, HeldLegacyExecutionCounterSources,
@@ -19,7 +20,7 @@ def verify_configured_legacy_execution_import_sources(
     cfg: HarnessConfig, db: sqlite3.Connection,
     counters: HeldLegacyExecutionCounterSources,
     observed: ObservedLegacyExecutionSqlImportSources,
-    *, extra_roots: tuple[str, ...] = (),
+    *, now: datetime | None = None, extra_roots: tuple[str, ...] = (),
 ) -> RevalidatedLegacyExecutionImportSources | BlockedLegacyExecutionSqlImportSources:
     """Bind SQL source revalidation to the same owner lineage daemon boot adopts.
 
@@ -67,4 +68,5 @@ def verify_configured_legacy_execution_import_sources(
     ))
     return verify_legacy_execution_import_sources(
         db, counters, observed, writer=writer, configured_prior_owners=predecessors,
+        now=now,
     )

@@ -230,7 +230,7 @@ def test_registration_membership_rejects_overdue_observations(rig):
     assert isinstance(registration, CompletedReviewRegistrationMembership)
     assert isinstance(_complete_lifecycle(store), CompletedReviewLifecycleArchiveAudit)
     with store.transaction() as db:
-        with pytest.raises(WorkflowAuthorityError, match="disagree"):
+        with pytest.raises(WorkflowAuthorityError, match="overdue"):
             observe_matched_review_registration_membership(
                 db, "o/r", now=registration.next_due_at,
             )

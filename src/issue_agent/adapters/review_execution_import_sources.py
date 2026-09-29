@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import sqlite3
+from datetime import datetime, timezone
 
 from ..domain.review_execution_activation import (
     BlockedLegacyReviewGenerationReceipts, BlockedLegacyReviewRuns,
@@ -24,6 +25,8 @@ from ..domain.review_execution_death_import import (
     BlockedLegacyReviewDeathAttribution, CompleteLegacyReviewDeathAttribution,
     attribute_complete_legacy_review_deaths,
 )
+from ..domain.review_lifecycle_archive_audit import ReviewLifecycleMembership
+from ..domain.review_registration_membership_audit import MatchedReviewRegistrationMembership
 from ..domain.workflow_identity import WorkflowWriter, canonical_workflow_repository, validate_workflow_text
 from .control_store import SQLiteControlStore
 from .deployment_authority import deployment_effect_barrier
@@ -36,6 +39,9 @@ from .review_execution_activation import (
     select_legacy_review_execution_files, verify_complete_legacy_submission_settlement_storage,
 )
 from .review_execution_counter_links import revalidate_complete_legacy_open_counter_links
+from .review_registration_membership_audit import observe_matched_review_registration_membership
+from .workflow_codec import encode_workflow
+from .workflow_rows import WorkflowAuthorityError
 
 _ROLES = ("fix", "review", "steward")
 _CURRENT_SCOPE: ContextVar[object | None] = ContextVar("legacy_execution_import_scope", default=None)
@@ -165,13 +171,15 @@ class ObservedLegacyExecutionSqlImportSources:
     runs: CompleteLegacyReviewRuns
     settlement: CompleteLegacySubmissionSettlementStorage
     generation: CompleteLegacyReviewGenerationReceipts
+    membership: MatchedReviewRegistrationMembership
 
     def __post_init__(self) -> None:
         if (not isinstance(self.runs, CompleteLegacyReviewRuns)
                 or not isinstance(self.settlement, CompleteLegacySubmissionSettlementStorage)
                 or not isinstance(self.generation, CompleteLegacyReviewGenerationReceipts)
+                or not isinstance(self.membership, MatchedReviewRegistrationMembership)
                 or len({self.runs.lineage.repository, self.settlement.repository,
-                         self.generation.repository}) != 1):
+                         self.generation.repository, self.membership.registration.repository}) != 1):
             raise ValueError("SQL import sources require complete same-repository inventories")
 
     @property
@@ -181,7 +189,8 @@ class ObservedLegacyExecutionSqlImportSources:
     @property
     def source_digest(self) -> str:
         source = (self.runs.source_digest, self.settlement.source_digest,
-                  self.generation.source_digest)
+                  self.generation.source_digest,
+                  encode_workflow((self.membership.registration, self.membership.lifecycle)))
         return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -222,13 +231,15 @@ def verify_legacy_execution_import_sources(
     db: sqlite3.Connection, counters: HeldLegacyExecutionCounterSources,
     observed: ObservedLegacyExecutionSqlImportSources,
     *, writer: WorkflowWriter, configured_prior_owners: tuple[str, ...],
+    now: datetime | None = None,
 ) -> RevalidatedLegacyExecutionImportSources | BlockedLegacyExecutionSqlImportSources:
     """Recheck all retained SQL sets inside the caller's acceptance transaction.
 
     The caller must keep `held_legacy_execution_counter_sources` open through
     commit. Owner inputs are caller supplied and still need deployment-config
-    provenance at the production writer. This verifies matching source sets,
-    not inherited debit/reset or imported session authority.
+    provenance at the production writer. `now` is a caller-supplied minimum;
+    wall time is checked again before minting. This verifies matching source
+    sets, not inherited debit/reset or imported session authority.
     """
     if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
         raise ValueError("execution import source verification requires an explicit SQL transaction")
@@ -238,8 +249,15 @@ def verify_legacy_execution_import_sources(
         raise ValueError("execution import source verification requires complete typed observations")
     if (not isinstance(writer, WorkflowWriter) or writer.role != "review"
             or not isinstance(configured_prior_owners, tuple)
-            or any(not isinstance(owner, str) for owner in configured_prior_owners)):
+            or any(not isinstance(owner, str) for owner in configured_prior_owners)
+            or now is not None and (
+                not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None
+            )):
         raise ValueError("execution import source verification requires configured review ownership")
+    # Caller time can make the check stricter, but cannot backdate an expired census.
+    audit_time = datetime.now(timezone.utc)
+    if now is not None and now > audit_time:
+        audit_time = now
     control_path = _held_control_path(counters)
     if control_path is None:
         return BlockedLegacyExecutionSqlImportSources("execution import source barriers are no longer held")
@@ -256,6 +274,15 @@ def verify_legacy_execution_import_sources(
     if (writer.repository != observed.repository or writer.owner_id != lineage.current_owner
             or configured_prior_owners != lineage.configured_prior_owners):
         return BlockedLegacyExecutionSqlImportSources("execution import owner lineage differs from configuration")
+    try:
+        membership = observe_matched_review_registration_membership(
+            db, observed.repository, now=audit_time,
+        )
+    except WorkflowAuthorityError as exc:
+        return BlockedLegacyExecutionSqlImportSources(str(exc))
+    if (membership.registration != observed.membership.registration
+            or membership.lifecycle != observed.membership.lifecycle):
+        return BlockedLegacyExecutionSqlImportSources("review command membership changed after inventory")
     runs = revalidate_complete_legacy_review_runs(db, observed.runs)
     if isinstance(runs, BlockedLegacyReviewRuns):
         return BlockedLegacyExecutionSqlImportSources(runs.reason)
@@ -265,10 +292,17 @@ def verify_legacy_execution_import_sources(
     )
     if isinstance(settlement, BlockedLegacySubmissionSettlementStorage):
         return BlockedLegacyExecutionSqlImportSources(settlement.reason)
+    commands = ReviewLifecycleMembership.empty()
+    for source in settlement.commands.submissions:
+        commands = commands.add("command", source.source_rowid, source.source_digest)
+    if commands != membership.registration.expected_commands:
+        return BlockedLegacyExecutionSqlImportSources(
+            "review submission inventory disagrees with registered command membership",
+        )
     generation = revalidate_complete_legacy_review_generation_receipts(db, observed.generation)
     if isinstance(generation, BlockedLegacyReviewGenerationReceipts):
         return BlockedLegacyExecutionSqlImportSources(generation.reason)
-    current = ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
+    current = ObservedLegacyExecutionSqlImportSources(runs, settlement, generation, observed.membership)
     if current != observed or current.source_digest != observed.source_digest:
         return BlockedLegacyExecutionSqlImportSources("execution SQL sources changed after inventory")
     deaths = attribute_complete_legacy_review_deaths(runs, counters.mapping)
@@ -276,4 +310,14 @@ def verify_legacy_execution_import_sources(
         return BlockedLegacyExecutionSqlImportSources(deaths.reason)
     if _held_control_path(counters) is None:
         return BlockedLegacyExecutionSqlImportSources("execution import source barriers are no longer held")
+    final_time = max(audit_time, datetime.now(timezone.utc))
+    try:
+        final_membership = observe_matched_review_registration_membership(
+            db, observed.repository, now=final_time,
+        )
+    except WorkflowAuthorityError as exc:
+        return BlockedLegacyExecutionSqlImportSources(str(exc))
+    if (final_membership.registration != membership.registration
+            or final_membership.lifecycle != membership.lifecycle):
+        return BlockedLegacyExecutionSqlImportSources("review command membership changed during verification")
     return RevalidatedLegacyExecutionImportSources(counters, current, deaths, _VERIFICATION_MINT)

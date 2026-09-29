@@ -514,9 +514,9 @@ checks checkpoint receipts and paired application sources under the
 checkpoint-source mutation revision, blocking an existing receipt for this
 execution or an unreadable source. The join requires that pass to be current.
 This bootstrap observation also has no production write or admission authority.
-A bounded global registration page now exposes canonical review submission
-registrations under the round-receipt mutation revision. It is an input to a
-future expected-command census. A bounded transaction-local link now rechecks
+A bounded global registration page exposes canonical review submission
+registrations under the round-receipt mutation revision. A bounded
+transaction-local link rechecks
 each registration's rowid and payload against its round index, preflight,
 round plan, planned stage receipts, lifecycle command and any effect receipt.
 This link is observational: it does not establish complete expected-command
@@ -526,6 +526,11 @@ independent lifecycle census under round-row, receipt and lifecycle mutation
 revisions. An extra unregistered command refuses the read-only match. This
 is still an observational import input, not a historical submission decision
 or an admission gate.
+The barrier-held offline import-source verifier now requires that completed
+match and compares its command membership with the revalidated whole-repository
+submission inventory. It rechecks the deadline against trusted UTC time before
+returning. Refused-ceiling prior state and ordered resets still lack full
+historical source proof; no production import writer consumes this result.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched

@@ -563,7 +563,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_round_receipt_owner.py` (bounded read-only source-to-round member join for bound, named and command-keyed receipts, with open rounds pending; no complete census or admission authority),
 `adapters/review_execution_compaction.py` (transaction-local retired-source proposal and checkpoint receipt reconstruction; no compaction authority),
 `adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
-`adapters/review_execution_import_sources.py` (barrier-held revalidation of configured legacy execution files and complete PR linkage before counter attribution),
+`adapters/review_execution_import_sources.py` (barrier-held legacy file/PR-link and SQL source revalidation, including current registration/lifecycle command membership before counter attribution),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
