@@ -87,6 +87,23 @@ def _insert_receipt(db, receipt, now, application=None):
     return receipt_id
 
 
+def _old_tip_encoding(value):
+    def strip_tip_source(item):
+        if isinstance(item, list):
+            return [strip_tip_source(entry) for entry in item]
+        if isinstance(item, dict):
+            return {
+                name: strip_tip_source(entry) for name, entry in item.items()
+                if name != "tip_application_source_sha256"
+            }
+        return item
+
+    return json.dumps(
+        strip_tip_source(json.loads(encode_workflow(value))),
+        sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+    )
+
+
 def _two_valid_checkpoints(active):
     store, snapshot = active
     first, first_outcome = round_facts(snapshot, 1)
@@ -173,7 +190,7 @@ def _stored(store):
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM level_state "
-            "WHERE namespace='review-checkpoint-archive-scan-v3'",
+            "WHERE namespace='review-checkpoint-archive-scan-v4'",
         ).fetchone()
         assert row is not None
         return decode_workflow(row["payload_json"], ReviewCheckpointArchiveState)
@@ -265,7 +282,7 @@ def test_prior_cursor_version_starts_new_application_aware_scan(active):
         db.execute(
             "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
             "VALUES ('review-checkpoint-archive-scan','o/r',?,?,?)",
-            (audit_key, encode_workflow(prior), now.isoformat()),
+            (audit_key, _old_tip_encoding(prior), now.isoformat()),
         )
     result = _advance(store, key, now)
     assert isinstance(result, ReviewCheckpointArchiveReplaySegment)
@@ -311,15 +328,15 @@ def test_v2_cursor_migrates_without_losing_prior_discrepancy(active, prior_kind)
     )
     with store.transaction() as db:
         row = db.execute(
-            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
         ).fetchone()
         db.execute(
-            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
         )
         db.execute(
             "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
             "VALUES ('review-checkpoint-archive-scan-v2','o/r',?,?,?)",
-            (row["key"], "{}" if prior_kind == "malformed" else encode_workflow(prior),
+            (row["key"], "{}" if prior_kind == "malformed" else _old_tip_encoding(prior),
              now.isoformat()),
         )
     resumed = _advance(store, key, now)
@@ -334,6 +351,67 @@ def test_v2_cursor_migrates_without_losing_prior_discrepancy(active, prior_kind)
         assert _advance(store, key, now) == resumed
 
 
+@pytest.mark.parametrize("prior_kind", ("valid", "blocked", "malformed"))
+def test_v3_cursor_restarts_without_losing_prior_discrepancy(active, prior_kind):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    now = store.now()
+    first = _advance(store, key, now)
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    prior = (
+        BlockedReviewCheckpointArchiveAudit(first.segment, "prior discrepancy", now)
+        if prior_kind == "blocked" else first
+    )
+
+    encoded = _old_tip_encoding(prior)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
+        ).fetchone()
+        db.execute(
+            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
+        )
+        db.execute(
+            "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+            "VALUES ('review-checkpoint-archive-scan-v3','o/r',?,?,?)",
+            (row["key"], "{}" if prior_kind == "malformed" else encoded, now.isoformat()),
+        )
+    resumed = _advance(store, key, now)
+    if prior_kind == "valid":
+        assert isinstance(resumed, ReviewCheckpointArchiveReplaySegment)
+        assert resumed.segment.source.receipt_id == tip
+        assert isinstance(_complete(store, key, now), CompletedReviewCheckpointArchiveAudit)
+    else:
+        assert isinstance(resumed, BlockedReviewCheckpointArchiveAudit)
+        assert "prior checkpoint audit" in resumed.reason
+        assert _stored(store) == resumed
+        assert _advance(store, key, now) == resumed
+
+
+def test_completed_v3_cursor_restarts_with_a_new_tip_digest(active):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    now = store.now()
+    completed = _complete(store, key, now)
+    assert isinstance(completed, CompletedReviewCheckpointArchiveAudit)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
+        ).fetchone()
+        db.execute(
+            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
+        )
+        db.execute(
+            "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+            "VALUES ('review-checkpoint-archive-scan-v3','o/r',?,?,?)",
+            (row["key"], _old_tip_encoding(completed), now.isoformat()),
+        )
+    restarted = _advance(store, key, now)
+    assert isinstance(restarted, ReviewCheckpointArchiveReplaySegment)
+    assert restarted.segment.source.receipt_id == tip
+    renewed = _complete(store, key, now)
+    assert isinstance(renewed, CompletedReviewCheckpointArchiveAudit)
+    assert renewed.tip_application_source_sha256 == completed.tip_application_source_sha256
+
+
 @pytest.mark.parametrize("damage", (
     "none", "source", "frontier", "nested_encoding",
 ))
@@ -342,7 +420,7 @@ def test_prior_segment_is_restarted_only_when_well_formed(active, damage):
     now = store.now()
     first = _advance(store, key, now)
     assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
-    encoded = json.loads(encode_workflow(first.segment))
+    encoded = json.loads(_old_tip_encoding(first.segment))
     fields = encoded["value"]["fields"]
     del fields["application"]
     del fields["application_source_sha256"]
@@ -361,10 +439,10 @@ def test_prior_segment_is_restarted_only_when_well_formed(active, damage):
     )
     with store.transaction() as db:
         row = db.execute(
-            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+            "SELECT key FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
         ).fetchone()
         db.execute(
-            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+            "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
         )
         db.execute(
             "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
@@ -708,7 +786,7 @@ def test_cursor_storage_excess_persists_a_bounded_blocker(active, monkeypatch, p
     if phase == "first_page":
         with store.transaction() as db:
             db.execute(
-                "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v3'",
+                "DELETE FROM level_state WHERE namespace='review-checkpoint-archive-scan-v4'",
             )
     original = archive_audit.encode_workflow
 
@@ -763,7 +841,7 @@ def test_malformed_persisted_cursor_refuses_resume(active):
     with store.transaction() as db:
         db.execute(
             "UPDATE level_state SET payload_json='{}' "
-            "WHERE namespace='review-checkpoint-archive-scan-v3'",
+            "WHERE namespace='review-checkpoint-archive-scan-v4'",
         )
     with store.transaction() as db:
         with pytest.raises(WorkflowAuthorityError, match="malformed"):

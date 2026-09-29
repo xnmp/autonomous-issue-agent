@@ -821,6 +821,21 @@ the complete audit benchmark.
   a page-order overread fix. Full `make test` passed: 3,302 domain, 3,418
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
   Log: `/tmp/checkpoint-manifest-receipt-classification-gate.log` (ephemeral).
+- Checkpoint 114 makes the read-only four-audit join recheck the current
+  checkpoint application sidecar and its first retained generation source in
+  the same SQL snapshot. The versioned v4 checkpoint audit cursor carries the
+  tip sidecar's six-field source digest through the scan; the join compares it
+  with the current source. A valid post-pass sidecar edit, missing or malformed
+  sidecar, and changed following accepted source now block that observation.
+  Valid v3 cursors restart from the tip, while malformed and blocked v3 cursors
+  remain blockers. Earlier v1/v2 cursor migration accepts their old shape and
+  keeps malformed or blocked sources as blockers. This does not establish an
+  atomic lifetime audit snapshot or grant admission. Sol review exposed the
+  valid-edit and v1 migration gaps; regressions cover both. The final review
+  found no remaining medium or high issue. Full `make test` passed: 3,302
+  domain, 3,426 adapter and 2,876 app tests, hooks, governor, four import
+  contracts and both Pyrefly checks. Log:
+  `/tmp/checkpoint-archive-tip-source-final-gate.log` (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

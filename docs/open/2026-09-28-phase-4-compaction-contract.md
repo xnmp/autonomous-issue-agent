@@ -11,7 +11,7 @@ can be verified.
 The transaction-local manifest observer now reconstructs expected retired
 round and generation streams and a candidate receipt. Its remaining byte
 budget is passed into retired round and generation page readers before payload
-fetch. Repeated reads of the same retained field, the canonical load and origin
+fetch. Repeated retired receipt reads are charged; the canonical load and origin
 read are still outside that bound, and the budget is not a peak-memory guarantee.
 It neither surveys unclaimed archive rows nor certifies
 external command/effect and transition lineage, so it cannot authorize a

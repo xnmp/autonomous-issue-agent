@@ -72,6 +72,7 @@ class ReviewCheckpointArchiveAwaiting:
     baseline_tail_sha256: str | None
     started_at: datetime
     due_at: datetime
+    tip_application_source_sha256: str | None
 
     def __post_init__(self) -> None:
         if not isinstance(self.cursor, ReviewCheckpointChainCursor):
@@ -82,6 +83,10 @@ class ReviewCheckpointArchiveAwaiting:
                 or self.source_count == 0
                 and self.chain_sha256 != EMPTY_CHECKPOINT_ARCHIVE_SHA256):
             raise ValueError("checkpoint audit has an invalid source count")
+        if (self.tip_application_source_sha256 is None) != (self.source_count == 0):
+            raise ValueError("checkpoint audit lost its tip application source")
+        if self.tip_application_source_sha256 is not None:
+            _digest(self.tip_application_source_sha256, "checkpoint audit tip application source")
         if (self.baseline is not None
                 and not isinstance(self.baseline, ReviewCheckpointArchiveBaseline)):
             raise ValueError("checkpoint audit requires a typed baseline")
@@ -205,6 +210,7 @@ class CompletedReviewCheckpointArchiveAudit:
     source_count: int
     completed_at: datetime
     next_due_at: datetime
+    tip_application_source_sha256: str
 
     def __post_init__(self) -> None:
         validate_workflow_identifier(self.tip_receipt_id, "completed checkpoint audit tip")
@@ -212,6 +218,7 @@ class CompletedReviewCheckpointArchiveAudit:
             raise ValueError("completed checkpoint audit requires its origin")
         _digest(self.origin_source_sha256, "completed checkpoint audit origin source")
         _digest(self.chain_sha256, "completed checkpoint audit chain")
+        _digest(self.tip_application_source_sha256, "completed checkpoint audit tip application")
         if type(self.source_count) is not int or self.source_count < 1:
             raise ValueError("completed checkpoint audit requires a source")
         _aware(self.completed_at, "completed checkpoint audit time")
@@ -267,7 +274,7 @@ def begin_review_checkpoint_archive_scan(
     _digest(origin_source_sha256, "checkpoint audit origin source")
     return ReviewCheckpointArchiveAwaiting(
         cursor, origin_source_sha256, EMPTY_CHECKPOINT_ARCHIVE_SHA256,
-        0, baseline, None, now, _due(now, due_seconds),
+        0, baseline, None, now, _due(now, due_seconds), None,
     )
 
 
@@ -402,6 +409,7 @@ def finish_review_checkpoint_archive_segment(
             segment.next_cursor, parent.origin_source_sha256, chain,
             parent.source_count + 1, parent.baseline, tail,
             parent.started_at, parent.due_at,
+            parent.tip_application_source_sha256 or segment.application_source_sha256,
         )
     if parent.baseline is not None and tail != parent.baseline.chain_sha256:
         return BlockedReviewCheckpointArchiveAudit(
@@ -411,6 +419,7 @@ def finish_review_checkpoint_archive_segment(
         parent.cursor.tip_receipt_id, parent.cursor.origin,
         parent.origin_source_sha256, chain, parent.source_count + 1,
         now, _due(now, due_seconds),
+        parent.tip_application_source_sha256 or segment.application_source_sha256,
     )
 
 

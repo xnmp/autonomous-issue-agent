@@ -120,8 +120,8 @@ def observe_review_checkpoint_manifest(
     unclaimed rows and receipts, verify external command/effect and transition
     lineage, and publish an audit gate atomically.
     The retained-field ceiling is passed to retired round and generation page
-    readers before each payload fetch. It does not count repeat fetches or
-    bound the canonical loader, origin read, or peak memory.
+    readers before each payload fetch and charges repeated retired receipt
+    reads. It does not bound the canonical loader, origin read, or peak memory.
     """
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or not isinstance(key, WorkflowKey)

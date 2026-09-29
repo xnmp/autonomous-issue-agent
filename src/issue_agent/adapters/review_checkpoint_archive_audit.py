@@ -57,7 +57,8 @@ from .workflow_rows import (
 )
 
 
-_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v3"
+_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v4"
+_V3_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v3"
 _V2_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v2"
 _LEGACY_AUDIT_NAMESPACE = "review-checkpoint-archive-scan"
 _LEGACY_SEGMENT_FIELDS = frozenset((
@@ -105,12 +106,64 @@ def _read_state(
         raise WorkflowAuthorityError("checkpoint audit cursor changed during bounded read")
     raw = row["payload_json"]
     try:
-        state = decode_workflow(raw, ReviewCheckpointArchiveState)
-        if encode_workflow(state) != raw:
-            raise ValueError("noncanonical cursor")
-    except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
+        if namespace in (_V2_AUDIT_NAMESPACE, _V3_AUDIT_NAMESPACE):
+            state = _decode_prior_tip_state(raw)
+        else:
+            state = decode_workflow(raw, ReviewCheckpointArchiveState)
+            if encode_workflow(state) != raw:
+                raise ValueError("noncanonical cursor")
+    except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError) as exc:
         raise WorkflowAuthorityError("checkpoint audit cursor is malformed") from exc
     return rows[0]["rowid"], state
+
+
+def _decode_prior_tip_state(raw: str) -> ReviewCheckpointArchiveState:
+    """Validate an old cursor after supplying only the new observational tip field."""
+    envelope = json.loads(raw, object_pairs_hook=_unique_object)
+    if (not isinstance(envelope, dict) or set(envelope) != {"format", "value"}
+            or envelope["format"] != 1 or type(envelope["format"]) is not int
+            or json.dumps(envelope, sort_keys=True, separators=(",", ":"),
+                          ensure_ascii=True, allow_nan=False) != raw):
+        raise ValueError("noncanonical prior cursor")
+
+    def add_tip_source(value: object) -> object:
+        if isinstance(value, list):
+            return [add_tip_source(item) for item in value]
+        if not isinstance(value, dict):
+            return value
+        changed = {name: add_tip_source(item) for name, item in value.items()}
+        fields = changed.get("fields")
+        if changed.get("type") == "ReviewCheckpointArchiveAwaiting" and isinstance(fields, dict):
+            if "tip_application_source_sha256" in fields:
+                raise ValueError("prior cursor has future fields")
+            fields["tip_application_source_sha256"] = (
+                None if fields.get("source_count") == 0 else "0" * 64
+            )
+        elif changed.get("type") == "CompletedReviewCheckpointArchiveAudit" and isinstance(fields, dict):
+            if "tip_application_source_sha256" in fields:
+                raise ValueError("prior cursor has future fields")
+            fields["tip_application_source_sha256"] = "0" * 64
+        return changed
+
+    upgraded = add_tip_source(envelope)
+    state = decode_workflow(
+        json.dumps(upgraded, sort_keys=True, separators=(",", ":"),
+                   ensure_ascii=True, allow_nan=False), ReviewCheckpointArchiveState,
+    )
+    def strip_tip_source(value: object) -> object:
+        if isinstance(value, list):
+            return [strip_tip_source(item) for item in value]
+        if isinstance(value, dict):
+            return {name: strip_tip_source(item) for name, item in value.items()
+                    if name != "tip_application_source_sha256"}
+        return value
+
+    if json.dumps(
+        strip_tip_source(json.loads(encode_workflow(state))), sort_keys=True,
+        separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+    ) != raw:
+        raise ValueError("noncanonical prior cursor")
+    return state
 
 
 def _v2_discrepancy(db: sqlite3.Connection, repository: str, audit_key: str) -> str | None:
@@ -121,6 +174,19 @@ def _v2_discrepancy(db: sqlite3.Connection, repository: str, audit_key: str) -> 
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
         return "prior checkpoint audit recorded an unresolved discrepancy"
     if isinstance(state, ReviewCheckpointArchiveReplaySegment):
+        return "prior checkpoint audit cursor has an invalid version"
+    return None
+
+
+def _v3_discrepancy(db: sqlite3.Connection, repository: str, audit_key: str) -> str | None:
+    """Restart prior observations while retaining malformed and blocked cursors."""
+    try:
+        _, state = _read_state(db, repository, audit_key, _V3_AUDIT_NAMESPACE)
+    except WorkflowAuthorityError:
+        return "prior checkpoint audit cursor is malformed or unreadable"
+    if isinstance(state, BlockedReviewCheckpointArchiveAudit):
+        return "prior checkpoint audit recorded an unresolved discrepancy"
+    if isinstance(state, ReviewCheckpointArchiveSegment):
         return "prior checkpoint audit cursor has an invalid version"
     return None
 
@@ -171,7 +237,15 @@ def _legacy_discrepancy(
             fields = envelope["value"]["fields"]
             if set(fields) != _LEGACY_SEGMENT_FIELDS:
                 raise ValueError("malformed prior segment")
-            decoded = {name: _decode(value) for name, value in fields.items()}
+            decoded = {name: _decode(value) for name, value in fields.items()
+                       if name != "parent"}
+            try:
+                decoded["parent"] = _decode(fields["parent"])
+            except (TypeError, ValueError, WorkflowEncodingError):
+                decoded["parent"] = _decode_prior_tip_state(json.dumps(
+                    {"format": 1, "value": fields["parent"]}, sort_keys=True,
+                    separators=(",", ":"), ensure_ascii=True, allow_nan=False,
+                ))
             if (not isinstance(decoded["parent"], ReviewCheckpointArchiveAwaiting)
                     or not isinstance(decoded["source"], ObservedReviewCheckpointChainSource)
                     or decoded["next_cursor"] is not None
@@ -205,7 +279,8 @@ def _legacy_discrepancy(
                 raise ValueError("malformed prior segment")
             canonical = {"format": 1, "value": {
                 "type": tag,
-                "fields": {name: _encode(value) for name, value in decoded.items()},
+                "fields": {name: fields[name] if name == "parent" else _encode(value)
+                           for name, value in decoded.items()},
             }}
             if json.dumps(
                 canonical, sort_keys=True, separators=(",", ":"),
@@ -214,11 +289,14 @@ def _legacy_discrepancy(
                 raise ValueError("noncanonical prior segment")
         elif tag in ("ReviewCheckpointArchiveAwaiting",
                      "CompletedReviewCheckpointArchiveAudit"):
-            state = decode_workflow(
-                raw, ReviewCheckpointArchiveAwaiting | CompletedReviewCheckpointArchiveAudit,
-            )
-            if encode_workflow(state) != raw:
-                raise ValueError("noncanonical prior cursor")
+            try:
+                state = decode_workflow(
+                    raw, ReviewCheckpointArchiveAwaiting | CompletedReviewCheckpointArchiveAudit,
+                )
+                if encode_workflow(state) != raw:
+                    raise ValueError("noncanonical prior cursor")
+            except (TypeError, ValueError, UnicodeError, RecursionError):
+                _decode_prior_tip_state(raw)
         else:
             raise ValueError("unknown prior cursor")
     except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
@@ -319,7 +397,8 @@ def advance_review_checkpoint_archive_audit(
     if isinstance(state, ReviewCheckpointArchiveSegment):
         raise WorkflowAuthorityError("checkpoint audit cursor has an invalid version")
     legacy_reason = (_legacy_discrepancy(db, key.repository, audit_key)
-                     or _v2_discrepancy(db, key.repository, audit_key))
+                     or _v2_discrepancy(db, key.repository, audit_key)
+                     or _v3_discrepancy(db, key.repository, audit_key))
     if legacy_reason is not None:
         if state is None:
             initial = ReviewCheckpointChainCursor(

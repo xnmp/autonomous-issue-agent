@@ -14,6 +14,10 @@ from issue_agent.adapters.review_execution_archive_audit import (
 from issue_agent.adapters.review_execution_archive_evidence import (
     observe_review_execution_archive_evidence,
 )
+from issue_agent.adapters.review_checkpoint_application_source import (
+    REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, read_review_checkpoint_application_source,
+)
+from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.review_round_archive_audit import advance_review_round_archive_audit
 from issue_agent.adapters.review_round_receipt_archive_audit import (
     advance_review_round_receipt_archive_audit,
@@ -58,8 +62,10 @@ def test_current_completed_archive_passes_join_without_writes(active):
     with store.transaction() as db:
         before = db.total_changes
         observed = observe_review_execution_archive_evidence(db, key, now=now)
+        tip_source = read_review_checkpoint_application_source(db, key.repository, tip)
         assert db.total_changes == before
     assert observed.checkpoints.tip_receipt_id == tip
+    assert observed.checkpoints.tip_application_source_sha256 == tip_source.source_sha256
     assert observed.rounds.through_sequence == 2
     assert observed.receipts.expected.through_sequence == 2
     assert observed.generations.generation_scan.final_cursor is None
@@ -130,6 +136,65 @@ def test_archive_join_rechecks_current_origin_source(active):
              observed.execution.origin.evidence_id),
         )
         with pytest.raises(WorkflowAuthorityError):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+@pytest.mark.parametrize("damage", ("missing", "malformed"))
+def test_archive_join_rechecks_current_checkpoint_application(active, damage):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        if damage == "missing":
+            db.execute(
+                "DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, key.repository, tip),
+            )
+        else:
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json='{}' "
+                "WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, key.repository, tip),
+            )
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint application"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_valid_application_change_after_completed_pass(active):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        before = read_review_checkpoint_application_source(db, key.repository, tip)
+        changed = replace(
+            before.recorded, tail_start_sequence=before.checkpoint.checkpoint.through_sequence,
+        )
+        assert changed != before.recorded
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json=? "
+            "WHERE namespace=? AND scope=? AND key=?",
+            (encode_workflow(changed), REVIEW_CHECKPOINT_APPLICATION_NAMESPACE,
+             key.repository, tip),
+        )
+        after = read_review_checkpoint_application_source(db, key.repository, tip)
+        assert after.source_sha256 != before.source_sha256
+        with pytest.raises(WorkflowAuthorityError, match="application changed"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rechecks_current_following_generation_source(rig):
+    store, key, manifest = _real_selected_checkpoint(rig)
+    assert manifest.plan.remaining_boundaries
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        source = manifest.application.tail.source
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-01-01T00:00:00+00:00' "
+            "WHERE namespace=? AND scope=? AND key=?",
+            (source.accepted_namespace, key.repository, source.accepted_key),
+        )
+        with pytest.raises((WorkflowAuthorityError, ValueError)):
             observe_review_execution_archive_evidence(db, key, now=now)
 
 
