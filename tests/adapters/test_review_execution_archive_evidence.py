@@ -6,28 +6,36 @@ from datetime import timedelta
 import pytest
 
 from issue_agent.adapters.review_checkpoint_archive_audit import (
-    advance_review_checkpoint_archive_audit,
+    _audit_key as _checkpoint_audit_key, advance_review_checkpoint_archive_audit,
 )
 from issue_agent.adapters.review_execution_archive_audit import (
     advance_review_generation_archive_audit,
 )
 from issue_agent.adapters.review_execution_archive_evidence import (
+    observe_initial_review_execution_archive_evidence,
     observe_review_execution_archive_evidence,
 )
+from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.adapters.review_lifecycle_archive_audit import (
     advance_review_lifecycle_archive_audit,
+)
+from issue_agent.adapters.review_initial_checkpoint_absence import (
+    advance_initial_checkpoint_absence_audit,
 )
 from issue_agent.adapters.review_archive_source_versions import read_review_archive_source_versions
 from issue_agent.adapters.review_checkpoint_application_source import (
     REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, read_review_checkpoint_application_source,
 )
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
-from issue_agent.adapters.review_round_archive_audit import advance_review_round_archive_audit
+from issue_agent.adapters.review_round_archive_audit import (
+    _current_execution, advance_review_round_archive_audit,
+)
 from issue_agent.adapters.review_round_receipt_archive_audit import (
     advance_review_round_receipt_archive_audit,
 )
 from issue_agent.adapters.workflow_rows import (
-    REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError,
+    REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, REVIEW_EXECUTION_ORIGIN_NAMESPACE,
+    WorkflowAuthorityError, review_execution_checkpoint_receipt_id,
 )
 from issue_agent.domain.review_checkpoint_archive import (
     CompletedReviewCheckpointArchiveAudit, ReviewCheckpointArchiveCursor,
@@ -36,9 +44,13 @@ from issue_agent.domain.review_execution import (
     CompletedReviewGenerationArchiveAudit, ReviewGenerationArchiveCursor,
 )
 from issue_agent.domain.review_execution_archive_evidence import (
+    ObservedInitialReviewExecutionArchiveEvidence,
     ObservedReviewExecutionArchiveEvidence,
 )
 from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
+from issue_agent.domain.review_initial_checkpoint_absence import (
+    BlockedInitialCheckpointAbsence, CompletedInitialCheckpointAbsence,
+)
 from issue_agent.domain.review_round_archive import (
     CompletedReviewRoundArchiveScan, ReviewRoundArchiveCursor,
 )
@@ -49,11 +61,11 @@ from tests.adapters.test_review_checkpoint_archive_audit import (
 from tests.adapters.test_review_execution_control import rig
 from tests.adapters.test_review_execution_persistence import active
 from tests.adapters.test_review_archive_source_versions import _insert_lifecycle_command
+from tests.adapters.test_review_productive_settlement import confirmed_copy, workflow_for
 
 
-def _complete(store, key, now):
+def _complete_source_passes(store, key, now, *, initial=False):
     for advance, completed in (
-        (advance_review_checkpoint_archive_audit, CompletedReviewCheckpointArchiveAudit),
         (advance_review_round_archive_audit, CompletedReviewRoundArchiveScan),
         (advance_review_round_receipt_archive_audit, CompletedReviewRoundReceiptArchiveAudit),
         (advance_review_generation_archive_audit, CompletedReviewGenerationArchiveAudit),
@@ -72,6 +84,156 @@ def _complete(store, key, now):
             break
     else:
         raise AssertionError("lifecycle audit did not complete")
+    if initial:
+        with store.transaction() as db:
+            binding = _current_execution(db, key).checkpoint.state.binding
+        for _ in range(64):
+            with store.transaction() as db:
+                state = advance_initial_checkpoint_absence_audit(db, binding, now=now)
+            if isinstance(state, CompletedInitialCheckpointAbsence):
+                break
+        else:
+            raise AssertionError("initial checkpoint absence audit did not complete")
+
+
+def _complete(store, key, now):
+    for _ in range(64):
+        with store.transaction() as db:
+            state = advance_review_checkpoint_archive_audit(db, key, now=now)
+        if isinstance(state, CompletedReviewCheckpointArchiveAudit):
+            break
+    else:
+        raise AssertionError("checkpoint audit did not complete")
+    _complete_source_passes(store, key, now)
+
+
+def test_initial_archive_join_precedes_first_checkpoint_and_has_no_writes(active):
+    store, snapshot = active
+    key = snapshot.revision.fence.key
+    now = store.now()
+    _complete_source_passes(store, key, now, initial=True)
+    with store.transaction() as db:
+        before = db.total_changes
+        observed = observe_initial_review_execution_archive_evidence(db, key, now=now)
+        assert db.total_changes == before
+    assert isinstance(observed, ObservedInitialReviewExecutionArchiveEvidence)
+    assert observed.execution.checkpoint_receipt is None
+    assert observed.rounds.through_sequence == 0
+    assert observed.receipts.expected.through_sequence == 0
+
+
+def test_initial_archive_join_covers_a_finalized_first_checkpoint_candidate(rig):
+    store, gateway, selection, _, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).settle_submission(command.command_id)
+    key = selection.expected.fence.key
+    now = store.now()
+    _complete_source_passes(store, key, now, initial=True)
+    with store.transaction() as db:
+        observed = observe_initial_review_execution_archive_evidence(db, key, now=now)
+        manifest = observe_review_checkpoint_manifest(db, key, plan.round.sequence)
+    assert observed.rounds.through_sequence == plan.round.sequence
+    assert observed.receipts.expected.rolling_sha256 == manifest.receipt.round_stream_sha256
+    assert observed.generations.generation_scan.final_cursor is None
+
+
+def test_initial_archive_join_detects_an_unclaimed_checkpoint_receipt(rig):
+    store, gateway, selection, _, plan, command = confirmed_copy(rig)
+    workflow_for(store, gateway).settle_submission(command.command_id)
+    key = selection.expected.fence.key
+    now = store.now()
+    _complete_source_passes(store, key, now, initial=True)
+    with store.transaction() as db:
+        manifest = observe_review_checkpoint_manifest(db, key, plan.round.sequence)
+        receipt_id = review_execution_checkpoint_receipt_id(manifest.receipt)
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES (?,?,?,?,?)",
+            (REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, key.repository,
+             receipt_id, now.isoformat(), encode_workflow(manifest.receipt)),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint absence pass is stale"):
+            observe_initial_review_execution_archive_evidence(db, key, now=now)
+    binding = manifest.receipt.previous_checkpoint.state.binding
+    for _ in range(64):
+        with store.transaction() as db:
+            state = advance_initial_checkpoint_absence_audit(db, binding, now=now)
+        if isinstance(state, BlockedInitialCheckpointAbsence):
+            break
+    else:
+        raise AssertionError("unclaimed checkpoint receipt was not found")
+    assert "already has a checkpoint receipt" in state.reason
+    with store.transaction() as db:
+        db.execute(
+            "DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+            (REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, key.repository, receipt_id),
+        )
+    for _ in range(64):
+        with store.transaction() as db:
+            state = advance_initial_checkpoint_absence_audit(db, binding, now=now)
+        if isinstance(state, CompletedInitialCheckpointAbsence):
+            break
+    else:
+        raise AssertionError("repaired checkpoint absence audit did not complete")
+    with store.transaction() as db:
+        restored = observe_initial_review_execution_archive_evidence(db, key, now=now)
+    assert restored.checkpoint_absence == state
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-checkpoint-application',?,'orphan:after-repair',?, '{}')",
+            (key.repository, now.isoformat()),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="checkpoint absence pass is stale"):
+            observe_initial_review_execution_archive_evidence(db, key, now=now)
+    for _ in range(64):
+        with store.transaction() as db:
+            orphan = advance_initial_checkpoint_absence_audit(db, binding, now=now)
+        if isinstance(orphan, BlockedInitialCheckpointAbsence):
+            break
+    else:
+        raise AssertionError("orphan application did not block recensus")
+    assert "unreadable" in orphan.reason
+
+
+def test_initial_archive_join_rejects_a_compacted_execution(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    with store.transaction() as db:
+        with pytest.raises(WorkflowAuthorityError, match="uncompacted"):
+            observe_initial_review_execution_archive_evidence(db, key, now=store.now())
+
+
+def test_initial_archive_join_rejects_a_prior_checkpoint_cursor(active):
+    store, snapshot = active
+    key = snapshot.revision.fence.key
+    execution = snapshot.execution
+    now = store.now()
+    _complete_source_passes(store, key, now, initial=True)
+    prior = CompletedReviewCheckpointArchiveAudit(
+        "checkpoint:unexpected", execution.origin, "0" * 64,
+        "0" * 64, 1, now, now + timedelta(seconds=3600), "0" * 64,
+    )
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+            "VALUES (?,?,?,?,?)",
+            ("review-checkpoint-archive-scan-v4", key.repository,
+             _checkpoint_audit_key(key, execution.binding.execution_epoch,
+                                   execution.binding.execution_episode),
+             encode_workflow(prior), now.isoformat()),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="unexpected checkpoint cursor"):
+            observe_initial_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_initial_archive_join_rejects_mutation_after_completed_census(active):
+    store, snapshot = active
+    key = snapshot.revision.fence.key
+    now = store.now()
+    _complete_source_passes(store, key, now, initial=True)
+    with store.transaction() as db:
+        _insert_lifecycle_command(db, "foreign:initial", kind="other")
+        with pytest.raises(WorkflowAuthorityError, match="lifecycle census is stale"):
+            observe_initial_review_execution_archive_evidence(db, key, now=now)
 
 
 def test_current_completed_archive_passes_join_without_writes(active):

@@ -1081,6 +1081,29 @@ the complete audit benchmark.
   four import contracts and both Pyrefly checks. Ten strict xfails remained
   expected. Log: `/tmp/review-lifecycle-join-gate.log` (ephemeral). The four
   paused services remained inactive.
+- Checkpoint 129 adds a separate initial-execution archive observation so the
+  first checkpoint writer is not required to present a checkpoint receipt it
+  has not minted. It aligns the completed round, receipt, generation and
+  lifecycle passes with the current origin and refuses an existing checkpoint
+  audit cursor. A new durable global scan walks at most 64 `dedupe_keys` rows
+  per step under the schema checkpoint-source revision. It validates every
+  selected checkpoint receipt and paired application receipt, including BLOB
+  aliases, malformed or orphaned sources, and blocks a checkpoint for the
+  selected execution episode. A source mutation restarts the scan; the join
+  refuses an absent, blocked, stale or overdue result. Tests cover an empty
+  origin, a finalized first-round candidate, an unclaimed same-episode
+  checkpoint, orphaned application, repair, alias and unrelated-page progress.
+  Sol found the missing checkpoint namespace and then the orphan-application
+  gap; both were fixed and its final review found no remaining bypass.
+  The result proves current absence under a revision, not that a checkpoint
+  never existed historically or that future writes are atomic. Each first
+  pass scales with all global dedupe rows; measure completion latency and
+  backlog before production admission. No writer or admission gate consumes
+  this observation yet. Full `make test` passed: 3,302 domain, 3,590 adapter
+  and 2,876 app tests, hooks, governor, four import contracts and both Pyrefly
+  checks. Ten strict xfails remained expected. Log:
+  `/tmp/initial-checkpoint-absence-gate.log` (ephemeral). The four paused
+  services remained inactive.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

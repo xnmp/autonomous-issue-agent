@@ -506,6 +506,14 @@ across transactions, compares effect links with command-joined receipts, and
 restarts after a source mutation. A repaired blocked source is rescanned when
 its revision changes. The read-only archive join consumes the result; no
 production writer or admission gate does.
+The initial execution has a separate read-only join of the completed round,
+receipt, generation and lifecycle passes. It does not require a checkpoint
+receipt that cannot exist before the first writer commit, and it rejects a
+prior checkpoint cursor for the same episode. A separate bounded global pass
+checks checkpoint receipts and paired application sources under the
+checkpoint-source mutation revision, blocking an existing receipt for this
+execution or an unreadable source. The join requires that pass to be current.
+This bootstrap observation also has no production write or admission authority.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched
