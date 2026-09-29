@@ -44,9 +44,12 @@ retained receipt namespace source, leaving valid open-round receipts pending.
 The ordered round and generation stream digests each match the initial
 checkpoint builder in real-source tests. Bounded checkpoint-chain pages check
 typed predecessor links, claim order and retained-row digests. Caller-held
-cursors do not prove earlier pages: segmented checkpoint ancestry, a
-transactional writer, cumulative hot-read bounds and the atomic admission
-gate remain to be implemented.
+cursors now feed a durable observational scan that checks one predecessor or
+retired source per transaction, matches each checkpoint segment's ordered
+stream digests, and compares the prior completed chain after tip growth.
+Retired outcome replay, unclaimed row and receipt census, a transactional
+writer, cumulative hot-read bounds and the atomic admission gate remain to be
+implemented.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

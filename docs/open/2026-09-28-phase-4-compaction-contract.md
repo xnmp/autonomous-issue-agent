@@ -215,6 +215,18 @@ and revalidate that path, then match each checkpoint's segmented retired
 round and generation streams. This page does not authorize compaction,
 admission or a compacted hot read.
 
+A durable observational checkpoint archive scan now owns that predecessor
+cursor in `level_state`. Each transaction rechecks the current segment
+receipt and consumes one expected retired round or accepted generation source,
+folding the same ordered digests as the checkpoint receipt builder. It compares
+each segment frontier and digest, reaches the exact origin, and records a
+completed chain digest for the next due pass. A new tip preserves the previous
+chain as a tail baseline; changed or missing predecessors persist a blocker.
+Completion is not an admission verdict: the scan has not replayed retired
+outcomes against each checkpoint state or censused unclaimed round rows and
+receipt references. The production writer and canonical compacted read remain
+disabled until those checks, cumulative bounds and the atomic audit gate exist.
+
 A read-only receipt sweep page now covers the twelve namespaces used by the
 round receipt-set definition, including command-keyed submission and recorded
 review receipts. It scans all repositories in indexed namespace, scope and

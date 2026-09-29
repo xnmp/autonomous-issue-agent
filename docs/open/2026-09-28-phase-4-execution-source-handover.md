@@ -646,6 +646,18 @@ the complete audit benchmark.
   refuse and no writer uses these pages. The full gate passed: 3,296 domain,
   3,357 adapter and 2,876 app tests, four import contracts and both Pyrefly
   checks.
+- Checkpoint 100 persists an observational checkpoint archive cursor by
+  execution episode. One transaction checks a predecessor receipt or one
+  expected retired round or accepted generation source, matching the ordered
+  stream digests in each receipt and following the chain to the exact origin.
+  A completed pass stores a chain digest for its next due pass; adding a new
+  tip preserves the old chain as a tail baseline. Missing or changed sources
+  persist a blocker. This is not an admission gate: it does not replay retired
+  outcomes against checkpoint state or census unclaimed archive rows and
+  receipt references. Canonical compacted loads still refuse. Independent Sol
+  review found no cursor regression and confirmed those two remaining
+  authority gaps. The full repository gate passed: 3,296 domain, 3,364
+  adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
 
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
