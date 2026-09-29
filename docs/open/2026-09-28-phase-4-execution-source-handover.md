@@ -7,6 +7,50 @@ with `CLAUDE.md`, `AGENTS.md`, the
 [execution design](2026-09-27-phase-4-review-execution-design.md), and the
 [origin and compaction contract](2026-09-28-phase-4-compaction-contract.md).
 
+## Continuation after checkpoint 137
+
+Latest coherent checkpoint: `96d4c13`, configured offline activation. Its
+final full gate and independent Luna review are recorded below. The checkout
+was clean and all seven installed services were inactive after publication.
+The phase-4 milestone count remains 0/7 and the six-phase count remains 3/6.
+
+The next implementation should compose checkpoint publication, bounded
+canonical reads and durable archive admission together. Sol and Luna's fresh
+read-only review identified these constraints:
+
+- Completed archive observations certify the existing tip, not a proposed next
+  checkpoint. The writer must verify current completed source passes and the
+  new manifest in one `BEGIN IMMEDIATE`, prove complete membership and full
+  command/effect and accepted-transition lineage, and atomically publish both
+  checkpoint/application receipts, the component and a typed audit gate.
+- Publishing receipts and the workflow changes their mutation witnesses.
+  Persist the gate with post-write versions. Broad witness equality is useful
+  for accepting a new checkpoint; requiring equality on every admission would
+  block ordinary suffix writes and unrelated PR changes immediately. A
+  certified tip has a bounded audit deadline; rescans restart on mutation,
+  and overdue or discrepant evidence blocks new work.
+- Separate canonical integrity from admission eligibility. Gate new preflight,
+  paid child reservation, generation advance, episode renewal and compaction
+  after exact retry checks in their write transactions. Do not put an overdue
+  refusal in generic workflow loads, settlement or round finalization: charged
+  returns and recovery evidence must remain writable while admission is held.
+- Finalized-round archive passes do not yet join a round's dispatch
+  `claim_occurrence_id` to its exact creation and terminal lifecycle receipts.
+  The `dispatch-claim-lifecycle` namespace is outside the round receipt sweep;
+  the ordinary completed seal proves an owner/claim pairing, not that lifecycle.
+  Add a bounded archival claim join, including exact identity and contradictory
+  event checks; the live-claim checker cannot verify a normally released claim.
+- The manifest's existing source ceiling excludes canonical load/origin reads
+  and peak memory. Bound those reads before enabling the writer. Keep the
+  unconditional compacted-load refusal until the complete writer, membership
+  and lineage proof, bounded reader and durable admission gate are installed.
+
+Acceptance tests must include multiple/partial checkpoints, zero-round
+generation retirement, source mutation between audit pages, orphan/aliased
+sources, a legitimate suffix write followed by another admission, exact retry,
+rollback, overdue/discrepant admission, and paid settlement/recovery while held.
+No next-step implementation or live action was made in this read-only review.
+
 ## Source inventory checkpoints
 
 - `d04070b` added a read-only, bounded file inventory for review
