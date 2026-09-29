@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
@@ -16,6 +17,7 @@ from .workflow_identity import canonical_workflow_repository, validate_workflow_
 MAX_ROUND_RECEIPT_ARCHIVE_STEP = 1
 MAX_ROUND_RECEIPT_ARCHIVE_MEMBERS = 128
 EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST = "0" * 64
+EMPTY_ROUND_RECEIPT_ARCHIVE_STREAM_DIGEST = hashlib.sha256(b"").hexdigest()
 ROUND_RECEIPT_NAMESPACES = tuple(sorted(item.value for item in ReviewRoundReceiptNamespace))
 
 
@@ -78,6 +80,7 @@ class ReviewRoundReceiptArchiveMember:
 class ReviewRoundReceiptArchiveSource:
     round: ReviewRoundIdentity
     round_source_sha256: str
+    receipt_set_sha256: str
     members: tuple[ReviewRoundReceiptArchiveMember, ...]
 
     def __post_init__(self) -> None:
@@ -90,9 +93,16 @@ class ReviewRoundReceiptArchiveSource:
                        for member in self.members)):
             raise ValueError("round receipt archive source requires exact members")
         _digest(self.round_source_sha256, "round receipt archive row")
+        _digest(self.receipt_set_sha256, "round receipt archive receipt set")
         keys = tuple((item.namespace, item.key) for item in self.members)
         if keys != tuple(sorted(set(keys))):
             raise ValueError("round receipt archive source requires unique ordered members")
+        receipt_set = hashlib.sha256(json.dumps(
+            [(item.namespace, item.key, item.source_sha256) for item in self.members],
+            separators=(",", ":"), ensure_ascii=True,
+        ).encode()).hexdigest()
+        if receipt_set != self.receipt_set_sha256:
+            raise ValueError("round receipt archive source disagrees with its receipt set")
 
 
 def _member_digest(member: ReviewRoundReceiptArchiveMember) -> int:
@@ -115,7 +125,7 @@ class ReviewRoundReceiptArchiveBaseline:
             raise ValueError("round receipt archive baseline requires a bounded frontier")
         _digest(self.rolling_sha256, "round receipt archive baseline")
         if (self.through_sequence == 0
-                and self.rolling_sha256 != EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST):
+                and self.rolling_sha256 != EMPTY_ROUND_RECEIPT_ARCHIVE_STREAM_DIGEST):
             raise ValueError("empty round receipt archive baseline cannot contain sources")
 
 
@@ -183,7 +193,7 @@ class CompletedReviewRoundReceiptArchiveScan:
             _digest(value, f"completed round receipt archive {name}")
         if (self.through_sequence == 0 and (
             self.receipt_count != 0
-            or self.rolling_sha256 != EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST
+            or self.rolling_sha256 != EMPTY_ROUND_RECEIPT_ARCHIVE_STREAM_DIGEST
             or self.membership_xor != EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST
         ) or self.through_sequence > 0 and self.receipt_count < 2):
             raise ValueError("completed round receipt archive scan lost its sources")
@@ -308,12 +318,12 @@ def begin_review_round_receipt_archive_scan(
     if through_sequence == 0:
         return CompletedReviewRoundReceiptArchiveScan(
             origin, origin_receipt, origin_source_sha256, 0,
-            EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST, 0,
+            EMPTY_ROUND_RECEIPT_ARCHIVE_STREAM_DIGEST, 0,
             EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST, now, due,
         )
     return ReviewRoundReceiptArchiveScan(
         origin, origin_receipt, origin_source_sha256, through_sequence, 1,
-        EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST, 0,
+        EMPTY_ROUND_RECEIPT_ARCHIVE_STREAM_DIGEST, 0,
         EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST, baseline, now, due,
     )
 
@@ -335,8 +345,9 @@ def advance_review_round_receipt_archive_scan(
     for member in source.members:
         membership ^= _member_digest(member)
     encoded = "\0".join((
-        str(source.round.sequence), source.round.round_id, source.round_source_sha256,
-        str(len(source.members)), f"{membership:064x}",
+        str(source.round.sequence), source.round.round_id,
+        str(source.round.binding.rejection.fence.generation),
+        source.round_source_sha256, source.receipt_set_sha256,
     )).encode()
     digest = hashlib.sha256(bytes.fromhex(digest) + encoded).hexdigest()
     if (scan.baseline is not None

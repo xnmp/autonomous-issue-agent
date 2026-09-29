@@ -1,5 +1,7 @@
 """Pure finalized-prefix receipt accounting and namespace reconciliation."""
 
+import hashlib
+import json
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 
@@ -11,7 +13,8 @@ from issue_agent.domain.review_execution import (
 from issue_agent.domain.review_round_receipt_archive import (
     BlockedReviewRoundReceiptArchiveScan, BlockedReviewRoundReceiptArchiveSweep,
     CompletedReviewRoundReceiptArchiveAudit, CompletedReviewRoundReceiptArchiveScan,
-    EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST, ReviewRoundReceiptArchiveBaseline,
+    EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST, EMPTY_ROUND_RECEIPT_ARCHIVE_STREAM_DIGEST,
+    ReviewRoundReceiptArchiveBaseline,
     ReviewRoundReceiptArchiveMember, ReviewRoundReceiptArchiveScan,
     ReviewRoundReceiptArchiveSource, ReviewRoundReceiptArchiveSweep,
     ReviewRoundReceiptSweepCursor, advance_review_round_receipt_archive_scan,
@@ -36,7 +39,11 @@ def _source(sequence, *, digest="b" * 64):
     members = tuple(ReviewRoundReceiptArchiveMember(
         round_id, "c" * 64, namespace, round_id.round_id, digest,
     ) for namespace in ("review-round-outcome", "review-round-preflight"))
-    return ReviewRoundReceiptArchiveSource(round_id, "c" * 64, members)
+    receipt_set = hashlib.sha256(json.dumps(
+        [(item.namespace, item.key, item.source_sha256) for item in members],
+        separators=(",", ":"), ensure_ascii=True,
+    ).encode()).hexdigest()
+    return ReviewRoundReceiptArchiveSource(round_id, "c" * 64, receipt_set, members)
 
 
 def test_expected_prefix_and_namespace_members_complete_exactly():
@@ -46,6 +53,16 @@ def test_expected_prefix_and_namespace_members_complete_exactly():
     assert isinstance(expected, CompletedReviewRoundReceiptArchiveScan)
     assert expected.receipt_count == 4
     assert expected.membership_xor != EMPTY_ROUND_RECEIPT_ARCHIVE_DIGEST
+    stream = EMPTY_ROUND_RECEIPT_ARCHIVE_STREAM_DIGEST
+    for sequence in (1, 2):
+        source = _source(sequence)
+        encoded = "\0".join((
+            str(sequence), source.round.round_id,
+            str(source.round.binding.rejection.fence.generation),
+            source.round_source_sha256, source.receipt_set_sha256,
+        )).encode()
+        stream = hashlib.sha256(bytes.fromhex(stream) + encoded).hexdigest()
+    assert expected.rolling_sha256 == stream
     ordered = sorted(
         (*_source(1).members, *_source(2).members),
         key=lambda member: (member.namespace, member.key),
@@ -141,6 +158,8 @@ def test_invalid_cursor_and_due_window_are_rejected():
         )
     with pytest.raises(ValueError, match="selected namespace"):
         replace(_source(1).members[0], namespace="foreign")
+    with pytest.raises(ValueError, match="disagrees with its receipt set"):
+        replace(_source(1), receipt_set_sha256="d" * 64)
     due = expected.due_at
     assert review_round_receipt_archive_overdue(expected, due)
     assert not review_round_receipt_archive_overdue(expected, due - timedelta(microseconds=1))

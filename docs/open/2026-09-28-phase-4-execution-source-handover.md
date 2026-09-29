@@ -615,6 +615,18 @@ the complete audit benchmark.
   issue after malformed-frontier persistence and cumulative-bound fixes. The
   full gate passed: 3,296 domain, 3,347 adapter and 2,876 app tests, four
   import contracts and both Pyrefly checks.
+- Checkpoint 97 makes that census's ordered round-source digest use the same
+  seed and per-round encoding as the existing checkpoint receipt builder.
+  Each expected round first verifies the canonical exact member set's own
+  receipt-set SHA-256. A real finalized round's audit digest now equals a
+  transaction-local initial checkpoint proposal's round-stream digest. The
+  audit cursor moved to a versioned `-v2` namespace so existing observational
+  rows remain intact while the new format starts a fresh pass; no old hash is
+  silently resumed. Independent Sol review verified this after finding the
+  initial cursor incompatibility. A later checkpoint still needs a segmented
+  source pass and ancestry proof; this comparison alone grants no authority.
+  The full gate passed: 3,296 domain, 3,348 adapter and 2,876 app tests,
+  four import contracts and both Pyrefly checks.
 
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
@@ -623,7 +635,7 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–96, the bounded round and receipt cursors can reconcile
+With checkpoints 88–97, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid
 open-round receipts remain pending. Next, bind the retired member stream to
 checkpoint ancestry. The census does not prove missing open receipts,

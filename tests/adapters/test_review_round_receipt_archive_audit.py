@@ -5,8 +5,9 @@ from dataclasses import replace
 import pytest
 
 from issue_agent.adapters.review_round_receipt_archive_audit import (
-    advance_review_round_receipt_archive_audit,
+    _audit_key, advance_review_round_receipt_archive_audit,
 )
+from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.review_round_receipt_archive import (
@@ -38,7 +39,7 @@ def _stored(store):
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM level_state "
-            "WHERE namespace='review-round-receipt-archive-scan'",
+            "WHERE namespace='review-round-receipt-archive-scan-v2'",
         ).fetchone()
         assert row is not None
         return decode_workflow(
@@ -58,12 +59,41 @@ def test_finalized_round_expected_members_match_complete_namespace_pass(rig):
     assert isinstance(first, CompletedReviewRoundReceiptArchiveScan)
     assert first.through_sequence == plan.round.sequence
     assert first.receipt_count >= 4
+    with store.transaction() as db:
+        manifest = observe_review_checkpoint_manifest(db, key, plan.round.sequence)
+    assert first.rolling_sha256 == manifest.receipt.round_stream_sha256
     result = _complete(store, key, now)
     assert isinstance(result, CompletedReviewRoundReceiptArchiveAudit)
     assert result.receipt_count == first.receipt_count
     assert result.membership_xor == first.membership_xor
     assert _stored(store) == result
     assert _advance(store, key, now) == result
+
+
+def test_prior_digest_format_cursor_is_preserved_and_new_pass_starts(rig):
+    store, _, _, selection, _ = rig
+    key = selection.expected.fence.key
+    binding = current(store, selection).execution.binding
+    audit_key = _audit_key(key, binding.execution_epoch, binding.execution_episode)
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) "
+            "VALUES (?,?,?,?,?)",
+            ("review-round-receipt-archive-scan", key.repository,
+             audit_key, "prior-format-evidence", store.now().isoformat()),
+        )
+    result = _advance(store, key, store.now())
+    assert isinstance(result, CompletedReviewRoundReceiptArchiveAudit)
+    with store.transaction() as db:
+        rows = db.execute(
+            "SELECT namespace,payload_json FROM level_state "
+            "WHERE namespace LIKE 'review-round-receipt-archive-scan%' "
+            "ORDER BY namespace",
+        ).fetchall()
+    assert [(row["namespace"], row["payload_json"]) for row in rows] == [
+        ("review-round-receipt-archive-scan", "prior-format-evidence"),
+        ("review-round-receipt-archive-scan-v2", encode_workflow(result)),
+    ]
 
 
 def test_valid_open_round_receipt_is_pending_outside_finalized_prefix(rig):
@@ -226,7 +256,7 @@ def test_malformed_or_aliased_persisted_cursor_refuses_resume(rig):
     with store.transaction() as db:
         db.execute(
             "UPDATE level_state SET payload_json='{}' "
-            "WHERE namespace='review-round-receipt-archive-scan'",
+            "WHERE namespace='review-round-receipt-archive-scan-v2'",
         )
     with pytest.raises(WorkflowAuthorityError, match="malformed"):
         _advance(store, key, now)

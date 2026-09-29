@@ -43,7 +43,7 @@ from .workflow_rows import (
 )
 
 
-_AUDIT_NAMESPACE = "review-round-receipt-archive-scan"
+_AUDIT_NAMESPACE = "review-round-receipt-archive-scan-v2"
 MAX_ROUND_RECEIPT_AUDIT_STEP_SOURCE_BYTES = (
     2 * MAX_LEGACY_ROUND_PAGE_BYTES
     + 3 * MAX_CHECKPOINT_ROUND_RECEIPT_BYTES
@@ -165,6 +165,7 @@ def _read_expected_source(
     round_id = observed.source.round
     return ReviewRoundReceiptArchiveSource(
         round_id, observed.source.row_sha256,
+        classified.source.source.receipt_set_sha256,
         tuple(ReviewRoundReceiptArchiveMember(
             round_id, observed.source.row_sha256,
             receipt.member.namespace, receipt.member.key,

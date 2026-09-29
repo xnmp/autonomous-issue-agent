@@ -223,9 +223,12 @@ indexed sweep's source digest for the same row. The member read still proves
 only the local retained set. A second bounded point read classifies every
 member payload, and a one-source join resolves named rounds or command
 registrations before comparing that source to its exact finalized-round
-member. Open rounds have no finalized member set. A complete expected-round
-walk and unclaimed receipt reconciliation must compare both sides before
-audit authority exists.
+member. Open rounds have no finalized member set. A persisted observational
+pass now compares a fixed contiguous finalized prefix with the complete
+retained receipt namespace, leaving valid open-round sources pending. Its
+round-source digest matches the initial checkpoint receipt builder's stream
+encoding, but later checkpoint segments, checkpoint ancestry and admission
+authority remain unimplemented.
 
 An audit discrepancy or overdue pass blocks new execution admission,
 generation advance, episode renewal and further compaction. Terminal money
