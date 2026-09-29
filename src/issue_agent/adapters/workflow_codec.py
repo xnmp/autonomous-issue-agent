@@ -21,6 +21,7 @@ from ..domain import review_round_archive as round_archive
 from ..domain import review_round_receipt_archive as receipt_archive
 from ..domain import review_checkpoint_chain as checkpoint_chain
 from ..domain import review_checkpoint_archive as checkpoint_archive
+from ..domain import review_checkpoint_application as checkpoint_application
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
@@ -125,6 +126,9 @@ _VALUES = (
     checkpoint_archive.ReviewCheckpointArchiveSegment,
     checkpoint_archive.CompletedReviewCheckpointArchiveAudit,
     checkpoint_archive.BlockedReviewCheckpointArchiveAudit,
+    checkpoint_application.ApplyAllCheckpointTailOutcomes,
+    checkpoint_application.ApplyCheckpointTailByFollowingBoundary,
+    checkpoint_application.ReviewCheckpointApplicationReceipt,
     rx.ReviewExecutionCheckpoint, rx.ReviewExecutionCompactionRoundSource,
     rx.ReviewExecutionCheckpointReceipt,
     rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,

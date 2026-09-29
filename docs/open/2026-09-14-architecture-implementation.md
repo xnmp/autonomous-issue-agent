@@ -56,6 +56,8 @@ boundary when one selected the outcomes. A pure replay check verifies a
 complete caller-supplied segment against that choice and projected checkpoint
 state. It still needs an atomic writer, durable audit replay, unclaimed row and
 receipt census, cumulative hot-read bounds and the admission gate.
+A compact application receipt format and bounded source reader now pair a
+retained tail choice with its exact checkpoint receipt, pending the writer.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

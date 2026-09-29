@@ -7,12 +7,13 @@ from dataclasses import dataclass
 
 from .review_execution import (
     ActivatedReviewExecution, MAX_EXECUTION_SUFFIX, ReviewExecutionBoundaryCursor,
-    ReviewExecutionCheckpoint, ReviewExecutionCompactionPlan,
+    ReviewExecutionCheckpoint, ReviewExecutionCheckpointReceipt,
+    ReviewExecutionCompactionPlan,
     ReviewExecutionGenerationBoundary, ReviewGenerationArchiveFingerprint,
     ReviewRoundOutcome, plan_review_execution_compaction,
     replay_review_execution_generations, same_execution_episode,
 )
-from .workflow_identity import WorkflowRevision
+from .workflow_identity import WorkflowRevision, validate_workflow_identifier
 
 
 def _applied_digest(sequences: tuple[int, ...]) -> str:
@@ -86,6 +87,55 @@ class ReviewCheckpointApplicationProposal:
                 raise ValueError("following boundary is outside the captured revision")
         else:
             raise ValueError("checkpoint application requires a typed tail selection")
+
+
+@dataclass(frozen=True)
+class ReviewCheckpointApplicationReceipt:
+    """Small durable tail choice keyed by its separately minted checkpoint receipt."""
+
+    checkpoint_receipt_id: str
+    captured_revision: WorkflowRevision
+    tail_start_sequence: int
+    tail: CheckpointTailApplication
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(
+            self.checkpoint_receipt_id, "checkpoint application receipt identity",
+        )
+        if (not isinstance(self.captured_revision, WorkflowRevision)
+                or type(self.tail_start_sequence) is not int
+                or self.tail_start_sequence < 0
+                or not isinstance(self.tail, (
+                    ApplyAllCheckpointTailOutcomes,
+                    ApplyCheckpointTailByFollowingBoundary,
+                ))):
+            raise ValueError("checkpoint application receipt requires a typed tail choice")
+
+
+def application_receipt_from_proposal(
+    checkpoint_receipt_id: str,
+    proposal: ReviewCheckpointApplicationProposal,
+) -> ReviewCheckpointApplicationReceipt:
+    if not isinstance(proposal, ReviewCheckpointApplicationProposal):
+        raise ValueError("checkpoint application receipt requires a typed proposal")
+    return ReviewCheckpointApplicationReceipt(
+        checkpoint_receipt_id, proposal.captured_revision,
+        proposal.tail_start_sequence, proposal.tail,
+    )
+
+
+def application_proposal_from_receipt(
+    checkpoint: ReviewExecutionCheckpointReceipt,
+    application: ReviewCheckpointApplicationReceipt,
+) -> ReviewCheckpointApplicationProposal:
+    if (not isinstance(checkpoint, ReviewExecutionCheckpointReceipt)
+            or not isinstance(application, ReviewCheckpointApplicationReceipt)):
+        raise ValueError("checkpoint application requires typed paired receipts")
+    return ReviewCheckpointApplicationProposal(
+        checkpoint.previous_checkpoint, checkpoint.checkpoint,
+        application.captured_revision, application.tail_start_sequence,
+        application.tail,
+    )
 
 
 def build_review_checkpoint_application_proposal(

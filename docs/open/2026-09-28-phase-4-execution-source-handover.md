@@ -658,17 +658,6 @@ the complete audit benchmark.
   review found no cursor regression and confirmed those two remaining
   authority gaps. The full repository gate passed: 3,296 domain, 3,364
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
-- Checkpoint 104 adds a pure replay check for a complete archived checkpoint
-  segment. It requires every retired outcome and boundary in order, verifies
-  the recorded tail selection against the first following boundary source,
-  then compares the projected checkpoint state. It accepts a following
-  boundary created after the captured revision and rejects changed source
-  fingerprints, applied sequences, missing outcomes and forged checkpoint
-  state. The function relies on the caller to establish exact source
-  membership and boundary absence; the current archive scan does not yet
-  collect those facts for state replay. Independent Sol review found no
-  concrete issue. The full gate passed: 3,297 domain, 3,368 adapter and
-  2,876 app tests, four import contracts and both Pyrefly checks.
 - Checkpoint 101 attempted sequential state replay for round-only checkpoint
   segments. A forged checkpoint with matching source digests reproduced the
   missing state check, and a versioned cursor resolved a persisted-schema
@@ -703,11 +692,35 @@ the complete audit benchmark.
   before an admission gate can use it. Independent Sol review found no
   remaining material issue. The full gate passed: 3,297 domain, 3,368
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
+- Checkpoint 104 adds a pure replay check for a complete archived checkpoint
+  segment. It requires every retired outcome and boundary in order, verifies
+  the recorded tail selection against the first following boundary source,
+  then compares the projected checkpoint state. It accepts a following
+  boundary created after the captured revision and rejects changed source
+  fingerprints, applied sequences, missing outcomes and forged checkpoint
+  state. The function relies on the caller to establish exact source
+  membership and boundary absence; the current archive scan does not yet
+  collect those facts for state replay. Independent Sol review found no
+  concrete issue. The full gate passed: 3,297 domain, 3,368 adapter and
+  2,876 app tests, four import contracts and both Pyrefly checks.
+- Checkpoint 105 defines a compact application receipt keyed by the checkpoint
+  receipt identity, carrying captured revision, tail start and typed choice.
+  Its bounded SQL reader pairs the permanent sidecar with the exact canonical
+  checkpoint receipt, checks equal claim instants, and fingerprints all six
+  retained source fields. Real selected and all-tail manifests round-trip;
+  absent, aliased, malformed, oversized, reusable, foreign and mismatched
+  claims block. This does not prove atomic minting or archive membership. No
+  production writer or archived audit uses the record yet. Sol review found
+  that a copied checkpoint and sidecar pair could be accepted under a foreign
+  repository scope; the embedded repository check and real copied-pair
+  regression close that gap. The full gate passed: 3,297 domain, 3,380
+  adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
 
 The next seam is durable checkpoint authority. The writer must mint the
-transaction-local applicability proposal with its checkpoint, verify the full
-retired stream using the identical round receipt-set definition, bind the
-ordered source digests, and publish the aggregate and checkpoint atomically.
+compact application receipt from its transaction-local proposal with the
+checkpoint. It must verify the full retired stream using the identical round
+receipt-set definition, bind the ordered source digests, and publish the
+aggregate and checkpoint atomically.
 The paged audit must re-read the selected boundary, replay outcomes,
 reconstruct retired member payloads and unclaimed receipts, and supply the
 admission gate. Keep the canonical compaction refusal until these checks are

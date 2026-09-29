@@ -249,6 +249,12 @@ that choice and the checkpoint state. It enforces contiguous retired sources,
 the supplied following boundary fingerprint and applied-sequence digest, and
 the captured revision's ordering. The archived audit does not yet supply or
 persist this complete state proof, so this check grants no admission authority.
+A compact codec-registered application receipt now records the checkpoint
+receipt identity, captured revision, tail start and typed selection. A bounded
+read joins its permanent source row to the exact checkpoint receipt, requires
+equal claim instants, and returns the six-field source digest. This format and
+reader are prerequisites for a writer; no production path mints the record,
+and equal timestamps alone do not prove atomic publication.
 
 A read-only receipt sweep page now covers the twelve namespaces used by the
 round receipt-set definition, including command-keyed submission and recorded
