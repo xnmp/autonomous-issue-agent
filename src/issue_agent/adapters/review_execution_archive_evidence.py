@@ -53,7 +53,9 @@ def observe_review_execution_archive_evidence(
             or _v2_discrepancy(db, key.repository, checkpoint_key)
             or _v3_discrepancy(db, key.repository, checkpoint_key)):
         raise WorkflowAuthorityError("execution archive has an unresolved prior checkpoint cursor")
-    _, checkpoint = _checkpoint_state(db, key.repository, checkpoint_key)
+    _, checkpoint, checkpoint_versions, _ = _checkpoint_state(
+        db, key.repository, checkpoint_key,
+    )
     _, rounds, round_rows_version = _round_state(
         db, key.repository, _round_key(key, epoch, episode),
     )
@@ -94,6 +96,8 @@ def observe_review_execution_archive_evidence(
         db, origin.checkpoint.state.binding,
         execution.binding.rejection.fence.generation, application.application,
     )
+    if checkpoint_versions != current_versions:
+        raise WorkflowAuthorityError("execution archive checkpoint census is stale")
     try:
         evidence = ObservedReviewExecutionArchiveEvidence(
             execution, checkpoint, rounds, receipts, generations, now,

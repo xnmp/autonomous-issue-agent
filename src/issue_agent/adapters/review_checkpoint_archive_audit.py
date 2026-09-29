@@ -11,7 +11,8 @@ from datetime import datetime
 from ..domain.review_checkpoint_archive import (
     BlockedReviewCheckpointArchiveAudit, CompletedReviewCheckpointArchiveAudit,
     MAX_CHECKPOINT_ARCHIVE_DUE_SECONDS, ReviewCheckpointArchiveAwaiting,
-    ReviewCheckpointArchiveBaseline, ReviewCheckpointArchiveSegment,
+    ReviewCheckpointArchiveBaseline, ReviewCheckpointArchiveCursor,
+    ReviewCheckpointArchiveSegment,
     ReviewCheckpointArchivePendingBoundary, ReviewCheckpointArchiveReplaySegment,
     ReviewCheckpointArchiveState, ReviewCheckpointArchiveStorageAnchor,
     advance_review_checkpoint_archive_round, begin_review_checkpoint_archive_scan,
@@ -47,6 +48,9 @@ from .review_execution_activation import (
 )
 from .review_round_archive_audit import _current_execution
 from .review_round_receipt_sweep import read_classified_checkpoint_round_receipt_members
+from .review_archive_source_versions import (
+    ReviewArchiveSourceVersions, read_review_archive_source_versions,
+)
 from .workflow_codec import (
     MAX_WORKFLOW_PAYLOAD_BYTES, _decode, _encode, _unique_object,
     WorkflowEncodingError, decode_workflow, encode_workflow,
@@ -81,7 +85,10 @@ def _audit_key(key: WorkflowKey, epoch: int, episode: str) -> str:
 def _read_state(
     db: sqlite3.Connection, repository: str, audit_key: str,
     namespace: str = _AUDIT_NAMESPACE,
-) -> tuple[int | None, ReviewCheckpointArchiveState | None]:
+) -> tuple[
+    int | None, ReviewCheckpointArchiveState | None,
+    ReviewArchiveSourceVersions | None, ReviewCheckpointArchiveBaseline | None,
+]:
     rows = db.execute(
         "SELECT rowid,typeof(namespace) AS namespace_type,typeof(scope) AS scope_type,"
         "typeof(key) AS key_type,typeof(payload_json) AS payload_type,"
@@ -91,7 +98,7 @@ def _read_state(
         (namespace, namespace, repository, repository, audit_key, audit_key),
     ).fetchall()
     if not rows:
-        return None, None
+        return None, None, None, None
     if (len(rows) != 1 or any(rows[0][f"{name}_type"] != "text" for name in (
         "namespace", "scope", "key", "payload",
     )) or type(rows[0]["payload_bytes"]) is not int
@@ -108,13 +115,31 @@ def _read_state(
     try:
         if namespace in (_V2_AUDIT_NAMESPACE, _V3_AUDIT_NAMESPACE):
             state = _decode_prior_tip_state(raw)
+            source_versions = None
+            prior_baseline = None
         else:
-            state = decode_workflow(raw, ReviewCheckpointArchiveState)
-            if encode_workflow(state) != raw:
+            decoded = decode_workflow(raw, object)
+            if encode_workflow(decoded) != raw:
                 raise ValueError("noncanonical cursor")
+            if isinstance(decoded, ReviewCheckpointArchiveCursor):
+                state = decoded.state
+                source_versions = decoded.source_versions
+                prior_baseline = decoded.prior_baseline
+                if source_versions.repository != repository:
+                    raise ValueError("cursor source scope changed")
+            elif isinstance(decoded, (
+                ReviewCheckpointArchiveAwaiting, ReviewCheckpointArchiveSegment,
+                ReviewCheckpointArchiveReplaySegment,
+                CompletedReviewCheckpointArchiveAudit, BlockedReviewCheckpointArchiveAudit,
+            )):
+                state = decoded
+                source_versions = None
+                prior_baseline = None
+            else:
+                raise ValueError("wrong checkpoint archive cursor variant")
     except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError) as exc:
         raise WorkflowAuthorityError("checkpoint audit cursor is malformed") from exc
-    return rows[0]["rowid"], state
+    return rows[0]["rowid"], state, source_versions, prior_baseline
 
 
 def _decode_prior_tip_state(raw: str) -> ReviewCheckpointArchiveState:
@@ -168,7 +193,7 @@ def _decode_prior_tip_state(raw: str) -> ReviewCheckpointArchiveState:
 
 def _v2_discrepancy(db: sqlite3.Connection, repository: str, audit_key: str) -> str | None:
     try:
-        _, state = _read_state(db, repository, audit_key, _V2_AUDIT_NAMESPACE)
+        _, state, _, _ = _read_state(db, repository, audit_key, _V2_AUDIT_NAMESPACE)
     except WorkflowAuthorityError:
         return "prior checkpoint audit cursor is malformed or unreadable"
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
@@ -181,7 +206,7 @@ def _v2_discrepancy(db: sqlite3.Connection, repository: str, audit_key: str) -> 
 def _v3_discrepancy(db: sqlite3.Connection, repository: str, audit_key: str) -> str | None:
     """Restart prior observations while retaining malformed and blocked cursors."""
     try:
-        _, state = _read_state(db, repository, audit_key, _V3_AUDIT_NAMESPACE)
+        _, state, _, _ = _read_state(db, repository, audit_key, _V3_AUDIT_NAMESPACE)
     except WorkflowAuthorityError:
         return "prior checkpoint audit cursor is malformed or unreadable"
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
@@ -306,9 +331,10 @@ def _legacy_discrepancy(
 
 def _persist_state(
     db: sqlite3.Connection, repository: str, audit_key: str, rowid: int | None,
-    state: ReviewCheckpointArchiveState, now: datetime,
+    state: ReviewCheckpointArchiveState, source_versions: ReviewArchiveSourceVersions,
+    prior_baseline: ReviewCheckpointArchiveBaseline | None, now: datetime,
 ) -> None:
-    encoded = encode_workflow(state)
+    encoded = encode_workflow(ReviewCheckpointArchiveCursor(state, source_versions, prior_baseline))
     if rowid is None:
         db.execute(
             "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) VALUES (?,?,?,?,?)",
@@ -325,10 +351,11 @@ def _persist_state(
 def _persist_bounded_state(
     db: sqlite3.Connection, repository: str, audit_key: str, rowid: int | None,
     state: ReviewCheckpointArchiveState, tip_id: str, origin_digest: str,
-    now: datetime,
+    source_versions: ReviewArchiveSourceVersions,
+    prior_baseline: ReviewCheckpointArchiveBaseline | None, now: datetime,
 ) -> ReviewCheckpointArchiveState:
     try:
-        _persist_state(db, repository, audit_key, rowid, state, now)
+        _persist_state(db, repository, audit_key, rowid, state, source_versions, prior_baseline, now)
     except WorkflowEncodingError:
         # Source and cursor limits differ; the fixed-size anchor also covers
         # blockers constructed from an already large prior cursor.
@@ -336,7 +363,7 @@ def _persist_bounded_state(
             ReviewCheckpointArchiveStorageAnchor(tip_id, origin_digest),
             "checkpoint archive audit cursor exceeds its storage bound", now,
         )
-        _persist_state(db, repository, audit_key, rowid, state, now)
+        _persist_state(db, repository, audit_key, rowid, state, source_versions, prior_baseline, now)
     return state
 
 
@@ -362,6 +389,18 @@ def _origin_source_sha256(state: ReviewCheckpointArchiveState) -> str:
     if isinstance(state.prior, ReviewCheckpointArchiveStorageAnchor):
         return state.prior.origin_source_sha256
     return _origin_source_sha256(state.prior)
+
+
+def _baseline(state: ReviewCheckpointArchiveState) -> ReviewCheckpointArchiveBaseline | None:
+    if isinstance(state, CompletedReviewCheckpointArchiveAudit):
+        return ReviewCheckpointArchiveBaseline(state.tip_receipt_id, state.chain_sha256)
+    if isinstance(state, ReviewCheckpointArchiveAwaiting):
+        return state.baseline
+    if isinstance(state, ReviewCheckpointArchiveSegment):
+        return state.parent.baseline
+    if isinstance(state, ReviewCheckpointArchiveReplaySegment):
+        return state.segment.parent.baseline
+    return None
 
 
 def advance_review_checkpoint_archive_audit(
@@ -391,7 +430,8 @@ def advance_review_checkpoint_archive_audit(
     audit_key = _audit_key(
         key, execution.binding.execution_epoch, execution.binding.execution_episode,
     )
-    rowid, state = _read_state(db, key.repository, audit_key)
+    source_versions = read_review_archive_source_versions(db, key.repository)
+    rowid, state, stored_versions, prior_baseline = _read_state(db, key.repository, audit_key)
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
         return state
     if isinstance(state, ReviewCheckpointArchiveSegment):
@@ -410,14 +450,16 @@ def advance_review_checkpoint_archive_audit(
             )
         blocked = BlockedReviewCheckpointArchiveAudit(state, legacy_reason, now)
         return _persist_bounded_state(
-            db, key.repository, audit_key, rowid, blocked, tip_id, origin_digest, now,
+            db, key.repository, audit_key, rowid, blocked, tip_id, origin_digest,
+            source_versions, prior_baseline, now,
         )
     if state is not None and _origin_source_sha256(state) != origin_digest:
         result: ReviewCheckpointArchiveState = BlockedReviewCheckpointArchiveAudit(
             state, "checkpoint origin source changed since audit start", now,
         )
         return _persist_bounded_state(
-            db, key.repository, audit_key, rowid, result, tip_id, origin_digest, now,
+            db, key.repository, audit_key, rowid, result, tip_id, origin_digest,
+            source_versions, prior_baseline, now,
         )
     cursor = _cursor(state) if state is not None else None
     if cursor is not None and (
@@ -429,25 +471,28 @@ def advance_review_checkpoint_archive_audit(
             state, "checkpoint tip changed during audit", now,
         )
         return _persist_bounded_state(
-            db, key.repository, audit_key, rowid, result, tip_id, origin_digest, now,
+            db, key.repository, audit_key, rowid, result, tip_id, origin_digest,
+            source_versions, prior_baseline, now,
         )
+    if state is not None and stored_versions != source_versions:
+        prior_baseline = (
+            _baseline(state) if isinstance(state, CompletedReviewCheckpointArchiveAudit)
+            else prior_baseline or _baseline(state)
+        )
+        state = None
     if isinstance(state, CompletedReviewCheckpointArchiveAudit):
         if (state.tip_receipt_id == tip_id and state.origin == execution.origin
                 and now < state.next_due_at):
             return state
-        baseline = ReviewCheckpointArchiveBaseline(
-            state.tip_receipt_id, state.chain_sha256,
-        )
+        prior_baseline = _baseline(state)
         state = None
-    else:
-        baseline = None
     if state is None:
         initial = ReviewCheckpointChainCursor(
             tip_id, execution.checkpoint, execution.origin,
             tip_id, execution.checkpoint, None,
         )
         state = begin_review_checkpoint_archive_scan(
-            initial, origin_digest, now, due_seconds, baseline,
+            initial, origin_digest, now, due_seconds, prior_baseline,
         )
     try:
         if isinstance(state, ReviewCheckpointArchiveAwaiting):
@@ -589,5 +634,6 @@ def advance_review_checkpoint_archive_audit(
             state, (str(exc) or "checkpoint archived source is unreadable")[:512], now,
         )
     return _persist_bounded_state(
-        db, key.repository, audit_key, rowid, result, tip_id, origin_digest, now,
+        db, key.repository, audit_key, rowid, result, tip_id, origin_digest,
+        source_versions, prior_baseline, now,
     )

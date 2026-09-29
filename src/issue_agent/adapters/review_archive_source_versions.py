@@ -3,40 +3,12 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
 
 from ..domain.workflow_identity import canonical_workflow_repository
+from ..domain.review_archive_source_versions import (
+    MAX_ARCHIVE_SOURCE_VERSION, ReviewArchiveSourceVersions,
+)
 from .workflow_rows import WorkflowAuthorityError
-
-
-MAX_ARCHIVE_SOURCE_VERSION = 9223372036854775806
-
-
-@dataclass(frozen=True)
-class ReviewArchiveSourceVersions:
-    repository: str
-    round_rows: int
-    all_round_rows: int
-    round_receipts: int
-    generation_sources: int
-    checkpoint_sources: int
-    workflow_rows: int
-
-    def __post_init__(self) -> None:
-        if (canonical_workflow_repository(self.repository) != self.repository
-                or type(self.round_rows) is not int
-                or not 0 <= self.round_rows <= MAX_ARCHIVE_SOURCE_VERSION
-                or type(self.all_round_rows) is not int
-                or not 0 <= self.all_round_rows <= MAX_ARCHIVE_SOURCE_VERSION
-                or type(self.round_receipts) is not int
-                or not 0 <= self.round_receipts <= MAX_ARCHIVE_SOURCE_VERSION
-                or type(self.generation_sources) is not int
-                or not 0 <= self.generation_sources <= MAX_ARCHIVE_SOURCE_VERSION
-                or type(self.checkpoint_sources) is not int
-                or not 0 <= self.checkpoint_sources <= MAX_ARCHIVE_SOURCE_VERSION
-                or type(self.workflow_rows) is not int
-                or not 0 <= self.workflow_rows <= MAX_ARCHIVE_SOURCE_VERSION):
-            raise ValueError("archive source versions require canonical bounded witnesses")
 
 
 def _read_version(db: sqlite3.Connection, source: str, scope: bytes) -> int | None:

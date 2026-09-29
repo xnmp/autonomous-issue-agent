@@ -22,6 +22,7 @@ from .review_checkpoint_stream_replay import (
     _CheckpointReplayBetweenBoundaries,
     _CheckpointReplayTail, finish_checkpoint_stream_replay,
 )
+from .review_archive_source_versions import ReviewArchiveSourceVersions
 from .workflow_identity import validate_workflow_identifier
 
 
@@ -262,6 +263,23 @@ ReviewCheckpointArchiveState = (
     | ReviewCheckpointArchiveReplaySegment
     | CompletedReviewCheckpointArchiveAudit | BlockedReviewCheckpointArchiveAudit
 )
+
+
+@dataclass(frozen=True)
+class ReviewCheckpointArchiveCursor:
+    state: ReviewCheckpointArchiveState
+    source_versions: ReviewArchiveSourceVersions
+    prior_baseline: ReviewCheckpointArchiveBaseline | None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.state, (
+                ReviewCheckpointArchiveAwaiting, ReviewCheckpointArchiveSegment,
+                ReviewCheckpointArchiveReplaySegment,
+                CompletedReviewCheckpointArchiveAudit, BlockedReviewCheckpointArchiveAudit,
+            )) or not isinstance(self.source_versions, ReviewArchiveSourceVersions)
+                or self.prior_baseline is not None
+                and not isinstance(self.prior_baseline, ReviewCheckpointArchiveBaseline)):
+            raise ValueError("checkpoint archive cursor requires typed state and source revisions")
 
 
 def begin_review_checkpoint_archive_scan(

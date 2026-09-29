@@ -53,8 +53,10 @@ generation receipts and accepted transition sources. The generation census
 now captures that revision, restarts on mutation and is rejected by the join
 when stale. This does not authorize compaction.
 Schema v30 now witnesses checkpoint/origin/application receipts and workflow
-and component mutations for the forthcoming versioned checkpoint audit. These
-witnesses alone do not authorize compacted loads.
+and component mutations. The durable checkpoint audit now captures all six
+source revisions across paged steps and retains its prior completed chain
+digest through restarts. The read-only join refuses stale or unversioned
+checkpoint passes. This does not authorize compacted loads.
 A transaction-local cursor now persists one bounded sweep page at a time,
 checks that the episode has exactly its allocated sequence count, and compares
 the prior pass's source membership when the frontier grows or a scheduled

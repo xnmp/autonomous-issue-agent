@@ -966,6 +966,22 @@ the complete audit benchmark.
   (ephemeral). The four paused services remained inactive. The new revisions
   are observational until the paged checkpoint audit and read-only join
   capture and compare them.
+- Checkpoint 123 stores the complete archive source revision set with every
+  durable checkpoint audit step. A revision change restarts the paged chain
+  scan, and the cursor retains the preceding completed chain digest across
+  later interrupted rescans. The read-only four-audit join rejects stale or
+  unversioned checkpoint completion before returning evidence. Old unversioned
+  v4 observations are re-censused; prior blocked cursors remain blocked.
+  Regressions cover foreign checkpoint and workflow mutations, changed source
+  during paging, retained baseline after a second mutation, legacy completion,
+  malformed revisions, and stale joins. The canonical source-revision value
+  moved to `domain/` so both adapter reads and the typed cursor use one pure
+  contract. Independent Sol review found no concrete issue. Full `make test`
+  passed: 3,302 domain, 3,518 adapter and 2,876 app tests, hooks, governor,
+  four import contracts and both Pyrefly checks. Log:
+  `/tmp/review-checkpoint-archive-versioned-gate.log` (ephemeral). The four
+  paused services remained inactive. This remains observational: the
+  production writer and admission gate do not yet consume the completed pass.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
@@ -989,10 +1005,12 @@ only on one connection, so it cannot serve as a durable cross-transaction
 witness. A complete schema-maintained revision needs exact trigger coverage of
 every source table and namespace, including updates, deletes and rekeys;
 [SQLite triggers](https://www.sqlite.org/lang_createtrigger.html) fire per row.
-The first schema revisions cover round rows, retained round receipts and
-generation receipt/accepted transition rows. Their audits capture and compare
-revisions across bounded pages. Other source groups still need mutation
-coverage before these results can support an atomic writer or admission gate.
+Schema revisions v27–v30 cover round rows, retained round receipts, generation
+receipt/accepted transition rows, checkpoint/origin/application receipts and
+workflow/component rows. The completed archive audits capture and compare
+those revisions across bounded pages. External command, effect and claim
+lineage still needs source-backed transactional revalidation before an atomic
+writer or admission gate can use these observations.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

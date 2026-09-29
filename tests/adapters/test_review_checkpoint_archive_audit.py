@@ -20,6 +20,7 @@ from issue_agent.adapters.review_checkpoint_state_replay import (
 )
 from issue_agent.adapters.review_execution_activation import read_checkpoint_round_receipt_source
 from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
+from issue_agent.adapters.review_archive_source_versions import read_review_archive_source_versions
 from issue_agent.adapters.review_round_archive_audit import _current_execution
 from issue_agent.adapters.workflow_codec import (
     MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow,
@@ -29,11 +30,12 @@ from issue_agent.adapters.workflow_rows import (
 )
 from issue_agent.domain.review_checkpoint_archive import (
     BlockedReviewCheckpointArchiveAudit, CompletedReviewCheckpointArchiveAudit,
-    ReviewCheckpointArchiveAwaiting, ReviewCheckpointArchiveSegment,
+    ReviewCheckpointArchiveAwaiting, ReviewCheckpointArchiveCursor,
+    ReviewCheckpointArchiveSegment,
     ReviewCheckpointArchivePendingBoundary,
     ReviewCheckpointArchiveReplaySegment,
     ReviewCheckpointArchiveStorageAnchor,
-    ReviewCheckpointArchiveState, begin_review_checkpoint_archive_scan,
+    begin_review_checkpoint_archive_scan,
     review_checkpoint_archive_overdue,
 )
 from issue_agent.domain.review_checkpoint_chain import ReviewCheckpointChainCursor
@@ -186,14 +188,18 @@ def _complete(store, key, now):
     raise AssertionError("checkpoint audit did not complete in bounded steps")
 
 
-def _stored(store):
+def _stored_cursor(store):
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM level_state "
             "WHERE namespace='review-checkpoint-archive-scan-v4'",
         ).fetchone()
         assert row is not None
-        return decode_workflow(row["payload_json"], ReviewCheckpointArchiveState)
+        return decode_workflow(row["payload_json"], ReviewCheckpointArchiveCursor)
+
+
+def _stored(store):
+    return _stored_cursor(store).state
 
 
 def test_two_checkpoint_segments_reach_origin_with_exact_streams(active):
@@ -458,10 +464,11 @@ def test_prior_segment_is_restarted_only_when_well_formed(active, damage):
         assert result.segment.source.receipt_id == tip
 
 
-def test_changed_application_source_blocks_segment_resume(active):
+def test_changed_application_source_restarts_uncompleted_scan(active):
     store, key, _, tip = _two_valid_checkpoints(active)
     now = store.now()
-    assert isinstance(_advance(store, key, now), ReviewCheckpointArchiveReplaySegment)
+    first = _advance(store, key, now)
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND key=?",
@@ -475,9 +482,12 @@ def test_changed_application_source_blocks_segment_resume(active):
             "UPDATE dedupe_keys SET payload_json=? WHERE namespace=? AND key=?",
             (encode_workflow(changed), REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, tip),
         )
-    result = _advance(store, key, now)
-    assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
-    assert "checkpoint application changed after its page" in result.reason
+    restarted = _advance(store, key, now)
+    assert isinstance(restarted, ReviewCheckpointArchiveReplaySegment)
+    assert restarted.segment.parent.source_count == 0
+    assert restarted.segment.application_source_sha256 != first.segment.application_source_sha256
+    result = _complete(store, key, now)
+    assert isinstance(result, CompletedReviewCheckpointArchiveAudit)
     assert _stored(store) == result
 
 
@@ -668,6 +678,80 @@ def test_prior_application_source_change_is_found_on_next_pass(active):
     assert "changed since its prior pass" in result.reason
 
 
+def test_checkpoint_audit_restarts_after_foreign_source_mutation(active):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    now = store.now()
+    first = _advance(store, key, now)
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    with store.transaction() as db:
+        before = read_review_archive_source_versions(db, key.repository)
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-execution-origin','other/repo','foreign:origin',"
+            "'2026-09-29T00:00:00+00:00','{}')",
+        )
+        after = read_review_archive_source_versions(db, key.repository)
+        assert after.checkpoint_sources == before.checkpoint_sources + 1
+    restarted = _advance(store, key, now)
+    assert isinstance(restarted, ReviewCheckpointArchiveReplaySegment)
+    assert restarted.segment.parent.source_count == 0
+    assert restarted.segment.source.receipt_id == tip
+    assert _stored_cursor(store).source_versions == after
+    assert isinstance(_complete(store, key, now), CompletedReviewCheckpointArchiveAudit)
+
+
+def test_checkpoint_audit_keeps_completed_baseline_across_version_restart(active):
+    store, key, first_id, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    completed = _complete(store, key, now)
+    assert isinstance(completed, CompletedReviewCheckpointArchiveAudit)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE workflow_components SET episode_id=episode_id "
+            "WHERE repository=? AND family='review_execution'",
+            (key.repository,),
+        )
+    first = _advance(store, key, now)
+    assert isinstance(first, ReviewCheckpointArchiveReplaySegment)
+    assert first.segment.parent.baseline is not None
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND key=?",
+            (REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, first_id),
+        ).fetchone()
+        recorded = decode_workflow(row["payload_json"], ReviewCheckpointApplicationReceipt)
+        changed = replace(recorded, captured_revision=replace(
+            recorded.captured_revision, version=recorded.captured_revision.version + 1,
+        ))
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json=? WHERE namespace=? AND key=?",
+            (encode_workflow(changed), REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, first_id),
+        )
+    restarted = _advance(store, key, now)
+    assert isinstance(restarted, ReviewCheckpointArchiveReplaySegment)
+    assert _stored_cursor(store).prior_baseline == first.segment.parent.baseline
+    result = _complete(store, key, now)
+    assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
+    assert "changed since its prior pass" in result.reason
+
+
+def test_unversioned_checkpoint_completion_is_recensused(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    completed = _complete(store, key, now)
+    assert isinstance(completed, CompletedReviewCheckpointArchiveAudit)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE level_state SET payload_json=? "
+            "WHERE namespace='review-checkpoint-archive-scan-v4'",
+            (encode_workflow(completed),),
+        )
+    restarted = _advance(store, key, now)
+    assert isinstance(restarted, ReviewCheckpointArchiveReplaySegment)
+    assert restarted.segment.parent.baseline is not None
+    assert isinstance(_complete(store, key, now), CompletedReviewCheckpointArchiveAudit)
+
+
 def test_new_tip_retains_prior_completed_chain_as_baseline(active):
     store, snapshot = active
     store, key, first_id, _ = _two_valid_checkpoints(active)
@@ -701,7 +785,7 @@ def test_missing_predecessor_blocks_on_its_page(active):
     assert isinstance(state, ReviewCheckpointArchiveAwaiting)
     with store.transaction() as db:
         db.execute("DELETE FROM dedupe_keys WHERE key=?", (first_id,))
-    result = _advance(store, key, now)
+    result = _complete(store, key, now)
     assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
     assert _stored(store) == result
 
@@ -762,9 +846,8 @@ def test_pending_generation_source_change_blocks_resume(rig):
             "WHERE namespace=? AND key=?",
             (pending.replay.source.accepted_namespace, pending.replay.source.accepted_key),
         )
-    result = _advance(store, key, store.now())
+    result = _complete(store, key, store.now())
     assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
-    assert "pending generation source changed" in result.reason
     assert _stored(store) == result
 
 
@@ -781,8 +864,9 @@ def test_cursor_storage_excess_persists_a_bounded_blocker(active, monkeypatch, p
     compact_blocker = BlockedReviewCheckpointArchiveAudit(
         anchor, "checkpoint archive audit cursor exceeds its storage bound", now,
     )
-    limit = len(encode_workflow(compact_blocker).encode()) + 32
-    assert len(encode_workflow(first).encode()) > limit
+    cursor = _stored_cursor(store)
+    limit = len(encode_workflow(replace(cursor, state=compact_blocker)).encode()) + 32
+    assert len(encode_workflow(cursor).encode()) > limit
     if phase == "first_page":
         with store.transaction() as db:
             db.execute(
@@ -792,7 +876,8 @@ def test_cursor_storage_excess_persists_a_bounded_blocker(active, monkeypatch, p
 
     def bounded(value):
         encoded = original(value)
-        if (phase == "first_page" or value != first) and len(encoded.encode()) > limit:
+        state = value.state if isinstance(value, ReviewCheckpointArchiveCursor) else value
+        if (phase == "first_page" or state != first) and len(encoded.encode()) > limit:
             raise WorkflowEncodingError("workflow payload is too large")
         return encoded
 
@@ -821,8 +906,9 @@ def test_prior_discrepancy_storage_excess_persists_anchor(active, monkeypatch):
     original = archive_audit.encode_workflow
 
     def bounded(value):
-        if (isinstance(value, BlockedReviewCheckpointArchiveAudit)
-                and isinstance(value.prior, ReviewCheckpointArchiveAwaiting)):
+        state = value.state if isinstance(value, ReviewCheckpointArchiveCursor) else value
+        if (isinstance(state, BlockedReviewCheckpointArchiveAudit)
+                and isinstance(state.prior, ReviewCheckpointArchiveAwaiting)):
             raise WorkflowEncodingError("workflow payload is too large")
         return original(value)
 
@@ -842,6 +928,34 @@ def test_malformed_persisted_cursor_refuses_resume(active):
         db.execute(
             "UPDATE level_state SET payload_json='{}' "
             "WHERE namespace='review-checkpoint-archive-scan-v4'",
+        )
+    with store.transaction() as db:
+        with pytest.raises(WorkflowAuthorityError, match="malformed"):
+            advance_review_checkpoint_archive_audit(db, key, now=now)
+
+
+@pytest.mark.parametrize("damage", ("boolean", "missing", "foreign_scope"))
+def test_malformed_checkpoint_source_revisions_refuse_resume(active, damage):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _advance(store, key, now)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM level_state "
+            "WHERE namespace='review-checkpoint-archive-scan-v4'",
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        versions = payload["value"]["fields"]["source_versions"]["fields"]
+        if damage == "boolean":
+            versions["checkpoint_sources"] = True
+        elif damage == "missing":
+            del versions["checkpoint_sources"]
+        else:
+            versions["repository"] = "other/repo"
+        db.execute(
+            "UPDATE level_state SET payload_json=? "
+            "WHERE namespace='review-checkpoint-archive-scan-v4'",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")),),
         )
     with store.transaction() as db:
         with pytest.raises(WorkflowAuthorityError, match="malformed"):
