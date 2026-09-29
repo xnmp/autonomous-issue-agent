@@ -9,7 +9,13 @@ from issue_agent.adapters.review_checkpoint_archive_audit import (
     _audit_key, advance_review_checkpoint_archive_audit,
 )
 from issue_agent.adapters.review_checkpoint_application_source import (
-    REVIEW_CHECKPOINT_APPLICATION_NAMESPACE,
+    REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, read_review_checkpoint_application_source,
+)
+from issue_agent.adapters.review_checkpoint_following_source import (
+    read_checkpoint_following_application_source,
+)
+from issue_agent.adapters.review_checkpoint_state_replay import (
+    observe_review_checkpoint_state_replay,
 )
 from issue_agent.adapters.review_execution_activation import read_checkpoint_round_receipt_source
 from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
@@ -207,6 +213,34 @@ def test_missing_application_source_blocks_checkpoint_page(active):
     assert isinstance(result, BlockedReviewCheckpointArchiveAudit)
     assert "checkpoint application source" in result.reason
     assert _stored(store) == result
+
+
+def test_following_source_refuses_a_foreign_execution_origin(active):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    with store.transaction() as db:
+        execution = _current_execution(db, key)
+        application = read_review_checkpoint_application_source(
+            db, key.repository, tip,
+        ).application
+        origin_binding = application.previous_checkpoint.state.binding
+        foreign_episode = replace(
+            origin_binding,
+            execution_epoch=execution.binding.execution_epoch + 1,
+        )
+        future_origin = replace(
+            origin_binding,
+            rejection=replace(
+                origin_binding.rejection,
+                fence=replace(origin_binding.rejection.fence,
+                              generation=origin_binding.rejection.fence.generation + 1),
+            ),
+        )
+        for foreign in (foreign_episode, future_origin):
+            with pytest.raises(ValueError, match="same execution episode"):
+                read_checkpoint_following_application_source(
+                    db, foreign, execution.binding.rejection.fence.generation,
+                    application,
+                )
 
 
 def test_prior_cursor_version_starts_new_application_aware_scan(active):
@@ -418,6 +452,45 @@ def test_real_selected_tail_matches_first_retained_generation(rig):
     assert result.source_count == 1
 
 
+def test_real_selected_checkpoint_state_replays_from_archived_sql(rig):
+    store, key, manifest = _real_selected_checkpoint(rig)
+    with store.transaction() as db:
+        receipt_id = _current_execution(db, key).checkpoint_receipt
+        assert receipt_id is not None
+        before = db.total_changes
+        observed = observe_review_checkpoint_state_replay(db, key, receipt_id)
+        assert observed.checkpoint == manifest.plan.checkpoint
+        assert observed.source_bytes > 0
+        assert db.total_changes == before
+        assert observe_review_checkpoint_state_replay(
+            db, key, receipt_id, max_source_bytes=observed.source_bytes,
+        ) == observed
+        with pytest.raises(WorkflowAuthorityError, match="byte bound"):
+            observe_review_checkpoint_state_replay(
+                db, key, receipt_id, max_source_bytes=observed.source_bytes - 1,
+            )
+
+
+def test_two_historical_round_only_checkpoint_states_replay(active):
+    store, key, first, tip = _two_valid_checkpoints(active)
+    with store.transaction() as db:
+        for receipt_id in (first, tip):
+            observed = observe_review_checkpoint_state_replay(db, key, receipt_id)
+            assert observed.checkpoint.through_sequence == (1 if receipt_id == first else 2)
+
+
+def test_checkpoint_state_replay_blocks_changed_archived_outcome(active):
+    store, key, _, tip = _two_valid_checkpoints(active)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE review_execution_rounds SET outcome_json='{}' "
+            "WHERE repository='o/r' AND sequence=2",
+        )
+    with store.transaction() as db:
+        with pytest.raises((WorkflowAuthorityError, ValueError)):
+            observe_review_checkpoint_state_replay(db, key, tip)
+
+
 def test_changed_selected_following_source_blocks_segment_resume(rig):
     store, key, manifest = _real_selected_checkpoint(rig)
     now = store.now()
@@ -535,6 +608,9 @@ def test_generation_and_round_segment_match_real_initial_checkpoint(rig):
             "UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='pr'",
             (encode_workflow(updated),),
         )
+    with store.transaction() as db:
+        observed = observe_review_checkpoint_state_replay(db, key, receipt_id)
+        assert observed.checkpoint == manifest.plan.checkpoint
     result = _complete(store, key, store.now())
     assert isinstance(result, CompletedReviewCheckpointArchiveAudit)
     assert result.source_count == 1

@@ -739,14 +739,28 @@ the complete audit benchmark.
   found no medium or high issue in this slice. The full gate passed: 3,297
   domain, 3,391 adapter and 2,876 app tests, four import contracts and both
   Pyrefly checks. Log: `/tmp/checkpoint-following-source-gate.log` (ephemeral).
+- Checkpoint 108 adds an immutable one-source-at-a-time checkpoint state
+  reducer and a transaction-local SQL observer for one compacted segment. It
+  reads the retained first following source, retired generation pairs and
+  classified round source sets, checks both ordered stream digests, and
+  compares the projected checkpoint state. Real selected-tail, round-only and
+  mixed round/generation fixtures pass; malformed source and source-byte
+  ceiling cases block. The reducer's intermediate states stay private and
+  in-memory; SQLite's round-id primary key supplies uniqueness for actual
+  archive rows. Sol reviews found no remaining medium or high issue within
+  this observational scope. This is not a durable paged audit, true cumulative
+  SQL read bound, source census, chain proof or admission gate. The full gate
+  passed: 3,302 domain, 3,395 adapter and 2,876 app tests, four import
+  contracts and both Pyrefly checks. Log:
+  `/tmp/checkpoint-state-replay-final-gate.log` (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round
 receipt-set definition, bind the ordered source digests, and publish the
 aggregate and checkpoint atomically.
-The paged audit must replay outcomes, reconstruct retired member payloads and
-unclaimed receipts, and supply the
+The paged audit must carry the state replay across bounded transactions,
+reconstruct retired member payloads and unclaimed receipts, and supply the
 admission gate. Keep the canonical compaction refusal until these checks are
 complete.
 

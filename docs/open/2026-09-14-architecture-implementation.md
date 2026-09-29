@@ -61,7 +61,10 @@ retained tail choice with its exact checkpoint receipt, pending the writer.
 The versioned observational archive scan binds that recorded choice and its
 full source digest through each checkpoint segment. It also re-reads the exact
 first following accepted generation and checks that source against the recorded
-tail choice on every active step. Archived checkpoint state replay remains open.
+tail choice on every active step. A one-source-at-a-time pure reducer and a
+transaction-local SQL observer now replay one archived checkpoint segment and
+compare its projected state with its receipt. Durable paged state replay,
+complete source membership and the admission gate remain open.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future
 import transaction. See the

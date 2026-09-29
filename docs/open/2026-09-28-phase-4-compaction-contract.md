@@ -23,6 +23,14 @@ activated. Read with the
 [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md), and
 [phase 4 progress](2026-09-27-phase-4-progress.md).
 
+A separate transaction-local observer now streams one compacted checkpoint's
+retired generation and round sources through a pure state reducer, compares
+both ordered source digests and the projected state with its receipt, and
+checks the recorded first following boundary choice. Its byte ceiling is
+accounted after individually bounded source reads. It does not establish
+checkpoint-chain membership, an unclaimed-source census, a strict cumulative
+SQL read bound, or the durable paged admission gate.
+
 ## Reason for a separate checkpoint
 
 Canonical reads currently verify every uncompacted round and every generation

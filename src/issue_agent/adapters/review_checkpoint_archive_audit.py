@@ -19,16 +19,16 @@ from ..domain.review_checkpoint_chain import (
     ObservedReviewCheckpointChainSource, ReviewCheckpointChainCursor,
 )
 from ..domain.review_checkpoint_application import (
-    ReviewCheckpointApplicationProposal, application_proposal_from_receipt,
-    validate_checkpoint_following_boundary,
+    application_proposal_from_receipt,
 )
 from ..domain.review_execution import (
-    ReviewExecutionBinding, ReviewExecutionBoundaryCursor,
+    ReviewExecutionBoundaryCursor,
     ReviewGenerationArchiveFingerprint,
 )
 from ..domain.workflow_identity import WorkflowKey, validate_workflow_identifier
 from .review_checkpoint_chain import read_review_checkpoint_chain_page
 from .review_checkpoint_application_source import read_review_checkpoint_application_source
+from .review_checkpoint_following_source import read_checkpoint_following_application_source
 from .review_execution_activation import (
     BlockedReviewGenerationArchivePage, ObservedReviewGenerationArchivePage,
     _read_recording_source, read_checkpoint_round_by_sequence,
@@ -237,40 +237,6 @@ def _origin_source_sha256(state: ReviewCheckpointArchiveState) -> str:
     return _origin_source_sha256(state.prior)
 
 
-def _check_following_application(
-    db: sqlite3.Connection, origin_binding: ReviewExecutionBinding,
-    current_generation: int, application: ReviewCheckpointApplicationProposal,
-) -> None:
-    checkpoint = application.checkpoint
-    following_generation = checkpoint.state.binding.rejection.fence.generation + 1
-    if current_generation < following_generation - 1:
-        raise WorkflowAuthorityError("checkpoint is ahead of its execution generation")
-    if current_generation < following_generation:
-        validate_checkpoint_following_boundary(application, None, None)
-        return
-    page = read_review_generation_archive_page(
-        db, origin_binding, following_generation, following_generation,
-        preceding=checkpoint.boundary_cursor, limit=1,
-    )
-    if isinstance(page, BlockedReviewGenerationArchivePage):
-        raise WorkflowAuthorityError(
-            f"checkpoint following generation {page.generation} is unreadable: {page.reason}"
-        )
-    if not isinstance(page, ObservedReviewGenerationArchivePage) or len(page.sources) != 1:
-        raise WorkflowAuthorityError("checkpoint following generation source is absent")
-    source = page.sources[0]
-    fingerprint = ReviewGenerationArchiveFingerprint(
-        ReviewExecutionBoundaryCursor(
-            source.boundary.receipt_id, source.boundary.to_revision,
-        ),
-        source.receipt_digest, source.accepted_namespace,
-        source.accepted_key, source.accepted_digest,
-    )
-    validate_checkpoint_following_boundary(
-        application, source.boundary, fingerprint,
-    )
-
-
 def advance_review_checkpoint_archive_audit(
     db: sqlite3.Connection, key: WorkflowKey, *, now: datetime,
     due_seconds: int = 3600,
@@ -359,7 +325,7 @@ def advance_review_checkpoint_archive_audit(
             )
             if application.checkpoint != page.sources[0].receipt:
                 raise WorkflowAuthorityError("checkpoint application changed its checkpoint source")
-            _check_following_application(
+            read_checkpoint_following_application_source(
                 db, origin.checkpoint.state.binding,
                 execution.binding.rejection.fence.generation, application.application,
             )
@@ -381,7 +347,7 @@ def advance_review_checkpoint_archive_audit(
                         state.source.receipt, state.application,
                     ) or application.source_sha256 != state.application_source_sha256):
                 raise WorkflowAuthorityError("checkpoint application changed after its page")
-            _check_following_application(
+            read_checkpoint_following_application_source(
                 db, origin.checkpoint.state.binding,
                 execution.binding.rejection.fence.generation, application.application,
             )

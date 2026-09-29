@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-09-28. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-09-29. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -495,6 +495,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_checkpoint_chain.py` (pure bounded checkpoint predecessor page and cursor identities; observational only),
 `domain/review_checkpoint_archive.py` (pure resumable checkpoint segment stream accounting and prior-chain baseline; observational only),
 `domain/review_checkpoint_application.py` (pure captured tail-outcome selection, compact receipt binding and archived replay check; no minted authority),
+`domain/review_checkpoint_stream_replay.py` (private one-source-at-a-time checkpoint state reducer; no source or admission authority),
 `domain/review_receipt_attribution.py` (pure namespace-specific retained receipt shape checks and typed round or command references; no external source authority),
 `domain/review_preflight.py` (pure round selection and current paid-work eligibility under captured execution authority),
 `domain/review_return.py` (bounded, unclassified review child result evidence),
@@ -542,6 +543,8 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_checkpoint_chain.py` (bounded source-backed checkpoint predecessor pages toward the execution origin; no stream or admission authority),
 `adapters/review_checkpoint_archive_audit.py` (durable checkpoint ancestry, application-source baseline and retired round/generation stream scan; no state or admission authority),
 `adapters/review_checkpoint_application_source.py` (bounded retained tail-choice reader paired with a checkpoint receipt; no writer or audit authority),
+`adapters/review_checkpoint_following_source.py` (exact first following accepted generation reader for a recorded checkpoint tail choice; no admission authority),
+`adapters/review_checkpoint_state_replay.py` (transaction-local archived state and source-digest replay for one compacted checkpoint; no chain, census or admission authority),
 `adapters/review_round_receipt_sweep.py` (bounded indexed read-only pages, canonical payload attribution and exact finalized-round member payload checks; no audit authority),
 `adapters/review_round_receipt_owner.py` (bounded read-only source-to-round member join for bound, named and command-keyed receipts, with open rounds pending; no complete census or admission authority),
 `adapters/review_execution_compaction.py` (transaction-local retired-source proposal and checkpoint receipt reconstruction; no compaction authority),

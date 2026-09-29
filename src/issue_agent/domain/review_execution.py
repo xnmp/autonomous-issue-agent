@@ -1698,6 +1698,20 @@ def replay_review_execution_generations(
     return state
 
 
+def apply_review_execution_replay_outcome(
+    state: ReviewExecutionState,
+    outcome: ReviewRoundOutcome,
+    policy: ReviewExecutionPolicy,
+) -> ReviewExecutionState:
+    """Apply one source-verified outcome at its exact generation binding."""
+    if (not isinstance(state, ReviewExecutionState)
+            or not isinstance(outcome, ReviewRoundOutcome)
+            or not isinstance(policy, ReviewExecutionPolicy)
+            or outcome.round.binding != state.binding):
+        raise ValueError("replay outcome disagrees with its current generation")
+    return _apply(state, outcome, policy)
+
+
 def advance_review_execution_generation(
     execution: ActivatedReviewExecution, from_revision: WorkflowRevision,
     to_revision: WorkflowRevision, mutation: WorkflowMutation,

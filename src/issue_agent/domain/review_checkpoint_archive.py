@@ -216,6 +216,20 @@ def start_review_checkpoint_archive_segment(
     )
 
 
+def fold_checkpoint_round_stream(
+    stream_sha256: str, source: ReviewExecutionCompactionRoundSource,
+) -> str:
+    _digest(stream_sha256, "checkpoint round stream")
+    if not isinstance(source, ReviewExecutionCompactionRoundSource):
+        raise ValueError("checkpoint round stream requires a typed source")
+    encoded = "\0".join((
+        str(source.round.sequence), source.round.round_id,
+        str(source.round.binding.rejection.fence.generation),
+        source.row_sha256, source.receipt_set_sha256,
+    )).encode()
+    return hashlib.sha256(bytes.fromhex(stream_sha256) + encoded).hexdigest()
+
+
 def advance_review_checkpoint_archive_round(
     segment: ReviewCheckpointArchiveSegment,
     source: ReviewExecutionCompactionRoundSource,
@@ -229,18 +243,29 @@ def advance_review_checkpoint_archive_round(
             <= source.round.binding.rejection.fence.generation
             <= segment.source.receipt.checkpoint.state.binding.rejection.fence.generation):
         raise ValueError("checkpoint audit round disagrees with its segment")
-    encoded = "\0".join((
-        str(source.round.sequence), source.round.round_id,
-        str(source.round.binding.rejection.fence.generation),
-        source.row_sha256, source.receipt_set_sha256,
-    )).encode()
     return ReviewCheckpointArchiveSegment(
         segment.parent, segment.source, segment.application,
         segment.application_source_sha256, segment.next_cursor,
         segment.next_round_sequence + 1, segment.next_generation, segment.preceding,
-        hashlib.sha256(bytes.fromhex(segment.round_stream_sha256) + encoded).hexdigest(),
+        fold_checkpoint_round_stream(segment.round_stream_sha256, source),
         segment.generation_stream_sha256,
     )
+
+
+def fold_checkpoint_generation_stream(
+    stream_sha256: str, generation: int, source: ReviewGenerationArchiveFingerprint,
+) -> str:
+    _digest(stream_sha256, "checkpoint generation stream")
+    if (type(generation) is not int or generation < 1
+            or not isinstance(source, ReviewGenerationArchiveFingerprint)
+            or source.cursor.revision.fence.generation != generation):
+        raise ValueError("checkpoint generation stream requires its typed source")
+    encoded = "\0".join((
+        str(generation), source.cursor.receipt_id,
+        str(source.cursor.revision.version), source.receipt_sha256,
+        source.accepted_namespace, source.accepted_key, source.accepted_sha256,
+    )).encode()
+    return hashlib.sha256(bytes.fromhex(stream_sha256) + encoded).hexdigest()
 
 
 def advance_review_checkpoint_archive_generation(
@@ -253,17 +278,14 @@ def advance_review_checkpoint_archive_generation(
             or source.cursor.revision.fence.key
             != segment.source.receipt.checkpoint.state.binding.rejection.fence.key):
         raise ValueError("checkpoint audit generation disagrees with its segment")
-    encoded = "\0".join((
-        str(segment.next_generation), source.cursor.receipt_id,
-        str(source.cursor.revision.version), source.receipt_sha256,
-        source.accepted_namespace, source.accepted_key, source.accepted_sha256,
-    )).encode()
     return ReviewCheckpointArchiveSegment(
         segment.parent, segment.source, segment.application,
         segment.application_source_sha256, segment.next_cursor,
         segment.next_round_sequence, segment.next_generation + 1, source.cursor,
         segment.round_stream_sha256,
-        hashlib.sha256(bytes.fromhex(segment.generation_stream_sha256) + encoded).hexdigest(),
+        fold_checkpoint_generation_stream(
+            segment.generation_stream_sha256, segment.next_generation, source,
+        ),
     )
 
 
