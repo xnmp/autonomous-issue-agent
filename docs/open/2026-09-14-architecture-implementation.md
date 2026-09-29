@@ -144,6 +144,17 @@ remain open. Independent Luna review found no false-eligible path. The final
 full `make test` passed: 3,332 domain, 3,625 adapter and 2,881 app tests,
 gate parity, four architecture contracts and both Pyrefly checks. Phase 4
 and the acceptance counts remain unchanged.
+Checkpoint 136 adds an internal transaction-local zero-history execution
+publisher. A two-PR injected failure rolls back all authority writes; success
+is checked through canonical hot reads. A separate configured remote reader
+rechecks complete PR reviews and the same-view trusted external holds. The
+production entrypoint still needs barrier-held source rederivation, SQL-only
+exact retry, process quiescence, durable archive audit and admission gating.
+Independent Luna review confirmed the coordinator gap. Full `make test`
+passed: 3,332 domain, 3,627 adapter and 2,884 app tests, gate parity, four
+architecture contracts and both Pyrefly checks. This checkpoint does not
+activate a deployment or accept a milestone.
+
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 

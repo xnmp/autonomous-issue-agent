@@ -1253,6 +1253,42 @@ expected-source proof and settlement provenance are present.
   first, and stopped pytest temporary directories exhausted sandbox quota in
   the second. The final run is the passing evidence.
 
+- Checkpoint 136 adds internal transaction-local publication of a previously
+  revalidated zero-history plan. It checks every current canonical workflow
+  before writing, publishes execution epoch, plan evidence, per-PR decision,
+  imported-origin receipt, component and version-bumped snapshot in one SQL
+  transaction, then reads each snapshot through the canonical hot loader. A
+  two-PR fault injected after partial writes rolls all of those tables back;
+  success yields two readable execution components. A configured read-only
+  remote adapter obtains complete reviews and trusted external holds from
+  each fresh PR view and checks the open listing before and after. Neither
+  function is a production activation entrypoint: the caller still must hold
+  all three effect barriers, rederive source files/links/SQL/inventory in the
+  acceptance transaction, prove process quiescence, implement exact SQL-only
+  retry, and install durable archive audit/admission. No deployment activated.
+  The next coordinator should check exact committed replay from SQL before
+  rereading retired files, then acquire the fix/review/steward barriers. For a
+  new activation it must reread complete files, open-PR links and same-view
+  reviews/holds; in one transaction it must recheck SQL sources, retained
+  workflow membership and repository quiescence, rebuild the identical plan,
+  and call the transaction-local publisher. Exact retry and a failed later PR
+  must not leave partial authority. The existing terminal-row blocker remains.
+  A SQL-only replay verifier must compare bounded canonical activation,
+  decision and imported-origin receipts, not re-read retired files or remote
+  facts. A current hot read alone is insufficient after later compaction:
+  compacted source anchors still refuse in the existing loader. The verifier
+  must preserve exact historical membership while tolerating valid later
+  workflow revisions and newly initialized PRs. The final full `make test`
+  passed: 3,332 domain, 3,627 adapter and 2,884 app tests, gate parity,
+  four architecture contracts and both Pyrefly checks. Log:
+  `/tmp/phase4-import-atomic-boundary-final-gate.log` (ephemeral). The first
+  full run hit a sandbox `/tmp` quota; a second run put pytest files inside
+  this checkout and exposed a Git discovery assumption in an unrelated
+  guidance test. The passing run used a workspace temp root with
+  `GIT_CEILING_DIRECTORIES` set to that root. The temp files were removed.
+  Independent Luna review found no defect in these internal boundaries and
+  confirmed that the missing production coordinator blocks activation.
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round

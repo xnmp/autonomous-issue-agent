@@ -566,6 +566,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_execution_compaction.py` (transaction-local retired-source proposal and checkpoint receipt reconstruction; no compaction authority),
 `adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
 `adapters/review_execution_import_sources.py` (barrier-held legacy file/PR-link and SQL source revalidation, including current registration/lifecycle command membership before counter attribution),
+`adapters/review_execution_import_commit.py` (transaction-local atomic publication of a caller-revalidated zero-history execution plan; no production source orchestration yet),
 `adapters/review_execution_workflow_census.py` (bounded transaction-local census of every retained review PR workflow against the complete open listing; terminal rows currently block import),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
@@ -596,6 +597,7 @@ adapters live under `adapters/dashweb/`.
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
 `app/review_execution_import.py` (configuration-bound legacy source checks and observational whole-repository zero-history import planning),
+`app/review_execution_import_remote.py` (configured complete PR, review and trusted-hold rereads for a future barrier-held import writer),
 `app/review_runtime.py` (the active review family's dispatch plan, bound
 submission authority, trusted external holds and fix-side guidance read, and the
 one review-control composition the daemon and the operator transport share),

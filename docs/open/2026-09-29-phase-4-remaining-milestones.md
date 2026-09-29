@@ -60,6 +60,19 @@ full gate passed (3,332 domain, 3,625 adapter, 2,881 app tests, four
 architecture contracts and both Pyrefly checks). The milestone count is
 unchanged.
 
+Checkpoint 136 adds a transaction-local publication function for a fully
+revalidated zero-history plan. A two-PR fault test verifies that partial
+epoch, decision, origin, component and workflow writes roll back together;
+canonical hot reads verify successful publication. A configured remote reader
+also rereads complete reviews and trusted external holds from each current PR
+view. These are internal boundaries: the production activation entrypoint must
+hold deployment barriers, rederive all file, SQL, workflow, inventory and
+remote sources, and implement exact SQL-only retry. The archived-source audit
+and admission gate also remain open. Independent Luna review confirmed this
+coordinator gap. The final full gate passed (3,332 domain, 3,627 adapter,
+2,884 app tests, four architecture contracts and both Pyrefly checks).
+Milestones 1 and 2 remain unaccepted.
+
 ## Progress rule
 
 For each milestone, record the accepting commit, behavior-level test or
