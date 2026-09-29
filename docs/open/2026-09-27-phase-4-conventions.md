@@ -75,3 +75,21 @@ No agent commits, service restarts, target checkout changes, paid harness runs,
 remote publication, real family activation or live measurement windows.
 Worktree agents verify their merge base against the target's real tip before
 starting, and the parent verifies it again before integration.
+
+## Empty-history activation and composed rehearsal brief
+
+The parent owns the activation coordinator, configuration/authority binding,
+shared domain values, hot reader signatures and documentation. The replay
+agent owns only the new SQL replay verifier and its tests; a rehearsal agent
+owns only a new composed test module. New authority stays in the existing
+epoch, workflow component, imported-origin and receipt tables. No new worker
+or queue is introduced: reuse the existing preflight, stage, reservation,
+round settlement and recovery compositions. The configured activation service
+holds fix, review and steward effect barriers through the acceptance commit;
+remote facts are read outside SQL, and SQL sources are revalidated inside it.
+Reuse the isolated configuration/source fixture, canonical workflow reader,
+closed codec and trusted round controls. Rehearsals must start with an actual
+source-revalidated empty-history activation, rather than a synthetic origin.
+Modern rounds after that activation prove composed behavior; they do not prove
+missing legacy chronology or authorize a historical import. Keep services
+paused and use Sol/Luna agents, uv and Pyrefly; agents do not commit.

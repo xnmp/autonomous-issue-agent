@@ -73,6 +73,26 @@ coordinator gap. The final full gate passed (3,332 domain, 3,627 adapter,
 2,884 app tests, four architecture contracts and both Pyrefly checks).
 Milestones 1 and 2 remain unaccepted.
 
+Checkpoint 137 adds a configured offline activation coordinator with fixed
+effect barriers, current remote reads, transaction-local source and quiescence
+checks, a final file recheck, and atomic authority/event publication. SQL-only
+retry verifies the historical plan and origin plus current canonical ancestry;
+it tolerates valid generation progress and initialized later PRs, handles an
+exact concurrent winner, and refuses changed or corrupt authority. Bounded
+identity scans cover Unicode-whitespace aliases. Source metadata, gate counts,
+selected payload corpus and a restored temporary SQLite row/value limit bound
+replay reads. An isolated composed rehearsal starts with the source-revalidated
+import, finalizes two real production-control rounds out of order, verifies
+allowance and accounting, and retries inertly without GitHub. These rounds are
+modern post-activation evidence, not a historical multi-round import fixture.
+Operator transport, terminal/historical sources, compacted authority, archive
+audit/admission and the production slice remain open. Shared configured state
+directories pass with both supported source-manifest representations.
+Independent Luna review found no remaining blocker. The final full `make test`
+passed (3,332 domain, 3,663 adapter, 2,909 app tests, hooks, governor, gate
+parity, four architecture contracts and both Pyrefly checks); the milestone
+count is unchanged.
+
 ## Progress rule
 
 For each milestone, record the accepting commit, behavior-level test or

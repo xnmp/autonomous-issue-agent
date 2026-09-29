@@ -155,6 +155,22 @@ passed: 3,332 domain, 3,627 adapter and 2,884 app tests, gate parity, four
 architecture contracts and both Pyrefly checks. This checkpoint does not
 activate a deployment or accept a milestone.
 
+Checkpoint 137 adds the configuration-bound offline activation coordinator:
+barrier-held remote reads, transaction-local legacy SQL/workflow/inventory
+rederivation, trusted process/heartbeat checks, final local-file revalidation,
+and atomic authority plus activation event. Bounded SQL-only retry proves the
+exact historical plan/origins and current ancestry before consulting external
+sources; valid generation advances and initialized later PRs are accepted.
+An isolated production-control two-round rehearsal starts from an actual
+source-revalidated imported origin and verifies out-of-order allowance effects,
+settled accounting and inert retry. It does not supply legacy chronology.
+Operator transport, terminal/historical imports, compaction/archive admission
+and the review production integration remain open. Shared state-root planning,
+activation and retry are covered. Independent Luna review found no remaining
+blocker. The final full `make test` passed: 3,332 domain, 3,663 adapter and
+2,909 app tests, hooks, governor, gate parity, four architecture contracts and
+both Pyrefly checks; phase and milestone counts remain unchanged.
+
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 

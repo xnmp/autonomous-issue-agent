@@ -1289,6 +1289,52 @@ expected-source proof and settlement provenance are present.
   Independent Luna review found no defect in these internal boundaries and
   confirmed that the missing production coordinator blocks activation.
 
+- Checkpoint 137 adds configuration-bound offline activation composition.
+  It checks the actual control and review-state paths against configuration,
+  requires a trusted operator process/heartbeat probe before and during
+  acceptance, and holds fix/review/steward effect barriers through commit.
+  It rereads complete PR linkage, current reviews and trusted holds outside
+  SQL, then revalidates SQL membership, lineage, workflows and repository
+  quiescence in one transaction. A final local-file reread catches changes
+  during remote observation. Only the identical rederived plan is published;
+  the activation event joins its authority writes in the same transaction.
+  Exact retry first verifies committed SQL, including canonical decisions,
+  origin receipts and current ancestry, without consulting old files, remote
+  observations or process liveness. A competing exact winner is also verified
+  inside acceptance or after source failure. Corrupt or conflicting authority
+  refuses. Valid rejection-generation advances and newly initialized PRs pass.
+  Bounded global identity scans detect case, BLOB and Unicode-whitespace
+  aliases; metadata checks bound active gates and the selected payload corpus.
+  A temporary 2 MiB SQLite row/value limit guards indirect source fetches and
+  restores the caller's prior limit on every exit. The 64 MiB selected corpus
+  bound is not a total-read or peak-memory claim: canonical reads can revisit
+  cells and retain their separate suffix limits. Capacity exhaustion refuses.
+  This offline activation/retry boundary requires Python 3.11+ SQLite limit
+  APIs (the verified Linux profile uses 3.12); an older runtime refuses with
+  an explicit authority error before activation. The project's broader
+  Python minimum is unchanged; there is no unbounded fallback for this feature.
+  The composed two-round rehearsal starts with this genuine source-revalidated
+  imported origin, then exercises production preflight/stage/launch/settlement
+  and abandonment controls. A later cancellation finalized before an older
+  paid failure preserves allowance ordering; isolated accounting retains one
+  12-micro charge and no active reservation. Exact activation retry after those
+  rounds leaves SQL unchanged with GitHub unavailable. This is modern behavior
+  after activation, not proof of missing legacy multi-round history or reset
+  chronology. Operator transport, terminal-row sources, historical import,
+  compaction writer/audit gate and production daemon integration remain open.
+  The canonical loader still refuses compacted authority. No real activation,
+  service restart, paid external run, target mutation or push occurred.
+  Shared fix/review state directories retain either supported source manifest
+  representation (complete role labels or one label per physical root); both
+  representations pass planning, activation and exact retry regressions.
+  Independent Luna review found no remaining blocking issue after the source
+  bounds, Unicode aliases, valid generation progression and shared-root fixes.
+  The first full run was interrupted to fix the shared-root regression and is
+  not passing evidence. The final full `make test` passed: 3,332 domain,
+  3,663 adapter and 2,909 app tests, hooks, governor, gate parity, four import
+  contracts and both Pyrefly checks. The final log is
+  `/tmp/phase4-configured-import-activation-final-gate.log` (ephemeral).
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round
