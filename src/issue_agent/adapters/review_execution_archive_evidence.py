@@ -60,7 +60,7 @@ def observe_review_execution_archive_evidence(
     _, receipts, receipt_versions = _receipt_state(
         db, key.repository, _receipt_key(key, epoch, episode),
     )
-    _, generations = _generation_state(
+    _, generations, generation_sources_version, _ = _generation_state(
         db, key.repository, _generation_key(key, epoch, episode),
     )
     if (not isinstance(checkpoint, CompletedReviewCheckpointArchiveAudit)
@@ -74,6 +74,8 @@ def observe_review_execution_archive_evidence(
     if receipt_versions != (current_versions.round_rows, current_versions.all_round_rows,
                             current_versions.round_receipts):
         raise WorkflowAuthorityError("execution archive receipt census is stale")
+    if generation_sources_version != current_versions.generation_sources:
+        raise WorkflowAuthorityError("execution archive generation census is stale")
     origin, _ = _read_execution_origin(db, scope, execution)
     _, origin_digest = _read_recording_source(
         db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,

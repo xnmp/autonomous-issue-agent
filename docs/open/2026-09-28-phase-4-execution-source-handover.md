@@ -932,6 +932,24 @@ the complete audit benchmark.
   generation audit cursor does not yet capture
   it, and workflow/component, checkpoint, origin and admission freshness remain
   open.
+- Checkpoint 121 stores the global generation-source revision with each
+  durable generation census state. A change restarts the expected scan from
+  the episode origin. The cursor separately retains the prior completed
+  stream digest even after the domain scan consumes its local comparison
+  baseline, so a later mutation of an already checked source blocks.
+  Completed read-only joins reject stale or unversioned generation passes.
+  Legacy unversioned cursors are re-censused; prior blockers remain blocked.
+  An old in-progress cursor whose local baseline was already consumed cannot
+  recover that previous digest across this migration, so the new pass does not
+  claim continuity with it. Regressions cover growth and mutation during
+  paging, a foreign source after completion, baseline retention, malformed
+  revisions, and legacy cursor migration. Independent Sol review found the
+  baseline-retention gap and verified its correction. Full `make test` passed:
+  3,302 domain, 3,495 adapter and 2,876 app tests, hooks, governor, four
+  import contracts and both Pyrefly checks. Log:
+  `/tmp/review-generation-archive-versioned-gate.log` (ephemeral). The four
+  paused services remained inactive. Workflow/component, checkpoint, origin
+  and admission freshness remain open.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
@@ -956,10 +974,9 @@ witness. A complete schema-maintained revision needs exact trigger coverage of
 every source table and namespace, including updates, deletes and rekeys;
 [SQLite triggers](https://www.sqlite.org/lang_createtrigger.html) fire per row.
 The first schema revisions cover round rows, retained round receipts and
-generation receipt/accepted transition rows. The round and receipt audits
-capture and compare their revisions across bounded pages. The generation audit
-must capture its new revision before its completed result can support a
-freshness claim. Other source groups still need mutation coverage.
+generation receipt/accepted transition rows. Their audits capture and compare
+revisions across bounded pages. Other source groups still need mutation
+coverage before these results can support an atomic writer or admission gate.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

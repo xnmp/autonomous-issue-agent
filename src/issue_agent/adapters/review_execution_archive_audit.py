@@ -13,6 +13,7 @@ from ..domain.review_execution import (
     BlockedReviewGenerationArchiveSweep, CompletedReviewGenerationArchiveAudit,
     CompletedReviewGenerationArchiveScan, ReviewExecutionBoundaryCursor,
     ReviewGenerationArchiveBaseline, ReviewGenerationArchiveFingerprint,
+    ReviewGenerationArchiveCursor,
     ReviewGenerationArchiveReceiptMember,
     ReviewGenerationArchiveScan, ReviewGenerationArchiveSweep,
     MAX_ARCHIVE_AUDIT_DUE_SECONDS,
@@ -28,6 +29,7 @@ from .review_execution_activation import (
 )
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, decode_workflow, encode_workflow
 from .review_round_archive_audit import _current_execution
+from .review_archive_source_versions import read_review_archive_source_versions
 from .workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError, _read_execution_origin,
     workflow_scope,
@@ -91,7 +93,7 @@ def _current_frontier(db: sqlite3.Connection, key: WorkflowKey) -> tuple[int, in
 
 def _read_state(
     db: sqlite3.Connection, repository: str, audit_key: str,
-) -> tuple[int | None, _AuditState | None]:
+) -> tuple[int | None, _AuditState | None, int | None, ReviewGenerationArchiveBaseline | None]:
     rows = db.execute(
         "SELECT rowid,typeof(namespace) AS namespace_type,typeof(scope) AS scope_type,"
         "typeof(key) AS key_type,typeof(payload_json) AS payload_type,"
@@ -101,7 +103,7 @@ def _read_state(
         (_AUDIT_NAMESPACE, _AUDIT_NAMESPACE, repository, repository, audit_key, audit_key),
     ).fetchall()
     if not rows:
-        return None, None
+        return None, None, None, None
     if (len(rows) != 1 or any(rows[0][f"{name}_type"] != "text" for name in (
         "namespace", "scope", "key", "payload",
     )) or type(rows[0]["payload_bytes"]) is not int
@@ -116,19 +118,31 @@ def _read_state(
         raise WorkflowAuthorityError("generation archive scan cursor changed during its bounded read")
     raw = row["payload_json"]
     try:
-        state = decode_workflow(raw, _AuditState)
-        if encode_workflow(state) != raw:
+        decoded = decode_workflow(raw, object)
+        if encode_workflow(decoded) != raw:
             raise ValueError("noncanonical cursor")
+        if isinstance(decoded, ReviewGenerationArchiveCursor):
+            state, version = decoded.state, decoded.generation_sources_version
+            prior_baseline = decoded.prior_baseline
+        elif isinstance(decoded, (
+            ReviewGenerationArchiveScan, CompletedReviewGenerationArchiveScan,
+            ReviewGenerationArchiveSweep, CompletedReviewGenerationArchiveAudit,
+            BlockedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveSweep,
+        )):
+            state, version, prior_baseline = decoded, None, None
+        else:
+            raise ValueError("wrong generation archive cursor variant")
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise WorkflowAuthorityError("generation archive scan cursor is malformed") from exc
-    return rows[0]["rowid"], state
+    return rows[0]["rowid"], state, version, prior_baseline
 
 
 def _persist_state(
     db: sqlite3.Connection, repository: str, audit_key: str, rowid: int | None,
-    state: _AuditState, now: datetime,
+    state: _AuditState, source_version: int,
+    prior_baseline: ReviewGenerationArchiveBaseline | None, now: datetime,
 ) -> None:
-    encoded = encode_workflow(state)
+    encoded = encode_workflow(ReviewGenerationArchiveCursor(state, source_version, prior_baseline))
     if rowid is None:
         db.execute(
             "INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) VALUES (?,?,?,?,?)",
@@ -161,7 +175,8 @@ def advance_review_generation_archive_audit(
         raise ValueError("generation archive audit requires a PR workflow")
     current_generation, epoch, episode = _current_frontier(db, key)
     audit_key = _audit_key(key, epoch, episode)
-    rowid, state = _read_state(db, key.repository, audit_key)
+    source_version = read_review_archive_source_versions(db, key.repository).generation_sources
+    rowid, state, stored_version, prior_baseline = _read_state(db, key.repository, audit_key)
     if state is None:
         execution = _current_execution(db, key)
         origin_receipt, _ = _read_execution_origin(db, scope, execution)
@@ -199,7 +214,8 @@ def advance_review_generation_archive_audit(
                 result = BlockedReviewGenerationArchiveSweep(
                     state, "indexed generation frontier moved backwards", None, now,
                 )
-            _persist_state(db, key.repository, audit_key, rowid, result, now)
+            _persist_state(db, key.repository, audit_key, rowid, result, source_version,
+                           prior_baseline, now)
             return result
         try:
             _, source_digest = _read_recording_source(
@@ -219,18 +235,36 @@ def advance_review_generation_archive_audit(
                 result = BlockedReviewGenerationArchiveSweep(
                     state, "execution origin source changed or is unreadable", None, now,
                 )
-            _persist_state(db, key.repository, audit_key, rowid, result, now)
+            _persist_state(db, key.repository, audit_key, rowid, result, source_version,
+                           prior_baseline, now)
             return result
-        if isinstance(state, CompletedReviewGenerationArchiveAudit) and (
+        if stored_version != source_version:
+            baseline = (
+                (prior_baseline or generation_scan.baseline)
+                if isinstance(generation_scan, ReviewGenerationArchiveScan)
+                else ReviewGenerationArchiveBaseline(
+                    generation_scan.through_generation, generation_scan.rolling_sha256,
+                )
+            )
+            prior_baseline = baseline
+            prior_due = (state.next_due_at if isinstance(state, CompletedReviewGenerationArchiveAudit)
+                         else generation_scan.due_at)
+            state = begin_review_generation_archive_scan(
+                origin, cause, generation_scan.origin_source_sha256,
+                current_generation, now, due_seconds, baseline,
+            )
+            state = replace(state, due_at=min(state.due_at, prior_due))
+        elif isinstance(state, CompletedReviewGenerationArchiveAudit) and (
             current_generation > state.generation_scan.through_generation or now >= state.next_due_at
         ):
             prior_due = state.next_due_at
+            prior_baseline = ReviewGenerationArchiveBaseline(
+                generation_scan.through_generation, generation_scan.rolling_sha256,
+            )
             state = begin_review_generation_archive_scan(
                 origin, cause, generation_scan.origin_source_sha256,
                 current_generation, now, due_seconds,
-                ReviewGenerationArchiveBaseline(
-                    generation_scan.through_generation, generation_scan.rolling_sha256,
-                ),
+                prior_baseline,
             )
             if isinstance(state, (ReviewGenerationArchiveScan, CompletedReviewGenerationArchiveScan)):
                 state = replace(state, due_at=min(state.due_at, prior_due))
@@ -288,5 +322,6 @@ def advance_review_generation_archive_audit(
             )
         else:
             raise WorkflowAuthorityError("generation receipt sweep returned an untyped page")
-    _persist_state(db, key.repository, audit_key, rowid, result, now)
+    _persist_state(db, key.repository, audit_key, rowid, result, source_version,
+                   prior_baseline, now)
     return result

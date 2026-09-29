@@ -1,5 +1,6 @@
 """Durable generation archive scans over real accepted transition sources."""
 
+import json
 import sqlite3
 
 import pytest
@@ -8,12 +9,12 @@ import issue_agent.adapters.review_execution_archive_audit as archive_audit
 import issue_agent.adapters.review_execution_activation as review_activation
 from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.adapters.review_execution_archive_audit import advance_review_generation_archive_audit
-from issue_agent.adapters.workflow_codec import decode_workflow
+from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.review_execution import (
     BlockedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveSweep,
     CompletedReviewGenerationArchiveAudit, CompletedReviewGenerationArchiveScan,
-    ReviewGenerationArchiveScan, ReviewGenerationArchiveSweep,
+    ReviewGenerationArchiveCursor, ReviewGenerationArchiveScan, ReviewGenerationArchiveSweep,
     review_generation_archive_scan_overdue,
 )
 from issue_agent.domain.workflow import (
@@ -46,12 +47,7 @@ def _stored_state(store):
             "SELECT payload_json FROM level_state WHERE namespace='review-generation-archive-scan'",
         ).fetchone()
         assert row is not None
-        return decode_workflow(
-            row["payload_json"],
-            ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan
-            | ReviewGenerationArchiveSweep | CompletedReviewGenerationArchiveAudit
-            | BlockedReviewGenerationArchiveScan | BlockedReviewGenerationArchiveSweep,
-        )
+        return decode_workflow(row["payload_json"], ReviewGenerationArchiveCursor).state
 
 
 def test_generation_archive_scan_resumes_from_durable_small_cursor(rig, monkeypatch):
@@ -109,6 +105,102 @@ def test_generation_archive_scan_finds_changed_source_on_next_pass(rig):
     assert _stored_state(store) == blocked
 
 
+def test_generation_audit_rechecks_unversioned_completed_cursor(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    now = store.now()
+    with store.transaction() as db:
+        assert isinstance(advance_review_generation_archive_audit(db, key, now=now),
+                          CompletedReviewGenerationArchiveScan)
+    with store.transaction() as db:
+        completed = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(completed, CompletedReviewGenerationArchiveAudit)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE level_state SET payload_json=? WHERE namespace='review-generation-archive-scan'",
+            (encode_workflow(completed),),
+        )
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2020-01-01T00:00:00+00:00' "
+            "WHERE namespace='workflow-request' AND scope=?",
+            (key.repository,),
+        )
+    with store.transaction() as db:
+        blocked = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(blocked, BlockedReviewGenerationArchiveScan)
+    assert "changed since its prior pass" in blocked.reason
+
+
+def test_generation_audit_migrates_unversioned_completion_after_fresh_pass(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    now = store.now()
+    with store.transaction() as db:
+        assert isinstance(advance_review_generation_archive_audit(db, key, now=now),
+                          CompletedReviewGenerationArchiveScan)
+    with store.transaction() as db:
+        completed = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(completed, CompletedReviewGenerationArchiveAudit)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE level_state SET payload_json=? WHERE namespace='review-generation-archive-scan'",
+            (encode_workflow(completed),),
+        )
+        rescanned = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(rescanned, CompletedReviewGenerationArchiveScan)
+    with store.transaction() as db:
+        migrated = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(migrated, CompletedReviewGenerationArchiveAudit)
+    assert migrated.generation_scan.rolling_sha256 == completed.generation_scan.rolling_sha256
+
+
+def test_generation_audit_preserves_unversioned_blocker(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    now = store.now()
+    with store.transaction() as db:
+        assert isinstance(advance_review_generation_archive_audit(db, key, now=now),
+                          CompletedReviewGenerationArchiveScan)
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json='{}' "
+            "WHERE namespace='workflow-request' AND scope=?",
+            (key.repository,),
+        )
+    with store.transaction() as db:
+        blocked = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(blocked, BlockedReviewGenerationArchiveScan)
+    with store.transaction() as db:
+        db.execute(
+            "UPDATE level_state SET payload_json=? WHERE namespace='review-generation-archive-scan'",
+            (encode_workflow(blocked),),
+        )
+        before = db.total_changes
+        unchanged = advance_review_generation_archive_audit(db, key, now=now)
+        assert db.total_changes == before
+    assert unchanged == blocked
+
+
+@pytest.mark.parametrize("invalid", (True, -1, 2**63 - 1, "0"))
+def test_generation_audit_rejects_malformed_source_version(rig, invalid):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    now = store.now()
+    with store.transaction() as db:
+        advance_review_generation_archive_audit(db, key, now=now)
+        row = db.execute(
+            "SELECT payload_json FROM level_state "
+            "WHERE namespace='review-generation-archive-scan'",
+        ).fetchone()
+        payload = json.loads(row["payload_json"])
+        payload["value"]["fields"]["generation_sources_version"] = invalid
+        db.execute(
+            "UPDATE level_state SET payload_json=? WHERE namespace='review-generation-archive-scan'",
+            (json.dumps(payload, sort_keys=True, separators=(",", ":")),),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="cursor is malformed"):
+            advance_review_generation_archive_audit(db, key, now=now)
+
+
 def test_generation_audit_stream_matches_initial_checkpoint_proposal(rig):
     store = _accepted_generation(rig)
     key = rig[1].revision.fence.key
@@ -161,8 +253,8 @@ def test_generation_receipt_sweep_persists_missing_tail_after_restart(rig, monke
         )
     with store.transaction() as db:
         blocked = advance_review_generation_archive_audit(db, key, now=now)
-    assert isinstance(blocked, BlockedReviewGenerationArchiveSweep)
-    assert "disagrees with expected source pairs" in blocked.reason
+    assert isinstance(blocked, BlockedReviewGenerationArchiveScan)
+    assert "generation receipt is absent" in blocked.reason
     assert _stored_state(store) == blocked
 
 
@@ -185,10 +277,7 @@ def test_next_pass_detects_valid_source_mutation_after_its_sweep_page(rig, monke
             (first.after.scope, first.after.key),
         )
     with store.transaction() as db:
-        complete = advance_review_generation_archive_audit(db, key, now=now)
-    assert isinstance(complete, CompletedReviewGenerationArchiveAudit)
-    with store.transaction() as db:
-        blocked = advance_review_generation_archive_audit(db, key, now=complete.next_due_at)
+        blocked = advance_review_generation_archive_audit(db, key, now=now)
     assert isinstance(blocked, BlockedReviewGenerationArchiveScan)
     assert "changed since its prior pass" in blocked.reason
     assert _stored_state(store) == blocked
@@ -231,7 +320,7 @@ def test_prior_digest_is_checked_when_generation_grows(rig):
     assert "changed since its prior pass" in blocked.reason
 
 
-def test_generation_growth_during_sweep_finishes_captured_frontier(rig, monkeypatch):
+def test_generation_growth_during_sweep_restarts_from_current_frontier(rig, monkeypatch):
     store, selection, workflow = _two_generations(rig)
     key = selection.expected.fence.key
     now = store.now()
@@ -257,17 +346,16 @@ def test_generation_growth_during_sweep_finishes_captured_frontier(rig, monkeypa
     assert current(store, selection).revision.fence.generation == expected.through_generation + 1
 
     result = first
-    for _ in range(3):
+    for _ in range(8):
         with store.transaction() as db:
             result = advance_review_generation_archive_audit(db, key, now=now)
         if isinstance(result, CompletedReviewGenerationArchiveAudit):
             break
     assert isinstance(result, CompletedReviewGenerationArchiveAudit)
-    assert result.generation_scan.through_generation == expected.through_generation
+    assert result.generation_scan.through_generation == expected.through_generation + 1
     with store.transaction() as db:
         resumed = advance_review_generation_archive_audit(db, key, now=now)
-    assert isinstance(resumed, CompletedReviewGenerationArchiveScan)
-    assert resumed.through_generation == expected.through_generation + 1
+    assert resumed == result
 
 
 def test_generation_receipt_sweep_blocks_changed_source_after_expected_pass(rig):
@@ -284,8 +372,8 @@ def test_generation_receipt_sweep_blocks_changed_source_after_expected_pass(rig)
         )
     with store.transaction() as db:
         blocked = advance_review_generation_archive_audit(db, key, now=now)
-    assert isinstance(blocked, BlockedReviewGenerationArchiveSweep)
-    assert "disagrees with expected source pairs" in blocked.reason
+    assert isinstance(blocked, BlockedReviewGenerationArchiveScan)
+    assert "changed since its prior pass" in blocked.reason
     assert review_generation_archive_scan_overdue(blocked, now)
     assert _stored_state(store) == blocked
 
@@ -308,6 +396,9 @@ def test_generation_receipt_sweep_blocks_unclaimed_row_after_expected_pass(rig):
             (row["namespace"], row["scope"], "unclaimed:generation",
              row["claimed_at"], row["reusable_after"], row["payload_json"]),
         )
+    with store.transaction() as db:
+        restarted = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(restarted, CompletedReviewGenerationArchiveScan)
     with store.transaction() as db:
         blocked = advance_review_generation_archive_audit(db, key, now=now)
     assert isinstance(blocked, BlockedReviewGenerationArchiveSweep)
@@ -359,7 +450,7 @@ def test_generation_archive_scan_blocks_changed_origin_before_next_due(rig, chan
     assert _stored_state(store) == blocked
 
 
-def test_generation_growth_preserves_incomplete_archive_pass(rig, monkeypatch):
+def test_generation_growth_restarts_incomplete_archive_pass(rig, monkeypatch):
     store, selection, workflow = _two_generations(rig)
     now = store.now()
     monkeypatch.setattr(archive_audit, "ARCHIVE_AUDIT_PAGE_SIZE", 1)
@@ -382,9 +473,17 @@ def test_generation_growth_preserves_incomplete_archive_pass(rig, monkeypatch):
     assert current(store, selection).revision.fence.generation == first.through_generation + 1
 
     with store.transaction() as db:
+        restarted = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(restarted, ReviewGenerationArchiveScan)
+    assert restarted.through_generation == first.through_generation + 1
+    assert restarted.next_generation == first.origin.rejection.fence.generation + 2
+    with store.transaction() as db:
+        next_page = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(next_page, ReviewGenerationArchiveScan)
+    with store.transaction() as db:
         complete = advance_review_generation_archive_audit(db, key, now=now)
     assert isinstance(complete, CompletedReviewGenerationArchiveScan)
-    assert complete.through_generation == first.through_generation
+    assert complete.through_generation == first.through_generation + 1
     assert complete.final_cursor is not None
     with store.transaction() as db:
         audited = advance_review_generation_archive_audit(db, key, now=now)
@@ -392,9 +491,61 @@ def test_generation_growth_preserves_incomplete_archive_pass(rig, monkeypatch):
     assert audited.generation_scan == complete
     with store.transaction() as db:
         resumed = advance_review_generation_archive_audit(db, key, now=now)
-    assert isinstance(resumed, ReviewGenerationArchiveScan)
-    assert resumed.through_generation == complete.through_generation + 1
-    assert resumed.next_generation == resumed.origin.rejection.fence.generation + 2
+    assert resumed == audited
+
+
+def test_generation_rescan_retains_completed_baseline_after_crossing_it(rig, monkeypatch):
+    store, selection, workflow = _two_generations(rig)
+    key = selection.expected.fence.key
+    now = store.now()
+    with store.transaction() as db:
+        assert isinstance(advance_review_generation_archive_audit(db, key, now=now),
+                          CompletedReviewGenerationArchiveScan)
+    with store.transaction() as db:
+        completed = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(completed, CompletedReviewGenerationArchiveAudit)
+
+    before = current(store, selection)
+    actor = OperatorActor("operator", "test")
+    assert isinstance(workflow.cancel_rearm(
+        CancelRearm("cancel:baseline-retention", before.revision, "rearm:archive-audit",
+                    "stop", expected_binding=before.binding), actor,
+    ), WorkflowCommitted)
+    stopped = current(store, selection)
+    assert isinstance(workflow.continue_rearm(
+        ContinueGrantedRearm("rearm:baseline-retention", stopped.revision,
+                             "rearm:archive-audit", expected_binding=stopped.binding), actor,
+    ), WorkflowCommitted)
+    monkeypatch.setattr(archive_audit, "ARCHIVE_AUDIT_PAGE_SIZE", 1)
+    with store.transaction() as db:
+        first = advance_review_generation_archive_audit(db, key, now=now)
+    assert isinstance(first, ReviewGenerationArchiveScan)
+    with store.transaction() as db:
+        crossed = advance_review_generation_archive_audit(db, key, now=now)
+        row = db.execute(
+            "SELECT payload_json FROM level_state WHERE namespace='review-generation-archive-scan'",
+        ).fetchone()
+    assert isinstance(crossed, ReviewGenerationArchiveScan)
+    assert crossed.baseline is None
+    cursor = decode_workflow(row["payload_json"], ReviewGenerationArchiveCursor)
+    assert cursor.prior_baseline is not None
+    assert cursor.prior_baseline.through_generation == completed.generation_scan.through_generation
+
+    with store.transaction() as db:
+        changed = db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2020-01-01T00:00:00+00:00' "
+            "WHERE namespace='workflow-request' AND scope=?",
+            (key.repository,),
+        )
+        assert changed.rowcount > 0
+    result = crossed
+    for _ in range(4):
+        with store.transaction() as db:
+            result = advance_review_generation_archive_audit(db, key, now=now)
+        if isinstance(result, BlockedReviewGenerationArchiveScan):
+            break
+    assert isinstance(result, BlockedReviewGenerationArchiveScan)
+    assert "changed since its prior pass" in result.reason
 
 
 def test_generation_archive_scan_update_rolls_back_with_failed_cursor_write(rig, monkeypatch):

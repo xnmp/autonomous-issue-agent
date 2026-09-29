@@ -104,6 +104,7 @@ _VALUES = (
     rx.CompletedReviewGenerationArchiveScan, rx.ReviewGenerationArchiveSweep,
     rx.CompletedReviewGenerationArchiveAudit,
     rx.BlockedReviewGenerationArchiveScan, rx.BlockedReviewGenerationArchiveSweep,
+    rx.ReviewGenerationArchiveCursor,
     round_archive.ReviewRoundArchiveFingerprint,
     round_archive.ReviewRoundArchiveBaseline,
     round_archive.ReviewRoundArchiveScan,

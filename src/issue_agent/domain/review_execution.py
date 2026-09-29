@@ -826,6 +826,28 @@ class BlockedReviewGenerationArchiveSweep:
             raise ValueError("blocked archive sweep requires its exact discrepancy")
 
 
+@dataclass(frozen=True)
+class ReviewGenerationArchiveCursor:
+    state: (
+        ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan
+        | ReviewGenerationArchiveSweep | CompletedReviewGenerationArchiveAudit
+        | BlockedReviewGenerationArchiveScan | BlockedReviewGenerationArchiveSweep
+    )
+    generation_sources_version: int
+    prior_baseline: ReviewGenerationArchiveBaseline | None = None
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.state, (
+            ReviewGenerationArchiveScan, CompletedReviewGenerationArchiveScan,
+            ReviewGenerationArchiveSweep, CompletedReviewGenerationArchiveAudit,
+            BlockedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveSweep,
+        )) or type(self.generation_sources_version) is not int
+                or not 0 <= self.generation_sources_version < _MAX_INTEGER
+                or self.prior_baseline is not None
+                and not isinstance(self.prior_baseline, ReviewGenerationArchiveBaseline)):
+            raise ValueError("generation archive cursor requires a bounded source revision")
+
+
 def review_generation_archive_scan_overdue(
     state: (
         ReviewGenerationArchiveScan | CompletedReviewGenerationArchiveScan

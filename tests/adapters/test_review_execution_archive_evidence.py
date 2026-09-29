@@ -27,7 +27,9 @@ from issue_agent.adapters.workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError,
 )
 from issue_agent.domain.review_checkpoint_archive import CompletedReviewCheckpointArchiveAudit
-from issue_agent.domain.review_execution import CompletedReviewGenerationArchiveAudit
+from issue_agent.domain.review_execution import (
+    CompletedReviewGenerationArchiveAudit, ReviewGenerationArchiveCursor,
+)
 from issue_agent.domain.review_execution_archive_evidence import (
     ObservedReviewExecutionArchiveEvidence,
 )
@@ -217,6 +219,45 @@ def test_archive_join_rejects_foreign_round_mutation_after_receipt_pass(active):
         assert after.round_receipts == before.round_receipts
         assert after.all_round_rows == before.all_round_rows + 1
         with pytest.raises(WorkflowAuthorityError, match="receipt census is stale"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_foreign_generation_source_after_completed_pass(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        before = read_review_archive_source_versions(db, key.repository)
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('review-execution-generation','other/repo','foreign:receipt',"
+            "'2026-09-29T00:00:00+00:00','{}')",
+        )
+        after = read_review_archive_source_versions(db, key.repository)
+        assert (after.round_rows, after.all_round_rows, after.round_receipts) == (
+            before.round_rows, before.all_round_rows, before.round_receipts,
+        )
+        assert after.generation_sources == before.generation_sources + 1
+        with pytest.raises(WorkflowAuthorityError, match="generation census is stale"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_unversioned_generation_completion(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM level_state "
+            "WHERE namespace='review-generation-archive-scan'",
+        ).fetchone()
+        completed = decode_workflow(row["payload_json"], ReviewGenerationArchiveCursor).state
+        db.execute(
+            "UPDATE level_state SET payload_json=? "
+            "WHERE namespace='review-generation-archive-scan'",
+            (encode_workflow(completed),),
+        )
+        with pytest.raises(WorkflowAuthorityError, match="generation census is stale"):
             observe_review_execution_archive_evidence(db, key, now=now)
 
 
