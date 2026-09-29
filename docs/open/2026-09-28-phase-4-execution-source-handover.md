@@ -1200,6 +1200,31 @@ expected-source proof and settlement provenance are present.
   Log: `/tmp/phase4-import-membership-final-gate.log` (ephemeral). All seven
   installed issue-agent user services were inactive before commit.
 
+- Checkpoint 134 adds a pure per-open-PR import-history classifier and a
+  configuration-bound app composition that runs it only after the complete
+  barrier-held file/linkage and SQL source recheck. Its empty result carries
+  the verifier's full source digest, but is observational rather than an
+  import decision. Any present legacy session/round file, mapped counter,
+  attributed run death, submission command or round retains a source-backed
+  origin blocker; real sessions, open rounds, predecessor deaths and nonzero
+  debit also have specific causes. Malformed command targets, unassigned
+  counters and runs block all apparently empty open PRs. The unassigned
+  counter check prevents an old issue-key file from disappearing under a
+  changed current PR-to-issue link. Tests cover empty and historical PRs,
+  malformed command targets, unassigned counters and missing origin evidence.
+  Independent Luna review found no remaining blocker. The final full gate
+  passed: 3,314 domain, 3,617 adapter and 2,878 app tests, hooks, governor,
+  gate parity, four architecture contracts and both Pyrefly checks. Ten
+  strict xfails remained expected. Log:
+  `/tmp/phase4-review-import-history-full-gate.log` (ephemeral).
+  The actual legacy producer retains only the latest scalar round/session
+  and mutable death count; these cannot prove a historical multi-round order,
+  reset chronology or session producer. SQL-era round receipts can rehearse
+  multiple rounds, but their current replay starts from an unproved imported
+  origin. The genuine multi-round import fixture and atomic writer remain
+  open; milestone 1 is still Doing, with 0 of 7 phase-4 milestones and 3 of
+  6 architecture phases accepted. No live authority was activated.
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round

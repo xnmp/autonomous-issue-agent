@@ -33,6 +33,17 @@ against the complete submission inventory; expiry and changed sources refuse.
 Unregistered commands now refuse this read-only boundary. Historical
 submission decisions and the other source
 families in milestone 1 remain open, so this does not accept the milestone.
+Checkpoint 134 adds a per-open-PR, pure history classification after the
+configuration-bound barrier/transaction recheck. An empty observation carries
+the full verified source digest but no activation authority. Present legacy
+session/round files, commands, rounds, debit, predecessor deaths, unassigned
+counters/runs and malformed command targets yield source-identified blockers;
+unproven historical origins remain explicit. Focused tests, independent Luna
+review and the full gate passed (3,314 domain, 3,617 adapter, 2,878 app tests,
+four architecture contracts and both Pyrefly checks). Legacy scalar files do
+not retain multi-round chronology or reset order, and the SQL-era replay still
+lacks a proved imported sequence-zero origin. The required valid multi-round
+import fixture and production decision remain open; the milestone stays Doing.
 
 ## Progress rule
 

@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+from pathlib import Path
 
 import pytest
 
@@ -28,11 +29,18 @@ from issue_agent.adapters.review_execution_import_sources import (
 from issue_agent.app.config import (
     HarnessConfig, configured_prior_owner_ids, owner_identity_for_target,
 )
-from issue_agent.app.review_execution_import import verify_configured_legacy_execution_import_sources
+from issue_agent.app.review_execution_import import (
+    classify_configured_legacy_review_import_history,
+    verify_configured_legacy_execution_import_sources,
+)
 from issue_agent.domain.review_execution_activation import LegacyReviewOwnerLineage
 from issue_agent.domain.review_execution_counter_mapping import CompleteLegacyOpenCounterLinks
+from issue_agent.domain.review_execution_history_import import (
+    ReviewImportBlockerKind, ReviewImportHistoryBlocked, ReviewImportNoHistoryObserved,
+)
 from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
 from issue_agent.domain.review_registration_membership_audit import CompletedReviewRegistrationMembership
+from issue_agent.domain.world import PRView
 
 
 class EmptyGateway:
@@ -43,6 +51,17 @@ class EmptyGateway:
 
     def get_review_pull_request(self, _number):
         raise AssertionError("the complete empty PR listing must not request a PR")
+
+
+class OnePRGateway:
+    repo = "o/r"
+
+    def _gh_json(self, _args):
+        return [[{"number": 9, "state": "open"}]]
+
+    def get_review_pull_request(self, number):
+        assert number == 9
+        return PRView(9, head_ref_name="work/topic", head_ref_oid="a" * 40)
 
 
 @pytest.fixture
@@ -145,6 +164,55 @@ def test_configured_import_revalidates_the_full_boot_owner_lineage(sources):
             assert isinstance(result, RevalidatedLegacyExecutionImportSources)
             assert result.sql == observed
             assert [run.source.run_id for run in result.deaths.unassigned_deaths] == ["prior-run"]
+
+
+def test_configured_history_classifies_empty_pr_from_held_complete_sources(sources):
+    cfg, control, _gateway, roots, files, _links = sources
+    gateway = OnePRGateway()
+    links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
+    assert isinstance(links, CompleteLegacyOpenCounterLinks)
+    observed = _sql_sources(cfg, control, include_prior=True)
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, cfg.repo, roots, files, links,
+        review_state_dir=cfg.review_state_dir,
+        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+    ) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = classify_configured_legacy_review_import_history(cfg, db, held, observed)
+            verified = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
+
+    assert len(result) == 1
+    assert isinstance(result[0], ReviewImportNoHistoryObserved)
+    assert result[0].pr == 9
+    assert isinstance(verified, RevalidatedLegacyExecutionImportSources)
+    assert result[0].source_digest == verified.source_digest
+
+
+def test_configured_history_blocks_real_legacy_round_file(sources):
+    cfg, control, _gateway, roots, _files, _links = sources
+    gateway = OnePRGateway()
+    (Path(cfg.review_state_dir) / "pr-9.round").write_text("2")
+    files = read_complete_legacy_execution_root_files(roots)
+    links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
+    assert isinstance(files, CompleteLegacyExecutionRootFiles)
+    assert isinstance(links, CompleteLegacyOpenCounterLinks)
+    observed = _sql_sources(cfg, control, include_prior=True)
+
+    with held_legacy_execution_counter_sources(
+        control, gateway, cfg.repo, roots, files, links,
+        review_state_dir=cfg.review_state_dir,
+        other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir),
+    ) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = classify_configured_legacy_review_import_history(cfg, db, held, observed)
+
+    assert len(result) == 1
+    assert isinstance(result[0], ReviewImportHistoryBlocked)
+    assert result[0].pr == 9
+    assert [blocker.kind for blocker in result[0].blockers] == [ReviewImportBlockerKind.ORIGIN]
 
 
 def test_configured_import_refuses_a_substituted_legacy_root(sources, tmp_path):

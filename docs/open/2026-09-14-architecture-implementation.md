@@ -122,6 +122,16 @@ the complete audit. Current fix and steward directories are exempted by
 deployment configuration; an unrelated root with active PR evidence blocks
 until its producing role is proved. Duplicate PR session sources block direct
 planning. These remain offline source checks, not import authority.
+The offline import-history classifier now runs after that configuration-bound
+source recheck and returns one result for each open PR. Its empty observation
+is bound to the full verified file/SQL digest and grants no execution authority;
+present historical files, commands, rounds, counters and runs retain
+source-identified blockers. Unassigned counters block an apparently empty PR
+because prior issue linkage is unresolved. Independent Luna review and full
+`make test` passed at checkpoint 134 (3,314 domain, 3,617 adapter, 2,878 app
+tests; four architecture contracts and both Pyrefly checks). A source-backed
+imported origin, ordered reset proof and genuine multi-round import fixture
+remain open. Phase 4 and the six-phase acceptance counts are unchanged.
 Live operation, family activation on
 real deployment data and paid harness runs remain separately withheld.
 

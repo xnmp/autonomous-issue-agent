@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from dataclasses import replace
 from datetime import datetime
 
 from ..adapters.review_execution_import_sources import (
@@ -12,6 +13,9 @@ from ..adapters.review_execution_import_sources import (
     verify_legacy_execution_import_sources,
 )
 from ..adapters.resolve_activation import distinct_roots
+from ..domain.review_execution_history_import import (
+    ReviewImportHistory, ReviewImportNoHistoryObserved, classify_review_import_history,
+)
 from ..domain.workflow_identity import WorkflowWriter, canonical_workflow_repository
 from .config import HarnessConfig, configured_prior_owner_ids, owner_identity_for_target
 
@@ -69,4 +73,32 @@ def verify_configured_legacy_execution_import_sources(
     return verify_legacy_execution_import_sources(
         db, counters, observed, writer=writer, configured_prior_owners=predecessors,
         now=now,
+    )
+
+
+def classify_configured_legacy_review_import_history(
+    cfg: HarnessConfig, db: sqlite3.Connection,
+    counters: HeldLegacyExecutionCounterSources,
+    observed: ObservedLegacyExecutionSqlImportSources,
+    *, now: datetime | None = None, extra_roots: tuple[str, ...] = (),
+) -> tuple[ReviewImportHistory, ...] | BlockedLegacyExecutionSqlImportSources:
+    """Classify every open PR only after the configured source set is rechecked.
+
+    The result is observational. Even an empty history requires independent
+    first-observation, workflow, hold and origin evidence before activation.
+    The caller must retain the held file scope and SQL transaction through use.
+    """
+    verified = verify_configured_legacy_execution_import_sources(
+        cfg, db, counters, observed, now=now, extra_roots=extra_roots,
+    )
+    if isinstance(verified, BlockedLegacyExecutionSqlImportSources):
+        return verified
+    histories = classify_review_import_history(
+        verified.counters.mapping, verified.deaths,
+        verified.sql.settlement.commands, verified.sql.settlement.round_storage,
+    )
+    return tuple(
+        replace(history, source_digest=verified.source_digest)
+        if isinstance(history, ReviewImportNoHistoryObserved) else history
+        for history in histories
     )
