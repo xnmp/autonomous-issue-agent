@@ -38,6 +38,9 @@ its source fingerprint, charging repeat reads before moving to the next round.
 Command/effect and accepted-transition lineage remain separate proof duties.
 Schema v26 now supplies an indexed, read-only repository round sweep page
 that checks row and finalized-payload identities before selecting an episode.
+The page accepts a caller-selected byte ceiling before payload fetch and
+charges foreign episode rows; a complete source census still needs a
+resumable freshness witness.
 A transaction-local cursor now persists one bounded sweep page at a time,
 checks that the episode has exactly its allocated sequence count, and compares
 the prior pass's source membership when the frontier grows or a scheduled

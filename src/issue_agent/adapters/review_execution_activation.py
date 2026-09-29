@@ -1881,14 +1881,18 @@ class ObservedReviewCheckpointRoundSweepPage:
     next_rowid: int | None
     upper_rowid: int | None
     has_more: bool
+    source_bytes: int
 
     def __post_init__(self) -> None:
         if (not isinstance(self.sources, tuple)
                 or len(self.sources) > MAX_CHECKPOINT_ROUND_SWEEP_PAGE
                 or any(not isinstance(source, LegacyReviewRoundSource) for source in self.sources)
                 or type(self.has_more) is not bool
+                or type(self.source_bytes) is not int
+                or not 0 <= self.source_bytes <= MAX_CHECKPOINT_ROUND_SWEEP_BYTES
                 or (self.upper_rowid is None
-                    and (self.sources or self.next_rowid is not None or self.has_more))
+                    and (self.sources or self.next_rowid is not None or self.has_more
+                         or self.source_bytes))
                 or (self.upper_rowid is not None
                     and (type(self.upper_rowid) is not int
                          or not MIN_SQL_ROWID <= self.upper_rowid <= MAX_SQL_ROWID))
@@ -1917,11 +1921,14 @@ def read_checkpoint_round_sweep_page(
     db: sqlite3.Connection, binding: ReviewExecutionBinding,
     *, after_rowid: int | None = None, upper_rowid: int | None = None,
     limit: int | None = None,
+    max_source_bytes: int | None = None,
 ) -> ObservedReviewCheckpointRoundSweepPage | BlockedReviewCheckpointRoundSweepPage:
-    """Sweep all repository rows so malformed or extra episode keys cannot hide.
+    """Read a bounded repository page before selecting the requested episode.
 
     The upper rowid fixes a pass frontier; a later pass must recheck earlier
-    rows and discover newer ones. Pages alone do not prove a complete census.
+    rows and discover newer ones. The byte budget includes foreign episode
+    rows because their payloads must be checked too. Pages alone do not prove
+    a complete census.
     """
     page_limit = MAX_CHECKPOINT_ROUND_SWEEP_PAGE if limit is None else limit
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
@@ -1935,7 +1942,9 @@ def read_checkpoint_round_sweep_page(
             or (after_rowid is not None
                 and (upper_rowid is None or after_rowid > upper_rowid))
             or type(page_limit) is not int
-            or not 1 <= page_limit <= MAX_CHECKPOINT_ROUND_SWEEP_PAGE):
+            or not 1 <= page_limit <= MAX_CHECKPOINT_ROUND_SWEEP_PAGE
+            or (max_source_bytes is not None
+                and (type(max_source_bytes) is not int or max_source_bytes < 1))):
         raise ValueError("checkpoint round sweep requires a transaction and bounded cursor")
     repository = binding.rejection.fence.key.repository
     current_rowid: int | None = None
@@ -1954,7 +1963,7 @@ def read_checkpoint_round_sweep_page(
                 "WHERE repository=? ORDER BY rowid DESC LIMIT 1", (repository,),
             ).fetchone()
             if edge is None:
-                return ObservedReviewCheckpointRoundSweepPage((), None, None, False)
+                return ObservedReviewCheckpointRoundSweepPage((), None, None, False, 0)
             upper_rowid = edge["rowid"]
         json_columns = ("plan_json", "planning_json", "closure_json", "outcome_json")
         other_columns = tuple(column for column in LEGACY_REVIEW_ROUND_COLUMNS if column not in json_columns)
@@ -1974,6 +1983,8 @@ def read_checkpoint_round_sweep_page(
         ).fetchall()
         selected: list[sqlite3.Row] = []
         source_bytes = 0
+        byte_limit = (MAX_CHECKPOINT_ROUND_SWEEP_BYTES if max_source_bytes is None
+                      else min(MAX_CHECKPOINT_ROUND_SWEEP_BYTES, max_source_bytes))
         for row in metadata[:page_limit]:
             current_rowid = row["source_rowid"]
             if (type(row["largest_json"]) is not int
@@ -1984,7 +1995,7 @@ def read_checkpoint_round_sweep_page(
                 return BlockedReviewCheckpointRoundSweepPage(
                     "checkpoint round sweep found an oversized or unreadable row", current_rowid,
                 )
-            if source_bytes + row["total_bytes"] > MAX_CHECKPOINT_ROUND_SWEEP_BYTES:
+            if source_bytes + row["total_bytes"] > byte_limit:
                 if selected:
                     break
                 return BlockedReviewCheckpointRoundSweepPage(
@@ -2048,6 +2059,7 @@ def read_checkpoint_round_sweep_page(
         next_rowid = selected[-1]["source_rowid"] if selected else after_rowid
         return ObservedReviewCheckpointRoundSweepPage(
             tuple(sources), next_rowid, upper_rowid, len(metadata) > len(selected),
+            source_bytes,
         )
     except (KeyError, TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error) as exc:

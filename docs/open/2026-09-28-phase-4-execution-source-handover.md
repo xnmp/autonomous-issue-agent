@@ -836,6 +836,18 @@ the complete audit benchmark.
   domain, 3,426 adapter and 2,876 app tests, hooks, governor, four import
   contracts and both Pyrefly checks. Log:
   `/tmp/checkpoint-archive-tip-source-final-gate.log` (ephemeral).
+- Checkpoint 115 gives the repository round sweep page a caller-selected
+  retained-field byte ceiling and reports the bytes charged. It checks the
+  metadata ceiling before fetching row payloads, counts foreign episode rows
+  because their payloads are validated before filtering, and preserves a
+  progressing cursor when a byte ceiling ends a page on a foreign row.
+  Focused regressions cover exact and insufficient budgets, invalid inputs,
+  foreign-row accounting and cursor continuation. Independent Sol review found
+  no actionable issue. Full `make test` passed: 3,302 domain, 3,428 adapter and
+  2,876 app tests, hooks, governor, four import contracts and both Pyrefly
+  checks. Log: `/tmp/checkpoint-round-sweep-byte-budget-gate.log` (ephemeral).
+  This is a bounded page primitive, not a completed source census or admission
+  authority.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
@@ -847,6 +859,12 @@ read-only join aligns its completed result with the separate source censuses.
 The writer must still revalidate its transaction-local sources, publish the
 checkpoint atomically, and supply the admission gate. Keep the canonical
 compaction refusal until these checks are complete.
+An attempted full repository census inside each manifest proposal was
+withdrawn: the 16-row page cap would refuse a single-PR checkpoint once
+unrelated repository history passed 65,536 rows, and proposal cost would grow
+with repository lifetime. The source census needs resumable, bounded work and
+a mutation/freshness witness before a completed pass can support an atomic
+writer or admission gate.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

@@ -710,6 +710,82 @@ def test_checkpoint_round_sweep_accepts_a_smaller_bounded_page(active):
                 )
 
 
+def test_checkpoint_round_sweep_budget_blocks_before_row_payload(active):
+    store, snapshot = active
+    facts, _ = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts)
+        full = read_checkpoint_round_sweep_page(db, snapshot.execution.binding)
+        assert isinstance(full, ObservedReviewCheckpointRoundSweepPage)
+        assert full.source_bytes > 1
+        exact = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding, max_source_bytes=full.source_bytes,
+        )
+        assert isinstance(exact, ObservedReviewCheckpointRoundSweepPage)
+        assert exact.sources == full.sources
+        statements = []
+        db.set_trace_callback(statements.append)
+        try:
+            blocked = read_checkpoint_round_sweep_page(
+                db, snapshot.execution.binding, max_source_bytes=full.source_bytes - 1,
+            )
+        finally:
+            db.set_trace_callback(None)
+        assert isinstance(blocked, BlockedReviewCheckpointRoundSweepPage)
+        assert not any(
+            "CAST(plan_json AS BLOB) AS raw_plan_json" in statement
+            for statement in statements
+        )
+        for invalid in (0, -1, True, "1024"):
+            with pytest.raises(ValueError, match="bounded cursor"):
+                read_checkpoint_round_sweep_page(
+                    db, snapshot.execution.binding, max_source_bytes=invalid,
+                )
+
+
+def test_checkpoint_round_sweep_budget_charges_foreign_rows_and_keeps_cursor(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        for sequence in (1, 2, 3):
+            facts, _ = round_facts(snapshot, sequence, copied=sequence == 2)
+            insert_round(db, facts)
+            if sequence == 2:
+                foreign_binding = replace(snapshot.execution.binding, execution_episode="other-episode")
+                foreign_plan = replace(facts.plan, round=replace(facts.plan.round, binding=foreign_binding))
+                db.execute(
+                    "UPDATE review_execution_rounds SET execution_episode=?,plan_json=? WHERE round_id=?",
+                    ("other-episode", encode_workflow(foreign_plan), facts.plan.round.round_id),
+                )
+        one = read_checkpoint_round_sweep_page(db, snapshot.execution.binding, limit=1)
+        assert isinstance(one, ObservedReviewCheckpointRoundSweepPage)
+        foreign = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding, after_rowid=one.next_rowid,
+            upper_rowid=one.upper_rowid, limit=1,
+        )
+        assert isinstance(foreign, ObservedReviewCheckpointRoundSweepPage)
+        budget = max(one.source_bytes, foreign.source_bytes)
+        first = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding, max_source_bytes=budget,
+        )
+        assert isinstance(first, ObservedReviewCheckpointRoundSweepPage)
+        assert [dict(source.fields)["sequence"] for source in first.sources] == [1]
+        assert first.source_bytes == one.source_bytes and first.has_more
+        second = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding, after_rowid=first.next_rowid,
+            upper_rowid=first.upper_rowid, max_source_bytes=budget,
+        )
+        assert isinstance(second, ObservedReviewCheckpointRoundSweepPage)
+        assert second.sources == () and second.source_bytes == foreign.source_bytes
+        assert second.next_rowid != first.next_rowid and second.has_more
+        third = read_checkpoint_round_sweep_page(
+            db, snapshot.execution.binding, after_rowid=second.next_rowid,
+            upper_rowid=second.upper_rowid,
+        )
+        assert isinstance(third, ObservedReviewCheckpointRoundSweepPage)
+        assert [dict(source.fields)["sequence"] for source in third.sources] == [3]
+        assert not third.has_more
+
+
 def test_v26_round_sweep_index_migrates_without_losing_existing_rounds(active):
     store, snapshot = active
     facts, _ = round_facts(snapshot, 1)
