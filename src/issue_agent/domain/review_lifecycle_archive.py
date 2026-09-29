@@ -61,6 +61,7 @@ class ObservedReviewLifecycleSourcePage:
     def __post_init__(self) -> None:
         if (canonical_workflow_repository(self.repository) != self.repository
                 or not isinstance(self.sources, tuple)
+                or not self.sources and self.source_bytes != 0
                 or any(not isinstance(source, LegacyReviewSubmissionSource)
                        or dict(source.command_fields)["repository"] != self.repository
                        for source in self.sources)):
@@ -121,6 +122,7 @@ class ObservedReviewLifecycleEffectPage:
     def __post_init__(self) -> None:
         if (canonical_workflow_repository(self.repository) != self.repository
                 or not isinstance(self.sources, tuple)
+                or not self.sources and self.source_bytes != 0
                 or any(not isinstance(source, ReviewLifecycleEffectSource)
                        or source.repository != self.repository
                        for source in self.sources)):

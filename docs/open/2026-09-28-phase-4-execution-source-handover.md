@@ -1043,6 +1043,27 @@ the complete audit benchmark.
   These are still separate observations: a durable cursor must reconcile the
   command and effect member sets under one unchanged lifecycle revision before
   lineage can contribute to archive or admission authority.
+- Checkpoint 127 adds that durable, repository-scoped lifecycle cursor. It
+  advances one bounded global command or effect page per transaction and
+  persists the fixed rowid frontiers, schema v31 revision, selected command
+  and effect membership, and command-joined effect links. Completion requires
+  the independent effect census to have exactly the same receipt links as the
+  command join. An intervening source mutation restarts the pass; a blocked
+  source stays blocked at the same revision and is rescanned after a repair
+  changes the revision. Completed observations are re-censused when due or
+  changed. The cursor refuses aliased or malformed persisted state. Tests
+  cover unrelated global pages, process restart, changed source between
+  phases, mutable receipts, missing links, orphan repair and malformed state.
+  Independent Sol review reproduced the original permanent block after a
+  repaired orphan; the revision restart and regression passed its re-review.
+  Full `make test` passed: 3,302 domain, 3,575 adapter and 2,876 app tests,
+  hooks, governor, four import contracts and both Pyrefly checks. Ten strict
+  xfails remained expected. Log:
+  `/tmp/review-lifecycle-audit-gate.log` (ephemeral). The four paused services
+  remained inactive.
+  This is an observational census only: no production writer, read-only
+  archive join or admission gate consumes it yet. It does not establish
+  historical reset/session proof.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

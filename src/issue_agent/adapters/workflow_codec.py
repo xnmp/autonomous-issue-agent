@@ -22,6 +22,7 @@ from ..domain import review_round_receipt_archive as receipt_archive
 from ..domain import review_checkpoint_chain as checkpoint_chain
 from ..domain import review_checkpoint_archive as checkpoint_archive
 from ..domain import review_archive_source_versions as archive_source_versions
+from ..domain import review_lifecycle_archive_audit as lifecycle_archive_audit
 from ..domain import review_checkpoint_stream_replay as checkpoint_replay
 from ..domain import review_checkpoint_application as checkpoint_application
 from ..domain import review_preflight as preflight
@@ -128,6 +129,11 @@ _VALUES = (
     checkpoint_chain.ObservedReviewCheckpointChainPage,
     checkpoint_archive.ReviewCheckpointArchiveBaseline,
     archive_source_versions.ReviewArchiveSourceVersions,
+    lifecycle_archive_audit.ReviewLifecycleMembership,
+    lifecycle_archive_audit.ScanningReviewLifecycleCommands,
+    lifecycle_archive_audit.ScanningReviewLifecycleEffects,
+    lifecycle_archive_audit.CompletedReviewLifecycleArchiveAudit,
+    lifecycle_archive_audit.BlockedReviewLifecycleArchiveAudit,
     checkpoint_archive.ReviewCheckpointArchiveCursor,
     checkpoint_archive.ReviewCheckpointArchiveAwaiting,
     checkpoint_archive.ReviewCheckpointArchiveSegment,
