@@ -10,6 +10,9 @@ from .review_checkpoint_chain import (
     ObservedReviewCheckpointChainPage, ObservedReviewCheckpointChainSource,
     ReviewCheckpointChainCursor,
 )
+from .review_checkpoint_application import (
+    ReviewCheckpointApplicationReceipt, application_proposal_from_receipt,
+)
 from .review_execution import (
     ReviewExecutionBoundaryCursor, ReviewExecutionCompactionRoundSource,
     ReviewExecutionOrigin, ReviewGenerationArchiveFingerprint,
@@ -92,6 +95,8 @@ class ReviewCheckpointArchiveAwaiting:
 class ReviewCheckpointArchiveSegment:
     parent: ReviewCheckpointArchiveAwaiting
     source: ObservedReviewCheckpointChainSource
+    application: ReviewCheckpointApplicationReceipt
+    application_source_sha256: str
     next_cursor: ReviewCheckpointChainCursor | None
     next_round_sequence: int
     next_generation: int
@@ -104,6 +109,8 @@ class ReviewCheckpointArchiveSegment:
                 or not isinstance(self.source, ObservedReviewCheckpointChainSource)
                 or self.source.receipt_id != self.parent.cursor.next_receipt_id
                 or self.source.receipt.checkpoint != self.parent.cursor.expected_checkpoint
+                or not isinstance(self.application, ReviewCheckpointApplicationReceipt)
+                or self.application.checkpoint_receipt_id != self.source.receipt_id
                 or (self.next_cursor is None)
                 != (self.source.receipt.previous_receipt_id is None)
                 or self.next_cursor is not None
@@ -111,6 +118,8 @@ class ReviewCheckpointArchiveSegment:
                      or self.next_cursor.next_receipt_id
                      != self.source.receipt.previous_receipt_id)):
             raise ValueError("checkpoint segment lost its predecessor source")
+        application_proposal_from_receipt(self.source.receipt, self.application)
+        _digest(self.application_source_sha256, "checkpoint segment application source")
         previous = self.source.receipt.previous_checkpoint
         current = self.source.receipt.checkpoint
         if (type(self.next_round_sequence) is not int
@@ -189,6 +198,8 @@ def begin_review_checkpoint_archive_scan(
 def start_review_checkpoint_archive_segment(
     state: ReviewCheckpointArchiveAwaiting,
     page: ObservedReviewCheckpointChainPage,
+    application: ReviewCheckpointApplicationReceipt,
+    application_source_sha256: str,
 ) -> ReviewCheckpointArchiveSegment:
     if (not isinstance(state, ReviewCheckpointArchiveAwaiting)
             or not isinstance(page, ObservedReviewCheckpointChainPage)
@@ -197,7 +208,7 @@ def start_review_checkpoint_archive_segment(
     source = page.sources[0]
     previous = source.receipt.previous_checkpoint
     return ReviewCheckpointArchiveSegment(
-        state, source, page.next_cursor,
+        state, source, application, application_source_sha256, page.next_cursor,
         previous.through_sequence + 1,
         previous.state.binding.rejection.fence.generation + 1,
         previous.boundary_cursor,
@@ -224,7 +235,8 @@ def advance_review_checkpoint_archive_round(
         source.row_sha256, source.receipt_set_sha256,
     )).encode()
     return ReviewCheckpointArchiveSegment(
-        segment.parent, segment.source, segment.next_cursor,
+        segment.parent, segment.source, segment.application,
+        segment.application_source_sha256, segment.next_cursor,
         segment.next_round_sequence + 1, segment.next_generation, segment.preceding,
         hashlib.sha256(bytes.fromhex(segment.round_stream_sha256) + encoded).hexdigest(),
         segment.generation_stream_sha256,
@@ -247,7 +259,8 @@ def advance_review_checkpoint_archive_generation(
         source.accepted_namespace, source.accepted_key, source.accepted_sha256,
     )).encode()
     return ReviewCheckpointArchiveSegment(
-        segment.parent, segment.source, segment.next_cursor,
+        segment.parent, segment.source, segment.application,
+        segment.application_source_sha256, segment.next_cursor,
         segment.next_round_sequence, segment.next_generation + 1, source.cursor,
         segment.round_stream_sha256,
         hashlib.sha256(bytes.fromhex(segment.generation_stream_sha256) + encoded).hexdigest(),
@@ -275,7 +288,8 @@ def finish_review_checkpoint_archive_segment(
         )
     encoded = "\0".join((
         segment.source.receipt_id, segment.source.source_sha256,
-        segment.round_stream_sha256, segment.generation_stream_sha256,
+        segment.application_source_sha256, segment.round_stream_sha256,
+        segment.generation_stream_sha256,
     )).encode()
     parent = segment.parent
     chain = hashlib.sha256(bytes.fromhex(parent.chain_sha256) + encoded).hexdigest()

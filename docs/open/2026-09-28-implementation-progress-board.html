@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 12:36 AEST · Latest accepted checkpoint: bounded checkpoint application source reader</p>
+      <p class="meta">Updated 29 Sep 2026, 12:58 AEST · Latest accepted checkpoint: application-aware checkpoint archive scan</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>A bounded reader now pairs a retained tail-choice record with its exact checkpoint receipt; the pure replay check can verify a complete retired segment. The writer and archived audit do not yet supply that proof; compacted loads still refuse. Next: atomic checkpoint writer, archived replay and receipt census, cumulative read bounds, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>The durable observational scan now binds each checkpoint to its recorded tail choice and retains the source fingerprint across passes. It still does not verify the selected following boundary or replay checkpoint state; compacted loads refuse. Next: those archived proofs, receipt census, cumulative read bounds, atomic checkpoint writer, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -167,6 +167,7 @@
           <li><time datetime="2026-09-29T12:01:00+10:00">29 Sep 2026, 12:01 AEST</time><strong>Checkpoint tail applicability proposal accepted offline · 3 of 6 accepted</strong><p>The transaction-local manifest now selects all tail outcomes or fingerprints the exact first remaining accepted generation boundary and its applied-sequence digest. A real partial-compaction path and changed source metadata exercise the selection. Sol review found no material issue; the full gate passed: 3,297 domain, 3,368 adapter and 2,876 app tests, four import contracts and Pyrefly. Atomic writer, archived replay, receipt census and admission authority remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T12:17:00+10:00">29 Sep 2026, 12:17 AEST</time><strong>Pure checkpoint state replay check accepted offline · 3 of 6 accepted</strong><p>A complete caller-supplied retired segment now replays the captured tail selection and checks checkpoint state. Partial compaction, zero-round advances, later boundaries, changed fingerprints, missing outcomes and forged state are covered. Sol found no concrete issue; the full gate passed: 3,297 domain, 3,368 adapter and 2,876 app tests, four import contracts and Pyrefly. The archived audit must still prove and supply the sources; no admission authority changed. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T12:36:00+10:00">29 Sep 2026, 12:36 AEST</time><strong>Checkpoint application source reader accepted offline · 3 of 6 accepted</strong><p>A compact retained tail-choice format and bounded SQL reader now pair the sidecar with its exact checkpoint receipt and fingerprint all six stored fields. Sol reproduced a copied foreign-repository pair; embedded key validation and a regression close it. The full gate passed: 3,297 domain, 3,380 adapter and 2,876 app tests, four import contracts and Pyrefly. No writer, archived replay integration or admission authority changed. Active work since the previous entry: Not recorded.</p></li>
+          <li><time datetime="2026-09-29T12:58:00+10:00">29 Sep 2026, 12:58 AEST</time><strong>Application-aware archive scan accepted offline · 3 of 6 accepted</strong><p>The durable checkpoint scan now rechecks each application sidecar and includes its six-field digest in the chain baseline. Valid prior-version cursors restart; prior blocked or malformed cursors remain blockers. Sol found and verified fixes for two migration gaps. The full gate passed: 3,297 domain, 3,389 adapter and 2,876 app tests, four import contracts and Pyrefly. The new scan does not certify continuity with a completed prior-version digest or replay checkpoint state; no admission authority changed. Active work since the previous entry: Not recorded.</p></li>
         </ol>
       </div>
     </section>

@@ -540,7 +540,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_round_archive_audit.py` (durable indexed round-row census over bounded repository pages; observational until checkpoint source and receipt reconciliation),
 `adapters/review_round_receipt_archive_audit.py` (durable finalized-prefix membership and full receipt-namespace census; observational without checkpoint ancestry or admission authority),
 `adapters/review_checkpoint_chain.py` (bounded source-backed checkpoint predecessor pages toward the execution origin; no stream or admission authority),
-`adapters/review_checkpoint_archive_audit.py` (durable one-source checkpoint ancestry and retired round/generation stream scan; no admission authority),
+`adapters/review_checkpoint_archive_audit.py` (durable checkpoint ancestry, application-source baseline and retired round/generation stream scan; no state or admission authority),
 `adapters/review_checkpoint_application_source.py` (bounded retained tail-choice reader paired with a checkpoint receipt; no writer or audit authority),
 `adapters/review_round_receipt_sweep.py` (bounded indexed read-only pages, canonical payload attribution and exact finalized-round member payload checks; no audit authority),
 `adapters/review_round_receipt_owner.py` (bounded read-only source-to-round member join for bound, named and command-keyed receipts, with open rounds pending; no complete census or admission authority),

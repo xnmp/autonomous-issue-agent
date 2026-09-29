@@ -26,6 +26,7 @@ REVIEW_CHECKPOINT_APPLICATION_NAMESPACE = "review-checkpoint-application"
 class ObservedReviewCheckpointApplicationSource:
     checkpoint_receipt_id: str
     checkpoint: ReviewExecutionCheckpointReceipt
+    recorded: ReviewCheckpointApplicationReceipt
     application: ReviewCheckpointApplicationProposal
     claimed_at: datetime
     source_sha256: str
@@ -35,7 +36,11 @@ class ObservedReviewCheckpointApplicationSource:
             self.checkpoint_receipt_id, "checkpoint application source identity",
         )
         if (not isinstance(self.checkpoint, ReviewExecutionCheckpointReceipt)
+                or not isinstance(self.recorded, ReviewCheckpointApplicationReceipt)
+                or self.recorded.checkpoint_receipt_id != self.checkpoint_receipt_id
                 or not isinstance(self.application, ReviewCheckpointApplicationProposal)
+                or application_proposal_from_receipt(self.checkpoint, self.recorded)
+                != self.application
                 or self.application.previous_checkpoint != self.checkpoint.previous_checkpoint
                 or self.application.checkpoint != self.checkpoint.checkpoint
                 or not isinstance(self.claimed_at, datetime)
@@ -85,7 +90,7 @@ def read_review_checkpoint_application_source(
             raise ValueError("checkpoint application payload is noncanonical or foreign")
         application = application_proposal_from_receipt(checkpoint, recorded)
         return ObservedReviewCheckpointApplicationSource(
-            checkpoint_receipt_id, checkpoint, application, claimed, source_digest,
+            checkpoint_receipt_id, checkpoint, recorded, application, claimed, source_digest,
         )
     except (TypeError, ValueError, UnicodeError, RecursionError, sqlite3.Error) as exc:
         raise WorkflowAuthorityError("checkpoint application source is unreadable") from exc

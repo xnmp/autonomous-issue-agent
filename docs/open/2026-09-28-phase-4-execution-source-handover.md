@@ -715,6 +715,18 @@ the complete audit benchmark.
   repository scope; the embedded repository check and real copied-pair
   regression close that gap. The full gate passed: 3,297 domain, 3,380
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
+- Checkpoint 106 makes the durable observational checkpoint scan require and
+  recheck each exact application source while following retired round and
+  generation streams. The six-field application digest enters the chain
+  baseline, so later source changes block the next pass. A versioned cursor
+  restarts valid prior scans at the origin and carries prior blocked or
+  malformed cursors into a persisted blocker. A prior completed chain digest
+  is not comparable with the new encoding, so continuity across the upgrade
+  is not yet certified. The selected following
+  boundary and checkpoint state still need archived replay; this remains
+  outside admission authority. Sol review found two migration gaps; both
+  are fixed with regressions. The full gate passed: 3,297 domain, 3,389
+  adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

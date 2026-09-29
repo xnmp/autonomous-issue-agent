@@ -222,6 +222,13 @@ folding the same ordered digests as the checkpoint receipt builder. It compares
 each segment frontier and digest, reaches the exact origin, and records a
 completed chain digest for the next due pass. A new tip preserves the previous
 chain as a tail baseline; changed or missing predecessors persist a blocker.
+The versioned scan now also reads the paired checkpoint application source at
+each segment step and folds its six-field digest into the chain baseline.
+Valid prior-version observational cursors restart at the origin; a prior
+blocked or malformed cursor persists as a new-version blocker. This source
+binding does not yet check the selected following boundary or replay state.
+The completed prior-version chain digest cannot be compared with the changed
+encoding, so this restart does not certify continuity across the upgrade.
 Completion is not an admission verdict: checkpoint state replay and a census
 of unclaimed round rows and receipt references are still missing. A proposed
 round-only replay was withdrawn because a later generation boundary can leave

@@ -15,12 +15,16 @@ from ..domain.review_checkpoint_archive import (
     advance_review_checkpoint_archive_round, begin_review_checkpoint_archive_scan,
     finish_review_checkpoint_archive_segment, start_review_checkpoint_archive_segment,
 )
-from ..domain.review_checkpoint_chain import ReviewCheckpointChainCursor
+from ..domain.review_checkpoint_chain import (
+    ObservedReviewCheckpointChainSource, ReviewCheckpointChainCursor,
+)
+from ..domain.review_checkpoint_application import application_proposal_from_receipt
 from ..domain.review_execution import (
     ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint,
 )
 from ..domain.workflow_identity import WorkflowKey, validate_workflow_identifier
 from .review_checkpoint_chain import read_review_checkpoint_chain_page
+from .review_checkpoint_application_source import read_review_checkpoint_application_source
 from .review_execution_activation import (
     BlockedReviewGenerationArchivePage, ObservedReviewGenerationArchivePage,
     _read_recording_source, read_checkpoint_round_by_sequence,
@@ -28,14 +32,22 @@ from .review_execution_activation import (
 )
 from .review_round_archive_audit import _current_execution
 from .review_round_receipt_sweep import read_classified_checkpoint_round_receipt_members
-from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, decode_workflow, encode_workflow
+from .workflow_codec import (
+    MAX_WORKFLOW_PAYLOAD_BYTES, _decode, _encode, _unique_object,
+    decode_workflow, encode_workflow,
+)
 from .workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, WorkflowAuthorityError,
     _read_execution_origin, workflow_scope,
 )
 
 
-_AUDIT_NAMESPACE = "review-checkpoint-archive-scan"
+_AUDIT_NAMESPACE = "review-checkpoint-archive-scan-v2"
+_LEGACY_AUDIT_NAMESPACE = "review-checkpoint-archive-scan"
+_LEGACY_SEGMENT_FIELDS = frozenset((
+    "parent", "source", "next_cursor", "next_round_sequence", "next_generation",
+    "preceding", "round_stream_sha256", "generation_stream_sha256",
+))
 
 
 def _audit_key(key: WorkflowKey, epoch: int, episode: str) -> str:
@@ -82,6 +94,107 @@ def _read_state(
     except (TypeError, ValueError, UnicodeError, RecursionError) as exc:
         raise WorkflowAuthorityError("checkpoint audit cursor is malformed") from exc
     return rows[0]["rowid"], state
+
+
+def _legacy_discrepancy(
+    db: sqlite3.Connection, repository: str, audit_key: str,
+) -> str | None:
+    """Retain v1 blockers while restarting valid observational cursors at origin."""
+    rows = db.execute(
+        "SELECT rowid,typeof(namespace) AS namespace_type,typeof(scope) AS scope_type,"
+        "typeof(key) AS key_type,typeof(payload_json) AS payload_type,"
+        "length(CAST(payload_json AS BLOB)) AS payload_bytes "
+        "FROM level_state WHERE namespace IN (?,CAST(? AS BLOB)) "
+        "AND scope IN (?,CAST(? AS BLOB)) AND key IN (?,CAST(? AS BLOB)) LIMIT 2",
+        (_LEGACY_AUDIT_NAMESPACE, _LEGACY_AUDIT_NAMESPACE,
+         repository, repository, audit_key, audit_key),
+    ).fetchall()
+    if not rows:
+        return None
+    if (len(rows) != 1 or any(rows[0][f"{name}_type"] != "text" for name in (
+        "namespace", "scope", "key", "payload",
+    )) or type(rows[0]["payload_bytes"]) is not int
+            or rows[0]["payload_bytes"] > MAX_WORKFLOW_PAYLOAD_BYTES):
+        return "prior checkpoint audit cursor is aliased or unreadable"
+    row = db.execute(
+        "SELECT payload_json FROM level_state WHERE rowid=? AND namespace=? "
+        "AND scope=? AND key=? AND length(CAST(payload_json AS BLOB))<=?",
+        (rows[0]["rowid"], _LEGACY_AUDIT_NAMESPACE,
+         repository, audit_key, MAX_WORKFLOW_PAYLOAD_BYTES),
+    ).fetchone()
+    if row is None:
+        return "prior checkpoint audit cursor changed during read"
+    raw = row["payload_json"]
+    try:
+        envelope = json.loads(raw, object_pairs_hook=_unique_object)
+        if (not isinstance(envelope, dict) or set(envelope) != {"format", "value"}
+                or type(envelope["format"]) is not int or envelope["format"] != 1
+                or not isinstance(envelope["value"], dict)
+                or set(envelope["value"]) != {"type", "fields"}
+                or not isinstance(envelope["value"]["fields"], dict)
+                or json.dumps(envelope, sort_keys=True, separators=(",", ":"),
+                              ensure_ascii=True, allow_nan=False) != raw):
+            raise ValueError("noncanonical prior cursor")
+        tag = envelope["value"]["type"]
+        if tag == "BlockedReviewCheckpointArchiveAudit":
+            return "prior checkpoint audit recorded an unresolved discrepancy"
+        if tag == "ReviewCheckpointArchiveSegment":
+            fields = envelope["value"]["fields"]
+            if set(fields) != _LEGACY_SEGMENT_FIELDS:
+                raise ValueError("malformed prior segment")
+            decoded = {name: _decode(value) for name, value in fields.items()}
+            if (not isinstance(decoded["parent"], ReviewCheckpointArchiveAwaiting)
+                    or not isinstance(decoded["source"], ObservedReviewCheckpointChainSource)
+                    or decoded["next_cursor"] is not None
+                    and not isinstance(decoded["next_cursor"], ReviewCheckpointChainCursor)
+                    or type(decoded["next_round_sequence"]) is not int
+                    or type(decoded["next_generation"]) is not int
+                    or decoded["preceding"] is not None
+                    and not isinstance(decoded["preceding"], ReviewExecutionBoundaryCursor)
+                    or any(not isinstance(decoded[name], str)
+                           or len(decoded[name]) != 64
+                           or any(char not in "0123456789abcdef" for char in decoded[name])
+                           for name in ("round_stream_sha256", "generation_stream_sha256"))):
+                raise ValueError("malformed prior segment")
+            parent = decoded["parent"]
+            source = decoded["source"]
+            next_cursor = decoded["next_cursor"]
+            previous = source.receipt.previous_checkpoint
+            current = source.receipt.checkpoint
+            if (source.receipt_id != parent.cursor.next_receipt_id
+                    or current != parent.cursor.expected_checkpoint
+                    or (next_cursor is None)
+                    != (source.receipt.previous_receipt_id is None)
+                    or next_cursor is not None
+                    and next_cursor.next_receipt_id
+                    != source.receipt.previous_receipt_id
+                    or not previous.through_sequence + 1
+                    <= decoded["next_round_sequence"] <= current.through_sequence + 1
+                    or not previous.state.binding.rejection.fence.generation + 1
+                    <= decoded["next_generation"]
+                    <= current.state.binding.rejection.fence.generation + 1):
+                raise ValueError("malformed prior segment")
+            canonical = {"format": 1, "value": {
+                "type": tag,
+                "fields": {name: _encode(value) for name, value in decoded.items()},
+            }}
+            if json.dumps(
+                canonical, sort_keys=True, separators=(",", ":"),
+                ensure_ascii=True, allow_nan=False,
+            ) != raw:
+                raise ValueError("noncanonical prior segment")
+        elif tag in ("ReviewCheckpointArchiveAwaiting",
+                     "CompletedReviewCheckpointArchiveAudit"):
+            state = decode_workflow(
+                raw, ReviewCheckpointArchiveAwaiting | CompletedReviewCheckpointArchiveAudit,
+            )
+            if encode_workflow(state) != raw:
+                raise ValueError("noncanonical prior cursor")
+        else:
+            raise ValueError("unknown prior cursor")
+    except (TypeError, ValueError, UnicodeError, RecursionError, OverflowError):
+        return "prior checkpoint audit cursor is malformed"
+    return None
 
 
 def _persist_state(
@@ -150,6 +263,19 @@ def advance_review_checkpoint_archive_audit(
     rowid, state = _read_state(db, key.repository, audit_key)
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
         return state
+    legacy_reason = _legacy_discrepancy(db, key.repository, audit_key)
+    if legacy_reason is not None:
+        if state is None:
+            initial = ReviewCheckpointChainCursor(
+                tip_id, execution.checkpoint, execution.origin,
+                tip_id, execution.checkpoint, None,
+            )
+            state = begin_review_checkpoint_archive_scan(
+                initial, origin_digest, now, due_seconds,
+            )
+        blocked = BlockedReviewCheckpointArchiveAudit(state, legacy_reason, now)
+        _persist_state(db, key.repository, audit_key, rowid, blocked, now)
+        return blocked
     if state is not None and _origin_source_sha256(state) != origin_digest:
         result: ReviewCheckpointArchiveState = BlockedReviewCheckpointArchiveAudit(
             state, "checkpoint origin source changed since audit start", now,
@@ -190,13 +316,29 @@ def advance_review_checkpoint_archive_audit(
             page = read_review_checkpoint_chain_page(
                 db, key, after=state.cursor, limit=1,
             )
-            result = start_review_checkpoint_archive_segment(state, page)
+            application = read_review_checkpoint_application_source(
+                db, key.repository, page.sources[0].receipt_id,
+            )
+            if application.checkpoint != page.sources[0].receipt:
+                raise WorkflowAuthorityError("checkpoint application changed its checkpoint source")
+            result = start_review_checkpoint_archive_segment(
+                state, page, application.recorded, application.source_sha256,
+            )
         elif isinstance(state, ReviewCheckpointArchiveSegment):
             page = read_review_checkpoint_chain_page(
                 db, key, after=state.parent.cursor, limit=1,
             )
             if page.sources != (state.source,) or page.next_cursor != state.next_cursor:
                 raise WorkflowAuthorityError("checkpoint segment source changed after its page")
+            application = read_review_checkpoint_application_source(
+                db, key.repository, state.source.receipt_id,
+            )
+            if (application.checkpoint != state.source.receipt
+                    or application.recorded != state.application
+                    or application.application != application_proposal_from_receipt(
+                        state.source.receipt, state.application,
+                    ) or application.source_sha256 != state.application_source_sha256):
+                raise WorkflowAuthorityError("checkpoint application changed after its page")
             receipt = state.source.receipt
             if state.next_round_sequence <= receipt.checkpoint.through_sequence:
                 observed = read_checkpoint_round_by_sequence(
