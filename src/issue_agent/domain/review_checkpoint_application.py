@@ -6,10 +6,11 @@ import hashlib
 from dataclasses import dataclass
 
 from .review_execution import (
-    ActivatedReviewExecution, ReviewExecutionBoundaryCursor,
+    ActivatedReviewExecution, MAX_EXECUTION_SUFFIX, ReviewExecutionBoundaryCursor,
     ReviewExecutionCheckpoint, ReviewExecutionCompactionPlan,
-    ReviewGenerationArchiveFingerprint, plan_review_execution_compaction,
-    same_execution_episode,
+    ReviewExecutionGenerationBoundary, ReviewGenerationArchiveFingerprint,
+    ReviewRoundOutcome, plan_review_execution_compaction,
+    replay_review_execution_generations, same_execution_episode,
 )
 from .workflow_identity import WorkflowRevision
 
@@ -125,3 +126,90 @@ def build_review_checkpoint_application_proposal(
     return ReviewCheckpointApplicationProposal(
         execution.checkpoint, plan.checkpoint, captured_revision, tail_start, tail,
     )
+
+
+def replay_review_checkpoint_application(
+    application: ReviewCheckpointApplicationProposal,
+    retired_outcomes: tuple[ReviewRoundOutcome, ...],
+    retired_boundaries: tuple[ReviewExecutionGenerationBoundary, ...],
+    following_boundary: ReviewExecutionGenerationBoundary | None,
+    following_source: ReviewGenerationArchiveFingerprint | None,
+) -> ReviewExecutionCheckpoint:
+    """Check projected checkpoint state from a complete, source-verified segment.
+
+    The caller must prove exact archive membership, source fingerprints and
+    the absence of an earlier following boundary. This pure check grants no
+    authority from caller-supplied objects by itself.
+    """
+    if (not isinstance(application, ReviewCheckpointApplicationProposal)
+            or not isinstance(retired_outcomes, tuple)
+            or not isinstance(retired_boundaries, tuple)
+            or len(retired_outcomes) > MAX_EXECUTION_SUFFIX
+            or len(retired_boundaries) > MAX_EXECUTION_SUFFIX
+            or any(not isinstance(outcome, ReviewRoundOutcome) for outcome in retired_outcomes)
+            or any(not isinstance(boundary, ReviewExecutionGenerationBoundary)
+                   for boundary in retired_boundaries)):
+        raise ValueError("checkpoint replay requires typed archived sources")
+    previous, checkpoint = application.previous_checkpoint, application.checkpoint
+    if (checkpoint.through_sequence - previous.through_sequence > MAX_EXECUTION_SUFFIX
+            or checkpoint.state.binding.rejection.fence.generation
+            - previous.state.binding.rejection.fence.generation > MAX_EXECUTION_SUFFIX):
+        raise ValueError("checkpoint replay exceeds its archived segment bound")
+    if tuple(outcome.round.sequence for outcome in retired_outcomes) != tuple(
+        range(previous.through_sequence + 1, checkpoint.through_sequence + 1)
+    ):
+        raise ValueError("checkpoint replay requires every retired outcome in order")
+    if tuple(boundary.to_revision.fence.generation for boundary in retired_boundaries) != tuple(
+        range(previous.state.binding.rejection.fence.generation + 1,
+              checkpoint.state.binding.rejection.fence.generation + 1)
+    ):
+        raise ValueError("checkpoint replay requires every retired boundary in order")
+    last_cursor = (
+        ReviewExecutionBoundaryCursor(
+            retired_boundaries[-1].receipt_id, retired_boundaries[-1].to_revision,
+        ) if retired_boundaries else previous.boundary_cursor
+    )
+    tail_start = (
+        retired_boundaries[-1].through_sequence
+        if retired_boundaries else previous.through_sequence
+    )
+    if (checkpoint.boundary_cursor != last_cursor
+            or application.tail_start_sequence != tail_start):
+        raise ValueError("checkpoint replay lost its retired frontier")
+    if following_boundary is not None and (
+        not isinstance(following_boundary, ReviewExecutionGenerationBoundary)
+        or not isinstance(following_source, ReviewGenerationArchiveFingerprint)
+        or following_source.cursor != ReviewExecutionBoundaryCursor(
+            following_boundary.receipt_id, following_boundary.to_revision,
+        ) or following_boundary.before.binding != checkpoint.state.binding
+        or following_boundary.through_sequence < checkpoint.through_sequence
+    ):
+        raise ValueError("checkpoint replay has an invalid following boundary source")
+    if following_boundary is None and following_source is not None:
+        raise ValueError("checkpoint replay has an unpaired following source")
+    if isinstance(application.tail, ApplyAllCheckpointTailOutcomes):
+        if (following_boundary is not None
+                and following_boundary.to_revision.version
+                <= application.captured_revision.version):
+            raise ValueError("checkpoint replay missed a captured following boundary")
+        selected = retired_outcomes
+    else:
+        if (following_boundary is None
+                or following_source != application.tail.source
+                or following_boundary.to_revision.version
+                > application.captured_revision.version
+                or _applied_digest(following_boundary.applied_sequences)
+                != application.tail.applied_sequences_sha256):
+            raise ValueError("checkpoint replay changed its captured tail selection")
+        applied = frozenset(following_boundary.applied_sequences)
+        selected = tuple(
+            outcome for outcome in retired_outcomes
+            if outcome.round.sequence <= tail_start or outcome.round.sequence in applied
+        )
+    replayed = replay_review_execution_generations(previous, selected, retired_boundaries)
+    expected = ReviewExecutionCheckpoint(
+        checkpoint.through_sequence, replayed, previous.policy, last_cursor,
+    )
+    if expected != checkpoint:
+        raise ValueError("checkpoint state differs from archived outcome replay")
+    return expected

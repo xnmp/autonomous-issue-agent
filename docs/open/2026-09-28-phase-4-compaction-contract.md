@@ -244,6 +244,11 @@ choice with its checkpoint atomically; the audit must re-read the named source
 and replay outcomes before a compacted load can use it. The event stream
 remains the source of truth for snapshots, consistent with the
 [event-sourcing pattern](https://learn.microsoft.com/en-us/azure/architecture/patterns/event-sourcing).
+The pure replay check now verifies a complete caller-supplied segment against
+that choice and the checkpoint state. It enforces contiguous retired sources,
+the supplied following boundary fingerprint and applied-sequence digest, and
+the captured revision's ordering. The archived audit does not yet supply or
+persist this complete state proof, so this check grants no admission authority.
 
 A read-only receipt sweep page now covers the twelve namespaces used by the
 round receipt-set definition, including command-keyed submission and recorded

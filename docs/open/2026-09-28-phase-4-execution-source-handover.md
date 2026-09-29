@@ -658,6 +658,17 @@ the complete audit benchmark.
   review found no cursor regression and confirmed those two remaining
   authority gaps. The full repository gate passed: 3,296 domain, 3,364
   adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
+- Checkpoint 104 adds a pure replay check for a complete archived checkpoint
+  segment. It requires every retired outcome and boundary in order, verifies
+  the recorded tail selection against the first following boundary source,
+  then compares the projected checkpoint state. It accepts a following
+  boundary created after the captured revision and rejects changed source
+  fingerprints, applied sequences, missing outcomes and forged checkpoint
+  state. The function relies on the caller to establish exact source
+  membership and boundary absence; the current archive scan does not yet
+  collect those facts for state replay. Independent Sol review found no
+  concrete issue. The full gate passed: 3,297 domain, 3,368 adapter and
+  2,876 app tests, four import contracts and both Pyrefly checks.
 - Checkpoint 101 attempted sequential state replay for round-only checkpoint
   segments. A forged checkpoint with matching source digests reproduced the
   missing state check, and a versioned cursor resolved a persisted-schema

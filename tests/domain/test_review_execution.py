@@ -10,6 +10,7 @@ import pytest
 from issue_agent.domain.review_checkpoint_application import (
     ApplyAllCheckpointTailOutcomes, ApplyCheckpointTailByFollowingBoundary,
     build_review_checkpoint_application_proposal,
+    replay_review_checkpoint_application,
 )
 from issue_agent.domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from issue_agent.domain.review_execution import (
@@ -536,6 +537,16 @@ def test_zero_round_advances_compact_at_same_sequence_with_distinct_boundary_fro
     assert plan.last_boundary_revision == second.to_revision
     assert plan.retired_boundaries == (first, second)
     assert plan.remaining_outcomes == ()
+    application = build_review_checkpoint_application_proposal(
+        component, plan, second.to_revision, None,
+    )
+    assert replay_review_checkpoint_application(
+        application, (), (first, second), None, None,
+    ) == plan.checkpoint
+    with pytest.raises(ValueError, match="every retired boundary"):
+        replay_review_checkpoint_application(
+            application, (), (first,), None, None,
+        )
     next_outcome = failed(1, captured=binding(2))
     next_state = project_review_execution(plan.checkpoint, (next_outcome,)).state
     later = ActivatedReviewExecution(component.origin, plan.checkpoint, next_state, 1)
@@ -637,6 +648,29 @@ def test_partial_compaction_keeps_a_later_boundary_and_ignores_late_old_outcome(
     assert isinstance(application.tail, ApplyCheckpointTailByFollowingBoundary)
     assert application.tail.source == source
     assert application.tail.applied_sequences_sha256 == hashlib.sha256(b"2").hexdigest()
+    assert replay_review_checkpoint_application(
+        application, settled, (), boundary, source,
+    ) == plan.checkpoint
+    with pytest.raises(ValueError, match="state differs"):
+        replay_review_checkpoint_application(
+            replace(application, checkpoint=replace(
+                application.checkpoint,
+                state=replace(application.checkpoint.state, failures=9),
+            )), settled, (), boundary, source,
+        )
+    with pytest.raises(ValueError, match="tail selection"):
+        replay_review_checkpoint_application(
+            application, settled, (), replace(boundary, applied_sequences=(1, 2)), source,
+        )
+    with pytest.raises(ValueError, match="following boundary source"):
+        replay_review_checkpoint_application(application, settled, (), boundary, None)
+    with pytest.raises(ValueError, match="tail selection"):
+        replay_review_checkpoint_application(
+            application, settled, (), boundary,
+            replace(source, accepted_sha256="c" * 64),
+        )
+    with pytest.raises(ValueError, match="every retired outcome"):
+        replay_review_checkpoint_application(application, settled[:1], (), boundary, source)
     with pytest.raises(ValueError, match="following boundary source"):
         build_review_checkpoint_application_proposal(component, plan, boundary.to_revision, None)
     with pytest.raises(ValueError, match="following boundary source"):
@@ -666,6 +700,33 @@ def test_checkpoint_application_without_a_following_boundary_applies_tail():
     assert application.tail_start_sequence == 0
     assert application.checkpoint.state == projected
     assert isinstance(application.tail, ApplyAllCheckpointTailOutcomes)
+    assert replay_review_checkpoint_application(
+        application, (outcome,), (), None, None,
+    ) == plan.checkpoint
+    with pytest.raises(ValueError, match="archived segment bound"):
+        replay_review_checkpoint_application(
+            replace(application, checkpoint=replace(
+                application.checkpoint, through_sequence=MAX_EXECUTION_SUFFIX + 1,
+            )), (), (), None, None,
+        )
+    late = generation_boundary(
+        projected, carry_review_execution_generation(projected, binding(1), 1),
+        1, (1,), "boundary:after-capture",
+    )
+    late_source = ReviewGenerationArchiveFingerprint(
+        ReviewExecutionBoundaryCursor(late.receipt_id, late.to_revision),
+        "a" * 64, "workflow-request", "request:later", "b" * 64,
+    )
+    assert replay_review_checkpoint_application(
+        application, (outcome,), (), late, late_source,
+    ) == plan.checkpoint
+    with pytest.raises(ValueError, match="missed a captured following boundary"):
+        replay_review_checkpoint_application(
+            replace(application, captured_revision=WorkflowRevision(
+                revision.fence, late.to_revision.version,
+            )),
+            (outcome,), (), late, late_source,
+        )
     with pytest.raises(ValueError, match="cannot invent a following boundary"):
         build_review_checkpoint_application_proposal(
             component, plan, revision,
