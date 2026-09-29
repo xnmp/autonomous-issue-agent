@@ -48,7 +48,7 @@
     <header>
       <p class="eyebrow">Autonomous issue agent</p>
       <h1>Six-phase plan</h1>
-      <p class="meta">Updated 29 Sep 2026, 15:12 AEST · Latest accepted checkpoint: bounded active-round suffix</p>
+      <p class="meta">Updated 29 Sep 2026, 15:32 AEST · Latest accepted checkpoint: classified checkpoint receipt members</p>
       <div class="progress-label"><span>Phases accepted</span><span>3 of 6 · 50%</span></div>
       <progress value="3" max="6" aria-label="Three of six phases accepted">3 of 6</progress>
       <p class="progress-note">Six plan phases are in scope; the bar counts accepted phases, not time or effort. Phase 5 live windows await explicit release of the deployment pause.</p>
@@ -72,7 +72,7 @@
       <section class="column doing" aria-labelledby="doing-title">
         <h2 id="doing-title"><span class="dot" aria-hidden="true"></span>Doing</h2>
         <ol>
-          <li><strong>Phase 4 · Continuation migration</strong><p>Completed archive audits align in a read-only observation. Retired source pages and SQLite 3.43+ active-round loads apply retained-field budgets before payload reads. Compacted loads still refuse. Next: strict total hot-read bounds, atomic writer, admission gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
+          <li><strong>Phase 4 · Continuation migration</strong><p>Completed archive audits align in a read-only observation. The checkpoint proposal now classifies retired local receipt payloads and budgets repeat reads. Compacted loads still refuse. Next: full source lineage and census, strict total read bounds, atomic writer, admission gate, historical reset/session proof, and production import. <a href="2026-09-28-phase-4-execution-source-handover.md">Current handover</a></p></li>
         </ol>
       </section>
 
@@ -174,6 +174,7 @@
           <li><time datetime="2026-09-29T14:37:00+10:00">29 Sep 2026, 14:37 AEST</time><strong>Execution archive audits aligned offline · 3 of 6 accepted</strong><p>A read-only join requires completed checkpoint, round-row, receipt and generation passes to match the current origin, tip, source frontiers and deadlines. Round-row and generation audits can now bootstrap from a compacted indexed execution while canonical admission stays closed. Round-only, retired-generation and selected-tail fixtures pass. Independent Sol review and the full gate passed: 3,302 domain, 3,410 adapter and 2,876 app tests, four import contracts and Pyrefly. The writer, active-suffix proof and admission gate remain open. Active work since the previous entry: Not recorded.</p></li>
           <li><time datetime="2026-09-29T14:53:00+10:00">29 Sep 2026, 14:53 AEST</time><strong>Archive source pages budgeted before payload reads · 3 of 6 accepted</strong><p>The manifest passes its remaining retained-field budget into retired round and generation pages. Metadata blocks oversized rows, receipts and accepted transitions before payload fetch; an exact-boundary regression covers the round ID and outcome pair. Sol review found and verified that fix. Full gate passed: 3,302 domain, 3,411 adapter and 2,876 app tests, four import contracts and Pyrefly. Repeated reads, canonical load and origin remain outside a strict cumulative bound; writer and admission gate remain open. Active work since the previous entry: About 16 minutes.</p></li>
           <li><time datetime="2026-09-29T15:12:00+10:00">29 Sep 2026, 15:12 AEST</time><strong>Active-round suffix source bound accepted offline · 3 of 6 accepted</strong><p>Canonical loads now check one expected round at a time by indexed metadata and cumulative retained-field budget before fetching active round payloads on SQLite 3.43+. The high-water type check refuses large BLOB sequences first. Older SQLite retains the weaker prior read path. Sol found and verified the read-bound fixes; the full gate passed: 3,302 domain, 3,416 adapter and 2,876 app tests, four import contracts and Pyrefly. Origin, receipts, repeated reads, atomic writer and admission gate remain open. Active work since the previous entry: About 19 minutes.</p></li>
+          <li><time datetime="2026-09-29T15:32:00+10:00">29 Sep 2026, 15:32 AEST</time><strong>Retired receipt payloads classified in checkpoint proposal · 3 of 6 accepted</strong><p>The transaction-local manifest now checks each retired round's local receipt payloads, timestamps and same-round references after matching its source fingerprint. It charges repeat reads and classifies one round before fetching the next. Real two-round and malformed-claim cases pass. Sol found and verified a page-order overread fix; the full gate passed: 3,302 domain, 3,418 adapter and 2,876 app tests, four import contracts and Pyrefly. External lineage, census, atomic writer and admission gate remain open. Active work since the previous entry: About 20 minutes.</p></li>
         </ol>
       </div>
     </section>

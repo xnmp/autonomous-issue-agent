@@ -17,9 +17,11 @@ from ..domain.review_round_receipt_archive import (
 )
 from ..domain.workflow_identity import WorkflowRevision
 from .review_execution_activation import (
-    MAX_LEGACY_RECORDING_BYTES, ObservedReviewCheckpointRoundReceiptMember,
+    MAX_CHECKPOINT_ROUND_RECEIPT_BYTES, MAX_LEGACY_RECORDING_BYTES,
+    ObservedReviewCheckpointRoundReceiptMember,
     ObservedReviewCheckpointRoundReceiptSet, _DEDUPE_SOURCE_COLUMNS, _printable,
-    _read_recording_source, read_checkpoint_round_receipt_members,
+    _read_recording_source, _recording_source_size,
+    read_checkpoint_round_receipt_members,
 )
 from .control_store import _parse_stamp
 from .workflow_codec import decode_workflow, encode_workflow
@@ -347,13 +349,17 @@ class ObservedReviewCheckpointRoundClassifiedReceipt:
 class ObservedReviewCheckpointRoundClassifiedReceiptSet:
     source: ObservedReviewCheckpointRoundReceiptSet
     receipts: tuple[ObservedReviewCheckpointRoundClassifiedReceipt, ...]
+    source_bytes: int
 
     def __post_init__(self) -> None:
         if (not isinstance(self.source, ObservedReviewCheckpointRoundReceiptSet)
                 or not isinstance(self.receipts, tuple)
                 or any(not isinstance(item, ObservedReviewCheckpointRoundClassifiedReceipt)
                        for item in self.receipts)
-                or tuple(item.member for item in self.receipts) != self.source.members):
+                or tuple(item.member for item in self.receipts) != self.source.members
+                or type(self.source_bytes) is not int
+                or not self.source.source_bytes < self.source_bytes
+                <= self.source.source_bytes + MAX_CHECKPOINT_ROUND_RECEIPT_BYTES):
             raise ValueError("checkpoint receipt classification requires its exact member set")
         round_id = self.source.source.round
         if any(
@@ -370,6 +376,7 @@ class ObservedReviewCheckpointRoundClassifiedReceiptSet:
 
 def read_classified_checkpoint_round_receipt_members(
     db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+    *, max_source_bytes: int | None = None,
 ) -> ObservedReviewCheckpointRoundClassifiedReceiptSet:
     """Check one finalized round's bounded exact receipt members and local payloads.
 
@@ -378,13 +385,23 @@ def read_classified_checkpoint_round_receipt_members(
     digest-checked read of the same bounded member set.
     """
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
-            or not isinstance(round_id, ReviewRoundIdentity)):
+            or not isinstance(round_id, ReviewRoundIdentity)
+            or max_source_bytes is not None
+            and (type(max_source_bytes) is not int or max_source_bytes < 1)):
         raise ValueError("round receipt member classification requires a transaction and round")
-    observed = read_checkpoint_round_receipt_members(db, round_id)
+    observed = read_checkpoint_round_receipt_members(
+        db, round_id, max_source_bytes=max_source_bytes,
+    )
     repository = round_id.binding.rejection.fence.key.repository
     classified: list[ObservedReviewCheckpointRoundClassifiedReceipt] = []
+    source_bytes = observed.source_bytes
     try:
         for member in observed.members:
+            size = _recording_source_size(db, member.namespace, repository, member.key)
+            if (type(size) is not int or size < 1
+                    or max_source_bytes is not None
+                    and source_bytes + size > max_source_bytes):
+                raise WorkflowAuthorityError("checkpoint receipt classification exceeds its byte bound")
             fields, digest = _read_recording_source(
                 db, member.namespace, repository, member.key,
             )
@@ -396,7 +413,12 @@ def read_classified_checkpoint_round_receipt_members(
                 values["claimed_at"], values["reusable_after"], values["payload_json"],
             )
             classified.append(ObservedReviewCheckpointRoundClassifiedReceipt(member, reference))
-        return ObservedReviewCheckpointRoundClassifiedReceiptSet(observed, tuple(classified))
+            source_bytes += size
+        return ObservedReviewCheckpointRoundClassifiedReceiptSet(
+            observed, tuple(classified), source_bytes,
+        )
+    except WorkflowAuthorityError:
+        raise
     except (AttributeError, KeyError, TypeError, ValueError, UnicodeError,
             RecursionError, sqlite3.Error) as exc:
         raise WorkflowAuthorityError("checkpoint round receipt payload is unreadable") from exc

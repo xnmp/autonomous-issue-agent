@@ -1715,12 +1715,15 @@ def read_checkpoint_round_receipt_source(
 
 def read_checkpoint_round_receipt_members(
     db: sqlite3.Connection, round_id: ReviewRoundIdentity,
+    *, max_source_bytes: int | None = None,
 ) -> ObservedReviewCheckpointRoundReceiptSet:
     """Expose the exact bounded source set for later archived membership joins.
 
     This observation does not verify each namespace-specific payload's meaning.
     """
-    return _read_checkpoint_round_receipt_observation(db, round_id)
+    return _read_checkpoint_round_receipt_observation(
+        db, round_id, max_source_bytes=max_source_bytes,
+    )
 
 
 @dataclass(frozen=True)

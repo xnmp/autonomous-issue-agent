@@ -809,6 +809,18 @@ the complete audit benchmark.
   3,302 domain, 3,416 adapter and 2,876 app tests, four import contracts and
   both Pyrefly checks. Log: `/tmp/active-suffix-budget-full-gate.log`
   (ephemeral).
+- Checkpoint 113 classifies every retired round's local receipt member payload
+  while building the transaction-local checkpoint manifest. Claim timestamps,
+  canonical payloads, derived identities and same-round references are checked
+  in addition to the row and receipt-set fingerprints. The manifest charges
+  repeated row/member reads to its retained-field budget and fetches one round
+  before classifying it, so a later round cannot be fetched after that budget
+  is exhausted. A real two-round fixture and a malformed-claim fixture cover
+  the boundary. This does not prove command/effect or accepted-transition
+  lineage, unclaimed-source census, or admission. Sol review found and verified
+  a page-order overread fix. Full `make test` passed: 3,302 domain, 3,418
+  adapter and 2,876 app tests, four import contracts and both Pyrefly checks.
+  Log: `/tmp/checkpoint-manifest-receipt-classification-gate.log` (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

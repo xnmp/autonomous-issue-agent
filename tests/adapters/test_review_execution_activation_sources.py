@@ -40,7 +40,7 @@ from issue_agent.adapters.review_execution_activation import (
     read_review_generation_archive_page, verify_checkpoint_generation_anchor,
     read_checkpoint_round_row_source, read_checkpoint_round_receipt_source,
     read_checkpoint_round_receipt_members, read_checkpoint_round_archive_page,
-    BlockedReviewCheckpointRoundPage,
+    BlockedReviewCheckpointRoundPage, ObservedReviewCheckpointRoundPage,
     ObservedReviewGenerationArchivePage, BlockedReviewGenerationArchivePage,
     read_review_generation_receipt_sweep_page, read_reconciled_review_generation_receipt_sweep_page,
     ObservedReviewGenerationReceiptSweepPage, BlockedReviewGenerationReceiptSweepPage,
@@ -1444,6 +1444,66 @@ def test_checkpoint_manifest_observes_real_round_and_generation_sources(rig):
             observe_review_checkpoint_manifest(
                 db, key, 1, max_source_bytes=observed.source_bytes - 1,
             )
+
+
+def test_checkpoint_manifest_refuses_retired_receipt_with_invalid_claim_time(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    with store.transaction() as db:
+        original = observe_review_checkpoint_manifest(db, key, 1)
+        round_id = original.plan.retired_outcomes[0].round.round_id
+        db.execute(
+            "UPDATE dedupe_keys SET claimed_at='2026-09-29T00:00:00' "
+            "WHERE namespace='review-round-outcome' AND scope=? AND key=?",
+            (key.repository, round_id),
+        )
+        assert load_review_workflow_row(db, key) is not None
+        with pytest.raises(WorkflowAuthorityError, match="receipt payload is unreadable"):
+            observe_review_checkpoint_manifest(db, key, 1)
+
+
+def test_checkpoint_manifest_stops_before_next_round_when_classification_exhausts_budget(rig):
+    store, _, _, selection, control = rig
+    for sequence in (1, 2):
+        selected = selection if sequence == 1 else replace(
+            selection, request_id="preflight:second-budget-round",
+            expected=current(store, selection).revision,
+        )
+        plan = control.preflight(selected)
+        planned = stage(plan)
+        control.register_stage(plan.round.round_id, current(store, selection).revision, planned)
+        assert store.record_review_admission_refusal(request(planned.children[0], cap=59)) is not None
+        control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+        control.finalize_completed_round(plan.round.round_id)
+    key = selection.expected.fence.key
+    with store.transaction() as db:
+        observed = observe_review_checkpoint_manifest(db, key, 2)
+        binding = observed.receipt.previous_checkpoint.state.binding
+        first_page = read_checkpoint_round_archive_page(db, binding, 1, 1, limit=1)
+        second_page = read_checkpoint_round_archive_page(db, binding, 2, 2, limit=1)
+        assert isinstance(first_page, ObservedReviewCheckpointRoundPage)
+        assert isinstance(second_page, ObservedReviewCheckpointRoundPage)
+        outcomes_bytes = db.execute(
+            "SELECT sum(length(CAST(outcome_json AS BLOB))) FROM review_execution_rounds",
+        ).fetchone()[0]
+        budget = (outcomes_bytes + first_page.rounds[0].source_bytes
+                  + second_page.rounds[0].source_bytes)
+        assert budget < observed.source_bytes
+        statements = []
+        db.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(WorkflowAuthorityError, match="byte bound") as blocked:
+                observe_review_checkpoint_manifest(
+                    db, key, 2, max_source_bytes=budget,
+                )
+        finally:
+            db.set_trace_callback(None)
+        assert not any(
+            "SELECT round_id,outcome_json FROM review_execution_rounds" in statement
+            and "sequence=2" in statement
+            for statement in statements
+        )
+        assert "classification" in str(blocked.value)
 
 
 def test_checkpoint_source_pages_refuse_exhausted_budget_before_payload_read(rig):

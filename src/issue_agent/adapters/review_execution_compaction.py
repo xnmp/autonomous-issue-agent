@@ -21,6 +21,7 @@ from .review_execution_activation import (
     ObservedReviewCheckpointRoundPage, ObservedReviewGenerationArchivePage,
     read_checkpoint_round_archive_page, read_review_generation_archive_page,
 )
+from .review_round_receipt_sweep import read_classified_checkpoint_round_receipt_members
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
     WorkflowAuthorityError, _read_execution_origin, load_review_workflow_row,
@@ -115,8 +116,9 @@ def observe_review_checkpoint_manifest(
 ) -> ObservedReviewCheckpointManifest:
     """Rebuild a retired source proposal from canonical SQL in one snapshot.
 
-    A writer must still census unclaimed rows and receipts, verify every
-    retired receipt's semantic payload, and publish an audit gate atomically.
+    Retired receipt payloads are classified locally. A writer must still census
+    unclaimed rows and receipts, verify external command/effect and transition
+    lineage, and publish an audit gate atomically.
     The retained-field ceiling is passed to retired round and generation page
     readers before each payload fetch. It does not count repeat fetches or
     bound the canonical loader, origin read, or peak memory.
@@ -143,7 +145,7 @@ def observe_review_checkpoint_manifest(
                 raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
             page = read_checkpoint_round_archive_page(
                 db, origin_binding, next_sequence, through_sequence,
-                max_source_bytes=max_source_bytes - source_bytes,
+                limit=1, max_source_bytes=max_source_bytes - source_bytes,
             )
             if isinstance(page, BlockedReviewCheckpointRoundPage):
                 raise WorkflowAuthorityError(
@@ -158,6 +160,15 @@ def observe_review_checkpoint_manifest(
                 source_bytes += observed.source_bytes
                 if source_bytes > max_source_bytes:
                     raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
+                if source_bytes >= max_source_bytes:
+                    raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
+                classified = read_classified_checkpoint_round_receipt_members(
+                    db, observed.source.round,
+                    max_source_bytes=max_source_bytes - source_bytes,
+                )
+                if classified.source.source != observed.source:
+                    raise WorkflowAuthorityError("checkpoint manifest retired receipt set changed")
+                source_bytes += classified.source_bytes
                 round_sources.append(observed.source)
             next_sequence = page.next_sequence
         if tuple(source.round for source in round_sources) != tuple(

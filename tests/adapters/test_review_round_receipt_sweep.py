@@ -215,6 +215,15 @@ def test_classified_checkpoint_round_members_match_real_receipt_payloads(rig):
         result = read_classified_checkpoint_round_receipt_members(db, plan.round)
         assert db.total_changes == before
     assert isinstance(result, ObservedReviewCheckpointRoundClassifiedReceiptSet)
+    assert result.source_bytes > result.source.source_bytes
+    with store.transaction() as db:
+        assert read_classified_checkpoint_round_receipt_members(
+            db, plan.round, max_source_bytes=result.source_bytes,
+        ) == result
+        with pytest.raises(WorkflowAuthorityError, match="byte bound"):
+            read_classified_checkpoint_round_receipt_members(
+                db, plan.round, max_source_bytes=result.source_bytes - 1,
+            )
     assert tuple(item.member for item in result.receipts) == result.source.members
     assert all(
         item.reference == BoundReviewRoundReceipt(plan.round)

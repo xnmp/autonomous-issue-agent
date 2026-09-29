@@ -14,7 +14,9 @@ budget is passed into retired round and generation page readers before payload
 fetch. Repeated reads of the same retained field, the canonical load and origin
 read are still outside that bound, and the budget is not a peak-memory guarantee.
 It neither surveys unclaimed archive rows nor certifies
-every retired receipt payload, so it cannot authorize a checkpoint write.
+external command/effect and transition lineage, so it cannot authorize a
+checkpoint write. It now classifies each retired round's local receipt
+payloads and charges the repeat reads before reading the next round.
 On SQLite 3.43+, canonical active-round loads now point-check the indexed
 suffix with metadata byte lengths and stop before an overbudget payload fetch.
 SQLite documents this optimization for

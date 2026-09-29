@@ -33,6 +33,9 @@ typed checkpoint receipt. Retired round and generation pages now apply its
 remaining byte budget before payload reads; the writer still needs a bound
 around the canonical load and origin, an unclaimed-row
 and receipt census, payload audit and atomic audit gate.
+The manifest now classifies each retired round's local receipt payloads after
+its source fingerprint, charging repeat reads before moving to the next round.
+Command/effect and accepted-transition lineage remain separate proof duties.
 Schema v26 now supplies an indexed, read-only repository round sweep page
 that checks row and finalized-payload identities before selecting an episode.
 A transaction-local cursor now persists one bounded sweep page at a time,
