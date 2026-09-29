@@ -311,6 +311,184 @@ def test_global_round_witness_blocks_missing_state_and_overflow(active):
             db.execute("DELETE FROM review_execution_rounds WHERE round_id=?", (round_id,))
 
 
+def test_generation_witness_covers_all_sources_and_foreign_receipts(active):
+    store, _ = active
+    with store.transaction() as db:
+        before = read_review_archive_source_versions(db, "o/r")
+        for namespace, key in (
+            ("review-execution-generation", "foreign:receipt"),
+            ("workflow-request", "accepted:request"),
+            ("workflow-transition", "accepted:transition"),
+        ):
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,?,?,'2026-09-29T00:00:00+00:00','{}')",
+                (namespace, "other/repo" if namespace == "review-execution-generation" else "o/r", key),
+            )
+        inserted = read_review_archive_source_versions(db, "o/r")
+        assert inserted.generation_sources == before.generation_sources + 3
+        assert (inserted.round_rows, inserted.all_round_rows, inserted.round_receipts) == (
+            before.round_rows, before.all_round_rows, before.round_receipts,
+        )
+        db.execute(
+            "UPDATE dedupe_keys SET namespace=CAST(namespace AS BLOB) "
+            "WHERE namespace='workflow-request' AND key='accepted:request'",
+        )
+        aliased = read_review_archive_source_versions(db, "o/r")
+        assert aliased.generation_sources == inserted.generation_sources + 1
+        db.execute(
+            "UPDATE dedupe_keys SET namespace='unrelated' WHERE key='accepted:transition'",
+        )
+        db.execute(
+            "DELETE FROM dedupe_keys WHERE key='foreign:receipt'",
+        )
+        assert read_review_archive_source_versions(db, "o/r").generation_sources == (
+            aliased.generation_sources + 2
+        )
+        db.execute(
+            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('other','o/r','unrelated:key','2026-09-29T00:00:00+00:00','{}')",
+        )
+        assert read_review_archive_source_versions(db, "o/r").generation_sources == (
+            aliased.generation_sources + 2
+        )
+        db.execute(
+            "UPDATE dedupe_keys SET namespace='workflow-request' WHERE key='unrelated:key'",
+        )
+        assert read_review_archive_source_versions(db, "o/r").generation_sources == (
+            aliased.generation_sources + 3
+        )
+        db.execute(
+            "INSERT OR REPLACE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+            "VALUES ('workflow-request','o/r','unrelated:key',"
+            "'2026-09-29T00:00:00+00:00','[]')",
+        )
+        assert read_review_archive_source_versions(db, "o/r").generation_sources == (
+            aliased.generation_sources + 4
+        )
+
+
+def test_generation_witness_survives_v28_migration_with_existing_sources(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_receipt(db, "workflow-transition", "accepted:transition")
+    with closing(sqlite3.connect(store.path)) as db:
+        _historical_fixture(db, 28)
+        db.commit()
+    store.initialize()
+    with store.transaction() as db:
+        assert read_review_archive_source_versions(db, "o/r").generation_sources == 0
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json='[]' "
+            "WHERE namespace='workflow-transition' AND key='accepted:transition'",
+        )
+        assert read_review_archive_source_versions(db, "o/r").generation_sources == 1
+
+
+def test_generation_witness_rollback_missing_state_and_overflow(active):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_receipt(db, "workflow-request", "accepted:request")
+        baseline = read_review_archive_source_versions(db, "o/r")
+    with closing(store._connect()) as db:
+        db.execute("BEGIN")
+        db.execute(
+            "UPDATE dedupe_keys SET payload_json='[]' WHERE key='accepted:request'",
+        )
+        assert read_review_archive_source_versions(db, "o/r").generation_sources == (
+            baseline.generation_sources + 1
+        )
+        db.rollback()
+    with store.transaction() as db:
+        assert read_review_archive_source_versions(db, "o/r") == baseline
+        db.execute(
+            "UPDATE review_archive_source_versions SET version=? "
+            "WHERE source='generation_sources' AND scope=X''",
+            (MAX_ARCHIVE_SOURCE_VERSION,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "UPDATE dedupe_keys SET payload_json='[]' WHERE key='accepted:request'",
+            )
+        db.execute(
+            "DELETE FROM review_archive_source_versions "
+            "WHERE source='generation_sources' AND scope=X''",
+        )
+        with pytest.raises(WorkflowAuthorityError, match="generation source mutation witness"):
+            read_review_archive_source_versions(db, "o/r")
+        with pytest.raises(sqlite3.IntegrityError, match="generation source witness"):
+            db.execute(
+                "DELETE FROM dedupe_keys WHERE key='accepted:request'",
+            )
+
+
+@pytest.mark.parametrize("namespace", ("review-round-stage", "review-execution-generation"))
+@pytest.mark.parametrize("operation", ("insert", "update"))
+def test_archive_witness_rejects_implicit_dedupe_source_replacement(active, namespace, operation):
+    store, _ = active
+    with store.transaction() as db:
+        _insert_receipt(db, namespace, "source:key")
+        source_rowid = db.execute(
+            "SELECT rowid FROM dedupe_keys WHERE namespace=? AND key='source:key'",
+            (namespace,),
+        ).fetchone()[0]
+        before = read_review_archive_source_versions(db, "o/r")
+        if operation == "update":
+            _insert_receipt(db, "other-namespace", "unrelated:key")
+            mutation = (
+                "UPDATE OR REPLACE dedupe_keys SET rowid=? "
+                "WHERE namespace='other-namespace' AND key='unrelated:key'"
+            )
+        else:
+            mutation = (
+                "INSERT OR REPLACE INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
+                "VALUES (?,'other-namespace','o/r','unrelated:key',"
+                "'2026-09-29T00:00:00+00:00','{}')"
+            )
+        with pytest.raises(sqlite3.IntegrityError, match="replacement would hide"):
+            db.execute(mutation, (source_rowid,))
+        assert read_review_archive_source_versions(db, "o/r") == before
+        assert db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE rowid=? AND namespace=? AND key='source:key'",
+            (source_rowid, namespace),
+        ).fetchone() is not None
+
+
+@pytest.mark.parametrize("namespace,version_field", (
+    ("review-round-stage", "round_receipts"),
+    ("review-execution-generation", "generation_sources"),
+))
+def test_archive_witness_handles_automatic_insert_with_negative_source_rowid(
+    active, namespace, version_field,
+):
+    store, _ = active
+    with store.transaction() as db:
+        db.execute(
+            "INSERT INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
+            "VALUES (-1,?,'o/r','negative:source','2026-09-29T00:00:00+00:00','{}')",
+            (namespace,),
+        )
+        before = read_review_archive_source_versions(db, "o/r")
+        _insert_receipt(db, "other-namespace", "unrelated:auto")
+        after_auto = read_review_archive_source_versions(db, "o/r")
+        assert getattr(after_auto, version_field) == getattr(before, version_field) + 1
+        assert db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND namespace=?",
+            (namespace,),
+        ).fetchone() is not None
+        db.execute(
+            "INSERT OR REPLACE INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
+            "VALUES (-1,'other-namespace','o/r','unrelated:replace',"
+            "'2026-09-29T00:00:00+00:00','{}')",
+        )
+        after_replace = read_review_archive_source_versions(db, "o/r")
+        assert getattr(after_replace, version_field) == getattr(after_auto, version_field) + 1
+        assert db.execute(
+            "SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND namespace=?",
+            (namespace,),
+        ).fetchone() is None
+
+
 def test_review_archive_witness_requires_transaction(active):
     store, _ = active
     with closing(store._connect()) as db:

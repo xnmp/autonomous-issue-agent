@@ -911,6 +911,27 @@ the complete audit benchmark.
   paused services remained inactive. Checkpoint, generation, origin and
   workflow sources still need lifetime freshness; writer and admission
   authority remain open.
+- Checkpoint 120 adds schema v29's global generation-source revision for the
+  `review-execution-generation`, `workflow-request` and `workflow-transition`
+  receipt namespaces. The expected generation page reads the first and the
+  matching accepted transition; the global receipt sweep also reads foreign
+  repositories. INSERT, UPDATE, DELETE, rekey and BLOB-alias writes advance
+  the bounded witness. Direct rowid replacement of a selected source by an
+  unrelated `dedupe_keys` row is rejected before SQLite can skip its DELETE
+  trigger. For a selected rowid of `-1`, the BEFORE INSERT trigger advances
+  its witness conservatively, since SQLite uses `NEW.rowid=-1` before assigning
+  an automatic rowid; this permits ordinary inserts and detects explicit
+  replacement at `-1`, at the cost of extra revisions in that unusual case.
+  Migration from v28, rollback, missing and overflowed witnesses, alias and
+  replacement paths have behavior regressions. Independent Sol review found
+  the REPLACE bypass and `-1` sentinel issue, then verified the fixes. This
+  checkpoint passed full `make test`: 3,302 domain, 3,485 adapter and 2,876 app
+  tests, hooks, governor, four import contracts and both Pyrefly checks. Log:
+  `/tmp/review-generation-source-witness-gate.log` (ephemeral). The four
+  paused services remained inactive. The revision is observational: the
+  generation audit cursor does not yet capture
+  it, and workflow/component, checkpoint, origin and admission freshness remain
+  open.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
@@ -934,10 +955,11 @@ only on one connection, so it cannot serve as a durable cross-transaction
 witness. A complete schema-maintained revision needs exact trigger coverage of
 every source table and namespace, including updates, deletes and rekeys;
 [SQLite triggers](https://www.sqlite.org/lang_createtrigger.html) fire per row.
-The first schema revision now covers round rows and retained round receipts.
-The round-row audit captures and compares its revision across bounded pages;
-the receipt audit must capture both revisions before its completed result can
-support a freshness claim. Other source groups still need mutation coverage.
+The first schema revisions cover round rows, retained round receipts and
+generation receipt/accepted transition rows. The round and receipt audits
+capture and compare their revisions across bounded pages. The generation audit
+must capture its new revision before its completed result can support a
+freshness claim. Other source groups still need mutation coverage.
 
 With checkpoints 88–99, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid

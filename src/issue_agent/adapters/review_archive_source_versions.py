@@ -18,6 +18,7 @@ class ReviewArchiveSourceVersions:
     round_rows: int
     all_round_rows: int
     round_receipts: int
+    generation_sources: int
 
     def __post_init__(self) -> None:
         if (canonical_workflow_repository(self.repository) != self.repository
@@ -26,7 +27,9 @@ class ReviewArchiveSourceVersions:
                 or type(self.all_round_rows) is not int
                 or not 0 <= self.all_round_rows <= MAX_ARCHIVE_SOURCE_VERSION
                 or type(self.round_receipts) is not int
-                or not 0 <= self.round_receipts <= MAX_ARCHIVE_SOURCE_VERSION):
+                or not 0 <= self.round_receipts <= MAX_ARCHIVE_SOURCE_VERSION
+                or type(self.generation_sources) is not int
+                or not 0 <= self.generation_sources <= MAX_ARCHIVE_SOURCE_VERSION):
             raise ValueError("archive source versions require canonical bounded witnesses")
 
 
@@ -61,10 +64,13 @@ def read_review_archive_source_versions(
     round_rows = _read_version(db, "round_rows", repository.encode())
     all_round_rows = _read_version(db, "all_round_rows", b"")
     round_receipts = _read_version(db, "round_receipts", b"")
+    generation_sources = _read_version(db, "generation_sources", b"")
     if all_round_rows is None:
         raise WorkflowAuthorityError("global round row mutation witness is absent")
     if round_receipts is None:
         raise WorkflowAuthorityError("round receipt mutation witness is absent")
+    if generation_sources is None:
+        raise WorkflowAuthorityError("generation source mutation witness is absent")
     if round_rows is None:
         existing = db.execute(
             "SELECT 1 FROM review_execution_rounds INDEXED BY review_execution_rounds_repository "
@@ -78,4 +84,6 @@ def read_review_archive_source_versions(
         if existing is not None or workflow is not None:
             raise WorkflowAuthorityError("round row mutation witness is absent")
         round_rows = 0
-    return ReviewArchiveSourceVersions(repository, round_rows, all_round_rows, round_receipts)
+    return ReviewArchiveSourceVersions(
+        repository, round_rows, all_round_rows, round_receipts, generation_sources,
+    )

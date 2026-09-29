@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 28
+SCHEMA_VERSION = 29
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1766,6 +1766,133 @@ BEGIN
     );
     UPDATE review_archive_source_versions SET version=version+1
     WHERE source='all_round_rows' AND scope=X'';
+END;
+"""),
+    SchemaMigration(29, """
+INSERT INTO review_archive_source_versions(source,scope,version)
+VALUES ('generation_sources',X'',0);
+-- REPLACE can delete a selected source without running its DELETE trigger.
+CREATE TRIGGER review_archive_dedupe_no_replace_insert BEFORE INSERT ON dedupe_keys
+WHEN NEW.rowid IS NOT -1 AND EXISTS (
+    SELECT 1 FROM dedupe_keys WHERE rowid=NEW.rowid AND (
+        substr(CAST(namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+        OR CAST(namespace AS BLOB) IN (
+            CAST('review-recorded-submission' AS BLOB),
+            CAST('review-execution-generation' AS BLOB),
+            CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT,'review archive replacement would hide a source mutation');
+END;
+-- SQLite reports an unspecified NEW.rowid (currently -1) for automatic inserts.
+-- Conservatively advance a source at -1 so ordinary inserts remain possible.
+CREATE TRIGGER review_archive_dedupe_minus_one_insert BEFORE INSERT ON dedupe_keys
+WHEN NEW.rowid=-1 AND EXISTS (
+    SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND (
+        substr(CAST(namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+        OR CAST(namespace AS BLOB) IN (
+            CAST('review-recorded-submission' AS BLOB),
+            CAST('review-execution-generation' AS BLOB),
+            CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT,'round receipt source witness is absent')
+    WHERE EXISTS (
+        SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND (
+            substr(CAST(namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+            OR CAST(namespace AS BLOB)=CAST('review-recorded-submission' AS BLOB)
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='round_receipts' AND scope=X''
+    );
+    SELECT RAISE(ABORT,'generation source witness is absent')
+    WHERE EXISTS (
+        SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND CAST(namespace AS BLOB) IN (
+            CAST('review-execution-generation' AS BLOB),
+            CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+        )
+    ) AND NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='generation_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='round_receipts' AND scope=X'' AND EXISTS (
+        SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND (
+            substr(CAST(namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+            OR CAST(namespace AS BLOB)=CAST('review-recorded-submission' AS BLOB)
+        )
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='generation_sources' AND scope=X'' AND EXISTS (
+        SELECT 1 FROM dedupe_keys WHERE rowid=-1 AND CAST(namespace AS BLOB) IN (
+            CAST('review-execution-generation' AS BLOB),
+            CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+        )
+    );
+END;
+CREATE TRIGGER review_archive_dedupe_no_replace_update BEFORE UPDATE ON dedupe_keys
+WHEN NEW.rowid IS NOT OLD.rowid AND EXISTS (
+    SELECT 1 FROM dedupe_keys WHERE rowid=NEW.rowid AND (
+        substr(CAST(namespace AS BLOB),1,13)=CAST('review-round-' AS BLOB)
+        OR CAST(namespace AS BLOB) IN (
+            CAST('review-recorded-submission' AS BLOB),
+            CAST('review-execution-generation' AS BLOB),
+            CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT,'review archive replacement would hide a source mutation');
+END;
+CREATE TRIGGER review_generation_source_insert AFTER INSERT ON dedupe_keys
+WHEN CAST(NEW.namespace AS BLOB) IN (
+    CAST('review-execution-generation' AS BLOB),
+    CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+)
+BEGIN
+    SELECT RAISE(ABORT,'generation source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='generation_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='generation_sources' AND scope=X'';
+END;
+CREATE TRIGGER review_generation_source_update AFTER UPDATE ON dedupe_keys
+WHEN CAST(OLD.namespace AS BLOB) IN (
+    CAST('review-execution-generation' AS BLOB),
+    CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+) OR CAST(NEW.namespace AS BLOB) IN (
+    CAST('review-execution-generation' AS BLOB),
+    CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+)
+BEGIN
+    SELECT RAISE(ABORT,'generation source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='generation_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='generation_sources' AND scope=X'';
+END;
+CREATE TRIGGER review_generation_source_delete AFTER DELETE ON dedupe_keys
+WHEN CAST(OLD.namespace AS BLOB) IN (
+    CAST('review-execution-generation' AS BLOB),
+    CAST('workflow-request' AS BLOB),CAST('workflow-transition' AS BLOB)
+)
+BEGIN
+    SELECT RAISE(ABORT,'generation source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='generation_sources' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='generation_sources' AND scope=X'';
 END;
 """),
 )

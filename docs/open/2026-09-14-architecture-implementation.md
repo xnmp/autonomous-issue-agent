@@ -48,7 +48,9 @@ revisions; v28 also maintains a global round-row revision because receipt-owner
 reconciliation reads foreign repositories. Both durable censuses now capture
 their source revisions across pages and restart on mutation. The read-only
 archive join rejects stale completed round and receipt passes. Other source
-groups still need lifetime freshness; this does not authorize compaction.
+groups still need lifetime freshness; v29 now records mutations of global
+generation receipts and accepted transition sources for a future versioned
+generation audit. This does not authorize compaction.
 A transaction-local cursor now persists one bounded sweep page at a time,
 checks that the episode has exactly its allocated sequence count, and compares
 the prior pass's source membership when the frontier grows or a scheduled
