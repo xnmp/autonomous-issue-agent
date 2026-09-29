@@ -23,6 +23,7 @@ from ..domain import review_checkpoint_chain as checkpoint_chain
 from ..domain import review_checkpoint_archive as checkpoint_archive
 from ..domain import review_archive_source_versions as archive_source_versions
 from ..domain import review_lifecycle_archive_audit as lifecycle_archive_audit
+from ..domain import review_registration_membership_audit as registration_membership_audit
 from ..domain import review_initial_checkpoint_absence as initial_checkpoint_absence
 from ..domain import review_checkpoint_stream_replay as checkpoint_replay
 from ..domain import review_checkpoint_application as checkpoint_application
@@ -135,6 +136,9 @@ _VALUES = (
     lifecycle_archive_audit.ScanningReviewLifecycleEffects,
     lifecycle_archive_audit.CompletedReviewLifecycleArchiveAudit,
     lifecycle_archive_audit.BlockedReviewLifecycleArchiveAudit,
+    registration_membership_audit.ScanningReviewRegistrationMembership,
+    registration_membership_audit.CompletedReviewRegistrationMembership,
+    registration_membership_audit.BlockedReviewRegistrationMembership,
     initial_checkpoint_absence.ScanningInitialCheckpointAbsence,
     initial_checkpoint_absence.CompletedInitialCheckpointAbsence,
     initial_checkpoint_absence.BlockedInitialCheckpointAbsence,

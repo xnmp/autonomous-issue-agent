@@ -6,8 +6,7 @@ from datetime import datetime, timezone
 import pytest
 
 from issue_agent.adapters.review_lifecycle_registration import (
-    _round_source_sql_bytes, read_review_lifecycle_registration_link,
-    read_review_lifecycle_registration_page,
+    read_review_lifecycle_registration_link, read_review_lifecycle_registration_page,
 )
 from issue_agent.adapters.workflow_rows import (
     REVIEW_SUBMISSION_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE,
@@ -164,7 +163,7 @@ def test_registration_link_rechecks_real_command_round_and_recorded_sources(rig)
         before = db.total_changes
         linked = read_review_lifecycle_registration_link(db, source)
         assert db.total_changes == before
-        with pytest.raises(WorkflowAuthorityError, match="cannot be linked"):
+        with pytest.raises(WorkflowAuthorityError, match="byte bound|cannot be linked"):
             read_review_lifecycle_registration_link(
                 db, source, max_source_bytes=linked.source_bytes - 1,
             )
@@ -186,7 +185,6 @@ def test_registration_link_refuses_missing_command(rig):
     with store.transaction() as db:
         with pytest.raises(WorkflowAuthorityError, match="cannot be linked"):
             read_review_lifecycle_registration_link(db, source)
-
 
 def test_registration_link_refuses_changed_round_index(rig):
     store, _, selection, _, plan, command = confirmed_copy(rig)
@@ -285,16 +283,3 @@ def test_registration_link_refuses_forged_copy_refusal_effect(rig):
         )
         with pytest.raises(WorkflowAuthorityError, match="cannot be linked"):
             read_review_lifecycle_registration_link(db, source)
-
-
-def test_round_source_byte_charge_matches_sqlite_large_integer_and_unicode(rig):
-    store = rig[0]
-    fields = (("sequence", 9223372036854775807), ("label", "é"), ("absent", None))
-    with store.transaction() as db:
-        expected = db.execute(
-            "SELECT ifnull(length(CAST(? AS BLOB)),0) + "
-            "ifnull(length(CAST(? AS BLOB)),0) + "
-            "ifnull(length(CAST(? AS BLOB)),0)",
-            tuple(value for _, value in fields),
-        ).fetchone()[0]
-    assert _round_source_sql_bytes(fields) == expected

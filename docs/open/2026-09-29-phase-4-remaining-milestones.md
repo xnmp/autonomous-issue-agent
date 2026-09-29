@@ -25,8 +25,11 @@ milestone rather than adding another progress unit.
 
 Milestone 1 evidence in progress: checkpoint 131 links one bounded
 registration to its recorded command, effect, preflight, round, and planned
-stage sources in a transaction. The global command census still lacks an
-expected registration membership proof, so this does not accept the milestone.
+stage sources in a transaction. Checkpoint 132 adds a durable, bounded
+registration census that compares expected command membership with the
+independent lifecycle command census. Unregistered commands now refuse this
+read-only match. Historical submission decisions and the other source
+families in milestone 1 remain open, so this does not accept the milestone.
 
 ## Progress rule
 

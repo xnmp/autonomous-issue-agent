@@ -8,7 +8,9 @@ import sqlite3
 from dataclasses import replace
 from datetime import datetime
 
-from ..domain.review_execution_activation import MAX_SQL_ROWID, MIN_SQL_ROWID
+from ..domain.review_execution_activation import (
+    LEGACY_REVIEW_ROUND_COLUMNS, MAX_SQL_ROWID, MIN_SQL_ROWID,
+)
 from ..domain.review_lifecycle_archive import (
     MAX_REVIEW_LIFECYCLE_PAGE_BYTES, MAX_REVIEW_LIFECYCLE_SOURCE_PAGE,
 )
@@ -39,6 +41,10 @@ from .workflow_rows import (
 )
 
 
+class RegistrationLinkByteLimit(WorkflowAuthorityError):
+    """The next complete link exceeds the caller's remaining source budget."""
+
+
 def _bounded_recording_source(
     db: sqlite3.Connection, namespace: str, repository: str, key: str,
     remaining: int,
@@ -53,17 +59,9 @@ def _bounded_recording_source(
         raise ValueError(f"{namespace} source is absent")
     size = metadata["source_bytes"]
     if size > remaining:
-        raise ValueError(f"{namespace} source exceeds the link byte bound")
+        raise RegistrationLinkByteLimit(f"{namespace} source exceeds the link byte bound")
     fields, digest = _read_recording_source(db, namespace, repository, key)
     return dict(fields), digest, size, metadata["source_rowid"]
-
-
-def _round_source_sql_bytes(fields: tuple[tuple[str, str | int | None], ...]) -> int:
-    return sum(
-        len(str(value).encode()) if type(value) is int
-        else len(value.encode("utf-8", "surrogatepass"))
-        for _, value in fields if value is not None
-    )
 
 
 def read_review_lifecycle_registration_link(
@@ -105,10 +103,24 @@ def read_review_lifecycle_registration_link(
         )
         source_bytes += preflight_bytes
         recorded_preflight = decode_workflow(preflight["payload_json"], tuple)
+        round_sizes = tuple(
+            f"ifnull(length(CAST({column} AS BLOB)),0)"
+            for column in LEGACY_REVIEW_ROUND_COLUMNS
+        )
+        round_metadata = db.execute(
+            f"SELECT {'+'.join(round_sizes)} AS source_bytes "
+            "FROM review_execution_rounds WHERE round_id=? LIMIT 1",
+            (registration.round.round_id,),
+        ).fetchone()
+        if (round_metadata is not None
+                and round_metadata["source_bytes"] > max_source_bytes - source_bytes):
+            raise RegistrationLinkByteLimit("review round exceeds the link byte bound")
         round_source = read_checkpoint_round_row_source(
             db, registration.round, max_source_bytes=max_source_bytes - source_bytes,
         )
-        source_bytes += _round_source_sql_bytes(round_source.fields)
+        if round_metadata is None or type(round_metadata["source_bytes"]) is not int:
+            raise ValueError("review round lost its SQL byte metadata")
+        source_bytes += round_metadata["source_bytes"]
         plan = decode_workflow(dict(round_source.fields)["plan_json"], ReviewRoundPlan)
         if (len(recorded_preflight) != 3
                 or encode_workflow(recorded_preflight) != preflight["payload_json"]
@@ -132,9 +144,12 @@ def read_review_lifecycle_registration_link(
         ).fetchall()
         if len(aliases) != 1 or aliases[0]["identity_type"] != "text":
             raise ValueError("registered lifecycle command is absent or aliased")
-        command_source, command_bytes = _submission_at_rowid(
-            db, repository, aliases[0]["rowid"], max_source_bytes - source_bytes,
-        )
+        try:
+            command_source, command_bytes = _submission_at_rowid(
+                db, repository, aliases[0]["rowid"], max_source_bytes - source_bytes,
+            )
+        except OverflowError as exc:
+            raise RegistrationLinkByteLimit("review command exceeds the link byte bound") from exc
         source_bytes += command_bytes
         command = dict(command_source.command_fields)
         if command_source.receipt_fields is not None:
@@ -191,13 +206,15 @@ def read_review_lifecycle_registration_link(
             raise ValueError("review stage receipts disagree with the round")
         stage_bytes = sum(row["source_bytes"] for row in stage_rows)
         if stage_bytes > max_source_bytes - source_bytes:
-            raise ValueError("review stage receipts exceed the link byte bound")
+            raise RegistrationLinkByteLimit("review stage receipts exceed the link byte bound")
         stage_digest = _verified_review_stage_sources(db, repository, plan)
         source_bytes += stage_bytes
         return LinkedReviewLifecycleRegistration(
             source, command_source, round_source, index_digest,
             preflight_digest, stage_digest, source_bytes,
         )
+    except RegistrationLinkByteLimit:
+        raise
     except (TypeError, ValueError, UnicodeError, RecursionError,
             sqlite3.Error, OverflowError, WorkflowAuthorityError) as exc:
         raise WorkflowAuthorityError("registration cannot be linked to its command and round") from exc

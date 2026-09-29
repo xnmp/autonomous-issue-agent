@@ -520,7 +520,12 @@ future expected-command census. A bounded transaction-local link now rechecks
 each registration's rowid and payload against its round index, preflight,
 round plan, planned stage receipts, lifecycle command and any effect receipt.
 This link is observational: it does not establish complete expected-command
-membership or close the unregistered-command gap.
+membership or close the unregistered-command gap. A separate durable paged
+registration scan now compares its expected command membership with the
+independent lifecycle census under round-row, receipt and lifecycle mutation
+revisions. An extra unregistered command refuses the read-only match. This
+is still an observational import input, not a historical submission decision
+or an admission gate.
 
 The indexed-allowance checkpoint replaces the repository-wide historical scan
 with a bounded per-episode admission query, preserving strict never-launched

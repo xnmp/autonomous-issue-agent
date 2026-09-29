@@ -1156,6 +1156,31 @@ expected-source proof and settlement provenance are present.
   Pyrefly checks. Ten strict xfails remained expected. Log:
   `/tmp/phase4-registration-link-gate.log` (ephemeral).
 
+- Checkpoint 132 adds a durable, bounded expected-command membership scan.
+  Each transaction advances a global registration page and links its selected
+  sources to exact command/round evidence, folding command rowid and full
+  source digest with the same membership encoding as the independent lifecycle
+  census. A read-only match refuses an extra unregistered command. The scan
+  captures repository and global round-row revisions, the round-receipt
+  revision and the lifecycle revision; changed links, stale completions and
+  malformed persisted cursors refuse. Each step shares one 8 MiB link budget
+  and persists partial-page progress only through its last checked source;
+  a smaller caller budget never persists a source blocker. Real two-submission,
+  unregistered-command, post-scan round mutation, byte-limit and restart
+  regressions pass. Independent Sol re-review found no remaining medium or
+  high issue. This remains an observation: historical unregistered submissions
+  need explicit classification or blocking in the full import decision, and
+  settlement, prior state, reset, death, counter, session and hold evidence
+  remain open. The cursor does not yet preserve the prior completed membership
+  through rescans, so it cannot authorize historical-source immutability.
+  The first full gate found the two new modules missing from the architecture
+  manifest; that contract was corrected. A later app run exhausted the
+  temporary test-output quota; after cleaning this run's disposable pytest
+  directories, the complete rerun passed: 3,302 domain, 3,613 adapter and
+  2,876 app tests, hooks, governor, four import contracts and both Pyrefly
+  checks. Ten strict xfails remained expected. Log:
+  `/tmp/phase4-registration-membership-gate.log` (ephemeral).
+
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the
 checkpoint. It must verify the full retired stream using the identical round
