@@ -120,6 +120,7 @@ _VALUES = (
     receipt_archive.CompletedReviewRoundReceiptArchiveAudit,
     receipt_archive.BlockedReviewRoundReceiptArchiveScan,
     receipt_archive.BlockedReviewRoundReceiptArchiveSweep,
+    receipt_archive.ReviewRoundReceiptArchiveCursor,
     checkpoint_chain.ReviewCheckpointChainCursor,
     checkpoint_chain.ObservedReviewCheckpointChainSource,
     checkpoint_chain.ObservedReviewCheckpointChainPage,

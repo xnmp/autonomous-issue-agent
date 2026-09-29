@@ -57,7 +57,9 @@ def observe_review_execution_archive_evidence(
     _, rounds, round_rows_version = _round_state(
         db, key.repository, _round_key(key, epoch, episode),
     )
-    _, receipts = _receipt_state(db, key.repository, _receipt_key(key, epoch, episode))
+    _, receipts, receipt_versions = _receipt_state(
+        db, key.repository, _receipt_key(key, epoch, episode),
+    )
     _, generations = _generation_state(
         db, key.repository, _generation_key(key, epoch, episode),
     )
@@ -66,8 +68,12 @@ def observe_review_execution_archive_evidence(
             or not isinstance(receipts, CompletedReviewRoundReceiptArchiveAudit)
             or not isinstance(generations, CompletedReviewGenerationArchiveAudit)):
         raise WorkflowAuthorityError("execution archive awaits complete source and census passes")
-    if round_rows_version != read_review_archive_source_versions(db, key.repository).round_rows:
+    current_versions = read_review_archive_source_versions(db, key.repository)
+    if round_rows_version != current_versions.round_rows:
         raise WorkflowAuthorityError("execution archive round-row census is stale")
+    if receipt_versions != (current_versions.round_rows, current_versions.all_round_rows,
+                            current_versions.round_receipts):
+        raise WorkflowAuthorityError("execution archive receipt census is stale")
     origin, _ = _read_execution_origin(db, scope, execution)
     _, origin_digest = _read_recording_source(
         db, REVIEW_EXECUTION_ORIGIN_NAMESPACE, key.repository,

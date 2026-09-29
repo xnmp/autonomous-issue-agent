@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 28))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 29))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -119,6 +119,12 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     # This constructs test fixtures, not a production downgrade: migrations
     # which rewrite rows need their historical inputs seeded by the caller.
     removals = {
+        28: (
+            "DROP TRIGGER review_all_round_source_insert",
+            "DROP TRIGGER review_all_round_source_update",
+            "DROP TRIGGER review_all_round_source_delete",
+            "DELETE FROM review_archive_source_versions WHERE source='all_round_rows' AND scope=X''",
+        ),
         27: (
             "DROP TRIGGER review_workflow_round_source_insert",
             "DROP TRIGGER review_round_source_no_replace_insert",
@@ -2955,7 +2961,7 @@ def test_v25_interrupted_nonempty_backfill_restarts_without_partial_authority(tm
     SQLiteControlStore(store.path, now=lambda: NOW).initialize()
     with sqlite3.connect(store.path) as db:
         assert db.execute("SELECT COUNT(*) FROM workflow_components").fetchone()[0] == 2
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 27
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 28
 
 
 def test_a_v24_binary_refuses_v25_without_rewriting_authority(tmp_path, monkeypatch):

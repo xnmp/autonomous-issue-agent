@@ -14,6 +14,7 @@ from issue_agent.adapters.review_execution_archive_audit import (
 from issue_agent.adapters.review_execution_archive_evidence import (
     observe_review_execution_archive_evidence,
 )
+from issue_agent.adapters.review_archive_source_versions import read_review_archive_source_versions
 from issue_agent.adapters.review_checkpoint_application_source import (
     REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, read_review_checkpoint_application_source,
 )
@@ -172,6 +173,73 @@ def test_archive_join_rejects_unversioned_round_completion(active):
             (encode_workflow(completed),),
         )
         with pytest.raises(WorkflowAuthorityError, match="round-row census is stale"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_receipt_mutation_after_completed_pass(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        changed = db.execute(
+            "UPDATE dedupe_keys SET payload_json=payload_json "
+            "WHERE namespace='review-round-preflight' AND scope=?",
+            (key.repository,),
+        )
+        assert changed.rowcount > 0
+        with pytest.raises(WorkflowAuthorityError, match="receipt census is stale"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_foreign_round_mutation_after_receipt_pass(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        before = read_review_archive_source_versions(db, key.repository)
+        db.execute(
+            "INSERT INTO workflows(repository,target_kind,target_number,generation,version,episode_json) "
+            "SELECT 'other/repo',target_kind,target_number,generation,version,episode_json "
+            "FROM workflows WHERE repository=? AND target_kind='pr'",
+            (key.repository,),
+        )
+        db.execute(
+            "INSERT INTO review_execution_rounds(round_id,repository,target_kind,target_number,"
+            "execution_epoch,execution_episode,generation,sequence,claim_occurrence_id,"
+            "plan_json,planning_json) "
+            "SELECT 'foreign-round','other/repo',target_kind,target_number,execution_epoch,"
+            "execution_episode,generation,sequence,claim_occurrence_id,plan_json,planning_json "
+            "FROM review_execution_rounds WHERE repository=? ORDER BY sequence LIMIT 1",
+            (key.repository,),
+        )
+        after = read_review_archive_source_versions(db, key.repository)
+        assert after.round_rows == before.round_rows
+        assert after.round_receipts == before.round_receipts
+        assert after.all_round_rows == before.all_round_rows + 1
+        with pytest.raises(WorkflowAuthorityError, match="receipt census is stale"):
+            observe_review_execution_archive_evidence(db, key, now=now)
+
+
+def test_archive_join_rejects_receipt_pass_after_round_rescan(active):
+    store, key, _, _ = _two_valid_checkpoints(active)
+    now = store.now()
+    _complete(store, key, now)
+    with store.transaction() as db:
+        changed = db.execute(
+            "UPDATE review_execution_rounds SET planning_json=planning_json "
+            "WHERE repository=?",
+            (key.repository,),
+        )
+        assert changed.rowcount > 0
+    for _ in range(64):
+        with store.transaction() as db:
+            round_state = advance_review_round_archive_audit(db, key, now=now)
+        if isinstance(round_state, CompletedReviewRoundArchiveScan):
+            break
+    else:
+        raise AssertionError("round census did not complete its fresh pass")
+    with store.transaction() as db:
+        with pytest.raises(WorkflowAuthorityError, match="receipt census is stale"):
             observe_review_execution_archive_evidence(db, key, now=now)
 
 

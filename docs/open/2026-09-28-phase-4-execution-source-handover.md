@@ -894,6 +894,23 @@ the complete audit benchmark.
   The receipt census still has no captured row/receipt mutation revisions;
   checkpoint, generation, origin and workflow sources also remain outside a
   complete lifetime freshness proof. No admission authority changed.
+- Checkpoint 119 binds each durable receipt census page to the repository
+  round-row and global retained-receipt revisions. Migration 28 adds a global
+  round-row revision because owner reconciliation reads round rows in foreign
+  repositories during the global receipt sweep. A changed revision restarts
+  the expected-member scan and retains its prior membership baseline; the
+  read-only four-audit join rejects a stale completed receipt pass. Legacy
+  unversioned cursors are re-censused while prior blocked states remain
+  blocked. Regressions cover changed or missing receipts, a round finalized
+  during the sweep, foreign round-row mutation, legacy cursor migration,
+  malformed revisions, migration from v27 and witness overflow/missing state.
+  Independent Sol review found no remaining medium or high issue. Full
+  `make test` passed: 3,302 domain, 3,474 adapter and 2,876 app tests, hooks,
+  governor, four import contracts and both Pyrefly checks. Log:
+  `/tmp/review-receipt-archive-versioned-gate.log` (ephemeral). The four
+  paused services remained inactive. Checkpoint, generation, origin and
+  workflow sources still need lifetime freshness; writer and admission
+  authority remain open.
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

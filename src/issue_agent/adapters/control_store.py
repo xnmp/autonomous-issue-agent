@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 27
+SCHEMA_VERSION = 28
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1732,6 +1732,40 @@ BEGIN
     );
     UPDATE review_archive_source_versions SET version=version+1
     WHERE source='round_receipts' AND scope=X'';
+END;
+"""),
+    SchemaMigration(28, """
+INSERT INTO review_archive_source_versions(source,scope,version)
+VALUES ('all_round_rows',X'',0);
+CREATE TRIGGER review_all_round_source_insert AFTER INSERT ON review_execution_rounds
+BEGIN
+    SELECT RAISE(ABORT,'global round source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='all_round_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='all_round_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_all_round_source_update AFTER UPDATE ON review_execution_rounds
+BEGIN
+    SELECT RAISE(ABORT,'global round source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='all_round_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='all_round_rows' AND scope=X'';
+END;
+CREATE TRIGGER review_all_round_source_delete AFTER DELETE ON review_execution_rounds
+BEGIN
+    SELECT RAISE(ABORT,'global round source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='all_round_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='all_round_rows' AND scope=X'';
 END;
 """),
 )

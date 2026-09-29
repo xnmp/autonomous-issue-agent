@@ -296,6 +296,26 @@ RoundReceiptArchiveState = (
 )
 
 
+@dataclass(frozen=True)
+class ReviewRoundReceiptArchiveCursor:
+    state: RoundReceiptArchiveState
+    round_rows_version: int
+    all_round_rows_version: int
+    round_receipts_version: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.state, (
+            ReviewRoundReceiptArchiveScan, CompletedReviewRoundReceiptArchiveScan,
+            ReviewRoundReceiptArchiveSweep, CompletedReviewRoundReceiptArchiveAudit,
+            BlockedReviewRoundReceiptArchiveScan, BlockedReviewRoundReceiptArchiveSweep,
+        )) or any(
+            type(version) is not int or not 0 <= version < MAX_SQL_ROWID
+            for version in (self.round_rows_version, self.all_round_rows_version,
+                            self.round_receipts_version)
+        ):
+            raise ValueError("round receipt cursor requires bounded source revisions")
+
+
 def begin_review_round_receipt_archive_scan(
     origin: ReviewExecutionBinding, origin_receipt: ReviewExecutionOrigin,
     origin_source_sha256: str, through_sequence: int,

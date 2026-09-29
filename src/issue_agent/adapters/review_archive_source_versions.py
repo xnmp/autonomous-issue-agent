@@ -16,12 +16,15 @@ MAX_ARCHIVE_SOURCE_VERSION = 9223372036854775806
 class ReviewArchiveSourceVersions:
     repository: str
     round_rows: int
+    all_round_rows: int
     round_receipts: int
 
     def __post_init__(self) -> None:
         if (canonical_workflow_repository(self.repository) != self.repository
                 or type(self.round_rows) is not int
                 or not 0 <= self.round_rows <= MAX_ARCHIVE_SOURCE_VERSION
+                or type(self.all_round_rows) is not int
+                or not 0 <= self.all_round_rows <= MAX_ARCHIVE_SOURCE_VERSION
                 or type(self.round_receipts) is not int
                 or not 0 <= self.round_receipts <= MAX_ARCHIVE_SOURCE_VERSION):
             raise ValueError("archive source versions require canonical bounded witnesses")
@@ -47,7 +50,7 @@ def _read_version(db: sqlite3.Connection, source: str, scope: bytes) -> int | No
 def read_review_archive_source_versions(
     db: sqlite3.Connection, repository: str,
 ) -> ReviewArchiveSourceVersions:
-    """Read both mutation witnesses in one explicit SQL snapshot.
+    """Read all mutation witnesses in one explicit SQL snapshot.
 
     Equality across paged steps can show a stable source set once the audit
     cursors capture these values. This reader alone grants no authority.
@@ -56,7 +59,10 @@ def read_review_archive_source_versions(
             or canonical_workflow_repository(repository) != repository):
         raise ValueError("archive source versions require a transaction and canonical repository")
     round_rows = _read_version(db, "round_rows", repository.encode())
+    all_round_rows = _read_version(db, "all_round_rows", b"")
     round_receipts = _read_version(db, "round_receipts", b"")
+    if all_round_rows is None:
+        raise WorkflowAuthorityError("global round row mutation witness is absent")
     if round_receipts is None:
         raise WorkflowAuthorityError("round receipt mutation witness is absent")
     if round_rows is None:
@@ -72,4 +78,4 @@ def read_review_archive_source_versions(
         if existing is not None or workflow is not None:
             raise WorkflowAuthorityError("round row mutation witness is absent")
         round_rows = 0
-    return ReviewArchiveSourceVersions(repository, round_rows, round_receipts)
+    return ReviewArchiveSourceVersions(repository, round_rows, all_round_rows, round_receipts)

@@ -54,23 +54,23 @@ def test_review_archive_mutation_witnesses_follow_round_rows_and_receipts(active
     store, snapshot = active
     with store.transaction() as db:
         before = read_review_archive_source_versions(db, "o/r")
-        assert (before.round_rows, before.round_receipts) == (0, 0)
+        assert (before.round_rows, before.all_round_rows, before.round_receipts) == (0, 0, 0)
         round_id = _insert_round(db, snapshot, 1)
         inserted = read_review_archive_source_versions(db, "o/r")
-        assert (inserted.round_rows, inserted.round_receipts) == (1, 0)
+        assert (inserted.round_rows, inserted.all_round_rows, inserted.round_receipts) == (1, 1, 0)
         db.execute(
             "UPDATE review_execution_rounds SET planning_json=planning_json WHERE round_id=?",
             (round_id,),
         )
         updated = read_review_archive_source_versions(db, "o/r")
-        assert (updated.round_rows, updated.round_receipts) == (2, 0)
+        assert (updated.round_rows, updated.all_round_rows, updated.round_receipts) == (2, 2, 0)
         _insert_receipt(db, "review-round-stage", "stage:1")
         with_receipt = read_review_archive_source_versions(db, "o/r")
-        assert (with_receipt.round_rows, with_receipt.round_receipts) == (2, 1)
+        assert (with_receipt.round_rows, with_receipt.all_round_rows, with_receipt.round_receipts) == (2, 2, 1)
         db.execute("DELETE FROM review_execution_rounds WHERE round_id=?", (round_id,))
         db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-stage' AND key='stage:1'")
         deleted = read_review_archive_source_versions(db, "o/r")
-        assert (deleted.round_rows, deleted.round_receipts) == (3, 2)
+        assert (deleted.round_rows, deleted.all_round_rows, deleted.round_receipts) == (3, 3, 2)
 
 
 def test_review_receipt_witness_covers_every_selected_namespace_and_rekeys(active):
@@ -133,6 +133,29 @@ def test_review_archive_witness_rekey_advances_both_repository_scopes(active):
         )
         assert read_review_archive_source_versions(db, "o/r").round_rows == before_a.round_rows + 1
         assert read_review_archive_source_versions(db, "other/repo").round_rows == before_b.round_rows + 1
+        assert read_review_archive_source_versions(db, "o/r").all_round_rows == before_a.all_round_rows + 1
+        assert read_review_archive_source_versions(db, "other/repo").all_round_rows == before_b.all_round_rows + 1
+
+
+def test_global_round_witness_covers_foreign_rows_without_changing_local_version(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        _clone_workflow_repository(db, "other/repo")
+        before = read_review_archive_source_versions(db, "o/r")
+        round_id = _insert_round(db, snapshot, 1)
+        db.execute(
+            "UPDATE review_execution_rounds SET repository='other/repo' WHERE round_id=?",
+            (round_id,),
+        )
+        moved = read_review_archive_source_versions(db, "o/r")
+        db.execute(
+            "UPDATE review_execution_rounds SET planning_json=planning_json WHERE round_id=?",
+            (round_id,),
+        )
+        foreign_updated = read_review_archive_source_versions(db, "o/r")
+        assert foreign_updated.round_rows == moved.round_rows
+        assert foreign_updated.round_receipts == before.round_receipts
+        assert foreign_updated.all_round_rows == moved.all_round_rows + 1
 
 
 def test_review_archive_witness_rejects_implicit_round_replacement(active):
@@ -212,6 +235,24 @@ def test_review_archive_witness_survives_v26_migration_with_existing_rows(active
         assert read_review_archive_source_versions(db, "o/r").round_receipts == 1
 
 
+def test_global_round_witness_survives_v27_migration_with_existing_rows(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        round_id = _insert_round(db, snapshot, 1)
+    with closing(sqlite3.connect(store.path)) as db:
+        _historical_fixture(db, 27)
+        db.commit()
+    store.initialize()
+    with store.transaction() as db:
+        baseline = read_review_archive_source_versions(db, "o/r")
+        assert baseline.all_round_rows == 0
+        db.execute(
+            "UPDATE review_execution_rounds SET planning_json=planning_json WHERE round_id=?",
+            (round_id,),
+        )
+        assert read_review_archive_source_versions(db, "o/r").all_round_rows == 1
+
+
 def test_review_archive_witness_blocks_overflow_and_missing_state(active):
     store, snapshot = active
     with store.transaction() as db:
@@ -245,6 +286,29 @@ def test_review_archive_witness_blocks_overflow_and_missing_state(active):
             read_review_archive_source_versions(db, "o/r")
         with pytest.raises(sqlite3.IntegrityError, match="round receipt source witness"):
             _insert_receipt(db, "review-round-stage", "stage:1")
+
+
+def test_global_round_witness_blocks_missing_state_and_overflow(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        round_id = _insert_round(db, snapshot, 1)
+        db.execute(
+            "UPDATE review_archive_source_versions SET version=? "
+            "WHERE source='all_round_rows' AND scope=X''",
+            (MAX_ARCHIVE_SOURCE_VERSION,),
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(
+                "UPDATE review_execution_rounds SET planning_json=planning_json WHERE round_id=?",
+                (round_id,),
+            )
+        db.execute(
+            "DELETE FROM review_archive_source_versions WHERE source='all_round_rows' AND scope=X''",
+        )
+        with pytest.raises(WorkflowAuthorityError, match="global round row mutation witness"):
+            read_review_archive_source_versions(db, "o/r")
+        with pytest.raises(sqlite3.IntegrityError, match="global round source witness"):
+            db.execute("DELETE FROM review_execution_rounds WHERE round_id=?", (round_id,))
 
 
 def test_review_archive_witness_requires_transaction(active):
