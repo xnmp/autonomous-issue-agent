@@ -15,6 +15,14 @@ fetch. Repeated reads of the same retained field, the canonical load and origin
 read are still outside that bound, and the budget is not a peak-memory guarantee.
 It neither surveys unclaimed archive rows nor certifies
 every retired receipt payload, so it cannot authorize a checkpoint write.
+On SQLite 3.43+, canonical active-round loads now point-check the indexed
+suffix with metadata byte lengths and stop before an overbudget payload fetch.
+SQLite documents this optimization for
+[`octet_length(column)`](https://www.sqlite.org/lang_corefunc.html#octet_length).
+The older SQLite fallback uses a length expression that may materialize one
+oversized row; a strict writer/admission bound must establish a platform floor
+or another bounded read before cutover. Receipt and origin reads remain separate
+from this active-round budget.
 Production import and renewal writers, the checkpoint writer, bounded
 compacted hot reads and the complete audit remain pending. A durable offline
 cursor now scans expected generation sources and the retained receipt

@@ -25,6 +25,7 @@ from ..domain.review_execution import (
     matches_accepted_review_transition_source, replay_review_execution_generations,
     review_generation_chain_digest, same_execution_episode,
 )
+from ..domain.review_execution_activation import MAX_LEGACY_SQL_TEXT_BYTES
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned,
     ReviewSealedParentAbandoned,
@@ -75,6 +76,7 @@ REVIEW_CEILING_PRODUCTIVITY_NAMESPACE = "review-round-ceiling-productivity"
 REVIEW_EXECUTION_ORIGIN_NAMESPACE = "review-execution-origin"
 REVIEW_EXECUTION_CHECKPOINT_NAMESPACE = "review-execution-checkpoint"
 RECORDED_REVIEW_NAMESPACE = "review-recorded-submission"
+MAX_EXECUTION_HOT_ROUND_SOURCE_BYTES = 2**27
 
 
 def review_submission_receipt_prefix(round_id: str) -> str:
@@ -852,6 +854,59 @@ def _check_imported_execution_origin(
         raise WorkflowAuthorityError("review execution origin lost its activation or import source")
 
 
+def _check_active_round_source_budget(
+    db: sqlite3.Connection, episode_scope: tuple[str, int, int, str],
+    through_sequence: int, expected_count: int,
+    *, max_source_bytes: int = MAX_EXECUTION_HOT_ROUND_SOURCE_BYTES,
+) -> None:
+    """Refuse an oversized active suffix before fetching its SQL payload fields."""
+    if (type(max_source_bytes) is not int
+            or not 1 <= max_source_bytes <= MAX_EXECUTION_HOT_ROUND_SOURCE_BYTES):
+        raise ValueError("active round source budget must be positive and bounded")
+    if (type(expected_count) is not int or not 0 <= expected_count <= MAX_EXECUTION_SUFFIX):
+        raise ValueError("active round source count must fit the suffix bound")
+    if expected_count == 0:
+        return
+    columns = ("round_id", "claim_occurrence_id", "plan_json", "planning_json",
+               "closure_json", "outcome_json")
+    # SQLite 3.43+ derives octet_length(column) from record metadata. Older
+    # runtimes keep the prior weaker read behavior until a platform floor exists.
+    sizes = [
+        (f"ifnull(octet_length({column}),0)" if sqlite3.sqlite_version_info >= (3, 43, 0)
+         else f"ifnull(length(CAST({column} AS BLOB)),0)")
+        for column in columns
+    ]
+    metadata_sql = (
+        "SELECT sequence,typeof(sequence) AS sequence_type,"
+        "typeof(generation) AS generation_type,"
+        + ",".join(f"typeof({column}) AS type_{column}" for column in columns)
+        + f",max({sizes[2]},{sizes[3]},{sizes[4]},{sizes[5]}) AS largest_json,"
+        + f"max({sizes[0]},{sizes[1]}) AS largest_identity,"
+        + f"{'+'.join(sizes)} AS total_bytes "
+        "FROM review_execution_rounds INDEXED BY review_execution_rounds_episode "
+        "WHERE repository=? AND target_number=? AND execution_epoch=? "
+        "AND execution_episode=? AND sequence=?"
+    )
+    source_bytes = 0
+    for sequence in range(through_sequence + 1, through_sequence + expected_count + 1):
+        row = db.execute(metadata_sql, (*episode_scope, sequence)).fetchone()
+        if row is None:
+            raise WorkflowAuthorityError("review execution round index has a suffix gap")
+        size = row["total_bytes"]
+        if (row["sequence_type"] != "integer" or row["sequence"] != sequence
+                or row["generation_type"] != "integer"
+                or any(row[f"type_{column}"] != "text" for column in columns[:4])
+                or any(row[f"type_{column}"] not in {"text", "null"} for column in columns[4:])
+                or type(size) is not int or size < 0
+                or type(row["largest_json"]) is not int
+                or row["largest_json"] > MAX_WORKFLOW_PAYLOAD_BYTES
+                or type(row["largest_identity"]) is not int
+                or row["largest_identity"] > MAX_LEGACY_SQL_TEXT_BYTES
+                or source_bytes + size > max_source_bytes):
+            raise WorkflowAuthorityError("review execution round index exceeds its source byte bound")
+        source_bytes += size
+
+
 def _check_execution_projection(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
     revision: WorkflowRevision,
@@ -863,15 +918,26 @@ def _check_execution_projection(
         _check_initialized_execution_origin(db, scope, execution, origin, claimed)
     episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
     latest = db.execute(
-        "SELECT sequence FROM review_execution_rounds WHERE repository=? AND target_number=? "
-        "AND execution_epoch=? AND execution_episode=? ORDER BY sequence DESC LIMIT 1",
+        "SELECT rowid AS source_rowid,typeof(sequence) AS sequence_type "
+        "FROM review_execution_rounds INDEXED BY review_execution_rounds_episode "
+        "WHERE repository=? AND target_number=? AND execution_epoch=? "
+        "AND execution_episode=? ORDER BY sequence DESC LIMIT 1",
         episode_scope,
     ).fetchone()
-    if (latest["sequence"] if latest is not None else 0) != execution.last_sequence:
+    if latest is not None and latest["sequence_type"] != "integer":
+        raise WorkflowAuthorityError("review execution round high water has a noninteger sequence")
+    latest_sequence = db.execute(
+        "SELECT sequence FROM review_execution_rounds WHERE rowid=?",
+        (latest["source_rowid"],),
+    ).fetchone() if latest is not None else None
+    if (latest_sequence["sequence"] if latest_sequence is not None else 0) != execution.last_sequence:
         raise WorkflowAuthorityError("review execution round high water disagrees with allocated sequence")
     suffix_count = execution.last_sequence - execution.checkpoint.through_sequence
     if suffix_count > MAX_EXECUTION_SUFFIX:
         raise WorkflowAuthorityError("review execution suffix exceeds its bounded projection")
+    _check_active_round_source_budget(
+        db, episode_scope, execution.checkpoint.through_sequence, suffix_count,
+    )
     for boundary in execution.boundaries:
         receipt = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation' "

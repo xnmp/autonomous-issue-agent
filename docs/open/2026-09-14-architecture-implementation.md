@@ -74,7 +74,10 @@ receipt-member and generation census cursors with one current execution,
 including the origin source, checkpoint tip, frontiers and due times. The
 round-row and generation audits can bootstrap from the bounded indexed
 execution after compaction, while the canonical loader still refuses
-compacted authority. This observation does not establish a single atomic
+compacted authority. On SQLite 3.43+, the canonical active-round suffix now
+checks each indexed row's metadata byte length against a cumulative budget
+before fetching its payload; older SQLite keeps the weaker prior read path.
+The archive observation does not establish a single atomic
 snapshot across the completed passes or authorize admission.
 A barrier-held source scope now joins
 configured-root files and complete open-PR counter linkage before a future

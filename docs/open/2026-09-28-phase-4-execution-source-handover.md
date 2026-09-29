@@ -796,6 +796,19 @@ the complete audit benchmark.
   3,302 domain, 3,411 adapter and 2,876 app tests, four import contracts and
   both Pyrefly checks. Log: `/tmp/checkpoint-source-budget-full-gate.log`
   (ephemeral).
+- Checkpoint 112 adds a cumulative retained-field budget to canonical active
+  round suffix reads. It checks expected sequences one indexed row at a time,
+  validates field types and sizes from metadata, and refuses overbudget fields
+  before the payload query on SQLite 3.43+ via `octet_length(column)`. The
+  high-water read now checks `typeof(sequence)` before fetching its value, so
+  a malformed large BLOB sequence cannot bypass the preflight. Older SQLite
+  keeps the prior weaker length expression for compatibility. This is not yet
+  a strict total hot-read bound: origin, receipts, repeated reads and old
+  SQLite still need an explicit cutover rule. Independent Sol review found
+  and verified fixes for all observed medium issues. Full `make test` passed:
+  3,302 domain, 3,416 adapter and 2,876 app tests, four import contracts and
+  both Pyrefly checks. Log: `/tmp/active-suffix-budget-full-gate.log`
+  (ephemeral).
 
 The next seam is durable checkpoint authority. The writer must mint the
 compact application receipt from its transaction-local proposal with the

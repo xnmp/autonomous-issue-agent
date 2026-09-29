@@ -26,7 +26,8 @@ from issue_agent.adapters.control_store import _command_payload_digest, _json
 from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
 from issue_agent.adapters.workflow_rows import (
     REVIEW_STAGE_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
-    WorkflowAuthorityError, encode_workflow_episodes, load_review_workflow_row,
+    WorkflowAuthorityError, _check_active_round_source_budget,
+    encode_workflow_episodes, load_review_workflow_row,
     review_execution_checkpoint_receipt_id, review_stage_receipt_key, review_submission_receipt_key,
 )
 from issue_agent.domain.contracts import CommandKind, LifecycleCommand
@@ -831,6 +832,108 @@ def test_indexed_round_high_water_does_not_hide_a_missing_suffix_middle(active):
         with pytest.raises(WorkflowAuthorityError, match="round index"):
             load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before
+
+
+def test_active_round_source_budget_blocks_before_payload_fetch(active):
+    store, snapshot = active
+    with store.transaction() as db:
+        for sequence in (1, 2):
+            facts, _ = round_facts(snapshot, sequence)
+            insert_round(db, facts)
+        scope = (snapshot.revision.fence.key.repository,
+                 snapshot.revision.fence.key.target.number,
+                 snapshot.execution.binding.execution_epoch,
+                 snapshot.execution.binding.execution_episode)
+        bytes_per_row = [row[0] for row in db.execute(
+            "SELECT length(CAST(round_id AS BLOB)) + length(CAST(claim_occurrence_id AS BLOB)) + "
+            "length(CAST(plan_json AS BLOB)) + length(CAST(planning_json AS BLOB)) + "
+            "ifnull(length(CAST(closure_json AS BLOB)),0) + "
+            "ifnull(length(CAST(outcome_json AS BLOB)),0) "
+            "FROM review_execution_rounds ORDER BY sequence",
+        )]
+        total = sum(bytes_per_row)
+        statements = []
+        db.set_trace_callback(statements.append)
+        try:
+            with pytest.raises(WorkflowAuthorityError, match="source byte bound"):
+                _check_active_round_source_budget(
+                    db, scope, 0, 2, max_source_bytes=total - 1,
+                )
+            _check_active_round_source_budget(
+                db, scope, 0, 2, max_source_bytes=total,
+            )
+        finally:
+            db.set_trace_callback(None)
+        assert not any(
+            "SELECT round_id,generation,sequence,claim_occurrence_id,plan_json" in statement
+            for statement in statements
+        )
+        observed_second = []
+        def tracked_length(value):
+            if value is None:
+                return None
+            raw = value if isinstance(value, bytes) else str(value).encode()
+            if b"round:2" in raw:
+                observed_second.append(True)
+            return len(raw)
+        db.create_function("octet_length", 1, tracked_length)
+        with pytest.raises(WorkflowAuthorityError, match="source byte bound"):
+            _check_active_round_source_budget(db, scope, 0, 2, max_source_bytes=1)
+        assert not observed_second
+
+
+def test_active_round_source_budget_keeps_older_sqlite_compatible(active, monkeypatch):
+    store, snapshot = active
+    key = snapshot.revision.fence.key
+    scope = (key.repository, key.target.number,
+             snapshot.execution.binding.execution_epoch,
+             snapshot.execution.binding.execution_episode)
+    monkeypatch.setattr(sqlite3, "sqlite_version_info", (3, 42, 0))
+    with store.transaction() as db:
+        facts, _ = round_facts(snapshot, 1)
+        insert_round(db, facts)
+        _check_active_round_source_budget(db, scope, 0, 0)
+        _check_active_round_source_budget(db, scope, 0, 1)
+
+
+@pytest.mark.parametrize("damage", ("oversized_plan", "blob_generation", "blob_sequence"))
+def test_canonical_execution_load_refuses_oversized_active_round_before_payload_fetch(active, damage):
+    store, snapshot = active
+    facts, _ = round_facts(snapshot, 1)
+    with store.transaction() as db:
+        insert_round(db, facts)
+        allocated = replace(snapshot, execution=replace(snapshot.execution, last_sequence=1))
+        db.execute(
+            "UPDATE workflows SET episode_json=? WHERE target_kind='pr'",
+            (encode_workflow_episodes(allocated),),
+        )
+        if damage == "oversized_plan":
+            db.execute(
+                "UPDATE review_execution_rounds SET plan_json=? WHERE round_id=?",
+                ("x" * (MAX_WORKFLOW_PAYLOAD_BYTES + 1), facts.plan.round.round_id),
+            )
+        elif damage == "blob_generation":
+            db.execute(
+                "UPDATE review_execution_rounds SET generation=zeroblob(?) WHERE round_id=?",
+                (2**20, facts.plan.round.round_id),
+            )
+        else:
+            db.execute(
+                "UPDATE review_execution_rounds SET sequence=zeroblob(?) WHERE round_id=?",
+                (2**20, facts.plan.round.round_id),
+            )
+        statements = []
+        db.set_trace_callback(statements.append)
+        try:
+            reason = "noninteger sequence" if damage == "blob_sequence" else "source byte bound"
+            with pytest.raises(WorkflowAuthorityError, match=reason):
+                load_review_workflow_row(db, snapshot.revision.fence.key)
+        finally:
+            db.set_trace_callback(None)
+        assert not any(
+            "SELECT round_id,generation,sequence,claim_occurrence_id,plan_json" in statement
+            for statement in statements
+        )
 
 
 @pytest.mark.parametrize("corruption", ["missing", "blob_alias", "oversized_plan", "foreign_episode"])
