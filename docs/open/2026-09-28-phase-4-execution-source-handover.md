@@ -627,6 +627,13 @@ the complete audit benchmark.
   source pass and ancestry proof; this comparison alone grants no authority.
   The full gate passed: 3,296 domain, 3,348 adapter and 2,876 app tests,
   four import contracts and both Pyrefly checks.
+- Checkpoint 98 adds a real-source contract regression for the existing
+  generation archive scan: its completed ordered stream digest equals the
+  same initial checkpoint proposal's generation-stream digest. Both stream
+  encodings now have direct checkpoint comparisons. This is test evidence,
+  not a persisted checkpoint-chain join or authority to compact. The full
+  gate passed: 3,296 domain, 3,349 adapter and 2,876 app tests, four import
+  contracts and both Pyrefly checks.
 
 The next seam is the transactional checkpoint writer: it must verify the full
 retired stream, use this identical round receipt-set definition, bind the
@@ -635,7 +642,7 @@ The paged audit must reconstruct all retired member payloads and unclaimed
 receipts and supply the admission gate. Keep the canonical compaction refusal
 until both are complete.
 
-With checkpoints 88–97, the bounded round and receipt cursors can reconcile
+With checkpoints 88–98, the bounded round and receipt cursors can reconcile
 the finalized prefix against the complete retained receipt namespace. Valid
 open-round receipts remain pending. Next, bind the retired member stream to
 checkpoint ancestry. The census does not prove missing open receipts,

@@ -6,6 +6,7 @@ import pytest
 
 import issue_agent.adapters.review_execution_archive_audit as archive_audit
 import issue_agent.adapters.review_execution_activation as review_activation
+from issue_agent.adapters.review_execution_compaction import observe_review_checkpoint_manifest
 from issue_agent.adapters.review_execution_archive_audit import advance_review_generation_archive_audit
 from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
@@ -106,6 +107,17 @@ def test_generation_archive_scan_finds_changed_source_on_next_pass(rig):
     assert "accepted transition" in blocked.reason
     assert review_generation_archive_scan_overdue(blocked, complete.next_due_at)
     assert _stored_state(store) == blocked
+
+
+def test_generation_audit_stream_matches_initial_checkpoint_proposal(rig):
+    store = _accepted_generation(rig)
+    key = rig[1].revision.fence.key
+    now = store.now()
+    with store.transaction() as db:
+        scanned = advance_review_generation_archive_audit(db, key, now=now)
+        manifest = observe_review_checkpoint_manifest(db, key, 1)
+    assert isinstance(scanned, CompletedReviewGenerationArchiveScan)
+    assert scanned.rolling_sha256 == manifest.receipt.generation_stream_sha256
 
 
 def test_generation_receipt_namespace_sweep_resumes_from_durable_cursor(rig, monkeypatch):
