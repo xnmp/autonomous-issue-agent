@@ -497,6 +497,29 @@ class ReviewRoundFacts:
 
 
 @dataclass(frozen=True)
+class CurrentReviewOutcomeReceipt:
+    """Exact writer input and immutable result, including its concurrency precondition."""
+
+    facts: ReviewRoundFacts
+    outcome: ReviewRoundOutcome
+    expected: WorkflowRevision
+    owner_id: str
+
+    def __post_init__(self) -> None:
+        identifier(self.owner_id, "current outcome owner")
+        if (not isinstance(self.facts, ReviewRoundFacts)
+                or not isinstance(self.outcome, ReviewRoundOutcome)
+                or not isinstance(self.expected, WorkflowRevision)
+                or self.outcome.round != self.facts.plan.round
+                or self.expected.fence.key != self.outcome.round.binding.rejection.fence.key
+                or self.expected.fence.generation < self.outcome.round.binding.rejection.fence.generation):
+            raise ValueError("current outcome receipt requires its exact facts, result and captured revision")
+        result = finalize_review_round(self.facts)
+        if not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)) or result.outcome != self.outcome:
+            raise ValueError("current outcome receipt disagrees with its classified terminal evidence")
+
+
+@dataclass(frozen=True)
 class StaleReviewProductivitySettlement:
     """The writer's generation witness captured atomically with a stale round."""
 

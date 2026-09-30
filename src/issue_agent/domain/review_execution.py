@@ -1232,9 +1232,6 @@ class ActivatedReviewExecution:
         return self.state.binding
 
 
-ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution
-
-
 @dataclass(frozen=True)
 class CurrentReviewExecution:
     """Generation-local authority under ADR 0016; retained work lives outside it.
@@ -1281,6 +1278,9 @@ class CurrentReviewExecution:
     @property
     def binding(self) -> ReviewExecutionBinding:
         return self.state.binding
+
+
+ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution | CurrentReviewExecution
 
 
 @dataclass(frozen=True)

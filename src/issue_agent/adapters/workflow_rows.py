@@ -24,6 +24,8 @@ from ..domain.review_execution import (
     ReviewExecutionOriginKind, ReviewRoundOutcome,
     matches_accepted_review_transition_source, replay_review_execution_generations,
     review_generation_chain_digest, same_execution_episode,
+    CurrentReviewExecution, OpenReviewExecutionRound, CompletedReviewExecutionRound,
+    PendingReviewExecutionRound, review_generation_receipt_id,
 )
 from ..domain.review_execution_activation import MAX_LEGACY_SQL_TEXT_BYTES
 from ..domain.review_rounds import (
@@ -33,6 +35,7 @@ from ..domain.review_rounds import (
     ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     ReviewSubmissionConfirmed, ReviewSubmissionRegistration,
     StaleReviewProductivitySettlement, finalize_review_round,
+    CurrentReviewOutcomeReceipt,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.review_workflow_policy import (
@@ -558,7 +561,7 @@ def _unique_text_identity_rowid(
 
 
 def _read_execution_origin(
-    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution | CurrentReviewExecution,
 ) -> tuple[ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt, datetime]:
     origin_id = execution.origin.evidence_id
     origin_rowid = _unique_text_identity_rowid(
@@ -599,14 +602,17 @@ def _read_execution_origin(
             raise ValueError("origin receipt is not canonical")
     except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
         raise WorkflowAuthorityError("review execution origin receipt is unreadable") from exc
+    checkpoint = execution.baseline if isinstance(execution, CurrentReviewExecution) else execution.checkpoint
     origin_binding = captured.checkpoint.state.binding
+    initial_checkpoint = checkpoint.through_sequence == 0 and (
+        checkpoint.state.binding == origin_binding if isinstance(execution, CurrentReviewExecution)
+        else checkpoint.boundary_cursor is None
+    )
     if (captured.origin != execution.origin
             or not same_execution_episode(origin_binding, execution.binding)
             or origin_binding.execution_epoch != execution.binding.execution_epoch
-            or captured.checkpoint.policy != execution.checkpoint.policy
-            or (execution.checkpoint.through_sequence == 0
-                and execution.checkpoint.boundary_cursor is None
-                and execution.checkpoint != captured.checkpoint)):
+            or captured.checkpoint.policy != checkpoint.policy
+            or initial_checkpoint and checkpoint != captured.checkpoint):
         raise WorkflowAuthorityError("review execution origin disagrees with its component")
     return captured, claimed
 
@@ -717,7 +723,7 @@ def _check_execution_checkpoint_receipt(
 
 
 def _check_initialized_execution_origin(
-    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution | CurrentReviewExecution,
     captured: InitializedReviewExecutionOriginReceipt, claimed: datetime,
 ) -> None:
     key = WorkflowKey(scope[0], PullRequestRef(scope[2]))
@@ -809,7 +815,7 @@ def _check_initialized_execution_origin(
 
 
 def _check_imported_execution_origin(
-    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution | CurrentReviewExecution,
     captured: ImportedReviewExecutionOriginReceipt, claimed: datetime,
 ) -> None:
     family = WorkflowFamily.REVIEW_EXECUTION.value
@@ -1354,7 +1360,250 @@ def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Review
     return _load_review_workflow_row(db, key)
 
 
-def _load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
+def load_current_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
+    """Construction seam for ADR 0016; published admission switches only at S4."""
+    from .sql_read_budget import SqlReadBudgetExceeded, bounded_sql_source_reads
+
+    try:
+        with bounded_sql_source_reads(db, MAX_EXECUTION_HOT_ROUND_SOURCE_BYTES):
+            return _load_review_workflow_row(db, key, current_state=True)
+    except SqlReadBudgetExceeded as exc:
+        raise WorkflowAuthorityError(str(exc)) from exc
+
+
+def read_current_review_pending(
+    db: sqlite3.Connection, execution: CurrentReviewExecution,
+) -> tuple[PendingReviewExecutionRound, ...]:
+    """Select one generation's unresolved range, including results behind an open gap."""
+    if not isinstance(execution, CurrentReviewExecution):
+        raise WorkflowAuthorityError("pending read requires current execution authority")
+    binding = execution.binding
+    key = binding.rejection.fence.key
+    episode = (key.repository, key.target.number, binding.execution_epoch, binding.execution_episode)
+    count = execution.last_sequence - execution.baseline.through_sequence
+    _check_active_round_source_budget(db, episode, execution.baseline.through_sequence, count)
+    rows = db.execute(
+        "SELECT round_id,generation,sequence,plan_json,closure_json,outcome_json "
+        "FROM review_execution_rounds INDEXED BY review_execution_rounds_generation_pending "
+        "WHERE repository=? AND target_number=? AND execution_epoch=? AND execution_episode=? "
+        "AND generation=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
+        (*episode, binding.rejection.fence.generation, execution.baseline.through_sequence,
+         execution.last_sequence, MAX_EXECUTION_SUFFIX + 1),
+    ).fetchall()
+    if len(rows) != count:
+        raise WorkflowAuthorityError("current review execution pending range is incomplete")
+    pending: list[PendingReviewExecutionRound] = []
+    for sequence, row in enumerate(rows, execution.baseline.through_sequence + 1):
+        plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
+        if (plan.round.binding != binding or plan.round.sequence != sequence
+                or row["sequence"] != sequence or row["round_id"] != plan.round.round_id):
+            raise WorkflowAuthorityError("current pending round disagrees with its allocated identity")
+        if row["outcome_json"] is None:
+            if row["closure_json"] is not None:
+                raise WorkflowAuthorityError("current pending round has an incomplete closure")
+            receipt = db.execute(
+                "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                (REVIEW_OUTCOME_NAMESPACE, key.repository, plan.round.round_id),
+            ).fetchone()
+            if receipt is not None:
+                raise WorkflowAuthorityError("current open round has an orphaned outcome receipt")
+            pending.append(OpenReviewExecutionRound(plan.round))
+        else:
+            outcome = _read_current_round_outcome(db, episode, sequence)
+            if outcome.round != plan.round:
+                raise WorkflowAuthorityError("current pending outcome belongs to another round")
+            pending.append(CompletedReviewExecutionRound(outcome))
+    return tuple(pending)
+
+
+def read_review_outcome_receipt(
+    db: sqlite3.Connection, repository: str, round_id: str,
+) -> tuple | CurrentReviewOutcomeReceipt | None:
+    """One immutable indexed receipt contract for live references and exact retries."""
+    metadata = db.execute(
+        "SELECT reusable_after,typeof(payload_json) AS payload_type,"
+        "length(CAST(payload_json AS BLOB)) AS payload_bytes,claimed_at "
+        "FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (REVIEW_OUTCOME_NAMESPACE, repository, round_id),
+    ).fetchone()
+    if metadata is None:
+        return None
+    if (metadata["reusable_after"] is not None or metadata["payload_type"] != "text"
+            or type(metadata["payload_bytes"]) is not int
+            or not 0 < metadata["payload_bytes"] <= MAX_WORKFLOW_PAYLOAD_BYTES
+            or not isinstance(metadata["claimed_at"], str) or len(metadata["claimed_at"]) > 64):
+        raise WorkflowAuthorityError("review outcome receipt is not bounded immutable evidence")
+    try:
+        claimed = datetime.fromisoformat(metadata["claimed_at"].replace("Z", "+00:00"))
+        if claimed.tzinfo is None or claimed.utcoffset() is None:
+            raise ValueError("outcome receipt time requires an offset")
+    except ValueError as exc:
+        raise WorkflowAuthorityError("review outcome receipt has a malformed claim time") from exc
+    row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+        (REVIEW_OUTCOME_NAMESPACE, repository, round_id),
+    ).fetchone()
+    return decode_workflow(row["payload_json"], tuple | CurrentReviewOutcomeReceipt)
+
+
+def _read_current_round_outcome(
+    db: sqlite3.Connection, episode: tuple[str, int, int, str], sequence: int,
+) -> ReviewRoundOutcome:
+    row = db.execute(
+        "SELECT round_id,closure_json,outcome_json FROM review_execution_rounds "
+        "WHERE repository=? AND target_number=? AND execution_epoch=? AND execution_episode=? "
+        "AND sequence=? AND length(CAST(closure_json AS BLOB))<=? "
+        "AND length(CAST(outcome_json AS BLOB))<=?",
+        (*episode, sequence, MAX_WORKFLOW_PAYLOAD_BYTES, MAX_WORKFLOW_PAYLOAD_BYTES),
+    ).fetchone()
+    if row is None or row["closure_json"] is None or row["outcome_json"] is None:
+        raise WorkflowAuthorityError("current execution reference lacks its finalized round")
+    captured_receipt = read_review_outcome_receipt(db, episode[0], row["round_id"])
+    if captured_receipt is None:
+        raise WorkflowAuthorityError("current execution reference lacks its exact outcome receipt")
+    facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
+    outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+    matching_receipt = (
+        captured_receipt.facts == facts and captured_receipt.outcome == outcome
+        if isinstance(captured_receipt, CurrentReviewOutcomeReceipt)
+        else captured_receipt == (facts, outcome)
+    )
+    final = finalize_review_round(facts)
+    if (not isinstance(final, (FinalizedReviewRound, DeferredReviewPreparation))
+            or final.outcome != outcome or outcome.round.round_id != row["round_id"]
+            or outcome.round.sequence != sequence
+            or outcome.round.binding.rejection.fence.key.repository != episode[0]
+            or outcome.round.binding.rejection.fence.key.target.number != episode[1]
+            or outcome.round.binding.execution_epoch != episode[2]
+            or outcome.round.binding.execution_episode != episode[3]
+            or not matching_receipt):
+        raise WorkflowAuthorityError("current execution outcome disagrees with its retained receipt")
+    from .review_execution_claims import load_review_preflight_record
+    from .review_round_sources import read_review_round_sources
+    from .control_store import ControlStoreError
+
+    preflight = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-preflight' "
+        "AND scope=? AND key=? AND reusable_after IS NULL "
+        "AND length(CAST(payload_json AS BLOB))<=?",
+        (episode[0], row["round_id"], MAX_WORKFLOW_PAYLOAD_BYTES),
+    ).fetchone()
+    if preflight is None:
+        raise WorkflowAuthorityError("current outcome reference lacks its live preflight receipt")
+    captured = decode_workflow(preflight["payload_json"], tuple)
+    if len(captured) != 3 or not isinstance(captured[1], str):
+        raise WorkflowAuthorityError("current outcome preflight owner is malformed")
+    stored = load_review_preflight_record(db, episode[0], captured[1], row["round_id"])
+    if stored is None:
+        raise WorkflowAuthorityError("current outcome reference lost its allocated round")
+    selection, _, plan, source = stored
+    planning = decode_workflow(source["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned)
+    revision_row = db.execute(
+        "SELECT generation,version FROM workflows WHERE repository=? AND target_kind='pr' AND target_number=?",
+        episode[:2],
+    ).fetchone()
+    if revision_row is None:
+        raise WorkflowAuthorityError("current outcome reference lost its workflow")
+    revision = WorkflowRevision(WorkflowFence(plan.round.binding.rejection.fence.key, revision_row["generation"]),
+                                revision_row["version"])
+    if isinstance(captured_receipt, CurrentReviewOutcomeReceipt) and (
+        captured_receipt.expected.fence.generation > revision.fence.generation
+        or captured_receipt.expected.fence == revision.fence and captured_receipt.expected.version >= revision.version
+    ):
+        raise WorkflowAuthorityError("current outcome receipt contains a future concurrency precondition")
+    try:
+        actual = read_review_round_sources(db, episode[0], captured[1], selection, plan, planning, revision)
+    except ControlStoreError as exc:
+        raise WorkflowAuthorityError("current outcome reference lost its actual accounting or effect evidence") from exc
+    if actual != facts:
+        raise WorkflowAuthorityError("current outcome reference lost its actual accounting or effect evidence")
+    return outcome
+
+
+def _check_current_execution(
+    db: sqlite3.Connection, scope: tuple[str, str, int], execution: CurrentReviewExecution,
+    revision: WorkflowRevision,
+) -> None:
+    """Validate active identities and live references, never replay retired history."""
+    from ..domain.review_execution import (
+        ClearReviewSession, NoReviewSession, ReplaceReviewSession, SetDisplayedRound,
+    )
+
+    origin, claimed = _read_execution_origin(db, scope, execution)
+    if isinstance(origin, ImportedReviewExecutionOriginReceipt):
+        _check_imported_execution_origin(db, scope, execution, origin, claimed)
+    else:
+        _check_initialized_execution_origin(db, scope, execution, origin, claimed)
+    origin_generation = origin.checkpoint.state.binding.rejection.fence.generation
+    generation = execution.binding.rejection.fence.generation
+    if generation < origin_generation:
+        raise WorkflowAuthorityError("current execution precedes its origin generation")
+    if generation == origin_generation:
+        if execution.generation_start_sequence != 0:
+            raise WorkflowAuthorityError("initial current execution has an invented generation cutoff")
+    else:
+        receipt = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation' "
+            "AND scope=? AND key=? AND reusable_after IS NULL "
+            "AND length(CAST(payload_json AS BLOB))<=?",
+            (scope[0], review_generation_receipt_id(execution.binding, generation), MAX_WORKFLOW_PAYLOAD_BYTES),
+        ).fetchone()
+        if receipt is None:
+            raise WorkflowAuthorityError("current generation lacks its exact transition receipt")
+        boundary = decode_workflow(receipt["payload_json"], ReviewExecutionGenerationBoundary)
+        if (boundary.after.binding != execution.binding
+                or boundary.through_sequence != execution.generation_start_sequence
+                or boundary.to_revision.fence != revision.fence
+                or boundary.to_revision.version > revision.version):
+            raise WorkflowAuthorityError("current generation transition disagrees with its cutoff or binding")
+    episode = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
+    latest = db.execute(
+        "SELECT sequence,typeof(sequence) AS sequence_type FROM review_execution_rounds "
+        "WHERE repository=? AND target_number=? AND execution_epoch=? AND execution_episode=? "
+        "ORDER BY sequence DESC LIMIT 1", episode,
+    ).fetchone()
+    if (latest is not None and latest["sequence_type"] != "integer"
+            or (latest["sequence"] if latest is not None else 0) != execution.last_sequence):
+        raise WorkflowAuthorityError("current execution allocation disagrees with its indexed high water")
+    read_current_review_pending(db, execution)
+    references = {
+        sequence: _read_current_round_outcome(db, episode, sequence)
+        for state in (execution.baseline.state, execution.state)
+        for sequence in {state.session_sequence, state.display_sequence, state.productive_sequence}
+        if sequence > 0 and sequence != execution.generation_start_sequence
+    }
+    if any(not same_execution_episode(execution.binding, outcome.round.binding)
+           or outcome.round.binding.rejection.fence.generation > generation
+           for outcome in references.values()):
+        raise WorkflowAuthorityError("current execution live reference belongs to a foreign or future binding")
+    for state in (execution.baseline.state, execution.state):
+        if state.session_sequence <= execution.generation_start_sequence:
+            if generation == origin_generation:
+                if state.session != origin.checkpoint.state.session or state.session_sequence != 0:
+                    raise WorkflowAuthorityError("current imported session disagrees with its verified origin")
+            elif (not isinstance(state.session, NoReviewSession)
+                  or state.session_sequence != execution.generation_start_sequence):
+                raise WorkflowAuthorityError("current carried session disagrees with its generation transition")
+        if state.session_sequence > execution.generation_start_sequence:
+            outcome = references[state.session_sequence]
+            update = outcome.session
+            if (outcome.round.binding != execution.binding
+                    or not (isinstance(update, ReplaceReviewSession) and update.session == state.session
+                            or isinstance(update, ClearReviewSession) and isinstance(state.session, NoReviewSession))):
+                raise WorkflowAuthorityError("current session lacks its exact productive source")
+        if state.display_sequence > 0:
+            outcome = references.get(state.display_sequence) or _read_current_round_outcome(db, episode, state.display_sequence)
+            if not isinstance(outcome.display, SetDisplayedRound) or outcome.display.number != state.displayed_round:
+                raise WorkflowAuthorityError("current displayed round lacks its exact outcome source")
+        if state.productive_sequence > 0:
+            outcome = references.get(state.productive_sequence) or _read_current_round_outcome(db, episode, state.productive_sequence)
+            if not isinstance(outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+                raise WorkflowAuthorityError("current productive watermark lacks its exact outcome source")
+
+
+def _load_review_workflow_row(
+    db: sqlite3.Connection, key: WorkflowKey, *, current_state: bool = False,
+) -> ReviewWorkflowSnapshot | None:
     """Review-rejection authority for a PR; an issue key is never read as review."""
     activation, row = _row_or_absence(db, key, WorkflowFamily.REVIEW_REJECTIONS)
     if row is None:
@@ -1373,7 +1622,7 @@ def _load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Revie
             raise WorkflowEncodingError("workflow activation epoch does not match its episode")
         _require_component_index(db, scope, authority, episode.episode_id)
         execution_authority = load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository)
-        if isinstance(execution, ActivatedReviewExecution):
+        if isinstance(execution, (ActivatedReviewExecution, CurrentReviewExecution)):
             if execution_authority is None or execution.binding.execution_epoch != execution_authority.epoch:
                 raise WorkflowEncodingError("execution activation epoch disagrees with its component")
             _require_component_index(
@@ -1402,7 +1651,14 @@ def _load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Revie
             WorkflowRevision(WorkflowFence(key, row["generation"]), row["version"]),
             authority, episode, gates, intent, execution,
         )
-        if isinstance(execution, ActivatedReviewExecution):
+        if current_state:
+            if isinstance(execution, ActivatedReviewExecution):
+                raise WorkflowAuthorityError("legacy review execution is held pending stopped verified conversion")
+            if isinstance(execution, CurrentReviewExecution):
+                _check_current_execution(db, scope, execution, snapshot.revision)
+        elif isinstance(execution, CurrentReviewExecution):
+            raise WorkflowAuthorityError("current review execution construction requires the S4 cutover")
+        elif isinstance(execution, ActivatedReviewExecution):
             _check_execution_projection(db, scope, execution, snapshot.revision)
         return snapshot
     except (ValueError, TypeError, KeyError) as exc:
@@ -1482,7 +1738,7 @@ def _require_current(snapshot: _Snapshot | None, binding: WorkflowBinding, *, al
 def persist_workflow_snapshot(db: sqlite3.Connection, after: AnyWorkflowSnapshot) -> None:
     """Write an existing workflow row and its unresolved gate index."""
     scope = workflow_scope(after.revision.fence.key)
-    if isinstance(after, ReviewWorkflowSnapshot) and isinstance(after.execution, ActivatedReviewExecution):
+    if isinstance(after, ReviewWorkflowSnapshot) and isinstance(after.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
         _require_component_index(
             db, scope, FamilyAuthority(WorkflowFamily.REVIEW_EXECUTION, after.execution.binding.execution_epoch),
             after.execution.binding.execution_episode,

@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 32
+SCHEMA_VERSION = 33
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2188,6 +2188,10 @@ BEGIN
 END;
 """),
     SchemaMigration(32, _review_execution_lineage_migration()),
+    SchemaMigration(33, """
+CREATE INDEX review_execution_rounds_generation_pending
+ON review_execution_rounds(repository,target_number,execution_epoch,execution_episode,generation,sequence);
+"""),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -3030,6 +3034,22 @@ class SQLiteControlStore:
     def now(self) -> datetime:
         """This store's authority clock; executors stamp their reads with it."""
         return self._now()
+
+    @staticmethod
+    @contextmanager
+    def mutation_savepoint(db: sqlite3.Connection) -> Iterator[None]:
+        """A caught helper error cannot leave half a mutation in its caller's transaction."""
+        if not db.in_transaction:
+            raise ControlStoreError("workflow mutation requires an enclosing transaction")
+        name = "workflow_mutation_" + uuid.uuid4().hex
+        db.execute(f"SAVEPOINT {name}")
+        try:
+            yield
+            db.execute(f"RELEASE SAVEPOINT {name}")
+        except BaseException:
+            db.execute(f"ROLLBACK TO SAVEPOINT {name}")
+            db.execute(f"RELEASE SAVEPOINT {name}")
+            raise
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:

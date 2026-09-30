@@ -172,7 +172,7 @@ _VALUES = (
     rx.ReviewExecutionOrigin, rx.ImportedReviewExecutionOriginReceipt,
     rx.InitializedReviewExecutionOriginReceipt,
     rx.ImportedReviewExecutionDecision,
-    rx.ExecutionNotActivated, rx.ActivatedReviewExecution,
+    rx.ExecutionNotActivated, rx.ActivatedReviewExecution, rx.CurrentReviewExecution,
     rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,
     rr.ReviewChildPending, rr.ReviewChildRefused, rr.ReviewChildReleased,
     rr.ReviewChildSettledWithoutLaunch, rr.ReviewChildNotAdmitted,
@@ -185,6 +185,7 @@ _VALUES = (
     rr.ReviewPlanningComplete, rr.ReviewPlanningRefused, rr.ReviewPlanningSealed,
     rr.ReviewParentAbandoned, rr.ReviewSealedParentAbandoned,
     rr.ReviewRoundFacts, rr.ReviewRoundAwaitingEvidence,
+    rr.CurrentReviewOutcomeReceipt,
     rr.StaleReviewProductivitySettlement,
     rr.FinalizedReviewRound, rr.DeferredReviewPreparation,
     preflight.ReviewPreflightSelection,
@@ -206,6 +207,7 @@ if len(_TAGS) != len(_VALUES) + len(_ENUMS):
 _CURRENT_REVIEW_SNAPSHOT_TAG = "ReviewWorkflowSnapshotV2"
 _LEGACY_REVIEW_SNAPSHOT_FIELDS = frozenset({"revision", "authority", "episode", "gates", "intent"})
 _CURRENT_ACTIVATED_EXECUTION_TAG = "ActivatedReviewExecutionV2"
+_CURRENT_EXECUTION_AUTHORITY_TAG = "CurrentReviewExecutionV1"
 _LEGACY_ACTIVATED_EXECUTION_FIELDS = frozenset({
     "origin", "checkpoint", "state", "last_sequence", "checkpoint_receipt",
 })
@@ -244,6 +246,7 @@ def _encode(value: object, depth: int = 0) -> object:
         return {
             "type": (_CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
                      else _CURRENT_ACTIVATED_EXECUTION_TAG if type(value) is rx.ActivatedReviewExecution
+                     else _CURRENT_EXECUTION_AUTHORITY_TAG if type(value) is rx.CurrentReviewExecution
                      else _CURRENT_EXECUTION_CHECKPOINT_TAG if type(value) is rx.ReviewExecutionCheckpoint
                      else type(value).__name__),
             "fields": {
@@ -320,6 +323,8 @@ def _decode(value: object, depth: int = 0) -> object:
         tag = "ReviewWorkflowSnapshot"
     if tag == _CURRENT_ACTIVATED_EXECUTION_TAG:
         tag = "ActivatedReviewExecution"
+    if tag == _CURRENT_EXECUTION_AUTHORITY_TAG:
+        tag = "CurrentReviewExecution"
     if tag == _CURRENT_EXECUTION_CHECKPOINT_TAG:
         tag = "ReviewExecutionCheckpoint"
     constructor = _TAGS.get(tag)
