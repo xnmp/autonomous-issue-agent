@@ -6,7 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from issue_agent.adapters.store import Store
-from issue_agent.app.review_runtime import review_external_holds, unproductive_rounds_reader
+from issue_agent.app.review_runtime import current_review_failures, review_external_holds
+from issue_agent.app.review_activation import unproductive_rounds_reader
 from issue_agent.app.roles import _review_unproductive_rounds
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState
@@ -47,15 +48,30 @@ def test_an_unreadable_counter_or_a_missing_view_is_never_permission_to_clear():
 
 
 @pytest.mark.parametrize("key", ["issue", "pr", "recovered"])
-def test_the_rearm_hold_and_the_dispatch_decision_count_the_same_unproductive_rounds(tmp_path, key):
-    """A breaker tripped under the legacy issue key must hold a re-arm exactly as it holds dispatch."""
+def test_stopped_import_reader_preserves_legacy_attribution(tmp_path, key):
+    """Legacy key attribution remains an input to stopped import only."""
     store = Store(str(tmp_path))
     pr = view(closing_issue=5, head_ref_name="fix/5-thing")
     deaths = {-PR: 3} if key == "recovered" else {}
     for _ in range(3 if key != "recovered" else 0):
         store.bump_infra_deaths(5 if key == "issue" else -PR)
-    decided = _review_unproductive_rounds(store, SimpleNamespace(prs=[pr]), deaths, {})[PR]
     read = unproductive_rounds_reader(store, lambda: deaths)(pr)
-    assert decided == read == 3
+    assert read == 3
     holds = review_external_holds(unproductive_rounds_reader(store, lambda: deaths), 3)
     assert holds(observed(), pr) == ("unproductive review round ceiling",)
+
+
+from tests.adapters.test_review_execution_control import rig
+
+
+def test_rearm_and_dispatch_read_the_same_current_allowance(rig, tmp_path):
+    control, _, _, _, _ = rig
+    store = Store(str(tmp_path / "retired-files"))
+    for _ in range(20):
+        store.bump_infra_deaths(-9)
+    pr = PRView(9, head_ref_oid=HEAD)
+    errors = {}
+    counts = _review_unproductive_rounds(control, "o/r", SimpleNamespace(prs=[pr]), errors)
+    assert counts == {9: 3} and errors == {}
+    holds = review_external_holds(lambda pr: current_review_failures(control, "o/r", pr.number), 3)
+    assert holds(observed(), view()) == ("unproductive review round ceiling",)

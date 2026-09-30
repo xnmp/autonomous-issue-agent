@@ -303,7 +303,7 @@ def test_paid_gate_with_only_refused_or_released_siblings_still_charges_one_oute
 @pytest.mark.parametrize("handle,reuse,expected", [
     ("verified-handle", rounds.ReviewSessionReuse.REUSABLE, execution.ReplaceReviewSession),
     (None, rounds.ReviewSessionReuse.REUSABLE, execution.ClearReviewSession),
-    ("verified-handle", rounds.ReviewSessionReuse.FRESH, execution.ClearReviewSession),
+    ("verified-handle", rounds.ReviewSessionReuse.FRESH, execution.ReplaceReviewSession),
 ])
 def test_only_productive_normal_reviewer_updates_the_session(mode, handle, reuse, expected):
     command = submission()
@@ -317,6 +317,22 @@ def test_only_productive_normal_reviewer_updates_the_session(mode, handle, reuse
     assert isinstance(refused_outcome.session, execution.PreserveReviewSession)
     assert isinstance(refused_outcome.display, execution.PreserveDisplayedRound)
     assert project(refused_outcome).failures == 3
+
+
+@pytest.mark.parametrize("runtime,expected", [(RuntimeName.GLM, execution.ReplaceReviewSession),
+                                            (RuntimeName.CODEX, execution.ClearReviewSession)])
+def test_fresh_runtime_output_uses_captured_sandbox_capability(runtime, expected):
+    command = submission()
+    planned = replace(plan(submissions=(command,), reuse=rounds.ReviewSessionReuse.FRESH), runtime=runtime)
+    child = planned.children[0]
+    launched = launch(child)
+    envelope = review_returned_envelope(AgentResult(is_error=False, exit_reason=ExitReason.OK, session_id="new-runtime-session"))
+    result = rounds.classify_normal_review_return(launched, runtime, envelope)
+    reviewer = returned(child, result=result)
+    outcome = finalized(facts(planned, children=(reviewer,), submissions=(confirmed(command),)))
+    assert isinstance(outcome.session, expected)
+    if isinstance(outcome.session, execution.ReplaceReviewSession):
+        assert outcome.session.session.handle == "new-runtime-session" and outcome.session.session.runtime is runtime
 
 
 def test_failed_normal_reviewer_cannot_update_session_even_with_a_confirmed_submission():
@@ -466,11 +482,12 @@ def test_post_seal_parent_loss_retains_completed_decision_and_exact_absence_proo
     assert outcome.disposition == execution.ReviewRoundCancelled(
         execution.ReviewCancellationReason.UNPAID_ABANDONMENT, "complete-closure",
     )
-    with pytest.raises(ValueError, match="completed planning"):
-        rounds.ReviewSealedParentAbandoned(
-            "parent:dead", "late:fenced",
-            rounds.ReviewPlanningSealed("seal:refused", rounds.ReviewPlanningRefused("refused")),
-        )
+    stopped = rounds.ReviewPlanningSealed("seal:stopped", execution.ReviewPinDeferred("pin"))
+    abandoned_stop = rounds.ReviewSealedParentAbandoned("parent:dead", "late:fenced", stopped)
+    stopped_child = rounds.ReviewChildNotAdmitted(planned.children[0], abandoned_stop.abandonment_receipt)
+    stopped_outcome = finalized(facts(planned, children=(stopped_child,), planning=abandoned_stop))
+    assert isinstance(stopped_outcome.disposition, execution.ReviewPinDeferred)
+    assert abandoned_stop.completed_seal == stopped
     with pytest.raises(ValueError, match="exact abandoned parent"):
         facts(planned, children=(rounds.ReviewChildNotAdmitted(planned.children[0], "another-parent"),),
               planning=abandoned)

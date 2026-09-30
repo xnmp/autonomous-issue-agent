@@ -19,7 +19,7 @@ from .review_execution import (
     ReviewInfrastructureDeath, ReviewBudgetExhausted, ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
     ReviewExecutionBinding, ReviewRoundCancelled, ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome,
     ReviewUnlaunchedRound, SaturateReviewFailures, SetDisplayedRound,
-    same_execution_episode,
+    compatible_review_session, same_execution_episode,
 )
 from .review_rejection import validate_commit_sha
 from .review_return import ReviewReturnedEnvelope
@@ -211,7 +211,11 @@ class ReviewChildSettledWithoutLaunch:
 
 @dataclass(frozen=True)
 class ReviewChildNotAdmitted:
-    """Verified absence after the exact parent claim occurrence was fenced."""
+    """Verified absence after the exact parent occurrence's admission was fenced.
+
+    The wire field retains its legacy name; it also accepts an immutable
+    stopped planning seal that fences every future child admission.
+    """
 
     child: ReviewChildIdentity
     abandonment_receipt: str
@@ -452,9 +456,8 @@ class ReviewSealedParentAbandoned(ReviewParentAbandoned):
 
     def __post_init__(self) -> None:
         super().__post_init__()
-        if (not isinstance(self.completed_seal, ReviewPlanningSealed)
-                or not isinstance(self.completed_seal.conclusion, ReviewPlanningComplete)):
-            raise ValueError("post-seal abandonment requires completed planning proof")
+        if not isinstance(self.completed_seal, ReviewPlanningSealed):
+            raise ValueError("post-seal abandonment requires its original immutable planning proof")
 
 
 @dataclass(frozen=True)
@@ -487,8 +490,13 @@ class ReviewRoundFacts:
             raise ValueError("one run cannot establish multiple planned children")
         for child in self.children:
             if isinstance(child, ReviewChildNotAdmitted) and (
-                not isinstance(self.planning, ReviewParentAbandoned)
-                or child.abandonment_receipt != self.planning.abandonment_receipt
+                not (
+                    isinstance(self.planning, ReviewParentAbandoned)
+                    and child.abandonment_receipt == self.planning.abandonment_receipt
+                    or isinstance(self.planning, ReviewPlanningSealed)
+                    and not isinstance(self.planning.conclusion, ReviewPlanningComplete)
+                    and child.abandonment_receipt == self.planning.seal_receipt
+                )
             ):
                 raise ValueError("absence of admission requires this exact abandoned parent")
             if isinstance(child, ReviewChildReturned) and isinstance(child.result, ReviewChildSucceeded) and isinstance(child.result.session, ReusableReviewSession):
@@ -643,7 +651,9 @@ def finalize_review_round(
         return ReviewRoundAwaitingEvidence(waiting)
     returned = tuple(sorted((child for child in facts.children if isinstance(child, ReviewChildReturned)), key=lambda child: child.child.child_id))
     launched = tuple(child.launched for child in returned)
-    conclusion = facts.planning.conclusion if isinstance(facts.planning, ReviewPlanningSealed) else None
+    conclusion = (facts.planning.conclusion if isinstance(facts.planning, ReviewPlanningSealed)
+                  else facts.planning.completed_seal.conclusion
+                  if isinstance(facts.planning, ReviewSealedParentAbandoned) else None)
     if confirmed:
         submission = confirmed[0]
         assert isinstance(submission.result, ReviewSubmissionConfirmed)
@@ -660,7 +670,8 @@ def finalize_review_round(
         if reviewer is not None:
             assert isinstance(reviewer.result, ReviewChildSucceeded)
             session = (ReplaceReviewSession(reviewer.result.session)
-                       if plan.session_reuse is ReviewSessionReuse.REUSABLE and isinstance(reviewer.result.session, ReusableReviewSession)
+                       if isinstance(compatible_review_session(reviewer.result.session, plan.runtime,
+                                                               RUNTIME_CAPABILITIES[plan.runtime]), ReusableReviewSession)
                        else ClearReviewSession(reviewer.launched))
         return FinalizedReviewRound(ReviewRoundOutcome(
             plan.round, PaidReviewProgress(receipt, launched), session, SetDisplayedRound(plan.displayed_round),

@@ -24,7 +24,10 @@ from ..planners import tasks as task_builders
 from ..planners.schemas import review_schema_with_exemptions
 from ..planners.tasks import ReviewTaskConfig
 from ...adapters.github import format_pr_discussion
-from ...adapters.runtime_plan import AgentRuntime
+from ...adapters.runtime_plan import AgentRuntime, ContextualRuntime
+from ...domain.actions import AgentKind
+from ...domain.review_execution import NoReviewSession, ReusableReviewSession, ReviewSession, ReviewChildIdentity, ReviewChildKind, ReviewPinDeferred
+from ...domain.review_rounds import ReviewPlanningConclusion, ReviewPlanningRefused, ReviewRoundPlan
 from ...domain.agent_task import (
     RUNTIME_CAPABILITIES,
     RuntimeCapabilities,
@@ -51,20 +54,10 @@ from ...domain.workflow_identity import PullRequestRef, WorkflowBinding, Workflo
 from ...adapters.workflow_rows import WorkflowAuthorityError
 from .base import run_leg
 
-_EXTERNAL_REVIEW_SESSION = "github-review"
-_FRESH_REVIEW_SESSION = "codex-review"
-
 # A round that could not PIN its checkout never ran a paid leg — it must defer
 # (retry next poll) without feeding the unproductive-round counter, or five
 # free deferrals walk a healthy PR into needs-human-review (0d2e295 H3).
 _PIN_DEFERRED_STATUS = "review_checkout_deferred"
-
-# …but "free" cannot mean "unbounded and invisible" (adversarial F1): a
-# checkout that can NEVER be pinned (TARGET_DIR not a repo, dead origin) would
-# otherwise stall the PR forever with no escalation and no dashboard signal.
-# Past this consecutive-deferral streak, further deferrals count as
-# unproductive rounds again, restoring the escalation bound.
-_MAX_FREE_PIN_DEFERRALS = 5
 
 @dataclass(frozen=True)
 class _PatchShortcut:
@@ -97,6 +90,10 @@ class BoundReviewRound:
     head_sha: str
     baseline_head: str | None
     guidance: str
+    plan: ReviewRoundPlan
+    claim_target: int
+    kind: AgentKind
+    session: ReviewSession = NoReviewSession()
     observation: object = field(compare=False, repr=False, default=None)
 
 
@@ -108,6 +105,12 @@ class ReviewAuthority(Protocol):
         ...
 
     def patch_covered(self, round: BoundReviewRound, patch_id: str) -> bool: ...
+
+    def stage(self, round: BoundReviewRound, kind: ReviewChildKind, names: tuple[str, ...]) -> tuple[ReviewChildIdentity, ...]: ...
+
+    def finish(self, round: BoundReviewRound) -> None: ...
+
+    def stop(self, round: BoundReviewRound, conclusion: ReviewPlanningConclusion) -> None: ...
 
     def prior_rejections(self, round: BoundReviewRound, non_resetting: frozenset[str]) -> int: ...
 
@@ -179,9 +182,6 @@ class ReviewWorkflow:
     # Missing composition remains representable so dispatch can report a
     # migration-required refusal before performing reads or paid work.
     authority: ReviewAuthority | None = None
-    # Consecutive pin-deferral streak per PR (daemon lifetime; a restart
-    # resets it, and a permanently broken config re-earns it within minutes).
-    _pin_deferrals: dict[int, int] = field(default_factory=dict)
     _evidence_errors: dict[int, str] = field(default_factory=dict)
 
     def _claim_matches(self, pr, claim_target: int | None) -> bool:
@@ -220,49 +220,14 @@ class ReviewWorkflow:
                 )
         return False
 
-    def _no_progress(
-        self,
-        pr,
-        reason: str,
-    ) -> None:
-        """Record that a PAID review round advanced nothing (review P0R-3).
-
-        Every `return` in this class that skips a settled submission
-        leaves the workflow's review obligation outstanding, so the identical
-        dispatch is bought again on the next poll — under REVIEW_MODE=multi that
-        is a gate + 5 dimensions + N validators, re-run every poll on a RESULT
-        the workflow chose not to use. Nothing counted those rounds: the
-        dispatcher's `except BaseException` bump only fires when the leg RAISED
-        out of the workflow, and these paths all return normally.
-
-        Review convergence is PR-keyed, independently of issue-keyed claim and
-        spend attribution. A later closing-link change must not erase a paid
-        failed round from the reviewer's ceiling.
-        """
-        key = -pr.number
-        try:
-            n = self.store.bump_infra_deaths(key)
-        except Exception as exc:  # noqa: BLE001 — a counter must not mask the failure
-            self.cfg.log(f"review #{pr.number}: no-progress counter not persisted ({exc})")
-            return
-        self.cfg.log(
-            f"review #{pr.number}: round bought nothing ({reason}) — "
-            f"unproductive round {n}"
-        )
+    def _no_progress(self, pr, reason: str) -> None:
+        """Finalization classifies the outer outcome from durable child evidence."""
+        self.cfg.log(f"review #{pr.number}: round bought nothing ({reason})")
 
     def _pin_deferral(self, p, result) -> bool:
-        """True when `result` is a pin deferral — the caller must return
-        without submitting anything. Every deferral is journalled on the ADR
-        0008 pattern (same shape as `_claim_matches`' dispatch_deferred: a
-        persistent flap must be visible in the dashboard's per-issue event
-        view, not only the log), and only a bounded streak is exempt from the
-        unproductive-round counter — past `_MAX_FREE_PIN_DEFERRALS` the
-        escalation bound is restored so an unpinnable PR still reaches a
-        human."""
+        """Journal the harness stop; Current SQL owns its bounded deferral streak."""
         if not _pin_deferred(result):
             return False
-        n = self._pin_deferrals.get(p.number, 0) + 1
-        self._pin_deferrals[p.number] = n
         if self.cfg.journal is not None:
             try:
                 self.cfg.journal.emit(
@@ -271,8 +236,8 @@ class ReviewWorkflow:
                             "review_pin_deferred",
                             f"review #{p.number}: pinned checkout at "
                             f"{p.head_ref_oid[:12] or '?'} unavailable — "
-                            f"deferral {n} in a row",
-                            {"streak": n, "head": p.head_ref_oid},
+                            "durable round deferred",
+                            {"head": p.head_ref_oid},
                         ),
                         Correlation(pr=p.number),
                     )
@@ -281,20 +246,27 @@ class ReviewWorkflow:
                 self.cfg.log(
                     f"review #{p.number}: pin deferral not journalled ({exc})"
                 )
-        if n > _MAX_FREE_PIN_DEFERRALS:
-            self._no_progress(p, f"pin deferral streak {n}")
         return True
 
-    async def _run_logged(self, label: str, pr: int, task, head_sha: str = ""):
+    async def _run_logged(self, label: str, pr: int, task, head_sha: str = "", *,
+                          bound: BoundReviewRound, child: ReviewChildIdentity):
         task = self._prepare_task(task, pr, head_sha)
         if isinstance(task, AgentResult):
+            assert self.authority is not None
+            self.authority.stop(bound, ReviewPinDeferred("harness-pin:" + bound.plan.round.round_id))
             return task
         if task is None:
+            assert self.authority is not None
+            self.authority.stop(bound, ReviewPlanningRefused("harness-preparation:" + bound.plan.round.round_id))
             return AgentResult(
                 is_error=True,
                 status="containment_unavailable",
                 summary="Codex review needs an explicit TARGET_DIR for its governor hook",
             )
+        if isinstance(self.runner, ContextualRuntime):
+            self.runner.set_context("review", bound.kind.name, pr,
+                                    bound.claim_target if bound.claim_target > 0 else None,
+                                    claim_target=bound.claim_target, workflow=bound.binding, review_child=child)
         if self.log_run is not None:
             return await self.log_run(label, pr, task)
         return await run_leg(
@@ -378,11 +350,18 @@ class ReviewWorkflow:
         bound = self._begin_bound(p, binding)
         if bound is None:
             return
+        assert self.authority is not None
+        try:
+            await self._review_selected(pr, p, bound, claim_target)
+        finally:
+            self.authority.finish(bound)
+
+    async def _review_selected(self, pr: int, p, bound: BoundReviewRound, claim_target: int | None) -> None:
         non_resetting_approvals = frozenset()
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
             await self._review_multi(
                 pr,
-                round_number=1,
+                round_number=bound.plan.displayed_round,
                 p=p,
                 claim_target=claim_target,
                 non_resetting_approval_commits=non_resetting_approvals,
@@ -394,6 +373,8 @@ class ReviewWorkflow:
         diff = self._revision_bound_diff(p)
         if diff is None:
             self._no_progress(p, "revision-bound diff unavailable")
+            assert self.authority is not None
+            self.authority.stop(bound, ReviewPlanningRefused("harness-diff:" + bound.plan.round.round_id))
             return
         signature = review_dom.patch_signature(diff)
         guidance = bound.guidance
@@ -426,7 +407,9 @@ class ReviewWorkflow:
         notice, declared_exemptions = exemption_request
         if notice:
             task = self._with_exemption_notice(task, notice, declared_exemptions)
-        result = await self._run_logged("review", pr, task, p.head_ref_oid)
+        assert self.authority is not None
+        child = self.authority.stage(bound, ReviewChildKind.REVIEWER, ("review",))[0]
+        result = await self._run_logged("review", pr, task, p.head_ref_oid, bound=bound, child=child)
         if self._pin_deferral(p, result):
             return
         if result.is_error:
@@ -450,7 +433,7 @@ class ReviewWorkflow:
             p, signature, result, declared_exemptions
         )
         if not self._submit_review(
-            p, result, 1, prior,
+            p, result, bound.plan.displayed_round, prior,
             patch_id=signature,
             body_suffix=grant_suffix,
             declared_exemptions=declared_exemptions,
@@ -459,16 +442,7 @@ class ReviewWorkflow:
         ):
             self._no_progress(p, "review POST failed")
             return
-        self.store.save_pr_session(
-            pr,
-            (
-                _FRESH_REVIEW_SESSION
-                if not self.cfg.reviewer_capabilities.resume_preserves_sandbox
-                else result.session_id
-            ),
-        )
-        self.store.set_round(pr, 1)
-        self._progress(p, claim_target)
+        self._cleanup_checkout(p.number)
 
     async def re_review(
         self, pr: int, *, claim_target: int | None = None,
@@ -486,10 +460,19 @@ class ReviewWorkflow:
         bound = self._begin_bound(p, binding)
         if bound is None:
             return
+        assert self.authority is not None
+        try:
+            await self._re_review_selected(pr, p, bound, claim_target)
+        finally:
+            self.authority.finish(bound)
+
+    async def _re_review_selected(self, pr: int, p, bound: BoundReviewRound, claim_target: int | None) -> None:
         non_resetting_approvals = frozenset()
         diff = self._revision_bound_diff(p)
         if diff is None:
             self._no_progress(p, "revision-bound diff unavailable")
+            assert self.authority is not None
+            self.authority.stop(bound, ReviewPlanningRefused("harness-diff:" + bound.plan.round.round_id))
             return
         signature = review_dom.patch_signature(diff)
         patch_shortcut = self._bound_patch_unchanged(p, diff, signature, bound, claim_target)
@@ -498,7 +481,7 @@ class ReviewWorkflow:
         non_resetting_approvals |= (
             patch_shortcut.non_resetting_approval_commits
         )
-        round_number = self.store.get_round(pr) + 1
+        round_number = bound.plan.displayed_round
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
             await self._review_multi(
                 pr,
@@ -533,8 +516,7 @@ class ReviewWorkflow:
                 discussion=discussion,
             )
         else:
-            session_id = self.store.get_pr_session(pr)
-            if session_id in (_EXTERNAL_REVIEW_SESSION, _FRESH_REVIEW_SESSION):
+            if not isinstance(bound.session, ReusableReviewSession):
                 prior = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
                 task = task_builders.build_fresh_re_review_task(
                     pr,
@@ -556,7 +538,7 @@ class ReviewWorkflow:
                     last_sha,
                     p.head_ref_oid,
                     as_untrusted(diff),
-                    session_id, self.cfg.review,
+                    bound.session.handle, self.cfg.review,
                     operator_guidance=guidance,
                     discussion=discussion,
                 )
@@ -568,7 +550,9 @@ class ReviewWorkflow:
         notice, declared_exemptions = exemption_request
         if notice:
             task = self._with_exemption_notice(task, notice, declared_exemptions)
-        result = await self._run_logged("re-review", pr, task, p.head_ref_oid)
+        assert self.authority is not None
+        child = self.authority.stage(bound, ReviewChildKind.REVIEWER, ("review",))[0]
+        result = await self._run_logged("re-review", pr, task, p.head_ref_oid, bound=bound, child=child)
         if self._pin_deferral(p, result):
             return
         if result.is_error:
@@ -600,17 +584,7 @@ class ReviewWorkflow:
         ):
             self._no_progress(p, "review POST failed")
             return
-        if result.session_id:
-            self.store.save_pr_session(
-                pr,
-                (
-                    _FRESH_REVIEW_SESSION
-                    if not self.cfg.reviewer_capabilities.resume_preserves_sandbox
-                    else result.session_id
-                ),
-            )
-        self.store.set_round(pr, round_number)
-        self._progress(p, claim_target)
+        self._cleanup_checkout(p.number)
 
     def _require_authority(self, binding: WorkflowBinding | None, pr: int) -> None:
         if not isinstance(binding, WorkflowBinding) or self.authority is None:
@@ -656,6 +630,7 @@ class ReviewWorkflow:
         # Bounded and visible: the authority backs the read off and, at its
         # ceiling, opens an EvidenceUnavailable hold (never an approval).
         self.authority.record_evidence(bound, f"{reason}: {error}" if error else reason)
+        self.authority.stop(bound, ReviewPlanningRefused("harness-evidence:" + bound.plan.round.round_id))
         self.cfg.log(f"review #{p.number}: {reason} — scheduled evidence read recorded")
 
     def _evidence_available(self, bound: BoundReviewRound) -> None:
@@ -744,7 +719,7 @@ class ReviewWorkflow:
             "patch is unchanged against the reviewed baseline — copied the "
             "verdict as a bound submission, no review agent run"
         )
-        self._progress(p, claim_target)
+        self._cleanup_checkout(p.number)
         return _PatchShortcut(settled=True)
 
     def _approval_grants_complete(self, p, diff: str) -> bool | None:
@@ -1037,8 +1012,7 @@ class ReviewWorkflow:
 
         The multi-agent path is stateless per round (no session resume) — every
         round re-derives findings from the CURRENT diff, so a re-review naturally
-        re-checks the whole PR rather than only the incremental change. It stores
-        a sentinel session id for subsequent rounds; SQLite owns the reviewed
+        re-checks the whole PR rather than only the incremental change. SQLite owns the reviewed
         baseline and decides when another review is owed.
 
         `p`/`diff` are accepted pre-fetched so `re_review`'s rebase short-circuit
@@ -1050,6 +1024,8 @@ class ReviewWorkflow:
             diff = self._revision_bound_diff(p)
             if diff is None:
                 self._no_progress(p, "revision-bound diff unavailable")
+                assert self.authority is not None
+                self.authority.stop(bound, ReviewPlanningRefused("harness-diff:" + bound.plan.round.round_id))
                 return
         signature = review_dom.patch_signature(diff)
         rcfg = self.cfg.review
@@ -1079,7 +1055,9 @@ class ReviewWorkflow:
         # No PR conversation here on purpose: its only failure direction ends
         # the review in an APPROVE, and a comment is the wrong evidence for
         # "is this diff behavioural?" (see build_review_gate_task).
-        gate = await self._run_logged("review-gate", pr, head_sha=p.head_ref_oid, task=
+        assert self.authority is not None
+        gate_child = self.authority.stage(bound, ReviewChildKind.GATE, ("gate",))[0]
+        gate = await self._run_logged("review-gate", pr, head_sha=p.head_ref_oid, bound=bound, child=gate_child, task=
             task_builders.build_review_gate_task(
                 pr,
                 as_untrusted(p.title),
@@ -1095,7 +1073,7 @@ class ReviewWorkflow:
             # transport failure — leave state untouched, retry next poll (but
             # COUNT the round: the retry is not free, and an is_error gate that
             # keeps repeating is the cheapest shape of the P0R-3 loop).
-            self._no_progress(p, "gate leg errored")
+            self._no_progress(p, f"gate leg errored: {gate.summary}")
             return
         # Fail SAFE: a degenerate gate result (is_error=False but empty envelope)
         # must default to reviewable=True — the conservative choice is to RUN the
@@ -1117,8 +1095,7 @@ class ReviewWorkflow:
                 f"→ {sub.event}"
             )
             if self._post(sub, bound, signature, counted_past):
-                self._persist_review_state(pr, round_number)
-                self._progress(p, claim_target)
+                self._cleanup_checkout(p.number)
             else:
                 self._no_progress(p, f"gate {sub.event} POST failed")
             return
@@ -1128,8 +1105,9 @@ class ReviewWorkflow:
         # not have run) — tracked so synthesis never emits a silent APPROVE on a
         # partial result; it retries next poll instead.
         dims = task_builders.REVIEW_DIMENSIONS
+        dim_children = self.authority.stage(bound, ReviewChildKind.DIMENSION, tuple(key for key, _ in dims))
         dim_results = await self._gather_legs([
-            self._run_logged(f"review:{key}", pr, head_sha=p.head_ref_oid, task=
+            self._run_logged(f"review:{key}", pr, head_sha=p.head_ref_oid, bound=bound, child=child, task=
                 task_builders.build_review_dimension_task(
                     pr,
                     key,
@@ -1142,7 +1120,7 @@ class ReviewWorkflow:
                     discussion=discussion,
                 )
             )
-            for key, focus in dims
+            for (key, focus), child in zip(dims, dim_children)
         ])
         lost = next((r for r in dim_results if _pin_deferred(r)), None)
         if lost is not None:
@@ -1175,8 +1153,10 @@ class ReviewWorkflow:
         # dropped into an APPROVE), while confirmed stays False so it isn't reported
         # as a fact either — the PR is simply retried next poll.
         if candidates:
+            validators = self.authority.stage(bound, ReviewChildKind.VALIDATOR,
+                                              tuple(f"{finding.dimension}:{index}" for index, finding in enumerate(candidates)))
             verdicts = await self._gather_legs([
-                self._run_logged(f"validate:{f.dimension}", pr, head_sha=p.head_ref_oid, task=
+                self._run_logged(f"validate:{f.dimension}", pr, head_sha=p.head_ref_oid, bound=bound, child=child, task=
                     task_builders.build_review_validation_task(
                         pr,
                         f.dimension,
@@ -1186,7 +1166,7 @@ class ReviewWorkflow:
                         rcfg,
                     )
                 )
-                for f in candidates
+                for f, child in zip(candidates, validators)
             ])
             lost = next((v for v in verdicts if _pin_deferred(v)), None)
             if lost is not None:
@@ -1224,68 +1204,25 @@ class ReviewWorkflow:
         if sub is None:
             self.cfg.log(f"review #{pr}: incomplete and no blocking finding — "
                          "submitting nothing, will retry next poll")
-            # The expensive shape: gate + every dimension + every validator were
-            # PAID FOR and the whole fan-out re-runs next poll on a returned
-            # result, never touching the dispatcher's raise-path counter.
+            # One finalization accounts for all actually launched siblings,
+            # including returned failures when no verdict can be synthesized.
             self._no_progress(p, "incomplete fan-out, no verdict to submit")
             return
         if not self._post(sub, bound, signature, counted_past):
             self._no_progress(p, "review POST failed")
             return  # failed POST → leave state untouched (retried next poll)
-        self._persist_review_state(pr, round_number)
-        self._progress(p, claim_target)
+        self._cleanup_checkout(p.number)
 
-    def _progress(self, p, claim_target: int | None = None) -> None:
-        """A round DID advance: clear the no-progress tally (the reviewer's twin
-        of review P1R-3's decay).
-
-        Without this the ceiling is a LIFETIME tally: a long-lived PR that
-        accumulates five flaky rounds over weeks of otherwise healthy reviewing
-        escalates on its next needed review, having never actually looped. The
-        counter's question is "is this PR stuck in a non-converging round?", and
-        a confirmed submit answers no — so success resets it, exactly as the fix
-        role's legs do. Keyed off the PRView so it matches `_no_progress`'s
-        `breaker_key(pr)` write with no extra gh call.
-
-        BOTH halves of the key space are cleared, because `roles._review_unproductive_rounds`
-        READS their union (review P1R-1): the dispatcher records a raise-path
-        death under `-pr` whenever its `issue_for_pr` lookup failed, and the
-        transient that fails that lookup is the same transient that kills the
-        session. Clearing only the resolved key would strand that death forever
-        — it reads as real on every later poll and walks a healthy PR toward
-        needs-human-review. Decay must clear exactly the set the read unions."""
-        # Clear the stable key plus the current issue key used by deployments
-        # predating the PR-keyed policy. New failures are written only to -PR.
-        legacy = (
-            claim_target
-            if claim_target is not None
-            else breaker_key(p)
-        )
-        for key in {-p.number, legacy}:
-            try:
-                self.store.clear_infra_deaths(key)
-            except Exception as exc:  # noqa: BLE001 — decay is best-effort, never fatal
-                self.cfg.log(f"review #{p.number}: no-progress counter not cleared ({exc})")
-        # The pin-deferral streak clears on confirmed PROGRESS, not on a
-        # successful pin: multi-mode's gate pins successfully every round even
-        # when a later dimension defers the round, and a pin-time reset would
-        # let that loop evade the deferral bound forever.
-        self._pin_deferrals.pop(p.number, None)
+    def _cleanup_checkout(self, pr: int) -> None:
         # A settled round no longer needs its pinned checkout; the next round
-        # recreates one at the then-current head. Best-effort — a leftover
-        # worktree is a directory, not a correctness hazard.
+        # recreates one at the then-current head.
         if self.cfg.review_checkout_cleanup is not None:
             try:
-                self.cfg.review_checkout_cleanup(p.number)
+                self.cfg.review_checkout_cleanup(pr)
             except Exception as exc:  # noqa: BLE001
                 self.cfg.log(
-                    f"review #{p.number}: pinned checkout not removed ({exc})"
+                    f"review #{pr}: pinned checkout not removed ({exc})"
                 )
-
-    def _persist_review_state(self, pr: int, round_number: int) -> None:
-        """Retain runtime session metadata after authority settles the verdict."""
-        self.store.save_pr_session(pr, self.store.get_pr_session(pr) or "multi")
-        self.store.set_round(pr, round_number)
 
     def _submit_review(
         self,

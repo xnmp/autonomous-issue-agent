@@ -8,14 +8,14 @@ from ..domain.fix import breaker_key
 from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import (
-    ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress,
+    ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress, MAX_EXECUTION_SUFFIX,
     ReviewPreparationKind,
     ReviewRoundOutcome, same_execution_episode,
     CurrentReviewExecution, finalize_current_review_round,
 )
 from ..domain.review_rounds import (
     DeferredReviewPreparation, FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningComplete,
-    ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
+    ReviewPlanningConclusion, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     ReviewRoundAwaitingEvidence, ReviewSubmissionConfirmed, ReviewSubmissionKind, ReviewSubmissionPlan,
     ReviewSubmissionRegistration, finalize_review_round,
     CurrentReviewOutcomeReceipt,
@@ -33,7 +33,7 @@ from ..domain.workflow_identity import (
 )
 from .control_store import (
     ControlStoreError, PendingCommand, SQLiteControlStore, _command_from_row, _command_payload_digest,
-    _json, _stamp,
+    _dispatch_claim_issue, _json, _stamp,
 )
 from .deployment_authority import deployment_role
 from .review_effects import ReviewReads, bound_submission_op, read_pull_request
@@ -196,9 +196,11 @@ class SQLiteReviewExecutionControl:
     def reconcile_review_rounds(self) -> ReviewRoundSweep:
         """Fence abandoned planning and finalize one indexed page of terminal rounds."""
         with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
             rows = db.execute(
                 "SELECT rr.round_id,rr.target_number,rr.execution_epoch,rr.execution_episode,rr.sequence,"
-                "rr.planning_json,rr.closure_json,dc.occurrence_id AS live_claim "
+                "rr.planning_json,rr.closure_json,dc.occurrence_id AS live_claim, "
+                "dc.target AS claim_target,dc.owner_id AS claim_owner,dc.owner_pid,dc.owner_start_ticks "
                 "FROM review_execution_rounds rr LEFT JOIN dispatch_claims dc "
                 "ON dc.repository=rr.repository AND dc.role='review' "
                 "AND dc.occurrence_id=rr.claim_occurrence_id "
@@ -219,7 +221,24 @@ class SQLiteReviewExecutionControl:
                 continue
             round_id = row["round_id"]
             open_planning = row["planning_json"] == encode_workflow(ReviewPlanningOpen())
-            if open_planning and row["live_claim"] is not None:
+            claim_present = row["live_claim"] is not None
+            if claim_present:
+                parent_identity = (row["owner_pid"], row["owner_start_ticks"])
+                parent_live = ProcessSupervisor.matches_identity(*parent_identity)
+                if not parent_live:
+                    target = _dispatch_claim_issue(row["claim_target"])
+                    if target is None:
+                        reason = "review parent claim target is malformed"
+                        blocked.append((round_id, reason))
+                        self._record_recovery_block(round_id, reason)
+                        continue
+                    # The dead identity is sampled outside SQLite's write lock;
+                    # a replacement occurrence cannot be released by this sample.
+                    claim_present = not self._control.release_dispatch_claim(
+                        self._writer.repository, "review", target, row["claim_owner"],
+                        expected_occurrence_id=row["live_claim"], expected_process_identity=parent_identity,
+                    )
+            if open_planning and claim_present:
                 continue
             try:
                 planning = (
@@ -227,7 +246,7 @@ class SQLiteReviewExecutionControl:
                         row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
                     )
                 )
-                if open_planning or (isinstance(planning, ReviewPlanningSealed) and row["live_claim"] is None):
+                if open_planning or (isinstance(planning, ReviewPlanningSealed) and not claim_present):
                     planning = self.seal_abandoned_planning(round_id)
                     sealed.append(round_id)
                 result = (
@@ -258,15 +277,45 @@ class SQLiteReviewExecutionControl:
             ).fetchone()
             if row is None:
                 return False
-            recorded = decode_workflow(row["payload_json"], tuple)
-            if (len(recorded) != 4 or not isinstance(recorded[0], str)
-                    or not isinstance(recorded[1], tuple)
-                    or any(not isinstance(reason, str) for reason in recorded[1])
-                    or not isinstance(recorded[2], str)
-                    or type(recorded[3]) is not int
-                    or not 1 <= recorded[3] <= MAX_ABANDONMENT_WAIT_OBSERVATIONS):
-                raise WorkflowAuthorityError("review recovery wait observation is malformed")
-            return recorded[3] == MAX_ABANDONMENT_WAIT_OBSERVATIONS
+            return self._wait_at_ceiling(row["payload_json"])
+
+    @staticmethod
+    def _wait_at_ceiling(payload: str) -> bool:
+        recorded = decode_workflow(payload, tuple)
+        if (len(recorded) != 4 or not isinstance(recorded[0], str)
+                or not isinstance(recorded[1], tuple)
+                or any(not isinstance(reason, str) for reason in recorded[1])
+                or not isinstance(recorded[2], str)
+                or type(recorded[3]) is not int
+                or not 1 <= recorded[3] <= MAX_ABANDONMENT_WAIT_OBSERVATIONS):
+            raise WorkflowAuthorityError("review recovery wait observation is malformed")
+        return recorded[3] == MAX_ABANDONMENT_WAIT_OBSERVATIONS
+
+    @staticmethod
+    def _pending_recovery_hold_in_tx(db: sqlite3.Connection, execution: CurrentReviewExecution) -> str | None:
+        binding = execution.binding
+        key = binding.rejection.fence.key
+        rows = db.execute(
+            "SELECT rr.round_id,d.payload_json FROM review_execution_rounds rr "
+            "INDEXED BY review_execution_rounds_generation_pending JOIN dedupe_keys d "
+            "ON d.namespace=? AND d.scope=rr.repository AND d.key=rr.round_id "
+            "WHERE rr.repository=? AND rr.target_number=? AND rr.execution_epoch=? "
+            "AND rr.execution_episode=? AND rr.generation=? AND rr.sequence>? AND rr.sequence<=? "
+            "AND rr.outcome_json IS NULL ORDER BY rr.sequence LIMIT ?",
+            (_WAIT_NAMESPACE, key.repository, key.target.number, binding.execution_epoch,
+             binding.execution_episode, binding.rejection.fence.generation,
+             execution.baseline.through_sequence, execution.last_sequence, MAX_EXECUTION_SUFFIX),
+        ).fetchall()
+        return next((f"unfinished review round reached recovery limit: {row['round_id']}"
+                     for row in rows if SQLiteReviewExecutionControl._wait_at_ceiling(row["payload_json"])), None)
+
+    def pending_recovery_hold(self, key: WorkflowKey) -> str | None:
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            snapshot = load_review_workflow_row(db, key)
+            if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
+                return None
+            return self._pending_recovery_hold_in_tx(db, snapshot.execution)
 
     def _record_recovery_block(self, round_id: str, reason: str) -> None:
         with self._control.transaction() as db:
@@ -804,6 +853,9 @@ class SQLiteReviewExecutionControl:
             plan = plan_review_preflight(snapshot, selection, now=now)
             if not isinstance(snapshot.execution, CurrentReviewExecution):
                 raise WorkflowAuthorityError("review execution is inactive")
+            recovery_hold = self._pending_recovery_hold_in_tx(db, snapshot.execution)
+            if recovery_hold is not None:
+                raise WorkflowAuthorityError(recovery_hold)
             execution = replace(snapshot.execution, last_sequence=plan.round.sequence)
             after = replace(
                 snapshot,
@@ -1069,11 +1121,13 @@ class SQLiteReviewExecutionControl:
 
     def seal_completed_planning(
         self, round_id: str, expected: WorkflowRevision,
+        conclusion: ReviewPlanningConclusion = ReviewPlanningComplete(),
     ) -> ReviewPlanningSealed:
         """Close the parent's stage list without classifying child outcomes."""
         validate_workflow_identifier(round_id, "review round")
         if not isinstance(expected, WorkflowRevision):
             raise ValueError("planning seal requires a captured aggregate revision")
+        ReviewPlanningSealed("validation", conclusion)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self._writer.owner_id)
             stored = self._stored_round(db, round_id)
@@ -1082,6 +1136,8 @@ class SQLiteReviewExecutionControl:
             selection, _, plan, row = stored
             prior = self._completed_seal_receipt(db, expected, selection, plan, row)
             if prior is not None:
+                if prior.conclusion != conclusion:
+                    raise WorkflowAuthorityError("review planning seal has a conflicting conclusion")
                 return prior
             claim = db.execute(
                 "SELECT owner_pid,owner_start_ticks FROM dispatch_claims "
@@ -1095,7 +1151,7 @@ class SQLiteReviewExecutionControl:
         if not ProcessSupervisor.matches_identity(parent_pid, parent_start_ticks):
             raise WorkflowAuthorityError("review parent claim process is no longer live")
 
-        with self._control.transaction() as db:
+        with self._control.transaction() as db, self._control.mutation_savepoint(db):
             self._control._assert_owner_active(db, self._writer.owner_id)
             stored = self._stored_round(db, round_id)
             if stored is None:
@@ -1103,12 +1159,14 @@ class SQLiteReviewExecutionControl:
             selection, _, plan, row = stored
             prior = self._completed_seal_receipt(db, expected, selection, plan, row)
             if prior is not None:
+                if prior.conclusion != conclusion:
+                    raise WorkflowAuthorityError("review planning seal has a conflicting conclusion")
                 return prior
             require_review_parent_claim(
                 db, self._writer.repository, self._writer.owner_id, selection.claim_occurrence_id,
                 selection.claim_target, probed_identity=(parent_pid, parent_start_ticks),
             )
-            if not (plan.stages or plan.submissions):
+            if isinstance(conclusion, ReviewPlanningComplete) and not (plan.stages or plan.submissions):
                 raise WorkflowAuthorityError("completed review planning has no registered work")
             snapshot = load_review_workflow_row(db, expected.fence.key)
             if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
@@ -1119,10 +1177,10 @@ class SQLiteReviewExecutionControl:
                     or snapshot.binding != plan.round.binding.rejection):
                 raise WorkflowAuthorityError("review planning seal captured a stale dual binding")
             payload = encode_workflow((round_id, self._writer.owner_id, selection.claim_occurrence_id,
-                                       expected, plan, ReviewPlanningComplete()))
+                                       expected, plan, conclusion))
             sealed = ReviewPlanningSealed(
                 "review-round-seal:" + hashlib.sha256(payload.encode()).hexdigest(),
-                ReviewPlanningComplete(),
+                conclusion,
             )
             changed = db.execute(
                 "UPDATE review_execution_rounds SET planning_json=? WHERE round_id=? "
@@ -1177,22 +1235,23 @@ class SQLiteReviewExecutionControl:
                     selection.claim_occurrence_id, selection.claim_target, plan,
                 )
             )
-            changed = db.execute(
-                "UPDATE review_execution_rounds SET planning_json=? WHERE round_id=? "
-                "AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
-                (encode_workflow(abandoned), round_id, row["planning_json"]),
-            ).rowcount
-            if changed != 1:
-                raise WorkflowAuthorityError("review round changed during abandonment fence")
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                (REVIEW_ABANDONMENT_NAMESPACE, self._writer.repository, round_id,
-                 _stamp(self._control.now()), encode_workflow((
-                     round_id, parent_owner, selection.claim_occurrence_id, plan, abandoned,
-                 ))),
-            )
-            self._control._transition(db, "review_round", round_id, "planning_abandoned", {
-                "claim_occurrence_id": selection.claim_occurrence_id,
-                "abandonment_receipt": abandoned.abandonment_receipt,
-            })
-            return abandoned
+            with self._control.mutation_savepoint(db):
+                changed = db.execute(
+                    "UPDATE review_execution_rounds SET planning_json=? WHERE round_id=? "
+                    "AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
+                    (encode_workflow(abandoned), round_id, row["planning_json"]),
+                ).rowcount
+                if changed != 1:
+                    raise WorkflowAuthorityError("review round changed during abandonment fence")
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (REVIEW_ABANDONMENT_NAMESPACE, self._writer.repository, round_id,
+                     _stamp(self._control.now()), encode_workflow((
+                         round_id, parent_owner, selection.claim_occurrence_id, plan, abandoned,
+                     ))),
+                )
+                self._control._transition(db, "review_round", round_id, "planning_abandoned", {
+                    "claim_occurrence_id": selection.claim_occurrence_id,
+                    "abandonment_receipt": abandoned.abandonment_receipt,
+                })
+                return abandoned

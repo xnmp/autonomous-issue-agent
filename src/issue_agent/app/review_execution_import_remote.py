@@ -15,7 +15,8 @@ from ..domain.review_activation import OpenPullRequestsListed
 from ..domain.review_workflow import CompleteReviews, ObservedPullRequest, RecordedPullRequest
 from ..domain.workflow_identity import PullRequestRef, WorkflowKey, canonical_workflow_repository
 from .config import HarnessConfig, owner_identity_for_target
-from .review_runtime import review_external_holds, unproductive_rounds_reader
+from .review_runtime import review_external_holds
+from .review_activation import unproductive_rounds_reader
 
 
 @dataclass(frozen=True)

@@ -39,15 +39,29 @@ from ..domain.review_linkage import LinkedIssueUnavailable, NoLinkedIssue, linke
 from ..domain.review_exemptions import approval_grants_cover, review_declarations
 from ..domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState, PullRequestUnavailable, SubmittedReviewState
 from ..domain.identity import login_eq
+from ..domain.fix import breaker_key
 from ..domain.refs import issue_from_branch
 from ..domain.world import PRView, Review
 from .config import HarnessConfig, owner_identity_for_target
 from .resolve_activation import ActivationNotConfirmed
 from .resolve_control import load_operator_configuration
 from .review_identity import review_identity
-from .review_runtime import unproductive_round_keys, unproductive_rounds_reader
 
 JsonReport = dict[str, object]
+
+
+def unproductive_round_keys(pr) -> frozenset[int]:
+    """Legacy attribution retained only for stopped one-time import."""
+    return frozenset({breaker_key(pr), -pr.number})
+
+
+def unproductive_rounds_reader(store, abandoned: Callable[[], Mapping[int, int]]) -> Callable[[object], int]:
+    """Legacy file and recovered-death evidence for stopped one-time import only."""
+    def read(pr: object) -> int:
+        deaths = abandoned()
+        return sum(store.get_infra_deaths(key) + deaths.get(key, 0) for key in unproductive_round_keys(pr))
+
+    return read
 
 
 @dataclass(frozen=True)

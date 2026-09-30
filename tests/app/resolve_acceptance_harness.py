@@ -312,10 +312,13 @@ class ScriptedProvider:
     def __init__(self, results=(), *, during: Callable[[object], None] = lambda _task: None):
         self.results = list(results)
         self.during = during
+        self.launch: Callable[[object], None] | None = None
         self.tasks: list = []
 
     async def run(self, task):
         self.tasks.append(task)
+        if self.launch is not None:
+            self.launch(task)
         self.during(task)
         if self.results:
             return self.results.pop(0)

@@ -37,7 +37,7 @@ from tests.fakes.review_workflow import HEAD
 from tests.app.resolve_acceptance_harness import ScriptedProvider
 from tests.app.review_acceptance_harness import (
     BOT, FIX_BOT, NHR, PR, REPO, TRIGGER, ReviewComposition, compose_review, create_review_deployment, install_clock,
-    isolate_authority, verdicts,
+    isolate_authority, verdicts, register_review_launch,
 )
 from tests.app.test_review_acceptance import escalate, progress_until
 
@@ -114,8 +114,9 @@ def bare(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def deployment(bare):
+def deployment(bare, monkeypatch):
     bare.activate()
+    compose_review(bare).activate_execution(monkeypatch)
     return bare
 
 
@@ -157,7 +158,9 @@ def test_an_escalated_ceiling_is_projected_read_only_with_its_counted_reviews_an
     assert dump(deployment.control_path) == before and escalated.remote.calls == writes
 
 
-def test_an_activated_but_never_observed_pull_request_is_absent(deployment):
+def test_a_rejection_only_family_with_no_observed_pull_request_is_absent(bare):
+    bare.activate()
+    deployment = bare
     response = http(deployment).get()
     assert response.status_code == 404
     assert response.json() == {"status": "absent", "repository": REPO, "pull_request": PR, "epoch": 1}
@@ -561,7 +564,7 @@ def test_an_exhausted_escalation_hold_is_a_visible_gate_without_an_operator_comm
     war = [True]
 
     def fault(point):
-        if point == "reviews_page:0" and war[0]:
+        if point == "reviews_page:0" and war[0] and daemon.submissions():
             labels = {label.value for label in daemon.remote.get_pr(PR).labels}
             daemon.remote.external_pr_change(PR, labels=sorted(labels ^ {"no-ai-review"}))
     daemon = compose_review(deployment, fault=fault, provider=ScriptedProvider(verdicts("ESCALATE", OK)))
@@ -605,6 +608,7 @@ def compose_sliced(deployment, provider: ScriptedProvider, *, fault=lambda _: No
     """`compose_review` over the trigger-labelled review read, so a held or closed pull request leaves it."""
     cfg = deployment.config()
     remote = TriggerSlice(deployment.github_path, fault=fault, clock=deployment.clock.now)
+    provider.launch = register_review_launch
     log: list[str] = []
     review = roles.compose_review_daemon(cfg, remote, Store(cfg.review_state_dir), provider, log=log.append)
     return ReviewComposition(deployment, cfg, review, remote, provider, log)

@@ -529,26 +529,29 @@ class AgentDispatcher:
                 f"{type(exc).__name__}: {exc}",
                 str(getattr(exc, "harness_last_trace", "") or ""),
             )
-            try:
-                if det is not None and self.cfg.max_infra_deaths > 0:
-                    charged = max(
-                        self.store.get_infra_deaths(key), self.cfg.max_infra_deaths
-                    )
-                    self.store.set_infra_deaths(key, charged)
-                    self.cfg.log(
-                        f"#{key}: deterministic session death "
-                        f"({det.signature}"
-                        + (f" on {det.path}" if det.path else "")
-                        + ") — retrying reproduces it, so the retry budget is "
-                        f"spent now ({charged}/{self.cfg.max_infra_deaths}); "
-                        "escalating to a human on the next poll"
-                    )
-                else:
-                    self.store.bump_infra_deaths(key)
-            except Exception as err:  # noqa: BLE001
-                # A counter we could not persist must not replace the death we
-                # are trying to report (the traceback is the diagnosis).
-                self.cfg.log(f"infra-death counter not persisted for #{key}: {err}")
+            bound_review = (self.cfg.role == "review" and action.workflow is not None
+                            and action.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW})
+            if not bound_review:
+                try:
+                    if det is not None and self.cfg.max_infra_deaths > 0:
+                        charged = max(
+                            self.store.get_infra_deaths(key), self.cfg.max_infra_deaths
+                        )
+                        self.store.set_infra_deaths(key, charged)
+                        self.cfg.log(
+                            f"#{key}: deterministic session death "
+                            f"({det.signature}"
+                            + (f" on {det.path}" if det.path else "")
+                            + ") — retrying reproduces it, so the retry budget is "
+                            f"spent now ({charged}/{self.cfg.max_infra_deaths}); "
+                            "escalating to a human on the next poll"
+                        )
+                    else:
+                        self.store.bump_infra_deaths(key)
+                except Exception as err:  # noqa: BLE001
+                    # A counter we could not persist must not replace the death we
+                    # are trying to report (the traceback is the diagnosis).
+                    self.cfg.log(f"infra-death counter not persisted for #{key}: {err}")
             # The deployment-wide breaker counts DISTINCT targets, so it is told
             # only about keys that are a real issue number. A `-pr` key is
             # `_death_key`'s last-resort guess for a PR whose issue could not be

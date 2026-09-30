@@ -78,7 +78,6 @@ from issue_agent.app.roles import (
     _inject_predicted_paths,
     _prediction_outcome_reporter,
     _recurrence_reporter,
-    _review_unproductive_rounds,
     _journal,
     _owner_identity,
     _shutdown_finalize,
@@ -855,50 +854,18 @@ REVIEW_BOT = "review-bot"
 from tests.fakes.review_authority import review_binding, review_state, with_review_authority
 
 
-def _bound_review_state(store, world, process_deaths=None):
-    errors = {}
-    counts = _review_unproductive_rounds(store, world, process_deaths, errors)
+def _bound_review_state(store, world):
     recorded = review_state(store)
+    errors = {}
+    counts = {}
     owed = {pr.number: (AgentKind.RE_REVIEW if recorded.head(pr.number) else AgentKind.REVIEW,
                        review_binding(pr.number)) for pr in world.prs if recorded.head(pr.number) != pr.head_ref_oid}
     return BoundReviewState(owed=owed, unproductive_rounds=counts, control_errors=errors)
 
 
 
-def _review_dispatcher(gw, store, runner, **overrides):
-    kwargs = dict(review=ReviewTaskConfig("o/r", review_prompt="p"), review_bot=REVIEW_BOT)
-    kwargs.update(overrides)
-    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return with_review_authority(AgentDispatcher(DispatchConfig(**kwargs), gw, store, None, runner, executor))
 
 
-def _simulate_review_polls(store, dispatcher, rcfg, base_pr, polls):
-    """`polls` review-daemon ticks: observe → decide_bound_review → execute.
-
-    Returns (paid dispatches, escalation comments, the PR's final label set).
-    Relabel actions are applied to the observed world exactly as GitHub would,
-    so a poll after an escalation sees the PR the way the next real poll does.
-    `Daemon.tick` swallows a dispatch that raises, so this does too — that
-    swallow is precisely why a pre-result death used to cost nothing but money.
-    """
-    labels = set(base_pr.labels)
-    dispatches = comments = 0
-    for _ in range(polls):
-        observed = replace(base_pr, labels=frozenset(labels))
-        w = WorldState(prs=(observed,))
-        for action in decide_bound_review(w, rcfg, _bound_review_state(store, w)):
-            if isinstance(action, RunAgent):
-                dispatches += 1
-                try:
-                    asyncio.run(dispatcher.dispatch(action))
-                except BaseException:  # noqa: BLE001 — Daemon.tick's swallow
-                    pass
-            elif isinstance(action, Relabel):
-                labels.discard(action.remove) if action.remove else None
-                labels.add(action.add) if action.add else None
-            else:
-                comments += 1
-    return dispatches, comments, labels
 
 
 def _open_pr(number=500, issue=9, sha="abc"):
@@ -909,95 +876,14 @@ def _open_pr(number=500, issue=9, sha="abc"):
     )
 
 
-def test_a_review_that_always_dies_pre_result_is_bounded_at_the_ceiling(tmp_path):
-    """review P0R-3, the headline repro. 20 polls against a runner that dies
-    before returning a result used to buy 20 full REVIEW sessions with every
-    counter reading zero. The dispatcher already bumped `infra-deaths` in the
-    review STATE_DIR — nothing read it."""
-    pr_view = _open_pr()
-    gw = FakeGateway(prs={pr_view.number: pr_view})
-    store = Store(state_dir=str(tmp_path))
-    d = _review_dispatcher(gw, store, RaisingRunner())
-    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=5)
-
-    dispatches, comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
-
-    assert dispatches == 5, "20 polls must not buy 20 review sessions"
-    assert comments == 1, "the handoff is announced once, not once per poll"
-    assert Label.NEEDS_HUMAN_REVIEW in labels and Label.AI_PR_OPEN not in labels
-    assert store.get_infra_deaths(-pr_view.number) == 5
 
 
-def test_without_the_ceiling_the_same_run_buys_a_session_every_poll(tmp_path):
-    """Disabling the breaker buys a round each poll for an unproductive PR."""
-    pr_view = _open_pr()
-    gw = FakeGateway(prs={pr_view.number: pr_view})
-    store = Store(state_dir=str(tmp_path))
-    d = _review_dispatcher(gw, store, RaisingRunner())
-    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=0)
-
-    dispatches, comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
-
-    assert dispatches == 20 and comments == 0
-    assert Label.NEEDS_HUMAN_REVIEW not in labels
 
 
-def test_a_multi_mode_fanout_that_never_synthesises_is_bounded(tmp_path):
-    """review P0R-3's worst case. The gate SUCCEEDS and the dimension legs die,
-    so `synthesize_review` returns None and the workflow returns — a RETURNED
-    result, which never touches the raise path the earlier P0 fix covers. The
-    whole fan-out (gate + every dimension) was re-run every poll."""
-    pr_view = _open_pr()
-    gw = FakeGateway(prs={pr_view.number: pr_view})
-    store = Store(state_dir=str(tmp_path))
-    runner = SchemaRunner(gate=_gate(), dimension=lambda _t: AgentResult(is_error=True),
-                          validation=lambda _t: _val(True))
-    d = _review_dispatcher(gw, store, runner, review_mode=ReviewMode.MULTI)
-    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=3)
-
-    dispatches, _comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
-
-    assert dispatches == 3
-    # The money is in the LEGS, not the dispatches: one round is a gate plus
-    # every dimension specialist. 20 polls would have been 20x this.
-    assert len(runner.tasks) == 3 * (1 + len(REVIEW_DIMENSIONS))
-    assert Label.NEEDS_HUMAN_REVIEW in labels
 
 
-def test_a_healthy_review_dispatches_once_and_never_hits_the_ceiling(tmp_path):
-    """Anti-vacuity. A ceiling that fires on a working reviewer is worse than no
-    ceiling: 20 polls of a healthy PR buy exactly ONE review (the second poll
-    sees the saved session), submit it, and escalate nothing."""
-    pr_view = _open_pr()
-    gw = FakeGateway(prs={pr_view.number: pr_view})
-    store = Store(state_dir=str(tmp_path))
-    runner = FakeRunner(AgentResult(is_error=False, session_id="rs",
-                                    structured={"decision": "APPROVE", "body": "lgtm"}))
-    d = _review_dispatcher(gw, store, runner)
-    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=5)
-
-    dispatches, comments, labels = _simulate_review_polls(store, d, rcfg, pr_view, 20)
-
-    assert dispatches == 1 and comments == 0
-    assert any(c[0] == "review" and c[2] == "APPROVE" for c in gw.calls)
-    assert store.get_pr_session(pr_view.number) == "rs"
-    assert store.get_infra_deaths(-pr_view.number) == 0
-    assert labels == {Label.AI_PR_OPEN}
 
 
-def test_the_reviewers_counter_survives_a_key_space_split(tmp_path):
-    """P1R-1's trap, closed for the review role. The dispatcher bumps under
-    `gateway.issue_for_pr(pr)` — but that lookup is a gh call, and the flakiness
-    that kills review sessions is the flakiness that fails it, so the SAME PR's
-    deaths land under the issue number on some polls and under `-pr` on others.
-    A reader that knows only one key space reads a permanently-short count."""
-    pr_view = _open_pr()
-    store = Store(state_dir=str(tmp_path))
-    store.bump_infra_deaths(9)                  # a poll where issue_for_pr worked
-    store.bump_infra_deaths(-pr_view.number)    # a poll where it raised
-    w = WorldState(prs=(pr_view,))
-
-    assert _bound_review_state(store, w).unproductive_rounds[pr_view.number] == 2
 
 
 def test_control_store_process_deaths_escalate_the_fix_role(tmp_path):
@@ -1092,43 +978,8 @@ def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):
                                _fix_state(store, world()), False), AgentKind.RESOLVE)
 
 
-def test_control_store_process_deaths_bound_the_review_role(tmp_path):
-    pr_view = _open_pr()
-    store = Store(state_dir=str(tmp_path))
-    rcfg = ReviewConfig(review_bot=REVIEW_BOT, max_unproductive_rounds=2)
-    w = WorldState(prs=(pr_view,))
-
-    assert _bound_review_state(
-        store, w, process_deaths={-pr_view.number: 1}
-    ).unproductive_rounds[pr_view.number] == 1
-    assert RunAgent(AgentKind.REVIEW, pr_view.number, workflow=review_binding(pr_view.number)) in decide_bound_review(
-        w,
-        rcfg,
-        _bound_review_state(
-            store, w, process_deaths={-pr_view.number: 1}
-        ),
-    )
-
-    actions = decide_bound_review(
-        w,
-        rcfg,
-        _bound_review_state(
-            store, w, process_deaths={-pr_view.number: 2}
-        ),
-    )
-    assert not any(isinstance(a, RunAgent) for a in actions)
-    assert Relabel(Target.PR, pr_view.number, Label.AI_PR_OPEN,
-                   Label.NEEDS_HUMAN_REVIEW) in actions
 
 
-def test_an_issueless_prs_process_death_lands_on_the_key_the_reader_uses(tmp_path):
-    pr_view = PRView(112, head_ref_name="feat/ACME-2468-x", head_ref_oid="abc",
-                     labels=frozenset({Label.AI_PR_OPEN}), state="OPEN")
-    store = Store(state_dir=str(tmp_path))
-    w = WorldState(prs=(pr_view,))
-    assert _bound_review_state(
-        store, w, process_deaths={-112: 1}
-    ).unproductive_rounds[112] == 1
 
 
 # ── steward: the third role P0R-3 names, bounded on the SAME two mechanisms ────
@@ -1977,7 +1828,7 @@ class _BuildableReviewGateway(_BuildableGateway):
         ))
 
 
-def _activate_review_fixture(cfg):
+def _activate_review_fixture(cfg, gateway=None):
     """Seed isolated family authority before composing a real review daemon."""
     from issue_agent.domain.workflow_identity import WorkflowFamily
     control = SQLiteControlStore(_control_store_path(cfg, cfg.review_state_dir))
@@ -1985,6 +1836,25 @@ def _activate_review_fixture(cfg):
     with control.transaction() as db:
         db.execute("INSERT INTO workflow_authority_epochs VALUES (?, ?, 1, 'fixture', 'fixture', ?)",
                    (cfg.repo, WorkflowFamily.REVIEW_REJECTIONS.value, datetime.now(timezone.utc).isoformat()))
+    if gateway is not None:
+        from issue_agent.app.review_execution_activation import (
+            ConfiguredReviewExecutionActivation, ReviewExecutionActivationScope, _observed_scope_sources,
+        )
+        from issue_agent.app.review_runtime import configured_review_control
+        from issue_agent.app.config import owner_identity_for_target
+        from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+        workflow = configured_review_control(cfg, control, gateway, Store(cfg.review_state_dir),
+                                            owner_identity_for_target(cfg.repo, cfg.target_dir, "review"))
+        for pr in gateway.build_review_world().prs:
+            workflow.ensure_observed_workflow(WorkflowKey(cfg.repo, PullRequestRef(pr.number)))
+        gateway.repo = cfg.repo
+        gateway.get_review_pull_request = gateway.get_pr
+        gateway._gh_json = lambda _: [[{"number": pr.number, "state": "open"}
+                                      for pr in gateway.build_review_world().prs]]
+        scope = ReviewExecutionActivationScope("fixture", cfg, gateway)
+        files, links, sql = _observed_scope_sources(scope, control)
+        activation = ConfiguredReviewExecutionActivation(cfg, control, gateway, Store(cfg.review_state_dir), liveness=lambda: ())
+        activation.activate(activation.plan(files, links, sql), files, links, sql)
     return control
 
 
@@ -2562,13 +2432,17 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
         issues={150: IssueView(150, title="dashboard health", state="open")},
         fail_on={"issue_for_pr"},
     )
-    runner = FakeRunner(
+    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.review_acceptance_harness import register_review_launch
+    from issue_agent.domain.outcome import ExitReason
+    runner = ScriptedProvider([
         AgentResult(
             is_error=False,
+            exit_reason=ExitReason.OK,
             session_id="review-session",
             structured={"decision": "APPROVE", "body": "lgtm"},
         )
-    )
+    ], during=register_review_launch)
     cfg = replace(
         from_env({
             "REPO": "o/r",
@@ -2581,7 +2455,7 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
         control_authority_root=str(tmp_path / "machine-state"),
     )
     store = Store(str(tmp_path / "review-state"))
-    control = _activate_review_fixture(cfg)
+    control = _activate_review_fixture(cfg, gateway)
     daemon = build_review_daemon(cfg, gateway, store, runner)
 
     actions = daemon.tick()
@@ -2598,7 +2472,9 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
     )
     assert any(c[:3] == ("review", pr.number, "APPROVE") and c[3].startswith("lgtm")
                for c in gateway.calls)
-    assert store.get_pr_session(pr.number) == "review-session"
+    from issue_agent.app.review_runtime import current_review_failures
+    assert current_review_failures(control, "o/r", pr.number) == 0
+    assert store.get_pr_session(pr.number) == ""
 
 
 def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
@@ -2632,12 +2508,15 @@ def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
     gateway = RelinkedReviewGateway(prs={changed.number: changed}, issues={
         number: IssueView(number, title="dashboard health", state="open") for number in (150, 151)
     })
-    runner = FakeRunner(
+    from tests.app.resolve_acceptance_harness import ScriptedProvider
+    from tests.app.review_acceptance_harness import register_review_launch
+    from issue_agent.domain.outcome import ExitReason
+    runner = ScriptedProvider([
         AgentResult(
             is_error=True,
             status="must-not-run",
         )
-    )
+    ], during=register_review_launch)
     cfg = replace(
         from_env({
             "REPO": "o/r",
@@ -2650,7 +2529,7 @@ def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
         control_authority_root=str(tmp_path / "machine-state"),
     )
     store = Store(str(tmp_path / "review-state"))
-    control = _activate_review_fixture(cfg)
+    control = _activate_review_fixture(cfg, gateway)
     daemon = build_review_daemon(cfg, gateway, store, runner)
 
     actions = daemon.tick()
@@ -2665,63 +2544,6 @@ def test_review_daemon_defers_changed_linkage_without_spend_or_retry(
     assert store.get_infra_deaths(151) == 0
 
 
-def test_paid_review_failure_remains_counted_after_later_relink(tmp_path):
-    from issue_agent.app.config import from_env
-    from issue_agent.app.roles import build_review_daemon
-
-    target_dir, head_sha = _git_target(tmp_path)
-    observed = PRView(
-        152,
-        head_ref_name="fix/150-live-e2e",
-        head_ref_oid=head_sha,
-        closing_issue=150,
-        title="dashboard health",
-        body="Adds a health endpoint.",
-        labels=frozenset({Label.AI_PR_OPEN}),
-        state="OPEN",
-        author=FIX_BOT,
-    )
-    world = WorldState(prs=(observed,))
-
-    class ReviewGateway(_BuildableReviewGateway):
-        def build_review_world(self):
-            return world
-
-    gateway = ReviewGateway(prs={observed.number: observed}, issues={
-        150: IssueView(150, title="dashboard health", state="open")
-    })
-    runner = FakeRunner(
-        AgentResult(is_error=True, status="provider-error")
-    )
-    cfg = replace(
-        from_env({
-            "REPO": "o/r",
-            "FIX_BOT": FIX_BOT,
-            "REVIEW_BOT": REVIEW_BOT,
-            "REVIEWER_RUNTIME": "claude",
-            "TARGET_DIR": target_dir,
-            **_role_state_env(tmp_path),
-        }),
-        control_authority_root=str(tmp_path / "machine-state"),
-    )
-    store = Store(str(tmp_path / "review-state"))
-    control = _activate_review_fixture(cfg)
-    daemon = build_review_daemon(cfg, gateway, store, runner)
-
-    daemon.tick()
-    daemon.wait_for_dispatches()
-    assert daemon.shutdown_dispatches(cancel=False)
-
-    relinked = replace(
-        observed,
-        head_ref_name="fix/151-relinked",
-        closing_issue=151,
-    )
-    state = _bound_review_state(store, WorldState(prs=(relinked,)))
-    assert state.unproductive_rounds[observed.number] == 1
-    assert store.get_infra_deaths(-observed.number) == 1
-    assert store.get_infra_deaths(150) == 0
-    assert store.get_infra_deaths(151) == 0
 
 
 def test_codex_fixer_declares_its_role_so_a_review_hook_cannot_cage_it(tmp_path, monkeypatch):

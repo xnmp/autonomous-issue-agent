@@ -48,8 +48,9 @@ def bare(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def deployment(bare):
+def deployment(bare, monkeypatch):
     bare.activate()
+    compose_review(bare).activate_execution(monkeypatch)
     return bare
 
 
@@ -127,6 +128,7 @@ def test_relink_after_the_dispatch_claim_check_defers_before_any_paid_work(deplo
 
 def test_an_excluded_unobserved_pr_preserves_its_basis_without_creating_a_workflow(deployment):
     client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    before = client.state()
     client.remote.external_pr_change(PR, labels=[Label.AI_PARKED.value])
     client.boot()
     runtime = client.review.runtime
@@ -137,7 +139,7 @@ def test_an_excluded_unobserved_pr_preserves_its_basis_without_creating_a_workfl
     assert decision.basis is not None and decision.basis.external_holds == ("ai-parked",)
     runtime.record_plan(plan)
     client.tick()
-    assert isinstance(client.workflow.load_workflow(KEY), WorkflowAbsent)
+    assert client.state() == before
     assert client.provider.tasks == [] and client.charges() == []
     assert not any("dispatch decisions not recorded" in line for line in client.log)
 
@@ -265,7 +267,7 @@ def test_an_inactive_repository_requires_migration_and_never_buys_a_review(bare)
 def test_an_active_review_is_bound_records_its_baseline_and_is_bought_once(deployment):
     client = compose_review(deployment, provider=ScriptedProvider(verdicts(RC)))
     client.boot()
-    assert isinstance(client.workflow.load_workflow(KEY), WorkflowAbsent)
+    assert client.state().execution.last_sequence == 0
     client.tick(3)
     assert len(client.provider.tasks) == 1 and len(client.submissions()) == 1
     baseline = client.state().episode.continuation
@@ -383,6 +385,7 @@ def test_dismissal_outcomes_complete_or_stop_visibly(tmp_path, monkeypatch, outc
     isolate_authority(deployment, monkeypatch)
     install_clock(deployment, monkeypatch)
     deployment.activate()
+    compose_review(deployment).activate_execution(monkeypatch)
     dismissals = [0]
 
     def fault(point):
@@ -939,8 +942,10 @@ DECLARATION = "chore: config only\n\nGate-Exemption: required-test *"
 @pytest.mark.parametrize("declared, escalates", [(False, False), (True, True)],
                          ids=["complete-approval-resets", "ungranted-approval-does-not-reset"])
 def test_a_current_head_approval_resets_the_bound_count_only_when_its_grants_are_complete(
-        bare, declared, escalates):
+        bare, monkeypatch, declared, escalates):
     """A legacy approval of the current head met at activation: counted past only if its grants fall short."""
+    bare.activate()
+    compose_review(bare).activate_execution(monkeypatch)
     heads = bare.heads
     remote = bare.github()
     remote.external_pr_change(PR, head_ref_oid=heads[1])
@@ -950,7 +955,6 @@ def test_a_current_head_approval_resets_the_bound_count_only_when_its_grants_are
                        submitted_at="2026-09-25T10:30:00+00:00", body="ok")
     if declared:
         remote.set_commit_messages(PR, DECLARATION)
-    bare.activate()
     client = compose_review(bare, provider=ScriptedProvider(verdicts(RC)))
     client.boot()
     client.tick(3)
@@ -1124,7 +1128,7 @@ def test_a_verdict_escalation_whose_hold_is_contested_becomes_a_visible_gate_and
     war = [True]
 
     def fault(point):
-        if point == "reviews_page:0" and war[0]:
+        if point == "reviews_page:0" and war[0] and client.submissions():
             labels = {label.value for label in client.remote.get_pr(PR).labels}
             client.remote.external_pr_change(PR, labels=sorted(labels ^ {"no-ai-review"}))
     client = compose_review(deployment, fault=fault, provider=ScriptedProvider(verdicts("ESCALATE", OK)),
@@ -1303,7 +1307,9 @@ def test_a_contested_hold_is_restored_a_bounded_number_of_times_then_surfaced_on
     assert journal(client, "hold_contest_cleared") == 1 and client.gate_causes() == []
 
 
-def test_a_never_observed_pull_request_whose_first_read_fails_backs_off(deployment):
+def test_a_never_observed_pull_request_whose_first_read_fails_backs_off(bare, monkeypatch):
+    bare.activate()
+    deployment = bare
     broken, reads = [True], [0]
 
     def fault(point):
@@ -1318,5 +1324,82 @@ def test_a_never_observed_pull_request_whose_first_read_fails_backs_off(deployme
     assert journal(client, "first_observation_unavailable") == 1
     assert any("first observation backing off" in line for line in client.log)
     broken[0] = False
+    client.activate_execution(monkeypatch)
     progress_until(client, lambda c: len(c.provider.tasks) == 1, limit=6, minutes=31)
     assert isinstance(client.state().episode.continuation, ReviewedBaseline)
+
+
+def _die_at_review_execution_boundary(deployment, boundary):
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.adapters.review_execution_control import SQLiteReviewExecutionControl
+
+    child_environment(deployment)
+    if boundary == "planning":
+        original_preflight = SQLiteReviewExecutionControl.preflight
+
+        def stop_after_plan(self, selection):
+            original_preflight(self, selection)
+            os._exit(96)
+
+        SQLiteReviewExecutionControl.preflight = stop_after_plan
+    elif boundary == "reservation":
+        original_reserve = SQLiteControlStore.reserve
+
+        def stop_after_reservation(self, request):
+            result = original_reserve(self, request)
+            if request.review_child is not None and result.admitted:
+                os._exit(96)
+            return result
+
+        SQLiteControlStore.reserve = stop_after_reservation
+    elif boundary == "return":
+        original_return = SQLiteControlStore.settle_review_return
+
+        def stop_after_return(self, request, evidence):
+            original_return(self, request, evidence)
+            os._exit(96)
+
+        SQLiteControlStore.settle_review_return = stop_after_return
+    provider = ScriptedProvider(verdicts(OK), during=lambda _: os._exit(96) if boundary == "launch" else None)
+    client = compose_review(deployment, provider=provider)
+    client.tick()
+    os._exit(97)
+
+
+@pytest.mark.parametrize("boundary", ["planning", "reservation", "launch", "return"])
+def test_process_loss_before_submission_recovers_without_duplicate_money_or_debit(deployment, boundary):
+    run_until_exit(_die_at_review_execution_boundary, deployment, boundary, code=96)
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    if boundary != "launch":
+        client.remote.external_pr_change(PR, labels=[Label.AI_PARKED.value])
+    client.boot()
+    client.tick(10)
+    assert client.provider.tasks == [] and client.submissions() == []
+    money = client.charges()
+    state = client.state()
+    with client.review.control.transaction() as db:
+        rounds = tuple(tuple(row) for row in db.execute(
+            "SELECT round_id,planning_json,closure_json,outcome_json FROM review_execution_rounds"))
+        reservations = tuple(tuple(row) for row in db.execute("SELECT run_id,state FROM budget_reservations"))
+        commands = tuple(tuple(row) for row in db.execute("SELECT * FROM lifecycle_commands"))
+    client.boot()
+    client.tick(3)
+    assert client.charges() == money and client.state() == state
+    with client.review.control.transaction() as db:
+        assert tuple(tuple(row) for row in db.execute(
+            "SELECT round_id,planning_json,closure_json,outcome_json FROM review_execution_rounds")) == rounds
+        assert tuple(tuple(row) for row in db.execute("SELECT run_id,state FROM budget_reservations")) == reservations
+        assert tuple(tuple(row) for row in db.execute("SELECT * FROM lifecycle_commands")) == commands
+        assert db.execute("SELECT count(*) FROM dispatch_claims").fetchone()[0] == 0
+    if boundary == "return":
+        assert len(money) == 1 and money[0][1] == 100_000
+        assert state.execution.state.failures == 1
+        assert rounds[0][3] is not None
+    elif boundary == "launch":
+        assert money == [] and state.execution.state.failures == 0
+        assert rounds[0][3] is None
+        assert journal(client, "evidence_wait") == 2
+        assert any("round evidence remains pending after bounded recovery observations" in line for line in client.log)
+    else:
+        assert money == [] and state.execution.state.failures == 0
+        assert rounds[0][3] is not None

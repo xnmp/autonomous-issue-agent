@@ -247,7 +247,7 @@ def review_sealed_parent_abandonment(
     db: sqlite3.Connection, repository: str, owner_id: str, claim_occurrence_id: str,
     claim_target: int, plan: ReviewRoundPlan, seal: ReviewPlanningSealed,
 ) -> ReviewSealedParentAbandoned:
-    """Retain the completed seal while fencing a departed parent's unadmitted children."""
+    """Retain the exact planning conclusion while fencing a departed parent's children."""
     if not isinstance(seal, ReviewPlanningSealed):
         raise ValueError("post-seal abandonment requires completed planning")
     verified_review_completed_seal(db, repository, owner_id, claim_occurrence_id, plan, seal)
@@ -307,7 +307,7 @@ def verified_review_completed_seal(
         if row is not None:
             raise WorkflowAuthorityError("open review planning has a contradictory seal receipt")
         return None
-    if not isinstance(planning, ReviewPlanningSealed) or not isinstance(planning.conclusion, ReviewPlanningComplete):
+    if not isinstance(planning, ReviewPlanningSealed):
         if row is not None:
             raise WorkflowAuthorityError("review planning seal receipt contradicts its branch")
         return None
@@ -320,7 +320,7 @@ def verified_review_completed_seal(
             or recorded[3].fence != plan.round.binding.rejection.fence):
         raise WorkflowAuthorityError("review planning seal disagrees with its round and parent")
     payload = encode_workflow((plan.round.round_id, owner_id, claim_occurrence_id,
-                               recorded[3], plan, ReviewPlanningComplete()))
+                               recorded[3], plan, planning.conclusion))
     if planning.seal_receipt != "review-round-seal:" + hashlib.sha256(payload.encode()).hexdigest():
         raise WorkflowAuthorityError("review planning seal identity disagrees with its facts")
     return recorded[3]

@@ -326,7 +326,7 @@ def test_delegated_review_routes_to_workflow():
     d = _delegated_dispatcher(gw, store, runner)
     asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
     assert any(c[0] == "review" for c in gw.calls)
-    assert store.pr_sessions.get(100) == "rs"
+    assert store.pr_sessions == {}
 
 
 def test_resolve_routes_to_fix_workflow():
@@ -409,7 +409,7 @@ def test_review_submits_decision_from_structured():
     d = _dispatcher(gw, store, runner)
     asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
     assert ("review", 100, "APPROVE", "lgtm") in gw.calls
-    assert store.pr_sessions[100] == "rs"
+    assert store.pr_sessions == {}
     assert review_state(store).head(100) == "abc"
 
 
@@ -440,7 +440,7 @@ def test_multi_review_routes_to_workflow():
     d = _multi_dispatcher(gw, store, runner)
     asyncio.run(d.dispatch(RunAgent(AgentKind.REVIEW, 100)))
     assert any(c[0] == "review" and c[2] == "REQUEST_CHANGES" for c in gw.calls)
-    assert store.pr_sessions[100] == "multi"
+    assert store.pr_sessions == {}
 
 
 def test_triage_routes_to_steward_workflow():

@@ -6,10 +6,15 @@ boundary used by these tests; legacy Store files never authorize a round.
 """
 
 from dataclasses import dataclass, field, fields
+import hashlib
 
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.app.workflows.review import BoundReviewRound, ReviewWorkflow
-from issue_agent.domain.review import count_prior_rejections
+from issue_agent.domain.actions import AgentKind
+from issue_agent.domain.agent_task import RuntimeName
+from issue_agent.domain.review import ReviewMode, count_prior_rejections
+from issue_agent.domain.review_execution import ReviewChildIdentity, ReviewExecutionBinding, ReviewRoundIdentity
+from issue_agent.domain.review_rounds import ReviewRoundPlan, ReviewSessionReuse
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey,
 )
@@ -24,6 +29,7 @@ class ReviewFixtureState:
     evidence: list = field(default_factory=list)
     evidence_ready: bool = True
     unavailable: bool = False
+    rounds: dict = field(default_factory=dict)
 
     def set_head(self, pr, head):
         self.heads[pr] = head
@@ -55,6 +61,7 @@ def review_binding(pr):
 class FixtureReviewAuthority:
     def __init__(self, gateway, store, executor, bot):
         self.gateway, self.state, self.executor, self.bot = gateway, review_state(store), executor, bot
+        self._staged = set()
 
     def evidence_due(self, binding, head_sha):
         return self.state.evidence_ready
@@ -67,7 +74,28 @@ class FixtureReviewAuthority:
             raise WorkflowAuthorityError("stale review authority")
         if self.state.head(pr) == head_sha:
             return None
-        return BoundReviewRound(binding, head_sha, self.state.head(pr) or None, self.state.guidance.get(pr, ""))
+        sequence = self.state.rounds.get(pr, 0) + 1
+        identity = ReviewRoundIdentity(ReviewExecutionBinding(binding, 1, f"execution:{pr}"),
+                                       f"round:{pr}:{sequence}", sequence)
+        # Prompt fixtures use opaque short heads; only their SQL-free plan needs
+        # a canonical commit-shaped value. Composed tests exercise real Git heads.
+        plan = ReviewRoundPlan(identity, hashlib.sha1(head_sha.encode()).hexdigest(), ReviewMode.SINGLE,
+                               RuntimeName.CLAUDE, ReviewSessionReuse.FRESH, sequence, 5)
+        return BoundReviewRound(binding, head_sha, self.state.head(pr) or None, self.state.guidance.get(pr, ""),
+                                plan, expected_claim_target,
+                                AgentKind.RE_REVIEW if self.state.head(pr) else AgentKind.REVIEW)
+
+    def stage(self, round, kind, names):
+        self._staged.add(round.plan.round.round_id)
+        return tuple(ReviewChildIdentity(round.plan.round, kind.value, name, kind) for name in names)
+
+    def stop(self, round, conclusion):
+        pass
+
+    def finish(self, round):
+        pr = round.binding.fence.key.target.number
+        if self.state.head(pr) == round.head_sha and round.plan.round.round_id in self._staged:
+            self.state.rounds[pr] = round.plan.displayed_round
 
     def patch_covered(self, round, patch_id):
         return self.state.patch(round.binding.fence.key.target.number) == patch_id

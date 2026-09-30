@@ -54,7 +54,7 @@ from ..domain.agent_task import RuntimeName
 from ..domain.review_execution import BlockedReviewExecutionMigration, CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
-from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed, classify_normal_review_return
+from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, classify_normal_review_return
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
     ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX, CeilingEscalation, ReviewSubmissionReceipt,
@@ -4437,6 +4437,9 @@ class SQLiteControlStore:
         role: str,
         issue: int,
         owner_id: str,
+        *,
+        expected_occurrence_id: str | None = None,
+        expected_process_identity: tuple[int, int] | None = None,
     ) -> bool:
         target = _dispatch_claim_target(issue)
         with self.transaction() as db:
@@ -4445,7 +4448,10 @@ class SQLiteControlStore:
                 "WHERE repository=? AND role=? AND target=? AND owner_id=?",
                 (repository, role, target, owner_id),
             ).fetchone()
-            if claim is None:
+            if (claim is None
+                    or (expected_occurrence_id is not None and claim["occurrence_id"] != expected_occurrence_id)
+                    or (expected_process_identity is not None
+                        and (claim["owner_pid"], claim["owner_start_ticks"]) != expected_process_identity)):
                 return False
             cursor = db.execute(
                 "DELETE FROM dispatch_claims "
@@ -5388,6 +5394,8 @@ class SQLiteControlStore:
         sealed_at = verified_review_completed_seal(
             db, repository, owner_id, selection.claim_occurrence_id, plan, planning,
         )
+        if isinstance(planning, ReviewPlanningSealed) and not isinstance(planning.conclusion, ReviewPlanningComplete):
+            raise WorkflowAuthorityError("review parent stopped planning and fenced child admission")
         if not isinstance(planning, ReviewPlanningOpen) and (
                 sealed_at is None or sealed_at.version > snapshot.revision.version):
             raise WorkflowAuthorityError("review child planning lacks an applicable completed seal")
@@ -5395,6 +5403,10 @@ class SQLiteControlStore:
             require_review_execution_eligibility(snapshot, plan.head_sha, plan.failure_ceiling)
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
+        from .review_execution_control import SQLiteReviewExecutionControl
+        recovery_hold = SQLiteReviewExecutionControl._pending_recovery_hold_in_tx(db, snapshot.execution)
+        if recovery_hold is not None:
+            raise WorkflowAuthorityError(recovery_hold)
         if (dispatch.get("repository") != repository or dispatch.get("role") != "review"
                 or dispatch.get("runtime") != plan.runtime.value
                 or type(dispatch.get("number")) is not int

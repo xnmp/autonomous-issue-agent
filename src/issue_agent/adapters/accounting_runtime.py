@@ -52,7 +52,7 @@ from .worktree import WorktreeUnavailable, capture_contract_revision
 from .workflow_control import SQLiteWorkflowControl
 from .workflow_codec import WorkflowEncodingError, encode_workflow
 from ..domain.agent_task import RuntimeName, run_input_fingerprint
-from ..domain.review_execution import ReviewChildIdentity
+from ..domain.review_execution import ReviewChildIdentity, review_child_budget_leg
 from ..domain.review_return import ReturnedReviewChild, review_returned_envelope
 from .control_store import (
     AccountingDisposition,
@@ -348,9 +348,10 @@ class AccountingRuntime(AgentRuntime):
             return _blocked("issue spend scope is unavailable")
         limits = list(self._limits(now, issue))
         primary, *additional = limits
+        budget_kind = review_child_budget_leg(review_child, kind or "") if review_child is not None else kind or ""
         try:
             maximum = self.budget_policy.maximum_for(
-                self.role, kind or ""
+                self.role, budget_kind
             )
         except KeyError as exc:
             return _blocked(str(exc))

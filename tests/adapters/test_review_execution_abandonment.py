@@ -360,3 +360,166 @@ def test_loader_refuses_orphan_abandonment_receipt_on_open_round(rig):
     with pytest.raises(WorkflowAuthorityError, match="abandonment fence"):
         current(store, selection)
     assert dump(store) == before
+
+
+def test_recovery_cannot_release_a_replacement_claim_from_an_old_liveness_sample(rig, monkeypatch):
+    from issue_agent.domain.actions import AgentKind
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+
+    def replace_dead_claim(*_):
+        assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+        assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+        return False
+
+    with monkeypatch.context() as patch:
+        patch.setattr(ProcessSupervisor, "matches_identity", staticmethod(replace_dead_claim))
+        assert control.reconcile_review_rounds().sealed == ()
+    replacement = store.active_dispatch_claims("o/r", "review")[0].claim_key
+    assert replacement != selection.claim_occurrence_id
+    sweep = control.reconcile_review_rounds()
+    assert sweep.finalized == (plan.round.round_id,)
+    assert store.active_dispatch_claims("o/r", "review")[0].claim_key == replacement
+
+
+def test_conditional_parent_release_refuses_a_changed_process_identity(rig):
+    store, _, _, selection, _ = rig
+    before = dump(store)
+    assert not store.release_dispatch_claim("o/r", "review", -9, OWNER,
+                                           expected_occurrence_id=selection.claim_occurrence_id,
+                                           expected_process_identity=(1, 1))
+    assert dump(store) == before
+
+
+def test_caught_abandonment_receipt_failure_cannot_commit_a_partial_fence(rig, monkeypatch):
+    from contextlib import contextmanager
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_abandonment BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='review-round-abandonment' BEGIN SELECT RAISE(ABORT,'abandonment refused'); END")
+    before = dump(store)
+    with store.transaction() as db:
+        @contextmanager
+        def borrowed_transaction():
+            yield db
+
+        monkeypatch.setattr(store, "transaction", borrowed_transaction)
+        with pytest.raises(sqlite3.IntegrityError, match="abandonment refused"):
+            control.seal_abandoned_planning(plan.round.round_id)
+    monkeypatch.undo()
+    assert dump(store) == before
+
+
+def test_full_pending_suffix_allows_money_settlement_and_existing_round_recovery(rig, monkeypatch):
+    from issue_agent.domain import review_preflight
+    from issue_agent.domain.outcome import AgentResult, ExitReason
+    from issue_agent.adapters.control_store import AccountingDisposition
+    from tests.adapters.test_review_execution_launch import register
+    from tests.adapters.test_review_execution_return import returned, settlement
+
+    monkeypatch.setattr(review_preflight, "MAX_EXECUTION_SUFFIX", 2)
+    store, _, _, selection, control = rig
+    paid = []
+    for index in (1, 2):
+        plan = control.preflight(replace(selection, request_id=f"recover-full:{index}",
+                                        expected=current(store, selection).revision))
+        child_stage = stage(plan)
+        control.register_stage(plan.round.round_id, current(store, selection).revision, child_stage)
+        proposed = request(child_stage.children[0], index=index, cap=200)
+        assert store.reserve(proposed).admitted
+        register(store, proposed)
+        control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+        paid.append(proposed)
+    with pytest.raises(ValueError, match="pending capacity"):
+        control.preflight(replace(selection, request_id="recover-full:refused",
+                                 expected=current(store, selection).revision))
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    failure = AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR)
+    for proposed in reversed(paid):
+        assert store.settle_review_return(settlement(proposed), returned(store, proposed, result=failure)).disposition is AccountingDisposition.AVAILABLE
+    sweep = control.reconcile_review_rounds()
+    assert set(sweep.finalized) == {proposed.review_child.round.round_id for proposed in paid}
+    assert sweep.blocked == ()
+    assert store.snapshot(paid[0].scope).committed.micros == 24
+    assert store.snapshot(paid[0].scope).reserved.micros == 0
+    assert current(store, selection).execution.state.failures == 5
+    before = dump(store)
+    assert control.reconcile_review_rounds().finalized == ()
+    assert dump(store) == before
+
+
+def test_recovery_limit_holds_new_allocation_but_retry_and_valid_settlement_clear_it(rig):
+    from issue_agent.domain.actions import AgentKind
+    from issue_agent.domain.outcome import AgentResult, ExitReason
+    from tests.adapters.test_review_execution_launch import register
+    from tests.adapters.test_review_execution_return import returned, settlement
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    child_stage = stage(plan)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, child_stage)
+    paid = request(child_stage.children[0])
+    assert store.reserve(paid).admitted
+    register(store, paid)
+    assert store.record_reservation_retained(paid.run_id, "actual launch returned no measured evidence")
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    for _ in range(8):
+        control.reconcile_review_rounds()
+    key = selection.expected.fence.key
+    assert control.pending_recovery_hold(key) is not None
+    assert store.claim_dispatch("o/r", "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
+    fresh = replace(selection, request_id="recovery-held:new",
+                    claim_occurrence_id=store.active_dispatch_claims("o/r", "review")[0].claim_key,
+                    expected=current(store, selection).revision)
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError, match="recovery limit"):
+        control.preflight(fresh)
+    assert dump(store) == before
+    assert control.preflight(selection) == plan
+    assert dump(store) == before
+    failure = AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR)
+    assert not store.settle_review_return(settlement(paid), returned(store, paid, result=failure)).idempotent
+    assert control.reconcile_review_rounds().finalized == (plan.round.round_id,)
+    assert control.pending_recovery_hold(key) is None
+    assert current(store, selection).execution.state.failures == 4
+    next_plan = control.preflight(replace(fresh, expected=current(store, selection).revision))
+    assert next_plan.round.sequence == 2
+    assert store.snapshot(paid.scope).committed.micros == 12
+
+
+@pytest.mark.parametrize("boundary", ["reservation", "launch"])
+def test_recovery_limit_refuses_late_child_purchase_and_launch_in_an_existing_round(rig, boundary):
+    from tests.adapters.test_review_execution_launch import register
+
+    store, _, _, selection, control = rig
+    first = control.preflight(selection)
+    first_stage = stage(first)
+    control.register_stage(first.round.round_id, current(store, selection).revision, first_stage)
+    unknown = request(first_stage.children[0], cap=200)
+    assert store.reserve(unknown).admitted
+    register(store, unknown)
+    assert store.record_reservation_retained(unknown.run_id, "launched usage remains unavailable")
+    control.seal_completed_planning(first.round.round_id, current(store, selection).revision)
+    second = control.preflight(replace(selection, request_id="before-recovery-limit:second",
+                                       expected=current(store, selection).revision))
+    second_stage = stage(second)
+    control.register_stage(second.round.round_id, current(store, selection).revision, second_stage)
+    late = request(second_stage.children[0], index=2, cap=200)
+    if boundary == "launch":
+        assert store.reserve(late).admitted
+    for _ in range(8):
+        control.reconcile_review_rounds()
+    assert control.pending_recovery_hold(selection.expected.fence.key) is not None
+    money = store.snapshot(unknown.scope)
+    if boundary == "reservation":
+        refusal = store.reserve(late)
+        assert not refusal.admitted and "recovery limit" in refusal.detail
+    else:
+        with pytest.raises(WorkflowAuthorityError, match="recovery limit"):
+            register(store, late)
+    assert store.snapshot(unknown.scope) == money
+    assert store.leases() == ()

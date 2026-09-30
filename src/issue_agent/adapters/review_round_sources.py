@@ -34,9 +34,6 @@ def read_review_round_sources(
         db, repository, parent_owner, selection.claim_occurrence_id,
         selection.claim_target, plan, planning,
     )
-    if (isinstance(planning, ReviewPlanningSealed)
-            and not isinstance(planning.conclusion, ReviewPlanningComplete)):
-        raise WorkflowAuthorityError("review planning conclusion lacks a source-backed writer")
     require_review_submission_receipts(
         db, repository, plan, selection.claim_occurrence_id, revision,
     )
@@ -46,6 +43,14 @@ def read_review_round_sources(
     if isinstance(planning, ReviewParentAbandoned):
         children = tuple(
             ReviewChildNotAdmitted(item.child, planning.abandonment_receipt)
+            if isinstance(item, ReviewChildPending) and _indexed_review_child_admission(
+                db, repository, item.child,
+            ) is None else item
+            for item in children
+        )
+    elif isinstance(planning, ReviewPlanningSealed) and not isinstance(planning.conclusion, ReviewPlanningComplete):
+        children = tuple(
+            ReviewChildNotAdmitted(item.child, planning.seal_receipt)
             if isinstance(item, ReviewChildPending) and _indexed_review_child_admission(
                 db, repository, item.child,
             ) is None else item

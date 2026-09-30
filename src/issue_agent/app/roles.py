@@ -31,6 +31,7 @@ from zoneinfo import ZoneInfo
 from ..adapters.agent_runner import AgentRunner
 from ..adapters.agent_publish import AgentPublicationBroker
 from ..adapters.control_store import (
+    ControlStoreError,
     LegacySpendMigrationError,
     ReservationRequest,
     ReservationResult,
@@ -185,7 +186,7 @@ from ..domain.infra_breaker import BreakerPolicy
 from .execute import Executor
 from .review_runtime import (
     ActiveReviewRuntime, ReviewDispatchPlan, configured_review_control,
-    review_guidance_reader, unproductive_round_keys,
+    review_guidance_reader, current_review_failures,
 )
 from .workflows.resolve_rearm import ResolveRearmWorkflow
 from .loop import Daemon
@@ -2955,17 +2956,17 @@ def compose_fix_daemon(
         workflow_control, rearm_workflow, recovery, owner_id,
     )
 def _review_unproductive_rounds(
-    store: Store, world, process_deaths: Mapping[int, int] | None, errors: dict[int, str],
+    control: SQLiteControlStore, repository: str, world, errors: dict[int, str],
 ) -> dict[int, int]:
-    """The unproductive-round counter per PR over `unproductive_round_keys` (shared with the hold source)."""
-    deaths = process_deaths or {}
-    return {
-        p.number: sum(
-            _control_value(errors, k, store.get_infra_deaths, 0, error_key=p.number) + deaths.get(k, 0)
-            for k in unproductive_round_keys(p)
-        )
-        for p in world.prs
-    }
+    """Current SQL allowance per target; unreadable authority withholds admission."""
+    counts = {}
+    for pr in world.prs:
+        try:
+            counts[pr.number] = current_review_failures(control, repository, pr.number)
+        except (WorkflowAuthorityError, ControlStoreError, sqlite3.Error, OSError) as exc:
+            errors[pr.number] = str(exc)
+            counts[pr.number] = 0
+    return counts
 
 
 def _fix_holds(control, repository: str, world, now: datetime) -> dict[int, FixHold]:
@@ -3304,7 +3305,7 @@ def compose_review_daemon(
         # decision `decide_bound_review` applies with exactly these counts.
         counter_errors: dict[int, str] = {}
         unproductive = _review_unproductive_rounds(
-            store, world, control.abandoned_dispatch_counts(owner_id), counter_errors
+            control, cfg.repo, world, counter_errors
         )
         plan = runtime.plan(world, rcfg, unproductive, counter_errors)
         errors: dict[int, str] = {**plan.errors, **counter_errors}
@@ -3503,6 +3504,8 @@ def _active_review_runtime(
     )
     return ActiveReviewRuntime(
         workflow, effects, gateway, review_bot=rcfg.review_bot, log=log,
+        mode=cfg.review_runtime.mode, runtime=cfg.review_runtime.runtime,
+        failure_ceiling=cfg.review_runtime.max_unproductive_rounds,
     )
 
 

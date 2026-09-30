@@ -95,6 +95,19 @@ class ReviewChildIdentity:
         identifier(self.child_id, "review child")
 
 
+def review_child_budget_leg(child: ReviewChildIdentity, parent_leg: str) -> str:
+    """Keep parent admission identity while selecting the configured child budget."""
+    if not isinstance(child, ReviewChildIdentity) or parent_leg not in {"REVIEW", "RE_REVIEW"}:
+        raise ValueError("review child budget requires its bound parent review leg")
+    if child.kind is ReviewChildKind.GATE:
+        return "REVIEW_GATE"
+    if child.kind is ReviewChildKind.DIMENSION:
+        return "REVIEW_" + child.child_id.upper().replace("-", "_")
+    if child.kind is ReviewChildKind.VALIDATOR:
+        return "VALIDATE_" + child.child_id.partition(":")[0].upper().replace("-", "_")
+    return parent_leg
+
+
 @dataclass(frozen=True)
 class ReviewChildAdmission:
     """One budget reservation attached to a planned child; no launch is implied."""

@@ -53,7 +53,7 @@ from ..domain.effect_retry import (
 from ..domain.events import Correlation, LevelChanged, TelemetryEvent
 from ..domain.ports import EventSink
 from .deployment_authority import DeploymentAuthority, deployment_role
-from .control_store import ControlStoreError
+from .control_store import ControlStoreError, PendingCommand
 from .durable_effects import DurableEffectRunner, EffectOutcome
 from .journal import alert
 from ..domain.review_workflow import PartialReviews, PullRequestState, PullRequestUnavailable, mark_review_body
@@ -773,6 +773,15 @@ class GitHubEffectExecutor:
         if _unresolved_workflow_command(pending):
             return self._reconcile_scheduled(pending, raise_unresolved=True)
         return self._run_bound_review_command(op, pending, raise_deferred=True)
+
+    def execute_registered_review(self, pending: PendingCommand) -> bool:
+        """Run an already registered round command through the same effect fences."""
+        if (not isinstance(pending, PendingCommand) or pending.command.workflow is None
+                or bound_submission_op(pending.command) is None):
+            raise ValueError("registered review execution requires its bound submission")
+        if _unresolved_workflow_command(pending):
+            return self._reconcile_scheduled(pending, raise_unresolved=True)
+        return self._run_submission(pending, raise_deferred=True)
 
     def _run_submission(self, pending, *, raise_deferred: bool) -> bool:
         op = bound_submission_op(pending.command)

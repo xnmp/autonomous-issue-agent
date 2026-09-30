@@ -31,6 +31,7 @@ from pathlib import Path
 import shlex
 import sqlite3
 import subprocess
+import sys
 
 from issue_agent.adapters.control_path import canonical_control_store_path
 from issue_agent.adapters.control_store import SQLiteControlStore
@@ -39,8 +40,9 @@ from issue_agent.adapters.store import Store
 from issue_agent.app import roles
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.domain.labels import Label
-from issue_agent.domain.outcome import AgentResult
+from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.recovery import RecoveryTrigger
+from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.review_workflow import ReviewWorkflowSnapshot
 from issue_agent.domain.workflow import KeepGuidance, OpenGate, OperatorActor, RearmingGate, RequestRearm
 from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowFamily, WorkflowKey
@@ -157,9 +159,25 @@ def create_review_deployment(root: Path, *, heads: int = 4, ceiling: int = CEILI
 
 
 def verdicts(*decisions: str) -> list[AgentResult]:
-    return [AgentResult(is_error=False, cost_usd=0.1, session_id=f"review-{index}",
+    return [AgentResult(is_error=False, exit_reason=ExitReason.OK, cost_usd=0.1, session_id=f"review-{index}",
                         structured={"decision": decision, "body": f"verdict {index}: {decision.lower()}"})
             for index, decision in enumerate(decisions)]
+
+
+def register_review_launch(task) -> None:
+    """Exercise the guarded launch boundary with an isolated local child."""
+    subprocess.run([sys.executable, "-c", """
+import os, sys
+from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
+from issue_agent.domain.contracts import RunId
+identity = ProcessSupervisor.process_identity(os.getpid())
+assert identity is not None
+SQLiteControlStore(sys.argv[1]).register_process_lease(
+    RunId(sys.argv[2]), expected_owner_id=sys.argv[3], pid=identity.pid,
+    pgid=os.getpgrp(), process_start_ticks=identity.start_ticks)
+""", task.env["ISSUE_AGENT_CONTROL_DB"], task.env["ISSUE_AGENT_RUN_ID"],
+                    task.env["ISSUE_AGENT_OWNER_ID"]], start_new_session=True, check=True)
 
 
 @dataclass
@@ -191,6 +209,24 @@ class ReviewComposition:
         assert isinstance(current, ReviewWorkflowSnapshot), current
         return current
 
+    def activate_execution(self, monkeypatch) -> None:
+        from issue_agent.app.review_execution_activation import (
+            ConfiguredReviewExecutionActivation, ReviewExecutionActivationScope, _observed_scope_sources,
+        )
+
+        self.workflow.ensure_observed_workflow(KEY)
+        remote = self.remote
+        monkeypatch.setattr(remote, "repo", self.cfg.repo, raising=False)
+        monkeypatch.setattr(remote, "get_review_pull_request", remote.get_pr, raising=False)
+        monkeypatch.setattr(remote, "_gh_json", lambda _: [[{"number": pr.number, "state": "open"}
+                             for pr in remote.build_review_world().prs if pr.state == "OPEN"]], raising=False)
+        scope = ReviewExecutionActivationScope("acceptance", self.cfg, remote)
+        files, links, sql = _observed_scope_sources(scope, self.review.control)
+        activation = ConfiguredReviewExecutionActivation(self.cfg, self.review.control, remote,
+                                                         Store(self.cfg.review_state_dir), liveness=lambda: ())
+        plan = activation.plan(files, links, sql)
+        activation.activate(plan, files, links, sql)
+
     def gates(self) -> list:
         return [gate.gate if isinstance(gate, RearmingGate) else gate for gate in self.state().gates]
 
@@ -221,17 +257,21 @@ class ReviewComposition:
 
 def compose_review(
     deployment: ReviewDeployment, *, fault: Callable[[str], None] = lambda _: None,
-    provider: ScriptedProvider | None = None, alerts: Path | None = None,
+    provider: ScriptedProvider | None = None, alerts: Path | None = None, mode: ReviewMode | None = None,
 ) -> ReviewComposition:
     """The production review daemon (``roles.compose_review_daemon``) over the deployment.
 
     `alerts` makes ALERT_CMD append each operator alert line to that file.
     """
     cfg = deployment.config()
+    if mode is not None:
+        cfg = replace(cfg, review_mode=mode)
     if alerts is not None:
         cfg = replace(cfg, alert_cmd=f"cat >> {shlex.quote(str(alerts))}")
     remote = deployment.github(fault)
     provider = provider or ScriptedProvider()
+    if provider.during is not register_review_launch:
+        provider.launch = register_review_launch
     log: list[str] = []
     review = roles.compose_review_daemon(cfg, remote, Store(cfg.review_state_dir), provider, log=log.append)
     return ReviewComposition(deployment, cfg, review, remote, provider, log)

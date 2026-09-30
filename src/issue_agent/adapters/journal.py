@@ -605,7 +605,7 @@ class JournalingRuntime:
         if isinstance(self.inner, ContextualRuntime):
             self.inner.set_context(
                 previous.role,
-                kind,
+                previous.kind if previous.review_child is not None else kind,
                 previous.number,
                 previous.issue,
                 claim_target=previous.claim_target,

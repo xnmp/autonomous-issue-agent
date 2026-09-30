@@ -18,26 +18,37 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 import sqlite3
 
-from ..adapters.control_store import ControlStoreError, SQLiteControlStore
+from ..adapters.control_store import ControlStoreError, SQLiteControlStore, _dispatch_claim_target
 from ..adapters.effects import GitHubEffectExecutor, UnknownEffectOutcome, bound_review_command_id
 from ..adapters.review_effects import (
     BoundReviewSubmissionOp, pull_request_observation, read_pull_request,
 )
 from ..adapters.review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
 from ..adapters.review_workflow_control import SQLiteReviewWorkflowControl, read_review_guidance
-from ..adapters.workflow_rows import WorkflowAuthorityError
+from ..adapters.review_execution_control import SQLiteReviewExecutionControl
+from ..adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
 from ..domain.actions import AgentKind
+from ..domain.contracts import CommandId, CommandKind, LifecycleCommand
 from ..domain.labels import Label
 from ..domain.lifecycle import retry_breaker
 from ..domain.fix import breaker_key
 from ..domain.review import (
-    UNPRODUCTIVE_ROUND_HOLD, ReviewConfig, ReviewExcluded, review_candidacy, review_eligibility,
+    UNPRODUCTIVE_ROUND_HOLD, ReviewConfig, ReviewExcluded, ReviewMode, review_candidacy, review_eligibility,
 )
 from ..domain.review_dispatch_record import (
     MAX_DEPARTED_READS, AdmissionOutcome, DecisionBasis, DecisionEntry, DecisionRead, DecisionUpdate,
     DepartedReadFailed, RecordedDispatch, ReviewDeferred, ReviewNotAdmitted, ReviewTerminal, admitted_decision,
 )
 from ..domain.review_evidence import ReviewEvidenceKind
+from ..domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
+from ..domain.review_execution import (
+    BlockedReviewExecutionMigration, CurrentReviewExecution, ReviewChildIdentity, ReviewChildKind,
+    compatible_review_session,
+)
+from ..domain.review_preflight import ReviewPreflightSelection
+from ..domain.review_rounds import ReviewStagePlan, ReviewSubmissionKind
+from ..domain.review_rounds import ReviewPlanningConclusion, ReviewPlanningOpen, ReviewPlanningSealed
+from ..adapters.workflow_codec import decode_workflow
 from ..domain.review_rejection import CountingRule
 from ..domain.review_workflow import (
     ObservedPullRequest, PartialReviews, PullRequestState, PullRequestUnavailable, ReviewedBaseline,
@@ -64,17 +75,6 @@ RECORD_FAILURE_REPORT_SECONDS = 900
 
 class _LinkedIssueDeferred(ValueError):
     """Linked-issue evidence is unavailable or waiting for its scheduled read."""
-
-
-def unproductive_round_keys(pr) -> frozenset[int]:
-    """The counter keys one PR's unproductive review rounds are recorded under.
-
-    New failures and recovered deaths use the stable `-PR` key; the linked
-    issue key (`breaker_key`) remains only for counters written before that
-    policy. Both the dispatch decision and the re-arm hold source sum exactly
-    this set, so they can never disagree about a tripped breaker.
-    """
-    return frozenset({breaker_key(pr), -pr.number})
 
 
 def trusted_external_holds(
@@ -137,13 +137,24 @@ def configured_review_control(
         control, gateway, repository=cfg.repo, owner_id=owner_id, ceiling=review.max_rejections,
         trigger_label=Label(review.trigger_label), review_bot=review.bot,
         external_holds=review_external_holds(
-            unproductive_rounds_reader(store, lambda: control.abandoned_dispatch_counts(owner_id)),
+            lambda view: current_review_failures(control, cfg.repo, view.number),
             review.max_unproductive_rounds,
             linked_holds=lambda observed, view: review_linked_issue_holds(control, gateway, observed.key, view),
         ),
         trailers=trailers if callable(trailers) else None,
         runtime_preflight=runtime_preflight,
     )
+
+
+def current_review_failures(control: SQLiteControlStore, repository: str, pr: int) -> int:
+    """The selected Current execution component owns the review failure allowance."""
+    with control.transaction() as db:
+        snapshot = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
+    if snapshot is None:
+        return 0
+    if not isinstance(snapshot.execution, CurrentReviewExecution):
+        raise WorkflowAuthorityError("review execution is blocked or requires activation")
+    return snapshot.execution.state.failures
 
 
 def review_guidance_reader(
@@ -193,13 +204,19 @@ class ActiveReviewRuntime:
 
     def __init__(
         self, control: SQLiteReviewWorkflowControl, effects: GitHubEffectExecutor, gateway: object, *,
-        review_bot: str, log: Callable[[str], None],
+        review_bot: str, log: Callable[[str], None], mode: ReviewMode = ReviewMode.SINGLE,
+        runtime: RuntimeName = RuntimeName.CLAUDE, failure_ceiling: int = 5,
     ) -> None:
         self.control = control
         self._effects = effects
         self._gateway = gateway
         self._review_bot = review_bot
         self._log = log
+        self._mode, self._runtime, self._failure_ceiling = mode, runtime, failure_ceiling
+        self.execution = SQLiteReviewExecutionControl(
+            control._control, control.writer, gateway,
+            preparation_control=control if control._runtime_preflight is not None else None,
+        )
         self._record_failures = 0
         self._record_failure_reported: datetime | None = None
 
@@ -234,6 +251,7 @@ class ActiveReviewRuntime:
             return 0
         progressed = 0
         for name, step in (
+            ("rounds", self._reconcile_rounds),
             ("submissions", self.control.reconcile_submissions),
             ("re-arms", self.control.reconcile_pending_rearms),
             ("holds", self.control.reconcile_holds),
@@ -243,6 +261,10 @@ class ActiveReviewRuntime:
             except (WorkflowAuthorityError, ControlStoreError, ValueError) as exc:
                 self._log(f"review workflow {name} reconciliation deferred: {exc}")
         return progressed
+
+    def _reconcile_rounds(self) -> int:
+        sweep = self.execution.reconcile_review_rounds()
+        return len(sweep.sealed) + len(sweep.finalized)
 
     # -- dispatch plan ---------------------------------------------------------------------
 
@@ -376,6 +398,15 @@ class ActiveReviewRuntime:
             if excluded is None:
                 errors[pr.number] = reason
             return ReviewDeferred(reason)
+        if not isinstance(state.execution, CurrentReviewExecution):
+            reason = ("review_execution_migration_blocked" if isinstance(state.execution, BlockedReviewExecutionMigration)
+                      else "review_execution_migration_required")
+            held[pr.number] = reason
+            return ReviewDeferred(reason)
+        recovery_hold = self.execution.pending_recovery_hold(key)
+        if recovery_hold is not None:
+            held[pr.number] = recovery_hold
+            return ReviewDeferred(recovery_hold)
         if not self.evidence_due(state.binding, observed.head_sha):
             held[pr.number] = "evidence read backing off"
             return ReviewDeferred(held[pr.number])
@@ -512,6 +543,8 @@ class ActiveReviewRuntime:
         state = self.control.load_workflow(key)
         if not isinstance(state, ReviewWorkflowSnapshot) or state.binding != binding:
             raise WorkflowAuthorityError("the review dispatch binding is no longer current")
+        if not isinstance(state.execution, CurrentReviewExecution):
+            raise WorkflowAuthorityError("review execution is blocked or requires activation")
         try:
             holds = self._scheduled_external_holds(observed, view)
         except _LinkedIssueDeferred as exc:
@@ -526,7 +559,60 @@ class ActiveReviewRuntime:
         continuation = state.episode.continuation
         baseline = (continuation.head_sha if isinstance(continuation, ReviewedBaseline)
                     and continuation.reviewed_generation == binding.fence.generation else None)
-        return BoundReviewRound(binding, observed.head_sha, baseline, state.episode.guidance, observed)
+        state = self.control.load_workflow(key)
+        if not isinstance(state, ReviewWorkflowSnapshot) or not isinstance(state.execution, CurrentReviewExecution):
+            raise WorkflowAuthorityError("review execution is no longer current")
+        with self.control._control.transaction() as db:
+            claim = db.execute("SELECT occurrence_id,leg FROM dispatch_claims "
+                               "WHERE repository=? AND role='review' AND target=? AND owner_id=?",
+                (self.repository, _dispatch_claim_target(expected_claim_target), self.control.writer.owner_id)).fetchone()
+        if claim is None:
+            raise WorkflowAuthorityError("review execution requires its exact parent claim")
+        selection = ReviewPreflightSelection(
+            f"review-preflight:{claim['occurrence_id']}", state.revision, state.execution.binding,
+            claim['occurrence_id'], expected_claim_target, observed, self.control._trigger,
+            self._mode, self._runtime, self._failure_ceiling,
+        )
+        plan = self.execution.preflight(selection)
+        session = compatible_review_session(state.execution.state.session, self._runtime, RUNTIME_CAPABILITIES[self._runtime])
+        return BoundReviewRound(binding, observed.head_sha, baseline, state.episode.guidance,
+                                plan, expected_claim_target, AgentKind[claim['leg']], session, observed)
+
+    def stage(self, bound: BoundReviewRound, kind: ReviewChildKind, names: tuple[str, ...]) -> tuple[ReviewChildIdentity, ...]:
+        children = tuple(ReviewChildIdentity(bound.plan.round, kind.value, name, kind) for name in names)
+        state = self.control.load_workflow(bound.binding.fence.key)
+        if not isinstance(state, ReviewWorkflowSnapshot):
+            raise WorkflowAuthorityError("review stage lacks its current aggregate")
+        self.execution.register_stage(bound.plan.round.round_id, state.revision, ReviewStagePlan(kind.value, kind, children))
+        return children
+
+    def finish(self, bound: BoundReviewRound) -> None:
+        state = self.control.load_workflow(bound.binding.fence.key)
+        if not isinstance(state, ReviewWorkflowSnapshot):
+            raise WorkflowAuthorityError("review completion lacks its current aggregate")
+        with self.control._control.transaction() as db:
+            stored = self.execution._stored_round(db, bound.plan.round.round_id)
+        if stored is None:
+            raise WorkflowAuthorityError("review completion lost its durable round")
+        planning = decode_workflow(stored[3]["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed)
+        if isinstance(planning, ReviewPlanningOpen):
+            self.execution.seal_completed_planning(bound.plan.round.round_id, state.revision)
+        for submission in stored[2].submissions:
+            self.control.settle_submission(CommandId(submission.command_id))
+        self.execution.finalize_completed_round(bound.plan.round.round_id)
+
+    def stop(self, bound: BoundReviewRound, conclusion: ReviewPlanningConclusion) -> None:
+        with self.control._control.transaction() as db:
+            stored = self.execution._stored_round(db, bound.plan.round.round_id)
+        if stored is None:
+            raise WorkflowAuthorityError("review stop lost its durable round")
+        planning = decode_workflow(stored[3]["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed)
+        if isinstance(planning, ReviewPlanningSealed):
+            return
+        state = self.control.load_workflow(bound.binding.fence.key)
+        if not isinstance(state, ReviewWorkflowSnapshot):
+            raise WorkflowAuthorityError("review stop lacks its current aggregate")
+        self.execution.seal_completed_planning(bound.plan.round.round_id, state.revision, conclusion)
 
     def _observed(self, bound: BoundReviewRound) -> ObservedPullRequest:
         observed = bound.observation
@@ -569,11 +655,23 @@ class ActiveReviewRuntime:
         counting = tuple(sorted(counted_past)) if escalate_cause == "ceiling" else ()
         command = bound_review_command_id(BoundReviewSubmissionOp(
             pr, event, body, bound.head_sha, self._review_bot, patch_id, escalate_cause, counting), bound.binding)
+        op = BoundReviewSubmissionOp(pr, event, body, bound.head_sha, self._review_bot, patch_id, escalate_cause, counting)
+        state = self.control.load_workflow(bound.binding.fence.key)
+        if not isinstance(state, ReviewWorkflowSnapshot):
+            raise WorkflowAuthorityError("review submission lacks its current aggregate")
+        with self.control._control.transaction() as db:
+            stored = self.execution._stored_round(db, bound.plan.round.round_id)
+        if stored is None:
+            raise WorkflowAuthorityError("review submission lacks its durable round")
+        pending = self.execution.register_submission(
+            bound.plan.round.round_id, state.revision,
+            LifecycleCommand(command, f"github:{command}", CommandKind.SUBMIT_REVIEW, f"pr:{pr}",
+                             bound.head_sha, op.payload(), self._effects.config_version,
+                             self.repository, self.control.writer.owner_id, workflow=bound.binding),
+            ReviewSubmissionKind.PAID if stored[2].stages else ReviewSubmissionKind.COPIED,
+        )
         try:
-            landed = self._effects.submit_bound_review(
-                pr, event, body, bound.head_sha, workflow=bound.binding, reviewer=self._review_bot,
-                patch_id=patch_id, escalate_cause=escalate_cause, non_resetting_commits=counting,
-            )
+            landed = self._effects.execute_registered_review(pending)
         except UnknownEffectOutcome as exc:
             # The drain settles it; dispatch holds on the unresolved submission.
             raise WorkflowAuthorityError(f"review submission outcome unresolved: {exc}") from exc
@@ -589,18 +687,6 @@ class ActiveReviewRuntime:
             raise
         if not landed:
             return False
-        try:
-            self.control.settle_submission(command)
-        except (WorkflowAuthorityError, ControlStoreError) as exc:
-            # The receipt is durable; the reconciliation pass applies it.
-            self._log(f"review #{pr}: submission landed; settlement deferred ({exc})")
+        # The outer driver closes planning before joint settlement. A crash
+        # leaves the same registered command for existing recovery to settle.
         return True
-
-
-def unproductive_rounds_reader(store, abandoned: Callable[[], Mapping[int, int]]) -> Callable[[object], int]:
-    """The review role's unproductive-round counter for one PR view, over `unproductive_round_keys`."""
-    def read(pr: object) -> int:
-        deaths = abandoned()
-        return sum(store.get_infra_deaths(key) + deaths.get(key, 0) for key in unproductive_round_keys(pr))
-
-    return read

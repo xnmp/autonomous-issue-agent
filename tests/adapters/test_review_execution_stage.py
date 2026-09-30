@@ -1,6 +1,7 @@
 """Ordered unpaid child-stage registration bound to one live review parent."""
 
 from dataclasses import replace
+from contextlib import contextmanager
 import sqlite3
 import subprocess
 import sys
@@ -12,7 +13,7 @@ from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, WorkflowRevisionConflict
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.review import ReviewMode
-from issue_agent.domain.review_execution import ReviewChildIdentity, ReviewChildKind
+from issue_agent.domain.review_execution import ReviewChildIdentity, ReviewChildKind, ReviewPinDeferred
 from issue_agent.domain.review_rounds import ReviewPlanningComplete, ReviewPlanningSealed, ReviewRoundPlan, ReviewStagePlan
 from tests.adapters.test_review_execution_control import OWNER, assert_unpaid, current, dump, rig
 
@@ -410,3 +411,179 @@ def test_a_retained_stage_receipt_prevents_erasing_the_stage_and_registering_a_r
         control.register_stage(initial.round.round_id, expected, replacement)
     assert dump(store) == before
     assert_unpaid(store)
+
+
+def test_stopped_parent_seal_proves_no_admission_and_refuses_late_purchase(rig):
+    from tests.adapters.test_review_execution_admission import request
+    from issue_agent.domain.review_rounds import FinalizedReviewRound
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    planned = control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    expected = current(store, selection).revision
+    prior_pins = current(store, selection).execution.state.pin_deferrals
+    conclusion = ReviewPinDeferred("harness-pin:verified")
+    sealed = control.seal_completed_planning(plan.round.round_id, expected, conclusion)
+    before = dump(store)
+    assert control.seal_completed_planning(plan.round.round_id, expected, conclusion) == sealed
+    assert dump(store) == before
+    with pytest.raises(WorkflowAuthorityError, match="conflicting conclusion"):
+        control.seal_completed_planning(plan.round.round_id, expected, ReviewPinDeferred("different"))
+    assert not store.reserve(request(planned.children[0])).admitted
+    finalized = control.finalize_completed_round(plan.round.round_id)
+    assert isinstance(finalized, FinalizedReviewRound)
+    assert isinstance(finalized.outcome.disposition, ReviewPinDeferred)
+    assert current(store, selection).execution.state.pin_deferrals == prior_pins + 1
+    assert_unpaid(store)
+
+
+def test_caught_stopped_seal_failure_cannot_commit_partial_planning(rig, monkeypatch):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    expected = current(store, selection).revision
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_stopped_seal BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='review-round-seal' BEGIN SELECT RAISE(ABORT,'stop refused'); END")
+    before = dump(store)
+    with store.transaction() as db:
+        @contextmanager
+        def borrowed_transaction():
+            yield db
+
+        monkeypatch.setattr(store, "transaction", borrowed_transaction)
+        with pytest.raises(sqlite3.IntegrityError, match="stop refused"):
+            control.seal_completed_planning(plan.round.round_id, expected, ReviewPinDeferred("harness-pin:verified"))
+    monkeypatch.undo()
+    assert dump(store) == before
+    assert_unpaid(store)
+
+
+def test_stopped_multi_parent_preserves_admitted_sibling_spending(rig):
+    from issue_agent.adapters.control_store import AccountingDisposition
+    from issue_agent.domain.outcome import AgentResult, ExitReason
+    from issue_agent.domain.review_rounds import FinalizedReviewRound
+    from tests.adapters.test_review_execution_admission import request
+    from tests.adapters.test_review_execution_launch import register
+    from tests.adapters.test_review_execution_return import returned, settlement
+
+    store, _, _, selection, control = rig
+    selection = replace(selection, mode=ReviewMode.MULTI)
+    plan = control.preflight(selection)
+    gate = stage(plan, ReviewChildKind.GATE, name="gate", child="gate")
+    control.register_stage(plan.round.round_id, current(store, selection).revision, gate)
+    gate_run = request(gate.children[0])
+    assert store.reserve(gate_run).admitted
+    register(store, gate_run)
+    assert store.settle_review_return(settlement(gate_run), returned(store, gate_run)).disposition is AccountingDisposition.AVAILABLE
+    children = tuple(ReviewChildIdentity(plan.round, "dimensions", name, ReviewChildKind.DIMENSION)
+                     for name in ("correctness", "security"))
+    control.register_stage(plan.round.round_id, current(store, selection).revision,
+                           ReviewStagePlan("dimensions", ReviewChildKind.DIMENSION, children))
+    sibling = request(children[0], index=2)
+    assert store.reserve(sibling).admitted
+    register(store, sibling)
+    failure = AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR)
+    assert store.settle_review_return(settlement(sibling), returned(store, sibling, result=failure)).disposition is AccountingDisposition.AVAILABLE
+    money = store.snapshot(sibling.scope)
+    control.seal_completed_planning(plan.round.round_id, current(store, selection).revision,
+                                    ReviewPinDeferred("harness-pin:stopped-sibling"))
+    assert not store.reserve(request(children[1], index=3)).admitted
+    result = control.finalize_completed_round(plan.round.round_id)
+    assert isinstance(result, FinalizedReviewRound) and isinstance(result.outcome.disposition, ReviewPinDeferred)
+    assert store.snapshot(sibling.scope) == money and money.committed.micros == 24
+    before = dump(store)
+    assert control.finalize_completed_round(plan.round.round_id) == result
+    assert dump(store) == before
+
+
+def test_a_forged_stopped_conclusion_cannot_prove_absence_of_child_admission(rig):
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    sealed = control.seal_completed_planning(plan.round.round_id, current(store, selection).revision,
+                                             ReviewPinDeferred("harness-pin:verified"))
+    with store.transaction() as db:
+        db.execute("UPDATE review_execution_rounds SET planning_json=? WHERE round_id=?",
+                   (encode_workflow(replace(sealed, conclusion=ReviewPinDeferred("forged"))), plan.round.round_id))
+    before = dump(store)
+    with pytest.raises(WorkflowAuthorityError):
+        control.finalize_completed_round(plan.round.round_id)
+    assert dump(store) == before
+    assert_unpaid(store)
+
+
+def test_parent_departure_after_pin_stop_retains_its_conclusion_and_recovers(rig):
+    from tests.adapters.test_review_execution_admission import request
+    from issue_agent.domain.review_rounds import FinalizedReviewRound, ReviewSealedParentAbandoned
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    planned = control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    prior_pins = current(store, selection).execution.state.pin_deferrals
+    sealed = control.seal_completed_planning(plan.round.round_id, current(store, selection).revision,
+                                             ReviewPinDeferred("harness-pin:verified"))
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    sweep = control.reconcile_review_rounds()
+    assert sweep.blocked == () and sweep.finalized == (plan.round.round_id,)
+    with store.transaction() as db:
+        planning = decode_workflow(db.execute("SELECT planning_json FROM review_execution_rounds").fetchone()[0],
+                                   ReviewSealedParentAbandoned)
+    assert planning.completed_seal == sealed
+    assert current(store, selection).execution.state.pin_deferrals == prior_pins + 1
+    assert not store.reserve(request(planned.children[0])).admitted
+    before = dump(store)
+    result = control.finalize_abandoned_round(plan.round.round_id)
+    assert isinstance(result, FinalizedReviewRound) and isinstance(result.outcome.disposition, ReviewPinDeferred)
+    assert dump(store) == before
+    assert_unpaid(store)
+
+
+def test_stopped_empty_parent_refusal_is_preserved_after_departure(rig):
+    from issue_agent.domain.review_rounds import ReviewPlanningRefused
+    from issue_agent.domain.review_execution import ReviewAdmissionRefused
+    from issue_agent.domain.review_rounds import FinalizedReviewRound
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    refusal = ReviewPlanningRefused("harness-preparation:unavailable")
+    control.seal_completed_planning(plan.round.round_id, current(store, selection).revision, refusal)
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    sweep = control.reconcile_review_rounds()
+    assert sweep.blocked == () and sweep.finalized == (plan.round.round_id,)
+    result = control.finalize_abandoned_round(plan.round.round_id)
+    assert isinstance(result, FinalizedReviewRound) and isinstance(result.outcome.disposition, ReviewAdmissionRefused)
+    assert_unpaid(store)
+
+
+def test_stopped_parent_waits_for_admitted_return_after_departure(rig):
+    from issue_agent.adapters.control_store import AccountingDisposition
+    from issue_agent.domain.review_rounds import FinalizedReviewRound, ReviewRoundAwaitingEvidence
+    from tests.adapters.test_review_execution_admission import request
+    from tests.adapters.test_review_execution_launch import register
+    from tests.adapters.test_review_execution_return import returned, settlement
+
+    store, _, _, selection, control = rig
+    plan = control.preflight(selection)
+    planned = control.register_stage(plan.round.round_id, current(store, selection).revision, stage(plan))
+    paid = request(planned.children[0])
+    assert store.reserve(paid).admitted
+    register(store, paid)
+    money = store.snapshot(paid.scope)
+    stopped = ReviewPinDeferred("harness-pin:after-admission")
+    control.seal_completed_planning(plan.round.round_id, current(store, selection).revision, stopped)
+    assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
+    sweep = control.reconcile_review_rounds()
+    assert sweep.blocked == () and sweep.finalized == ()
+    assert isinstance(control.finalize_abandoned_round(plan.round.round_id), ReviewRoundAwaitingEvidence)
+    assert store.snapshot(paid.scope) == money and money.reserved.micros == 60
+    evidence = returned(store, paid)
+    charge = settlement(paid)
+    assert store.settle_review_return(charge, evidence).disposition is AccountingDisposition.AVAILABLE
+    result = control.finalize_abandoned_round(plan.round.round_id)
+    assert isinstance(result, FinalizedReviewRound) and isinstance(result.outcome.disposition, ReviewPinDeferred)
+    assert store.snapshot(paid.scope).committed.micros == 12
+    before = dump(store)
+    assert store.settle_review_return(charge, evidence).idempotent
+    assert control.finalize_abandoned_round(plan.round.round_id) == result
+    assert dump(store) == before

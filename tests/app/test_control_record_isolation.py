@@ -99,20 +99,24 @@ def test_missing_activation_is_a_hold_not_a_fresh_allowance(tmp_path):
     assert not decide_fix(world, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
 
 
-def test_corrupt_review_counter_holds_only_affected_pr(tmp_path):
-    store = Store(str(tmp_path))
-    (tmp_path / "issue--1.infra-deaths").write_text("oops")
+from tests.adapters.test_review_execution_control import rig
+
+
+def test_corrupt_current_review_allowance_holds_only_affected_pr(rig):
+    control, _, _, _, _ = rig
+    with control.transaction() as db:
+        db.execute("UPDATE workflows SET episode_json='oops' WHERE target_kind='pr' AND target_number=9")
     world = WorldState(prs=tuple(
         PRView(n, labels=frozenset({Label.AI_PR_OPEN}), head_ref_oid=f"h{n}")
-        for n in (1, 2)
+        for n in (9, 10)
     ))
     errors = {}
-    rounds = _review_unproductive_rounds(store, world, None, errors)
-    state = BoundReviewState(owed={n: (AgentKind.REVIEW, review_binding(n)) for n in (1, 2)},
+    rounds = _review_unproductive_rounds(control, "o/r", world, errors)
+    state = BoundReviewState(owed={n: (AgentKind.REVIEW, review_binding(n)) for n in (9, 10)},
                              unproductive_rounds=rounds, control_errors=errors)
     actions = decide_bound_review(world, ReviewConfig(review_bot="review-bot"), state)
-    assert [a.number for a in actions if isinstance(a, RunAgent)] == [2]
-    assert "issue--1.infra-deaths" in state.control_errors[1]
+    assert [a.number for a in actions if isinstance(a, RunAgent)] == [10]
+    assert errors[9]
 
 
 @pytest.mark.parametrize("raw", [

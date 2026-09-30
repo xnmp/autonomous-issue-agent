@@ -47,6 +47,8 @@ def active():
 
 def exhausted(snapshot, selection):
     state = replace(snapshot.execution.state, failures=5)
+    from issue_agent.domain.review_execution import CurrentReviewExecution
+    assert isinstance(snapshot.execution, CurrentReviewExecution)
     execution = replace(snapshot.execution, baseline=replace(snapshot.execution.baseline, state=state), state=state)
     return replace(snapshot, execution=execution), selection
 
@@ -61,6 +63,23 @@ def test_preflight_allocates_one_unpaid_round_from_current_snapshot():
     assert plan.session_reuse is ReviewSessionReuse.FRESH
     assert plan.children == () and plan.submissions == ()
     assert snapshot.execution.last_sequence == 0
+
+
+@pytest.mark.parametrize("runtime,expected", [(RuntimeName.CLAUDE, ReviewSessionReuse.REUSABLE),
+                                            (RuntimeName.GLM, ReviewSessionReuse.FRESH),
+                                            (RuntimeName.CODEX, ReviewSessionReuse.FRESH)])
+def test_current_session_reuse_requires_same_runtime_and_preserved_sandbox(runtime, expected):
+    from issue_agent.domain.review_execution import ImportedReviewSession, ReusableReviewSession
+
+    snapshot, selection = active()
+    state = replace(snapshot.execution.state,
+                    session=ReusableReviewSession(RuntimeName.CLAUDE, "old-compatible-session", ImportedReviewSession("import:verified")))
+    from issue_agent.domain.review_execution import CurrentReviewExecution
+    assert isinstance(snapshot.execution, CurrentReviewExecution)
+    execution = replace(snapshot.execution, baseline=replace(snapshot.execution.baseline, state=state), state=state)
+    snapshot = replace(snapshot, execution=execution)
+    plan = plan_review_preflight(snapshot, replace(selection, runtime=runtime), now=NOW)
+    assert plan.session_reuse is expected
 
 
 @pytest.mark.parametrize("change", [
