@@ -41,6 +41,9 @@ from issue_agent.domain.review_execution import (
     review_generation_chain_digest, review_generation_receipt_id, review_generation_within_frontier,
     plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
     build_review_execution_checkpoint_receipt,
+    CurrentReviewExecution, OpenReviewExecutionRound, CompletedReviewExecutionRound,
+    allocate_current_review_round, reduce_current_review_execution,
+    finalize_current_review_round, advance_current_review_generation,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
 from issue_agent.domain.workflow import ObservedTransition, WorkflowMutation
@@ -1194,3 +1197,187 @@ def test_snapshot_and_family_envelope_require_an_explicit_typed_execution_compon
         replace(state, execution=component)
     with pytest.raises(ValueError, match="typed execution component"):
         ReviewFamilyEpisodes(state.authority, state.episode, component)
+
+
+def current_execution(**state):
+    initial = checkpoint(**state)
+    return CurrentReviewExecution(
+        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:verified"),
+        initial, initial.state, 0, 0,
+    )
+
+
+def allocate_pending(execution, count):
+    pending = ()
+    for _ in range(count):
+        execution, round = allocate_current_review_round(execution, f"round:{execution.last_sequence + 1}")
+        pending += (OpenReviewExecutionRound(round),)
+    return execution, pending
+
+
+@pytest.mark.parametrize("outcomes", [
+    (failed(1), productive(2, handle="earlier", display=7), failed(3),
+     productive(4, clear=True, display=8), copied(5)),
+    (pin(1), pin(2), failed(3), copied(4), pin(5)),
+    (productive(1, handle="earlier"), productive(2, clear=True),
+     copied(3), productive(4, handle="latest"), failed(5)),
+])
+def test_generation_local_reduction_matches_full_ordered_oracle_for_every_delivery_order(outcomes):
+    initial = current_execution(failures=3, pin_deferrals=2, policy=ReviewExecutionPolicy(1))
+    for delivery in permutations(outcomes):
+        execution, pending = allocate_pending(initial, len(outcomes))
+        delivered = ()
+        for outcome in delivery:
+            result = finalize_current_review_round(execution, pending, outcome)
+            execution, pending = result.execution, result.pending
+            delivered += (outcome,)
+            oracle = project_review_execution(initial.baseline, delivered)
+            assert execution.state == oracle.state
+            assert execution.baseline == oracle.checkpoint
+        assert pending == ()
+        assert execution.baseline.through_sequence == len(outcomes)
+
+
+def test_generation_local_open_gap_completion_keeps_later_debit_and_session_clear():
+    execution, pending = allocate_pending(current_execution(failures=4), 3)
+    for outcome in (productive(3, clear=True, display=3), failed(2)):
+        result = finalize_current_review_round(execution, pending, outcome)
+        execution, pending = result.execution, result.pending
+    assert execution.state.failures == 0
+    assert isinstance(execution.state.session, NoReviewSession)
+    result = finalize_current_review_round(execution, pending, productive(1, handle="late-old-session"))
+    assert result.execution.state.failures == 0
+    assert isinstance(result.execution.state.session, NoReviewSession)
+    assert result.execution.state.session_sequence == 3
+    assert result.pending == ()
+
+    execution, pending = allocate_pending(current_execution(), 3)
+    for outcome in (failed(3), productive(2, handle="later")):
+        result = finalize_current_review_round(execution, pending, outcome)
+        execution, pending = result.execution, result.pending
+    result = finalize_current_review_round(execution, pending, productive(1, handle="earlier"))
+    assert result.execution.state.failures == 1
+    assert result.execution.state.session.handle == "later"
+
+
+def test_current_generation_advance_freezes_open_gap_projection_and_releases_suffix_capacity():
+    execution, pending = allocate_pending(current_execution(failures=2), 3)
+    result = finalize_current_review_round(execution, pending, productive(2, handle="cleared", display=7))
+    result = finalize_current_review_round(result.execution, result.pending, failed(3))
+    old_execution = result.execution
+    advanced, receipt = advance_current_review_generation(
+        old_execution, result.pending, WorkflowRevision(binding().rejection.fence, 4),
+        WorkflowRevision(binding(1).rejection.fence, 5), WorkflowMutation.REQUEST_REARM,
+    )
+    assert advanced.state.failures == 1
+    assert advanced.state.displayed_round == 7
+    assert isinstance(advanced.state.session, NoReviewSession)
+    assert receipt.before == old_execution.state and receipt.after == advanced.state
+    assert receipt.applied_sequences == (2, 3)
+    assert reduce_current_review_execution(advanced, ()).execution == advanced
+    with pytest.raises(ValueError, match="stale generation"):
+        finalize_current_review_round(advanced, (), failed(1))
+    new, round = allocate_current_review_round(advanced, "new-round")
+    final = finalize_current_review_round(new, (OpenReviewExecutionRound(round),),
+                                          ReviewRoundOutcome(round, ReviewPinDeferred("new-pin")))
+    assert final.execution.state.failures == 1
+    assert final.execution.state.pin_deferrals == 1
+
+
+def test_current_pending_duplicate_delivery_is_inert_and_conflicting_identity_refuses():
+    execution, pending = allocate_pending(current_execution(), 2)
+    result = finalize_current_review_round(execution, pending, failed(2))
+    assert finalize_current_review_round(result.execution, result.pending, failed(2)) == result
+    for conflict in (copied(2), ReviewRoundOutcome(replace(round_id(2), round_id="foreign"),
+                                                 CopiedReviewProgress("changed")), copied(3)):
+        with pytest.raises(ValueError, match="conflicting|exact allocated"):
+            finalize_current_review_round(result.execution, result.pending, conflict)
+    completed = finalize_current_review_round(result.execution, result.pending, failed(1))
+    with pytest.raises(ValueError, match="exact receipt"):
+        finalize_current_review_round(completed.execution, (), failed(1))
+
+
+@pytest.mark.parametrize("bad", [None, [], (None,), ()])
+def test_current_reducer_requires_complete_typed_pending_identity_range(bad):
+    execution, _ = allocate_pending(current_execution(), 1)
+    with pytest.raises(ValueError):
+        reduce_current_review_execution(execution, bad)
+
+
+def test_current_reducer_refuses_foreign_future_duplicate_and_missing_allocations():
+    execution, pending = allocate_pending(current_execution(), 2)
+    for bad in ((pending[0], pending[0]),
+                (pending[0], OpenReviewExecutionRound(round_id(3))),
+                (pending[0], OpenReviewExecutionRound(round_id(2, captured=binding(1)))),
+                (pending[0], OpenReviewExecutionRound(replace(round_id(2), round_id="round:1")))):
+        with pytest.raises(ValueError, match="foreign|conflicting"):
+            reduce_current_review_execution(execution, bad)
+    for foreign in (copied(1, captured=binding(1)),
+                    copied(1, captured=replace(binding(), execution_episode="foreign"))):
+        with pytest.raises(ValueError, match="foreign"):
+            finalize_current_review_round(execution, pending, foreign)
+    with pytest.raises(ValueError, match="pending projection"):
+        finalize_current_review_round(replace(execution, state=replace(execution.state, failures=9)),
+                                      pending, failed(1))
+
+
+def test_current_capacity_counts_all_allocated_pending_work_and_recovers_obstructing_round():
+    initial = current_execution()
+    execution, pending = allocate_pending(initial, MAX_EXECUTION_SUFFIX)
+    with pytest.raises(ValueError, match="capacity"):
+        allocate_current_review_round(execution, "over-capacity")
+    completed_later = (pending[0],) + tuple(CompletedReviewExecutionRound(failed(item.round.sequence))
+                                         for item in pending[1:])
+    result = reduce_current_review_execution(execution, completed_later)
+    assert result.execution.state.failures == MAX_EXECUTION_SUFFIX - 1
+    assert result.execution.baseline.through_sequence == 0
+    with pytest.raises(ValueError, match="capacity"):
+        allocate_current_review_round(result.execution, "still-over-capacity")
+    recovered = finalize_current_review_round(result.execution, result.pending, failed(1))
+    assert recovered.execution.state.failures == MAX_EXECUTION_SUFFIX and recovered.pending == ()
+    next_execution, round = allocate_current_review_round(recovered.execution, "recovery-admitted")
+    assert round.sequence == MAX_EXECUTION_SUFFIX + 1
+    assert next_execution.last_sequence == round.sequence
+
+
+def test_current_authority_has_no_lifetime_round_or_zero_round_generation_limit():
+    execution = current_execution()
+    for sequence in range(1, 5001):
+        execution, round = allocate_current_review_round(execution, f"round:{sequence}")
+        execution = finalize_current_review_round(execution, (OpenReviewExecutionRound(round),),
+                                                  failed(sequence)).execution
+    assert execution.state.failures == 5000
+    assert execution.baseline.through_sequence == 5000
+    for generation in range(1, MAX_EXECUTION_SUFFIX + 2):
+        execution, receipt = advance_current_review_generation(
+            execution, (), WorkflowRevision(binding(generation - 1).rejection.fence, generation + 3),
+            WorkflowRevision(binding(generation).rejection.fence, generation + 4),
+            WorkflowMutation.REQUEST_REARM,
+        )
+        assert receipt.applied_sequences == ()
+    assert execution.binding.rejection.fence.generation == MAX_EXECUTION_SUFFIX + 1
+    assert execution.state.failures == 5000 and execution.last_sequence == 5000
+
+
+@pytest.mark.parametrize("field,value", [
+    ("generation_start_sequence", -1), ("generation_start_sequence", True),
+    ("generation_start_sequence", 1), ("last_sequence", None),
+    ("last_sequence", 2**63), ("last_sequence", MAX_EXECUTION_SUFFIX + 1),
+    ("origin", None), ("state", None), ("baseline", None),
+])
+def test_current_authority_refuses_malformed_or_contradictory_active_state(field, value):
+    with pytest.raises(ValueError):
+        replace(current_execution(), **{field: value})
+
+
+def test_current_authority_refuses_foreign_baseline_future_watermarks_and_invented_fresh_allowance():
+    current = current_execution()
+    with pytest.raises(ValueError, match="binding"):
+        replace(current, baseline=checkpoint(captured=binding(1)))
+    with pytest.raises(ValueError, match="future"):
+        replace(current, state=replace(current.state, productive_sequence=2), last_sequence=1)
+    with pytest.raises(ValueError, match="completed baseline"):
+        replace(current, state=replace(current.state, failures=9))
+    imported = current_execution(failures=2)
+    with pytest.raises(ValueError, match="fresh execution"):
+        replace(imported, origin=ReviewExecutionOrigin(ReviewExecutionOriginKind.INITIALIZED, "new"))

@@ -1236,6 +1236,85 @@ ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution
 
 
 @dataclass(frozen=True)
+class CurrentReviewExecution:
+    """Generation-local authority under ADR 0016; retained work lives outside it.
+
+    ``ActivatedReviewExecution`` remains the legacy adapter encoding until the
+    stopped-writer conversion. Current authority never contains its ancestry.
+    """
+
+    origin: ReviewExecutionOrigin
+    baseline: ReviewExecutionCheckpoint
+    state: ReviewExecutionState
+    generation_start_sequence: int
+    last_sequence: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionOrigin)
+                or not isinstance(self.baseline, ReviewExecutionCheckpoint)
+                or not isinstance(self.state, ReviewExecutionState)):
+            raise ValueError("current execution requires typed origin, baseline and state")
+        integer(self.generation_start_sequence, "generation start sequence")
+        integer(self.last_sequence, "last allocated review round")
+        if (self.baseline.boundary_cursor is not None
+                or self.baseline.state.binding != self.state.binding):
+            raise ValueError("current execution baseline requires the current generation binding")
+        if not self.generation_start_sequence <= self.baseline.through_sequence <= self.last_sequence:
+            raise ValueError("current execution baseline exceeds its allocated generation range")
+        if self.last_sequence - self.baseline.through_sequence > MAX_EXECUTION_SUFFIX:
+            raise ValueError("current execution pending capacity is exhausted")
+        if max(self.state.session_sequence, self.state.display_sequence,
+               self.state.productive_sequence) > self.last_sequence:
+            raise ValueError("current execution state contains a future outcome")
+        if self.baseline.through_sequence == self.last_sequence and self.baseline.state != self.state:
+            raise ValueError("current execution state disagrees with its completed baseline")
+        for state in (self.baseline.state, self.state):
+            if (isinstance(state.session, ReusableReviewSession)
+                    and isinstance(state.session.source, ImportedReviewSession)
+                    and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED):
+                raise ValueError("an imported session requires an imported execution origin")
+        if (self.last_sequence == 0 and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED
+                and (self.state.failures or self.state.pin_deferrals
+                     or not isinstance(self.state.session, NoReviewSession))):
+            raise ValueError("a fresh execution origin cannot invent prior allowance or session")
+
+    @property
+    def binding(self) -> ReviewExecutionBinding:
+        return self.state.binding
+
+
+@dataclass(frozen=True)
+class OpenReviewExecutionRound:
+    round: ReviewRoundIdentity
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.round, ReviewRoundIdentity):
+            raise ValueError("open execution round requires its allocated identity")
+
+
+@dataclass(frozen=True)
+class CompletedReviewExecutionRound:
+    outcome: ReviewRoundOutcome
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.outcome, ReviewRoundOutcome):
+            raise ValueError("completed execution round requires its typed outcome")
+
+    @property
+    def round(self) -> ReviewRoundIdentity:
+        return self.outcome.round
+
+
+PendingReviewExecutionRound = OpenReviewExecutionRound | CompletedReviewExecutionRound
+
+
+@dataclass(frozen=True)
+class ReviewExecutionReduction:
+    execution: CurrentReviewExecution
+    pending: tuple[PendingReviewExecutionRound, ...]
+
+
+@dataclass(frozen=True)
 class ReviewExecutionProjection:
     state: ReviewExecutionState
     checkpoint: ReviewExecutionCheckpoint
@@ -1662,6 +1741,111 @@ def project_review_execution(
         if sequence == prefix.through_sequence + 1:
             prefix = ReviewExecutionCheckpoint(sequence, state, checkpoint.policy, checkpoint.boundary_cursor)
     return ReviewExecutionProjection(state, prefix, max(ordered, default=checkpoint.through_sequence))
+
+
+def allocate_current_review_round(
+    execution: CurrentReviewExecution, round_id: str,
+) -> tuple[CurrentReviewExecution, ReviewRoundIdentity]:
+    """Allocate no partial identity when unresolved work is at capacity.
+
+    The adapter enforces round-id uniqueness against retained SQL identities.
+    """
+    if not isinstance(execution, CurrentReviewExecution):
+        raise ValueError("round allocation requires current execution authority")
+    if execution.last_sequence - execution.baseline.through_sequence >= MAX_EXECUTION_SUFFIX:
+        raise ValueError("current execution pending capacity is exhausted")
+    round = ReviewRoundIdentity(execution.binding, round_id, execution.last_sequence + 1)
+    return replace(execution, last_sequence=round.sequence), round
+
+
+def reduce_current_review_execution(
+    execution: CurrentReviewExecution, pending: tuple[PendingReviewExecutionRound, ...],
+) -> ReviewExecutionReduction:
+    """Recompute only allocated unresolved work and retire its completed prefix."""
+    if not isinstance(execution, CurrentReviewExecution):
+        raise ValueError("execution reduction requires current authority")
+    if (not isinstance(pending, tuple) or len(pending) > MAX_EXECUTION_SUFFIX
+            or len(pending) != execution.last_sequence - execution.baseline.through_sequence):
+        raise ValueError("execution reduction requires the complete bounded pending range")
+    ordered: dict[int, PendingReviewExecutionRound] = {}
+    identities: set[str] = set()
+    for item in pending:
+        if not isinstance(item, (OpenReviewExecutionRound, CompletedReviewExecutionRound)):
+            raise ValueError("execution pending range contains an untyped round")
+        round = item.round
+        if (round.binding != execution.binding
+                or not execution.baseline.through_sequence < round.sequence <= execution.last_sequence):
+            raise ValueError("execution pending round belongs to a foreign or unallocated identity")
+        if round.sequence in ordered or round.round_id in identities:
+            raise ValueError("execution pending range has conflicting round identities")
+        ordered[round.sequence] = item
+        identities.add(round.round_id)
+    state, baseline = execution.baseline.state, execution.baseline
+    for sequence, item in sorted(ordered.items()):
+        if isinstance(item, CompletedReviewExecutionRound):
+            state = _apply(state, item.outcome, baseline.policy)
+            if sequence == baseline.through_sequence + 1:
+                baseline = ReviewExecutionCheckpoint(sequence, state, baseline.policy)
+    return ReviewExecutionReduction(
+        replace(execution, baseline=baseline, state=state),
+        tuple(item for sequence, item in sorted(ordered.items()) if sequence > baseline.through_sequence),
+    )
+
+
+def finalize_current_review_round(
+    execution: CurrentReviewExecution, pending: tuple[PendingReviewExecutionRound, ...],
+    outcome: ReviewRoundOutcome,
+) -> ReviewExecutionReduction:
+    """Exact pending retries are inert; retired retries require indexed receipts."""
+    if not isinstance(outcome, ReviewRoundOutcome) or not isinstance(execution, CurrentReviewExecution):
+        raise ValueError("execution finalization requires current authority and a typed outcome")
+    # Late generations are settled through retained receipts by the adapter,
+    # never folded into this generation's baseline or pending range.
+    if outcome.round.binding != execution.binding:
+        raise ValueError("execution finalization belongs to a foreign or stale generation")
+    if outcome.round.sequence <= execution.baseline.through_sequence:
+        raise ValueError("retired execution outcome requires exact receipt replay verification")
+    validated = reduce_current_review_execution(execution, pending)
+    if validated.execution.state != execution.state:
+        raise ValueError("current execution state disagrees with its pending projection")
+    selected = next((item for item in pending if item.round == outcome.round), None)
+    if selected is None:
+        raise ValueError("execution outcome lacks its exact allocated pending identity")
+    if isinstance(selected, CompletedReviewExecutionRound):
+        if selected.outcome != outcome:
+            raise ValueError("conflicting duplicate execution outcome")
+        return validated
+    return reduce_current_review_execution(
+        execution, tuple(CompletedReviewExecutionRound(outcome) if item == selected else item for item in pending),
+    )
+
+
+def advance_current_review_generation(
+    execution: CurrentReviewExecution, pending: tuple[PendingReviewExecutionRound, ...],
+    from_revision: WorkflowRevision, to_revision: WorkflowRevision, mutation: WorkflowMutation,
+) -> tuple[CurrentReviewExecution, ReviewExecutionGenerationBoundary]:
+    """Freeze the accepted projection; old open rounds remain separately recoverable."""
+    if (not isinstance(execution, CurrentReviewExecution)
+            or not isinstance(from_revision, WorkflowRevision)
+            or not isinstance(to_revision, WorkflowRevision)
+            or from_revision.fence != execution.binding.rejection.fence):
+        raise ValueError("generation advance requires current authority and its exact revision")
+    validated = reduce_current_review_execution(execution, pending)
+    if validated.execution.state != execution.state:
+        raise ValueError("current execution state disagrees with its pending projection")
+    binding = replace(execution.binding, rejection=replace(execution.binding.rejection, fence=to_revision.fence))
+    after = carry_review_execution_generation(execution.state, binding, execution.last_sequence)
+    boundary = ReviewExecutionGenerationBoundary(
+        execution.state, after, execution.last_sequence,
+        tuple(item.round.sequence for item in sorted(pending, key=lambda item: item.round.sequence)
+              if isinstance(item, CompletedReviewExecutionRound)),
+        review_generation_receipt_id(execution.binding, to_revision.fence.generation),
+        from_revision, to_revision, mutation,
+    )
+    return CurrentReviewExecution(
+        execution.origin, ReviewExecutionCheckpoint(execution.last_sequence, after, execution.baseline.policy),
+        after, execution.last_sequence, execution.last_sequence,
+    ), boundary
 
 
 def replay_review_execution_generations(
