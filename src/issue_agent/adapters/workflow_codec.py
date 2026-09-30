@@ -17,18 +17,6 @@ from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
 from ..domain import review_execution as rx
 from ..domain import review_rounds as rr
-from ..domain import review_round_archive as round_archive
-from ..domain import review_round_receipt_archive as receipt_archive
-from ..domain import review_checkpoint_chain as checkpoint_chain
-from ..domain import review_checkpoint_archive as checkpoint_archive
-from ..domain import review_archive_source_versions as archive_source_versions
-from ..domain import review_lifecycle_archive_audit as lifecycle_archive_audit
-from ..domain import review_registration_membership_audit as registration_membership_audit
-from ..domain import review_initial_checkpoint_absence as initial_checkpoint_absence
-from ..domain import review_checkpoint_stream_replay as checkpoint_replay
-from ..domain import review_checkpoint_application as checkpoint_application
-from ..domain import review_execution_archive_gate as archive_gate
-from ..domain import review_archive_identity as archive_identity
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
@@ -50,10 +38,6 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
-    archive_identity.ScanningReviewArchiveIdentities,
-    archive_identity.CompletedReviewArchiveIdentities,
-    archive_identity.BlockedReviewArchiveIdentities,
-    archive_identity.ReviewArchiveIdentityCursor,
     RearmObservation,
     workspace.ResolveWorkspaceObserved, w.ResolveRearmAcceptance,
     workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
@@ -108,66 +92,7 @@ _VALUES = (
     rx.ReviewPreparationFailure, rx.ReviewPreparationDeferred,
     rx.ReviewRoundCancelled, rx.ReviewRoundOutcome, rx.ReviewExecutionPolicy,
     rx.ReviewExecutionState, rx.ReviewExecutionBoundaryCursor,
-    rx.ReviewGenerationArchiveFingerprint, rx.ReviewGenerationReceiptSweepCursor,
-    rx.ReviewGenerationArchiveReceiptMember, rx.ReviewGenerationArchiveBaseline,
-    rx.ReviewGenerationArchiveScan,
-    rx.CompletedReviewGenerationArchiveScan, rx.ReviewGenerationArchiveSweep,
-    rx.CompletedReviewGenerationArchiveAudit,
-    rx.BlockedReviewGenerationArchiveScan, rx.BlockedReviewGenerationArchiveSweep,
-    rx.ReviewGenerationArchiveCursor,
-    round_archive.ReviewRoundArchiveFingerprint,
-    round_archive.ReviewRoundArchiveBaseline,
-    round_archive.ReviewRoundArchiveScan,
-    round_archive.CompletedReviewRoundArchiveScan,
-    round_archive.BlockedReviewRoundArchiveScan,
-    round_archive.ReviewRoundArchiveCursor,
-    receipt_archive.ReviewRoundReceiptSweepCursor,
-    receipt_archive.ReviewRoundReceiptArchiveMember,
-    receipt_archive.ReviewRoundReceiptArchiveSource,
-    receipt_archive.ReviewRoundReceiptArchiveBaseline,
-    receipt_archive.ReviewRoundReceiptArchiveScan,
-    receipt_archive.CompletedReviewRoundReceiptArchiveScan,
-    receipt_archive.ReviewRoundReceiptArchiveSweep,
-    receipt_archive.CompletedReviewRoundReceiptArchiveAudit,
-    receipt_archive.BlockedReviewRoundReceiptArchiveScan,
-    receipt_archive.BlockedReviewRoundReceiptArchiveSweep,
-    receipt_archive.ReviewRoundReceiptArchiveCursor,
-    checkpoint_chain.ReviewCheckpointChainCursor,
-    checkpoint_chain.ObservedReviewCheckpointChainSource,
-    checkpoint_chain.ObservedReviewCheckpointChainPage,
-    checkpoint_archive.ReviewCheckpointArchiveBaseline,
-    archive_source_versions.ReviewArchiveSourceVersions,
-    lifecycle_archive_audit.ReviewLifecycleMembership,
-    lifecycle_archive_audit.ScanningReviewLifecycleCommands,
-    lifecycle_archive_audit.ScanningReviewLifecycleEffects,
-    lifecycle_archive_audit.CompletedReviewLifecycleArchiveAudit,
-    lifecycle_archive_audit.BlockedReviewLifecycleArchiveAudit,
-    registration_membership_audit.ScanningReviewRegistrationMembership,
-    registration_membership_audit.CompletedReviewRegistrationMembership,
-    registration_membership_audit.BlockedReviewRegistrationMembership,
-    initial_checkpoint_absence.ScanningInitialCheckpointAbsence,
-    initial_checkpoint_absence.CompletedInitialCheckpointAbsence,
-    initial_checkpoint_absence.BlockedInitialCheckpointAbsence,
-    checkpoint_archive.ReviewCheckpointArchiveCursor,
-    checkpoint_archive.ReviewCheckpointArchiveAwaiting,
-    checkpoint_archive.ReviewCheckpointArchiveSegment,
-    checkpoint_archive.ReviewCheckpointArchiveReplaySegment,
-    checkpoint_archive.ReviewCheckpointArchivePendingBoundary,
-    checkpoint_archive.ReviewCheckpointArchiveStorageAnchor,
-    checkpoint_replay._CheckpointReplayBetweenBoundaries,
-    checkpoint_replay._CheckpointReplayWithinBoundary,
-    checkpoint_replay._CheckpointReplayTail,
-    checkpoint_archive.CompletedReviewCheckpointArchiveAudit,
-    checkpoint_archive.BlockedReviewCheckpointArchiveAudit,
-    checkpoint_application.ApplyAllCheckpointTailOutcomes,
-    checkpoint_application.ApplyCheckpointTailByFollowingBoundary,
-    checkpoint_application.ReviewCheckpointApplicationReceipt,
-    checkpoint_application.ReviewCheckpointApplicationProposal,
-    archive_gate.CertifiedReviewExecutionArchive,
-    archive_gate.BlockedReviewExecutionArchive,
-    rx.ReviewExecutionCheckpoint, rx.ReviewExecutionCompactionRoundSource,
-    rx.ReviewExecutionCheckpointReceipt,
-    rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,
+    rx.ReviewExecutionCheckpoint, rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,
     rx.ReviewExecutionTransitionProofSource,
     rx.ReviewExecutionOrigin, rx.ImportedReviewExecutionOriginReceipt,
     rx.InitializedReviewExecutionOriginReceipt,
@@ -218,7 +143,6 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS = {
-    "ReviewExecutionCompactionRoundSource": {"lineage_sha256": None},
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},

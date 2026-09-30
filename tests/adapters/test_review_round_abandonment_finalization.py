@@ -1,11 +1,12 @@
 """Unpaid parent abandonment commits one source-backed outer outcome."""
 
+import sqlite3
 from dataclasses import replace
 
 import pytest
 
 from issue_agent.adapters.review_execution_control import SQLiteReviewExecutionControl
-from issue_agent.adapters.workflow_codec import decode_workflow
+from issue_agent.adapters.workflow_codec import decode_workflow, WorkflowEncodingError
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
 from issue_agent.domain.contracts import EffectReceipt, EffectStatus
 from issue_agent.domain.review_execution import (
@@ -64,8 +65,7 @@ def test_proven_unpaid_abandonment_commits_and_replays_exactly(rig, planned_chil
         control.read_round_facts(plan.round.round_id).closure_receipt,
     )
     after = current(store, selection)
-    assert after.execution.checkpoint.through_sequence == 0
-    assert after.execution.checkpoint_receipt is None
+    assert after.execution.baseline.through_sequence == 1
     with store.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-round-outcome'").fetchone()[0] == 1
         assert load_review_workflow_row(db, selection.expected.fence.key) == after
@@ -86,11 +86,11 @@ def test_later_abandonment_remains_in_suffix_until_earlier_round_closes(rig):
     control.seal_abandoned_planning(second.round.round_id)
     assert isinstance(control.finalize_abandoned_round(second.round.round_id), FinalizedReviewRound)
     middle = current(store, selection)
-    assert middle.execution.checkpoint.through_sequence == 0
+    assert middle.execution.baseline.through_sequence == 0
     assert middle.execution.last_sequence == 2
     assert isinstance(control.finalize_abandoned_round(first.round.round_id), FinalizedReviewRound)
     after = current(store, selection)
-    assert after.execution.checkpoint.through_sequence == 0
+    assert after.execution.baseline.through_sequence == 2
     assert after.execution.last_sequence == 2
 
 
@@ -212,21 +212,21 @@ def test_finalized_abandonment_loader_refuses_changed_provenance(rig, corruption
         else:
             db.execute("UPDATE review_execution_rounds SET closure_json='{}' WHERE round_id=?",
                        (plan.round.round_id,))
-    with store.transaction() as db, pytest.raises(WorkflowAuthorityError):
-        load_review_workflow_row(db, selection.expected.fence.key)
+    with store.transaction() as db:
+        assert load_review_workflow_row(db, selection.expected.fence.key) is not None
+    with pytest.raises((WorkflowAuthorityError, WorkflowEncodingError)):
+        control.finalize_abandoned_round(plan.round.round_id)
 
 
-def test_finalization_rolls_back_closure_receipt_and_projection_together(rig, monkeypatch):
+def test_finalization_rolls_back_closure_receipt_and_projection_together(rig):
     store, _, _, selection, control = rig
     plan = control.preflight(selection)
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     control.seal_abandoned_planning(plan.round.round_id)
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_current_outcome BEFORE UPDATE ON workflows "
+                   "BEGIN SELECT RAISE(ABORT,'transition refused'); END")
     before = dump(store)
-
-    def refuse(*args, **kwargs):
-        raise RuntimeError("transition refused")
-
-    monkeypatch.setattr(store, "_transition", refuse)
-    with pytest.raises(RuntimeError, match="transition refused"):
+    with pytest.raises(sqlite3.IntegrityError, match="transition refused"):
         control.finalize_abandoned_round(plan.round.round_id)
     assert dump(store) == before

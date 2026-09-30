@@ -21,10 +21,6 @@ from issue_agent.adapters.review_execution_activation import (
 )
 from issue_agent.adapters.review_execution_counter_links import read_complete_legacy_open_counter_links
 from issue_agent.adapters.review_execution_import_sources import ObservedLegacyExecutionSqlImportSources
-from issue_agent.adapters.review_lifecycle_archive_audit import advance_review_lifecycle_archive_audit
-from issue_agent.adapters.review_registration_membership_audit import (
-    advance_review_registration_membership_audit, observe_matched_review_registration_membership,
-)
 from issue_agent.adapters.store import Store
 from issue_agent.adapters.workflow_rows import (
     WorkflowAuthorityError, encode_workflow_episodes, insert_workflow_component, load_review_workflow_row,
@@ -35,11 +31,9 @@ from issue_agent.app.review_execution_activation import (
 )
 from issue_agent.domain.events import ControlTransitionCommitted, EventEnvelope, Producer, new_event_id
 from issue_agent.domain.labels import Label
-from issue_agent.domain.review_execution import ActivatedReviewExecution
+from issue_agent.domain.review_execution import CurrentReviewExecution
 from issue_agent.domain.review_execution_activation import LegacyReviewOwnerLineage
 from issue_agent.domain.review_execution_counter_mapping import CompleteLegacyOpenCounterLinks
-from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
-from issue_agent.domain.review_registration_membership_audit import CompletedReviewRegistrationMembership
 from issue_agent.domain.review_workflow import CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState
 from issue_agent.domain.review_workflow_policy import initial_review_workflow
 from issue_agent.domain.workflow_identity import FamilyAuthority, PullRequestRef, WorkflowFamily, WorkflowKey
@@ -75,14 +69,6 @@ class Gateway:
 
 def _sql_sources(cfg, control):
     now = datetime.now(timezone.utc) - timedelta(seconds=20)
-    for step in range(8):
-        with control.transaction() as db:
-            registration = advance_review_registration_membership_audit(db, cfg.repo, now=now + timedelta(seconds=step))
-            lifecycle = advance_review_lifecycle_archive_audit(db, cfg.repo, now=now + timedelta(seconds=step))
-        if isinstance(registration, CompletedReviewRegistrationMembership) and isinstance(lifecycle, CompletedReviewLifecycleArchiveAudit):
-            break
-    else:
-        raise AssertionError("empty source census did not finish")
     with control.transaction() as db:
         lineage = read_legacy_review_owner_lineage(
             db, cfg.repo, owner_identity_for_target(cfg.repo, cfg.target_dir, "review"),
@@ -97,9 +83,8 @@ def _sql_sources(cfg, control):
         storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcomes)
         settlement = verify_complete_legacy_submission_settlement_storage(db, commands, receipts, storage)
         generation = read_complete_legacy_review_generation_receipts(db, cfg.repo)
-        membership = observe_matched_review_registration_membership(db, cfg.repo, now=now + timedelta(seconds=10))
     assert isinstance(settlement, CompleteLegacySubmissionSettlementStorage)
-    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation, membership)
+    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
 
 
 @pytest.fixture
@@ -156,8 +141,8 @@ def test_offline_activation_is_atomic_hot_readable_and_exact_retry_is_inert(rig)
     with control.transaction() as db:
         for pr in (9, 10):
             snapshot = load_review_workflow_row(db, WorkflowKey(cfg.repo, PullRequestRef(pr)))
-            assert snapshot is not None and isinstance(snapshot.execution, ActivatedReviewExecution)
-            assert snapshot.execution.checkpoint.through_sequence == 0
+            assert snapshot is not None and isinstance(snapshot.execution, CurrentReviewExecution)
+            assert snapshot.execution.baseline.through_sequence == 0
         assert db.execute("SELECT count(*) FROM workflow_activation_imports WHERE family='review_execution'").fetchone()[0] == 2
     assert len(published) == 1
     payload = published[0].payload

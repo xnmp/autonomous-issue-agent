@@ -14,20 +14,13 @@ from issue_agent.adapters.review_execution_import_observation import (
 from issue_agent.adapters.review_execution_import_sources import (
     BlockedLegacyExecutionSqlImportSources, ObservedLegacyExecutionSqlImportSources,
 )
-from issue_agent.adapters.review_lifecycle_archive_audit import advance_review_lifecycle_archive_audit
-from issue_agent.adapters.review_registration_membership_audit import (
-    advance_review_registration_membership_audit,
-    observe_matched_review_registration_membership,
-)
 from issue_agent.app.config import configured_prior_owner_ids, owner_identity_for_target
-from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
 from issue_agent.domain.review_execution_activation import MAX_LEGACY_REVIEW_OWNERS
-from issue_agent.domain.review_registration_membership_audit import CompletedReviewRegistrationMembership
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from tests.app.test_review_execution_activation import rig
 from tests.adapters.test_review_execution_control import OWNER, rig as round_rig
-from tests.adapters.test_review_execution_checkpoint_commit import _copy_source
-from tests.adapters.test_review_archive_source_versions import _insert_lifecycle_command
+from tests.adapters.test_review_productive_settlement import confirmed_copy, workflow_for
+from tests.adapters.test_review_execution_import_sources import _insert_lifecycle_command
 
 
 def _dump(store: SQLiteControlStore) -> tuple[str, ...]:
@@ -46,37 +39,9 @@ def _collect(rig, *, now: datetime | None = None, max_source_bytes: int | None =
         )
 
 
-def _complete_census(
-    control: SQLiteControlStore, repository: str, *, require_match: bool = True,
-) -> datetime:
-    start = datetime.now(timezone.utc)
-    for step in range(64):
-        with control.transaction() as db:
-            lifecycle = advance_review_lifecycle_archive_audit(
-                db, repository, now=start + timedelta(seconds=step),
-            )
-            registration = advance_review_registration_membership_audit(
-                db, repository, now=start + timedelta(seconds=step),
-            )
-            matched = False
-            if (isinstance(registration, CompletedReviewRegistrationMembership)
-                    and isinstance(lifecycle, CompletedReviewLifecycleArchiveAudit)):
-                try:
-                    observe_matched_review_registration_membership(
-                        db, repository, now=start + timedelta(seconds=step),
-                    )
-                    matched = True
-                except WorkflowAuthorityError:
-                    pass
-        if matched or not require_match and (
-            isinstance(registration, CompletedReviewRegistrationMembership)
-            and isinstance(lifecycle, CompletedReviewLifecycleArchiveAudit)
-        ):
-            return start + timedelta(seconds=step)
-    raise AssertionError("source census did not complete")
 
 
-def test_observation_requires_current_completed_censuses(tmp_path: Path) -> None:
+def test_empty_observation_needs_no_retired_certificate(tmp_path: Path) -> None:
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
     before = _dump(control)
@@ -84,15 +49,10 @@ def test_observation_requires_current_completed_censuses(tmp_path: Path) -> None
         result = observe_legacy_execution_sql_import_sources(
             db, "o/r", "o/r:review:test", now=datetime.now(timezone.utc),
         )
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "census" in result.reason or "membership" in result.reason
+    assert isinstance(result, ObservedLegacyExecutionSqlImportSources)
     assert _dump(control) == before
 
 
-def test_overdue_completed_census_cannot_supply_sql_observation(rig) -> None:
-    result = _collect(rig, now=datetime.now(timezone.utc) + timedelta(hours=2))
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "overdue" in result.reason
 
 
 def test_complete_empty_sources_feed_configured_activation_without_writing(rig) -> None:
@@ -113,17 +73,18 @@ def test_complete_empty_sources_feed_configured_activation_without_writing(rig) 
         ).fetchone()[0] == 1
 
 
-def test_complete_nonempty_round_sources_remain_observations(round_rig) -> None:
-    control, key, _, _ = _copy_source(round_rig)
-    certified_at = _complete_census(control, key.repository)
+def test_recorded_history_is_held_for_target_scoped_r1_assessment(round_rig) -> None:
+    control, gateway, selection, _, plan, command = confirmed_copy(round_rig)
+    workflow_for(control, gateway).record_review(command.command_id)
+    key = selection.expected.fence.key
+    certified_at = control.now()
     before = _dump(control)
     with control.transaction() as db:
         result = observe_legacy_execution_sql_import_sources(
             db, key.repository, OWNER, now=certified_at,
         )
-    assert isinstance(result, ObservedLegacyExecutionSqlImportSources)
-    assert result.settlement.round_storage.rounds.rounds
-    assert result.settlement.commands.submissions
+    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+    assert "target-scoped R1" in result.reason
     assert _dump(control) == before
 
 
@@ -144,7 +105,7 @@ def test_configured_repoint_predecessors_keep_their_prior_repository(rig) -> Non
     assert _dump(control) == before
 
 
-def test_orphan_outcome_receipt_invalidates_census_then_blocks_collection(rig) -> None:
+def test_orphan_outcome_receipt_is_held_without_writing(rig) -> None:
     cfg, control, *_ = rig
     with control.transaction() as db:
         db.execute(
@@ -154,11 +115,11 @@ def test_orphan_outcome_receipt_invalidates_census_then_blocks_collection(rig) -
         )
     stale = _collect(rig)
     assert isinstance(stale, BlockedLegacyExecutionSqlImportSources)
-    certified_at = _complete_census(control, cfg.repo)
+    certified_at = datetime.now(timezone.utc)
     before = _dump(control)
     result = _collect(rig, now=certified_at)
     assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "outcome" in result.reason or "round" in result.reason
+    assert "target-scoped R1" in result.reason or "outcome" in result.reason
     assert _dump(control) == before
 
 
@@ -170,11 +131,11 @@ def test_unregistered_submission_command_blocks_collection(rig) -> None:
             "UPDATE lifecycle_commands SET repository=? WHERE command_id=?",
             (cfg.repo, "unregistered-import-command"),
         )
-    certified_at = _complete_census(control, cfg.repo, require_match=False)
+    certified_at = datetime.now(timezone.utc)
     before = _dump(control)
     result = _collect(rig, now=certified_at)
     assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "registration" in result.reason or "command" in result.reason
+    assert "target-scoped R1" in result.reason or "command" in result.reason
     assert _dump(control) == before
 
 
@@ -186,7 +147,7 @@ def test_oversized_retained_source_and_cumulative_ceiling_refuse(rig) -> None:
             "VALUES ('review-execution-generation',?,?,?,?)",
             (cfg.repo, "oversized-generation", datetime.now(timezone.utc).isoformat(), "x" * (2**21 + 1)),
         )
-    certified_at = _complete_census(control, cfg.repo)
+    certified_at = datetime.now(timezone.utc)
     before = _dump(control)
     result = _collect(rig, now=certified_at)
     assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
@@ -194,12 +155,11 @@ def test_oversized_retained_source_and_cumulative_ceiling_refuse(rig) -> None:
     assert _dump(control) == before
 
 
-def test_cumulative_source_ceiling_refuses_even_small_complete_sources(rig) -> None:
-    # Even a complete empty corpus cannot be read through an arbitrarily
-    # smaller requested ceiling; the meter includes repeated audit reads.
+def test_empty_sources_fit_small_budget_after_retired_census_removal(rig) -> None:
+    # Empty sources no longer read retained membership certificates.
     limited = _collect(rig, max_source_bytes=64)
-    assert isinstance(limited, BlockedLegacyExecutionSqlImportSources)
-    assert "bound" in limited.reason
+    assert isinstance(limited, ObservedLegacyExecutionSqlImportSources)
+    assert not limited.runs.runs
 
 
 @pytest.mark.parametrize(

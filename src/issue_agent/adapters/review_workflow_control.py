@@ -42,7 +42,7 @@ from ..domain.review_evidence import (
     unavailable_evidence, unavailable_first_observation,
 )
 from ..domain.review_execution import (
-    ActivatedReviewExecution, accepted_review_transition_proof_source, initialized_review_execution,
+    initialized_review_execution,
     CurrentReviewExecution, CompletedReviewExecutionRound, freeze_current_review_generation,
 )
 from ..domain.review_rounds import (
@@ -99,7 +99,7 @@ from .workflow_commit import (
     same_receipt, transition_dedupe_key, transition_receipt, update_rearm_state,
 )
 from .workflow_rows import (
-    WorkflowAuthorityError, active_families, load_family_authority, load_review_workflow_row, load_workflow_read,
+    WorkflowAuthorityError, ReviewExecutionHeld, active_families, load_family_authority, load_review_workflow_row, load_workflow_read,
     persist_workflow_snapshot, read_review_submission_registration, workflow_run_scope_bounds, workflow_scope,
     REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
     insert_initialized_review_execution_origin, insert_workflow_component, encode_workflow_episodes,
@@ -828,7 +828,9 @@ class SQLiteReviewWorkflowControl:
                     )
                 except (TypeError, ValueError) as exc:
                     raise WorkflowAuthorityError("execution initialization activation digests are unreadable") from exc
-                snapshot = replace(snapshot, execution=execution)
+                snapshot = replace(snapshot, execution=CurrentReviewExecution(
+                    execution.origin, execution.checkpoint, execution.state, 0, execution.last_sequence,
+                ))
             db.execute("INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
                        (*workflow_scope(key), encode_workflow_episodes(snapshot)))
             insert_workflow_component(db, key, authority, snapshot.episode.episode_id)
@@ -961,11 +963,6 @@ class SQLiteReviewWorkflowControl:
         except ValueError as exc:
             raise WorkflowAuthorityError(f"review proposal refused: {exc}") from exc
         self._validate_receipts(db, prior, transition, facts)
-        if (transition.snapshot.revision.fence.generation != prior.revision.fence.generation
-                and isinstance(prior.execution, ActivatedReviewExecution)):
-            from .review_execution_archive_gate import require_review_execution_archive_admission
-
-            require_review_execution_archive_admission(db, key, prior.execution, now=self._now())
         # Enqueued commands load the new aggregate before this transaction ends;
         # its generation boundary requires the accepted transition receipt.
         committed = record_commit(db, self._control, self._writer.repository, transition, encoded)
@@ -976,7 +973,7 @@ class SQLiteReviewWorkflowControl:
                        (_RECORDED_REVIEW_NAMESPACE, self._writer.repository, self._recorded_submission(transition),
                         self._now().isoformat(), encode_workflow(transition.snapshot.revision)))
         if (transition.mutation is WorkflowMutation.RECORD_REVIEW
-                and isinstance(prior.execution, (ActivatedReviewExecution, CurrentReviewExecution))):
+                and isinstance(prior.execution, CurrentReviewExecution)):
             # The confirmed verdict is the reset boundary. A later settled
             # marker cannot repair a crash between baseline and round writes.
             from .review_execution_control import SQLiteReviewExecutionControl
@@ -1088,19 +1085,7 @@ class SQLiteReviewWorkflowControl:
         if isinstance(execution, CurrentReviewExecution):
             return tuple(item.round.sequence for item in read_current_review_pending(db, execution)
                          if isinstance(item, CompletedReviewExecutionRound))
-        if not isinstance(execution, ActivatedReviewExecution):
-            return ()
-        lower = (execution.boundaries[-1].through_sequence if execution.boundaries
-                 else execution.checkpoint.through_sequence)
-        rows = db.execute(
-            "SELECT sequence FROM review_execution_rounds WHERE repository=? AND target_number=? "
-            "AND execution_epoch=? AND execution_episode=? AND sequence>? AND sequence<=? "
-            "AND outcome_json IS NOT NULL ORDER BY sequence",
-            (self._writer.repository, snapshot.revision.fence.key.target.number,
-             execution.binding.execution_epoch, execution.binding.execution_episode,
-             lower, execution.last_sequence),
-        ).fetchall()
-        return tuple(row["sequence"] for row in rows)
+        return ()
 
     def _retry_facts(self, db: sqlite3.Connection, command: AuthorizeAbsentRetry) -> RetryAuthorizationFacts:
         """The shared grant facts, scoped to this review owner's own command of this workflow."""
@@ -1290,7 +1275,6 @@ class SQLiteReviewWorkflowControl:
         assert isinstance(after, ReviewWorkflowSnapshot)
         key = after.revision.fence.key
         scope = workflow_scope(key)
-        persist_workflow_snapshot(db, after)
         if (after.revision.fence.generation != prior.revision.fence.generation
                 and isinstance(prior.execution, CurrentReviewExecution)):
             advanced, boundary = freeze_current_review_generation(
@@ -1304,23 +1288,7 @@ class SQLiteReviewWorkflowControl:
                 ("review-execution-generation", self._writer.repository, boundary.receipt_id,
                  self._now().isoformat(), encode_workflow(boundary)),
             )
-        if (after.revision.fence.generation != prior.revision.fence.generation
-                and isinstance(prior.execution, ActivatedReviewExecution)):
-            if (not isinstance(after.execution, ActivatedReviewExecution)
-                    or len(after.execution.boundaries) != len(prior.execution.boundaries) + 1
-                    or after.execution.boundaries[:-1] != prior.execution.boundaries):
-                raise WorkflowAuthorityError("generation advance lost its execution boundary")
-            boundary = after.execution.boundaries[-1]
-            namespace, dedupe = transition_dedupe_key(transition)
-            if not isinstance(transition.audit, (AuthorizedOperatorCommand, ObservedTransition)):
-                raise WorkflowAuthorityError("generation advance lacks a typed transition cause")
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                ("review-execution-generation", self._writer.repository, boundary.receipt_id,
-                 self._now().isoformat(), encode_workflow(accepted_review_transition_proof_source(
-                     boundary, namespace, dedupe, encoded, transition.audit, encode_workflow(transition.audit),
-                 ))),
-            )
+        persist_workflow_snapshot(db, after)
         intent = after.intent
         if intent is not None and intent != prior.intent:
             if isinstance(intent, PendingReviewRearm):
@@ -1461,7 +1429,7 @@ class SQLiteReviewWorkflowControl:
         with closing(self._control._connect()) as db:
             db.execute("BEGIN")
             current = load_review_workflow_row(db, key)
-            if current is not None and isinstance(current.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
+            if current is not None and isinstance(current.execution, CurrentReviewExecution):
                 registration = read_review_submission_registration(db, self._writer.repository, str(escalation))
                 if registration is None:
                     raise WorkflowAuthorityError("active ceiling escalation lacks its originating round")
@@ -1489,7 +1457,7 @@ class SQLiteReviewWorkflowControl:
                 evidence_ids=(self._evidence_id(recorded),),
             )
             result = self._apply(db, prior, key, recorded, proposal)
-            if (isinstance(prior.execution, (ActivatedReviewExecution, CurrentReviewExecution))
+            if (isinstance(prior.execution, CurrentReviewExecution)
                     and not isinstance(result, WorkflowConflict)
                     and not (isinstance(result, WorkflowRejected)
                              and result.code is WorkflowRejection.OBSERVATION_UNAVAILABLE)):
@@ -1749,8 +1717,14 @@ class SQLiteReviewWorkflowControl:
             if not isinstance(bound, ReviewSubmissionReceipt):
                 return WorkflowRejected(WorkflowRejection.INVALID_SCOPE, "an escalation is not a reviewed baseline")
             key = self._scope(bound.submission.binding.fence.key)
-            prior = self._load(db, key)
-            if self._submission_recorded(db, str(submission)):
+            recorded_submission = self._submission_recorded(db, str(submission))
+            try:
+                prior = self._load(db, key)
+            except ReviewExecutionHeld as held:
+                if recorded_submission:
+                    return WorkflowCommitted(held.snapshot, idempotent=True)
+                raise
+            if recorded_submission:
                 return WorkflowCommitted(prior, idempotent=True)
             if not bound.escalated:
                 proposal = record_review(prior, bound)
@@ -2340,7 +2314,7 @@ class SQLiteReviewWorkflowControl:
             with closing(self._control._connect()) as db:
                 db.execute("BEGIN")
                 current = load_review_workflow_row(db, key)
-                if current is not None and isinstance(current.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
+                if current is not None and isinstance(current.execution, CurrentReviewExecution):
                     registration = read_review_submission_registration(db, self._writer.repository, str(submission))
                     if registration is None:
                         raise WorkflowAuthorityError("active review verdict lacks its originating round")
@@ -2417,7 +2391,7 @@ class SQLiteReviewWorkflowControl:
             with closing(self._control._connect()) as db:
                 db.execute("BEGIN")
                 current = load_review_workflow_row(db, key)
-                if current is not None and isinstance(current.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
+                if current is not None and isinstance(current.execution, CurrentReviewExecution):
                     registration = read_review_submission_registration(db, self._writer.repository, str(submission))
                     if registration is None:
                         raise WorkflowAuthorityError("active ceiling escalation lacks its originating round")

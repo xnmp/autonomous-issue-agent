@@ -33,8 +33,9 @@ def test_refused_admission_finalizes_completed_round_and_replays_without_writes(
     assert dump(store) == before
     with store.transaction() as db:
         db.execute("DELETE FROM dedupe_keys WHERE namespace='review-execution-refusal'")
-        with pytest.raises(WorkflowAuthorityError):
-            load_review_workflow_row(db, selection.expected.fence.key)
+        assert load_review_workflow_row(db, selection.expected.fence.key) is not None
+    with pytest.raises(WorkflowAuthorityError):
+        control.finalize_completed_round(child.round.round_id)
 
 
 def test_pending_completed_child_waits_for_terminal_accounting(planned):
@@ -98,6 +99,6 @@ def test_confirmed_copy_requires_joint_productive_settlement(rig):
                                       store.now(), store.now(), EffectStatus.SUCCEEDED, remote_object_id="review:9"))
     before = dump(store)
 
-    with pytest.raises(WorkflowAuthorityError, match="productive review"):
+    with pytest.raises(WorkflowAuthorityError, match="joint settlement receipt"):
         control.finalize_completed_round(plan.round.round_id)
     assert dump(store) == before

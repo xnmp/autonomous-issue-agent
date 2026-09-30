@@ -17,10 +17,6 @@ from issue_agent.adapters.review_execution_activation import (
     verify_complete_legacy_round_outcome_storage, verify_complete_legacy_submission_settlement_storage,
 )
 from issue_agent.adapters.review_execution_counter_links import read_complete_legacy_open_counter_links
-from issue_agent.adapters.review_lifecycle_archive_audit import advance_review_lifecycle_archive_audit
-from issue_agent.adapters.review_registration_membership_audit import (
-    advance_review_registration_membership_audit, observe_matched_review_registration_membership,
-)
 from issue_agent.adapters.review_execution_import_sources import (
     BlockedLegacyExecutionSqlImportSources, HeldLegacyExecutionCounterSources,
     ObservedLegacyExecutionSqlImportSources, RevalidatedLegacyExecutionImportSources,
@@ -47,8 +43,6 @@ from issue_agent.domain.review_execution_import_plan import (
     EmptyReviewExecutionImportPlan, ZeroHistoryImportBlockerKind,
 )
 from issue_agent.domain.resolve_activation import DeploymentInventory
-from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
-from issue_agent.domain.review_registration_membership_audit import CompletedReviewRegistrationMembership
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState, RecordedPullRequest
 from issue_agent.domain.review_workflow_policy import initial_review_workflow
@@ -107,20 +101,6 @@ def _sql_sources(cfg, control, *, include_prior):
     )
     current_owner = owner_identity_for_target(cfg.repo, cfg.target_dir, "review")
     now = datetime.now(timezone.utc) - timedelta(seconds=20)
-    for step in range(8):
-        with control.transaction() as db:
-            registration = advance_review_registration_membership_audit(
-                db, cfg.repo, now=now + timedelta(seconds=step),
-            )
-            lifecycle = advance_review_lifecycle_archive_audit(
-                db, cfg.repo, now=now + timedelta(seconds=step),
-            )
-        if isinstance(registration, CompletedReviewRegistrationMembership) and isinstance(
-            lifecycle, CompletedReviewLifecycleArchiveAudit,
-        ):
-            break
-    else:
-        raise AssertionError("empty import membership census did not finish")
     with control.transaction() as db:
         lineage = read_legacy_review_owner_lineage(
             db, cfg.repo, current_owner,
@@ -138,10 +118,7 @@ def _sql_sources(cfg, control, *, include_prior):
         )
         generation = read_complete_legacy_review_generation_receipts(db, cfg.repo)
         assert isinstance(settlement, CompleteLegacySubmissionSettlementStorage)
-        membership = observe_matched_review_registration_membership(
-            db, cfg.repo, now=now + timedelta(seconds=10),
-        )
-    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation, membership)
+    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
 
 
 def _record_prior_run(cfg, control):
@@ -174,9 +151,8 @@ def test_configured_import_revalidates_the_full_boot_owner_lineage(sources):
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
-            assert isinstance(result, RevalidatedLegacyExecutionImportSources)
-            assert result.sql == observed
-            assert [run.source.run_id for run in result.deaths.unassigned_deaths] == ["prior-run"]
+            assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+            assert "target-scoped R1" in result.reason
 
 
 def test_configured_history_classifies_empty_pr_from_held_complete_sources(sources):

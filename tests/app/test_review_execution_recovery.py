@@ -12,7 +12,7 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.review_execution import (
-    ActivatedReviewExecution, ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
+    CurrentReviewExecution, ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
     ReviewExecutionBinding, ReviewExecutionCheckpoint,
     ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionPolicy, ReviewExecutionState,
 )
@@ -37,9 +37,9 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
         assert prior is not None
         binding = ReviewExecutionBinding(prior.binding, 1, "execution:recovery")
         state = ReviewExecutionState(binding, failures=0, pin_deferrals=0)
-        execution = ActivatedReviewExecution(
+        execution = CurrentReviewExecution(
             ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "import:recovery"),
-            ReviewExecutionCheckpoint(0, state, ReviewExecutionPolicy(1)), state, 0,
+            ReviewExecutionCheckpoint(0, state, ReviewExecutionPolicy(1)), state, 0, 0,
         )
         db.execute("UPDATE workflows SET episode_json=? WHERE repository=? AND target_kind='pr' AND target_number=?",
                    (encode_workflow(ReviewFamilyEpisodes(prior.authority, prior.episode, execution)), REPO, PR))
@@ -47,7 +47,7 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
         inventory_digest = hashlib.sha256(b"fixture:recovery:inventory").hexdigest()
         plan_digest = hashlib.sha256(b"fixture:recovery:plan").hexdigest()
         imported = encode_workflow(ImportedReviewExecutionDecision(
-            execution.origin, execution.checkpoint, plan_digest, source_digest,
+            execution.origin, execution.baseline, plan_digest, source_digest,
         ))
         activated_at = deployment.clock.now()
         db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
@@ -61,7 +61,7 @@ def test_review_daemon_recovery_fences_a_round_from_its_released_parent_claim(tm
                    (REPO, "review_execution", 1, "pr", PR, source_digest, imported))
         insert_imported_review_execution_origin(
             db, REPO, ImportedReviewExecutionOriginReceipt(
-                execution.origin, execution.checkpoint, plan_digest, source_digest,
+                execution.origin, execution.baseline, plan_digest, source_digest,
                 inventory_digest, hashlib.sha256(imported.encode()).hexdigest(),
             ), claimed_at=activated_at,
         )

@@ -1,12 +1,14 @@
 """Offline rehearsal of modern rounds after source-backed execution activation."""
 
 import sqlite3
+from itertools import count
 
 from issue_agent.adapters.control_store import AccountingDisposition
 from issue_agent.adapters.review_execution_control import SQLiteReviewExecutionControl
 from issue_agent.adapters.workflow_rows import load_review_workflow_row
 from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.agent_task import RuntimeName
+from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.review import ReviewMode
@@ -27,6 +29,15 @@ from tests.adapters.test_review_execution_stage import stage
 
 def test_imported_empty_origin_survives_paid_failure_and_later_abandonment(rig):
     cfg, store, gateway, _files_store, files, links, sql, _liveness, activation = rig
+    sequence = count()
+    producer = Producer("review-rehearsal", cfg.repo, "review", 123, "boot")
+
+    def factory(payload, correlation):
+        index = next(sequence)
+        return EventEnvelope(payload, new_event_id(store.now()), index, store.now(), store.now(),
+                             index, producer, correlation)
+
+    store.bind_event_outbox(factory, lambda envelope: None)
     activation_plan = activation.plan(files, links, sql)
     assert not activation.activate(activation_plan, files, links, sql).idempotent
 
@@ -41,7 +52,7 @@ def test_imported_empty_origin_survives_paid_failure_and_later_abandonment(rig):
     assert imported.execution.origin.kind is ReviewExecutionOriginKind.IMPORTED
     assert origin_receipts == 2
     assert imported.execution.last_sequence == 0
-    assert imported.execution.checkpoint.through_sequence == 0
+    assert imported.execution.baseline.through_sequence == 0
 
     assert store.claim_dispatch(cfg.repo, "review", -9, AgentKind.REVIEW.name, OWNER, frozenset())
     occurrence = store.active_dispatch_claims(cfg.repo, "review")[0].claim_key

@@ -8,7 +8,7 @@ import sqlite3
 
 from ..domain.review_activation import MAX_IMPORTED_PULL_REQUESTS
 from ..domain.review_execution import (
-    ActivatedReviewExecution, ImportedReviewExecutionOriginReceipt,
+    CurrentReviewExecution, ImportedReviewExecutionOriginReceipt,
     ReviewExecutionOriginKind, same_execution_episode,
 )
 from ..domain.review_execution_import_plan import EmptyReviewExecutionImportPlan
@@ -405,7 +405,7 @@ def _verify_committed_empty_review_execution_import(
     seen_origin_ids: set[str] = set()
     for pr, component in component_by_pr.items():
         snapshot = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
-        if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+        if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
             raise WorkflowAuthorityError("review execution import current authority is absent")
         execution = snapshot.execution
         if component[5] != execution.binding.execution_episode:

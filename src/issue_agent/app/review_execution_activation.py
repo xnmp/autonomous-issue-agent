@@ -25,7 +25,8 @@ from ..adapters.store import Store
 from ..domain.review_execution_counter_mapping import CompleteLegacyOpenCounterLinks
 from ..domain.review_execution_import_plan import EmptyReviewExecutionImportPlan
 from ..domain.review_workflow import RecordedPullRequest
-from ..domain.workflow_identity import WorkflowFamily, canonical_workflow_repository
+from ..domain.workflow_identity import WorkflowFamily, WorkflowKey, canonical_workflow_repository
+from ..domain.review_workflow import ReviewWorkflowSnapshot
 from .config import HarnessConfig
 from .review_execution_import import (
     BlockedReviewImportObservationSet, ObservedReviewExecutionImportCandidates,
@@ -91,6 +92,19 @@ class ConfiguredReviewExecutionActivation:
             raise ReviewExecutionActivationRefused("deployment liveness evidence is malformed")
         if reasons:
             raise ReviewExecutionActivationRefused("watchers may be running: " + "; ".join(reasons[:4]))
+
+    def convert_current(self, key: WorkflowKey) -> ReviewWorkflowSnapshot:
+        """Convert one stopped, bounded prior component; never called by daemons."""
+        from ..adapters.workflow_rows import convert_legacy_review_execution
+
+        if not isinstance(key, WorkflowKey) or key.repository != self._cfg.repo:
+            raise ValueError("execution conversion requires its configured repository")
+        self._control.require_initialized()
+        self._require_stopped()
+        with self._control.transaction() as db:
+            with self._control.mutation_savepoint(db):
+                self._require_stopped()
+                return convert_legacy_review_execution(db, key)
 
     def _roots(
         self, extra_roots: tuple[str, ...], observed: CompleteLegacyExecutionRootFiles,

@@ -3069,10 +3069,10 @@ def test_v25_inactive_review_cannot_load_with_retained_execution_authority(tmp_p
         assert tuple(db.iterdump()) == before
 
 
-def _activate_execution_fixture(db):
+def _activate_legacy_execution_fixture(db):
     from issue_agent.adapters.workflow_codec import encode_workflow
     from issue_agent.adapters.workflow_rows import (
-        insert_imported_review_execution_origin, load_review_workflow_row,
+        insert_imported_review_execution_origin, load_legacy_review_workflow_row,
     )
     from issue_agent.domain.review_execution import (
         ActivatedReviewExecution, ImportedReviewExecutionDecision,
@@ -3084,7 +3084,7 @@ def _activate_execution_fixture(db):
     from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey
 
     key = WorkflowKey("o/r", PullRequestRef(9))
-    prior = load_review_workflow_row(db, key)
+    prior = load_legacy_review_workflow_row(db, key)
     assert prior is not None
     state = ReviewExecutionState(ReviewExecutionBinding(prior.binding, 5, "execution:legacy"), failures=3, pin_deferrals=2)
     execution = ActivatedReviewExecution(ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "import:execution"),
@@ -3111,8 +3111,21 @@ def _activate_execution_fixture(db):
             inventory_digest, hashlib.sha256(import_json.encode()).hexdigest(),
         ), claimed_at=NOW,
     )
-    assert load_review_workflow_row(db, key) == snapshot
+    assert load_legacy_review_workflow_row(db, key) == snapshot
     return snapshot
+
+
+def _activate_execution_fixture(db):
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+    from issue_agent.domain.review_execution import CurrentReviewExecution
+
+    legacy = _activate_legacy_execution_fixture(db)
+    current = dataclasses.replace(legacy, execution=CurrentReviewExecution(
+        legacy.execution.origin, legacy.execution.checkpoint, legacy.execution.state, 0, 0,
+    ))
+    persist_workflow_snapshot(db, current)
+    assert load_review_workflow_row(db, current.revision.fence.key) == current
+    return current
 
 
 @pytest.mark.parametrize("corruption", ["missing_index", "index_epoch", "index_episode", "missing_activation",

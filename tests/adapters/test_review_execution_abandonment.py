@@ -83,8 +83,9 @@ def test_sealed_parent_loss_keeps_completed_seal_and_terminalizes_unadmitted_chi
     assert dump(store) == before
     with store.transaction() as db:
         db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-seal'")
-        with pytest.raises(WorkflowAuthorityError):
-            load_review_workflow_row(db, selection.expected.fence.key)
+        assert load_review_workflow_row(db, selection.expected.fence.key) is not None
+    with pytest.raises(WorkflowAuthorityError):
+        control.finalize_abandoned_round(child.round.round_id)
 
 
 def test_sealed_parent_without_terminal_claim_receipt_stays_open(planned):
@@ -356,6 +357,6 @@ def test_loader_refuses_orphan_abandonment_receipt_on_open_round(rig):
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
                    ("review-round-abandonment", "o/r", plan.round.round_id, store.now().isoformat(), "[]"))
     before = dump(store)
-    with pytest.raises(WorkflowAuthorityError, match="contradictory abandonment fence"):
+    with pytest.raises(WorkflowAuthorityError, match="abandonment fence"):
         current(store, selection)
     assert dump(store) == before

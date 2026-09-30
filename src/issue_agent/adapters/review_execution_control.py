@@ -4,18 +4,13 @@ from dataclasses import dataclass, replace
 import hashlib
 import sqlite3
 
-from ..domain.review_execution_compaction_maintenance import (
-    BlockedReviewExecutionMaintenance, PendingReviewExecutionMaintenance,
-    ReviewExecutionMaintenanceResult,
-)
 from ..domain.fix import breaker_key
 from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
 from ..domain.review_execution import (
     ActivatedReviewExecution, CopiedReviewProgress, PaidReviewProgress,
     ReviewPreparationKind,
-    ReviewRoundOutcome, replay_review_execution_generations, same_execution_episode,
-    review_generation_chain_digest,
+    ReviewRoundOutcome, same_execution_episode,
     CurrentReviewExecution, finalize_current_review_round,
 )
 from ..domain.review_rounds import (
@@ -23,7 +18,6 @@ from ..domain.review_rounds import (
     ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundFacts, ReviewRoundPlan, ReviewStagePlan,
     ReviewRoundAwaitingEvidence, ReviewSubmissionConfirmed, ReviewSubmissionKind, ReviewSubmissionPlan,
     ReviewSubmissionRegistration, finalize_review_round,
-    StaleReviewProductivitySettlement,
     CurrentReviewOutcomeReceipt,
     CurrentStaleReviewProductivitySettlement,
 )
@@ -51,7 +45,6 @@ from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_ho
 from .review_round_sources import read_review_round_sources
 from .review_workflow_control import SQLiteReviewWorkflowControl
 from .process_supervisor import ProcessSupervisor
-from .sql_read_budget import MAX_SQL_READ_BYTES
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
     REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE, REVIEW_PREPARATION_NAMESPACE,
@@ -59,14 +52,14 @@ from .workflow_rows import (
     REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
     REVIEW_SEAL_NAMESPACE, REVIEW_STAGE_NAMESPACE,
     REVIEW_SUBMISSION_INDEX_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE,
-    WorkflowAuthorityError, WorkflowRevisionConflict,
+    WorkflowAuthorityError, WorkflowRevisionConflict, ReviewExecutionHeld,
     linked_issue_workflow_holds, load_review_workflow_row, persist_workflow_snapshot,
     read_review_submission_registration, require_review_submission_receipts,
     review_parent_abandonment, review_sealed_parent_abandonment,
     review_stage_receipt_key, review_submission_receipt_key,
     verified_review_completed_seal,
     verified_review_parent_abandonment,
-    load_current_review_workflow_row, read_current_review_pending,
+    read_current_review_pending,
     read_review_outcome_receipt, require_current_review_productivity_receipt,
 )
 
@@ -115,7 +108,7 @@ class SQLiteReviewExecutionControl:
     def _write_current_outcome_in_tx(
         self, db: sqlite3.Connection, facts: ReviewRoundFacts, expected: WorkflowRevision,
     ) -> FinalizedReviewRound | DeferredReviewPreparation:
-        """S2 construction seam; an exact receipt is resolved before new eligibility."""
+        """Resolve exact receipts before current eligibility; publish atomically."""
         from ..domain.events import ControlTransitionCommitted, Correlation
 
         with self._control.mutation_savepoint(db):
@@ -146,7 +139,7 @@ class SQLiteReviewExecutionControl:
                     raise WorkflowAuthorityError("current outcome retry conflicts with its exact receipt")
                 return result
             self._control._assert_owner_active(db, self._writer.owner_id)
-            snapshot = load_current_review_workflow_row(db, round.binding.rejection.fence.key)
+            snapshot = load_review_workflow_row(db, round.binding.rejection.fence.key)
             if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
                 raise WorkflowAuthorityError("current review execution is absent or inactive")
             if snapshot.revision != expected:
@@ -199,25 +192,6 @@ class SQLiteReviewExecutionControl:
                 }), Correlation(),
             ), db)
             return result
-
-    def maintain_archive(
-        self, key: WorkflowKey, *, round_threshold: int = 128,
-        generation_threshold: int = 32, payload_threshold: int = 65536,
-        max_source_bytes: int = MAX_SQL_READ_BYTES,
-    ) -> ReviewExecutionMaintenanceResult:
-        """Run before deriving a proposal; compaction may change its revision."""
-        from .review_execution_compaction_maintenance import (
-            advance_review_execution_compaction_maintenance,
-        )
-
-        if not isinstance(key, WorkflowKey) or key.repository != self._writer.repository:
-            raise ValueError("review maintenance requires the configured writer repository")
-        with self._control.transaction() as db:
-            return advance_review_execution_compaction_maintenance(
-                db, key, now=self._control.now(), round_threshold=round_threshold,
-                generation_threshold=generation_threshold,
-                payload_threshold=payload_threshold, max_source_bytes=max_source_bytes,
-            )
 
     def reconcile_review_rounds(self) -> ReviewRoundSweep:
         """Fence abandoned planning and finalize one indexed page of terminal rounds."""
@@ -391,11 +365,16 @@ class SQLiteReviewExecutionControl:
         planning = decode_workflow(
             row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
         )
-        snapshot = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
-        if snapshot is None:
+        key = plan.round.binding.rejection.fence.key
+        aggregate = db.execute(
+            "SELECT generation,version FROM workflows WHERE repository=? AND target_kind='pr' AND target_number=?",
+            (key.repository, key.target.number),
+        ).fetchone()
+        if aggregate is None:
             raise WorkflowAuthorityError("review round lost its aggregate")
+        revision = WorkflowRevision(WorkflowFence(key, aggregate["generation"]), aggregate["version"])
         return read_review_round_sources(
-            db, self._writer.repository, parent_owner, selection, plan, planning, snapshot.revision,
+            db, self._writer.repository, parent_owner, selection, plan, planning, revision,
         )
 
     def finalize_abandoned_round(
@@ -416,16 +395,35 @@ class SQLiteReviewExecutionControl:
     ) -> ReviewRoundAwaitingEvidence | FinalizedReviewRound | DeferredReviewPreparation:
         validate_workflow_identifier(round_id, "review round")
         with self._control.transaction() as db:
-            self._control._assert_owner_active(db, self._writer.owner_id)
             stored = self._round_record(db, round_id)
             if stored is None:
                 raise WorkflowAuthorityError("review round lacks its preflight")
             _, _, plan, row = stored
-            snapshot = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
-            if snapshot is None or not isinstance(snapshot.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
-                raise WorkflowAuthorityError("review execution workflow is absent or inactive")
             facts = self._read_round_facts(db, round_id)
             result = finalize_review_round(facts)
+            receipt = read_review_outcome_receipt(db, self._writer.repository, round_id)
+            if receipt is not None:
+                if not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)):
+                    raise WorkflowAuthorityError("review round replay lost its terminal evidence")
+                recorded = (receipt.facts, receipt.outcome) if isinstance(receipt, CurrentReviewOutcomeReceipt) else receipt
+                if (not isinstance(facts.planning, planning_type)
+                        or row["closure_json"] != encode_workflow(facts)
+                        or row["outcome_json"] != encode_workflow(result.outcome)
+                        or recorded != (facts, result.outcome)):
+                    raise WorkflowAuthorityError("review round replay changed its sealed outcome")
+                return result
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            try:
+                snapshot = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
+            except ReviewExecutionHeld as held:
+                if isinstance(result, ReviewRoundAwaitingEvidence):
+                    self._record_recovery_wait(db, facts, result)
+                    return result
+                if not isinstance(facts.planning, planning_type):
+                    raise WorkflowAuthorityError("review round planning has a different settlement path")
+                return self._finalize_held_round_in_tx(db, held.snapshot, facts, result)
+            if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
+                raise WorkflowAuthorityError("review execution workflow is absent or inactive")
             if isinstance(result, ReviewRoundAwaitingEvidence):
                 if isinstance(facts.planning, (ReviewParentAbandoned, ReviewPlanningSealed)):
                     self._record_recovery_wait(db, facts, result)
@@ -442,73 +440,54 @@ class SQLiteReviewExecutionControl:
                 return self._finalize_current_nonproductive_in_tx(
                     db, snapshot, facts, result, preparation_error,
                 )
-            receipt = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, round_id),
-            ).fetchone()
-            if row["outcome_json"] is not None:
-                if (row["closure_json"] != encode_workflow(facts)
-                        or row["outcome_json"] != encode_workflow(result.outcome)
-                        or receipt is None or receipt["payload_json"] != encode_workflow((facts, result.outcome))):
-                    raise WorkflowAuthorityError("review round replay changed its sealed outcome")
-                return result
+    def _finalize_held_round_in_tx(
+        self, db: sqlite3.Connection, held: ReviewWorkflowSnapshot, facts: ReviewRoundFacts,
+        result: FinalizedReviewRound | DeferredReviewPreparation,
+    ) -> FinalizedReviewRound | DeferredReviewPreparation:
+        """Retain exact terminal evidence without granting or changing prior authority."""
+        from ..domain.events import ControlTransitionCommitted, Correlation
+
+        if (not isinstance(held.execution, ActivatedReviewExecution)
+                or not same_execution_episode(held.execution.binding, facts.plan.round.binding)
+                or facts.plan.round.sequence > held.execution.last_sequence
+                or facts.plan.round.binding.rejection.fence.generation > held.revision.fence.generation):
+            raise WorkflowAuthorityError("held round belongs to a foreign or future component")
+        with self._control.mutation_savepoint(db):
+            if self._control._event_factory is None:
+                raise WorkflowAuthorityError("held settlement requires a bound durable event outbox")
+            changed = db.execute(
+                "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
+                "WHERE round_id=? AND closure_json IS NULL AND outcome_json IS NULL",
+                (encode_workflow(facts), encode_workflow(result.outcome), facts.plan.round.round_id),
+            ).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("held round changed during settlement")
+            db.execute(
+                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, facts.plan.round.round_id,
+                 _stamp(self._control.now()), encode_workflow((facts, result.outcome))),
+            )
             if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
                 confirmed = tuple(item.plan.command_id for item in facts.submissions
                                   if isinstance(item.result, ReviewSubmissionConfirmed))
                 if len(confirmed) != 1:
-                    raise WorkflowAuthorityError("productive review lacks one confirmed submission")
-                recorded = db.execute(
-                    "SELECT 1 FROM dedupe_keys WHERE namespace='review-recorded-submission' "
-                    "AND scope=? AND key=?", (self._writer.repository, confirmed[0]),
-                ).fetchone() is not None
-                stale = plan.round.binding.rejection.fence.generation < snapshot.revision.fence.generation
-                if not recorded and not stale:
-                    raise WorkflowAuthorityError("productive review requires joint rejection settlement")
-                self._settle_productive_in_tx(db, confirmed[0], snapshot, stale=not recorded)
-                load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
-                return result
-            if receipt is not None or row["closure_json"] is not None:
-                raise WorkflowAuthorityError("review round has an orphaned outcome receipt")
-            changed = db.execute(
-                "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
-                "WHERE round_id=? AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
-                (encode_workflow(facts), encode_workflow(result.outcome), round_id, row["planning_json"]),
-            ).rowcount
-            if changed != 1:
-                raise WorkflowAuthorityError("review round changed during finalization")
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, round_id,
-                 _stamp(self._control.now()), encode_workflow((facts, result.outcome))),
-            )
+                    raise WorkflowAuthorityError("held productive round lacks one confirmed submission")
+                db.execute(
+                    "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    ("review-submission-settled", self._writer.repository, confirmed[0],
+                     _stamp(self._control.now()), '{"outcome":"refused: held prior execution"}'),
+                )
             if isinstance(result, DeferredReviewPreparation):
                 db.execute(
                     "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                    (REVIEW_PREPARATION_NAMESPACE, self._writer.repository, round_id,
+                    (REVIEW_PREPARATION_NAMESPACE, self._writer.repository, facts.plan.round.round_id,
                      _stamp(self._control.now()), encode_workflow((facts, result.failures))),
                 )
-            after = replace(
-                snapshot,
-                revision=WorkflowRevision(snapshot.revision.fence, snapshot.revision.version + 1),
-                execution=self._project_outcomes(db, snapshot, plan),
-            )
-            persist_workflow_snapshot(db, after)
-            self._control._transition(db, "review_round", round_id, "outcome_finalized", {
-                "disposition": type(result.outcome.disposition).__name__,
-                "sequence": plan.round.sequence,
-            })
-            if isinstance(result, DeferredReviewPreparation):
-                assert preparation_error is not None
-                if snapshot.revision.fence.generation == plan.round.binding.rejection.fence.generation:
-                    assert self._preparation_control is not None
-                    self._preparation_control._record_evidence_in_tx(
-                        db, plan.round.binding.rejection.fence.key, plan.head_sha,
-                        ReviewEvidenceKind.RUNTIME_PREPARATION, error=preparation_error,
-                    )
-                else:
-                    self._control._transition(db, "review_round", round_id, "preparation_superseded", {
-                        "settled_generation": snapshot.revision.fence.generation,
-                    })
+            self._control.enqueue_event(self._control._event_factory(
+                ControlTransitionCommitted("review_round", facts.plan.round.round_id, "held_outcome_finalized", {
+                    "disposition": type(result.outcome.disposition).__name__, "sequence": facts.plan.round.sequence,
+                }), Correlation(),
+            ), db)
             return result
 
     def _finalize_current_nonproductive_in_tx(
@@ -550,25 +529,6 @@ class SQLiteReviewExecutionControl:
                     })
             return accepted
 
-    def _project_outcomes(
-        self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot, plan: ReviewRoundPlan,
-    ) -> ActivatedReviewExecution:
-        execution = snapshot.execution
-        assert isinstance(execution, ActivatedReviewExecution)
-        rows = db.execute(
-            "SELECT outcome_json FROM review_execution_rounds WHERE repository=? AND target_number=? "
-            "AND execution_epoch=? AND execution_episode=? AND sequence>? "
-            "AND outcome_json IS NOT NULL ORDER BY sequence",
-            (self._writer.repository, plan.round.binding.rejection.fence.key.target.number,
-             execution.binding.execution_epoch, execution.binding.execution_episode,
-             execution.checkpoint.through_sequence),
-        ).fetchall()
-        outcomes = tuple(decode_workflow(item["outcome_json"], ReviewRoundOutcome) for item in rows)
-        projected = replay_review_execution_generations(
-            execution.checkpoint, outcomes, execution.boundaries,
-        )
-        return replace(execution, state=projected)
-
     def _settle_productive_in_tx(
         self, db: sqlite3.Connection, command_id: str, after_rejection: ReviewWorkflowSnapshot,
         *, stale: bool = False, superseded_evidence_id: str | None = None,
@@ -596,7 +556,7 @@ class SQLiteReviewExecutionControl:
         parent_owner, selection, plan, row = stored
         settled_at = self._control.now()
         if (plan.round != registration.round or registration.submission not in plan.submissions
-                or not isinstance(after_rejection.execution, (ActivatedReviewExecution, CurrentReviewExecution))
+                or not isinstance(after_rejection.execution, CurrentReviewExecution)
                 or not same_execution_episode(after_rejection.execution.binding, plan.round.binding)
                 or plan.round.binding.rejection.fence.generation > after_rejection.revision.fence.generation
                 or (stale and plan.round.binding.rejection.fence.generation
@@ -656,7 +616,7 @@ class SQLiteReviewExecutionControl:
                            for submission in facts.submissions)):
             raise WorkflowAuthorityError("review verdict has no sealed, settled productive round")
         if isinstance(after_rejection.execution, CurrentReviewExecution):
-            if load_current_review_workflow_row(db, plan.round.binding.rejection.fence.key) != after_rejection:
+            if load_review_workflow_row(db, plan.round.binding.rejection.fence.key) != after_rejection:
                 raise WorkflowAuthorityError("current productive settlement changed its captured workflow")
             receipt = CurrentReviewOutcomeReceipt(
                 facts, result.outcome, after_rejection.revision, self._writer.owner_id,
@@ -684,70 +644,6 @@ class SQLiteReviewExecutionControl:
                     )
             self._write_current_outcome_in_tx(db, facts, after_rejection.revision)
             return
-        stale_settlement: StaleReviewProductivitySettlement | None = None
-        if stale:
-            persisted = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
-            if persisted != after_rejection:
-                raise WorkflowAuthorityError("stale review settlement changed its current workflow")
-            old_generation = plan.round.binding.rejection.fence.generation
-            settled_generation = after_rejection.revision.fence.generation
-            boundaries = tuple(boundary for boundary in after_rejection.execution.boundaries
-                               if old_generation <= boundary.from_revision.fence.generation < settled_generation)
-            if (len(boundaries) != settled_generation - old_generation
-                    or any(boundary.from_revision.fence.generation != old_generation + index
-                           or boundary.to_revision.fence.generation != old_generation + index + 1
-                           or not same_execution_episode(boundary.before.binding, plan.round.binding)
-                           or not same_execution_episode(boundary.after.binding, plan.round.binding)
-                           for index, boundary in enumerate(boundaries))
-                    or boundaries[-1].to_revision.version > after_rejection.revision.version):
-                raise WorkflowAuthorityError("stale review settlement lacks its accepted generation chain")
-            stale_settlement = StaleReviewProductivitySettlement(
-                facts, result.outcome, after_rejection.revision, after_rejection.execution.binding,
-                review_generation_chain_digest(tuple(boundary.receipt_id for boundary in boundaries)),
-            )
-        changed = db.execute(
-            "UPDATE review_execution_rounds SET closure_json=?,outcome_json=? "
-            "WHERE round_id=? AND planning_json=? AND closure_json IS NULL AND outcome_json IS NULL",
-            (encode_workflow(facts), encode_workflow(result.outcome),
-             plan.round.round_id, row["planning_json"]),
-        ).rowcount
-        if changed != 1:
-            raise WorkflowAuthorityError("review verdict round changed during settlement")
-        db.execute(
-            "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-            (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, plan.round.round_id,
-             _stamp(settled_at), encode_workflow((facts, result.outcome))),
-        )
-        if stale:
-            assert stale_settlement is not None
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
-                 _stamp(settled_at), encode_workflow(stale_settlement)),
-            )
-        if superseded_evidence_id is not None:
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
-                 _stamp(settled_at),
-                 encode_workflow((superseded_evidence_id, after_rejection.revision,
-                                  settled_at.isoformat()))),
-            )
-        if ceiling is not None:
-            db.execute(
-                "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
-                 _stamp(settled_at), encode_workflow((ceiling, after_rejection.revision,
-                                                    settled_at.isoformat()))),
-            )
-        persist_workflow_snapshot(db, replace(
-            after_rejection, execution=self._project_outcomes(db, after_rejection, plan),
-        ))
-        self._control._transition(db, "review_round", plan.round.round_id, "outcome_finalized", {
-            "disposition": type(result.outcome.disposition).__name__,
-            "sequence": plan.round.sequence,
-        })
-
     def _runtime_preparation_error(
         self, db: sqlite3.Connection, plan: ReviewRoundPlan, result: DeferredReviewPreparation,
     ) -> str:
@@ -864,18 +760,6 @@ class SQLiteReviewExecutionControl:
                 raise WorkflowAuthorityError("review parent claim occurrence is absent")
             parent_pid, parent_start_ticks = claim["owner_pid"], claim["owner_start_ticks"]
 
-        # Persist audit progress separately: a deferred proposal must not roll
-        # back the maintenance that will make a later proposal admissible.
-        maintenance = self.maintain_archive(key)
-        if isinstance(maintenance, PendingReviewExecutionMaintenance):
-            raise WorkflowAuthorityError(
-                f"review preflight awaits archive maintenance: {maintenance.stage.value}",
-            )
-        if isinstance(maintenance, BlockedReviewExecutionMaintenance):
-            raise WorkflowAuthorityError(f"review preflight archive maintenance blocked: {maintenance.reason}")
-        if maintenance.revision != selection.expected:
-            raise WorkflowRevisionConflict(maintenance.revision, "review preflight aggregate version changed")
-
         if not ProcessSupervisor.matches_identity(parent_pid, parent_start_ticks):
             raise WorkflowAuthorityError("review parent claim process is no longer live")
 
@@ -917,12 +801,8 @@ class SQLiteReviewExecutionControl:
             if release is not None and release.status is not ReleaseStatus.VERIFIED:
                 raise WorkflowAuthorityError("review preflight is held by unverified release projection")
             now = self._control.now()
-            if isinstance(snapshot.execution, ActivatedReviewExecution):
-                from .review_execution_archive_gate import require_review_execution_archive_admission
-
-                require_review_execution_archive_admission(db, key, snapshot.execution, now=now)
             plan = plan_review_preflight(snapshot, selection, now=now)
-            if not isinstance(snapshot.execution, ActivatedReviewExecution):
+            if not isinstance(snapshot.execution, CurrentReviewExecution):
                 raise WorkflowAuthorityError("review execution is inactive")
             execution = replace(snapshot.execution, last_sequence=plan.round.sequence)
             after = replace(
@@ -997,7 +877,7 @@ class SQLiteReviewExecutionControl:
                 raise WorkflowAuthorityError("review round planning is already sealed")
             self._require_refused_submissions(db, current)
             snapshot = load_review_workflow_row(db, expected.fence.key)
-            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+            if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
                 raise WorkflowAuthorityError("review execution workflow is absent or inactive")
             if snapshot.revision != expected:
                 raise WorkflowRevisionConflict(snapshot.revision, "review stage aggregate version changed")
@@ -1135,7 +1015,7 @@ class SQLiteReviewExecutionControl:
                     or kind is ReviewSubmissionKind.PAID and not plan.stages):
                 raise WorkflowAuthorityError("review submission kind disagrees with planned work")
             snapshot = load_review_workflow_row(db, expected.fence.key)
-            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+            if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
                 raise WorkflowAuthorityError("review execution workflow is absent or inactive")
             if snapshot.revision != expected:
                 raise WorkflowRevisionConflict(snapshot.revision, "review submission aggregate version changed")
@@ -1231,7 +1111,7 @@ class SQLiteReviewExecutionControl:
             if not (plan.stages or plan.submissions):
                 raise WorkflowAuthorityError("completed review planning has no registered work")
             snapshot = load_review_workflow_row(db, expected.fence.key)
-            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+            if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
                 raise WorkflowAuthorityError("review execution workflow is absent or inactive")
             if snapshot.revision != expected:
                 raise WorkflowRevisionConflict(snapshot.revision, "review planning seal aggregate version changed")

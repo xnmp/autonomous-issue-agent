@@ -21,7 +21,7 @@ from issue_agent.adapters.control_store import load_bound_review_submission
 from issue_agent.domain.contracts import CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
-from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress, ReviewRoundFailure
+from issue_agent.domain.review_execution import CopiedReviewProgress, PaidReviewProgress, ReviewRoundFailure, ReviewExecutionGenerationBoundary, review_generation_receipt_id
 from issue_agent.domain.review_evidence import ReviewEvidenceKind
 from issue_agent.domain.review_rejection import CountingRule
 from issue_agent.domain.review_rounds import ReviewRoundPlan, ReviewSubmissionKind, ReviewSubmissionRegistration
@@ -51,6 +51,18 @@ def workflow_for(store, gateway):
         trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"),
     )
 
+
+
+def current_boundary(store, snapshot):
+    with store.transaction() as db:
+        row = db.execute(
+            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation' "
+            "AND scope=? AND key=?",
+            (snapshot.revision.fence.key.repository,
+             review_generation_receipt_id(snapshot.execution.binding, snapshot.revision.fence.generation)),
+        ).fetchone()
+    assert row is not None
+    return decode_workflow(row["payload_json"], ReviewExecutionGenerationBoundary)
 
 def confirmed_copy(rig, *, seal=True):
     store, _, gateway, selection, control = rig
@@ -341,7 +353,7 @@ def test_productive_round_requires_its_recorded_baseline_receipt_on_reload(rig):
                    "AND key=?", (str(command.command_id),))
     before = dump(store)
 
-    with pytest.raises(WorkflowAuthorityError, match="one settlement authority"):
+    with pytest.raises(WorkflowAuthorityError, match="joint settlement receipt"):
         current(store, selection)
 
     assert dump(store) == before
@@ -450,9 +462,10 @@ def _forge_generation_with_open_round(store, selection):
         binding = replace(prior.execution.binding, rejection=replace(prior.binding, fence=fence))
         execution = replace(
             prior.execution,
-            checkpoint=replace(prior.execution.checkpoint,
-                               state=replace(prior.execution.checkpoint.state, binding=binding)),
-            state=replace(prior.execution.checkpoint.state, binding=binding),
+            baseline=replace(prior.execution.baseline,
+                             state=replace(prior.execution.baseline.state, binding=binding)),
+            state=replace(prior.execution.baseline.state, binding=binding),
+            generation_start_sequence=prior.execution.last_sequence,
         )
         advanced = replace(
             prior, revision=replace(prior.revision, fence=fence, version=prior.revision.version + 1),
@@ -669,7 +682,8 @@ def test_rejection_rearm_preserves_active_execution_boundary_and_reloads(rig):
     assert after.execution.state.pin_deferrals == before.execution.state.pin_deferrals
     assert after.execution.binding.rejection == after.binding
     assert after.execution.state.productive_sequence == plan.round.sequence
-    assert after.execution.boundaries[-1].applied_sequences == (plan.round.sequence,)
+    assert current_boundary(store, after).before == before.execution.state
+    assert current_boundary(store, after).through_sequence == plan.round.sequence
     before_replay = dump(store)
     assert workflow.request_rearm(request, OperatorActor("operator", "test")).idempotent
     assert dump(store) == before_replay
@@ -692,8 +706,8 @@ def test_old_open_round_closes_as_audit_after_rearm(rig):
                            KeepGuidance(), expected_binding=before.binding)
     assert isinstance(workflow.request_rearm(request, OperatorActor("operator", "test")), WorkflowCommitted)
     advanced = current(store, selection)
-    assert advanced.execution.boundaries[-1].through_sequence == productive.round.sequence
-    assert advanced.execution.boundaries[-1].applied_sequences == (productive.round.sequence,)
+    assert current_boundary(store, advanced).through_sequence == productive.round.sequence
+    assert current_boundary(store, advanced).applied_sequences == (productive.round.sequence,)
 
     assert store.release_dispatch_claim("o/r", "review", -9, OWNER)
     control.seal_abandoned_planning(old.round.round_id)
@@ -733,7 +747,7 @@ def test_late_old_paid_failure_does_not_debit_rearmed_execution(rig):
     assert isinstance(workflow.request_rearm(request_rearm, OperatorActor("operator", "test")),
                       WorkflowCommitted)
     advanced = current(store, selection)
-    assert advanced.execution.boundaries[-1].applied_sequences == (productive.round.sequence,)
+    assert current_boundary(store, advanced).applied_sequences == (productive.round.sequence,)
 
     result = control.finalize_completed_round(old.round.round_id)
 
@@ -764,9 +778,10 @@ def test_boundary_captures_state_neutral_outcome_settled_before_rearm(rig):
                          KeepGuidance(), expected_binding=before.binding)
 
     assert isinstance(workflow.request_rearm(rearm, OperatorActor("operator", "test")), WorkflowCommitted)
-    assert current(store, selection).execution.boundaries[-1].applied_sequences == (
-        old.round.sequence, productive.round.sequence,
-    )
+    boundary = current_boundary(store, current(store, selection))
+    assert boundary.before == before.execution.state
+    assert boundary.through_sequence == productive.round.sequence
+    assert before.execution.baseline.through_sequence == productive.round.sequence
 
 
 def test_stopped_rearm_continuation_preserves_execution_across_second_advance(rig):
@@ -798,8 +813,8 @@ def test_stopped_rearm_continuation_preserves_execution_across_second_advance(ri
     assert isinstance(result, WorkflowCommitted)
     after = current(store, selection)
     assert after.revision.fence.generation == first.revision.fence.generation + 2
-    assert len(after.execution.boundaries) == 2
-    assert after.execution.boundaries[1].applied_sequences == ()
+    assert current_boundary(store, after).applied_sequences == ()
+    assert current_boundary(store, after).from_revision.fence.generation == first.revision.fence.generation + 1
     assert after.execution.state.productive_sequence == plan.round.sequence
 
 
@@ -823,7 +838,8 @@ def test_ceiling_release_advances_active_execution_with_verified_boundary(rig):
     assert after.revision.fence.generation == before.revision.fence.generation + 1
     assert after.execution.binding.rejection == after.binding
     assert after.execution.state.productive_sequence == plan.round.sequence
-    assert after.execution.boundaries[-1].applied_sequences == (plan.round.sequence,)
+    assert current_boundary(store, after).before == before.execution.state
+    assert current_boundary(store, after).through_sequence == plan.round.sequence
 
 
 @pytest.mark.parametrize("corruption", ["boundary", "transition"])
@@ -845,8 +861,11 @@ def test_active_generation_boundary_requires_its_accepted_receipts(rig, corrupti
             db.execute("DELETE FROM dedupe_keys WHERE namespace='workflow-request' AND key=?",
                        (request.request_id,))
 
-    with pytest.raises(WorkflowAuthorityError, match="boundary"):
-        current(store, selection)
+    if corruption == "boundary":
+        with pytest.raises(WorkflowAuthorityError, match="exact transition receipt"):
+            current(store, selection)
+    else:
+        assert current(store, selection).execution.binding.rejection == current(store, selection).binding
 
 
 def test_generation_receipt_failure_rolls_back_rearm_and_accepted_transition(rig):
@@ -933,5 +952,5 @@ def test_refused_ceiling_reload_requires_its_exact_observation(rig):
         db.execute("DELETE FROM workflow_evidence WHERE evidence_id=?",
                    (decision.observation_evidence_id,))
 
-    with pytest.raises(WorkflowAuthorityError, match="exact observation"):
+    with pytest.raises(WorkflowAuthorityError, match="joint settlement receipt"):
         current(store, selection)

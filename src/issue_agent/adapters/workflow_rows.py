@@ -16,16 +16,26 @@ from ..domain.review_workflow import (
     ReviewFamilyEpisodes, ReviewRearmIntent, ReviewWorkflowSnapshot, SupersededReviewRearm,
 )
 from ..domain.review_execution import (
-    MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, CopiedReviewProgress, ExecutionNotActivated, PaidReviewProgress,
-    ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
-    InitializedReviewExecutionOriginReceipt, initialized_review_execution,
-    ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
-    ReviewExecutionCheckpoint, ReviewExecutionCheckpointReceipt, ReviewExecutionGenerationBoundary,
-    ReviewExecutionOriginKind, ReviewRoundOutcome,
-    matches_accepted_review_transition_source, replay_review_execution_generations,
-    review_generation_chain_digest, same_execution_episode,
-    CurrentReviewExecution, OpenReviewExecutionRound, CompletedReviewExecutionRound,
-    PendingReviewExecutionRound, review_generation_receipt_id,
+    MAX_EXECUTION_SUFFIX,
+    ActivatedReviewExecution,
+    CopiedReviewProgress,
+    ExecutionNotActivated,
+    PaidReviewProgress,
+    ImportedReviewExecutionDecision,
+    ImportedReviewExecutionOriginReceipt,
+    InitializedReviewExecutionOriginReceipt,
+    initialized_review_execution,
+    ReviewExecutionCheckpoint,
+    ReviewExecutionGenerationBoundary,
+    ReviewExecutionOriginKind,
+    ReviewRoundOutcome,
+    same_execution_episode,
+    CurrentReviewExecution,
+    OpenReviewExecutionRound,
+    CompletedReviewExecutionRound,
+    PendingReviewExecutionRound,
+    review_generation_receipt_id,
+    reduce_current_review_execution,
 )
 from ..domain.review_execution_activation import MAX_LEGACY_SQL_TEXT_BYTES
 from ..domain.review_rounds import (
@@ -58,6 +68,14 @@ from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, d
 
 class WorkflowAuthorityError(ValueError):
     pass
+
+
+class ReviewExecutionHeld(WorkflowAuthorityError):
+    """Prior authority is readable for settlement, but grants no new admission."""
+
+    def __init__(self, snapshot: ReviewWorkflowSnapshot):
+        super().__init__("legacy review execution is held pending stopped verified conversion")
+        self.snapshot = snapshot
 
 
 class WorkflowRevisionConflict(WorkflowAuthorityError):
@@ -618,111 +636,6 @@ def _read_execution_origin(
     return captured, claimed
 
 
-def review_execution_checkpoint_receipt_id(receipt: ReviewExecutionCheckpointReceipt) -> str:
-    if not isinstance(receipt, ReviewExecutionCheckpointReceipt):
-        raise ValueError("checkpoint identity requires a typed receipt")
-    return "review-execution-checkpoint:" + hashlib.sha256(encode_workflow(receipt).encode()).hexdigest()
-
-
-def _read_checkpoint_receipt_row(
-    db: sqlite3.Connection, repository: str, receipt_id: str,
-) -> tuple[ReviewExecutionCheckpointReceipt, datetime]:
-    rowid = _unique_text_identity_rowid(
-        db, "dedupe_keys", (("namespace", REVIEW_EXECUTION_CHECKPOINT_NAMESPACE),
-                            ("scope", repository), ("key", receipt_id)),
-        source="review execution checkpoint",
-    )
-    metadata = db.execute(
-        "SELECT rowid,max(ifnull(length(CAST(claimed_at AS BLOB)),0),"
-        "ifnull(length(CAST(payload_json AS BLOB)),0)) AS largest "
-        "FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-        (REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, repository, receipt_id),
-    ).fetchone()
-    if (metadata is None or metadata["rowid"] != rowid
-            or metadata["largest"] > MAX_WORKFLOW_PAYLOAD_BYTES):
-        raise WorkflowAuthorityError("review execution checkpoint receipt exceeds its bound")
-    row = db.execute(
-        "SELECT rowid,claimed_at,reusable_after,payload_json,"
-        "typeof(claimed_at) AS claimed_type,typeof(payload_json) AS payload_type "
-        "FROM dedupe_keys WHERE rowid=? AND namespace=? AND scope=? AND key=?",
-        (rowid, REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, repository, receipt_id),
-    ).fetchone()
-    if (row is None or row["reusable_after"] is not None or row["claimed_type"] != "text"
-            or row["payload_type"] != "text"):
-        raise WorkflowAuthorityError("review execution checkpoint receipt changed or is malformed")
-    try:
-        claimed = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
-        if claimed.tzinfo is None or claimed.utcoffset() is None:
-            raise ValueError("checkpoint claim has no timezone")
-        receipt = decode_workflow(row["payload_json"], ReviewExecutionCheckpointReceipt)
-        if (encode_workflow(receipt) != row["payload_json"]
-                or review_execution_checkpoint_receipt_id(receipt) != receipt_id):
-            raise ValueError("checkpoint receipt identity is not canonical")
-    except (TypeError, ValueError, UnicodeError, WorkflowEncodingError) as exc:
-        raise WorkflowAuthorityError("review execution checkpoint receipt is unreadable") from exc
-    return receipt, claimed
-
-
-def _check_execution_checkpoint_receipt(
-    db: sqlite3.Connection, repository: str, execution: ActivatedReviewExecution,
-    origin: ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt,
-    *, certified: bool = False,
-) -> None:
-    receipt_id = execution.checkpoint_receipt
-    if receipt_id is None:
-        raise WorkflowAuthorityError("review execution checkpoint lacks its compaction receipt")
-    receipt, claimed = _read_checkpoint_receipt_row(db, repository, receipt_id)
-    if receipt.origin != origin.origin or receipt.checkpoint != execution.checkpoint:
-        raise WorkflowAuthorityError("review execution checkpoint disagrees with its origin or component")
-    if receipt.previous_receipt_id is None:
-        previous = origin.checkpoint
-    else:
-        predecessor, previous_claimed = _read_checkpoint_receipt_row(
-            db, repository, receipt.previous_receipt_id,
-        )
-        if predecessor.origin != origin.origin or previous_claimed > claimed:
-            raise WorkflowAuthorityError("review execution checkpoint has a foreign predecessor")
-        previous = predecessor.checkpoint
-    if receipt.previous_checkpoint != previous:
-        raise WorkflowAuthorityError("review execution checkpoint has a changed predecessor")
-    if receipt.last_round_source is not None:
-        from .review_execution_activation import (
-            read_checkpoint_round_row_source, read_checkpoint_round_receipt_source,
-        )
-
-        row_source = read_checkpoint_round_row_source(db, receipt.last_round_source.round)
-        if row_source.source_digest != receipt.last_round_source.row_sha256:
-            raise WorkflowAuthorityError("review execution checkpoint round row changed after compaction")
-        round_source = read_checkpoint_round_receipt_source(db, receipt.last_round_source.round)
-        if round_source.row_sha256 != row_source.source_digest:
-            raise WorkflowAuthorityError("review execution checkpoint round row changed during its read")
-        if round_source.receipt_set_sha256 != receipt.last_round_source.receipt_set_sha256:
-            raise WorkflowAuthorityError("review execution checkpoint round receipts changed after compaction")
-    if receipt.last_generation_source is not None:
-        if certified:
-            from .review_execution_transition_proof import read_review_execution_transition_proof
-            from .review_execution_activation import _generation_receipt_parts, _read_recording_source
-
-            fields, _ = _read_recording_source(
-                db, "review-execution-generation", repository,
-                receipt.last_generation_source.cursor.receipt_id,
-            )
-            boundary, namespace, key, _ = _generation_receipt_parts(dict(fields)["payload_json"])
-            if (namespace != receipt.last_generation_source.accepted_namespace
-                    or key != receipt.last_generation_source.accepted_key):
-                raise WorkflowAuthorityError("checkpoint generation proof source changed")
-            read_review_execution_transition_proof(
-                db, repository, boundary,
-                expected_receipt_sha256=receipt.last_generation_source.receipt_sha256,
-            )
-            return
-        from .review_execution_activation import verify_checkpoint_generation_anchor
-
-        verify_checkpoint_generation_anchor(
-            db, receipt.previous_checkpoint.state.binding, receipt.last_generation_source,
-        )
-
-
 def _check_initialized_execution_origin(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution | CurrentReviewExecution,
     captured: InitializedReviewExecutionOriginReceipt, claimed: datetime,
@@ -932,388 +845,6 @@ def _check_active_round_source_budget(
         source_bytes += size
 
 
-def _check_execution_projection(
-    db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution,
-    revision: WorkflowRevision,
-) -> None:
-    origin, claimed = _read_execution_origin(db, scope, execution)
-    if isinstance(origin, ImportedReviewExecutionOriginReceipt):
-        _check_imported_execution_origin(db, scope, execution, origin, claimed)
-    else:
-        _check_initialized_execution_origin(db, scope, execution, origin, claimed)
-    certified = execution.checkpoint_receipt is not None
-    if certified:
-        from .sql_read_budget import BudgetedSqlConnection
-
-        if not isinstance(db, BudgetedSqlConnection) or sqlite3.sqlite_version_info < (3, 43, 0):
-            raise WorkflowAuthorityError("compacted review authority requires metered SQLite 3.43+ reads")
-    episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
-    latest = db.execute(
-        "SELECT rowid AS source_rowid,typeof(sequence) AS sequence_type "
-        "FROM review_execution_rounds INDEXED BY review_execution_rounds_episode "
-        "WHERE repository=? AND target_number=? AND execution_epoch=? "
-        "AND execution_episode=? ORDER BY sequence DESC LIMIT 1",
-        episode_scope,
-    ).fetchone()
-    if latest is not None and latest["sequence_type"] != "integer":
-        raise WorkflowAuthorityError("review execution round high water has a noninteger sequence")
-    latest_sequence = db.execute(
-        "SELECT sequence FROM review_execution_rounds WHERE rowid=?",
-        (latest["source_rowid"],),
-    ).fetchone() if latest is not None else None
-    if (latest_sequence["sequence"] if latest_sequence is not None else 0) != execution.last_sequence:
-        raise WorkflowAuthorityError("review execution round high water disagrees with allocated sequence")
-    suffix_count = execution.last_sequence - execution.checkpoint.through_sequence
-    if suffix_count > MAX_EXECUTION_SUFFIX:
-        raise WorkflowAuthorityError("review execution suffix exceeds its bounded projection")
-    _check_active_round_source_budget(
-        db, episode_scope, execution.checkpoint.through_sequence, suffix_count,
-    )
-    for boundary in execution.boundaries:
-        if certified:
-            from .review_execution_transition_proof import read_review_execution_transition_proof
-
-            read_review_execution_transition_proof(db, scope[0], boundary)
-            continue
-        receipt = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation' "
-            "AND scope=? AND key=?", (scope[0], boundary.receipt_id),
-        ).fetchone()
-        if receipt is None:
-            raise WorkflowAuthorityError("review generation boundary lacks its accepted receipt")
-        captured = decode_workflow(
-            receipt["payload_json"],
-            tuple | ReviewExecutionAcceptedTransitionSource | ReviewExecutionTransitionProofSource,
-        )
-        if isinstance(captured, (ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource)):
-            if captured.boundary != boundary:
-                raise WorkflowAuthorityError("review generation boundary receipt changed")
-            namespace, key = captured.namespace, captured.key
-        elif (len(captured) == 4 and captured[0] == boundary
-              and all(isinstance(item, str) for item in captured[1:])):
-            namespace, key = captured[1:3]
-        else:
-            raise WorkflowAuthorityError("review generation boundary receipt changed")
-        committed = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (namespace, scope[0], key),
-        ).fetchone()
-        if (committed is None or not isinstance(committed["payload_json"], str)
-                or not matches_accepted_review_transition_source(
-                    captured, boundary, namespace, key, committed["payload_json"],
-                )):
-            raise WorkflowAuthorityError("review generation boundary lost its accepted transition")
-        accepted = committed["payload_json"]
-        try:
-            payload = json.loads(accepted)
-            observed = decode_workflow(payload["snapshot"], ReviewWorkflowSnapshot)
-            expected = decode_workflow(payload["expected"], WorkflowRevision)
-            audit = decode_workflow(payload["audit"], AuthorizedOperatorCommand) if (
-                boundary.mutation in (WorkflowMutation.REQUEST_REARM, WorkflowMutation.CONTINUE_REARM)
-            ) else decode_workflow(payload["audit"], ObservedTransition)
-        except (ValueError, TypeError, KeyError) as exc:
-            raise WorkflowAuthorityError("review generation boundary has invalid transition facts") from exc
-        if (payload.get("mutation") != boundary.mutation.value or expected != boundary.from_revision
-                or observed.revision != boundary.to_revision
-                or not isinstance(observed.execution, ActivatedReviewExecution)
-                or not observed.execution.boundaries
-                or observed.execution.boundaries[-1] != boundary):
-            raise WorkflowAuthorityError("review generation boundary disagrees with accepted transition")
-        if (isinstance(captured, ReviewExecutionTransitionProofSource)
-                and captured.audit_sha256 != hashlib.sha256(payload["audit"].encode()).hexdigest()):
-            raise WorkflowAuthorityError("review generation proof disagrees with accepted transition")
-        if isinstance(audit, AuthorizedOperatorCommand):
-            if (not isinstance(audit.command, (RequestRearm, ContinueGrantedRearm))
-                    or namespace != "workflow-request" or key != audit.command.request_id
-                    or audit.command.expected != boundary.from_revision):
-                raise WorkflowAuthorityError("review generation boundary request identity changed")
-        elif (namespace != "workflow-transition" or key != hashlib.sha256(
-            encode_workflow(boundary.from_revision).encode(),
-        ).hexdigest()):
-            raise WorkflowAuthorityError("review generation boundary release identity changed")
-    if execution.checkpoint.through_sequence or execution.checkpoint.boundary_cursor is not None:
-        _check_execution_checkpoint_receipt(db, scope[0], execution, origin, certified=certified)
-    if certified:
-        from .review_execution_archive_gate import read_review_execution_archive_gate
-
-        read_review_execution_archive_gate(db, revision.fence.key, execution)
-    outcomes: list[ReviewRoundOutcome] = []
-    rows = db.execute(
-        "SELECT round_id,generation,sequence,claim_occurrence_id,plan_json,planning_json,closure_json,outcome_json "
-        "FROM review_execution_rounds WHERE repository=? AND target_number=? AND execution_epoch=? "
-        "AND execution_episode=? AND sequence>? ORDER BY sequence",
-        (*episode_scope, execution.checkpoint.through_sequence),
-    )
-    expected_sequence = execution.checkpoint.through_sequence + 1
-    for row in rows:
-        plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
-        require_review_stage_receipts(db, scope[0], plan)
-        require_review_submission_receipts(db, scope[0], plan, row["claim_occurrence_id"], revision)
-        planning = decode_workflow(
-            row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
-        )
-        identity = plan.round
-        if (
-            row["sequence"] != expected_sequence
-            or row["round_id"] != identity.round_id
-            or row["sequence"] != identity.sequence
-            or row["generation"] != identity.binding.rejection.fence.generation
-            or row["generation"] > execution.binding.rejection.fence.generation
-            or identity.binding.execution_epoch != execution.binding.execution_epoch
-            or identity.binding.execution_episode != execution.binding.execution_episode
-            or identity.binding.rejection.authority != execution.binding.rejection.authority
-            or identity.binding.rejection.episode_id != execution.binding.rejection.episode_id
-            or identity.binding.rejection.fence.key != execution.binding.rejection.fence.key
-            or not isinstance(row["claim_occurrence_id"], str)
-            or not row["claim_occurrence_id"]
-        ):
-            raise WorkflowAuthorityError("review execution round index disagrees with its plan")
-        seal_row = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (REVIEW_SEAL_NAMESPACE, scope[0], identity.round_id),
-        ).fetchone()
-        completed_planning = (
-            planning.completed_seal if isinstance(planning, ReviewSealedParentAbandoned) else planning
-        )
-        if isinstance(completed_planning, ReviewPlanningSealed) and isinstance(completed_planning.conclusion, ReviewPlanningComplete):
-            if seal_row is None:
-                raise WorkflowAuthorityError("sealed review round lacks its immutable planning receipt")
-            seal_record = decode_workflow(seal_row["payload_json"], tuple)
-            if len(seal_record) != 6 or not isinstance(seal_record[1], str) or not seal_record[1]:
-                raise WorkflowAuthorityError("sealed review round has malformed parent provenance")
-            captured = verified_review_completed_seal(
-                db, scope[0], seal_record[1], row["claim_occurrence_id"], plan, planning,
-            )
-            if (captured is None or captured.fence.generation > revision.fence.generation
-                    or (captured.fence == revision.fence and captured.version > revision.version)):
-                raise WorkflowAuthorityError("review planning seal revision is not applicable")
-        elif seal_row is not None:
-            raise WorkflowAuthorityError("review planning state contradicts its completed seal receipt")
-        if not isinstance(planning, ReviewParentAbandoned) and db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (REVIEW_ABANDONMENT_NAMESPACE, scope[0], identity.round_id),
-        ).fetchone() is not None:
-            raise WorkflowAuthorityError("review planning has a contradictory abandonment fence")
-        preflight = None
-        if isinstance(planning, ReviewParentAbandoned) or row["outcome_json"] is not None:
-            preflight_row = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-preflight' "
-                "AND scope=? AND key=?", (scope[0], identity.round_id),
-            ).fetchone()
-            if preflight_row is None:
-                raise WorkflowAuthorityError("finalized review round lacks its exact preflight")
-            preflight = decode_workflow(preflight_row["payload_json"], tuple)
-            if (len(preflight) != 3 or not isinstance(preflight[0], ReviewPreflightSelection)
-                    or not isinstance(preflight[1], str) or not preflight[1]
-                    or not isinstance(preflight[2], ReviewRoundPlan)
-                    or preflight[0].request_id != identity.round_id
-                    or preflight[0].claim_occurrence_id != row["claim_occurrence_id"]
-                    or replace(preflight[2], stages=plan.stages, submissions=plan.submissions) != plan):
-                raise WorkflowAuthorityError("finalized review round preflight disagrees with its plan")
-            if isinstance(planning, ReviewParentAbandoned):
-                verified_review_parent_abandonment(
-                    db, scope[0], preflight[1], row["claim_occurrence_id"],
-                    preflight[0].claim_target, plan, planning,
-                )
-        expected_sequence += 1
-        if row["outcome_json"] is None:
-            if row["closure_json"] is not None:
-                raise WorkflowAuthorityError("closed review round is missing its outcome")
-            continue
-        if row["closure_json"] is None:
-            raise WorkflowAuthorityError("review round outcome lacks closure facts")
-        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
-        result = finalize_review_round(facts)
-        if not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)):
-            raise WorkflowAuthorityError("review round closure has not finalized")
-        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
-        if facts.plan != plan or facts.planning != planning or outcome != result.outcome:
-            raise WorkflowAuthorityError("review round outcome disagrees with verified closure facts")
-        if isinstance(outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
-            confirmed = tuple(item.plan.command_id for item in facts.submissions
-                              if isinstance(item.result, ReviewSubmissionConfirmed))
-            if len(confirmed) != 1:
-                raise WorkflowAuthorityError("productive review round lacks one confirmed submission")
-            baseline = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (RECORDED_REVIEW_NAMESPACE, scope[0], confirmed[0]),
-            ).fetchone()
-            stale = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
-            ).fetchone()
-            superseded = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
-            ).fetchone()
-            ceiling = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
-            ).fetchone()
-            if sum(item is not None for item in (baseline, stale, superseded, ceiling)) != 1:
-                raise WorkflowAuthorityError("productive review round lacks one settlement authority")
-            if baseline is not None:
-                recorded_revision = decode_workflow(baseline["payload_json"], WorkflowRevision)
-                if (recorded_revision.fence != plan.round.binding.rejection.fence
-                        or (recorded_revision.fence == revision.fence
-                            and recorded_revision.version > revision.version)):
-                    raise WorkflowAuthorityError("productive review round baseline receipt disagrees with its generation")
-            elif stale is not None:
-                old_generation = identity.binding.rejection.fence.generation
-                recorded = decode_workflow(
-                    stale["payload_json"], tuple | StaleReviewProductivitySettlement,
-                )
-                if isinstance(recorded, tuple):
-                    valid = recorded == (facts, outcome)
-                else:
-                    settled_generation = recorded.settled_revision.fence.generation
-                    crossings = tuple(boundary for boundary in execution.boundaries
-                                      if old_generation <= boundary.from_revision.fence.generation
-                                      < settled_generation)
-                    valid = (
-                        recorded.facts == facts and recorded.outcome == outcome
-                        and recorded.settled_revision.fence.key == revision.fence.key
-                        and recorded.settled_revision.version <= revision.version
-                        and settled_generation <= revision.fence.generation
-                        and same_execution_episode(recorded.settled_binding, execution.binding)
-                        and len(crossings) == settled_generation - old_generation
-                        and all(boundary.from_revision.fence.generation == old_generation + index
-                                and boundary.to_revision.fence.generation == old_generation + index + 1
-                                and same_execution_episode(boundary.before.binding, identity.binding)
-                                and same_execution_episode(boundary.after.binding, identity.binding)
-                                for index, boundary in enumerate(crossings))
-                        and bool(crossings)
-                        and crossings[-1].to_revision.version <= recorded.settled_revision.version
-                        and recorded.crossing_digest == review_generation_chain_digest(
-                            tuple(boundary.receipt_id for boundary in crossings)
-                        )
-                    )
-                if not valid or old_generation >= revision.fence.generation:
-                    raise WorkflowAuthorityError("stale productive review round lacks its exact retirement")
-            elif superseded is not None:
-                supersession = decode_workflow(superseded["payload_json"], tuple)
-                if (len(supersession) != 3 or not isinstance(supersession[0], str)
-                        or not isinstance(supersession[1], WorkflowRevision)
-                        or not isinstance(supersession[2], str)):
-                    raise WorkflowAuthorityError("superseded review round receipt is malformed")
-                recorded_id, recorded_revision, settled_stamp = supersession
-                evidence = db.execute(
-                    "SELECT payload_json,kind,repository,target_kind,target_number,command_id FROM workflow_evidence "
-                    "WHERE evidence_id=?", (recorded_id,),
-                ).fetchone()
-                if (evidence is None or evidence["kind"] != "observation" or evidence["command_id"] is not None
-                        or (evidence["repository"], evidence["target_kind"], evidence["target_number"]) != scope
-                        or recorded_id != "pr-observation:" + hashlib.sha256(evidence["payload_json"].encode()).hexdigest()):
-                    raise WorkflowAuthorityError("superseded review round lacks its exact observation")
-                observed = decode_workflow(evidence["payload_json"], RecordedPullRequest)
-                settled_at = datetime.fromisoformat(settled_stamp)
-                if settled_at.tzinfo is None or settled_at.utcoffset() is None:
-                    raise WorkflowAuthorityError("superseded review round settlement time is not aware")
-                observation_age = (settled_at - observed.observation.observed_at).total_seconds()
-                if (observed.observation.key != revision.fence.key
-                        or (observed.observation.head_sha == plan.head_sha
-                            and observed.observation.state is PullRequestState.OPEN)
-                        or not 0 <= observation_age <= OBSERVATION_MAX_AGE_SECONDS
-                        or recorded_revision.fence != plan.round.binding.rejection.fence
-                        or (recorded_revision.fence == revision.fence
-                            and recorded_revision.version > revision.version)):
-                    raise WorkflowAuthorityError("superseded review round observation disagrees with its head")
-            elif ceiling is not None:
-                record = decode_workflow(ceiling["payload_json"], tuple)
-                if (len(record) != 3 or not isinstance(record[0], CeilingProductivityDecision)
-                        or not isinstance(record[1], WorkflowRevision)
-                        or not isinstance(record[2], str)):
-                    raise WorkflowAuthorityError("ceiling review round receipt is malformed")
-                decision, recorded_revision, settled_stamp = record
-                if (decision.escalation.escalate_cause != "ceiling"
-                        or str(decision.escalation.submission.command_id) != confirmed[0]
-                        or decision.escalation.submission.binding != plan.round.binding.rejection
-                        or decision.prior.revision.fence != plan.round.binding.rejection.fence
-                        or record[1].fence != plan.round.binding.rejection.fence
-                        or (recorded_revision.fence == revision.fence
-                            and recorded_revision.version > revision.version)):
-                    raise WorkflowAuthorityError("ceiling review round lacks its bound escalation")
-                evidence = db.execute(
-                    "SELECT payload_json,kind,repository,target_kind,target_number,command_id FROM workflow_evidence "
-                    "WHERE evidence_id=?", (decision.observation_evidence_id,),
-                ).fetchone()
-                if (evidence is None or evidence["kind"] != "observation" or evidence["command_id"] is not None
-                        or (evidence["repository"], evidence["target_kind"], evidence["target_number"]) != scope
-                        or decision.observation_evidence_id != "pr-observation:" + hashlib.sha256(
-                            evidence["payload_json"].encode()).hexdigest()):
-                    raise WorkflowAuthorityError("ceiling review round lacks its exact observation")
-                observed = decode_workflow(evidence["payload_json"], RecordedPullRequest)
-                settled_at = datetime.fromisoformat(settled_stamp)
-                if settled_at.tzinfo is None or settled_at.utcoffset() is None:
-                    raise WorkflowAuthorityError("ceiling review round settlement time is not aware")
-                if (observed.observation.key != revision.fence.key
-                        or not 0 <= (decision.decided_at - observed.observation.observed_at).total_seconds()
-                        <= OBSERVATION_MAX_AGE_SECONDS
-                        or not 0 <= (settled_at - observed.observation.observed_at).total_seconds()
-                        <= OBSERVATION_MAX_AGE_SECONDS):
-                    raise WorkflowAuthorityError("ceiling review round observation expired")
-                replayed = open_review_ceiling(
-                    decision.prior, observed.observation, now=decision.decided_at,
-                    rule=decision.configured_rule, ceiling=decision.configured_ceiling,
-                    escalation=decision.escalation, trigger_label=decision.trigger_label,
-                    executor_identity=decision.executor_identity,
-                    evidence_ids=(decision.observation_evidence_id,),
-                )
-                if (isinstance(replayed, WorkflowRejected)
-                        and (replayed != decision.refusal or recorded_revision != decision.prior.revision)):
-                    raise WorkflowAuthorityError("ceiling review refusal disagrees with its observation")
-                if (isinstance(replayed, WorkflowChanged)
-                        and (decision.refusal is not None or recorded_revision != replayed.snapshot.revision)):
-                    raise WorkflowAuthorityError("ceiling review gate disagrees with its observation")
-                if (isinstance(replayed, WorkflowUnchanged)
-                        and (decision.refusal is not None or recorded_revision != decision.prior.revision)):
-                    raise WorkflowAuthorityError("ceiling review replay disagrees with its observation")
-        elif db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
-        ).fetchone() is not None or db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
-        ).fetchone() is not None or db.execute(
-            "SELECT 1 FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, scope[0], identity.round_id),
-        ).fetchone() is not None:
-            raise WorkflowAuthorityError("nonproductive review round has an unapplied productivity receipt")
-        preparation = db.execute(
-            "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-            (REVIEW_PREPARATION_NAMESPACE, scope[0], identity.round_id),
-        ).fetchone()
-        if isinstance(result, DeferredReviewPreparation):
-            if preparation is None or decode_workflow(preparation["payload_json"], tuple) != (facts, result.failures):
-                raise WorkflowAuthorityError("review preparation outcome lacks its immutable obligation")
-        elif preparation is not None:
-            raise WorkflowAuthorityError("review round has a contradictory preparation obligation")
-        if isinstance(planning, (ReviewParentAbandoned, ReviewPlanningSealed)):
-            # Both nonproductive writers commit the same source-backed receipt.
-            from .review_round_sources import read_review_round_sources
-
-            assert preflight is not None
-            source = read_review_round_sources(
-                db, scope[0], preflight[1], preflight[0], plan, planning, revision,
-            )
-            receipt = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-                (REVIEW_OUTCOME_NAMESPACE, scope[0], identity.round_id),
-            ).fetchone()
-            if source != facts or receipt is None or decode_workflow(
-                receipt["payload_json"], tuple,
-            ) != (facts, outcome):
-                raise WorkflowAuthorityError("review outcome disagrees with durable source receipt")
-        outcomes.append(outcome)
-    if expected_sequence != execution.last_sequence + 1:
-        raise WorkflowAuthorityError("review execution round suffix has a gap")
-    projected = replay_review_execution_generations(
-        execution.checkpoint, tuple(outcomes), execution.boundaries,
-    )
-    if projected != execution.state:
-        raise WorkflowAuthorityError("review execution state disagrees with ordered outcomes")
-
-
 def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> WorkflowSnapshot | None:
     """Resolve authority for an issue; a PR key is never read as resolve."""
     activation, row = _row_or_absence(db, key, WorkflowFamily.RESOLVE)
@@ -1349,7 +880,8 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
         raise WorkflowAuthorityError(f"invalid workflow authority: {exc}") from exc
 
 
-def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
+def load_legacy_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
+    """Stopped conversion and retired-mechanism tests; never new-work admission."""
     from .sql_read_budget import BudgetedSqlConnection, SqlReadBudgetExceeded, bounded_sql_source_reads
 
     if isinstance(db, BudgetedSqlConnection) and db.in_transaction and sqlite3.sqlite_version_info >= (3, 43, 0):
@@ -1361,8 +893,8 @@ def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Review
     return _load_review_workflow_row(db, key)
 
 
-def load_current_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
-    """Construction seam for ADR 0016; published admission switches only at S4."""
+def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
+    """Canonical current authority; legacy components remain explicitly held."""
     from .sql_read_budget import SqlReadBudgetExceeded, bounded_sql_source_reads
 
     try:
@@ -1370,6 +902,59 @@ def load_current_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -
             return _load_review_workflow_row(db, key, current_state=True)
     except SqlReadBudgetExceeded as exc:
         raise WorkflowAuthorityError(str(exc)) from exc
+
+
+def convert_legacy_review_execution(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot:
+    """Stopped operator conversion of a single bounded component without ancestry."""
+    from .control_store import SQLiteControlStore
+
+    with SQLiteControlStore.mutation_savepoint(db):
+        return _convert_legacy_review_execution(db, key)
+
+
+def _convert_legacy_review_execution(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot:
+    if not db.in_transaction:
+        raise WorkflowAuthorityError("execution conversion requires the stopped acceptance transaction")
+    try:
+        current = load_review_workflow_row(db, key)
+    except ReviewExecutionHeld as held:
+        current = held.snapshot
+    if current is None or isinstance(current.execution, ExecutionNotActivated):
+        raise WorkflowAuthorityError("execution conversion requires an activated component")
+    if isinstance(current.execution, CurrentReviewExecution):
+        return current
+    prior = current.execution
+    if (prior.boundaries or prior.checkpoint.boundary_cursor is not None
+            or prior.checkpoint_receipt is not None or prior.checkpoint.through_sequence != 0
+            or prior.last_sequence > MAX_EXECUTION_SUFFIX):
+        raise WorkflowAuthorityError("prior execution ancestry is unsupported; its data remains held")
+    for statement in (
+        "SELECT 1 FROM dispatch_claims WHERE repository=? LIMIT 1",
+        "SELECT 1 FROM budget_reservations WHERE state='active' "
+        "AND (repository=? OR workload_repository=? OR repository='*' AND workload_repository='*') LIMIT 1",
+        "SELECT 1 FROM lifecycle_commands WHERE repository=? "
+        "AND state NOT IN ('succeeded','permanent_failure') LIMIT 1",
+        "SELECT 1 FROM runs r LEFT JOIN budget_reservations b ON b.run_id=r.run_id "
+        "WHERE (r.state IN ('reserved','starting','running') "
+        "OR EXISTS (SELECT 1 FROM leases l WHERE l.run_id=r.run_id)) "
+        "AND (b.repository=? OR b.workload_repository=? OR b.run_id IS NULL "
+        "OR b.repository='*' AND b.workload_repository='*') LIMIT 1",
+    ):
+        parameters = (key.repository,) * statement.count("?")
+        if db.execute(statement, parameters).fetchone() is not None:
+            raise WorkflowAuthorityError("execution conversion requires quiescent claims, money and commands")
+    # Verification is stopped and capped to one initial generation. Runtime
+    # admission never invokes this historical reader or trusts its fallback.
+    verified = load_legacy_review_workflow_row(db, key)
+    if verified != current:
+        raise WorkflowAuthorityError("prior execution changed during stopped conversion")
+    converted = replace(current, execution=CurrentReviewExecution(
+        prior.origin, prior.checkpoint, prior.state, 0, prior.last_sequence,
+    ))
+    persist_workflow_snapshot(db, converted)
+    if load_review_workflow_row(db, key) != converted:
+        raise WorkflowAuthorityError("converted execution failed current readback")
+    return converted
 
 
 def read_current_review_pending(
@@ -1384,7 +969,7 @@ def read_current_review_pending(
     count = execution.last_sequence - execution.baseline.through_sequence
     _check_active_round_source_budget(db, episode, execution.baseline.through_sequence, count)
     rows = db.execute(
-        "SELECT round_id,generation,sequence,plan_json,closure_json,outcome_json "
+        "SELECT round_id,generation,sequence,plan_json,planning_json,closure_json,outcome_json "
         "FROM review_execution_rounds INDEXED BY review_execution_rounds_generation_pending "
         "WHERE repository=? AND target_number=? AND execution_epoch=? AND execution_episode=? "
         "AND generation=? AND sequence>? AND sequence<=? ORDER BY sequence LIMIT ?",
@@ -1393,6 +978,15 @@ def read_current_review_pending(
     ).fetchall()
     if len(rows) != count:
         raise WorkflowAuthorityError("current review execution pending range is incomplete")
+    if not rows:
+        return ()
+    metadata = db.execute(
+        "SELECT generation,version FROM workflows WHERE repository=? AND target_kind='pr' AND target_number=?",
+        (key.repository, key.target.number),
+    ).fetchone()
+    if metadata is None or metadata["generation"] != binding.rejection.fence.generation:
+        raise WorkflowAuthorityError("current pending source revision is absent or stale")
+    revision = WorkflowRevision(binding.rejection.fence, metadata["version"])
     pending: list[PendingReviewExecutionRound] = []
     for sequence, row in enumerate(rows, execution.baseline.through_sequence + 1):
         plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
@@ -1400,6 +994,35 @@ def read_current_review_pending(
                 or row["sequence"] != sequence or row["round_id"] != plan.round.round_id):
             raise WorkflowAuthorityError("current pending round disagrees with its allocated identity")
         if row["outcome_json"] is None:
+            captured = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-preflight' "
+                "AND scope=? AND key=? AND reusable_after IS NULL "
+                "AND length(CAST(payload_json AS BLOB))<=?",
+                (key.repository, plan.round.round_id, MAX_WORKFLOW_PAYLOAD_BYTES),
+            ).fetchone()
+            if captured is None:
+                raise WorkflowAuthorityError("current pending round lacks its preflight source")
+            preflight = decode_workflow(captured["payload_json"], tuple)
+            if (len(preflight) != 3 or not isinstance(preflight[0], ReviewPreflightSelection)
+                    or not isinstance(preflight[1], str) or not isinstance(preflight[2], ReviewRoundPlan)):
+                raise WorkflowAuthorityError("current pending preflight source is malformed")
+            selection = preflight[0]
+            if (selection.request_id != plan.round.round_id or selection.binding != plan.round.binding
+                    or replace(preflight[2], stages=plan.stages, submissions=plan.submissions) != plan):
+                raise WorkflowAuthorityError("current pending round disagrees with its exact preflight")
+            planning = decode_workflow(
+                row["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned,
+            )
+            verified_review_completed_seal(
+                db, key.repository, preflight[1], selection.claim_occurrence_id, plan, planning,
+            )
+            verified_review_parent_abandonment(
+                db, key.repository, preflight[1], selection.claim_occurrence_id,
+                selection.claim_target, plan, planning,
+            )
+            require_review_submission_receipts(
+                db, key.repository, plan, selection.claim_occurrence_id, revision,
+            )
             if row["closure_json"] is not None:
                 raise WorkflowAuthorityError("current pending round has an incomplete closure")
             receipt = db.execute(
@@ -1586,7 +1209,7 @@ def _read_current_round_outcome(
                                 revision_row["version"])
     if isinstance(captured_receipt, CurrentReviewOutcomeReceipt) and (
         captured_receipt.expected.fence.generation > revision.fence.generation
-        or captured_receipt.expected.fence == revision.fence and captured_receipt.expected.version >= revision.version
+        or captured_receipt.expected.fence == revision.fence and captured_receipt.expected.version > revision.version
     ):
         raise WorkflowAuthorityError("current outcome receipt contains a future concurrency precondition")
     try:
@@ -1595,6 +1218,31 @@ def _read_current_round_outcome(
         raise WorkflowAuthorityError("current outcome reference lost its actual accounting or effect evidence") from exc
     if actual != facts:
         raise WorkflowAuthorityError("current outcome reference lost its actual accounting or effect evidence")
+    if isinstance(captured_receipt, tuple) and isinstance(outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+        confirmed = tuple(item.plan.command_id for item in facts.submissions
+                          if isinstance(item.result, ReviewSubmissionConfirmed))
+        if len(confirmed) != 1:
+            raise WorkflowAuthorityError("legacy productivity lacks one exact confirmed submission")
+        markers = db.execute(
+            "SELECT namespace,payload_json FROM dedupe_keys WHERE scope=? AND reusable_after IS NULL "
+            "AND ((namespace='review-recorded-submission' AND key=?) "
+            "OR (namespace IN (?,?) AND key=?)) "
+            "AND length(CAST(payload_json AS BLOB)) BETWEEN 1 AND ? LIMIT 3",
+            (episode[0], confirmed[0], REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
+             REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, outcome.round.round_id, MAX_WORKFLOW_PAYLOAD_BYTES),
+        ).fetchall()
+        if not markers:
+            raise WorkflowAuthorityError("legacy productivity lacks its exact joint settlement receipt")
+        for marker in markers:
+            encoded = decode_workflow(marker["payload_json"], WorkflowRevision | tuple)
+            expected = encoded if isinstance(encoded, WorkflowRevision) else encoded[1] if len(encoded) == 3 else None
+            if (not isinstance(expected, WorkflowRevision) or expected.fence != outcome.round.binding.rejection.fence
+                    or expected.fence.generation > revision.fence.generation
+                    or expected.fence == revision.fence and expected.version > revision.version):
+                raise WorkflowAuthorityError("legacy productivity contains an invalid concurrency precondition")
+            require_current_review_productivity_receipt(
+                db, CurrentReviewOutcomeReceipt(facts, outcome, expected, captured[1]),
+            )
     return outcome
 
 
@@ -1731,14 +1379,24 @@ def _load_review_workflow_row(
         )
         if current_state:
             if isinstance(execution, ActivatedReviewExecution):
-                raise WorkflowAuthorityError("legacy review execution is held pending stopped verified conversion")
+                raise ReviewExecutionHeld(snapshot)
             if isinstance(execution, CurrentReviewExecution):
                 _check_current_execution(db, scope, execution, snapshot.revision)
         elif isinstance(execution, CurrentReviewExecution):
-            raise WorkflowAuthorityError("current review execution construction requires the S4 cutover")
+            raise WorkflowAuthorityError("current execution is unavailable to the retired legacy reader")
         elif isinstance(execution, ActivatedReviewExecution):
-            _check_execution_projection(db, scope, execution, snapshot.revision)
+            if (execution.boundaries or execution.checkpoint.through_sequence != 0
+                    or execution.checkpoint_receipt is not None or execution.last_sequence > MAX_EXECUTION_SUFFIX):
+                raise WorkflowAuthorityError("prior execution ancestry is unsupported; its data remains held")
+            candidate = CurrentReviewExecution(execution.origin, execution.checkpoint,
+                                               execution.state, 0, execution.last_sequence)
+            _check_current_execution(db, scope, candidate, snapshot.revision)
+            initial = replace(candidate, state=candidate.baseline.state)
+            if reduce_current_review_execution(initial, read_current_review_pending(db, initial)).execution.state != execution.state:
+                raise WorkflowAuthorityError("prior execution disagrees with its bounded selected outcomes")
         return snapshot
+    except ReviewExecutionHeld:
+        raise
     except (ValueError, TypeError, KeyError) as exc:
         raise WorkflowAuthorityError(f"invalid workflow authority: {exc}") from exc
 

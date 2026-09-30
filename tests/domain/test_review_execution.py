@@ -7,43 +7,64 @@ from itertools import permutations
 
 import pytest
 
-from issue_agent.domain.review_checkpoint_application import (
-    ApplyAllCheckpointTailOutcomes, ApplyCheckpointTailByFollowingBoundary,
-    build_review_checkpoint_application_proposal,
-    replay_review_checkpoint_application,
-)
 from issue_agent.domain.agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from issue_agent.domain.review_execution import (
-    MAX_EXECUTION_SUFFIX, MAX_ROUND_CHILDREN, ActivatedReviewExecution, AddReviewStrike, ClearReviewSession,
-    CopiedReviewProgress, ImportedReviewExecutionDecision, ImportedReviewExecutionOriginReceipt,
-    InitializedReviewExecutionOriginReceipt, initialized_review_execution,
-    ImportedReviewSession, LaunchedReviewChild, NoReviewSession,
-    PaidReviewProgress, PreserveDisplayedRound, PreserveReviewSession, ReplaceReviewSession,
-    ReusableReviewSession, ReviewAdmissionRefused, ReviewCancellationReason, ReviewChildAdmissionRefusal, ReviewChildIdentity,
-    ReviewChildKind, ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionPolicy,
-    ReviewExecutionGenerationBoundary, ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
-    ReviewExecutionCompactionRoundSource, ReviewExecutionCheckpointReceipt,
-    ReviewExecutionBoundaryCursor, ReviewGenerationArchiveFingerprint, ReviewGenerationArchiveScan,
-    ReviewGenerationArchiveReceiptMember, ReviewGenerationArchiveSweep,
-    ReviewGenerationReceiptSweepCursor, CompletedReviewGenerationArchiveAudit,
-    CompletedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveScan,
-    BlockedReviewGenerationArchiveSweep,
-    begin_review_generation_archive_scan, advance_review_generation_archive_scan,
-    advance_review_generation_archive_sweep,
-    review_generation_archive_scan_overdue,
-    ReviewExecutionAcceptedTransitionSource, ReviewExecutionTransitionProofSource,
-    accepted_review_transition_source, accepted_review_transition_proof_source,
-    ReviewPinDeferred, ReviewPreparationDeferred, ReviewPreparationFailure,
-    ReviewPreparationKind, ReviewReservationReleased, ReviewRoundCancelled, ReviewUnlaunchedRound,
-    ReviewRoundFailure, ReviewRoundIdentity, ReviewRoundOutcome, SaturateReviewFailures,
-    SetDisplayedRound, advance_review_execution_generation, carry_review_execution_generation,
-    compatible_review_session, matches_accepted_review_transition_source,
-    review_generation_chain_digest, review_generation_receipt_id, review_generation_within_frontier,
-    plan_review_execution_compaction, project_review_execution, replay_review_execution_generations,
-    build_review_execution_checkpoint_receipt,
-    CurrentReviewExecution, OpenReviewExecutionRound, CompletedReviewExecutionRound,
-    allocate_current_review_round, reduce_current_review_execution,
-    finalize_current_review_round, advance_current_review_generation,
+    MAX_EXECUTION_SUFFIX,
+    MAX_ROUND_CHILDREN,
+    ActivatedReviewExecution,
+    AddReviewStrike,
+    ClearReviewSession,
+    CopiedReviewProgress,
+    ImportedReviewExecutionDecision,
+    ImportedReviewExecutionOriginReceipt,
+    InitializedReviewExecutionOriginReceipt,
+    initialized_review_execution,
+    ImportedReviewSession,
+    LaunchedReviewChild,
+    NoReviewSession,
+    PaidReviewProgress,
+    PreserveDisplayedRound,
+    PreserveReviewSession,
+    ReplaceReviewSession,
+    ReusableReviewSession,
+    ReviewAdmissionRefused,
+    ReviewCancellationReason,
+    ReviewChildAdmissionRefusal,
+    ReviewChildIdentity,
+    ReviewChildKind,
+    ReviewExecutionBinding,
+    ReviewExecutionCheckpoint,
+    ReviewExecutionPolicy,
+    ReviewExecutionGenerationBoundary,
+    ReviewExecutionOrigin,
+    ReviewExecutionOriginKind,
+    ReviewExecutionState,
+    ReviewExecutionBoundaryCursor,
+    ReviewExecutionAcceptedTransitionSource,
+    ReviewExecutionTransitionProofSource,
+    ReviewPinDeferred,
+    ReviewPreparationDeferred,
+    ReviewPreparationFailure,
+    ReviewPreparationKind,
+    ReviewReservationReleased,
+    ReviewRoundCancelled,
+    ReviewUnlaunchedRound,
+    ReviewRoundFailure,
+    ReviewRoundIdentity,
+    ReviewRoundOutcome,
+    SaturateReviewFailures,
+    SetDisplayedRound,
+    carry_review_execution_generation,
+    compatible_review_session,
+    review_generation_receipt_id,
+    project_review_execution,
+    CurrentReviewExecution,
+    OpenReviewExecutionRound,
+    CompletedReviewExecutionRound,
+    allocate_current_review_round,
+    reduce_current_review_execution,
+    finalize_current_review_round,
+    advance_current_review_generation,
     freeze_current_review_generation,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
@@ -72,16 +93,6 @@ def test_imported_origin_contract_rejects_noninitial_or_malformed_activation_evi
         replace(decision, origin=ReviewExecutionOrigin(ReviewExecutionOriginKind.RENEWED, "origin:2"))
     with pytest.raises(ValueError, match="SHA-256"):
         replace(decision, source_digest="")
-
-
-def test_generation_chain_digest_binds_order_and_rejects_malformed_receipts():
-    assert review_generation_chain_digest(("boundary:1", "boundary:2")) != review_generation_chain_digest(
-        ("boundary:2", "boundary:1"),
-    )
-    for malformed in ((), ("boundary:1", "boundary:1"), ([],), ("\ud800",),
-                      tuple(f"boundary:{index}" for index in range(MAX_EXECUTION_SUFFIX + 1))):
-        with pytest.raises(ValueError):
-            review_generation_chain_digest(malformed)
 
 
 def binding(generation=0):
@@ -193,574 +204,6 @@ def test_out_of_order_delivery_and_incremental_compaction_preserve_the_same_outc
         assert committed.through_sequence == 5 and committed.state == expected
         assert pending == {}
     assert initial.state.failures == 3 and initial.through_sequence == 0
-
-
-def test_generation_boundary_carries_prior_failures_and_ignores_late_old_rounds():
-    initial = checkpoint(failures=2, pin_deferrals=1)
-    prior = project_review_execution(initial, (failed(1),)).state
-    carried = carry_review_execution_generation(prior, binding(1), 2)
-    boundary = generation_boundary(prior, carried, 2, (1,), "boundary:1")
-
-    observed = replay_review_execution_generations(
-        initial, (failed(3, captured=binding(1)), failed(2), failed(1)), (boundary,),
-    )
-
-    assert observed.binding == binding(1)
-    assert (observed.failures, observed.pin_deferrals) == (4, 1)
-    assert observed.session_sequence == 2
-
-
-def test_generation_replay_from_verified_prefix_inside_a_boundary_matches_full_history():
-    initial = checkpoint(failures=2)
-    first = failed(1)
-    before = project_review_execution(initial, (first,)).state
-    after = carry_review_execution_generation(before, binding(1), 2)
-    boundary = generation_boundary(before, after, 2, (1,), "boundary:1")
-    late = failed(2)
-    next_round = failed(3, captured=binding(1))
-    full = replay_review_execution_generations(initial, (first, late, next_round), (boundary,))
-    compacted = project_review_execution(initial, (first,)).checkpoint
-
-    assert replay_review_execution_generations(compacted, (late, next_round), (boundary,)) == full
-
-
-def test_repeated_generation_boundaries_preserve_only_pre_advance_effects():
-    initial = checkpoint(failures=1)
-    first_before = project_review_execution(initial, (failed(1),)).state
-    first_after = carry_review_execution_generation(first_before, binding(1), 2)
-    first = generation_boundary(first_before, first_after, 2, (1,), "boundary:1")
-    second_before = project_review_execution(
-        ReviewExecutionCheckpoint(2, first_after), (failed(3, captured=binding(1)),),
-    ).state
-    second_after = carry_review_execution_generation(second_before, binding(2), 3)
-    second = generation_boundary(second_before, second_after, 3, (3,), "boundary:2")
-
-    observed = replay_review_execution_generations(
-        initial, (failed(2), failed(1), failed(3, captured=binding(1)),
-                  copied(4, captured=binding(2))), (first, second),
-    )
-
-    assert observed.binding == binding(2)
-    assert observed.failures == 0 and observed.productive_sequence == 4
-    backwards = replace(
-        second, from_revision=WorkflowRevision(binding(1).rejection.fence, 1),
-        to_revision=WorkflowRevision(binding(2).rejection.fence, 2),
-    )
-    with pytest.raises(ValueError, match="advance one execution history"):
-        replay_review_execution_generations(
-            initial, (failed(1), failed(3, captured=binding(1))), (first, backwards),
-        )
-
-
-def test_generation_boundary_clears_verified_reviewer_session_for_fresh_review():
-    initial = checkpoint()
-    prior = project_review_execution(initial, (productive(1, handle="session:1", display=7),)).state
-
-    carried = carry_review_execution_generation(prior, binding(1), 1)
-
-    assert isinstance(carried.session, NoReviewSession)
-    assert carried.session_sequence == 1
-    assert carried.displayed_round == 7 and carried.display_sequence == 1
-    assert carried.productive_sequence == 1
-    assert replay_review_execution_generations(
-        initial, (productive(1, handle="session:1", display=7),),
-        (generation_boundary(prior, carried, 1, (1,), "boundary:1"),),
-    ) == carried
-
-
-def test_generation_boundary_refuses_missing_source_and_changed_carry():
-    initial = checkpoint()
-    before = project_review_execution(initial, (failed(1),)).state
-    after = carry_review_execution_generation(before, binding(1), 1)
-    boundary = generation_boundary(before, after, 1, (1,), "boundary:1")
-
-    with pytest.raises(ValueError, match="finalized outcome"):
-        replay_review_execution_generations(initial, (), (boundary,))
-    with pytest.raises(ValueError, match="prior outcome projection"):
-        replay_review_execution_generations(initial, (copied(1),), (boundary,))
-    with pytest.raises(ValueError, match="round allocation"):
-        replay_review_execution_generations(initial, (failed(1, captured=binding(1)),), (boundary,))
-    with pytest.raises(ValueError, match="carry the prior allowance"):
-        replace(boundary, after=replace(after, failures=0))
-    with pytest.raises(ValueError, match="ordered and allocated"):
-        replace(boundary, applied_sequences=(1, 1))
-    with pytest.raises(ValueError, match="next rejection generation"):
-        carry_review_execution_generation(before, binding(2), 1)
-    with pytest.raises(ValueError, match="exact advancing transition"):
-        replace(boundary, to_revision=WorkflowRevision(binding(1).rejection.fence, 100))
-    with pytest.raises(ValueError, match="exact advancing transition"):
-        replace(boundary, mutation="request_rearm")
-
-
-def test_generation_transition_source_binds_payload_without_retaining_it():
-    initial = checkpoint()
-    carried = carry_review_execution_generation(initial.state, binding(1), 0)
-    boundary = generation_boundary(initial.state, carried, 0, (), "boundary:source")
-    accepted = "accepted-transition:" + "x" * 100_000
-    source = accepted_review_transition_source(boundary, "workflow-request", "request:1", accepted)
-
-    assert isinstance(source, ReviewExecutionAcceptedTransitionSource)
-    assert matches_accepted_review_transition_source(
-        source, boundary, "workflow-request", "request:1", accepted,
-    )
-    assert not matches_accepted_review_transition_source(
-        source, boundary, "workflow-request", "request:1", accepted + "changed",
-    )
-    assert matches_accepted_review_transition_source(
-        (boundary, "workflow-request", "request:1", accepted),
-        boundary, "workflow-request", "request:1", accepted,
-    )
-    assert len(source.payload_sha256) == 64 and accepted not in repr(source)
-    with pytest.raises(ValueError, match="SHA-256"):
-        replace(source, payload_sha256="not-a-digest")
-
-
-def test_generation_transition_proof_binds_a_typed_release_cause():
-    initial = checkpoint()
-    carried = carry_review_execution_generation(initial.state, binding(1), 0)
-    boundary = replace(
-        generation_boundary(initial.state, carried, 0, (), "boundary:release"),
-        mutation=WorkflowMutation.RELEASE_CEILING,
-    )
-    accepted = "accepted-release:" + "x" * 100_000
-    cause = ObservedTransition(("release:evidence",))
-    proof = accepted_review_transition_proof_source(
-        boundary, "workflow-transition", "transition:key", accepted, cause, "encoded-release-audit",
-    )
-
-    assert isinstance(proof, ReviewExecutionTransitionProofSource)
-    assert proof.audit_sha256 == hashlib.sha256(b"encoded-release-audit").hexdigest()
-    assert accepted not in repr(proof)
-    assert matches_accepted_review_transition_source(
-        proof, boundary, "workflow-transition", "transition:key", accepted,
-    )
-    assert not matches_accepted_review_transition_source(
-        proof, boundary, "workflow-transition", "transition:key", accepted + "changed",
-    )
-    with pytest.raises(ValueError, match="release proof"):
-        replace(proof, namespace="workflow-request")
-    with pytest.raises(ValueError, match="SHA-256 audit"):
-        replace(proof, audit_sha256="untyped")
-    with pytest.raises(ValueError, match="release proof"):
-        accepted_review_transition_proof_source(
-            boundary, "workflow-transition", "transition:key", accepted, "untyped", "encoded-release-audit",
-        )
-
-
-def test_generation_receipt_identity_is_reconstructible_from_episode_and_destination():
-    component = activated(origin=ReviewExecutionOriginKind.IMPORTED)
-    from_revision = WorkflowRevision(component.binding.rejection.fence, 7)
-    to_revision = WorkflowRevision(binding(1).rejection.fence, 8)
-    advanced = advance_review_execution_generation(
-        component, from_revision, to_revision, WorkflowMutation.REQUEST_REARM, (),
-    )
-    episode = component.binding
-
-    assert advanced.boundaries[0].receipt_id == review_generation_receipt_id(episode, 1)
-    assert review_generation_receipt_id(episode, 1) == review_generation_receipt_id(
-        advanced.binding, 1,
-    )
-    assert review_generation_receipt_id(episode, 1) != review_generation_receipt_id(episode, 2)
-    with pytest.raises(ValueError, match="generation"):
-        review_generation_receipt_id(episode, 0)
-
-
-def test_generation_frontier_classifies_swept_episode_receipts():
-    initial = checkpoint()
-    origin = initial.state.binding
-    after = carry_review_execution_generation(initial.state, binding(1), 0)
-    boundary = generation_boundary(initial.state, after, 0, (), "boundary:frontier")
-
-    assert review_generation_within_frontier(origin, 1, boundary)
-    assert not review_generation_within_frontier(origin, 0, boundary)
-    assert not review_generation_within_frontier(binding(1), 1, boundary)
-    assert not review_generation_within_frontier(
-        replace(origin, execution_episode="other-episode"), 1, boundary,
-    )
-    with pytest.raises(ValueError, match="generation frontier"):
-        review_generation_within_frontier(origin, -1, boundary)
-    with pytest.raises(ValueError, match="typed episode"):
-        review_generation_within_frontier(origin, 1, "untyped")
-
-
-def test_archive_scan_folds_bounded_pages_and_preserves_its_predecessor():
-    origin = checkpoint().state.binding
-    origin_receipt = ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:audit")
-    now = datetime(2026, 9, 29, tzinfo=timezone.utc)
-    first = ReviewExecutionBoundaryCursor(
-        review_generation_receipt_id(origin, 1), WorkflowRevision(binding(1).rejection.fence, 5),
-    )
-    second = ReviewExecutionBoundaryCursor(
-        review_generation_receipt_id(origin, 2), WorkflowRevision(binding(2).rejection.fence, 6),
-    )
-    fingerprint = lambda cursor: ReviewGenerationArchiveFingerprint(
-        cursor, "a" * 64, "workflow-request", "request:one", "b" * 64,
-    )
-    initial = begin_review_generation_archive_scan(origin, origin_receipt, "c" * 64, 2, now, 60)
-    assert isinstance(initial, ReviewGenerationArchiveScan)
-    advanced = advance_review_generation_archive_scan(initial, (fingerprint(first),), now)
-    assert isinstance(advanced, ReviewGenerationArchiveScan)
-    assert advanced.next_generation == 2 and advanced.preceding == first
-    assert advanced.rolling_sha256 != initial.rolling_sha256
-    complete = advance_review_generation_archive_scan(advanced, (fingerprint(second),), now)
-    assert isinstance(complete, CompletedReviewGenerationArchiveScan)
-    assert complete.final_cursor == second and complete.through_generation == 2
-    assert complete.rolling_sha256 != advanced.rolling_sha256
-    assert complete.origin_source_sha256 == "c" * 64
-    assert review_generation_archive_scan_overdue(advanced, advanced.due_at)
-    assert not review_generation_archive_scan_overdue(complete, now)
-    assert review_generation_archive_scan_overdue(complete, complete.due_at)
-    with pytest.raises(ValueError, match="expected generation"):
-        advance_review_generation_archive_scan(initial, (fingerprint(second),), now)
-    with pytest.raises(ValueError, match="predecessor"):
-        replace(advanced, preceding=second)
-    with pytest.raises(ValueError, match="SHA-256"):
-        replace(advanced, rolling_sha256="malformed")
-    with pytest.raises(ValueError, match="SHA-256"):
-        replace(advanced, origin_source_sha256="malformed")
-    with pytest.raises(ValueError, match="one day"):
-        begin_review_generation_archive_scan(origin, origin_receipt, "c" * 64, 1, now, 86401)
-    assert isinstance(BlockedReviewGenerationArchiveScan(initial, 1, "missing", now),
-                      BlockedReviewGenerationArchiveScan)
-    assert review_generation_archive_scan_overdue(BlockedReviewGenerationArchiveScan(initial, 1, "missing", now), now)
-    with pytest.raises(ValueError, match="exact discrepancy"):
-        BlockedReviewGenerationArchiveScan(initial, 2**63 - 1, "missing", now)
-    assert isinstance(BlockedReviewGenerationArchiveScan(complete, 2, "origin changed", now),
-                      BlockedReviewGenerationArchiveScan)
-
-
-def test_archive_sweep_reconciles_exact_receipt_membership_and_cursor_progress():
-    origin = checkpoint().state.binding
-    cause = ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:sweep")
-    now = datetime(2026, 9, 29, tzinfo=timezone.utc)
-    first = ReviewExecutionBoundaryCursor(
-        review_generation_receipt_id(origin, 1), WorkflowRevision(binding(1).rejection.fence, 5),
-    )
-    second = ReviewExecutionBoundaryCursor(
-        review_generation_receipt_id(origin, 2), WorkflowRevision(binding(2).rejection.fence, 6),
-    )
-    initial = begin_review_generation_archive_scan(origin, cause, "c" * 64, 2, now, 60)
-    assert isinstance(initial, ReviewGenerationArchiveScan)
-    fingerprints = tuple(ReviewGenerationArchiveFingerprint(
-        cursor, "a" * 64, "workflow-request", "request:one", "b" * 64,
-    ) for cursor in (first, second))
-    expected = advance_review_generation_archive_scan(initial, fingerprints, now)
-    assert isinstance(expected, CompletedReviewGenerationArchiveScan)
-    member = lambda cursor: ReviewGenerationArchiveReceiptMember(
-        cursor.revision.fence.generation, cursor.receipt_id, "a" * 64,
-        "workflow-request", "request:one",
-    )
-    first_key = ReviewGenerationReceiptSweepCursor("o/r", "receipt:first")
-    last_key = ReviewGenerationReceiptSweepCursor("o/r", "receipt:last")
-    sweep = advance_review_generation_archive_sweep(
-        ReviewGenerationArchiveSweep(expected), (member(first),), first_key, last_key,
-        True, now, 60,
-    )
-    assert isinstance(sweep, ReviewGenerationArchiveSweep)
-    assert sweep.source_count == 1 and sweep.after == first_key
-    complete = advance_review_generation_archive_sweep(
-        sweep, (member(second),), last_key, last_key, False, now, 60,
-    )
-    assert isinstance(complete, CompletedReviewGenerationArchiveAudit)
-    assert complete.source_count == 2
-    assert complete.receipt_membership_xor == expected.receipt_membership_xor
-    assert not review_generation_archive_scan_overdue(complete, now)
-    assert review_generation_archive_scan_overdue(complete, complete.next_due_at)
-    with pytest.raises(ValueError, match="did not advance"):
-        advance_review_generation_archive_sweep(
-            sweep, (member(second),), first_key, last_key, False, now, 60,
-        )
-    changed = replace(member(second), receipt_sha256="d" * 64)
-    blocked = advance_review_generation_archive_sweep(
-        sweep, (changed,), last_key, last_key, False, now, 60,
-    )
-    assert isinstance(blocked, BlockedReviewGenerationArchiveSweep)
-    assert review_generation_archive_scan_overdue(blocked, now)
-
-
-def test_active_generation_advance_preserves_imported_allowance_without_rounds():
-    component = activated(origin=ReviewExecutionOriginKind.IMPORTED, failures=3, pin_deferrals=2)
-    from_revision = WorkflowRevision(component.binding.rejection.fence, 7)
-    to_revision = WorkflowRevision(binding(1).rejection.fence, 8)
-
-    advanced = advance_review_execution_generation(
-        component, from_revision, to_revision, WorkflowMutation.REQUEST_REARM, (),
-    )
-
-    assert advanced.binding == binding(1)
-    assert (advanced.state.failures, advanced.state.pin_deferrals) == (3, 2)
-    assert advanced.checkpoint == component.checkpoint and advanced.last_sequence == 0
-    assert replay_review_execution_generations(
-        advanced.checkpoint, (), advanced.boundaries,
-    ) == advanced.state
-
-
-def test_compaction_after_late_old_round_preserves_carried_state_and_new_suffix():
-    initial = checkpoint(failures=2)
-    first = failed(1)
-    productive_old = copied(2)
-    before = project_review_execution(initial, (productive_old,)).state
-    after = carry_review_execution_generation(before, binding(1), 2)
-    boundary = generation_boundary(before, after, 2, (2,), "boundary:late")
-    new_failure = failed(3, captured=binding(1))
-    outcomes = (first, productive_old, new_failure)
-    current_state = replay_review_execution_generations(initial, outcomes, (boundary,))
-    component = ActivatedReviewExecution(
-        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:late"),
-        initial, current_state, 3, boundaries=(boundary,),
-    )
-
-    with pytest.raises(ValueError, match="open or missing"):
-        plan_review_execution_compaction(component, (productive_old, new_failure), 2)
-    plan = plan_review_execution_compaction(component, outcomes, 2)
-
-    assert plan.checkpoint.through_sequence == 2
-    assert plan.checkpoint.state == after
-    assert plan.last_boundary_receipt == "boundary:late"
-    assert plan.retired_outcomes == (first, productive_old)
-    assert plan.remaining_outcomes == (new_failure,)
-    assert project_review_execution(plan.checkpoint, plan.remaining_outcomes).state == current_state
-    assert plan_review_execution_compaction(component, tuple(reversed(outcomes)), 2) == plan
-
-
-def test_zero_round_advances_compact_at_same_sequence_with_distinct_boundary_frontiers():
-    initial = checkpoint()
-    first_after = carry_review_execution_generation(initial.state, binding(1), 0)
-    first = generation_boundary(initial.state, first_after, 0, (), "boundary:zero:1")
-    second_after = carry_review_execution_generation(first_after, binding(2), 0)
-    second = generation_boundary(first_after, second_after, 0, (), "boundary:zero:2")
-    component = ActivatedReviewExecution(
-        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:zero"),
-        initial, second_after, 0, boundaries=(first, second),
-    )
-
-    plan = plan_review_execution_compaction(component, (), 0)
-
-    assert plan.checkpoint.state == second_after
-    assert plan.last_boundary_receipt == "boundary:zero:2"
-    assert plan.last_boundary_revision == second.to_revision
-    assert plan.retired_boundaries == (first, second)
-    assert plan.remaining_outcomes == ()
-    application = build_review_checkpoint_application_proposal(
-        component, plan, second.to_revision, None,
-    )
-    assert replay_review_checkpoint_application(
-        application, (), (first, second), None, None,
-    ) == plan.checkpoint
-    with pytest.raises(ValueError, match="every retired boundary"):
-        replay_review_checkpoint_application(
-            application, (), (first,), None, None,
-        )
-    next_outcome = failed(1, captured=binding(2))
-    next_state = project_review_execution(plan.checkpoint, (next_outcome,)).state
-    later = ActivatedReviewExecution(component.origin, plan.checkpoint, next_state, 1)
-    later_plan = plan_review_execution_compaction(later, (next_outcome,), 1)
-    assert later_plan.retired_boundaries == ()
-    assert later_plan.last_boundary_receipt == "boundary:zero:2"
-    assert later_plan.last_boundary_revision == second.to_revision
-    with pytest.raises(ValueError, match="new finalized frontier"):
-        plan_review_execution_compaction(activated(), (), 0)
-
-
-def test_checkpoint_receipt_binds_retired_generation_order_and_next_round_frontier():
-    initial = checkpoint()
-    first_after = carry_review_execution_generation(initial.state, binding(1), 0)
-    first = generation_boundary(initial.state, first_after, 0, (), "boundary:receipt:1")
-    second_after = carry_review_execution_generation(first_after, binding(2), 0)
-    second = generation_boundary(first_after, second_after, 0, (), "boundary:receipt:2")
-    component = ActivatedReviewExecution(
-        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:checkpoint-receipt"),
-        initial, second_after, 0, boundaries=(first, second),
-    )
-    plan = plan_review_execution_compaction(component, (), 0)
-    sources = tuple(ReviewGenerationArchiveFingerprint(
-        ReviewExecutionBoundaryCursor(boundary.receipt_id, boundary.to_revision),
-        "a" * 64, "workflow-request", f"request:receipt:{index}", "b" * 64,
-    ) for index, boundary in enumerate((first, second), start=1))
-    receipt = build_review_execution_checkpoint_receipt(component, plan, (), sources)
-    assert isinstance(receipt, ReviewExecutionCheckpointReceipt)
-    assert receipt.previous_checkpoint == initial and receipt.previous_receipt_id is None
-    assert receipt.checkpoint == plan.checkpoint
-    assert receipt.last_generation_source == sources[-1]
-    assert receipt.last_round_source is None
-    assert receipt.generation_stream_sha256 != hashlib.sha256(b"").hexdigest()
-    with pytest.raises(ValueError, match="generation source order"):
-        build_review_execution_checkpoint_receipt(component, plan, (), tuple(reversed(sources)))
-    with pytest.raises(ValueError, match="projected prefix"):
-        build_review_execution_checkpoint_receipt(component, plan, (), sources[:1])
-    with pytest.raises(ValueError, match="generation anchor"):
-        replace(receipt, last_generation_source=None)
-    with pytest.raises(ValueError, match="previous checkpoint"):
-        replace(receipt, previous_receipt_id="checkpoint:forged")
-
-    next_outcome = failed(1, captured=binding(2))
-    later = ActivatedReviewExecution(
-        component.origin, plan.checkpoint,
-        project_review_execution(plan.checkpoint, (next_outcome,)).state, 1,
-        checkpoint_receipt="checkpoint:first",
-    )
-    later_plan = plan_review_execution_compaction(later, (next_outcome,), 1)
-    round_source = ReviewExecutionCompactionRoundSource(
-        next_outcome.round, "c" * 64, "d" * 64,
-    )
-    later_receipt = build_review_execution_checkpoint_receipt(
-        later, later_plan, (round_source,), (),
-    )
-    assert later_receipt.previous_receipt_id == "checkpoint:first"
-    assert later_receipt.last_round_source == round_source
-    assert later_receipt.last_generation_source is None
-    assert later_receipt.generation_stream_sha256 == hashlib.sha256(b"").hexdigest()
-    with pytest.raises(ValueError, match="round anchor"):
-        replace(later_receipt, last_round_source=None)
-    with pytest.raises(ValueError, match="previous checkpoint"):
-        replace(later_receipt, previous_receipt_id=None)
-    with pytest.raises(ValueError, match="advancing frontier"):
-        replace(later_receipt, checkpoint=later_receipt.previous_checkpoint)
-
-
-def test_partial_compaction_keeps_a_later_boundary_and_ignores_late_old_outcome():
-    initial = checkpoint()
-    settled = (failed(1), failed(2))
-    before = project_review_execution(initial, (failed(2),)).state
-    after = carry_review_execution_generation(before, binding(1), 3)
-    boundary = generation_boundary(before, after, 3, (2,), "boundary:open-third")
-    component = ActivatedReviewExecution(
-        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:partial"),
-        initial, after, 3, boundaries=(boundary,),
-    )
-
-    plan = plan_review_execution_compaction(component, settled, 2)
-
-    assert plan.checkpoint.through_sequence == 2
-    assert plan.checkpoint.state == before
-    assert plan.retired_boundaries == ()
-    assert plan.retired_outcomes == settled
-    assert plan.remaining_boundaries == (boundary,)
-    assert replay_review_execution_generations(plan.checkpoint, (failed(3),),
-                                               plan.remaining_boundaries) == after
-
-    source = ReviewGenerationArchiveFingerprint(
-        ReviewExecutionBoundaryCursor(boundary.receipt_id, boundary.to_revision),
-        "a" * 64, "workflow-request", "request:partial", "b" * 64,
-    )
-    application = build_review_checkpoint_application_proposal(
-        component, plan, boundary.to_revision, source,
-    )
-    assert application.previous_checkpoint == initial
-    assert application.checkpoint == plan.checkpoint
-    assert application.tail_start_sequence == 0
-    assert isinstance(application.tail, ApplyCheckpointTailByFollowingBoundary)
-    assert application.tail.source == source
-    assert application.tail.applied_sequences_sha256 == hashlib.sha256(b"2").hexdigest()
-    assert replay_review_checkpoint_application(
-        application, settled, (), boundary, source,
-    ) == plan.checkpoint
-    with pytest.raises(ValueError, match="state differs"):
-        replay_review_checkpoint_application(
-            replace(application, checkpoint=replace(
-                application.checkpoint,
-                state=replace(application.checkpoint.state, failures=9),
-            )), settled, (), boundary, source,
-        )
-    with pytest.raises(ValueError, match="tail selection"):
-        replay_review_checkpoint_application(
-            application, settled, (), replace(boundary, applied_sequences=(1, 2)), source,
-        )
-    with pytest.raises(ValueError, match="following boundary source"):
-        replay_review_checkpoint_application(application, settled, (), boundary, None)
-    with pytest.raises(ValueError, match="tail selection"):
-        replay_review_checkpoint_application(
-            application, settled, (), boundary,
-            replace(source, accepted_sha256="c" * 64),
-        )
-    with pytest.raises(ValueError, match="every retired outcome"):
-        replay_review_checkpoint_application(application, settled[:1], (), boundary, source)
-    with pytest.raises(ValueError, match="following boundary source"):
-        build_review_checkpoint_application_proposal(component, plan, boundary.to_revision, None)
-    with pytest.raises(ValueError, match="following boundary source"):
-        build_review_checkpoint_application_proposal(
-            component, plan, boundary.to_revision,
-            replace(source, cursor=ReviewExecutionBoundaryCursor(
-                "boundary:other", boundary.to_revision,
-            )),
-        )
-
-
-def test_checkpoint_application_without_a_following_boundary_applies_tail():
-    initial = checkpoint()
-    outcome = failed(1)
-    projected = project_review_execution(initial, (outcome,)).state
-    component = ActivatedReviewExecution(
-        ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:all-tail"),
-        initial, projected, 1,
-    )
-    plan = plan_review_execution_compaction(component, (outcome,), 1)
-    revision = WorkflowRevision(component.binding.rejection.fence, 0)
-
-    application = build_review_checkpoint_application_proposal(
-        component, plan, revision, None,
-    )
-
-    assert application.tail_start_sequence == 0
-    assert application.checkpoint.state == projected
-    assert isinstance(application.tail, ApplyAllCheckpointTailOutcomes)
-    assert replay_review_checkpoint_application(
-        application, (outcome,), (), None, None,
-    ) == plan.checkpoint
-    with pytest.raises(ValueError, match="archived segment bound"):
-        replay_review_checkpoint_application(
-            replace(application, checkpoint=replace(
-                application.checkpoint, through_sequence=MAX_EXECUTION_SUFFIX + 1,
-            )), (), (), None, None,
-        )
-    late = generation_boundary(
-        projected, carry_review_execution_generation(projected, binding(1), 1),
-        1, (1,), "boundary:after-capture",
-    )
-    late_source = ReviewGenerationArchiveFingerprint(
-        ReviewExecutionBoundaryCursor(late.receipt_id, late.to_revision),
-        "a" * 64, "workflow-request", "request:later", "b" * 64,
-    )
-    assert replay_review_checkpoint_application(
-        application, (outcome,), (), late, late_source,
-    ) == plan.checkpoint
-    with pytest.raises(ValueError, match="missed a captured following boundary"):
-        replay_review_checkpoint_application(
-            replace(application, captured_revision=WorkflowRevision(
-                revision.fence, late.to_revision.version,
-            )),
-            (outcome,), (), late, late_source,
-        )
-    with pytest.raises(ValueError, match="cannot invent a following boundary"):
-        build_review_checkpoint_application_proposal(
-            component, plan, revision,
-            ReviewGenerationArchiveFingerprint(
-                ReviewExecutionBoundaryCursor("boundary:extra", WorkflowRevision(binding(1).rejection.fence, 1)),
-                "a" * 64, "workflow-request", "request:extra", "b" * 64,
-            ),
-        )
-
-
-@pytest.mark.parametrize("outcomes", [(None,), (failed(1), failed(1)), (failed(2),)])
-def test_compaction_refuses_invalid_or_noncontiguous_source_sets(outcomes):
-    component = replace(activated(), state=replace(activated().state, failures=1), last_sequence=2)
-    with pytest.raises(ValueError, match="invalid outcome|open or missing|exact allocated"):
-        plan_review_execution_compaction(component, outcomes, 2)
-
-
-def test_compaction_refuses_future_or_duplicated_state_neutral_outcomes():
-    neutral = ReviewRoundOutcome(
-        round_id(1), ReviewRoundCancelled(ReviewCancellationReason.SHUTDOWN, "shutdown:1"),
-    )
-    future = ReviewRoundOutcome(
-        round_id(2), ReviewRoundCancelled(ReviewCancellationReason.SHUTDOWN, "shutdown:2"),
-    )
-    component = replace(activated(), last_sequence=1)
-
-    with pytest.raises(ValueError, match="exact allocated"):
-        plan_review_execution_compaction(component, (neutral, future), 1)
-    with pytest.raises(ValueError, match="exact allocated"):
-        plan_review_execution_compaction(component, (neutral, neutral), 1)
 
 
 def test_a_gap_is_not_compacted_and_filling_it_does_not_charge_later_rounds_twice():

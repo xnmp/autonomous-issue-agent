@@ -17,7 +17,7 @@ from issue_agent.adapters.workflow_rows import (
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_activation import OpenPullRequestsListed
-from issue_agent.domain.review_execution import initialized_review_execution
+from issue_agent.domain.review_execution import initialized_review_execution, CurrentReviewExecution
 from issue_agent.domain.review_execution_counter_mapping import LegacyOpenPRCounterLink
 from issue_agent.domain.review_execution_history_import import ReviewImportNoHistoryObserved
 from issue_agent.domain.review_execution_import_plan import (
@@ -199,6 +199,7 @@ def test_newly_initialized_pr_keeps_import_replay_inert(tmp_path):
             rejection.binding, plan.execution_epoch, evidence_id,
             plan.plan_digest, plan.source_digest, plan.inventory_digest, NOW,
         )
+        execution = CurrentReviewExecution(execution.origin, execution.checkpoint, execution.state, 0, 0)
         insert_workflow_component(
             db, key, FamilyAuthority(WorkflowFamily.REVIEW_EXECUTION, plan.execution_epoch),
             execution.binding.execution_episode,

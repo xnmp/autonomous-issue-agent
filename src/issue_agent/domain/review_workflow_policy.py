@@ -24,7 +24,7 @@ from .labels import LIFECYCLE_LABELS, Label
 from .review import EscalationCause
 from .review_rejection import validate_commit_sha
 from .review_execution import (
-    ActivatedReviewExecution, CurrentReviewExecution, advance_review_execution_generation,
+    CurrentReviewExecution,
     freeze_current_review_generation,
 )
 from .review_workflow import (
@@ -405,11 +405,7 @@ def _advanced_execution(
         return freeze_current_review_generation(
             execution, snapshot.revision, revision, mutation, applied_sequences,
         )[0]
-    return (
-        advance_review_execution_generation(
-            execution, snapshot.revision, revision, mutation, applied_sequences,
-        ) if isinstance(execution, ActivatedReviewExecution) else execution
-    )
+    return execution
 
 
 def _review_snapshot(snapshot: object) -> ReviewWorkflowSnapshot:

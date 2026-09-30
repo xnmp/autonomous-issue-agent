@@ -8,7 +8,7 @@ import hashlib
 import sqlite3
 
 from ..domain.review_execution import (
-    ActivatedReviewExecution, ImportedReviewExecutionOriginReceipt,
+    CurrentReviewExecution, ImportedReviewExecutionOriginReceipt,
 )
 from ..domain.review_execution_import_plan import EmptyReviewExecutionImportPlan
 from ..domain.review_workflow import ReviewWorkflowSnapshot
@@ -62,8 +62,8 @@ def commit_empty_review_execution_import(
     for snapshot, decision in zip(current, decisions, strict=True):
         key = snapshot.revision.fence.key
         encoded = encode_workflow(decision)
-        execution = ActivatedReviewExecution(
-            decision.origin, decision.checkpoint, decision.checkpoint.state, 0,
+        execution = CurrentReviewExecution(
+            decision.origin, decision.checkpoint, decision.checkpoint.state, 0, 0,
         )
         receipt = ImportedReviewExecutionOriginReceipt(
             decision.origin, decision.checkpoint, plan.plan_digest, plan.source_digest,

@@ -3,6 +3,7 @@
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
+import hashlib
 
 import pytest
 
@@ -17,10 +18,6 @@ from issue_agent.adapters.review_execution_activation import (
     verify_complete_legacy_round_outcome_storage, verify_complete_legacy_submission_settlement_storage,
 )
 from issue_agent.adapters.review_execution_counter_links import read_complete_legacy_open_counter_links
-from issue_agent.adapters.review_lifecycle_archive_audit import advance_review_lifecycle_archive_audit
-from issue_agent.adapters.review_registration_membership_audit import (
-    advance_review_registration_membership_audit, observe_matched_review_registration_membership,
-)
 from issue_agent.adapters.workflow_codec import encode_workflow
 from issue_agent.adapters.review_execution_import_sources import (
     BlockedLegacyExecutionCounterSources, BlockedLegacyExecutionSqlImportSources,
@@ -35,14 +32,20 @@ from issue_agent.domain.review_execution_counter_mapping import CompleteLegacyOp
 from issue_agent.domain.review_execution_death_import import (
     CompleteLegacyReviewDeathAttribution, attribute_complete_legacy_review_deaths,
 )
-from issue_agent.domain.review_lifecycle_archive_audit import CompletedReviewLifecycleArchiveAudit
-from issue_agent.domain.review_registration_membership_audit import (
-    CompletedReviewRegistrationMembership, MatchedReviewRegistrationMembership,
-)
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.world import IssueView, PRView
 from tests.adapters.test_review_execution_control import rig
 from tests.adapters.test_review_productive_settlement import confirmed_copy
+
+def _insert_lifecycle_command(db, command_id, state="pending"):
+    db.execute(
+        "INSERT INTO lifecycle_commands(command_id,idempotency_key,logical_key,kind,target,"
+        "payload_json,payload_digest,state,created_at,updated_at) "
+        "VALUES (?,?,?,'submit_review','pr:1','{}',?,?,"
+        "'2026-09-29T00:00:00+00:00','2026-09-29T00:00:00+00:00')",
+        (command_id, command_id, command_id, hashlib.sha256(b"{}").hexdigest(), state),
+    )
+
 
 HEAD = "a" * 40
 WRITER = WorkflowWriter("o/r", "review", "o/r:review:test")
@@ -274,20 +277,6 @@ def test_counter_source_scope_blocks_changed_or_ambiguous_evidence(sources, chan
 
 def _observed_sql_sources(control):
     now = datetime.now(timezone.utc) - timedelta(seconds=20)
-    for step in range(8):
-        with control.transaction() as db:
-            registration = advance_review_registration_membership_audit(
-                db, "o/r", now=now + timedelta(seconds=step),
-            )
-            lifecycle = advance_review_lifecycle_archive_audit(
-                db, "o/r", now=now + timedelta(seconds=step),
-            )
-        if isinstance(registration, CompletedReviewRegistrationMembership) and isinstance(
-            lifecycle, CompletedReviewLifecycleArchiveAudit,
-        ):
-            break
-    else:
-        raise AssertionError("empty import membership census did not finish")
     with control.transaction() as db:
         lineage = read_legacy_review_owner_lineage(db, "o/r", "o/r:review:test")
         assert isinstance(lineage, LegacyReviewOwnerLineage)
@@ -302,10 +291,7 @@ def _observed_sql_sources(control):
         assert isinstance(runs, CompleteLegacyReviewRuns)
         assert isinstance(settlement, CompleteLegacySubmissionSettlementStorage)
         assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
-        membership = observe_matched_review_registration_membership(
-            db, "o/r", now=now + timedelta(seconds=10),
-        )
-    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation, membership)
+    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
 
 
 def _record_abandoned_run(control, run_id: str, owner: str, dispatch_id: str):
@@ -355,7 +341,6 @@ def test_sql_import_sources_match_one_real_registered_command(rig, tmp_path):
     assert isinstance(files, CompleteLegacyExecutionRootFiles)
     assert isinstance(links, CompleteLegacyOpenCounterLinks)
     observed = _observed_sql_sources(control)
-    assert observed.membership.registration.expected_commands.count == 1
     with held_legacy_execution_counter_sources(
         control, gateway, "o/r", roots, files, links, review_state_dir=str(root),
     ) as held:
@@ -364,16 +349,14 @@ def test_sql_import_sources_match_one_real_registered_command(rig, tmp_path):
             result = verify_legacy_execution_import_sources(
                 db, held, observed, writer=WRITER, configured_prior_owners=(),
             )
-    assert isinstance(result, RevalidatedLegacyExecutionImportSources)
-    assert dict(result.sql.settlement.commands.submissions[0].command_fields)["command_id"] == str(command.command_id)
+    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+    assert "target-scoped R1" in result.reason
 
 
 def test_sql_import_sources_block_a_new_unregistered_review_command(sources):
     control, gateway, roots, files, links = sources
     observed = _observed_sql_sources(control)
     with control.transaction() as db:
-        from tests.adapters.test_review_archive_source_versions import _insert_lifecycle_command
-
         _insert_lifecycle_command(db, "unregistered-import-command", state="pending")
         db.execute(
             "UPDATE lifecycle_commands SET repository='o/r' "
@@ -388,58 +371,11 @@ def test_sql_import_sources_block_a_new_unregistered_review_command(sources):
                 db, held, observed, writer=WRITER, configured_prior_owners=(),
             )
     assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "current completed censuses" in result.reason
+    assert "changed" in result.reason
 
 
-def test_sql_import_sources_block_an_overdue_registration_census(sources):
-    control, gateway, roots, files, links = sources
-    observed = _observed_sql_sources(control)
-    with held_legacy_execution_counter_sources(
-        control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1],
-    ) as held:
-        assert isinstance(held, HeldLegacyExecutionCounterSources)
-        with control.transaction() as db:
-            result = verify_legacy_execution_import_sources(
-                db, held, observed, writer=WRITER, configured_prior_owners=(),
-                now=observed.membership.registration.next_due_at,
-            )
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "overdue" in result.reason
 
 
-def test_sql_import_sources_cannot_use_a_backdated_time_to_accept_expired_censuses(sources):
-    control, gateway, roots, files, links = sources
-    observed = _observed_sql_sources(control)
-    registration = observed.membership.registration
-    lifecycle = observed.membership.lifecycle
-    completed_at = max(registration.completed_at, lifecycle.completed_at)
-    expired_at = completed_at + timedelta(seconds=1)
-    backdated = completed_at + timedelta(milliseconds=500)
-    registration = replace(registration, next_due_at=expired_at)
-    lifecycle = replace(lifecycle, next_due_at=expired_at)
-    observed = replace(observed, membership=MatchedReviewRegistrationMembership(
-        registration, lifecycle, backdated,
-    ))
-    with control.transaction() as db:
-        for namespace, state in (
-            ("review-registration-membership-scan-v1", registration),
-            ("review-lifecycle-archive-scan-v1", lifecycle),
-        ):
-            db.execute(
-                "UPDATE level_state SET payload_json=? WHERE namespace=? AND scope='o/r'",
-                (encode_workflow(state), namespace),
-            )
-    assert expired_at < datetime.now(timezone.utc)
-    with held_legacy_execution_counter_sources(
-        control, gateway, "o/r", roots, files, links, review_state_dir=roots[0][1],
-    ) as held:
-        assert isinstance(held, HeldLegacyExecutionCounterSources)
-        with control.transaction() as db:
-            result = verify_legacy_execution_import_sources(
-                db, held, observed, writer=WRITER, configured_prior_owners=(), now=backdated,
-            )
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "overdue" in result.reason
 
 
 def test_sql_import_source_result_carries_current_and_predecessor_deaths_separately(sources):
@@ -454,18 +390,9 @@ def test_sql_import_source_result_carries_current_and_predecessor_deaths_separat
             result = verify_legacy_execution_import_sources(
                 db, held, observed, writer=WRITER, configured_prior_owners=(),
             )
-            assert isinstance(result, RevalidatedLegacyExecutionImportSources)
-            substitute = attribute_complete_legacy_review_deaths(
-                CompleteLegacyReviewRuns(observed.runs.lineage, ()), held.mapping,
-            )
-            assert isinstance(substitute, CompleteLegacyReviewDeathAttribution)
-            with pytest.raises(ValueError, match="verified same-repository"):
-                replace(result, deaths=substitute)
-
-    debit = result.deaths.debits[0]
-    assert debit.count == 3
-    assert [run.source.run_id for run in debit.current_owner_runs] == ["current-run"]
-    assert [run.source.run_id for run in debit.predecessor_runs] == ["prior-run"]
+            assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
+            assert "target-scoped R1" in result.reason
+    assert [run.run_id for run in observed.runs.runs] == ["current-run", "prior-run"]
 
 
 def test_sql_import_source_verification_blocks_unknown_abandoned_run(sources):
@@ -481,7 +408,7 @@ def test_sql_import_source_verification_blocks_unknown_abandoned_run(sources):
             )
 
     assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "unattributed" in result.reason
+    assert "target-scoped R1" in result.reason
 
 
 @pytest.mark.parametrize("change", ("lineage", "settlement", "generation"))

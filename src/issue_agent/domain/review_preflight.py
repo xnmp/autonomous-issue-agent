@@ -7,7 +7,7 @@ from .agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from .labels import Label
 from .review import ReviewMode, labels_holding_review
 from .review_execution import (
-    MAX_EXECUTION_SUFFIX, ActivatedReviewExecution, ReusableReviewSession,
+    MAX_EXECUTION_SUFFIX, CurrentReviewExecution, ReusableReviewSession,
     ReviewExecutionBinding, ReviewRoundIdentity, compatible_review_session,
 )
 from .review_rounds import ReviewRoundPlan, ReviewSessionReuse
@@ -58,7 +58,7 @@ def require_review_execution_eligibility(
     snapshot: ReviewWorkflowSnapshot, head_sha: str, failure_ceiling: int,
 ) -> None:
     """Current paid-work allowance for an already selected review head."""
-    if not isinstance(snapshot.execution, ActivatedReviewExecution):
+    if not isinstance(snapshot.execution, CurrentReviewExecution):
         raise ValueError("review execution activation is required")
     if snapshot.gates or isinstance(snapshot.intent, PendingReviewRearm):
         raise ValueError("review execution is held by workflow recovery")
@@ -77,7 +77,7 @@ def plan_review_preflight(
         raise ValueError("review preflight requires typed authority and selection")
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("review preflight requires an aware authority clock")
-    if not isinstance(snapshot.execution, ActivatedReviewExecution):
+    if not isinstance(snapshot.execution, CurrentReviewExecution):
         raise ValueError("review execution activation is required")
     if snapshot.revision != selection.expected or snapshot.execution.binding != selection.binding:
         raise ValueError("review preflight captured a stale aggregate revision or execution binding")
@@ -90,8 +90,8 @@ def plan_review_preflight(
         raise ValueError("review preflight trigger is absent or the pull request is held")
     require_review_execution_eligibility(snapshot, observed.head_sha, selection.failure_ceiling)
     state = snapshot.execution.state
-    if snapshot.execution.last_sequence - snapshot.execution.checkpoint.through_sequence >= MAX_EXECUTION_SUFFIX:
-        raise ValueError("review execution requires checkpoint compaction before another round")
+    if snapshot.execution.last_sequence - snapshot.execution.baseline.through_sequence >= MAX_EXECUTION_SUFFIX:
+        raise ValueError("review execution unresolved pending capacity is exhausted")
     session = compatible_review_session(state.session, selection.runtime, RUNTIME_CAPABILITIES[selection.runtime])
     reuse = ReviewSessionReuse.REUSABLE if isinstance(session, ReusableReviewSession) else ReviewSessionReuse.FRESH
     integer(snapshot.execution.last_sequence + 1, "next review round sequence", minimum=1)

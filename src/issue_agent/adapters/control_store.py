@@ -51,7 +51,7 @@ from ..domain.workflow import (
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.agent_task import RuntimeName
-from ..domain.review_execution import ActivatedReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
+from ..domain.review_execution import CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
 from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed, classify_normal_review_return
@@ -3462,12 +3462,6 @@ class SQLiteControlStore:
                 or recovery["policy"] != "spawn_pending"):
             raise ControlStoreError("review launch requires an active unlaunched reservation")
         snapshot = require_review_binding(db, admission.child.round.binding.rejection)
-        if isinstance(snapshot.execution, ActivatedReviewExecution):
-            from .review_execution_archive_gate import require_review_execution_archive_admission
-
-            require_review_execution_archive_admission(
-                db, snapshot.revision.fence.key, snapshot.execution, now=self.now(),
-            )
         if (admission.admitted_revision.fence != snapshot.revision.fence
                 or admission.admitted_revision.version > snapshot.revision.version):
             raise ControlStoreError("review launch admission revision is stale or impossible")
@@ -3811,13 +3805,13 @@ class SQLiteControlStore:
                     raise ControlStoreError("review return has no retainable or settled reservation")
                 return False
             now = _stamp(self._now())
-            db.execute(
+            recovery_changed = db.execute(
                 "UPDATE reservation_recovery SET policy='reconcile_only', "
                 "reason=?, updated_at=? WHERE run_id=? "
                 "AND (policy IS NOT 'reconcile_only' OR reason IS NOT ?)",
                 (reason, now, str(run_id), reason),
-            )
-            db.execute(
+            ).rowcount
+            run_changed = db.execute(
                 "UPDATE runs SET "
                 "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
                 "THEN state ELSE 'completed' END, "
@@ -3827,15 +3821,16 @@ class SQLiteControlStore:
                 "AND (state NOT IN ('completed','cancelled','abandoned') "
                 "OR completed_at IS NULL)",
                 (now, str(run_id)),
-            )
-            db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
+            ).rowcount
+            lease_removed = db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),)).rowcount
             if review_return is not None and not review_return[1]:
                 self._insert_review_return(db, review_return[0], returned_review)
-            self._event(
-                db,
-                ReservationRetained(str(run_id), reason),
-                correlation=_run_correlation(run_id, row["dispatch_id"]),
-            )
+            if recovery_changed or run_changed or lease_removed or review_return is not None and not review_return[1]:
+                self._event(
+                    db,
+                    ReservationRetained(str(run_id), reason),
+                    correlation=_run_correlation(run_id, row["dispatch_id"]),
+                )
             return True
 
     def record_admission_reconciled(
@@ -4970,15 +4965,6 @@ class SQLiteControlStore:
                     db, request, workspace_verified=workspace_verified,
                     review_parent_identity=review_parent_identity,
                 )
-                if (request.review_child is not None
-                        and isinstance(workflow_snapshot, ReviewWorkflowSnapshot)
-                        and isinstance(workflow_snapshot.execution, ActivatedReviewExecution)):
-                    from .review_execution_archive_gate import require_review_execution_archive_admission
-
-                    require_review_execution_archive_admission(
-                        db, workflow_snapshot.revision.fence.key, workflow_snapshot.execution,
-                        now=self.now(),
-                    )
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
                     settled, reserved = self._balance(db, limit.scope)
@@ -5228,7 +5214,7 @@ class SQLiteControlStore:
                 holds = linked_issue_workflow_holds(db, WorkflowKey(binding.fence.key.repository, IssueRef(issue)))
                 if holds:
                     raise WorkflowAuthorityError(f"linked issue #{issue}: {'; '.join(holds)}")
-            if isinstance(snapshot.execution, ActivatedReviewExecution):
+            if isinstance(snapshot.execution, CurrentReviewExecution):
                 if request.review_child is None:
                     raise WorkflowAuthorityError("active review execution requires a planned child")
                 if _indexed_review_child_admission(
@@ -5281,7 +5267,7 @@ class SQLiteControlStore:
         child: ReviewChildIdentity, kind: str, dispatch: dict[str, object],
         snapshot: ReviewWorkflowSnapshot, parent_identity: tuple[int, int] | None,
     ) -> ReviewPreflightSelection:
-        if parent_identity is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+        if parent_identity is None or not isinstance(snapshot.execution, CurrentReviewExecution):
             raise WorkflowAuthorityError("review child admission lacks its live parent or execution authority")
         key = _review_child_key(child)
         if db.execute(
@@ -5385,7 +5371,7 @@ class SQLiteControlStore:
         snapshot: ReviewWorkflowSnapshot, now: str,
     ) -> None:
         child = request.review_child
-        if child is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+        if child is None or not isinstance(snapshot.execution, CurrentReviewExecution):
             raise WorkflowAuthorityError("review admission requires an active planned child")
         recorded = load_review_preflight_record(
             db, request.workload_repository, request.owner_id, child.round.round_id,
@@ -5459,10 +5445,13 @@ class SQLiteControlStore:
                     db, request.workload_repository, request.owner_id,
                     request.review_child.round.round_id,
                 )
-                current = load_workflow_row(db, request.workflow.fence.key)
+                current = db.execute(
+                    "SELECT generation,version FROM workflows WHERE repository=? AND target_kind='pr' AND target_number=?",
+                    (request.workload_repository, request.workflow.fence.key.target.number),
+                ).fetchone()
                 if (recorded is None or current is None
-                        or current.revision.fence != admission.admitted_revision.fence
-                        or admission.admitted_revision.version > current.revision.version
+                        or current["generation"] != admission.admitted_revision.fence.generation
+                        or admission.admitted_revision.version > current["version"]
                         or admission.child != request.review_child
                         or admission.run_id != str(request.run_id)
                         or admission.reservation_id != str(request.reservation_id)
@@ -6681,7 +6670,7 @@ class SQLiteControlStore:
                 bound_submission_op(command)
                 review_snapshot = require_review_binding(db, binding, allow_gated=True)
                 if (command.kind is CommandKind.SUBMIT_REVIEW
-                        and isinstance(review_snapshot.execution, ActivatedReviewExecution)):
+                        and isinstance(review_snapshot.execution, CurrentReviewExecution)):
                     if not registering_review_submission:
                         registration = read_review_submission_registration(
                             db, command.repository, str(command.command_id),

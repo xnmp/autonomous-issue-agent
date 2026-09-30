@@ -3,6 +3,7 @@
 from dataclasses import replace
 import sqlite3
 from contextlib import contextmanager
+from itertools import count
 
 import pytest
 
@@ -18,6 +19,7 @@ from issue_agent.domain.review_preflight import ReviewPreflightSelection
 from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PartialReviews, PullRequestState
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.world import IssueView, PRView
+from issue_agent.domain.events import EventEnvelope, Producer, new_event_id
 from tests.adapters.test_control_store import _activate_execution_fixture, _seed_v24_workflow_history, _store
 
 OWNER = "o/r:review:test"
@@ -58,6 +60,15 @@ class Gateway:
 @pytest.fixture
 def rig(tmp_path):
     store = _store(tmp_path)
+    sequence = count()
+    producer = Producer("review-test", "o/r", "review", 123, "boot")
+
+    def factory(payload, correlation):
+        index = next(sequence)
+        return EventEnvelope(payload, new_event_id(store.now()), index, store.now(), store.now(),
+                             index, producer, correlation)
+
+    store.bind_event_outbox(factory, lambda envelope: None)
     _seed_v24_workflow_history(store)
     store.initialize()
     with store.transaction() as db:

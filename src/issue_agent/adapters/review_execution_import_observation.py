@@ -24,7 +24,6 @@ from .review_execution_activation import (
 from .review_execution_import_sources import (
     BlockedLegacyExecutionSqlImportSources, ObservedLegacyExecutionSqlImportSources,
 )
-from .review_registration_membership_audit import observe_matched_review_registration_membership
 from .sql_read_budget import MAX_SQL_READ_BYTES, SqlReadBudgetExceeded, bounded_sql_source_reads
 from .workflow_rows import WorkflowAuthorityError
 
@@ -59,9 +58,6 @@ def observe_legacy_execution_sql_import_sources(
 
     try:
         with bounded_sql_source_reads(db, max_source_bytes):
-            # The membership read rejects absent, incomplete, stale and blocked
-            # registration or lifecycle censuses before the retained inventories.
-            membership = observe_matched_review_registration_membership(db, repository, now=now)
             lineage = read_legacy_review_owner_lineage(
                 db, repository, current_owner,
                 configured_prior_owners=configured_prior_owners,
@@ -83,6 +79,16 @@ def observe_legacy_execution_sql_import_sources(
             outcomes = read_complete_legacy_review_outcome_receipts(db, repository)
             if not isinstance(outcomes, CompleteLegacyReviewOutcomeReceipts):
                 return BlockedLegacyExecutionSqlImportSources(outcomes.reason)
+            unsupported = tuple(kind for kind, values in (
+                ("runs", runs.runs), ("commands", commands.submissions),
+                ("submission receipts", receipts.receipts), ("rounds", rounds.rounds),
+                ("outcome receipts", outcomes.receipts),
+            ) if values)
+            if unsupported:
+                return BlockedLegacyExecutionSqlImportSources(
+                    f"recorded review {', '.join(unsupported)} require target-scoped R1 assessment; "
+                    "retired membership certificates grant no import authority",
+                )
             storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcomes)
             if not isinstance(storage, CompleteLegacyRoundOutcomeStorage):
                 return BlockedLegacyExecutionSqlImportSources(storage.reason)
@@ -94,8 +100,13 @@ def observe_legacy_execution_sql_import_sources(
             generation = read_complete_legacy_review_generation_receipts(db, repository)
             if not isinstance(generation, CompleteLegacyReviewGenerationReceipts):
                 return BlockedLegacyExecutionSqlImportSources(generation.reason)
+            if generation.receipts:
+                return BlockedLegacyExecutionSqlImportSources(
+                    "recorded review generation receipts require target-scoped R1 assessment; "
+                    "retired membership certificates grant no import authority",
+                )
             return ObservedLegacyExecutionSqlImportSources(
-                runs, settlement, generation, membership,
+                runs, settlement, generation,
             )
     except (WorkflowAuthorityError, SqlReadBudgetExceeded) as exc:
         return BlockedLegacyExecutionSqlImportSources((str(exc) or "execution SQL source is unreadable")[:512])

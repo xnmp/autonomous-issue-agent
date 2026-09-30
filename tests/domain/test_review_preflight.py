@@ -9,7 +9,7 @@ from issue_agent.domain.agent_task import RuntimeName
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.review_execution import (
-    ActivatedReviewExecution, ExecutionNotActivated, ReviewExecutionBinding, ReviewExecutionCheckpoint,
+    CurrentReviewExecution, ExecutionNotActivated, ReviewExecutionBinding, ReviewExecutionCheckpoint,
     ReviewExecutionOrigin, ReviewExecutionOriginKind, ReviewExecutionState,
 )
 from issue_agent.domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
@@ -33,9 +33,9 @@ def active():
     episode = ReviewEpisode("review:1", continuation=FreshReviewRequired(0))
     binding = ReviewExecutionBinding(WorkflowBinding(revision.fence, authority, episode.episode_id), 1, "execution:1")
     state = ReviewExecutionState(binding)
-    execution = ActivatedReviewExecution(
+    execution = CurrentReviewExecution(
         ReviewExecutionOrigin(ReviewExecutionOriginKind.IMPORTED, "origin:1"),
-        ReviewExecutionCheckpoint(0, state), state, 0,
+        ReviewExecutionCheckpoint(0, state), state, 0, 0,
     )
     snapshot = ReviewWorkflowSnapshot(revision, authority, episode, execution=execution)
     observed = ObservedPullRequest(KEY, "a" * 40, PullRequestState.OPEN,
@@ -47,7 +47,7 @@ def active():
 
 def exhausted(snapshot, selection):
     state = replace(snapshot.execution.state, failures=5)
-    execution = replace(snapshot.execution, checkpoint=replace(snapshot.execution.checkpoint, state=state), state=state)
+    execution = replace(snapshot.execution, baseline=replace(snapshot.execution.baseline, state=state), state=state)
     return replace(snapshot, execution=execution), selection
 
 

@@ -345,7 +345,7 @@ def test_changed_initial_failure_count_after_planning_blocks_paid_admission(plan
     snapshot = current(store, selection)
     state = replace(snapshot.execution.state, failures=selection.failure_ceiling)
     changed = replace(snapshot, execution=replace(snapshot.execution, state=state,
-                      checkpoint=replace(snapshot.execution.checkpoint, state=state)))
+                      baseline=replace(snapshot.execution.baseline, state=state)))
     with store.transaction() as db:
         db.execute("UPDATE workflows SET episode_json=?,version=version+1 WHERE target_kind='pr'",
                    (encode_workflow_episodes(changed),))

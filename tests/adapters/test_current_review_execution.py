@@ -11,7 +11,7 @@ from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from issue_agent.adapters.workflow_rows import (
     REVIEW_EXECUTION_ORIGIN_NAMESPACE, REVIEW_OUTCOME_NAMESPACE,
-    WorkflowAuthorityError, load_current_review_workflow_row, load_review_workflow_row,
+    WorkflowAuthorityError, load_review_workflow_row,
     persist_workflow_snapshot, read_current_review_pending,
 )
 from issue_agent.domain.events import ControlTransitionCommitted, EventEnvelope, Producer, new_event_id
@@ -37,12 +37,7 @@ def current_rig(rig):
     facts = control.read_round_facts(plan.round.round_id)
     key = selection.expected.fence.key
     with store.transaction() as db:
-        legacy = load_review_workflow_row(db, key)
-        authority = CurrentReviewExecution(legacy.execution.origin, legacy.execution.checkpoint,
-                                          legacy.execution.state, 0, legacy.execution.last_sequence)
-        current = replace(legacy, execution=authority)
-        persist_workflow_snapshot(db, current)
-        assert load_current_review_workflow_row(db, key) == current
+        current = load_review_workflow_row(db, key)
     published = []
     sequence = count()
     producer = Producer("construction", "o/r", "review", 123, "boot")
@@ -70,8 +65,9 @@ def test_current_wire_format_is_explicit_and_has_no_ancestry_defaults(current_ri
 def test_current_outcome_commits_receipt_projection_and_event_together(current_rig):
     store, key, control, facts, before, published = current_rig
     with store.transaction() as db:
+        prior_events = db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0]
         result = control._write_current_outcome_in_tx(db, facts, before.revision)
-        after = load_current_review_workflow_row(db, key)
+        after = load_review_workflow_row(db, key)
         assert after.execution.baseline.through_sequence == facts.plan.round.sequence
         assert after.execution.state == before.execution.state
         assert after.revision.version == before.revision.version + 1
@@ -81,7 +77,7 @@ def test_current_outcome_commits_receipt_projection_and_event_together(current_r
             (REVIEW_OUTCOME_NAMESPACE, key.repository, facts.plan.round.round_id),
         ).fetchone()[0] == encode_workflow(CurrentReviewOutcomeReceipt(facts, result.outcome, before.revision, OWNER))
         assert published == []
-        assert db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0] == 1
+        assert db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0] == prior_events + 1
     assert len(published) == 1
     assert isinstance(published[0].payload, ControlTransitionCommitted)
     assert published[0].payload.entity_id == facts.plan.round.round_id
@@ -96,24 +92,25 @@ def test_caught_current_write_failure_rolls_back_all_halves_and_keeps_outer_work
         "event": ("event_outbox", "INSERT", ""),
     }[stage]
     with store.transaction() as db:
+        prior_events = db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0]
         db.execute(f"CREATE TEMP TRIGGER inject_failure BEFORE {operation} ON {table} {condition} "
                    "BEGIN SELECT RAISE(ABORT,'injected current write failure'); END")
         db.execute("INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) VALUES (?,?,?,?,?)",
                    ("test-outer", "o/r", "before", "{}", store.now().isoformat()))
         with pytest.raises(sqlite3.IntegrityError, match="injected"):
             control._write_current_outcome_in_tx(db, facts, before.revision)
-        assert load_current_review_workflow_row(db, key) == before
+        assert load_review_workflow_row(db, key) == before
         assert db.execute("SELECT closure_json,outcome_json FROM review_execution_rounds WHERE round_id=?",
                           (facts.plan.round.round_id,)).fetchone()[:] == (None, None)
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace=?",
                           (REVIEW_OUTCOME_NAMESPACE,)).fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM event_outbox").fetchone()[0] == prior_events
         db.execute("INSERT INTO level_state(namespace,scope,key,payload_json,updated_at) VALUES (?,?,?,?,?)",
                    ("test-outer", "o/r", "after", "{}", store.now().isoformat()))
     with store.transaction() as db:
         assert db.execute("SELECT key FROM level_state WHERE namespace='test-outer' ORDER BY key").fetchall()[0][0] == "after"
         assert db.execute("SELECT COUNT(*) FROM level_state WHERE namespace='test-outer'").fetchone()[0] == 2
-        assert load_current_review_workflow_row(db, key) == before
+        assert load_review_workflow_row(db, key) == before
     assert published == []
 
 
@@ -151,13 +148,13 @@ def test_current_imported_session_requires_its_actual_origin_after_baseline_adva
     store, key, control, facts, before, _ = current_rig
     with store.transaction() as db:
         control._write_current_outcome_in_tx(db, facts, before.revision)
-        completed = load_current_review_workflow_row(db, key)
+        completed = load_review_workflow_row(db, key)
         invented = ReusableReviewSession(RuntimeName.CLAUDE, "invented-session", ImportedReviewSession("invented-evidence"))
         state = replace(completed.execution.state, session=invented)
         invalid = replace(completed.execution, state=state, baseline=replace(completed.execution.baseline, state=state))
         persist_workflow_snapshot(db, replace(completed, execution=invalid))
         with pytest.raises(WorkflowAuthorityError, match="verified origin"):
-            load_current_review_workflow_row(db, key)
+            load_review_workflow_row(db, key)
 
 
 @pytest.mark.parametrize("session", [NoReviewSession(), ReusableReviewSession(
@@ -167,7 +164,7 @@ def test_current_generation_carry_requires_the_transition_session_clear_and_cuto
     store, key, control, facts, before, _ = current_rig
     with store.transaction() as db:
         control._write_current_outcome_in_tx(db, facts, before.revision)
-        completed = load_current_review_workflow_row(db, key)
+        completed = load_review_workflow_row(db, key)
         next_revision = WorkflowRevision(replace(completed.revision.fence, generation=completed.revision.fence.generation + 1),
                                          completed.revision.version + 1)
         execution, boundary = advance_current_review_generation(
@@ -178,12 +175,12 @@ def test_current_generation_carry_requires_the_transition_session_clear_and_cuto
         advanced = replace(completed, revision=next_revision, execution=execution,
                            episode=replace(completed.episode, continuation=FreshReviewRequired(next_revision.fence.generation)))
         persist_workflow_snapshot(db, advanced)
-        assert load_current_review_workflow_row(db, key) == advanced
+        assert load_review_workflow_row(db, key) == advanced
         state = replace(execution.state, session=session, session_sequence=0)
         invalid = replace(execution, state=state, baseline=replace(execution.baseline, state=state))
         persist_workflow_snapshot(db, replace(advanced, execution=invalid))
         with pytest.raises(WorkflowAuthorityError, match="generation transition"):
-            load_current_review_workflow_row(db, key)
+            load_review_workflow_row(db, key)
 
 
 @pytest.mark.parametrize("corruption", ["origin", "component", "malformed", "high_water", "pending_identity"])
@@ -203,7 +200,7 @@ def test_current_active_authority_and_required_references_fail_closed(current_ri
             db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE round_id=?",
                        (encode_workflow(plan), facts.plan.round.round_id))
         with pytest.raises(WorkflowAuthorityError):
-            load_current_review_workflow_row(db, key)
+            load_review_workflow_row(db, key)
 
 
 def test_current_writer_refuses_unbacked_source_facts_and_missing_event_outbox(current_rig):
@@ -214,10 +211,10 @@ def test_current_writer_refuses_unbacked_source_facts_and_missing_event_outbox(c
         store._event_factory = None
         with pytest.raises(WorkflowAuthorityError, match="durable event"):
             control._write_current_outcome_in_tx(db, facts, before.revision)
-        assert load_current_review_workflow_row(db, key) == before
+        assert load_review_workflow_row(db, key) == before
 
 
-def test_pending_selection_uses_generation_range_index_and_legacy_publication_stays_held(current_rig):
+def test_pending_selection_uses_generation_range_index_and_canonical_current_authority(current_rig):
     store, key, _, facts, before, _ = current_rig
     with store.transaction() as db:
         statements = []
@@ -230,11 +227,10 @@ def test_pending_selection_uses_generation_range_index_and_legacy_publication_st
         query = db.execute("EXPLAIN QUERY PLAN " + selected).fetchall()
         assert any("review_execution_rounds_generation_pending" in row[3] for row in query)
         assert all("SCAN " not in row[3] for row in query)
-        with pytest.raises(WorkflowAuthorityError, match="S4 cutover"):
-            load_review_workflow_row(db, key)
+        assert load_review_workflow_row(db, key) == before
 
 
-def test_schema32_upgrade_preserves_legacy_authority_and_holds_unconverted_execution(rig):
+def test_schema32_upgrade_preserves_current_authority_without_mutating_historical_schema(rig):
     store, before, _, _, _ = rig
     with store.transaction() as db:
         retained = db.execute("SELECT episode_json FROM workflows WHERE target_kind='pr'").fetchone()[0]
@@ -247,26 +243,49 @@ def test_schema32_upgrade_preserves_legacy_authority_and_holds_unconverted_execu
         assert db.execute("SELECT source_digest FROM schema_migrations WHERE version=32").fetchone()[0] == old_digest
         assert db.execute("SELECT episode_json FROM workflows WHERE target_kind='pr'").fetchone()[0] == retained
         assert load_review_workflow_row(db, before.revision.fence.key) == before
-        with pytest.raises(WorkflowAuthorityError, match="held pending stopped verified conversion"):
-            load_current_review_workflow_row(db, before.revision.fence.key)
+
 
 
 @pytest.mark.parametrize("missing", ["launch", "return", "charge", "effect", "outcome", "preflight"])
 def test_current_live_productive_reference_requires_actual_launch_settlement_and_effect_sources(rig, missing):
-    from tests.adapters.test_review_execution_checkpoint_commit import _paid_source
+    from tests.adapters.test_review_execution_stage import stage
+    from tests.adapters.test_review_execution_admission import request
+    from tests.adapters.test_review_execution_launch import register
+    from tests.adapters.test_review_execution_return import returned, settlement
+    from tests.adapters.test_review_execution_submission import command_for
+    from tests.adapters.test_review_productive_settlement import workflow_for
+    from issue_agent.domain.review_rounds import ReviewSubmissionKind
+    from issue_agent.domain.contracts import EffectReceipt, EffectStatus
+    from tests.adapters.test_review_execution_control import current
 
-    store, key, plan, _ = _paid_source(rig)
+    store, _, gateway, selection, control = rig
+    key = selection.expected.fence.key
+    plan = control.preflight(selection)
+    planned = stage(plan)
+    control.register_stage(plan.round.round_id, current(store, selection).revision, planned)
+    proposed = request(planned.children[0])
+    assert store.reserve(proposed).admitted
+    register(store, proposed)
+    store.settle_review_return(settlement(proposed), returned(store, proposed))
+    command = command_for(current(store, selection), patch_id="0" * 64)
+    control.register_submission(plan.round.round_id, current(store, selection).revision,
+                                command, ReviewSubmissionKind.PAID)
+    control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+    store.begin_command(command.command_id)
+    store.record_effect(EffectReceipt(command.command_id, OWNER, store.now(), store.now(),
+                                      EffectStatus.SUCCEEDED, remote_object_id="review:paid"))
+    workflow_for(store, gateway).record_review(command.command_id)
     with store.transaction() as db:
         before = load_review_workflow_row(db, key)
         execution = CurrentReviewExecution(
             before.execution.origin,
             ReviewExecutionCheckpoint(before.execution.last_sequence, before.execution.state,
-                                      before.execution.checkpoint.policy),
+                                      before.execution.baseline.policy),
             before.execution.state, 0, before.execution.last_sequence,
         )
         selected = replace(before, execution=execution)
         persist_workflow_snapshot(db, selected)
-        assert load_current_review_workflow_row(db, key) == selected
+        assert load_review_workflow_row(db, key) == selected
         if missing in {"launch", "return", "outcome", "preflight"}:
             namespace = {
                 "launch": "review-execution-launch", "return": "review-execution-return",
@@ -278,4 +297,4 @@ def test_current_live_productive_reference_requires_actual_launch_settlement_and
         else:
             db.execute("DELETE FROM effect_receipts")
         with pytest.raises(WorkflowAuthorityError):
-            load_current_review_workflow_row(db, key)
+            load_review_workflow_row(db, key)

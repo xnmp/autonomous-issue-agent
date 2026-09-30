@@ -13,7 +13,7 @@ from issue_agent.adapters.workflow_rows import (
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review_activation import OpenPullRequestsListed
-from issue_agent.domain.review_execution import ActivatedReviewExecution
+from issue_agent.domain.review_execution import CurrentReviewExecution
 from issue_agent.domain.review_execution_counter_mapping import LegacyOpenPRCounterLink
 from issue_agent.domain.review_execution_history_import import ReviewImportNoHistoryObserved
 from issue_agent.domain.review_execution_import_plan import (
@@ -100,7 +100,7 @@ def test_two_pr_import_rolls_back_every_authority_row_after_partial_write(tmp_pa
         committed = commit_module.commit_empty_review_execution_import(db, plan, now=NOW)
         assert tuple(load_review_workflow_row(db, item.workflow.revision.fence.key)
                      for item in plan.candidates) == committed
-        assert all(snapshot.revision.version == 1 and isinstance(snapshot.execution, ActivatedReviewExecution)
+        assert all(snapshot.revision.version == 1 and isinstance(snapshot.execution, CurrentReviewExecution)
                    for snapshot in committed)
         assert db.execute("SELECT COUNT(*) FROM workflow_activation_imports WHERE family='review_execution'").fetchone()[0] == 2
         assert db.execute("SELECT COUNT(*) FROM workflow_components WHERE family='review_execution'").fetchone()[0] == 2
