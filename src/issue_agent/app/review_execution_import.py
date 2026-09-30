@@ -236,7 +236,12 @@ def assess_configured_review_execution_import_candidates(
             cfg.review_runtime.bot, now=audit_time,
         )
         if isinstance(candidate, BlockedZeroHistoryReviewImport):
-            digest = hashlib.sha256(encode_workflow(recorded).encode()).hexdigest()
+            # A fresh read time is not a change to the held source. Semantic
+            # review timestamps and every other observed fact remain bound.
+            source = replace(recorded, observation=replace(
+                recorded.observation, observed_at=datetime(1970, 1, 1, tzinfo=timezone.utc),
+            ))
+            digest = hashlib.sha256(encode_workflow(source).encode()).hexdigest()
             candidate = ReviewImportHistoryBlocked(history.pr, (ReviewImportBlocker(
                 ReviewImportBlockerKind.CURRENT_OBSERVATION, (ReviewImportSource(
                     candidate.kind.value, f"pr:{history.pr}", digest),),

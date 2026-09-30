@@ -576,6 +576,37 @@ legacy dismissal/reset controls have been removed. Rollback retains SQLite
 authority and requires compatible code. Real activation and restart remain
 subject to the architecture plan's deployment pause.
 
+### Review execution activation (offline, operator-only)
+
+Execution activation follows rejection activation. Keep all writers stopped.
+Inventory and shadow show every open or retained target; verified empty targets
+receive a current execution origin, while historical targets retain a sourced
+migration hold. A hold grants no allowance or reusable session. Shadow reports
+compare legacy observations with eligibility, allowance, session and holds,
+and name the deliberate differences where history cannot safely import.
+
+```bash
+issue-agent review-execution-activation inventory
+issue-agent review-execution-activation shadow > /tmp/execution-plan.json
+issue-agent review-execution-activation rehearse --copy-to /tmp/empty-execution-rehearsal
+issue-agent review-execution-activation activate --plan-file /tmp/execution-plan.json --confirm-plan-digest <digest from shadow>
+```
+
+The saved shadow report contains the complete immutable original plan. Keep it
+for retry after an ambiguous command response; supply the same file and digest.
+An exact committed retry checks SQL receipts without GitHub, source-file or
+writer-liveness observations. A different digest refuses. First publication
+revalidates the configured sources, remote observations and stopped writers.
+Inactive execution reports `migration_required`. Activation creates no paid work.
+
+Rehearsal always activates an isolated copy using the canonical control layout.
+It refuses destinations overlapping source roots, the target checkout or control
+authority, checks exact retry and digest conflict, and verifies original file and
+database bytes remain unchanged. Repeatable `--legacy-state-dir` includes older
+roots. Rehearsal plans identify their copied sources; obtain a fresh original
+shadow report before a separately authorized deployment. Live activation and
+restart remain paused under the architecture plan.
+
 ## Testing
 
 ```bash

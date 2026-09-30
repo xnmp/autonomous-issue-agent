@@ -3410,25 +3410,30 @@ def cmd_review_activation(args) -> int:
     return _cmd_workflow_activation(args, family="review")
 
 
+def cmd_review_execution_activation(args) -> int:
+    return _cmd_workflow_activation(args, family="review-execution")
+
+
 def _cmd_workflow_activation(args, *, family: str) -> int:
     import sqlite3
 
     from ..adapters.control_store import ControlStoreError
-    from . import resolve_activation, review_activation
+    from . import resolve_activation, review_activation, review_execution_activation
 
     activation = resolve_activation if family == "resolve" else review_activation
 
     name = args.name or _resolve_context(args)[2]
     try:
-        scope = activation.activation_scope(
+        transport = review_execution_activation if family == "review-execution" else activation
+        scope = transport.activation_scope(
             name, harness_root=HARNESS_ROOT, extra_roots=tuple(args.legacy_state_dir))
         if args.action in ("inventory", "shadow"):
-            result = activation.inspect(scope, shadow=args.action == "shadow")
+            result = transport.inspect(scope, shadow=args.action == "shadow")
         elif args.action == "rehearse":
             if not args.copy_to:
                 err("rehearse requires --copy-to <new empty directory>")
                 return 2
-            result = activation.rehearse(scope, copy_to=args.copy_to)
+            result = transport.rehearse(scope, copy_to=args.copy_to)
         else:
             if not args.confirm_plan_digest:
                 err("activate requires --confirm-plan-digest from a reviewed `shadow` report")
@@ -3436,11 +3441,20 @@ def _cmd_workflow_activation(args, *, family: str) -> int:
             # Old writers cannot be fenced by a table they never read. An empty
             # pgrep is not evidence across PID namespaces, so heartbeats of
             # every deployment of this repository refuse too, failing closed.
-            live = _activation_liveness(name, scope.repository)
-            if live:
-                err(f"REFUSING to activate '{name}': watchers may be running: {'; '.join(live)}")
-                return 2
-            result = activation.activate(scope, confirm_plan_digest=args.confirm_plan_digest)
+            if isinstance(scope, review_execution_activation.ReviewExecutionActivationScope):
+                from dataclasses import replace
+                if not args.plan_file:
+                    err("execution activate requires --plan-file with the original complete shadow report")
+                    return 2
+                scope = replace(scope, liveness=lambda: tuple(_activation_liveness(name, scope.repository)))
+                result = review_execution_activation.activate(
+                    scope, confirm_plan_digest=args.confirm_plan_digest, plan_file=args.plan_file)
+            else:
+                live = _activation_liveness(name, scope.repository)
+                if live:
+                    err(f"REFUSING to activate '{name}': watchers may be running: {'; '.join(live)}")
+                    return 2
+                result = activation.activate(scope, confirm_plan_digest=args.confirm_plan_digest)
     except (ValueError, OSError, ControlStoreError, sqlite3.Error) as exc:
         err(f"{family} activation refused: {exc}")
         return 2
@@ -3584,7 +3598,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--branch", required=True)
     sp.set_defaults(func=cmd_publish_base_branch)
 
-    for family, handler in (("resolve", cmd_resolve_activation), ("review", cmd_review_activation)):
+    for family, handler in (("resolve", cmd_resolve_activation), ("review", cmd_review_activation),
+                            ("review-execution", cmd_review_execution_activation)):
         sp = sub.add_parser(
             f"{family}-activation",
             help=f"inventory, shadow-compare, rehearse or activate the {family} workflow family",
@@ -3600,6 +3615,8 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--legacy-state-dir", action="append", default=[], metavar="DIR",
                         help="additional older/custom state root to import from (repeatable)")
         sp.add_argument("--copy-to", default="", help="rehearse: new empty directory for the isolated copy")
+        if family == "review-execution":
+            sp.add_argument("--plan-file", default="", help="activate: saved original complete shadow JSON report")
         sp.set_defaults(func=handler)
 
     sp = sub.add_parser("install-service", help="install the OS service units (launchd/systemd)")

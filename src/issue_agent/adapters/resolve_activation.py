@@ -374,7 +374,7 @@ def _overlaps(first: str, second: str) -> bool:
 
 def copy_for_rehearsal(
     control_path: str, roots: LegacyRoots, destination: str, *, protected: tuple[str, ...] = (),
-    legacy_name: re.Pattern[str] = _LEGACY_NAME,
+    legacy_name: re.Pattern[str] = _LEGACY_NAME, canonical_layout: bool = False,
 ) -> RehearsalCopy:
     """Isolated copy of authority and legacy resolve sources; never overwrites.
 
@@ -403,9 +403,10 @@ def copy_for_rehearsal(
     if root.is_symlink() or (root.exists() and (not root.is_dir() or any(root.iterdir()))):
         raise ResolveActivationRefused("rehearsal destination must be a new or empty directory")
     root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    (root / "control").mkdir(mode=0o700)
+    control_directory = root / ("issue-agent-control" if canonical_layout else "control")
+    control_directory.mkdir(mode=0o700)
     (root / "state").mkdir(mode=0o700)
-    copy_path = str(root / "control" / os.path.basename(control_path))
+    copy_path = str(control_directory / os.path.basename(control_path))
     with closing(sqlite3.connect(f"{Path(control_path).as_uri()}?mode=ro", uri=True)) as source, \
             closing(sqlite3.connect(copy_path)) as target:
         source.backup(target)

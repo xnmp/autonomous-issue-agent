@@ -282,3 +282,63 @@ def verify_committed_review_execution_import(
             setlimit(category, prior)
         except sqlite3.Error as exc:
             raise WorkflowAuthorityError("review execution import SQL length guard could not be restored") from exc
+
+
+def original_review_execution_plan(plan: ReviewExecutionImportPlan) -> dict[str, object]:
+    """Transport the complete immutable plan without widening authority payloads."""
+    if not isinstance(plan, ReviewExecutionImportPlan):
+        raise ValueError("original execution plan requires a typed plan")
+    value = {
+        "format": 1, "repository": plan.repository, "listing": list(plan.listing.numbers),
+        "execution_epoch": plan.execution_epoch, "source_set_digest": plan.source_set_digest,
+        "retained_digest": plan.retained_digest, "inventory_digest": plan.inventory_digest,
+        "planned_at": plan.planned_at.isoformat(), "policy": encode_workflow(plan.policy),
+        "candidates": [encode_workflow(candidate) for candidate in plan.candidates],
+        "plan_digest": plan.plan_digest,
+    }
+    import json
+    if len(json.dumps(value, ensure_ascii=True).encode()) > _MAX_SOURCE_BYTES:
+        raise WorkflowAuthorityError("original execution plan exceeds the source byte bound")
+    return value
+
+
+def read_original_review_execution_plan(path: str) -> ReviewExecutionImportPlan:
+    """Read a bounded saved shadow report; each target uses the closed codec."""
+    import json
+    import os
+    import stat
+    from ..domain.review_activation import OpenPullRequestsListed
+    from ..domain.review_execution import ReviewExecutionPolicy
+    from ..domain.review_execution_import_plan import EligibleZeroHistoryReviewImport
+    from ..domain.review_execution_migration import ReviewImportHistoryBlocked
+    from .workflow_codec import decode_workflow, _unique_object
+
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0))
+        with os.fdopen(fd, "rb") as saved:
+            metadata = os.fstat(saved.fileno())
+            if not stat.S_ISREG(metadata.st_mode) or metadata.st_size > _MAX_SOURCE_BYTES:
+                raise ValueError("original execution plan file exceeds the source bound or is not regular")
+            raw = saved.read(_MAX_SOURCE_BYTES + 1)
+        if len(raw) > _MAX_SOURCE_BYTES:
+            raise ValueError("original execution plan exceeds the source bound")
+        report = json.loads(raw, object_pairs_hook=_unique_object)
+        value = report.get("original_plan", report) if isinstance(report, dict) else report
+        names = {"format", "repository", "listing", "execution_epoch", "source_set_digest",
+                 "retained_digest", "inventory_digest", "planned_at", "policy", "candidates", "plan_digest"}
+        if (not isinstance(value, dict) or set(value) != names or type(value["format"]) is not int
+                or value["format"] != 1 or not isinstance(value["listing"], list)
+                or not isinstance(value["candidates"], list) or len(value["candidates"]) > MAX_IMPORTED_PULL_REQUESTS):
+            raise ValueError("original execution plan has unsupported fields or target bound")
+        plan = ReviewExecutionImportPlan(
+            value["repository"], OpenPullRequestsListed(tuple(value["listing"])), value["execution_epoch"],
+            value["source_set_digest"], value["retained_digest"], value["inventory_digest"],
+            tuple(decode_workflow(item, EligibleZeroHistoryReviewImport | ReviewImportHistoryBlocked)
+                  for item in value["candidates"]), datetime.fromisoformat(value["planned_at"]),
+            decode_workflow(value["policy"], ReviewExecutionPolicy),
+        )
+        if plan.plan_digest != value["plan_digest"]:
+            raise ValueError("original execution plan digest disagrees with its complete decisions")
+        return plan
+    except (TypeError, ValueError, KeyError, RecursionError, UnicodeError) as exc:
+        raise WorkflowAuthorityError(f"original execution plan is malformed: {exc}") from exc

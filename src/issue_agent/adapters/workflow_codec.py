@@ -17,6 +17,9 @@ from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
 from ..domain import review_execution as rx
 from ..domain import review_execution_migration as migration
+from ..domain.review_execution_import_plan import EligibleZeroHistoryReviewImport
+from ..domain.review_execution_history_import import ReviewImportNoHistoryObserved
+from ..domain.review_execution_counter_mapping import LegacyOpenPRCounterLink
 from ..domain import review_rounds as rr
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
@@ -39,6 +42,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    EligibleZeroHistoryReviewImport, ReviewImportNoHistoryObserved, LegacyOpenPRCounterLink,
     migration.ReviewImportSource, migration.ReviewImportBlocker, migration.ReviewImportHistoryBlocked,
     migration.BlockedReviewExecutionMigration,
     RearmObservation,
