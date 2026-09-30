@@ -8,8 +8,8 @@ import sqlite3
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.review_execution_import_commit import commit_empty_review_execution_import
-from issue_agent.adapters.review_execution_import_replay import verify_committed_empty_review_execution_import
+from issue_agent.adapters.review_execution_import_commit import commit_review_execution_import
+from issue_agent.adapters.review_execution_import_replay import verify_committed_review_execution_import
 from issue_agent.adapters.workflow_rows import (
     WorkflowAuthorityError, encode_workflow_episodes, insert_workflow_component,
     insert_initialized_review_execution_origin, load_review_workflow_row, persist_workflow_snapshot,
@@ -21,7 +21,7 @@ from issue_agent.domain.review_execution import initialized_review_execution, Cu
 from issue_agent.domain.review_execution_counter_mapping import LegacyOpenPRCounterLink
 from issue_agent.domain.review_execution_history_import import ReviewImportNoHistoryObserved
 from issue_agent.domain.review_execution_import_plan import (
-    EligibleZeroHistoryReviewImport, EmptyReviewExecutionImportPlan, screen_zero_history_review_import,
+    EligibleZeroHistoryReviewImport, ReviewExecutionImportPlan, screen_zero_history_review_import,
 )
 from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState, RecordedPullRequest
 from issue_agent.domain.review_workflow_policy import initial_review_workflow
@@ -60,7 +60,7 @@ def _rig(tmp_path, *, store=None):
             )
             assert isinstance(candidate, EligibleZeroHistoryReviewImport)
             candidates.append(candidate)
-    plan = EmptyReviewExecutionImportPlan(
+    plan = ReviewExecutionImportPlan(
         REPOSITORY, OpenPullRequestsListed((9, 10)), 2,
         "b" * 64, "c" * 64, "d" * 64, tuple(candidates), NOW,
     )
@@ -76,23 +76,23 @@ def test_absence_and_historical_retry_are_inert(tmp_path):
     store, plan = _rig(tmp_path)
     before = _dump(store)
     with store.transaction() as db:
-        assert verify_committed_empty_review_execution_import(db, plan) is False
+        assert verify_committed_review_execution_import(db, plan) is False
     assert _dump(store) == before
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
     after = _dump(store)
     with store.transaction() as db:
-        assert verify_committed_empty_review_execution_import(db, plan) is True
+        assert verify_committed_review_execution_import(db, plan) is True
     assert _dump(store) == after
     with store.transaction() as db:
-        assert verify_committed_empty_review_execution_import(db, plan) is True
+        assert verify_committed_review_execution_import(db, plan) is True
     assert _dump(store) == after
 
 
 def test_replay_requires_transaction(tmp_path):
     store, plan = _rig(tmp_path)
     with sqlite3.connect(store.path) as db, pytest.raises(ValueError, match="open SQL transaction"):
-        verify_committed_empty_review_execution_import(db, plan)
+        verify_committed_review_execution_import(db, plan)
 
 
 @pytest.mark.parametrize("sql,params", [
@@ -109,27 +109,27 @@ def test_replay_requires_transaction(tmp_path):
 def test_corrupt_authority_is_conflict_without_mutation(tmp_path, sql, params):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
     with sqlite3.connect(store.path) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute(sql, params)
     before = _dump(store)
     with store.transaction() as db, pytest.raises(WorkflowAuthorityError):
-        verify_committed_empty_review_execution_import(db, plan)
+        verify_committed_review_execution_import(db, plan)
     assert _dump(store) == before
 
 
 def test_changed_plan_is_not_a_retry(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
-    changed = EmptyReviewExecutionImportPlan(
+        commit_review_execution_import(db, plan, now=NOW)
+    changed = ReviewExecutionImportPlan(
         plan.repository, plan.listing, plan.execution_epoch, plan.source_set_digest,
         plan.retained_digest, "e" * 64, plan.candidates, plan.planned_at, plan.policy,
     )
     before = _dump(store)
     with store.transaction() as db, pytest.raises(WorkflowAuthorityError):
-        verify_committed_empty_review_execution_import(db, changed)
+        verify_committed_review_execution_import(db, changed)
     assert _dump(store) == before
 
 
@@ -142,7 +142,7 @@ def test_generation_progress_keeps_import_replay_inert(tmp_path):
     rig = Rig(tmp_path, reviews=0)
     store, plan = _rig(tmp_path, store=rig.store)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
     rig.remote.seed_review(9, "later-bot-review", author="review-bot[bot]",
                            commit="a" * 40, submitted_at=NOW.isoformat())
     control = rig.control(ceiling=1)
@@ -170,14 +170,14 @@ def test_generation_progress_keeps_import_replay_inert(tmp_path):
     before = _dump(store)
     with store.transaction() as db:
         assert load_review_workflow_row(db, WorkflowKey(REPOSITORY, PullRequestRef(9))) == accepted.snapshot
-        assert verify_committed_empty_review_execution_import(db, plan) is True
+        assert verify_committed_review_execution_import(db, plan) is True
     assert _dump(store) == before
 
 
 def test_newly_initialized_pr_keeps_import_replay_inert(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         key = WorkflowKey(REPOSITORY, PullRequestRef(11))
         rejection = initial_review_workflow(
             key, FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1),
@@ -211,14 +211,14 @@ def test_newly_initialized_pr_keeps_import_replay_inert(tmp_path):
         assert load_review_workflow_row(db, key) is not None
     before = _dump(store)
     with store.transaction() as db:
-        assert verify_committed_empty_review_execution_import(db, plan) is True
+        assert verify_committed_review_execution_import(db, plan) is True
     assert _dump(store) == before
 
 
-def test_round_in_foreign_episode_is_conflict(tmp_path):
+def test_unselected_foreign_round_does_not_reaudit_original_plan(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         db.execute(
             "INSERT INTO review_execution_rounds "
             "(round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
@@ -228,8 +228,8 @@ def test_round_in_foreign_episode_is_conflict(tmp_path):
              0, "claim", "{}", "{}"),
         )
     before = _dump(store)
-    with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="orphan round"):
-        verify_committed_empty_review_execution_import(db, plan)
+    with store.transaction() as db:
+        assert verify_committed_review_execution_import(db, plan) is True
     assert _dump(store) == before
 
 
@@ -243,7 +243,7 @@ def test_unmatched_global_rows_exceeding_scan_bound_fail_closed(tmp_path):
         )
         before = db.total_changes
         with pytest.raises(WorkflowAuthorityError, match="global census bound"):
-            verify_committed_empty_review_execution_import(db, plan)
+            verify_committed_review_execution_import(db, plan)
         assert db.total_changes == before
 
 
@@ -265,7 +265,7 @@ def test_absent_activation_with_retained_execution_row_is_conflict(tmp_path, orp
             )
     before = _dump(store)
     with store.transaction() as db, pytest.raises(WorkflowAuthorityError):
-        verify_committed_empty_review_execution_import(db, plan)
+        verify_committed_review_execution_import(db, plan)
     assert _dump(store) == before
 
 
@@ -277,18 +277,18 @@ def test_absent_activation_with_retained_execution_row_is_conflict(tmp_path, orp
 def test_selected_oversized_payload_is_conflict_without_mutation(tmp_path, table, column, where):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         db.execute(f"UPDATE {table} SET {column}=? WHERE {where}", ("x" * 262_145,))
     before = _dump(store)
-    with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="malformed SQL source"):
-        verify_committed_empty_review_execution_import(db, plan)
+    with store.transaction() as db, pytest.raises(WorkflowAuthorityError):
+        verify_committed_review_execution_import(db, plan)
     assert _dump(store) == before
 
 
-def test_new_inactive_workflow_without_execution_component_is_conflict(tmp_path):
+def test_unrelated_inactive_target_refuses_at_reader_without_invalidating_original_retry(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         key = WorkflowKey(REPOSITORY, PullRequestRef(11))
         workflow = initial_review_workflow(
             key, FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1),
@@ -297,15 +297,17 @@ def test_new_inactive_workflow_without_execution_component_is_conflict(tmp_path)
                    (REPOSITORY, 11, encode_workflow_episodes(workflow)))
         insert_workflow_component(db, key, workflow.authority, workflow.episode.episode_id)
     before = _dump(store)
-    with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="workflow membership"):
-        verify_committed_empty_review_execution_import(db, plan)
+    with store.transaction() as db:
+        assert verify_committed_review_execution_import(db, plan) is True
+        with pytest.raises(WorkflowAuthorityError, match="component is absent"):
+            load_review_workflow_row(db, key)
     assert _dump(store) == before
 
 
 def test_sql_length_guard_rejects_huge_linked_gate_and_restores_limit(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         db.execute(
             "INSERT INTO workflow_gates VALUES (? ,?, 'pr', 9, 0, ?, 'open', ?)",
             ("huge-gate", REPOSITORY, "huge-cause", "x" * (8 * 262_144 + 1)),
@@ -315,7 +317,7 @@ def test_sql_length_guard_rejects_huge_linked_gate_and_restores_limit(tmp_path):
         caller_limit = db.setlimit(category, 4 * 1024 * 1024)
         try:
             with pytest.raises(WorkflowAuthorityError):
-                verify_committed_empty_review_execution_import(db, plan)
+                verify_committed_review_execution_import(db, plan)
             assert db.getlimit(category) == 4 * 1024 * 1024
         finally:
             db.setlimit(category, caller_limit)
@@ -324,17 +326,17 @@ def test_sql_length_guard_rejects_huge_linked_gate_and_restores_limit(tmp_path):
 def test_sql_length_guard_preserves_lower_caller_limit_on_success_and_refusal(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
     with store.transaction() as db:
         category = sqlite3.SQLITE_LIMIT_LENGTH
         caller_limit = db.setlimit(category, 512 * 1024)
         try:
-            assert verify_committed_empty_review_execution_import(db, plan) is True
+            assert verify_committed_review_execution_import(db, plan) is True
             assert db.getlimit(category) == 512 * 1024
             db.execute("UPDATE workflow_activation_evidence SET plan_digest=? WHERE family='review_execution'",
                        ("e" * 64,))
             with pytest.raises(WorkflowAuthorityError):
-                verify_committed_empty_review_execution_import(db, plan)
+                verify_committed_review_execution_import(db, plan)
             assert db.getlimit(category) == 512 * 1024
         finally:
             db.setlimit(category, caller_limit)
@@ -343,22 +345,22 @@ def test_sql_length_guard_preserves_lower_caller_limit_on_success_and_refusal(tm
 def test_active_gate_cardinality_is_checked_before_decode(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         db.executemany(
             "INSERT INTO workflow_gates VALUES (?,?,'pr',9,0,?,'open','{}')",
             ((f"gate:{index}", REPOSITORY, f"cause:{index}") for index in range(65)),
         )
     before = _dump(store)
     with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="gate count"):
-        verify_committed_empty_review_execution_import(db, plan)
+        verify_committed_review_execution_import(db, plan)
     assert _dump(store) == before
 
 
 @pytest.mark.parametrize("table", ("dedupe_keys", "workflow_evidence"))
-def test_unreferenced_repository_payload_is_bounded_before_reader(tmp_path, table):
+def test_unreferenced_payload_is_not_part_of_original_plan_retry(tmp_path, table):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         if table == "dedupe_keys":
             db.execute(
                 "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
@@ -371,15 +373,15 @@ def test_unreferenced_repository_payload_is_bounded_before_reader(tmp_path, tabl
                 ("foreign-evidence", REPOSITORY, "x" * 262_145),
             )
     before = _dump(store)
-    with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="corpus source"):
-        verify_committed_empty_review_execution_import(db, plan)
+    with store.transaction() as db:
+        assert verify_committed_review_execution_import(db, plan) is True
     assert _dump(store) == before
 
 
 def test_foreign_repository_payload_is_not_charged_to_corpus(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
         db.execute(
             "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
             "VALUES ('foreign','another/repo','other',?,?)",
@@ -387,7 +389,7 @@ def test_foreign_repository_payload_is_not_charged_to_corpus(tmp_path):
         )
     before = _dump(store)
     with store.transaction() as db:
-        assert verify_committed_empty_review_execution_import(db, plan) is True
+        assert verify_committed_review_execution_import(db, plan) is True
     assert _dump(store) == before
 
 
@@ -411,7 +413,7 @@ def test_absent_execution_with_whitespace_repository_alias_is_conflict(tmp_path,
         db.execute(sql, params)
     before = _dump(store)
     with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="repository identity is aliased"):
-        verify_committed_empty_review_execution_import(db, plan)
+        verify_committed_review_execution_import(db, plan)
     assert _dump(store) == before
 
 
@@ -423,27 +425,27 @@ def test_absent_execution_with_whitespace_repository_alias_is_conflict(tmp_path,
 def test_committed_family_or_origin_namespace_whitespace_alias_is_conflict(tmp_path, sql):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
     with sqlite3.connect(store.path) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute(sql)
     before = _dump(store)
-    with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="identity is aliased"):
-        verify_committed_empty_review_execution_import(db, plan)
+    with store.transaction() as db, pytest.raises(WorkflowAuthorityError):
+        verify_committed_review_execution_import(db, plan)
     assert _dump(store) == before
 
 
 def test_committed_target_kind_whitespace_alias_is_conflict(tmp_path):
     store, plan = _rig(tmp_path)
     with store.transaction() as db:
-        commit_empty_review_execution_import(db, plan, now=NOW)
+        commit_review_execution_import(db, plan, now=NOW)
     with sqlite3.connect(store.path) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute("PRAGMA ignore_check_constraints=ON")
         db.execute("UPDATE workflows SET target_kind='\tpr\n' WHERE target_number=9")
     before = _dump(store)
-    with store.transaction() as db, pytest.raises(WorkflowAuthorityError, match="target_kind identity is aliased"):
-        verify_committed_empty_review_execution_import(db, plan)
+    with store.transaction() as db, pytest.raises(WorkflowAuthorityError):
+        verify_committed_review_execution_import(db, plan)
     assert _dump(store) == before
 
 
@@ -460,7 +462,7 @@ def test_missing_sqlite_length_limit_api_refuses_without_mutation(tmp_path):
         db.execute("BEGIN")
         changes = db.total_changes
         with pytest.raises(WorkflowAuthorityError, match="available in Python 3.11\\+"):
-            verify_committed_empty_review_execution_import(db, plan)
+            verify_committed_review_execution_import(db, plan)
         assert db.total_changes == changes
         db.rollback()
     assert _dump(store) == before

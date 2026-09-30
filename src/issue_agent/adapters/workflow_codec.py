@@ -16,6 +16,7 @@ from ..domain import review_workflow as rw
 from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
 from ..domain import review_execution as rx
+from ..domain import review_execution_migration as migration
 from ..domain import review_rounds as rr
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
@@ -38,6 +39,8 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    migration.ReviewImportSource, migration.ReviewImportBlocker, migration.ReviewImportHistoryBlocked,
+    migration.BlockedReviewExecutionMigration,
     RearmObservation,
     workspace.ResolveWorkspaceObserved, w.ResolveRearmAcceptance,
     workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
@@ -117,6 +120,7 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
+    migration.ReviewImportBlockerKind,
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
     w.RetryDisposition, w.RemediationOperation,

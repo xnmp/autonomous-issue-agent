@@ -6,6 +6,7 @@ no runtime authority until the execution family is explicitly activated.
 """
 
 from __future__ import annotations
+from .review_execution_migration import BlockedReviewExecutionMigration
 
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
@@ -815,7 +816,7 @@ class CurrentReviewExecution:
         return self.state.binding
 
 
-ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution | CurrentReviewExecution
+ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution | CurrentReviewExecution | BlockedReviewExecutionMigration
 
 
 @dataclass(frozen=True)

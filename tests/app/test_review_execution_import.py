@@ -9,12 +9,11 @@ import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.review_execution_activation import (
-    CompleteLegacyExecutionRootFiles, CompleteLegacySubmissionSettlementStorage,
+    CompleteLegacyExecutionRootFiles,
     read_complete_legacy_execution_root_files, read_complete_legacy_review_generation_receipts,
     read_complete_legacy_review_outcome_receipts, read_complete_legacy_review_rounds,
     read_complete_legacy_review_runs, read_complete_legacy_review_submission_receipts,
     read_complete_legacy_review_submissions, read_legacy_review_owner_lineage,
-    verify_complete_legacy_round_outcome_storage, verify_complete_legacy_submission_settlement_storage,
 )
 from issue_agent.adapters.review_execution_counter_links import read_complete_legacy_open_counter_links
 from issue_agent.adapters.review_execution_import_sources import (
@@ -29,7 +28,7 @@ from issue_agent.app.config import (
 )
 from issue_agent.app.review_execution_import import (
     BlockedReviewImportObservationSet, ObservedReviewExecutionImportCandidates,
-    assess_configured_review_execution_import_candidates, plan_configured_empty_review_execution_import,
+    assess_configured_review_execution_import_candidates, plan_configured_review_execution_import,
     classify_configured_legacy_review_import_history,
     verify_configured_legacy_execution_import_sources,
 )
@@ -40,7 +39,7 @@ from issue_agent.domain.review_execution_history_import import (
 )
 from issue_agent.domain.review_execution_import_plan import (
     BlockedZeroHistoryReviewImport, EligibleZeroHistoryReviewImport,
-    EmptyReviewExecutionImportPlan, ZeroHistoryImportBlockerKind,
+    ReviewExecutionImportPlan, ZeroHistoryImportBlockerKind,
 )
 from issue_agent.domain.resolve_activation import DeploymentInventory
 from issue_agent.domain.labels import Label
@@ -112,13 +111,8 @@ def _sql_sources(cfg, control, *, include_prior):
         receipts = read_complete_legacy_review_submission_receipts(db, cfg.repo)
         rounds = read_complete_legacy_review_rounds(db, cfg.repo)
         outcomes = read_complete_legacy_review_outcome_receipts(db, cfg.repo)
-        round_storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcomes)
-        settlement = verify_complete_legacy_submission_settlement_storage(
-            db, commands, receipts, round_storage,
-        )
         generation = read_complete_legacy_review_generation_receipts(db, cfg.repo)
-        assert isinstance(settlement, CompleteLegacySubmissionSettlementStorage)
-    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
+    return ObservedLegacyExecutionSqlImportSources(runs, commands, receipts, rounds, outcomes, generation)
 
 
 def _record_prior_run(cfg, control):
@@ -151,8 +145,9 @@ def test_configured_import_revalidates_the_full_boot_owner_lineage(sources):
         assert isinstance(held, HeldLegacyExecutionCounterSources)
         with control.transaction() as db:
             result = verify_configured_legacy_execution_import_sources(cfg, db, held, observed)
-            assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-            assert "target-scoped R1" in result.reason
+            assert isinstance(result, RevalidatedLegacyExecutionImportSources)
+            assert result.sql.runs.lineage.configured_prior_owners == (prior_owner,)
+            assert result.deaths.unassigned_deaths[0].pr == 9
 
 
 def test_configured_history_classifies_empty_pr_from_held_complete_sources(sources):
@@ -250,16 +245,16 @@ def test_configured_candidate_joins_every_retained_row_to_current_open_pr(source
     assert len(result.candidates) == 1
     assert isinstance(result.candidates[0], EligibleZeroHistoryReviewImport)
     assert result.candidates[0].pr == 9
-    plan = plan_configured_empty_review_execution_import(result, DeploymentInventory("o/r"), 1)
-    assert isinstance(plan, EmptyReviewExecutionImportPlan)
+    plan = plan_configured_review_execution_import(result, DeploymentInventory("o/r"), 1)
+    assert isinstance(plan, ReviewExecutionImportPlan)
     assert plan.source_digest == result.source_digest
     assert plan.decisions_at(datetime.now(timezone.utc))[0].checkpoint.state.binding.rejection == result.candidates[0].workflow.binding
-    assert isinstance(plan_configured_empty_review_execution_import(
+    assert isinstance(plan_configured_review_execution_import(
         result, DeploymentInventory("o/r", active_runs=("run-1",)), 1,
     ), BlockedReviewImportObservationSet)
 
 
-def test_configured_candidate_refuses_a_second_retained_workflow(sources):
+def test_configured_candidate_blocks_terminal_retained_workflow(sources):
     cfg, control, _gateway, roots, files, _links = sources
     gateway = OnePRGateway()
     key = _record_review_workflow(control, 9)
@@ -283,8 +278,17 @@ def test_configured_candidate_refuses_a_second_retained_workflow(sources):
                 cfg, db, held, observed, (recorded,),
             )
 
-    assert isinstance(result, BlockedRetainedReviewWorkflows)
-    assert "terminal_or_extra=(10,)" in result.reason
+    assert isinstance(result, ObservedReviewExecutionImportCandidates)
+    clean, terminal = result.candidates
+    assert clean.pr == 9 and isinstance(clean, EligibleZeroHistoryReviewImport)
+    assert terminal.pr == 10 and isinstance(terminal, ReviewImportHistoryBlocked)
+    assert terminal.blockers[0].sources[0].identity == "pr:10"
+    plan = plan_configured_review_execution_import(result, DeploymentInventory("o/r"), 1)
+    assert isinstance(plan, ReviewExecutionImportPlan)
+    assert plan.candidates == result.candidates
+    from issue_agent.domain.review_execution_migration import BlockedReviewExecutionMigration
+    decisions = plan.decisions_at(datetime.now(timezone.utc))
+    assert len(decisions) == 2 and isinstance(decisions[1], BlockedReviewExecutionMigration)
 
 
 def test_configured_candidate_keeps_missing_remote_read_as_a_pr_blocker(sources):
@@ -307,13 +311,15 @@ def test_configured_candidate_keeps_missing_remote_read_as_a_pr_blocker(sources)
             )
 
     assert isinstance(result, ObservedReviewExecutionImportCandidates)
-    assert result.source_digest is None
-    assert result.candidates == (
-        BlockedZeroHistoryReviewImport(9, ZeroHistoryImportBlockerKind.REMOTE_UNAVAILABLE),
-    )
-    assert isinstance(plan_configured_empty_review_execution_import(
-        result, DeploymentInventory("o/r"), 1,
-    ), BlockedReviewImportObservationSet)
+    assert len(result.source_digest) == 64
+    blocked, = result.candidates
+    assert isinstance(blocked, ReviewImportHistoryBlocked)
+    assert blocked.blockers[0].sources[0].kind == ZeroHistoryImportBlockerKind.REMOTE_UNAVAILABLE.value
+    plan = plan_configured_review_execution_import(result, DeploymentInventory("o/r"), 1)
+    assert isinstance(plan, ReviewExecutionImportPlan)
+    from issue_agent.domain.review_execution_migration import BlockedReviewExecutionMigration
+    decision, = plan.decisions_at(datetime.now(timezone.utc))
+    assert isinstance(decision, BlockedReviewExecutionMigration) and decision.history == blocked
 
 
 def test_configured_import_refuses_a_substituted_legacy_root(sources, tmp_path):

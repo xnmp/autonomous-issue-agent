@@ -26,7 +26,7 @@ from .workflow import (
     _command_ids, _count, _items, _text, _time,
 )
 from .review_evidence import is_review_evidence_gate
-from .review_execution import ActivatedReviewExecution, CurrentReviewExecution, ExecutionNotActivated, ReviewExecutionComponent
+from .review_execution import ActivatedReviewExecution, CurrentReviewExecution, ExecutionNotActivated, BlockedReviewExecutionMigration, ReviewExecutionComponent
 from .workflow_reconciliation import is_prewrite_gate
 from .workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
@@ -366,12 +366,14 @@ class ReviewWorkflowSnapshot:
             raise ValueError("snapshot requires validated revision, authority and episode")
         if self.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
             raise ValueError("this snapshot supports only review rejections")
-        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution)):
+        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution, BlockedReviewExecutionMigration)):
             raise ValueError("review snapshot requires a typed execution component")
         if isinstance(self.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
             binding = self.execution.binding.rejection
             if binding != WorkflowBinding(self.revision.fence, self.authority, self.episode.episode_id):
                 raise ValueError("execution component disagrees with the review workflow binding")
+        if isinstance(self.execution, BlockedReviewExecutionMigration) and self.execution.key != self.revision.fence.key:
+            raise ValueError("blocked migration belongs to another review target")
         if not isinstance(self.revision.fence.key.target, PullRequestRef):
             raise ValueError("review rejection workflow requires a pull request")
         generation = self.revision.fence.generation
@@ -448,7 +450,7 @@ class ReviewFamilyEpisodes:
             raise ValueError("review family envelope requires rejection authority")
         if not isinstance(self.episode, ReviewEpisode):
             raise ValueError("review family envelope requires its rejection episode")
-        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution)):
+        if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution, BlockedReviewExecutionMigration)):
             raise ValueError("review family envelope requires a typed execution component")
         if isinstance(self.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
             parent = self.execution.binding.rejection

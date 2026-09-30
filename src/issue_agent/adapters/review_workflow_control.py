@@ -42,7 +42,7 @@ from ..domain.review_evidence import (
     unavailable_evidence, unavailable_first_observation,
 )
 from ..domain.review_execution import (
-    initialized_review_execution,
+    initialized_review_execution, BlockedReviewExecutionMigration,
     CurrentReviewExecution, CompletedReviewExecutionRound, freeze_current_review_generation,
 )
 from ..domain.review_rounds import (
@@ -103,6 +103,7 @@ from .workflow_rows import (
     persist_workflow_snapshot, read_review_submission_registration, workflow_run_scope_bounds, workflow_scope,
     REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
     insert_initialized_review_execution_origin, insert_workflow_component, encode_workflow_episodes,
+    load_review_execution_import_decision,
     read_current_review_pending,
 )
 
@@ -787,7 +788,12 @@ class SQLiteReviewWorkflowControl:
             snapshot = initial_review_workflow(key, authority)
             origin_receipt = None
             origin_claimed_at = None
-            if execution_authority is not None:
+            retained_decision = load_review_execution_import_decision(db, key)
+            if isinstance(retained_decision, BlockedReviewExecutionMigration):
+                snapshot = replace(snapshot, execution=retained_decision)
+            elif retained_decision is not None:
+                raise WorkflowAuthorityError("imported review target lost its workflow")
+            elif execution_authority is not None:
                 origin_claimed_at = self._now()
                 if not isinstance(recorded.observation.reviews, CompleteReviews):
                     raise WorkflowAuthorityError("execution initialization requires a complete first observation")
@@ -835,7 +841,7 @@ class SQLiteReviewWorkflowControl:
                        (*workflow_scope(key), encode_workflow_episodes(snapshot)))
             insert_workflow_component(db, key, authority, snapshot.episode.episode_id)
             observed_id = self._insert_evidence(db, key, recorded)
-            if execution_authority is not None:
+            if execution_authority is not None and not isinstance(snapshot.execution, BlockedReviewExecutionMigration):
                 if origin_receipt is None or origin_claimed_at is None:
                     raise WorkflowAuthorityError("execution initialization lost its origin evidence")
                 if observed_id != origin_receipt.observation_evidence_id:
@@ -847,8 +853,8 @@ class SQLiteReviewWorkflowControl:
                 insert_initialized_review_execution_origin(
                     db, key.repository, origin_receipt, claimed_at=origin_claimed_at,
                 )
-                if load_review_workflow_row(db, key) != snapshot:
-                    raise WorkflowAuthorityError("initialized execution failed canonical readback")
+            if execution_authority is not None and load_review_workflow_row(db, key) != snapshot:
+                raise WorkflowAuthorityError("discovered execution failed canonical readback")
             self._control._transition(db, "workflow", encode_workflow(key), "discovered",
                                       {"generation": 0, "version": 0, "epoch": authority.epoch})
             return WorkflowCommitted(snapshot)

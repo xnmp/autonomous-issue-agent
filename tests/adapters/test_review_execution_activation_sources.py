@@ -38,15 +38,9 @@ from issue_agent.adapters.review_execution_activation import (
     MAX_OUTCOME_RECEIPT_SOURCE_PAGE,
     read_complete_legacy_review_outcome_receipts,
     revalidate_complete_legacy_review_outcome_receipts,
-    verify_legacy_round_outcome_storage,
-    verify_complete_legacy_round_outcome_storage,
-    verify_complete_legacy_submission_settlement_storage,
-    VerifiedLegacySubmissionRegistrationStorage,
-    CompleteLegacySubmissionSettlementStorage,
     read_complete_legacy_review_generation_receipts,
     revalidate_complete_legacy_review_generation_receipts,
     read_checkpoint_round_row_source,
-    read_review_submission_round_link,
 )
 from issue_agent.domain.resolve_activation import (
     MAX_LEGACY_FILE_BYTES, LegacyAbsent, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry,
@@ -68,31 +62,49 @@ from issue_agent.adapters.workflow_rows import (
     WorkflowAuthorityError, encode_workflow_episodes, load_review_workflow_row,
 )
 from issue_agent.domain.review_execution_activation import (
-    LegacyExecutionCounterRecord, LegacyExecutionNumber, LegacyExecutionPRRecord,
-    LegacyExecutionRunRecord, LegacyReviewRunState, LegacyReviewSessionCandidate,
+    LegacyExecutionCounterRecord,
+    LegacyExecutionNumber,
+    LegacyExecutionPRRecord,
+    LegacyExecutionRunRecord,
+    LegacyReviewRunState,
+    LegacyReviewSessionCandidate,
     LegacyReviewSessionModeMarker,
-    parse_legacy_review_counter, parse_legacy_review_round, parse_legacy_review_session,
-    classify_legacy_execution_file_values, CompleteLegacyExecutionFileValues,
+    parse_legacy_review_counter,
+    parse_legacy_review_round,
+    parse_legacy_review_session,
+    classify_legacy_execution_file_values,
+    CompleteLegacyExecutionFileValues,
     BlockedLegacyExecutionFileValues,
-    UnreadableLegacyExecutionRun, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
-    CompleteLegacyReviewSubmissions, BlockedLegacyReviewSubmissions,
-    LegacyReviewSubmissionReceiptSource, UnreadableLegacyReviewSubmissionReceipt,
-    CompleteLegacyReviewSubmissionReceipts, BlockedLegacyReviewSubmissionReceipts,
-    LegacyReviewOwnerLineage, UnreadableLegacyReviewOwnerLineage,
-    CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
-    LegacyReviewRoundSource, UnreadableLegacyReviewRound, MAX_LEGACY_ROUND_JSON_BYTES,
-    CompleteLegacyReviewRounds, BlockedLegacyReviewRounds,
-    LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES, MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES,
-    LegacyReviewOutcomeReceiptPage, LegacyReviewOutcomeReceiptSource, UnreadableLegacyReviewOutcomeReceipt,
+    UnreadableLegacyExecutionRun,
+    LegacyReviewSubmissionSource,
+    UnreadableLegacyReviewSubmission,
+    CompleteLegacyReviewSubmissions,
+    BlockedLegacyReviewSubmissions,
+    LegacyReviewSubmissionReceiptSource,
+    UnreadableLegacyReviewSubmissionReceipt,
+    CompleteLegacyReviewSubmissionReceipts,
+    BlockedLegacyReviewSubmissionReceipts,
+    LegacyReviewOwnerLineage,
+    UnreadableLegacyReviewOwnerLineage,
+    CompleteLegacyReviewRuns,
+    BlockedLegacyReviewRuns,
+    LegacyReviewRoundSource,
+    UnreadableLegacyReviewRound,
+    MAX_LEGACY_ROUND_JSON_BYTES,
+    CompleteLegacyReviewRounds,
+    BlockedLegacyReviewRounds,
+    LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES,
+    MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES,
+    LegacyReviewOutcomeReceiptPage,
+    LegacyReviewOutcomeReceiptSource,
+    UnreadableLegacyReviewOutcomeReceipt,
     BlockedLegacyReviewOutcomeReceiptPage,
-    CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
-    VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
-    CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
-    LegacyReviewGenerationReceiptSource, CompleteLegacyReviewGenerationReceipts,
-    BlockedLegacyReviewGenerationReceipts, MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES,
-    BlockedLegacySubmissionSettlementStorage,
-    VerifiedLegacyRecordedReview, VerifiedReviewSubmissionRoundLink,
-    VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
+    CompleteLegacyReviewOutcomeReceipts,
+    BlockedLegacyReviewOutcomeReceipts,
+    LegacyReviewGenerationReceiptSource,
+    CompleteLegacyReviewGenerationReceipts,
+    BlockedLegacyReviewGenerationReceipts,
+    MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES,
 )
 from tests.adapters.test_review_execution_control import rig, current, OWNER as CONTROL_OWNER
 from tests.adapters.test_review_productive_settlement import (
@@ -806,302 +818,28 @@ def test_complete_outcome_receipts_bounds_shared_table_and_retained_bytes(monkey
     assert "total bound" in bytes_blocked.reason
 
 
-def test_sealed_round_outcome_joins_exact_durable_receipt_without_writes(rig):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        before = db.total_changes
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        proof = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
-        assert db.total_changes == before
-        db.rollback()
-
-    assert isinstance(proof, VerifiedLegacyRoundOutcomeStorage)
-    assert proof.facts.plan.round == plan.round
-    assert proof.outcome.round == plan.round
-    assert isinstance(proof.outcome.disposition, CopiedReviewProgress)
-    assert dict(proof.receipt_source.fields)["key"] == plan.round.round_id
 
 
-@pytest.mark.parametrize("damage", ["receipt_payload", "round_outcome", "missing_receipt"])
-def test_sealed_round_outcome_rejects_changed_or_missing_sources(rig, damage):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        db.rollback()
-    assert isinstance(rounds, CompleteLegacyReviewRounds)
-    assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-    with store.transaction() as db:
-        if damage == "receipt_payload":
-            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='review-round-outcome'")
-        elif damage == "round_outcome":
-            db.execute("UPDATE review_execution_rounds SET outcome_json='{}' WHERE round_id=?",
-                       (plan.round.round_id,))
-        else:
-            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-outcome'")
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
-        db.rollback()
-
-    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
 
 
-@pytest.mark.parametrize("damage", ["receipt_payload", "round_plan", "round_closure", "expiring_receipt"])
-def test_sealed_round_outcome_rejects_matching_inventories_with_contradictory_storage(rig, damage):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with store.transaction() as db:
-        if damage == "receipt_payload":
-            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='review-round-outcome'")
-        elif damage == "round_plan":
-            db.execute("UPDATE review_execution_rounds SET plan_json='{}' WHERE round_id=?",
-                       (plan.round.round_id,))
-        elif damage == "round_closure":
-            db.execute("UPDATE review_execution_rounds SET closure_json='{}' WHERE round_id=?",
-                       (plan.round.round_id,))
-        else:
-            db.execute("UPDATE dedupe_keys SET reusable_after='2026-09-29T00:00:00Z' "
-                       "WHERE namespace='review-round-outcome'")
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
-        db.rollback()
-
-    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
 
 
-def test_open_round_cannot_claim_a_sealed_outcome(rig):
-    store, _, _, selection, control = rig
-    plan = control.preflight(selection)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
-        db.rollback()
-
-    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
 
 
-def test_sealed_round_outcome_rejects_forged_but_matching_receipt(rig):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with store.transaction() as db:
-        row = db.execute("SELECT closure_json,outcome_json FROM review_execution_rounds WHERE round_id=?",
-                         (plan.round.round_id,)).fetchone()
-        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
-        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
-        forged = replace(outcome, disposition=ReviewUnlaunchedRound(facts.closure_receipt))
-        db.execute("UPDATE review_execution_rounds SET outcome_json=? WHERE round_id=?",
-                   (encode_workflow(forged), plan.round.round_id))
-        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='review-round-outcome'",
-                   (encode_workflow((facts, forged)),))
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
-        db.rollback()
-
-    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
-    assert "closure facts" in result.reason
 
 
-def test_sealed_round_outcome_returns_unverified_for_control_characters_in_bad_tag(rig):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with store.transaction() as db:
-        db.execute("UPDATE review_execution_rounds SET closure_json=? WHERE round_id=?",
-                   (json.dumps({"format": 1, "value": {"type": "unknown\nvariant"}}), plan.round.round_id))
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        result = verify_legacy_round_outcome_storage(db, rounds, receipts, plan.round.round_id)
-        db.rollback()
-
-    assert isinstance(result, UnverifiedLegacyRoundOutcomeStorage)
-    assert "unknown" in result.reason and "\n" not in result.reason
 
 
-def test_complete_round_outcome_storage_accounts_for_real_sealed_round_without_writes(rig):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        before = db.total_changes
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        complete = verify_complete_legacy_round_outcome_storage(db, rounds, receipts)
-        assert db.total_changes == before
-        db.rollback()
-
-    assert isinstance(complete, CompleteLegacyRoundOutcomeStorage)
-    assert [entry.outcome.round.round_id for entry in complete.sealed] == [plan.round.round_id]
-    assert complete.repository == "o/r"
-    with pytest.raises(ValueError, match="unaccounted"):
-        CompleteLegacyRoundOutcomeStorage(complete.rounds, complete.receipts, ())
-    outcome_receipt = complete.receipts.receipts[0]
-    extras = tuple(replace(
-        outcome_receipt, source_rowid=index,
-        fields=tuple((name, namespace if name == "namespace" else value)
-                     for name, value in outcome_receipt.fields),
-    ) for index, namespace in ((-1, "review-round-stale-productivity"),
-                               (-2, "review-round-superseded-productivity")))
-    contradictory = CompleteLegacyReviewOutcomeReceipts("o/r", (outcome_receipt, *extras))
-    with pytest.raises(ValueError, match="contradictory auxiliary"):
-        CompleteLegacyRoundOutcomeStorage(complete.rounds, contradictory, complete.sealed)
 
 
-def test_complete_round_outcome_storage_rejects_partial_caller_inventory(rig):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        partial = CompleteLegacyReviewOutcomeReceipts("o/r", ())
-        result = verify_complete_legacy_round_outcome_storage(db, rounds, partial)
-        db.rollback()
-
-    assert isinstance(result, BlockedLegacyRoundOutcomeStorage)
-    assert "changed" in result.reason
 
 
-def test_complete_round_outcome_storage_accepts_open_round_without_outcome_receipt(rig):
-    store, _, _, selection, control = rig
-    plan = control.preflight(selection)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        complete = verify_complete_legacy_round_outcome_storage(db, rounds, receipts)
-        db.rollback()
-
-    assert isinstance(complete, CompleteLegacyRoundOutcomeStorage)
-    assert complete.sealed == ()
-    assert [dict(source.fields)["round_id"] for source in complete.rounds.rounds] == [plan.round.round_id]
 
 
-def test_complete_round_outcome_storage_accepts_real_deferred_preparation(stopped_round):
-    store, _, control, _, child, _, _ = stopped_round
-    control.finalize_completed_round(child.round.round_id)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        complete = verify_complete_legacy_round_outcome_storage(db, rounds, receipts)
-        db.rollback()
-
-    assert isinstance(complete, CompleteLegacyRoundOutcomeStorage)
-    assert len(complete.sealed) == 1
-    assert {dict(source.fields)["namespace"] for source in complete.receipts.receipts} == {
-        "review-round-outcome", "review-round-preparation",
-    }
-    outcome_receipt = next(source for source in complete.receipts.receipts
-                           if dict(source.fields)["namespace"] == "review-round-outcome")
-    stale = replace(outcome_receipt, source_rowid=-1,
-                    fields=tuple((name, "review-round-stale-productivity" if name == "namespace" else value)
-                                 for name, value in outcome_receipt.fields))
-    contradictory = CompleteLegacyReviewOutcomeReceipts("o/r", (*complete.receipts.receipts, stale))
-    with pytest.raises(ValueError, match="contradictory auxiliary"):
-        CompleteLegacyRoundOutcomeStorage(complete.rounds, contradictory, complete.sealed)
 
 
-@pytest.mark.parametrize("damage", ["missing_outcome_receipt", "orphan_outcome_receipt", "orphan_productivity_receipt",
-                                     "receipt_on_open_round", "partially_sealed_round", "expiring_productivity_receipt",
-                                     "forged_preparation", "malformed_stale", "malformed_superseded",
-                                     "malformed_claim_time"])
-def test_complete_round_outcome_storage_blocks_unaccounted_evidence(rig, damage):
-    if damage == "receipt_on_open_round":
-        store, _, _, selection, control = rig
-        plan = control.preflight(selection)
-    else:
-        store, gateway, _, control, plan, command = confirmed_copy(rig)
-        workflow_for(store, gateway).record_review(command.command_id)
-        control.finalize_completed_round(plan.round.round_id)
-    with store.transaction() as db:
-        if damage == "missing_outcome_receipt":
-            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-outcome'")
-        elif damage in {"orphan_outcome_receipt", "orphan_productivity_receipt"}:
-            namespace = ("review-round-outcome" if damage == "orphan_outcome_receipt"
-                         else "review-round-stale-productivity")
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                       "VALUES (?,?,?,?,?)", (namespace, "o/r", "unknown-round", "now", "{}"))
-        elif damage == "receipt_on_open_round":
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                       "VALUES ('review-round-preparation','o/r',?,'now','{}')", (plan.round.round_id,))
-        elif damage == "partially_sealed_round":
-            db.execute("UPDATE review_execution_rounds SET closure_json=NULL WHERE round_id=?",
-                       (plan.round.round_id,))
-        elif damage == "expiring_productivity_receipt":
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,reusable_after,payload_json) "
-                       "VALUES ('review-round-stale-productivity','o/r',?,'now','later','{}')",
-                       (plan.round.round_id,))
-        elif damage == "malformed_claim_time":
-            db.execute("UPDATE dedupe_keys SET claimed_at='now' WHERE namespace='review-round-outcome'")
-        else:
-            namespace = {"forged_preparation": "review-round-preparation",
-                         "malformed_stale": "review-round-stale-productivity",
-                         "malformed_superseded": "review-round-superseded-productivity"}[damage]
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
-                       "VALUES (?,?,?,?,?)", (namespace, "o/r", plan.round.round_id,
-                                             "2026-09-28T00:00:00Z", "{}"))
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        rounds = read_complete_legacy_review_rounds(db, "o/r")
-        receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        assert isinstance(rounds, CompleteLegacyReviewRounds)
-        assert isinstance(receipts, CompleteLegacyReviewOutcomeReceipts)
-        result = verify_complete_legacy_round_outcome_storage(db, rounds, receipts)
-        db.rollback()
-
-    assert isinstance(result, BlockedLegacyRoundOutcomeStorage)
 
 
-def _complete_settlement_observations(db):
-    commands = read_complete_legacy_review_submissions(db, "o/r")
-    receipts = read_complete_legacy_review_submission_receipts(db, "o/r")
-    rounds = read_complete_legacy_review_rounds(db, "o/r")
-    outcome_receipts = read_complete_legacy_review_outcome_receipts(db, "o/r")
-    assert isinstance(commands, CompleteLegacyReviewSubmissions)
-    assert isinstance(receipts, CompleteLegacyReviewSubmissionReceipts)
-    assert isinstance(rounds, CompleteLegacyReviewRounds)
-    assert isinstance(outcome_receipts, CompleteLegacyReviewOutcomeReceipts)
-    storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcome_receipts)
-    assert isinstance(storage, CompleteLegacyRoundOutcomeStorage)
-    return commands, receipts, storage
 
 
 def _accepted_generation(rig):
@@ -1233,34 +971,10 @@ def test_generation_receipt_scan_preserves_negative_and_zero_rowids(tmp_path):
     assert all(isinstance(source, LegacyReviewGenerationReceiptSource) for source in result.receipts)
 
 
-def _stale_settlement(rig):
-    store, _, _, _, plan, command, workflow = accepted_generation_with_open_submission(rig)
-    assert isinstance(workflow.settle_submission(command.command_id), WorkflowRejected)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        complete = verify_complete_legacy_submission_settlement_storage(
-            db, *_complete_settlement_observations(db),
-        )
-        db.rollback()
-    assert isinstance(complete, CompleteLegacySubmissionSettlementStorage)
-    return store, plan, command, complete
 
 
-def _stale_generation_sources(db):
-    storage = verify_complete_legacy_submission_settlement_storage(
-        db, *_complete_settlement_observations(db),
-    )
-    generation = read_complete_legacy_review_generation_receipts(db, "o/r")
-    assert isinstance(storage, CompleteLegacySubmissionSettlementStorage)
-    assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
-    return storage, generation
 
 
-def _classification_observations(db):
-    storage, generation = _stale_generation_sources(db)
-    lineage = read_legacy_review_owner_lineage(db, "o/r", CONTROL_OWNER)
-    assert isinstance(lineage, LegacyReviewOwnerLineage)
-    return storage, generation, lineage
 
 
 def test_older_successful_submission_can_settle_after_accepted_generation_advance(rig):
@@ -1293,191 +1007,16 @@ def test_unreferenced_stale_history_does_not_block_current_authority(rig):
     assert current(store, selection) == before
 
 
-@pytest.mark.parametrize("damage", ["wrong_pr", "deep_json"])
-def test_complete_settlement_storage_rejects_self_consistent_invalid_command_payload(rig, damage):
-    store, _, _, _, plan, command = confirmed_copy(rig)
-    with store.transaction() as db:
-        row = db.execute("SELECT payload_json,workflow_binding_json FROM lifecycle_commands WHERE command_id=?",
-                         (str(command.command_id),)).fetchone()
-        if damage == "wrong_pr":
-            payload = json.loads(row["payload_json"])
-            payload["pr"] = plan.round.binding.rejection.fence.key.target.number + 1
-            changed_payload = json.dumps(payload, sort_keys=True, separators=(",", ":"))
-        else:
-            changed_payload = row["payload_json"][:-1] + ',"extra":' + '[' * 10_000 + '0' + ']' * 10_000 + '}'
-        changed_digest = _encoded_payload_digest(changed_payload, row["workflow_binding_json"])
-        db.execute("UPDATE lifecycle_commands SET payload_json=?,payload_digest=? WHERE command_id=?",
-                   (changed_payload, changed_digest, str(command.command_id)))
-        source = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='review-round-submission' "
-                            "AND key=?", (str(command.command_id),)).fetchone()
-        registration = decode_workflow(source["payload_json"], review_activation.ReviewSubmissionRegistration)
-        changed_registration = encode_workflow(replace(registration, command_digest=changed_digest))
-        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace IN "
-                   "('review-round-submission','review-round-submission-index') AND scope='o/r'",
-                   (changed_registration,))
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        result = verify_complete_legacy_submission_settlement_storage(
-            db, *_complete_settlement_observations(db),
-        )
-        db.rollback()
-
-    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
 
 
-def test_complete_settlement_storage_accounts_registered_and_historical_commands(rig):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with store.transaction() as db:
-        _submission(db, 42, receipt=False)
-        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                   ("review-recorded-submission", "o/r", "cmd-42", "2026-09-28T00:00:00+00:00", "{}"))
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        observations = _complete_settlement_observations(db)
-        before = db.total_changes
-        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
-        assert db.total_changes == before
-        db.rollback()
-
-    assert isinstance(result, CompleteLegacySubmissionSettlementStorage)
-    assert [dict(proof.command_source.command_fields)["command_id"] for proof in result.registered] == [
-        str(command.command_id),
-    ]
-    assert [dict(source.command_fields)["command_id"] for source in result.unregistered] == ["cmd-42"]
-    assert {dict(source.fields)["key"] for source in result.recorded_markers} == {
-        str(command.command_id), "cmd-42",
-    }
-    assert result.registered[0].plan.round == plan.round
-    pair = result.registered[0]
-    forged_index = replace(pair.index_source, fields=tuple(
-        (name, "orphan-index" if name == "key" else value) for name, value in pair.index_source.fields
-    ))
-    with pytest.raises(ValueError, match="contradictory"):
-        replace(pair, index_source=forged_index)
-    forged_registration = replace(pair.registration_source, fields=tuple(
-        (name, "{}" if name == "payload_json" else value) for name, value in pair.registration_source.fields
-    ))
-    forged_index = replace(pair.index_source, fields=tuple(
-        (name, "{}" if name == "payload_json" else value) for name, value in pair.index_source.fields
-    ))
-    with pytest.raises(ValueError, match="contradictory"):
-        replace(pair, registration_source=forged_registration, index_source=forged_index)
-    changed_plan = replace(pair.plan, displayed_round=pair.plan.displayed_round + 1)
-    changed_round = replace(pair.round_source, fields=tuple(
-        (name, encode_workflow(changed_plan) if name == "plan_json" else value)
-        for name, value in pair.round_source.fields
-    ))
-    changed_rounds = replace(result.round_storage.rounds, rounds=(changed_round,))
-    changed_seal = replace(result.round_storage.sealed[0], round_source=changed_round)
-    changed_storage = replace(result.round_storage, rounds=changed_rounds, sealed=(changed_seal,))
-    changed_pair = replace(pair, round_source=changed_round, plan=changed_plan)
-    with pytest.raises(ValueError, match="round plan"):
-        replace(result, round_storage=changed_storage, round_plans=((changed_round, changed_plan),),
-                registered=(changed_pair,))
 
 
-@pytest.mark.parametrize("damage", [
-    "orphan_registration", "orphan_index", "orphan_marker", "missing_registration",
-    "index_payload", "index_claim", "index_reusable", "registration_claim",
-])
-def test_complete_settlement_storage_blocks_orphaned_or_contradictory_receipts(rig, damage):
-    store, gateway, _, control, plan, command = confirmed_copy(rig)
-    workflow_for(store, gateway).record_review(command.command_id)
-    control.finalize_completed_round(plan.round.round_id)
-    with store.transaction() as db:
-        if damage == "orphan_registration":
-            row = db.execute("SELECT payload_json,claimed_at FROM dedupe_keys "
-                             "WHERE namespace='review-round-submission'").fetchone()
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                       ("review-round-submission", "o/r", "missing-command", row["claimed_at"], row["payload_json"]))
-        elif damage == "orphan_index":
-            row = db.execute("SELECT payload_json,claimed_at FROM dedupe_keys "
-                             "WHERE namespace='review-round-submission-index'").fetchone()
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                       ("review-round-submission-index", "o/r", "orphan-index", row["claimed_at"], row["payload_json"]))
-        elif damage == "orphan_marker":
-            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
-                       ("review-recorded-submission", "o/r", "missing-command",
-                        "2026-09-28T00:00:00+00:00", "{}"))
-        elif damage == "missing_registration":
-            db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-submission'")
-        elif damage == "index_payload":
-            db.execute("UPDATE dedupe_keys SET payload_json='{}' "
-                       "WHERE namespace='review-round-submission-index'")
-        elif damage == "index_claim":
-            db.execute("UPDATE dedupe_keys SET claimed_at='2026-09-28T00:00:00+00:00' "
-                       "WHERE namespace='review-round-submission-index'")
-        elif damage == "index_reusable":
-            db.execute("UPDATE dedupe_keys SET reusable_after='2026-09-29T00:00:00+00:00' "
-                       "WHERE namespace='review-round-submission-index'")
-        else:
-            db.execute("UPDATE dedupe_keys SET claimed_at='invalid' "
-                       "WHERE namespace='review-round-submission'")
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        observations = _complete_settlement_observations(db)
-        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
-        db.rollback()
-
-    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
 
 
-def test_complete_settlement_storage_blocks_round_plan_without_its_registration(rig):
-    store, _, _, control, plan, command = confirmed_copy(rig)
-    with store.transaction() as db:
-        db.execute("DELETE FROM dedupe_keys WHERE namespace='review-round-submission'")
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        observations = _complete_settlement_observations(db)
-        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
-        db.rollback()
-
-    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
-    assert "receipt" in result.reason or "planned" in result.reason
 
 
-def test_complete_settlement_storage_blocks_registration_missing_from_open_plan(rig):
-    store, _, _, _, plan, _ = confirmed_copy(rig)
-    with store.transaction() as db:
-        row = db.execute("SELECT plan_json FROM review_execution_rounds WHERE round_id=?",
-                         (plan.round.round_id,)).fetchone()
-        stored = decode_workflow(row["plan_json"], ReviewRoundPlan)
-        db.execute("UPDATE review_execution_rounds SET plan_json=? WHERE round_id=?",
-                   (encode_workflow(replace(stored, submissions=())), plan.round.round_id))
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        observations = _complete_settlement_observations(db)
-        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
-        db.rollback()
-
-    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
 
 
-@pytest.mark.parametrize("changed", ["command", "receipt", "round"])
-def test_complete_settlement_storage_rechecks_every_observed_sql_set(rig, changed):
-    store, _, _, _, plan, command = confirmed_copy(rig)
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        observations = _complete_settlement_observations(db)
-        db.rollback()
-    with store.transaction() as db:
-        if changed == "command":
-            db.execute("UPDATE lifecycle_commands SET payload_json='{}' WHERE command_id=?",
-                       (str(command.command_id),))
-        elif changed == "receipt":
-            db.execute("UPDATE dedupe_keys SET claimed_at='changed' "
-                       "WHERE namespace='review-round-submission'")
-        else:
-            db.execute("UPDATE review_execution_rounds SET plan_json='{}' WHERE round_id=?",
-                       (plan.round.round_id,))
-    with closing(store._connect()) as db:
-        db.execute("BEGIN")
-        result = verify_complete_legacy_submission_settlement_storage(db, *observations)
-        db.rollback()
-
-    assert isinstance(result, BlockedLegacySubmissionSettlementStorage)
 
 
 def _control(tmp_path):

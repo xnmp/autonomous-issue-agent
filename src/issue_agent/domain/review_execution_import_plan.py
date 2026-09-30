@@ -9,21 +9,22 @@ import hashlib
 import json
 
 from .labels import Label
-from .review_activation import OpenPullRequestsListed
+from .review_activation import MAX_IMPORTED_PULL_REQUESTS, OpenPullRequestsListed
 from .review_execution import (
     ExecutionNotActivated, ImportedReviewExecutionDecision,
     ReviewExecutionBinding, ReviewExecutionCheckpoint, ReviewExecutionOrigin,
     ReviewExecutionOriginKind, ReviewExecutionPolicy, ReviewExecutionState,
 )
 from .review_execution_counter_mapping import LegacyOpenPRCounterLink
-from .review_execution_history_import import ReviewImportNoHistoryObserved
+from .review_execution_history_import import ReviewImportNoHistoryObserved, ReviewImportHistoryBlocked
+from .review_execution_migration import BlockedReviewExecutionMigration
 from .review_workflow import (
     CompleteReviews, FreshReviewRequired, PullRequestState, RecordedPullRequest,
     ReviewWorkflowSnapshot,
 )
 from .review_workflow_policy import OBSERVATION_MAX_AGE_SECONDS
 from .workflow_identity import (
-    PullRequestRef, canonical_workflow_repository, validate_workflow_integer,
+    PullRequestRef, WorkflowKey, WorkflowFamily, FamilyAuthority, canonical_workflow_repository, validate_workflow_integer,
     validate_workflow_text,
 )
 
@@ -213,8 +214,8 @@ def _digest(value: str, name: str) -> None:
 
 
 @dataclass(frozen=True)
-class EmptyReviewExecutionImportPlan:
-    """Whole-repository zero-history plan; observational until a writer rechecks it."""
+class ReviewExecutionImportPlan:
+    """Fixed eligible or blocked target decisions; publication must recheck sources."""
 
     repository: str
     listing: OpenPullRequestsListed
@@ -222,7 +223,7 @@ class EmptyReviewExecutionImportPlan:
     source_set_digest: str
     retained_digest: str
     inventory_digest: str
-    candidates: tuple[EligibleZeroHistoryReviewImport, ...]
+    candidates: tuple[EligibleZeroHistoryReviewImport | ReviewImportHistoryBlocked, ...]
     planned_at: datetime
     policy: ReviewExecutionPolicy = ReviewExecutionPolicy()
 
@@ -230,16 +231,20 @@ class EmptyReviewExecutionImportPlan:
         if (canonical_workflow_repository(self.repository) != self.repository
                 or not isinstance(self.listing, OpenPullRequestsListed)
                 or not isinstance(self.candidates, tuple)
-                or any(not isinstance(item, EligibleZeroHistoryReviewImport) for item in self.candidates)
-                or tuple(item.pr for item in self.candidates) != self.listing.numbers
+                or len(self.candidates) > MAX_IMPORTED_PULL_REQUESTS
+                or any(not isinstance(item, (EligibleZeroHistoryReviewImport, ReviewImportHistoryBlocked)) for item in self.candidates)
+                or (numbers := tuple(item.pr for item in self.candidates)) != tuple(sorted(set(numbers)))
+                or not set(self.listing.numbers) <= set(numbers)
+                or any(item.pr not in self.listing.numbers for item in self.candidates
+                       if isinstance(item, EligibleZeroHistoryReviewImport))
                 or any(item.workflow.revision.fence.key.repository != self.repository
                        or item.history.source_digest != self.source_set_digest
-                       for item in self.candidates)
+                       for item in self.candidates if isinstance(item, EligibleZeroHistoryReviewImport))
                 or not isinstance(self.planned_at, datetime) or self.planned_at.tzinfo is None
                 or self.planned_at.utcoffset() is None
                 or any(_blocking_kind(item.history, item.workflow, item.observation,
                                       item.link, item.review_bot, self.planned_at) is not None
-                       for item in self.candidates)
+                       for item in self.candidates if isinstance(item, EligibleZeroHistoryReviewImport))
                 or not isinstance(self.policy, ReviewExecutionPolicy)):
             raise ValueError("execution import plan requires every listed PR and matching typed sources")
         validate_workflow_integer(self.execution_epoch, "execution import epoch", minimum=1)
@@ -252,7 +257,7 @@ class EmptyReviewExecutionImportPlan:
     def source_digest(self) -> str:
         source = (
             self.source_set_digest, self.retained_digest,
-            tuple(item.source_digest for item in self.candidates),
+            tuple(review_import_candidate_digest(item) for item in self.candidates),
         )
         return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()
 
@@ -264,7 +269,7 @@ class EmptyReviewExecutionImportPlan:
         )
         return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()
 
-    def decisions_at(self, now: datetime) -> tuple[ImportedReviewExecutionDecision, ...]:
+    def decisions_at(self, now: datetime) -> tuple[ImportedReviewExecutionDecision | BlockedReviewExecutionMigration, ...]:
         """Recheck freshness when deriving decisions from a reviewed plan."""
         if (not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None
                 or now < self.planned_at):
@@ -272,4 +277,19 @@ class EmptyReviewExecutionImportPlan:
         return tuple(propose_zero_history_review_execution(
             item, self.execution_epoch, self.plan_digest, self.source_digest, self.policy,
             now=now,
+        ) if isinstance(item, EligibleZeroHistoryReviewImport) else BlockedReviewExecutionMigration(
+            WorkflowKey(self.repository, PullRequestRef(item.pr)),
+            FamilyAuthority(WorkflowFamily.REVIEW_EXECUTION, self.execution_epoch),
+            item, self.plan_digest, self.source_digest,
         ) for item in self.candidates)
+
+
+def review_import_candidate_digest(candidate: EligibleZeroHistoryReviewImport | ReviewImportHistoryBlocked) -> str:
+    if isinstance(candidate, EligibleZeroHistoryReviewImport):
+        return candidate.source_digest
+    if not isinstance(candidate, ReviewImportHistoryBlocked):
+        raise ValueError("review import requires a typed target decision")
+    source = (candidate.pr, tuple((blocker.kind.value,
+                                  tuple((item.kind, item.identity, item.digest) for item in blocker.sources))
+                                 for blocker in candidate.blockers))
+    return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()

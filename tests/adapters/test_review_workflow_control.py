@@ -46,8 +46,8 @@ from issue_agent.domain.review_workflow_policy import (
     reconcile_review_ceiling, request_review_rearm, review_rearm_observation_gate_id,
 )
 from issue_agent.domain.review_execution_activation import (
-    LegacyReviewOwnerLineage, LegacyReviewSubmissionSource, UnverifiedLegacyRecordedReview,
-    VerifiedLegacyRecordedReview,
+    LegacyReviewOwnerLineage,
+    LegacyReviewSubmissionSource,
 )
 from issue_agent.domain.workflow import (
     AuthorizeAbsentRetry, CancelRearm, ContinueGrantedRearm, EvidenceUnavailable, KeepGuidance, OpenGate,

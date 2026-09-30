@@ -7,7 +7,7 @@ from .agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from .labels import Label
 from .review import ReviewMode, labels_holding_review
 from .review_execution import (
-    MAX_EXECUTION_SUFFIX, CurrentReviewExecution, ReusableReviewSession,
+    MAX_EXECUTION_SUFFIX, BlockedReviewExecutionMigration, CurrentReviewExecution, ReusableReviewSession,
     ReviewExecutionBinding, ReviewRoundIdentity, compatible_review_session,
 )
 from .review_rounds import ReviewRoundPlan, ReviewSessionReuse
@@ -58,6 +58,8 @@ def require_review_execution_eligibility(
     snapshot: ReviewWorkflowSnapshot, head_sha: str, failure_ceiling: int,
 ) -> None:
     """Current paid-work allowance for an already selected review head."""
+    if isinstance(snapshot.execution, BlockedReviewExecutionMigration):
+        raise ValueError("review execution migration is blocked")
     if not isinstance(snapshot.execution, CurrentReviewExecution):
         raise ValueError("review execution activation is required")
     if snapshot.gates or isinstance(snapshot.intent, PendingReviewRearm):
@@ -77,6 +79,8 @@ def plan_review_preflight(
         raise ValueError("review preflight requires typed authority and selection")
     if not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None:
         raise ValueError("review preflight requires an aware authority clock")
+    if isinstance(snapshot.execution, BlockedReviewExecutionMigration):
+        raise ValueError("review execution migration is blocked")
     if not isinstance(snapshot.execution, CurrentReviewExecution):
         raise ValueError("review execution activation is required")
     if snapshot.revision != selection.expected or snapshot.execution.binding != selection.binding:

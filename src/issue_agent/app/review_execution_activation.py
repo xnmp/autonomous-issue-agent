@@ -15,15 +15,16 @@ from ..adapters.review_execution_activation import (
     BlockedLegacyExecutionFileValues, CompleteLegacyExecutionRootFiles,
     MAX_LEGACY_EXECUTION_ROOTS, revalidate_complete_legacy_execution_file_values,
 )
-from ..adapters.review_execution_import_commit import commit_empty_review_execution_import
-from ..adapters.review_execution_import_replay import verify_committed_empty_review_execution_import
+from ..adapters.review_execution_import_commit import commit_review_execution_import
+from ..adapters.review_execution_import_replay import verify_committed_review_execution_import
 from ..adapters.review_execution_import_sources import (
     HeldLegacyExecutionCounterSources, ObservedLegacyExecutionSqlImportSources,
     held_legacy_execution_counter_sources,
 )
 from ..adapters.store import Store
+from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.review_execution_counter_mapping import CompleteLegacyOpenCounterLinks
-from ..domain.review_execution_import_plan import EmptyReviewExecutionImportPlan
+from ..domain.review_execution_import_plan import EligibleZeroHistoryReviewImport, ReviewExecutionImportPlan
 from ..domain.review_workflow import RecordedPullRequest
 from ..domain.workflow_identity import WorkflowFamily, WorkflowKey, canonical_workflow_repository
 from ..domain.review_workflow import ReviewWorkflowSnapshot
@@ -31,7 +32,7 @@ from .config import HarnessConfig
 from .review_execution_import import (
     BlockedReviewImportObservationSet, ObservedReviewExecutionImportCandidates,
     assess_configured_review_execution_import_candidates,
-    plan_configured_empty_review_execution_import,
+    plan_configured_review_execution_import,
 )
 from .review_execution_import_remote import (
     BlockedReviewImportRemote, read_configured_review_import_remote,
@@ -44,11 +45,11 @@ class ReviewExecutionActivationRefused(ValueError):
 
 @dataclass(frozen=True)
 class ReviewExecutionActivationCommitted:
-    plan: EmptyReviewExecutionImportPlan
+    plan: ReviewExecutionImportPlan
     idempotent: bool = False
 
     def __post_init__(self) -> None:
-        if not isinstance(self.plan, EmptyReviewExecutionImportPlan) or type(self.idempotent) is not bool:
+        if not isinstance(self.plan, ReviewExecutionImportPlan) or type(self.idempotent) is not bool:
             raise ValueError("execution activation result requires its reviewed plan")
 
 
@@ -135,7 +136,7 @@ class ConfiguredReviewExecutionActivation:
         self, db: sqlite3.Connection, held: HeldLegacyExecutionCounterSources,
         sql: ObservedLegacyExecutionSqlImportSources, remote: tuple[RecordedPullRequest, ...],
         epoch: int, extra_roots: tuple[str, ...],
-    ) -> EmptyReviewExecutionImportPlan:
+    ) -> ReviewExecutionImportPlan:
         if db.execute(
             "SELECT 1 FROM workflow_authority_epochs WHERE repository=? AND family=?",
             (self._cfg.repo, WorkflowFamily.REVIEW_EXECUTION.value),
@@ -147,7 +148,7 @@ class ConfiguredReviewExecutionActivation:
         if not isinstance(observed, ObservedReviewExecutionImportCandidates):
             raise ReviewExecutionActivationRefused(observed.reason)
         inventory = family_inventory(db, self._cfg.repo, WorkflowFamily.REVIEW_EXECUTION, None)
-        plan = plan_configured_empty_review_execution_import(observed, inventory, epoch)
+        plan = plan_configured_review_execution_import(observed, inventory, epoch)
         if isinstance(plan, BlockedReviewImportObservationSet):
             raise ReviewExecutionActivationRefused(plan.reason)
         self._require_stopped()
@@ -160,7 +161,7 @@ class ConfiguredReviewExecutionActivation:
         self, files: CompleteLegacyExecutionRootFiles, links: CompleteLegacyOpenCounterLinks,
         sql: ObservedLegacyExecutionSqlImportSources, *, execution_epoch: int = 1,
         extra_roots: tuple[str, ...] = (),
-    ) -> EmptyReviewExecutionImportPlan:
+    ) -> ReviewExecutionImportPlan:
         """Rederive a reviewable plan while excluding all role effects."""
         self._control.require_initialized()
         self._require_stopped()
@@ -180,16 +181,16 @@ class ConfiguredReviewExecutionActivation:
                 return self._current_plan(db, held, sql, remote, execution_epoch, extra_roots)
 
     def activate(
-        self, plan: EmptyReviewExecutionImportPlan,
+        self, plan: ReviewExecutionImportPlan,
         files: CompleteLegacyExecutionRootFiles, links: CompleteLegacyOpenCounterLinks,
         sql: ObservedLegacyExecutionSqlImportSources, *, extra_roots: tuple[str, ...] = (),
     ) -> ReviewExecutionActivationCommitted:
         """Publish only the identical plan rebuilt from current configured sources."""
-        if not isinstance(plan, EmptyReviewExecutionImportPlan) or plan.repository != self._cfg.repo:
+        if not isinstance(plan, ReviewExecutionImportPlan) or plan.repository != self._cfg.repo:
             raise ValueError("execution activation requires this repository's reviewed plan")
         self._control.require_initialized()
         with self._control.transaction() as db:
-            if verify_committed_empty_review_execution_import(db, plan):
+            if verify_committed_review_execution_import(db, plan):
                 return ReviewExecutionActivationCommitted(plan, idempotent=True)
         try:
             return self._activate_absent(plan, files, links, sql, extra_roots)
@@ -198,12 +199,12 @@ class ConfiguredReviewExecutionActivation:
             # or reads external sources. A winner's exact SQL proof is sufficient
             # even if the old files or remote inputs have since disappeared.
             with self._control.transaction() as db:
-                if verify_committed_empty_review_execution_import(db, plan):
+                if verify_committed_review_execution_import(db, plan):
                     return ReviewExecutionActivationCommitted(plan, idempotent=True)
             raise
 
     def _activate_absent(
-        self, plan: EmptyReviewExecutionImportPlan,
+        self, plan: ReviewExecutionImportPlan,
         files: CompleteLegacyExecutionRootFiles, links: CompleteLegacyOpenCounterLinks,
         sql: ObservedLegacyExecutionSqlImportSources, extra_roots: tuple[str, ...],
     ) -> ReviewExecutionActivationCommitted:
@@ -221,15 +222,19 @@ class ConfiguredReviewExecutionActivation:
             if isinstance(remote, BlockedReviewImportRemote):
                 raise ReviewExecutionActivationRefused(remote.reason)
             with self._control.transaction() as db:
-                if verify_committed_empty_review_execution_import(db, plan):
+                if verify_committed_review_execution_import(db, plan):
                     return ReviewExecutionActivationCommitted(plan, idempotent=True)
                 fresh = self._current_plan(db, held, sql, remote, plan.execution_epoch, extra_roots)
                 if fresh.plan_digest != plan.plan_digest:
                     raise ReviewExecutionActivationRefused("review execution import sources changed since the plan was reviewed")
-                commit_empty_review_execution_import(db, fresh, now=datetime.now(timezone.utc))
-                self._control._transition(db, "workflow_activation", f"{plan.repository}:review_execution", "activated", {
-                    "epoch": plan.execution_epoch, "plan_digest": plan.plan_digest,
-                    "source_digest": plan.source_digest, "inventory_digest": plan.inventory_digest,
-                    "imported": len(plan.candidates),
-                })
+                commit_review_execution_import(db, fresh, now=datetime.now(timezone.utc))
+                if self._control._event_factory is not None:
+                    self._control.enqueue_event(self._control._event_factory(
+                        ControlTransitionCommitted("workflow_activation", f"{plan.repository}:review_execution", "activated", {
+                            "epoch": plan.execution_epoch, "plan_digest": plan.plan_digest,
+                            "source_digest": plan.source_digest, "inventory_digest": plan.inventory_digest,
+                            "imported": sum(isinstance(item, EligibleZeroHistoryReviewImport) for item in plan.candidates),
+                            "blocked": sum(not isinstance(item, EligibleZeroHistoryReviewImport) for item in plan.candidates),
+                        }), Correlation(),
+                    ), db)
         return ReviewExecutionActivationCommitted(plan)

@@ -47,8 +47,9 @@ class CompleteRetainedReviewWorkflows:
                 or not isinstance(self.sources, tuple)
                 or len(self.sources) > MAX_RETAINED_REVIEW_ROWS
                 or any(not isinstance(item, RetainedReviewWorkflowSource) for item in self.sources)
-                or tuple(item.snapshot.revision.fence.key.target.number for item in self.sources)
-                != self.listing.numbers
+                or (numbers := tuple(item.snapshot.revision.fence.key.target.number
+                                     for item in self.sources)) != tuple(sorted(set(numbers)))
+                or not set(self.listing.numbers) <= set(numbers)
                 or not isinstance(self.source_digest, str) or len(self.source_digest) != 64
                 or any(char not in "0123456789abcdef" for char in self.source_digest)):
             raise ValueError("retained review census requires all listed PR workflows")
@@ -175,11 +176,10 @@ def read_complete_retained_review_workflows(
         sources.append(RetainedReviewWorkflowSource(metadata["rowid"], snapshot, row_digest))
     sources.sort(key=lambda item: item.snapshot.revision.fence.key.target.number)
     numbers = tuple(item.snapshot.revision.fence.key.target.number for item in sources)
-    if numbers != listing.numbers:
+    if not set(listing.numbers) <= set(numbers):
         missing = tuple(sorted(set(listing.numbers) - set(numbers)))
-        extra = tuple(sorted(set(numbers) - set(listing.numbers)))
         return BlockedRetainedReviewWorkflows(
-            f"retained review membership differs: missing={missing[:8]}, terminal_or_extra={extra[:8]}"
+            f"retained review membership differs: missing={missing[:8]}"
         )
     digest = hashlib.sha256(json.dumps((
         repository, listing.numbers, tuple((item.rowid, item.row_digest) for item in sources),

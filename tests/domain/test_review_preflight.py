@@ -83,3 +83,17 @@ def test_preflight_refuses_invalid_claim_identity_and_inactive_execution():
         replace(selection, claim_target=-10)
     with pytest.raises(ValueError, match="activation"):
         plan_review_preflight(replace(snapshot, execution=ExecutionNotActivated()), selection, now=NOW)
+
+
+def test_preflight_distinguishes_blocked_migration_from_missing_activation():
+    from issue_agent.domain.review_execution_migration import (
+        BlockedReviewExecutionMigration, ReviewImportBlocker, ReviewImportBlockerKind,
+        ReviewImportHistoryBlocked, ReviewImportSource,
+    )
+    snapshot, selection = active()
+    key = snapshot.revision.fence.key
+    blocked = BlockedReviewExecutionMigration(key, FamilyAuthority(WorkflowFamily.REVIEW_EXECUTION, 2),
+        ReviewImportHistoryBlocked(key.target.number, (ReviewImportBlocker(ReviewImportBlockerKind.ORIGIN,
+            (ReviewImportSource("round", "retained-round", "a" * 64),)),)), "b" * 64, "c" * 64)
+    with pytest.raises(ValueError, match="migration is blocked"):
+        plan_review_preflight(replace(snapshot, execution=blocked), selection, now=NOW)

@@ -12,112 +12,103 @@ import stat
 import sqlite3
 import hashlib
 import json
-from collections.abc import Mapping
-from dataclasses import dataclass, field, replace
-from types import MappingProxyType
+from dataclasses import (
+    dataclass,
+)
 
 from ..domain.resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
 from ..domain.review_execution_activation import (
-    MAX_LEGACY_SQL_TEXT_BYTES, MAX_SQL_ROWID, MIN_SQL_ROWID, LegacyExecutionCounterRecord,
-    LegacyExecutionEntry, LegacyExecutionPRRecord,
-    MAX_LEGACY_EXECUTION_FILE_ENTRIES, MAX_LEGACY_EXECUTION_FILE_BYTES,
-    CompleteLegacyExecutionFileValues, BlockedLegacyExecutionFileValues,
+    MAX_LEGACY_SQL_TEXT_BYTES,
+    MAX_SQL_ROWID,
+    MIN_SQL_ROWID,
+    LegacyExecutionCounterRecord,
+    LegacyExecutionEntry,
+    LegacyExecutionPRRecord,
+    MAX_LEGACY_EXECUTION_FILE_ENTRIES,
+    MAX_LEGACY_EXECUTION_FILE_BYTES,
+    CompleteLegacyExecutionFileValues,
+    BlockedLegacyExecutionFileValues,
     classify_legacy_execution_file_values,
-    LegacyExecutionRunPage, LegacyExecutionRunRecord, LegacyReviewRunState, UnreadableLegacyExecutionRun,
-    CompleteLegacyReviewRuns, BlockedLegacyReviewRuns,
-    MAX_LEGACY_RUN_INVENTORY_ROWS, MAX_LEGACY_RUN_INVENTORY_BYTES,
-    LEGACY_SUBMISSION_COMMAND_COLUMNS, LEGACY_SUBMISSION_RECEIPT_COLUMNS,
-    LegacyReviewSubmissionPage, LegacyReviewSubmissionSource, UnreadableLegacyReviewSubmission,
-    potentially_successful_review_submission,
-    CompleteLegacyReviewSubmissions, BlockedLegacyReviewSubmissions,
-    MAX_LEGACY_SUBMISSION_INVENTORY_ROWS, MAX_LEGACY_SUBMISSION_INVENTORY_BYTES,
-    LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS, LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
-    LegacyReviewSubmissionReceiptPage, LegacyReviewSubmissionReceiptSource,
+    LegacyExecutionRunPage,
+    LegacyExecutionRunRecord,
+    LegacyReviewRunState,
+    UnreadableLegacyExecutionRun,
+    CompleteLegacyReviewRuns,
+    BlockedLegacyReviewRuns,
+    MAX_LEGACY_RUN_INVENTORY_ROWS,
+    MAX_LEGACY_RUN_INVENTORY_BYTES,
+    LEGACY_SUBMISSION_COMMAND_COLUMNS,
+    LEGACY_SUBMISSION_RECEIPT_COLUMNS,
+    LegacyReviewSubmissionPage,
+    LegacyReviewSubmissionSource,
+    UnreadableLegacyReviewSubmission,
+    CompleteLegacyReviewSubmissions,
+    BlockedLegacyReviewSubmissions,
+    MAX_LEGACY_SUBMISSION_INVENTORY_ROWS,
+    MAX_LEGACY_SUBMISSION_INVENTORY_BYTES,
+    LEGACY_REVIEW_SUBMISSION_RECEIPT_COLUMNS,
+    LEGACY_REVIEW_SUBMISSION_RECEIPT_NAMESPACES,
+    LegacyReviewSubmissionReceiptPage,
+    LegacyReviewSubmissionReceiptSource,
     UnreadableLegacyReviewSubmissionReceipt,
-    CompleteLegacyReviewSubmissionReceipts, BlockedLegacyReviewSubmissionReceipts,
-    MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_ROWS, MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_BYTES,
-    MAX_LEGACY_REVIEW_OWNERS, LegacyReviewOwnerLink, LegacyReviewOwnerLineage,
+    CompleteLegacyReviewSubmissionReceipts,
+    BlockedLegacyReviewSubmissionReceipts,
+    MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_ROWS,
+    MAX_LEGACY_SUBMISSION_RECEIPT_INVENTORY_BYTES,
+    MAX_LEGACY_REVIEW_OWNERS,
+    LegacyReviewOwnerLink,
+    LegacyReviewOwnerLineage,
     UnreadableLegacyReviewOwnerLineage,
-    VerifiedLegacyRecordedReview, UnverifiedLegacyRecordedReview,
-    VerifiedReviewSubmissionRoundLink, UnverifiedReviewSubmissionRoundLink,
-    LEGACY_REVIEW_ROUND_COLUMNS, MAX_LEGACY_ROUND_JSON_BYTES, MAX_LEGACY_ROUND_PAGE_BYTES,
-    LegacyReviewRoundPage, LegacyReviewRoundSource, UnreadableLegacyReviewRound,
-    CompleteLegacyReviewRounds, BlockedLegacyReviewRounds,
-    MAX_LEGACY_ROUND_INVENTORY_ROWS, MAX_LEGACY_ROUND_INVENTORY_BYTES,
-    LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES, MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES,
-    LegacyReviewOutcomeReceiptPage, LegacyReviewOutcomeReceiptSource,
-    UnreadableLegacyReviewOutcomeReceipt, BlockedLegacyReviewOutcomeReceiptPage,
-    CompleteLegacyReviewOutcomeReceipts, BlockedLegacyReviewOutcomeReceipts,
-    MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS, MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES,
-    VerifiedLegacyRoundOutcomeStorage, UnverifiedLegacyRoundOutcomeStorage,
-    CompleteLegacyRoundOutcomeStorage, BlockedLegacyRoundOutcomeStorage,
-    VerifiedLegacyPlainProductiveRound, UnverifiedLegacyPlainProductiveRound,
-    OpenLegacyOrderedRound, FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound,
-    LegacyOrderedExecutionEpisode,
-    BlockedLegacySubmissionSettlementStorage,
-    LegacyReviewGenerationReceiptSource, CompleteLegacyReviewGenerationReceipts,
-    BlockedLegacyReviewGenerationReceipts, MAX_LEGACY_GENERATION_RECEIPT_ROWS,
-    MAX_LEGACY_GENERATION_RECEIPT_BYTES, MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES,
+    LEGACY_REVIEW_ROUND_COLUMNS,
+    MAX_LEGACY_ROUND_JSON_BYTES,
+    MAX_LEGACY_ROUND_PAGE_BYTES,
+    LegacyReviewRoundPage,
+    LegacyReviewRoundSource,
+    UnreadableLegacyReviewRound,
+    CompleteLegacyReviewRounds,
+    BlockedLegacyReviewRounds,
+    MAX_LEGACY_ROUND_INVENTORY_ROWS,
+    MAX_LEGACY_ROUND_INVENTORY_BYTES,
+    LEGACY_REVIEW_OUTCOME_RECEIPT_NAMESPACES,
+    MAX_LEGACY_OUTCOME_RECEIPT_JSON_BYTES,
+    LegacyReviewOutcomeReceiptPage,
+    LegacyReviewOutcomeReceiptSource,
+    UnreadableLegacyReviewOutcomeReceipt,
+    BlockedLegacyReviewOutcomeReceiptPage,
+    CompleteLegacyReviewOutcomeReceipts,
+    BlockedLegacyReviewOutcomeReceipts,
+    MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_ROWS,
+    MAX_LEGACY_OUTCOME_RECEIPT_INVENTORY_BYTES,
+    LegacyReviewGenerationReceiptSource,
+    CompleteLegacyReviewGenerationReceipts,
+    BlockedLegacyReviewGenerationReceipts,
+    MAX_LEGACY_GENERATION_RECEIPT_ROWS,
+    MAX_LEGACY_GENERATION_RECEIPT_BYTES,
+    MAX_LEGACY_GENERATION_RECEIPT_JSON_BYTES,
 )
-from ..domain.contracts import CommandId, CommandKind, EffectReceipt, EffectStatus, LifecycleCommand
 from ..domain.review_execution import (
-    ExecutionNotActivated,
-    ActivatedReviewExecution,
     NoReviewSession,
     ReviewRoundIdentity,
-    ReviewRoundOutcome,
-    PaidReviewProgress,
-    CopiedReviewProgress,
     ReviewExecutionBinding,
-    ReviewExecutionGenerationBoundary,
-    review_generation_receipt_id,
-    same_execution_episode,
 )
 from ..domain.review_execution_session_import import (
     BlockedLegacyReviewSessionImport, UnprovenLegacyReviewSession, plan_legacy_review_session_import,
 )
-from ..domain.review_workflow import (
-    ReviewWorkflowSnapshot, RecordedPullRequest, ReviewedBaseline, PullRequestState,
-)
-from ..domain.review_workflow_policy import (
-    ReviewSubmissionReceipt, CeilingEscalation, CeilingProductivityDecision,
-    OBSERVATION_MAX_AGE_SECONDS, _escalation_projection, open_review_ceiling,
-)
-from ..domain.labels import Label
 from ..domain.review_rounds import (
-    MAX_REVIEW_STAGES, MAX_ROUND_SUBMISSIONS, ReviewRoundPlan, ReviewStagePlan, ReviewSubmissionKind,
-    ReviewSubmissionRegistration, ReviewPlanningSealed, ReviewPlanningComplete, ReviewParentAbandoned,
-    ReviewPlanningOpen, ReviewSealedParentAbandoned, FinalizedReviewRound,
-    ReviewRoundFacts,
-    DeferredReviewPreparation, ReviewSubmissionConfirmed, finalize_review_round,
-    StaleReviewProductivitySettlement, CurrentStaleReviewProductivitySettlement,
-    CurrentReviewOutcomeReceipt,
-)
-from ..domain.review_preflight import ReviewPreflightSelection
-from ..domain.workflow import (
-    ObservedTransition, WorkflowChanged, WorkflowMutation, AuthorizedOperatorCommand,
-    RequestRearm, ContinueGrantedRearm,
+    ReviewRoundPlan,
 )
 from ..domain.workflow_identity import (
-    PullRequestRef, WorkflowBinding, WorkflowRevision, WorkflowKey, FamilyAuthority, MAX_REARM_COMMANDS,
-    canonical_workflow_repository, validate_workflow_identifier, validate_workflow_text,
-)
-from .control_store import (
-    CorruptControlStore, _command_from_row, _encoded_payload_digest, _parse_stamp,
-    _receipt_digest, load_bound_review_submission,
+    PullRequestRef,
+    canonical_workflow_repository,
+    validate_workflow_identifier,
 )
 from .resolve_activation import LegacyRoots, _printable, _read_legacy_file, distinct_roots
-from .review_round_sources import _effect_receipt_id
-from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
-from .workflow_commit import _unique_receipt_object
+from .workflow_codec import (
+    decode_workflow,
+    encode_workflow,
+)
 from .workflow_rows import (
-    WorkflowAuthorityError, load_review_workflow_row, review_stage_receipt_key, review_stage_receipt_prefix,
-    review_submission_receipt_key, review_submission_receipt_prefix,
-    REVIEW_STAGE_NAMESPACE, REVIEW_SUBMISSION_NAMESPACE, REVIEW_SUBMISSION_INDEX_NAMESPACE,
-    REVIEW_SEAL_NAMESPACE, REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE,
-    REVIEW_PREPARATION_NAMESPACE, REVIEW_STALE_PRODUCTIVITY_NAMESPACE,
-    REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, REVIEW_CEILING_PRODUCTIVITY_NAMESPACE,
-    RECORDED_REVIEW_NAMESPACE,
+    WorkflowAuthorityError,
 )
 
 _PR_NAME = re.compile(r"pr-(.*)\.(session|round)", re.DOTALL)
@@ -1007,154 +998,6 @@ def revalidate_complete_legacy_review_outcome_receipts(
     return current
 
 
-def _verify_legacy_round_outcome_sources(
-    round_source: LegacyReviewRoundSource, receipt_source: LegacyReviewOutcomeReceiptSource,
-) -> VerifiedLegacyRoundOutcomeStorage | UnverifiedLegacyRoundOutcomeStorage:
-    round_id = dict(round_source.fields)["round_id"]
-    row = dict(round_source.fields)
-    receipt = dict(receipt_source.fields)
-    if row["closure_json"] is None or row["outcome_json"] is None:
-        return UnverifiedLegacyRoundOutcomeStorage(round_id, "round outcome is not sealed")
-    try:
-        facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
-        outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
-        captured = decode_workflow(receipt["payload_json"], tuple | CurrentReviewOutcomeReceipt)
-        values = (captured.facts, captured.outcome) if isinstance(captured, CurrentReviewOutcomeReceipt) else captured
-        if (row["plan_json"] != encode_workflow(facts.plan)
-                or row["planning_json"] != encode_workflow(facts.planning)
-                or row["closure_json"] != encode_workflow(facts)
-                or row["outcome_json"] != encode_workflow(outcome)
-                or values != (facts, outcome) or receipt["payload_json"] != encode_workflow(captured)):
-            raise ValueError("round outcome and receipt disagree on canonical stored facts")
-        return VerifiedLegacyRoundOutcomeStorage(round_source, receipt_source, facts, outcome)
-    except (KeyError, TypeError, ValueError, UnicodeError, CorruptControlStore) as exc:
-        return UnverifiedLegacyRoundOutcomeStorage(round_id, _printable(str(exc)))
-
-
-def verify_legacy_round_outcome_storage(
-    db: sqlite3.Connection, observed_rounds: CompleteLegacyReviewRounds,
-    observed_receipts: CompleteLegacyReviewOutcomeReceipts, round_id: str,
-) -> VerifiedLegacyRoundOutcomeStorage | UnverifiedLegacyRoundOutcomeStorage:
-    """Recheck complete source sets and pair one sealed round to its exact receipt."""
-    validate_workflow_identifier(round_id, "round outcome storage")
-    if observed_rounds.repository != observed_receipts.repository:
-        return UnverifiedLegacyRoundOutcomeStorage(round_id, "round and receipt inventories disagree on repository")
-    rounds = revalidate_complete_legacy_review_rounds(db, observed_rounds)
-    if isinstance(rounds, BlockedLegacyReviewRounds):
-        return UnverifiedLegacyRoundOutcomeStorage(round_id, rounds.reason)
-    receipts = revalidate_complete_legacy_review_outcome_receipts(db, observed_receipts)
-    if isinstance(receipts, BlockedLegacyReviewOutcomeReceipts):
-        return UnverifiedLegacyRoundOutcomeStorage(round_id, receipts.reason)
-    round_source = next((source for source in rounds.rounds if dict(source.fields)["round_id"] == round_id), None)
-    receipt_source = next((source for source in receipts.receipts
-                           if dict(source.fields)["namespace"] == "review-round-outcome"
-                           and dict(source.fields)["key"] == round_id), None)
-    if round_source is None or receipt_source is None:
-        return UnverifiedLegacyRoundOutcomeStorage(round_id, "round or outcome receipt is absent")
-    return _verify_legacy_round_outcome_sources(round_source, receipt_source)
-
-
-def verify_complete_legacy_round_outcome_storage(
-    db: sqlite3.Connection, observed_rounds: CompleteLegacyReviewRounds,
-    observed_receipts: CompleteLegacyReviewOutcomeReceipts,
-) -> CompleteLegacyRoundOutcomeStorage | BlockedLegacyRoundOutcomeStorage:
-    """Account for every round and receipt after one revalidation of each SQL set."""
-    if observed_rounds.repository != observed_receipts.repository:
-        return BlockedLegacyRoundOutcomeStorage(observed_rounds.repository, "round and receipt repositories disagree")
-    rounds = revalidate_complete_legacy_review_rounds(db, observed_rounds)
-    if isinstance(rounds, BlockedLegacyReviewRounds):
-        return BlockedLegacyRoundOutcomeStorage(observed_rounds.repository, rounds.reason, rounds.source_rowid)
-    receipts = revalidate_complete_legacy_review_outcome_receipts(db, observed_receipts)
-    if isinstance(receipts, BlockedLegacyReviewOutcomeReceipts):
-        return BlockedLegacyRoundOutcomeStorage(observed_rounds.repository, receipts.reason, receipts.source_rowid)
-    receipt_by_identity = {(dict(source.fields)["namespace"], dict(source.fields)["key"]): source
-                           for source in receipts.receipts}
-    sealed: list[VerifiedLegacyRoundOutcomeStorage] = []
-    closed_ids: set[str] = set()
-    for source in rounds.rounds:
-        row = dict(source.fields)
-        round_id = row["round_id"]
-        if (row["closure_json"] is None) != (row["outcome_json"] is None):
-            return BlockedLegacyRoundOutcomeStorage(rounds.repository, "review round is partially sealed",
-                                                    source.source_rowid)
-        if row["outcome_json"] is None:
-            continue
-        closed_ids.add(round_id)
-        receipt = receipt_by_identity.get(("review-round-outcome", round_id))
-        if receipt is None:
-            return BlockedLegacyRoundOutcomeStorage(rounds.repository, "sealed round lacks its outcome receipt",
-                                                    source.source_rowid)
-        proof = _verify_legacy_round_outcome_sources(source, receipt)
-        if isinstance(proof, UnverifiedLegacyRoundOutcomeStorage):
-            return BlockedLegacyRoundOutcomeStorage(rounds.repository, proof.reason, source.source_rowid)
-        sealed.append(proof)
-    for receipt in receipts.receipts:
-        values = dict(receipt.fields)
-        if values["key"] not in closed_ids or values["reusable_after"] is not None:
-            return BlockedLegacyRoundOutcomeStorage(rounds.repository,
-                                                    "outcome or productivity receipt lacks permanent sealed round",
-                                                    receipt.source_rowid)
-        try:
-            _parse_stamp(values["claimed_at"])
-        except (TypeError, ValueError, AttributeError):
-            return BlockedLegacyRoundOutcomeStorage(rounds.repository,
-                                                    "outcome receipt has malformed claim time", receipt.source_rowid)
-    for proof in sealed:
-        round_id = proof.facts.plan.round.round_id
-        result = finalize_review_round(proof.facts)
-        preparation = receipt_by_identity.get(("review-round-preparation", round_id))
-        if isinstance(result, DeferredReviewPreparation):
-            if preparation is None or dict(preparation.fields)["payload_json"] != encode_workflow(
-                (proof.facts, result.failures)
-            ):
-                return BlockedLegacyRoundOutcomeStorage(rounds.repository,
-                                                        "preparation receipt disagrees with deferred round",
-                                                        proof.round_source.source_rowid)
-        elif preparation is not None:
-            return BlockedLegacyRoundOutcomeStorage(rounds.repository,
-                                                    "nondeferred round has a preparation receipt",
-                                                    preparation.source_rowid)
-        stale = receipt_by_identity.get(("review-round-stale-productivity", round_id))
-        if stale is not None:
-            try:
-                raw_stale = dict(stale.fields)["payload_json"]
-                captured_stale = decode_workflow(raw_stale, tuple | StaleReviewProductivitySettlement | CurrentStaleReviewProductivitySettlement)
-                stale_value = captured_stale.receipt if isinstance(captured_stale, CurrentStaleReviewProductivitySettlement) else captured_stale
-                valid_stale = (
-                    stale_value == (proof.facts, proof.outcome)
-                    if isinstance(stale_value, tuple)
-                    else stale_value.facts == proof.facts and stale_value.outcome == proof.outcome
-                ) and raw_stale == encode_workflow(captured_stale)
-            except (TypeError, ValueError, UnicodeError, RecursionError):
-                valid_stale = False
-            if not valid_stale:
-                return BlockedLegacyRoundOutcomeStorage(rounds.repository,
-                                                        "stale productivity receipt disagrees with its round",
-                                                        stale.source_rowid)
-        for namespace, expected in (("review-round-superseded-productivity", str),
-                                    ("review-round-ceiling-productivity", CeilingProductivityDecision)):
-            source = receipt_by_identity.get((namespace, round_id))
-            if source is None:
-                continue
-            try:
-                payload = dict(source.fields)["payload_json"]
-                decoded = decode_workflow(payload, tuple)
-                if (len(decoded) != 3 or not isinstance(decoded[0], expected)
-                        or not isinstance(decoded[1], WorkflowRevision) or not isinstance(decoded[2], str)
-                        or decoded[1].fence != proof.facts.plan.round.binding.rejection.fence
-                        or encode_workflow(decoded) != payload):
-                    raise ValueError("productivity receipt has malformed settlement fields")
-                _parse_stamp(decoded[2])
-            except (TypeError, ValueError, AttributeError, UnicodeError):
-                return BlockedLegacyRoundOutcomeStorage(rounds.repository,
-                                                        "productivity receipt has malformed settlement fields",
-                                                        source.source_rowid)
-    try:
-        return CompleteLegacyRoundOutcomeStorage(rounds, receipts, tuple(sealed))
-    except ValueError as exc:
-        return BlockedLegacyRoundOutcomeStorage(rounds.repository, _printable(str(exc)))
-
-
 def read_legacy_review_round_page(
     db: sqlite3.Connection, repository: str, *, after_rowid: int | None = None,
 ) -> LegacyReviewRoundPage:
@@ -1510,519 +1353,6 @@ def _read_recording_source(
         raise ValueError(f"{namespace} source lacks its payload or claim")
     digest = hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
     return fields, digest
-
-
-def _bounded_identity_row(
-    db: sqlite3.Connection, table: str, key_column: str, key: str,
-    columns: tuple[str, ...], max_field_bytes: int,
-) -> sqlite3.Row:
-    sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in columns)
-    metadata = db.execute(
-        f"SELECT rowid AS source_rowid,max({sizes}) AS largest_value FROM {table} WHERE {key_column}=?",
-        (key,),
-    ).fetchone()
-    if metadata is None or metadata["source_rowid"] is None:
-        raise ValueError(f"{table} source is absent")
-    if metadata["largest_value"] > max_field_bytes:
-        raise ValueError(f"{table} source exceeds its field bound")
-    row = db.execute(
-        f"SELECT rowid AS source_rowid,* FROM {table} WHERE rowid=? AND {key_column}=?",
-        (metadata["source_rowid"], key),
-    ).fetchone()
-    if row is None:
-        raise ValueError(f"{table} source changed during its read")
-    return row
-
-
-def _reject_nonfinite(value: str) -> None:
-    raise ValueError(f"accepted review transition contains {value}")
-
-
-def _verified_review_stage_sources(db: sqlite3.Connection, repository: str, plan: ReviewRoundPlan) -> str:
-    prefix = review_stage_receipt_prefix(plan.round.round_id)
-    rows = db.execute(
-        "SELECT rowid AS source_rowid,typeof(key) AS key_type,length(CAST(key AS BLOB)) AS key_bytes,"
-        "ifnull(length(CAST(payload_json AS BLOB)),0) AS payload_bytes "
-        "FROM dedupe_keys WHERE namespace='review-round-stage' AND scope=? "
-        "AND key>=? AND key<? ORDER BY key LIMIT ?",
-        (repository, prefix, prefix[:-1] + ";", MAX_REVIEW_STAGES + 1),
-    ).fetchall()
-    if len(rows) != len(plan.stages):
-        raise ValueError("review stages disagree with their bounded receipt index")
-    planned = {stage.stage_id: stage for stage in plan.stages}
-    digests: list[tuple[str, str]] = []
-    for row in rows:
-        if (row["key_type"] != "text" or row["key_bytes"] > 512
-                or row["payload_bytes"] > MAX_LEGACY_SQL_TEXT_BYTES):
-            raise ValueError("review stage receipt exceeds its SQL source bound")
-        key_row = db.execute("SELECT key FROM dedupe_keys WHERE rowid=?", (row["source_rowid"],)).fetchone()
-        if key_row is None:
-            raise ValueError("review stage receipt changed during its read")
-        stage_key = key_row["key"]
-        fields, digest = _read_recording_source(db, "review-round-stage", repository, stage_key)
-        recorded = decode_workflow(dict(fields)["payload_json"], tuple)
-        if (len(recorded) != 2 or recorded[0] != plan.round.round_id
-                or not isinstance(recorded[1], ReviewStagePlan)
-                or stage_key != review_stage_receipt_key(plan.round.round_id, recorded[1].stage_id)
-                or planned.get(recorded[1].stage_id) != recorded[1]):
-            raise ValueError("review stage receipt disagrees with its round")
-        digests.append((stage_key, digest))
-    return hashlib.sha256(json.dumps(digests, separators=(",", ":")).encode()).hexdigest()
-
-
-def _recheck_submission_source(db: sqlite3.Connection, source: LegacyReviewSubmissionSource) -> None:
-    command_id = dict(source.command_fields)["command_id"]
-    for table, columns, required in (
-        ("lifecycle_commands", LEGACY_SUBMISSION_COMMAND_COLUMNS, True),
-        ("effect_receipts", LEGACY_SUBMISSION_RECEIPT_COLUMNS, source.receipt_fields is not None),
-    ):
-        sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in columns)
-        metadata = db.execute(
-            f"SELECT max({sizes}) AS largest_value FROM {table} WHERE command_id=?", (command_id,),
-        ).fetchone()
-        if (metadata is None) != (not required):
-            raise ValueError("submission command or effect changed after inventory")
-        if metadata is not None and metadata["largest_value"] > MAX_LEGACY_SQL_TEXT_BYTES:
-            raise ValueError("submission command or effect exceeds its SQL source bound")
-    command_row = db.execute(
-        "SELECT rowid AS source_rowid,* FROM lifecycle_commands WHERE command_id=?", (command_id,),
-    ).fetchone()
-    effect_row = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (command_id,)).fetchone()
-    if (command_row is None or command_row["source_rowid"] != source.source_rowid
-            or any(command_row[name] != value for name, value in source.command_fields)
-            or (effect_row is None) != (source.receipt_fields is None)
-            or (effect_row is not None and source.receipt_fields is not None
-                and any(effect_row[name] != value for name, value in source.receipt_fields))):
-        raise ValueError("submission command or effect changed after inventory")
-
-
-def read_review_submission_round_link(
-    db: sqlite3.Connection, source: LegacyReviewSubmissionSource,
-    lineage: LegacyReviewOwnerLineage,
-) -> VerifiedReviewSubmissionRoundLink | UnverifiedReviewSubmissionRoundLink:
-    """Join a registered review command to its exact round plan in one SQL snapshot.
-
-    Registration proves planning provenance only. A confirmed productive
-    outcome still needs a sealed round, effect and recorded baseline receipt.
-    """
-    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
-        raise ValueError("review round link requires an explicit SQL transaction")
-    if not isinstance(source, LegacyReviewSubmissionSource) or not isinstance(lineage, LegacyReviewOwnerLineage):
-        raise ValueError("review round link requires typed command and lineage sources")
-    command = dict(source.command_fields)
-    command_id = command["command_id"]
-    if command["repository"] != lineage.repository:
-        return UnverifiedReviewSubmissionRoundLink(command_id, "submission belongs to another repository")
-    try:
-        current_lineage = read_legacy_review_owner_lineage(
-            db, lineage.repository, lineage.current_owner,
-            configured_prior_owners=lineage.configured_prior_owners,
-        )
-        if current_lineage != lineage:
-            raise ValueError("review owner lineage changed after inventory")
-        _recheck_submission_source(db, source)
-        if source.receipt_fields is not None:
-            effect = dict(source.receipt_fields)
-            receipt = EffectReceipt(
-                CommandId(command_id), effect["executor_identity"],
-                _parse_stamp(effect["started_at"]), _parse_stamp(effect["completed_at"]),
-                EffectStatus(effect["status"]), effect["remote_object_id"], effect["remote_revision"], effect["error"],
-            )
-            if (command["attempts"] < 1 or command["attempt_owner"] != receipt.executor_identity
-                    or effect["receipt_digest"] != _receipt_digest(receipt)):
-                raise ValueError("review effect receipt lacks its paid attempt or digest")
-        registration_fields, registration_digest = _read_recording_source(
-            db, "review-round-submission", lineage.repository, command_id,
-        )
-        registration = decode_workflow(dict(registration_fields)["payload_json"], ReviewSubmissionRegistration)
-        if (registration.submission.command_id != command_id
-                or registration.owner_id != command["executor_identity"]
-                or registration.owner_id not in lineage.owners
-                or registration.command_digest != command["payload_digest"]
-                or registration.idempotency_key != command["idempotency_key"]
-                or registration.config_version != command["config_version"]
-                or command["kind"] != "submit_review"):
-            raise ValueError("review registration disagrees with its exact command")
-        index_fields, index_digest = _read_recording_source(
-            db, "review-round-submission-index", lineage.repository,
-            review_submission_receipt_key(registration.round.round_id, command_id),
-        )
-        recorded = dict(registration_fields)
-        indexed = dict(index_fields)
-        if (indexed["payload_json"] != recorded["payload_json"]
-                or indexed["claimed_at"] != recorded["claimed_at"]
-                or indexed["reusable_after"] is not None or recorded["reusable_after"] is not None):
-            raise ValueError("review registration and round index disagree")
-        round_id = registration.round.round_id
-        preflight_fields, preflight_digest = _read_recording_source(
-            db, "review-round-preflight", lineage.repository, round_id,
-        )
-        preflight = decode_workflow(dict(preflight_fields)["payload_json"], tuple)
-        if (len(preflight) != 3 or not isinstance(preflight[0], ReviewPreflightSelection)
-                or not isinstance(preflight[1], str) or preflight[1] != registration.owner_id
-                or not isinstance(preflight[2], ReviewRoundPlan)
-                or preflight[0].request_id != round_id
-                or preflight[0].claim_occurrence_id != registration.claim_occurrence_id
-                or preflight[0].binding != registration.round.binding
-                or preflight[2].round != registration.round):
-            raise ValueError("review registration disagrees with its preflight")
-        sizes = ",".join(f"ifnull(length(CAST({column} AS BLOB)),0)" for column in (
-            "round_id", "repository", "target_kind", "target_number", "execution_epoch",
-            "execution_episode", "generation", "sequence", "claim_occurrence_id", "plan_json",
-        ))
-        metadata = db.execute(
-            f"SELECT max({sizes}) AS largest_value FROM review_execution_rounds WHERE round_id=?", (round_id,),
-        ).fetchone()
-        if metadata is None or metadata["largest_value"] is None:
-            raise ValueError("registered review round is absent")
-        if metadata["largest_value"] > MAX_LEGACY_RECORDING_BYTES:
-            raise ValueError("registered review round exceeds its byte bound")
-        row = db.execute(
-            "SELECT round_id,repository,target_kind,target_number,execution_epoch,execution_episode,"
-            "generation,sequence,claim_occurrence_id,plan_json "
-            "FROM review_execution_rounds WHERE round_id=?", (round_id,),
-        ).fetchone()
-        if row is None:
-            raise ValueError("registered review round changed during its read")
-        fields = tuple((name, row[name]) for name in row.keys())
-        if any(type(value) is not (int if name in {"target_number", "execution_epoch", "generation", "sequence"}
-                                   else str) for name, value in fields):
-            raise ValueError("registered review round has malformed SQL fields")
-        plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
-        key = plan.round.binding.rejection.fence.key
-        if (plan.round != registration.round or row["repository"] != lineage.repository
-                or row["target_kind"] != "pr" or row["target_number"] != key.target.number
-                or row["execution_epoch"] != plan.round.binding.execution_epoch
-                or row["execution_episode"] != plan.round.binding.execution_episode
-                or row["generation"] != plan.round.binding.rejection.fence.generation
-                or row["sequence"] != plan.round.sequence
-                or row["claim_occurrence_id"] != registration.claim_occurrence_id):
-            raise ValueError("registered review round index disagrees with its plan")
-        if (replace(preflight[2], stages=plan.stages, submissions=plan.submissions) != plan
-                or registration.submission not in plan.submissions):
-            raise ValueError("registered review submission disagrees with its evolved plan")
-        if registration.submission.kind is ReviewSubmissionKind.PAID and not plan.stages:
-            raise ValueError("paid review submission lacks a planned stage")
-        if registration.submission.kind is ReviewSubmissionKind.COPIED and plan.stages:
-            effect = dict(source.receipt_fields) if source.receipt_fields is not None else None
-            if (command["state"] != "permanent_failure" or command["attempts"] < 1
-                    or effect is None or effect["status"] != "permanent_failure"
-                    or effect["remote_object_id"] is not None):
-                raise ValueError("copied review with later stages lacks its definitive refusal")
-        stage_digest = _verified_review_stage_sources(db, lineage.repository, plan)
-        if (command["expected_revision"] != plan.head_sha
-                or command["workflow_binding_json"] != encode_workflow(registration.round.binding.rejection)
-                or command["payload_digest"] != _encoded_payload_digest(
-                    command["payload_json"], command["workflow_binding_json"],
-                )):
-            raise ValueError("registered review command disagrees with its plan")
-        payload = json.loads(command["payload_json"], object_pairs_hook=_unique_receipt_object,
-                             parse_constant=_reject_nonfinite)
-        if (not isinstance(payload, dict) or payload.get("head") != plan.head_sha
-                or payload.get("pr") != key.target.number):
-            raise ValueError("registered review command payload disagrees with its plan")
-        round_digest = hashlib.sha256(json.dumps(fields, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
-        return VerifiedReviewSubmissionRoundLink(source, lineage, registration.round,
-                                                 registration_digest, index_digest,
-                                                 preflight_digest, stage_digest, round_digest)
-    except (KeyError, TypeError, ValueError, UnicodeError, sqlite3.Error,
-            WorkflowAuthorityError, CorruptControlStore) as exc:
-        return UnverifiedReviewSubmissionRoundLink(command_id, _printable(str(exc)))
-
-
-@dataclass(frozen=True)
-class VerifiedLegacySubmissionRegistrationStorage:
-    """One command, registration, index and planned round agree on storage identity."""
-
-    command_source: LegacyReviewSubmissionSource
-    registration_source: LegacyReviewSubmissionReceiptSource
-    index_source: LegacyReviewSubmissionReceiptSource
-    round_source: LegacyReviewRoundSource
-    plan: ReviewRoundPlan
-    registration: ReviewSubmissionRegistration
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.command_source, LegacyReviewSubmissionSource)
-                or not isinstance(self.registration_source, LegacyReviewSubmissionReceiptSource)
-                or not isinstance(self.index_source, LegacyReviewSubmissionReceiptSource)
-                or not isinstance(self.round_source, LegacyReviewRoundSource)
-                or not isinstance(self.plan, ReviewRoundPlan)
-                or not isinstance(self.registration, ReviewSubmissionRegistration)):
-            raise ValueError("registered submission storage requires typed sources")
-        command = dict(self.command_source.command_fields)
-        receipt = dict(self.registration_source.fields)
-        index = dict(self.index_source.fields)
-        round_row = dict(self.round_source.fields)
-        try:
-            payload = json.loads(command["payload_json"], object_pairs_hook=_unique_receipt_object,
-                                 parse_constant=_reject_nonfinite)
-        except (TypeError, ValueError, RecursionError) as exc:
-            raise ValueError("registered submission has malformed command payload") from exc
-        if (receipt["namespace"] != "review-round-submission"
-                or index["namespace"] != "review-round-submission-index"
-                or receipt["scope"] != command["repository"] or index["scope"] != command["repository"]
-                or receipt["key"] != command["command_id"]
-                or index["key"] != review_submission_receipt_key(
-                    self.registration.round.round_id, command["command_id"],
-                )
-                or receipt["payload_json"] != encode_workflow(self.registration)
-                or receipt["payload_json"] != index["payload_json"]
-                or receipt["claimed_at"] != index["claimed_at"]
-                or receipt["reusable_after"] is not None or index["reusable_after"] is not None
-                or self.registration.submission.command_id != command["command_id"]
-                or self.registration.round != self.plan.round
-                or self.registration.submission not in self.plan.submissions
-                or round_row["round_id"] != self.plan.round.round_id
-                or round_row["claim_occurrence_id"] != self.registration.claim_occurrence_id
-                or self.registration.owner_id != command["executor_identity"]
-                or self.registration.command_digest != command["payload_digest"]
-                or self.registration.idempotency_key != command["idempotency_key"]
-                or self.registration.config_version != command["config_version"]
-                or command["target"] != f"pr:{self.plan.round.binding.rejection.fence.key.target.number}"
-                or command["expected_revision"] != self.plan.head_sha
-                or command["workflow_binding_json"] != encode_workflow(self.plan.round.binding.rejection)
-                or command["payload_digest"] != _encoded_payload_digest(
-                    command["payload_json"], command["workflow_binding_json"],
-                )
-                or not isinstance(payload, dict)
-                or payload.get("head") != self.plan.head_sha
-                or type(payload.get("pr")) is not int
-                or payload.get("pr") != self.plan.round.binding.rejection.fence.key.target.number
-                or _stored_review_round_plan(self.round_source) != self.plan):
-            raise ValueError("registered submission storage has contradictory identities")
-        _parse_stamp(receipt["claimed_at"])
-
-    @property
-    def source_digest(self) -> str:
-        parts = (self.command_source.source_digest, self.registration_source.source_digest,
-                 self.index_source.source_digest, self.round_source.source_digest)
-        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class CompleteLegacySubmissionSettlementStorage:
-    """Every inventoried command and settlement receipt is accounted for as storage."""
-
-    commands: CompleteLegacyReviewSubmissions
-    receipts: CompleteLegacyReviewSubmissionReceipts
-    round_storage: CompleteLegacyRoundOutcomeStorage
-    round_plans: tuple[tuple[LegacyReviewRoundSource, ReviewRoundPlan], ...]
-    registered: tuple[VerifiedLegacySubmissionRegistrationStorage, ...]
-    unregistered: tuple[LegacyReviewSubmissionSource, ...]
-    recorded_markers: tuple[LegacyReviewSubmissionReceiptSource, ...]
-    _registered_by_id: Mapping[str, VerifiedLegacySubmissionRegistrationStorage] = field(
-        init=False, repr=False, compare=False,
-    )
-    _recorded_marker_ids: frozenset[str] = field(init=False, repr=False, compare=False)
-    _unique_remote_review_ids: frozenset[str] = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.commands, CompleteLegacyReviewSubmissions)
-                or not isinstance(self.receipts, CompleteLegacyReviewSubmissionReceipts)
-                or not isinstance(self.round_storage, CompleteLegacyRoundOutcomeStorage)
-                or not isinstance(self.round_plans, tuple) or not isinstance(self.registered, tuple)
-                or not isinstance(self.unregistered, tuple) or not isinstance(self.recorded_markers, tuple)
-                or len({self.commands.repository, self.receipts.repository, self.round_storage.repository}) != 1):
-            raise ValueError("submission settlement storage requires matching complete inventories")
-        command_by_id = {dict(source.command_fields)["command_id"]: source for source in self.commands.submissions}
-        receipt_by_key = {(dict(source.fields)["namespace"], dict(source.fields)["key"]): source
-                          for source in self.receipts.receipts}
-        round_by_id = {dict(source.fields)["round_id"]: source for source in self.round_storage.rounds.rounds}
-        sealed_by_id = {entry.outcome.round.round_id: entry for entry in self.round_storage.sealed}
-        plan_by_id: dict[str, ReviewRoundPlan] = {}
-        for entry in self.round_plans:
-            if (not isinstance(entry, tuple) or len(entry) != 2
-                    or not isinstance(entry[0], LegacyReviewRoundSource)
-                    or not isinstance(entry[1], ReviewRoundPlan)):
-                raise ValueError("settlement storage requires typed round plans")
-            source, plan = entry
-            round_id = plan.round.round_id
-            if (round_id in plan_by_id or round_by_id.get(round_id) != source
-                    or _stored_review_round_plan(source) != plan
-                    or (round_id in sealed_by_id and sealed_by_id[round_id].facts.plan != plan)):
-                raise ValueError("settlement storage has an unaccounted round plan")
-            plan_by_id[round_id] = plan
-        if set(plan_by_id) != set(round_by_id):
-            raise ValueError("settlement storage leaves a round plan unaccounted for")
-        registered_by_id: dict[str, VerifiedLegacySubmissionRegistrationStorage] = {}
-        for proof in self.registered:
-            if not isinstance(proof, VerifiedLegacySubmissionRegistrationStorage):
-                raise ValueError("settlement storage requires typed registration proofs")
-            command_id = dict(proof.command_source.command_fields)["command_id"]
-            round_id = proof.plan.round.round_id
-            index = dict(proof.index_source.fields)
-            if (command_id in registered_by_id or command_by_id.get(command_id) != proof.command_source
-                    or round_by_id.get(round_id) != proof.round_source or plan_by_id.get(round_id) != proof.plan
-                    or receipt_by_key.get(("review-round-submission", command_id)) != proof.registration_source
-                    or receipt_by_key.get((index["namespace"], index["key"])) != proof.index_source):
-                raise ValueError("settlement storage has an unaccounted registration")
-            registered_by_id[command_id] = proof
-        unregistered_ids = [dict(source.command_fields)["command_id"] for source in self.unregistered
-                            if isinstance(source, LegacyReviewSubmissionSource)]
-        if (len(unregistered_ids) != len(self.unregistered)
-                or len(set(unregistered_ids)) != len(unregistered_ids)
-                or any(command_by_id.get(command_id) != source
-                       for command_id, source in zip(unregistered_ids, self.unregistered, strict=True))
-                or set(registered_by_id) & set(unregistered_ids)
-                or set(registered_by_id) | set(unregistered_ids) != set(command_by_id)):
-            raise ValueError("settlement storage leaves a command unaccounted for")
-        planned_ids = [submission.command_id for plan in plan_by_id.values() for submission in plan.submissions]
-        if len(planned_ids) != len(set(planned_ids)) or set(planned_ids) != set(registered_by_id):
-            raise ValueError("settlement storage leaves a planned submission unaccounted for")
-        marker_keys = set()
-        for marker in self.recorded_markers:
-            if not isinstance(marker, LegacyReviewSubmissionReceiptSource):
-                raise ValueError("settlement storage requires typed recorded markers")
-            values = dict(marker.fields)
-            if (values["namespace"] != "review-recorded-submission"
-                    or receipt_by_key.get((values["namespace"], values["key"])) != marker
-                    or values["key"] not in command_by_id):
-                raise ValueError("settlement storage has an orphaned recorded marker")
-            marker_keys.add(values["key"])
-        registration_keys = {("review-round-submission", command_id) for command_id in registered_by_id}
-        index_keys = {(dict(proof.index_source.fields)["namespace"], dict(proof.index_source.fields)["key"])
-                      for proof in self.registered}
-        marker_receipt_keys = {("review-recorded-submission", command_id) for command_id in marker_keys}
-        if len(index_keys) != len(self.registered) or set(receipt_by_key) != registration_keys | index_keys | marker_receipt_keys:
-            raise ValueError("settlement storage leaves a receipt unaccounted for")
-        remote_counts: dict[str, int] = {}
-        for source in self.commands.submissions:
-            effect = dict(source.receipt_fields) if source.receipt_fields is not None else {}
-            remote_id = effect.get("remote_object_id")
-            if isinstance(remote_id, str):
-                remote_counts[remote_id] = remote_counts.get(remote_id, 0) + 1
-        object.__setattr__(self, "_registered_by_id", MappingProxyType(registered_by_id))
-        object.__setattr__(self, "_recorded_marker_ids", frozenset(marker_keys))
-        object.__setattr__(self, "_unique_remote_review_ids", frozenset(
-            remote_id for remote_id, count in remote_counts.items() if count == 1
-        ))
-
-    @property
-    def repository(self) -> str:
-        return self.commands.repository
-
-    @property
-    def source_digest(self) -> str:
-        parts = (self.commands.source_digest, self.receipts.source_digest, self.round_storage.source_digest)
-        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
-
-
-def _stored_review_round_plan(source: LegacyReviewRoundSource) -> ReviewRoundPlan:
-    row = dict(source.fields)
-    plan = decode_workflow(row["plan_json"], ReviewRoundPlan)
-    identity = plan.round
-    key = identity.binding.rejection.fence.key
-    if (row["plan_json"] != encode_workflow(plan) or row["round_id"] != identity.round_id
-            or not isinstance(key.target, PullRequestRef) or row["repository"] != key.repository
-            or row["target_kind"] != "pr" or row["target_number"] != key.target.number
-            or row["execution_epoch"] != identity.binding.execution_epoch
-            or row["execution_episode"] != identity.binding.execution_episode
-            or row["generation"] != identity.binding.rejection.fence.generation
-            or row["sequence"] != identity.sequence):
-        raise ValueError("review round plan disagrees with its SQL identity")
-    return plan
-
-
-def verify_complete_legacy_submission_settlement_storage(
-    db: sqlite3.Connection, observed_commands: CompleteLegacyReviewSubmissions,
-    observed_receipts: CompleteLegacyReviewSubmissionReceipts,
-    observed_round_storage: CompleteLegacyRoundOutcomeStorage,
-) -> CompleteLegacySubmissionSettlementStorage | BlockedLegacySubmissionSettlementStorage:
-    """Account for every command, registration, index and marker in one SQL snapshot."""
-    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
-        raise ValueError("submission settlement storage requires an explicit SQL transaction")
-    if (not isinstance(observed_commands, CompleteLegacyReviewSubmissions)
-            or not isinstance(observed_receipts, CompleteLegacyReviewSubmissionReceipts)
-            or not isinstance(observed_round_storage, CompleteLegacyRoundOutcomeStorage)):
-        raise ValueError("submission settlement storage requires complete typed observations")
-    repository = observed_commands.repository
-    if repository != observed_receipts.repository or repository != observed_round_storage.repository:
-        return BlockedLegacySubmissionSettlementStorage(repository, "submission and round repositories disagree")
-    commands = revalidate_complete_legacy_review_submissions(db, observed_commands)
-    if isinstance(commands, BlockedLegacyReviewSubmissions):
-        return BlockedLegacySubmissionSettlementStorage(repository, commands.reason, commands.source_rowid)
-    receipts = revalidate_complete_legacy_review_submission_receipts(db, observed_receipts)
-    if isinstance(receipts, BlockedLegacyReviewSubmissionReceipts):
-        return BlockedLegacySubmissionSettlementStorage(repository, receipts.reason, receipts.source_rowid)
-    round_storage = verify_complete_legacy_round_outcome_storage(
-        db, observed_round_storage.rounds, observed_round_storage.receipts,
-    )
-    if isinstance(round_storage, BlockedLegacyRoundOutcomeStorage):
-        return BlockedLegacySubmissionSettlementStorage(repository, round_storage.reason, round_storage.source_rowid)
-    command_by_id = {dict(source.command_fields)["command_id"]: source for source in commands.submissions}
-    receipt_by_key = {(dict(source.fields)["namespace"], dict(source.fields)["key"]): source
-                      for source in receipts.receipts}
-    plan_by_id: dict[str, tuple[LegacyReviewRoundSource, ReviewRoundPlan]] = {}
-    round_plans: list[tuple[LegacyReviewRoundSource, ReviewRoundPlan]] = []
-    sealed_by_id = {entry.outcome.round.round_id: entry for entry in round_storage.sealed}
-    for source in round_storage.rounds.rounds:
-        try:
-            plan = _stored_review_round_plan(source)
-            sealed = sealed_by_id.get(plan.round.round_id)
-            if sealed is not None and sealed.facts.plan != plan:
-                raise ValueError("sealed review round plan disagrees with its closure")
-        except (TypeError, ValueError, UnicodeError, WorkflowAuthorityError) as exc:
-            return BlockedLegacySubmissionSettlementStorage(repository, _printable(str(exc)), source.source_rowid)
-        plan_by_id[plan.round.round_id] = (source, plan)
-        round_plans.append((source, plan))
-    registered: list[VerifiedLegacySubmissionRegistrationStorage] = []
-    registered_ids: set[str] = set()
-    recorded_markers: list[LegacyReviewSubmissionReceiptSource] = []
-    for source in receipts.receipts:
-        row = dict(source.fields)
-        namespace = row["namespace"]
-        if namespace == "review-recorded-submission":
-            if row["key"] not in command_by_id:
-                return BlockedLegacySubmissionSettlementStorage(
-                    repository, "recorded review marker has no submission command", source.source_rowid,
-                )
-            recorded_markers.append(source)
-            continue
-        if namespace != "review-round-submission":
-            continue
-        try:
-            registration = decode_workflow(row["payload_json"], ReviewSubmissionRegistration)
-            command_id = registration.submission.command_id
-            command_source = command_by_id.get(command_id)
-            planned = plan_by_id.get(registration.round.round_id)
-            if (row["payload_json"] != encode_workflow(registration)
-                    or row["key"] != command_id or command_source is None or planned is None):
-                raise ValueError("review registration lacks its exact command or round")
-            round_source, plan = planned
-            command = dict(command_source.command_fields)
-            if (command["repository"] != repository or command["target"] !=
-                    f"pr:{registration.round.binding.rejection.fence.key.target.number}"
-                    or command["expected_revision"] != plan.head_sha
-                    or command["workflow_binding_json"] != encode_workflow(registration.round.binding.rejection)
-                    or command["payload_digest"] != _encoded_payload_digest(
-                        command["payload_json"], command["workflow_binding_json"],
-                    )):
-                raise ValueError("review registration disagrees with its bound command")
-            index_key = review_submission_receipt_key(registration.round.round_id, command_id)
-            index_source = receipt_by_key.get(("review-round-submission-index", index_key))
-            if index_source is None:
-                raise ValueError("review registration lacks its exact round index")
-            index = dict(index_source.fields)
-            if (index["payload_json"] != row["payload_json"] or index["claimed_at"] != row["claimed_at"]
-                    or row["reusable_after"] is not None or index["reusable_after"] is not None):
-                raise ValueError("review registration and round index disagree")
-            _parse_stamp(row["claimed_at"])
-            registered.append(VerifiedLegacySubmissionRegistrationStorage(
-                command_source, source, index_source, round_source, plan, registration,
-            ))
-            registered_ids.add(command_id)
-        except (KeyError, TypeError, ValueError, AttributeError, UnicodeError,
-                WorkflowAuthorityError) as exc:
-            return BlockedLegacySubmissionSettlementStorage(repository, _printable(str(exc)), source.source_rowid)
-    unregistered = tuple(source for source in commands.submissions
-                         if dict(source.command_fields)["command_id"] not in registered_ids)
-    try:
-        return CompleteLegacySubmissionSettlementStorage(
-            commands, receipts, round_storage, tuple(round_plans), tuple(registered),
-            unregistered, tuple(recorded_markers),
-        )
-    except ValueError as exc:
-        return BlockedLegacySubmissionSettlementStorage(repository, _printable(str(exc)))
 
 
 def read_complete_legacy_review_generation_receipts(

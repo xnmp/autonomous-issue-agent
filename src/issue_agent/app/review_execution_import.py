@@ -20,14 +20,17 @@ from ..adapters.review_execution_workflow_census import (
     read_complete_retained_review_workflows,
 )
 from ..adapters.resolve_activation import distinct_roots
+from ..adapters.workflow_codec import encode_workflow
+from ..domain.review_activation import MAX_IMPORTED_PULL_REQUESTS
 from ..domain.review_execution_history_import import (
     ReviewImportHistory, ReviewImportHistoryBlocked, ReviewImportNoHistoryObserved,
-    classify_review_import_history,
+    classify_review_import_history, ReviewImportScopeBlocked,
+    ReviewImportSource, ReviewImportBlocker, ReviewImportBlockerKind,
 )
 from ..domain.review_execution_import_plan import (
     BlockedZeroHistoryReviewImport, EligibleZeroHistoryReviewImport,
-    EmptyReviewExecutionImportPlan, ZeroHistoryImportBlockerKind,
-    screen_zero_history_review_import,
+    ReviewExecutionImportPlan, ZeroHistoryImportBlockerKind,
+    screen_zero_history_review_import, review_import_candidate_digest,
 )
 from ..domain.review_workflow import RecordedPullRequest
 from ..domain.resolve_activation import DeploymentInventory
@@ -96,7 +99,7 @@ def classify_configured_legacy_review_import_history(
     counters: HeldLegacyExecutionCounterSources,
     observed: ObservedLegacyExecutionSqlImportSources,
     *, now: datetime | None = None, extra_roots: tuple[str, ...] = (),
-) -> tuple[ReviewImportHistory, ...] | BlockedLegacyExecutionSqlImportSources:
+) -> tuple[ReviewImportHistory, ...] | ReviewImportScopeBlocked | BlockedLegacyExecutionSqlImportSources:
     """Classify every open PR only after the configured source set is rechecked.
 
     The result is observational. Even an empty history requires independent
@@ -110,8 +113,12 @@ def classify_configured_legacy_review_import_history(
         return verified
     histories = classify_review_import_history(
         verified.counters.mapping, verified.deaths,
-        verified.sql.settlement.commands, verified.sql.settlement.round_storage,
+        verified.sql.commands, verified.sql.rounds,
+        receipts=verified.sql.receipts, outcome_receipts=verified.sql.outcomes,
+        generation_receipts=verified.sql.generation,
     )
+    if isinstance(histories, ReviewImportScopeBlocked):
+        return histories
     return tuple(
         replace(history, source_digest=verified.source_digest)
         if isinstance(history, ReviewImportNoHistoryObserved) else history
@@ -120,7 +127,7 @@ def classify_configured_legacy_review_import_history(
 
 
 ReviewImportCandidate = (
-    ReviewImportHistoryBlocked | BlockedZeroHistoryReviewImport | EligibleZeroHistoryReviewImport
+    ReviewImportHistoryBlocked | EligibleZeroHistoryReviewImport
 )
 
 
@@ -146,20 +153,19 @@ class ObservedReviewExecutionImportCandidates:
                 or not isinstance(self.retained, CompleteRetainedReviewWorkflows)
                 or not isinstance(self.candidates, tuple)
                 or any(not isinstance(item, (
-                    ReviewImportHistoryBlocked, BlockedZeroHistoryReviewImport,
-                    EligibleZeroHistoryReviewImport,
+                    ReviewImportHistoryBlocked, EligibleZeroHistoryReviewImport,
                 )) for item in self.candidates)
-                or tuple(item.pr for item in self.candidates) != self.retained.listing.numbers
+                or (numbers := tuple(item.pr for item in self.candidates)) != tuple(sorted(set(numbers)))
+                or not set(self.retained.listing.numbers) <= set(numbers)
+                or not {item.snapshot.revision.fence.key.target.number for item in self.retained.sources} <= set(numbers)
                 or self.sources.sql.repository != self.retained.repository):
             raise ValueError("review import candidates require complete matching source sets")
 
     @property
-    def source_digest(self) -> str | None:
-        if any(not isinstance(item, EligibleZeroHistoryReviewImport) for item in self.candidates):
-            return None
+    def source_digest(self) -> str:
         source = (
             self.sources.source_digest, self.retained.source_digest,
-            tuple(item.source_digest for item in self.candidates),
+            tuple(review_import_candidate_digest(item) for item in self.candidates),
         )
         return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()
 
@@ -194,38 +200,57 @@ def assess_configured_review_execution_import_candidates(
         return BlockedReviewImportObservationSet("remote review observations repeat or name an unlisted PR")
     by_pr = dict(zip(numbers, remote, strict=True))
     links = {item.pr: item for item in verified.counters.mapping.links.links}
+    retained_by_pr = {item.snapshot.revision.fence.key.target.number: item
+                      for item in retained.sources}
     histories = classify_review_import_history(
-        verified.counters.mapping, verified.deaths,
-        verified.sql.settlement.commands, verified.sql.settlement.round_storage,
+        verified.counters.mapping, verified.deaths, verified.sql.commands, verified.sql.rounds,
+        receipts=verified.sql.receipts, outcome_receipts=verified.sql.outcomes,
+        generation_receipts=verified.sql.generation,
+        retained_target_sources=tuple((pr, ReviewImportSource("workflow", f"pr:{pr}", source.row_digest))
+                                      for pr, source in retained_by_pr.items()
+                                      if pr not in retained.listing.numbers),
     )
+    if isinstance(histories, ReviewImportScopeBlocked):
+        return BlockedReviewImportObservationSet(
+            "review import scope contains unassigned " + ", ".join(item.kind.value for item in histories.blockers)
+        )
     audit_time = datetime.now(timezone.utc)
     if now is not None and now > audit_time:
         audit_time = now
     candidates: list[ReviewImportCandidate] = []
-    for history, retained_source in zip(histories, retained.sources, strict=True):
+    for history in histories:
         if isinstance(history, ReviewImportHistoryBlocked):
             candidates.append(history)
             continue
         recorded = by_pr.get(history.pr)
         if recorded is None:
-            candidates.append(BlockedZeroHistoryReviewImport(
-                history.pr, ZeroHistoryImportBlockerKind.REMOTE_UNAVAILABLE,
-            ))
+            candidates.append(ReviewImportHistoryBlocked(history.pr, (ReviewImportBlocker(
+                ReviewImportBlockerKind.CURRENT_OBSERVATION, (ReviewImportSource(
+                    ZeroHistoryImportBlockerKind.REMOTE_UNAVAILABLE.value, f"pr:{history.pr}",
+                    retained_by_pr[history.pr].row_digest),),
+            ),)))
             continue
         bound_history = replace(history, source_digest=verified.source_digest)
-        candidates.append(screen_zero_history_review_import(
-            bound_history, retained_source.snapshot, recorded, links[history.pr],
+        candidate = screen_zero_history_review_import(
+            bound_history, retained_by_pr[history.pr].snapshot, recorded, links[history.pr],
             cfg.review_runtime.bot, now=audit_time,
-        ))
+        )
+        if isinstance(candidate, BlockedZeroHistoryReviewImport):
+            digest = hashlib.sha256(encode_workflow(recorded).encode()).hexdigest()
+            candidate = ReviewImportHistoryBlocked(history.pr, (ReviewImportBlocker(
+                ReviewImportBlockerKind.CURRENT_OBSERVATION, (ReviewImportSource(
+                    candidate.kind.value, f"pr:{history.pr}", digest),),
+            ),))
+        candidates.append(candidate)
     return ObservedReviewExecutionImportCandidates(verified, retained, tuple(candidates))
 
 
-def plan_configured_empty_review_execution_import(
+def plan_configured_review_execution_import(
     assessment: ObservedReviewExecutionImportCandidates,
     inventory: DeploymentInventory, execution_epoch: int,
     *, now: datetime | None = None,
-) -> EmptyReviewExecutionImportPlan | BlockedReviewImportObservationSet:
-    """Produce an observational repository-wide plan only from complete eligible PRs."""
+) -> ReviewExecutionImportPlan | BlockedReviewImportObservationSet:
+    """Produce fixed mixed decisions from a complete stopped source scope."""
     if not isinstance(assessment, ObservedReviewExecutionImportCandidates) or not isinstance(
         inventory, DeploymentInventory,
     ):
@@ -239,13 +264,10 @@ def plan_configured_empty_review_execution_import(
         return BlockedReviewImportObservationSet("execution import inventory belongs to another repository")
     if inventory.activation is not None or not inventory.quiescent:
         return BlockedReviewImportObservationSet("execution import deployment is active or not quiescent")
-    if assessment.source_digest is None:
-        blocked = next(item.pr for item in assessment.candidates
-                       if not isinstance(item, EligibleZeroHistoryReviewImport))
-        return BlockedReviewImportObservationSet(f"review execution import PR #{blocked} lacks complete origin evidence")
-    candidates = tuple(item for item in assessment.candidates
-                       if isinstance(item, EligibleZeroHistoryReviewImport))
-    plan = EmptyReviewExecutionImportPlan(
+    candidates = assessment.candidates
+    if len(candidates) > MAX_IMPORTED_PULL_REQUESTS:
+        return BlockedReviewImportObservationSet("execution import target scope exceeds the retained decision bound")
+    plan = ReviewExecutionImportPlan(
         assessment.retained.repository, assessment.retained.listing, execution_epoch,
         assessment.sources.source_digest, assessment.retained.source_digest,
         inventory.digest, candidates, planned_at,

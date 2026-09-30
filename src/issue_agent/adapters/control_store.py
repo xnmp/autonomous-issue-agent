@@ -51,7 +51,7 @@ from ..domain.workflow import (
 )
 from ..domain.resolve_workspace import EpisodeWorkspacePrepared, PriorResolveAdmission
 from ..domain.agent_task import RuntimeName
-from ..domain.review_execution import CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
+from ..domain.review_execution import BlockedReviewExecutionMigration, CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
 from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed, classify_normal_review_return
@@ -99,7 +99,7 @@ from .deployment_authority import (
 from .review_effects import bound_submission_op, review_family_op
 from .review_execution_claims import load_review_preflight_record, require_review_parent_claim
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
+from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 35
 
@@ -3239,12 +3239,18 @@ class SQLiteControlStore:
     def register_lease(self, lease: Lease) -> None:
         with self.transaction() as db:
             run = db.execute(
-                "SELECT state,review_round_id FROM runs WHERE run_id=?", (str(lease.run_id),),
+                "SELECT state,review_round_id,workflow_binding_json FROM runs WHERE run_id=?", (str(lease.run_id),),
             ).fetchone()
             if run is None or run["state"] in {"completed", "cancelled", "abandoned"}:
                 raise ControlStoreError("process lease requires a nonterminal run")
             if run["review_round_id"] is not None:
                 raise ControlStoreError("review child requires guarded process registration")
+            if run["workflow_binding_json"] is not None:
+                captured = decode_workflow(run["workflow_binding_json"], WorkflowBinding)
+                if captured.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
+                    snapshot = load_review_workflow_row(db, captured.fence.key)
+                    if snapshot is not None and isinstance(snapshot.execution, BlockedReviewExecutionMigration):
+                        raise ControlStoreError("review execution migration is blocked")
             db.execute(
                 "INSERT INTO leases(run_id, dispatch_id, owner_id, pid, pgid, "
                 "process_start_ticks, started_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -3423,6 +3429,12 @@ class SQLiteControlStore:
                     _parse_stamp(existing["started_at"]),
                     process_start_ticks,
                 )
+            if run["workflow_binding_json"] is not None:
+                captured = decode_workflow(run["workflow_binding_json"], WorkflowBinding)
+                if captured.authority.family is WorkflowFamily.REVIEW_REJECTIONS:
+                    snapshot = load_review_workflow_row(db, captured.fence.key)
+                    if snapshot is not None and isinstance(snapshot.execution, BlockedReviewExecutionMigration):
+                        raise ControlStoreError("review execution migration is blocked")
             review_admission = None
             if review_attached:
                 if not review_child_identity_proven:
@@ -6641,6 +6653,7 @@ class SQLiteControlStore:
         self._assert_owner_active(db, command.executor_identity)
         self._validate_workflow_command(
             db, command, registering_review_submission=registering_review_submission,
+            allow_blocked_submission_retry=True,
         )
         row = db.execute(
             "SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
@@ -6709,6 +6722,7 @@ class SQLiteControlStore:
     def _validate_workflow_command(
         self, db: sqlite3.Connection, command: LifecycleCommand, *,
         registering_review_submission: bool = False,
+        allow_blocked_submission_retry: bool = False,
     ) -> None:
         binding = command.workflow
         publication = command.kind in {CommandKind.PUBLISH_BRANCH, CommandKind.OPEN_PULL_REQUEST, CommandKind.UPDATE_PULL_REQUEST_BODY}
@@ -6755,6 +6769,13 @@ class SQLiteControlStore:
                 review_family_op(command)
                 bound_submission_op(command)
                 review_snapshot = require_review_binding(db, binding, allow_gated=True)
+                if (command.kind is CommandKind.SUBMIT_REVIEW
+                        and isinstance(review_snapshot.execution, BlockedReviewExecutionMigration)):
+                    prior = db.execute("SELECT * FROM lifecycle_commands WHERE idempotency_key=?",
+                                       (command.idempotency_key,)).fetchone() if allow_blocked_submission_retry else None
+                    if (prior is None or prior["state"] not in ("succeeded", "permanent_failure")
+                            or _command_from_row(prior) != command):
+                        raise WorkflowAuthorityError("review execution migration is blocked")
                 if (command.kind is CommandKind.SUBMIT_REVIEW
                         and isinstance(review_snapshot.execution, CurrentReviewExecution)):
                     if not registering_review_submission:

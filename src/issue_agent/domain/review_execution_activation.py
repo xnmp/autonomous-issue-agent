@@ -4,28 +4,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from collections.abc import Mapping
-from types import MappingProxyType
 import hashlib
 import json
 
 from .agent_task import RuntimeName
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable, UnmappedLegacyEntry
-from .review_workflow import ReviewedBaseline
-from .contracts import CommandId
-from .review_workflow_policy import ReviewSubmissionReceipt
 from .review_execution import (
-    ReviewExecutionBinding, ReviewRoundIdentity, ReviewRoundOutcome, PaidReviewProgress, CopiedReviewProgress,
-    same_execution_episode, is_review_session_mode_marker, validate_review_session_handle,
+    is_review_session_mode_marker,
+    validate_review_session_handle,
 )
-from .review_rounds import (
-    ReviewRoundFacts, ReviewSubmissionConfirmed, ReviewSubmissionKind,
-    FinalizedReviewRound, DeferredReviewPreparation, finalize_review_round,
-)
-from .workflow import ObservedTransition
 from .workflow_identity import (
-    PullRequestRef, WorkflowRevision, canonical_workflow_repository, validate_workflow_identifier,
-    validate_workflow_integer, validate_workflow_text,
+    canonical_workflow_repository,
+    validate_workflow_identifier,
+    validate_workflow_integer,
+    validate_workflow_text,
 )
 
 
@@ -1131,154 +1123,6 @@ class BlockedLegacyReviewGenerationReceipts:
             _rowid(self.source_rowid, "blocked generation receipt rowid")
 
 
-@dataclass(frozen=True)
-class VerifiedLegacyRoundOutcomeStorage:
-    """One typed round outcome is paired with its exact durable receipt."""
-
-    round_source: LegacyReviewRoundSource
-    receipt_source: LegacyReviewOutcomeReceiptSource
-    facts: ReviewRoundFacts
-    outcome: ReviewRoundOutcome
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.round_source, LegacyReviewRoundSource)
-                or not isinstance(self.receipt_source, LegacyReviewOutcomeReceiptSource)
-                or not isinstance(self.facts, ReviewRoundFacts)
-                or not isinstance(self.outcome, ReviewRoundOutcome)):
-            raise ValueError("round outcome storage requires typed sources")
-        row = dict(self.round_source.fields)
-        receipt = dict(self.receipt_source.fields)
-        identity = self.facts.plan.round
-        key = identity.binding.rejection.fence.key
-        if (not isinstance(key.target, PullRequestRef)
-                or self.outcome.round != identity or row["round_id"] != identity.round_id
-                or row["repository"] != key.repository
-                or row["target_number"] != key.target.number
-                or row["execution_epoch"] != identity.binding.execution_epoch
-                or row["execution_episode"] != identity.binding.execution_episode
-                or row["generation"] != identity.binding.rejection.fence.generation
-                or row["sequence"] != identity.sequence
-                or receipt["namespace"] != "review-round-outcome"
-                or receipt["scope"] != key.repository or receipt["key"] != identity.round_id
-                or receipt["reusable_after"] is not None):
-            raise ValueError("round outcome storage has contradictory identities")
-        derived = finalize_review_round(self.facts)
-        if not isinstance(derived, (FinalizedReviewRound, DeferredReviewPreparation)) or derived.outcome != self.outcome:
-            raise ValueError("round outcome disagrees with its closure facts")
-
-    @property
-    def source_digest(self) -> str:
-        parts = (self.round_source.source_digest, self.receipt_source.source_digest)
-        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class UnverifiedLegacyRoundOutcomeStorage:
-    round_id: str
-    reason: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.round_id, "unverified round outcome")
-        validate_workflow_text(self.reason, "unverified round outcome reason")
-
-
-@dataclass(frozen=True)
-class CompleteLegacyRoundOutcomeStorage:
-    """Every sealed round has one verified outcome receipt; open rounds have none."""
-
-    rounds: CompleteLegacyReviewRounds
-    receipts: CompleteLegacyReviewOutcomeReceipts
-    sealed: tuple[VerifiedLegacyRoundOutcomeStorage, ...]
-    _sealed_by_id: Mapping[str, VerifiedLegacyRoundOutcomeStorage] = field(init=False, repr=False, compare=False)
-    _receipt_by_key: Mapping[tuple[str, str], LegacyReviewOutcomeReceiptSource] = field(
-        init=False, repr=False, compare=False,
-    )
-    _receipt_names_by_round: Mapping[str, frozenset[str]] = field(init=False, repr=False, compare=False)
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.rounds, CompleteLegacyReviewRounds)
-                or not isinstance(self.receipts, CompleteLegacyReviewOutcomeReceipts)
-                or self.rounds.repository != self.receipts.repository
-                or not isinstance(self.sealed, tuple)
-                or any(not isinstance(entry, VerifiedLegacyRoundOutcomeStorage) for entry in self.sealed)):
-            raise ValueError("complete outcome storage requires typed matching inventories")
-        round_sources = {dict(source.fields)["round_id"]: source for source in self.rounds.rounds}
-        receipt_sources = {(dict(source.fields)["namespace"], dict(source.fields)["key"]): source
-                           for source in self.receipts.receipts}
-        if any((dict(source.fields)["closure_json"] is None) != (dict(source.fields)["outcome_json"] is None)
-               for source in self.rounds.rounds):
-            raise ValueError("complete outcome storage has a partially sealed round")
-        closed_ids = {round_id for round_id, source in round_sources.items()
-                      if dict(source.fields)["outcome_json"] is not None}
-        proof_ids = [entry.facts.plan.round.round_id for entry in self.sealed]
-        outcome_receipt_ids = {key for namespace, key in receipt_sources if namespace == "review-round-outcome"}
-        if (len(set(proof_ids)) != len(proof_ids)
-                or set(proof_ids) != closed_ids or outcome_receipt_ids != closed_ids
-                or any(dict(source.fields)["key"] not in closed_ids
-                       or dict(source.fields)["reusable_after"] is not None
-                       for source in self.receipts.receipts)
-                or any(entry.round_source != round_sources[round_id]
-                       or entry.receipt_source != receipt_sources[("review-round-outcome", round_id)]
-                       for round_id, entry in zip(proof_ids, self.sealed, strict=True))):
-            raise ValueError("complete outcome storage leaves a round or receipt unaccounted for")
-        productivity_names = {"review-round-stale-productivity", "review-round-superseded-productivity",
-                              "review-round-ceiling-productivity"}
-        names_by_round: dict[str, set[str]] = {}
-        for namespace, key in receipt_sources:
-            names_by_round.setdefault(key, set()).add(namespace)
-        for entry in self.sealed:
-            round_id = entry.facts.plan.round.round_id
-            names = names_by_round[round_id]
-            deferred = isinstance(finalize_review_round(entry.facts), DeferredReviewPreparation)
-            productive = isinstance(entry.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
-            if (("review-round-preparation" in names) != deferred
-                    or len(names & productivity_names) > 1
-                    or (not productive and bool(names & productivity_names))):
-                raise ValueError("complete outcome storage has contradictory auxiliary receipts")
-        object.__setattr__(self, "_sealed_by_id", MappingProxyType(dict(zip(proof_ids, self.sealed, strict=True))))
-        object.__setattr__(self, "_receipt_by_key", MappingProxyType(receipt_sources))
-        object.__setattr__(self, "_receipt_names_by_round", MappingProxyType(
-            {round_id: frozenset(names) for round_id, names in names_by_round.items()},
-        ))
-
-    @property
-    def repository(self) -> str:
-        return self.rounds.repository
-
-    @property
-    def source_digest(self) -> str:
-        parts = (self.rounds.source_digest, self.receipts.source_digest)
-        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class BlockedLegacyRoundOutcomeStorage:
-    repository: str
-    reason: str
-    source_rowid: int | None = None
-
-    def __post_init__(self) -> None:
-        if canonical_workflow_repository(self.repository) != self.repository:
-            raise ValueError("blocked outcome storage requires a canonical repository")
-        validate_workflow_text(self.reason, "blocked outcome storage reason")
-        if self.source_rowid is not None:
-            _rowid(self.source_rowid, "blocked outcome storage cursor")
-
-
-@dataclass(frozen=True)
-class BlockedLegacySubmissionSettlementStorage:
-    repository: str
-    reason: str
-    source_rowid: int | None = None
-
-    def __post_init__(self) -> None:
-        if canonical_workflow_repository(self.repository) != self.repository:
-            raise ValueError("blocked settlement storage requires a canonical repository")
-        validate_workflow_text(self.reason, "blocked settlement storage reason")
-        if self.source_rowid is not None:
-            _rowid(self.source_rowid, "blocked settlement storage cursor")
-
-
 MAX_LEGACY_REVIEW_OWNERS = 64
 
 
@@ -1373,262 +1217,6 @@ class UnreadableLegacyReviewOwnerLineage:
             _rowid(self.source_rowid, "unreadable retired owner cursor")
 
 
-def _source_digest(value: str, name: str) -> None:
-    if not isinstance(value, str) or len(value) != 64 or any(char not in "0123456789abcdef" for char in value):
-        raise ValueError(f"{name} must be a SHA-256 digest")
-
-
-@dataclass(frozen=True)
-class VerifiedLegacyRecordedReview:
-    """A plain recorded baseline; execution productivity and round order remain unproved."""
-
-    source: LegacyReviewSubmissionSource
-    lineage: LegacyReviewOwnerLineage
-    submission: ReviewSubmissionReceipt
-    expected_revision: WorkflowRevision
-    recorded_revision: WorkflowRevision
-    baseline: ReviewedBaseline
-    audit: ObservedTransition
-    recorded_source_digest: str
-    transition_source_digest: str
-    execution_binding: ReviewExecutionBinding | None = None
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.source, LegacyReviewSubmissionSource)
-                or not isinstance(self.lineage, LegacyReviewOwnerLineage)
-                or not isinstance(self.submission, ReviewSubmissionReceipt)
-                or not isinstance(self.expected_revision, WorkflowRevision)
-                or not isinstance(self.recorded_revision, WorkflowRevision)
-                or not isinstance(self.baseline, ReviewedBaseline)
-                or not isinstance(self.audit, ObservedTransition)):
-            raise ValueError("verified recorded review requires typed sources")
-        for name in ("recorded_source_digest", "transition_source_digest"):
-            _source_digest(getattr(self, name), name)
-        if self.execution_binding is not None and not isinstance(self.execution_binding, ReviewExecutionBinding):
-            raise ValueError("recorded review execution binding must be typed")
-        command = dict(self.source.command_fields)
-        effect = dict(self.source.receipt_fields) if self.source.receipt_fields is not None else None
-        binding = self.submission.submission.binding
-        key = binding.fence.key
-        if (self.submission.escalated
-                or not isinstance(key.target, PullRequestRef) or key.repository != self.lineage.repository
-                or command["command_id"] != str(self.submission.submission.command_id)
-                or command["repository"] != key.repository
-                or command["executor_identity"] not in self.lineage.owners
-                or effect is None or effect["status"] != "succeeded"
-                or effect["executor_identity"] != command["executor_identity"]
-                or command["attempt_owner"] != effect["executor_identity"]
-                or effect["remote_object_id"] != self.submission.receipt_id.removeprefix("github-review:")
-                or self.expected_revision.fence != self.recorded_revision.fence
-                or self.expected_revision.version + 1 != self.recorded_revision.version
-                or self.baseline.reviewed_generation != self.recorded_revision.fence.generation
-                or self.baseline.source != self.submission.submission
-                or self.baseline.head_sha != self.submission.head_sha
-                or self.baseline.patch_id != self.submission.patch_id
-                or (self.execution_binding is not None
-                    and self.execution_binding.rejection != self.submission.submission.binding)
-                or self.audit.evidence_ids != (str(self.submission.submission.command_id), self.submission.receipt_id)):
-            raise ValueError("legacy sources do not prove one plain recorded baseline")
-
-    @property
-    def source_digest(self) -> str:
-        parts = (self.source.source_digest, self.lineage.source_digest,
-                 self.recorded_source_digest, self.transition_source_digest)
-        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class UnverifiedLegacyRecordedReview:
-    command_id: str
-    reason: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.command_id, "unverified review command")
-        validate_workflow_text(self.reason, "unverified recorded review reason")
-
-
-@dataclass(frozen=True)
-class VerifiedReviewSubmissionRoundLink:
-    """One SQL-backed command-to-round link; kind and productivity remain unproved."""
-
-    source: LegacyReviewSubmissionSource
-    lineage: LegacyReviewOwnerLineage
-    round: ReviewRoundIdentity
-    registration_source_digest: str
-    index_source_digest: str
-    preflight_source_digest: str
-    stage_sources_digest: str
-    round_source_digest: str
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.source, LegacyReviewSubmissionSource)
-                or not isinstance(self.lineage, LegacyReviewOwnerLineage)
-                or not isinstance(self.round, ReviewRoundIdentity)):
-            raise ValueError("verified review round link requires typed sources")
-        for name in ("registration_source_digest", "index_source_digest",
-                     "preflight_source_digest", "stage_sources_digest", "round_source_digest"):
-            _source_digest(getattr(self, name), name)
-        command = dict(self.source.command_fields)
-        key = self.round.binding.rejection.fence.key
-        if (command["repository"] != self.lineage.repository
-                or key.repository != self.lineage.repository
-                or not isinstance(key.target, PullRequestRef)
-                or command["target"] != f"pr:{key.target.number}"
-                or command["executor_identity"] not in self.lineage.owners):
-            raise ValueError("review submission sources do not prove one round link")
-
-    @property
-    def source_digest(self) -> str:
-        parts = (self.source.source_digest, self.lineage.source_digest,
-                 self.registration_source_digest, self.index_source_digest,
-                 self.preflight_source_digest, self.stage_sources_digest, self.round_source_digest)
-        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class UnverifiedReviewSubmissionRoundLink:
-    command_id: str
-    reason: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.command_id, "unverified review command")
-        validate_workflow_text(self.reason, "unverified review round link reason")
-
-
-@dataclass(frozen=True)
-class VerifiedLegacyPlainProductiveRound:
-    """One confirmed plain verdict has a sealed outcome and recorded baseline."""
-
-    complete_storage: CompleteLegacyRoundOutcomeStorage
-    storage: VerifiedLegacyRoundOutcomeStorage
-    link: VerifiedReviewSubmissionRoundLink
-    baseline: VerifiedLegacyRecordedReview
-    effect_receipt_id: str
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.complete_storage, CompleteLegacyRoundOutcomeStorage)
-                or not isinstance(self.storage, VerifiedLegacyRoundOutcomeStorage)
-                or not isinstance(self.link, VerifiedReviewSubmissionRoundLink)
-                or not isinstance(self.baseline, VerifiedLegacyRecordedReview)):
-            raise ValueError("plain productive round requires typed source proofs")
-        validate_workflow_identifier(self.effect_receipt_id, "productive effect receipt identity")
-        round_id = self.storage.outcome.round.round_id
-        auxiliary = {"review-round-stale-productivity", "review-round-superseded-productivity",
-                     "review-round-ceiling-productivity"}
-        conflicting_receipts = bool(self.complete_storage._receipt_names_by_round.get(round_id, frozenset())
-                                    & auxiliary)
-        confirmed = tuple(item for item in self.storage.facts.submissions
-                          if isinstance(item.result, ReviewSubmissionConfirmed))
-        disposition = self.storage.outcome.disposition
-        if (self.complete_storage._sealed_by_id.get(round_id) != self.storage or conflicting_receipts
-                or len(confirmed) != 1 or not isinstance(disposition, (PaidReviewProgress, CopiedReviewProgress))
-                or self.storage.outcome.round != self.link.round
-                or self.link.source != self.baseline.source or self.link.lineage != self.baseline.lineage
-                or str(confirmed[0].plan.command_id) != dict(self.link.source.command_fields)["command_id"]
-                or confirmed[0].result.receipt_id != disposition.submission_receipt
-                or confirmed[0].result.receipt_id != self.effect_receipt_id
-                or confirmed[0].plan.kind is not (
-                    ReviewSubmissionKind.PAID if isinstance(disposition, PaidReviewProgress)
-                    else ReviewSubmissionKind.COPIED
-                )
-                or self.baseline.recorded_revision.fence != self.link.round.binding.rejection.fence
-                or self.baseline.execution_binding != self.link.round.binding):
-            raise ValueError("plain productive round has contradictory submission evidence")
-
-    @property
-    def source_digest(self) -> str:
-        parts = (self.complete_storage.source_digest, self.storage.source_digest,
-                 self.link.source_digest, self.baseline.source_digest,
-                 self.effect_receipt_id)
-        return hashlib.sha256(json.dumps(parts, separators=(",", ":")).encode()).hexdigest()
-
-
-@dataclass(frozen=True)
-class OpenLegacyOrderedRound:
-    round: ReviewRoundIdentity
-
-    def __post_init__(self) -> None:
-        if not isinstance(self.round, ReviewRoundIdentity):
-            raise ValueError("open ordered round requires its identity")
-
-
-@dataclass(frozen=True)
-class FinalizedLegacyUnproductiveRound:
-    outcome: ReviewRoundOutcome
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.outcome, ReviewRoundOutcome)
-                or isinstance(self.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))):
-            raise ValueError("unproductive ordered round requires a nonproductive outcome")
-
-    @property
-    def round(self) -> ReviewRoundIdentity:
-        return self.outcome.round
-
-
-@dataclass(frozen=True)
-class FinalizedLegacyProductiveRound:
-    outcome: ReviewRoundOutcome
-    command_id: CommandId
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.outcome, ReviewRoundOutcome)
-                or not isinstance(self.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
-                or not isinstance(self.command_id, str)):
-            raise ValueError("productive ordered round requires a confirmed command and outcome")
-        validate_workflow_identifier(self.command_id, "productive ordered command")
-
-    @property
-    def round(self) -> ReviewRoundIdentity:
-        return self.outcome.round
-
-
-LegacyOrderedRound = OpenLegacyOrderedRound | FinalizedLegacyUnproductiveRound | FinalizedLegacyProductiveRound
-
-
-@dataclass(frozen=True)
-class LegacyOrderedExecutionEpisode:
-    """Every allocated round in one uncompacted episode, in preflight order."""
-
-    rounds: tuple[LegacyOrderedRound, ...]
-
-    def __post_init__(self) -> None:
-        if (not isinstance(self.rounds, tuple) or not self.rounds
-                or len(self.rounds) > MAX_LEGACY_ROUND_INVENTORY_ROWS
-                or any(not isinstance(item, (
-                    OpenLegacyOrderedRound, FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound,
-                )) for item in self.rounds)):
-            raise ValueError("ordered execution requires bounded typed rounds")
-        identities = tuple(item.round for item in self.rounds)
-        first = identities[0]
-        if (tuple(round_.sequence for round_ in identities) != tuple(range(1, len(identities) + 1))
-                or len({round_.round_id for round_ in identities}) != len(identities)
-                or any(not same_execution_episode(first.binding, round_.binding) for round_ in identities)
-                or tuple(round_.binding.rejection.fence.generation for round_ in identities)
-                != tuple(sorted(round_.binding.rejection.fence.generation for round_ in identities))):
-            raise ValueError("ordered execution has a gap, duplicate or crossed episode")
-
-    @property
-    def latest_productive_outcome_sequence(self) -> int:
-        return max((item.round.sequence for item in self.rounds
-                    if isinstance(item, FinalizedLegacyProductiveRound)), default=0)
-
-    @property
-    def outcomes(self) -> tuple[ReviewRoundOutcome, ...]:
-        return tuple(item.outcome for item in self.rounds
-                     if isinstance(item, (FinalizedLegacyUnproductiveRound, FinalizedLegacyProductiveRound)))
-
-
-@dataclass(frozen=True)
-class UnverifiedLegacyPlainProductiveRound:
-    command_id: str
-    reason: str
-
-    def __post_init__(self) -> None:
-        validate_workflow_identifier(self.command_id, "unverified productive review command")
-        validate_workflow_text(self.reason, "unverified productive review reason")
-
-
 @dataclass(frozen=True)
 class LegacyReviewRunNoDeath:
     source: LegacyExecutionRunRecord
@@ -1655,7 +1243,7 @@ class AttributedLegacyReviewDeath:
             raise ValueError("review death requires a valid signed counter key")
         if self.counter_key < 0 and self.counter_key != -self.pr:
             raise ValueError("negative review death counter must name its PR")
-        if _dispatch_identity(self.source) != (self.repository, self.pr, self.counter_key):
+        if legacy_review_dispatch_identity(self.source) != (self.repository, self.pr, self.counter_key):
             raise ValueError("review death attribution disagrees with its source")
 
 
@@ -1683,10 +1271,10 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
 
 
 def _reject_nonfinite(value: str) -> object:
-    raise ValueError(f"nonfinite dispatch value: {value}")
+    raise ValueError(f"nonfinite dispatch value {value}")
 
 
-def _dispatch_identity(source: LegacyExecutionRunRecord) -> tuple[str, int, int] | str:
+def legacy_review_dispatch_identity(source: LegacyExecutionRunRecord) -> tuple[str, int, int] | str:
     try:
         payload = json.loads(
             source.dispatch_id, object_pairs_hook=_unique_object,
@@ -1728,7 +1316,7 @@ def classify_legacy_review_death(source: LegacyExecutionRunRecord) -> LegacyRevi
         raise ValueError("review death classification requires a typed run source")
     if source.state is not LegacyReviewRunState.ABANDONED:
         return LegacyReviewRunNoDeath(source)
-    identity = _dispatch_identity(source)
+    identity = legacy_review_dispatch_identity(source)
     if isinstance(identity, str):
         return UnattributedLegacyReviewDeath(source, identity)
     return AttributedLegacyReviewDeath(source, *identity)

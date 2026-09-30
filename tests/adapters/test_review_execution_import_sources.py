@@ -10,12 +10,11 @@ import pytest
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.deployment_authority import deployment_effect_authority
 from issue_agent.adapters.review_execution_activation import (
-    CompleteLegacyExecutionRootFiles, CompleteLegacySubmissionSettlementStorage,
+    CompleteLegacyExecutionRootFiles,
     read_complete_legacy_execution_root_files, read_complete_legacy_review_generation_receipts,
     read_complete_legacy_review_outcome_receipts, read_complete_legacy_review_rounds,
     read_complete_legacy_review_runs, read_complete_legacy_review_submission_receipts,
     read_complete_legacy_review_submissions, read_legacy_review_owner_lineage,
-    verify_complete_legacy_round_outcome_storage, verify_complete_legacy_submission_settlement_storage,
 )
 from issue_agent.adapters.review_execution_counter_links import read_complete_legacy_open_counter_links
 from issue_agent.adapters.workflow_codec import encode_workflow
@@ -285,13 +284,10 @@ def _observed_sql_sources(control):
         receipts = read_complete_legacy_review_submission_receipts(db, "o/r")
         rounds = read_complete_legacy_review_rounds(db, "o/r")
         outcomes = read_complete_legacy_review_outcome_receipts(db, "o/r")
-        round_storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcomes)
-        settlement = verify_complete_legacy_submission_settlement_storage(db, commands, receipts, round_storage)
         generation = read_complete_legacy_review_generation_receipts(db, "o/r")
         assert isinstance(runs, CompleteLegacyReviewRuns)
-        assert isinstance(settlement, CompleteLegacySubmissionSettlementStorage)
         assert isinstance(generation, CompleteLegacyReviewGenerationReceipts)
-    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
+    return ObservedLegacyExecutionSqlImportSources(runs, commands, receipts, rounds, outcomes, generation)
 
 
 def _record_abandoned_run(control, run_id: str, owner: str, dispatch_id: str):
@@ -349,8 +345,8 @@ def test_sql_import_sources_match_one_real_registered_command(rig, tmp_path):
             result = verify_legacy_execution_import_sources(
                 db, held, observed, writer=WRITER, configured_prior_owners=(),
             )
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "target-scoped R1" in result.reason
+    assert isinstance(result, RevalidatedLegacyExecutionImportSources)
+    assert dict(result.sql.commands.submissions[0].command_fields)["command_id"] == command.command_id
 
 
 def test_sql_import_sources_block_a_new_unregistered_review_command(sources):
@@ -390,8 +386,10 @@ def test_sql_import_source_result_carries_current_and_predecessor_deaths_separat
             result = verify_legacy_execution_import_sources(
                 db, held, observed, writer=WRITER, configured_prior_owners=(),
             )
-            assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-            assert "target-scoped R1" in result.reason
+            assert isinstance(result, RevalidatedLegacyExecutionImportSources)
+            debit = next(item for item in result.deaths.debits if item.pr == 9)
+            assert [item.source.run_id for item in debit.current_owner_runs] == ["current-run"]
+            assert [item.source.run_id for item in debit.predecessor_runs] == ["prior-run"]
     assert [run.run_id for run in observed.runs.runs] == ["current-run", "prior-run"]
 
 
@@ -408,7 +406,7 @@ def test_sql_import_source_verification_blocks_unknown_abandoned_run(sources):
             )
 
     assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "target-scoped R1" in result.reason
+    assert "opaque-run is unattributed" in result.reason
 
 
 @pytest.mark.parametrize("change", ("lineage", "settlement", "generation"))

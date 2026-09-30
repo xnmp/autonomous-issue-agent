@@ -1,4 +1,4 @@
-"""Bounded SQL proof for a previously committed empty review execution import."""
+"""Exact SQL retry of a mixed import; later unrelated history is not re-audited."""
 
 from __future__ import annotations
 
@@ -9,22 +9,24 @@ import sqlite3
 from ..domain.review_activation import MAX_IMPORTED_PULL_REQUESTS
 from ..domain.review_execution import (
     CurrentReviewExecution, ImportedReviewExecutionOriginReceipt,
-    ReviewExecutionOriginKind, same_execution_episode,
+    BlockedReviewExecutionMigration, same_execution_episode,
 )
-from ..domain.review_execution_import_plan import EmptyReviewExecutionImportPlan
-from ..domain.workflow_identity import MAX_WORKFLOW_GATES, PullRequestRef, WorkflowFamily, WorkflowKey
+from ..domain.review_execution_import_plan import ReviewExecutionImportPlan
+from ..domain.workflow_identity import PullRequestRef, WorkflowFamily, WorkflowKey
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, encode_workflow
-from .workflow_rows import WorkflowAuthorityError, load_review_workflow_row
+from .workflow_rows import (
+    WorkflowAuthorityError, load_review_workflow_row, load_review_execution_import_decision,
+    _read_execution_origin,
+)
 
 
 _FAMILY = WorkflowFamily.REVIEW_EXECUTION.value
 _ORIGIN = "review-execution-origin"
-_MAX_COMPONENTS = MAX_IMPORTED_PULL_REQUESTS * 2
 _MAX_SOURCE_BYTES = 64 * 1024 * 1024
 # Four codec payload columns can share one round row; reserve room for identity metadata.
 _SQL_LENGTH_LIMIT = 8 * MAX_WORKFLOW_PAYLOAD_BYTES
 _MAX_GLOBAL_ROWS = 65_536
-_CENSUS_IDENTITIES = {
+_UNPUBLISHED_SCOPE_IDENTITIES = {
     "workflow_authority_epochs": ("repository", "family"),
     "workflow_activation_evidence": ("repository", "family"),
     "workflow_activation_imports": ("repository", "family", "target_kind"),
@@ -113,83 +115,11 @@ def _table(
     return [_read(db, table, columns, item, payload_columns=payload_columns) for item in metadata]
 
 
-def _repository_payload_corpus_bytes(
-    db: sqlite3.Connection, table: str, identity: str, repository: str,
-    *, nullable: bool,
-) -> int:
-    # Count cells the canonical reader may revisit without fetching their bytes.
-    payload_size = (
-        "ifnull(octet_length(payload_json),0)"
-        if sqlite3.sqlite_version_info >= (3, 43, 0)
-        else "ifnull(length(CAST(payload_json AS BLOB)),0)"
-    )
-    identity_size = (
-        f"ifnull(octet_length({identity}),0)"
-        if sqlite3.sqlite_version_info >= (3, 43, 0)
-        else f"ifnull(length(CAST({identity} AS BLOB)),0)"
-    )
-    rows = db.execute(
-        f"SELECT typeof({identity}),{identity}=?,typeof(payload_json),"
-        f"{identity_size},{payload_size} FROM {table} "
-        f"WHERE lower(trim(CAST({identity} AS TEXT)))=lower(?) LIMIT ?",
-        (repository, repository, _MAX_GLOBAL_ROWS + 1),
-    ).fetchall()
-    if len(rows) > _MAX_GLOBAL_ROWS:
-        raise WorkflowAuthorityError(f"review execution import {table} corpus exceeds row bound")
-    total = 0
-    for row in rows:
-        identity_type, exact, payload_type, identity_bytes, payload_bytes = tuple(row)
-        if (identity_type != "text" or exact != 1
-                or type(identity_bytes) is not int or identity_bytes > 512
-                or payload_type not in ({"text", "null"} if nullable else {"text"})
-                or type(payload_bytes) is not int
-                or payload_bytes > MAX_WORKFLOW_PAYLOAD_BYTES):
-            raise WorkflowAuthorityError(f"review execution import {table} corpus source is malformed")
-        total += payload_bytes
-        if total > _MAX_SOURCE_BYTES:
-            raise WorkflowAuthorityError(f"review execution import {table} corpus exceeds byte bound")
-    return total
-
-
-def _latest_intent_source_bytes(
-    db: sqlite3.Connection, repository: str, prs: set[int],
-) -> int:
-    # The canonical reader fetches its latest rearm row as a whole.
-    size = (
-        "octet_length" if sqlite3.sqlite_version_info >= (3, 43, 0)
-        else "length"
-    )
-    def octets(column: str) -> str:
-        return (f"ifnull({size}({column}),0)" if size == "octet_length"
-                else f"ifnull(length(CAST({column} AS BLOB)),0)")
-    query = (
-        "SELECT typeof(intent_json),typeof(actor_json),"
-        f"{octets('intent_json')},{octets('actor_json')} "
-        "FROM workflow_rearms WHERE repository=? AND target_kind='pr' "
-        "AND target_number=? ORDER BY to_generation DESC LIMIT 1"
-    )
-    total = 0
-    for pr in prs:
-        row = db.execute(query, (repository, pr)).fetchone()
-        if row is None:
-            continue
-        intent_type, actor_type, intent_size, actor_size = tuple(row)
-        if (intent_type != "text" or actor_type != "text"
-                or type(intent_size) is not int or type(actor_size) is not int
-                or intent_size > MAX_WORKFLOW_PAYLOAD_BYTES
-                or actor_size > MAX_WORKFLOW_PAYLOAD_BYTES):
-            raise WorkflowAuthorityError("review execution import latest rearm source exceeds bound")
-        total += intent_size + actor_size
-        if total > _MAX_SOURCE_BYTES:
-            raise WorkflowAuthorityError("review execution import rearm sources exceed cumulative bound")
-    return total
-
-
-def _require_bounded_global_census(db: sqlite3.Connection, repository: str) -> None:
+def _require_bounded_unpublished_scope(db: sqlite3.Connection, repository: str) -> None:
     # Indexed SQL equality misses Unicode whitespace and casefold aliases.
     # Limit the global pass, bound every identity cell before fetching it, and
     # compare using the same Python normalization as the domain boundary.
-    for table, columns in _CENSUS_IDENTITIES.items():
+    for table, columns in _UNPUBLISHED_SCOPE_IDENTITIES.items():
         sizes = tuple(
             (f"ifnull(octet_length({column}),0)"
              if sqlite3.sqlite_version_info >= (3, 43, 0)
@@ -248,48 +178,31 @@ def _require_bounded_global_census(db: sqlite3.Connection, repository: str) -> N
 
 
 
-def _verify_committed_empty_review_execution_import(
-    db: sqlite3.Connection, plan: EmptyReviewExecutionImportPlan,
-) -> bool:
-    """Prove an exact historical import without consulting current external sources.
-
-    False is reserved for a wholly absent execution activation and its related
-    SQL records. Once authority exists, every mismatch is a hard conflict.
-    """
-    if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
-        raise ValueError("review execution import replay requires an open SQL transaction")
-    if not isinstance(plan, EmptyReviewExecutionImportPlan):
-        raise ValueError("review execution import replay requires a typed plan")
-    _require_bounded_global_census(db, plan.repository)
+def _verify_committed_review_execution_import(db: sqlite3.Connection, plan: ReviewExecutionImportPlan) -> bool:
     repository = plan.repository
     authority = _table(db, "workflow_authority_epochs",
                        ("repository", "family", "epoch", "source_digest", "inventory_digest", "activated_at"),
                        repository, family=_FAMILY, limit=1)
+    if not authority:
+        # An absent epoch is safe to publish only after the existing whole-scope
+        # identity inventory. Successful retries never revisit that inventory.
+        _require_bounded_unpublished_scope(db, repository)
+        for table, predicate, params in (
+            ("workflow_activation_evidence", "repository=? AND family=?", (repository, _FAMILY)),
+            ("workflow_activation_imports", "repository=? AND family=?", (repository, _FAMILY)),
+            ("workflow_components", "repository=? AND family=?", (repository, _FAMILY)),
+            ("dedupe_keys", "scope=? AND namespace=?", (repository, _ORIGIN)),
+            ("review_execution_rounds", "repository=?", (repository,)),
+        ):
+            if db.execute(f"SELECT 1 FROM {table} WHERE {predicate} LIMIT 1", params).fetchone() is not None:
+                raise WorkflowAuthorityError("absent execution activation retains incompatible authority")
+        return False
     evidence = _table(db, "workflow_activation_evidence",
                       ("repository", "family", "epoch", "ceiling", "plan_digest"),
                       repository, family=_FAMILY, limit=1)
     imports = _table(db, "workflow_activation_imports",
                      ("repository", "family", "epoch", "target_kind", "target_number", "source_digest", "decision_json"),
                      repository, family=_FAMILY, payload_columns=frozenset({"decision_json"}))
-    if sum(len(row[6].encode("utf-8")) for row in imports) > _MAX_SOURCE_BYTES:
-        raise WorkflowAuthorityError("review execution import decisions exceed source byte bound")
-    components = _table(db, "workflow_components",
-                        ("repository", "target_kind", "target_number", "family", "epoch", "episode_id"),
-                        repository, family=_FAMILY, limit=_MAX_COMPONENTS)
-    origins = _table(db, "dedupe_keys",
-                     ("namespace", "scope", "key", "claimed_at", "payload_json"),
-                     repository, namespace=_ORIGIN, limit=_MAX_COMPONENTS,
-                     payload_columns=frozenset({"payload_json"}))
-    if (sum(len(row[6].encode("utf-8")) for row in imports)
-            + sum(len(row[4].encode("utf-8")) for row in origins) > _MAX_SOURCE_BYTES):
-        raise WorkflowAuthorityError("review execution import payloads exceed cumulative byte bound")
-    round_source = db.execute(
-        "SELECT 1 FROM review_execution_rounds "
-        "WHERE lower(trim(CAST(repository AS TEXT)))=lower(?) LIMIT 1",
-        (repository,),
-    ).fetchone()
-    if not any((authority, evidence, imports, components, origins, round_source)):
-        return False
     if len(authority) != 1 or len(evidence) != 1 or len(imports) != len(plan.candidates):
         raise WorkflowAuthorityError("review execution import activation or membership changed")
     activated = authority[0][5]
@@ -297,134 +210,46 @@ def _verify_committed_empty_review_execution_import(
         parsed = datetime.fromisoformat(activated)
     except (TypeError, ValueError) as exc:
         raise WorkflowAuthorityError("review execution import activation time is malformed") from exc
-    if (parsed.tzinfo is None or parsed.utcoffset() is None
-            or parsed < plan.planned_at
-            or authority[0][:5] != (repository, _FAMILY, plan.execution_epoch,
-                                     plan.source_digest, plan.inventory_digest)
+    if (parsed.tzinfo is None or parsed.utcoffset() is None or parsed < plan.planned_at
+            or authority[0][:5] != (repository, _FAMILY, plan.execution_epoch, plan.source_digest, plan.inventory_digest)
             or evidence[0] != (repository, _FAMILY, plan.execution_epoch, 0, plan.plan_digest)):
         raise WorkflowAuthorityError("review execution import activation disagrees with plan")
-
     decisions = plan.decisions_at(plan.planned_at)
-    decision_by_pr = dict(zip(plan.listing.numbers, decisions, strict=True))
-    expected_imports = {
+    expected = {
         candidate.pr: (repository, _FAMILY, plan.execution_epoch, "pr", candidate.pr,
                        plan.source_digest, encode_workflow(decision))
         for candidate, decision in zip(plan.candidates, decisions, strict=True)
     }
-    if (len({row[4] for row in imports}) != len(imports)
-            or any(expected_imports.get(row[4]) != row for row in imports)):
+    if len({row[4] for row in imports}) != len(imports) or any(expected.get(row[4]) != row for row in imports):
         raise WorkflowAuthorityError("review execution import decision or membership changed")
-
-    component_by_pr: dict[int, tuple[object, ...]] = {}
-    for row in components:
-        if (row[:2] != (repository, "pr") or row[3:5] != (_FAMILY, plan.execution_epoch)
-                or row[2] in component_by_pr):
-            raise WorkflowAuthorityError("review execution import component identity changed")
-        component_by_pr[row[2]] = row
-    if not set(expected_imports).issubset(component_by_pr):
-        raise WorkflowAuthorityError("review execution import component is missing")
-
-    workflow_rows = _table(
-        db, "workflows",
-        ("repository", "target_kind", "target_number", "generation", "version", "episode_json"),
-        repository, kind="pr", limit=_MAX_COMPONENTS,
-        payload_columns=frozenset({"episode_json"}),
-    )
-    if (sum(len(row[6].encode("utf-8")) for row in imports)
-            + sum(len(row[4].encode("utf-8")) for row in origins)
-            + sum(len(row[5].encode("utf-8")) for row in workflow_rows) > _MAX_SOURCE_BYTES):
-        raise WorkflowAuthorityError("review execution import workflow sources exceed cumulative byte bound")
-    active_gates = _table(
-        db, "workflow_gates",
-        ("gate_id", "repository", "target_kind", "target_number",
-         "opened_generation", "cause_key", "state", "payload_json"),
-        repository, kind="pr", active_gates=True, limit=_MAX_GLOBAL_ROWS,
-        payload_columns=frozenset({"payload_json"}),
-    )
-    if (sum(len(row[6].encode("utf-8")) for row in imports)
-            + sum(len(row[4].encode("utf-8")) for row in origins)
-            + sum(len(row[5].encode("utf-8")) for row in workflow_rows)
-            + sum(len(row[7].encode("utf-8")) for row in active_gates) > _MAX_SOURCE_BYTES):
-        raise WorkflowAuthorityError("review execution import linked sources exceed cumulative byte bound")
-    gates_by_pr: dict[int, int] = {}
-    for gate in active_gates:
-        if (gate[1:3] != (repository, "pr") or gate[3] not in component_by_pr
-                or gate[6] not in ("open", "rearming")):
-            raise WorkflowAuthorityError("review execution import active gate identity changed")
-        gates_by_pr[gate[3]] = gates_by_pr.get(gate[3], 0) + 1
-        if gates_by_pr[gate[3]] > MAX_WORKFLOW_GATES:
-            raise WorkflowAuthorityError("review execution import active gate count exceeds bound")
-    latest_intent_bytes = _latest_intent_source_bytes(db, repository, set(component_by_pr))
-    dedupe_bytes = _repository_payload_corpus_bytes(
-        db, "dedupe_keys", "scope", repository, nullable=True,
-    )
-    evidence_bytes = _repository_payload_corpus_bytes(
-        db, "workflow_evidence", "repository", repository, nullable=False,
-    )
-    if (latest_intent_bytes + dedupe_bytes + evidence_bytes
-            + sum(len(row[7].encode("utf-8")) for row in active_gates)
-            + sum(len(row[5].encode("utf-8")) for row in workflow_rows)
-            + sum(len(row[6].encode("utf-8")) for row in imports) > _MAX_SOURCE_BYTES):
-        raise WorkflowAuthorityError("review execution import linked sources exceed cumulative byte bound")
-    workflow_numbers = [row[2] for row in workflow_rows]
-    if (any(row[:2] != (repository, "pr") for row in workflow_rows)
-            or len(workflow_numbers) != len(set(workflow_numbers))
-            or set(workflow_numbers) != set(component_by_pr)):
-        raise WorkflowAuthorityError("review execution import workflow membership changed")
-
-    orphan_round = db.execute(
-        "SELECT 1 FROM review_execution_rounds AS r "
-        "WHERE lower(trim(CAST(r.repository AS TEXT)))=lower(?) "
-        "AND (typeof(r.repository)!='text' OR r.repository!=? "
-        "OR typeof(r.target_number)!='integer' OR typeof(r.execution_epoch)!='integer' "
-        "OR NOT EXISTS (SELECT 1 FROM workflow_components AS c "
-        "WHERE c.repository=r.repository AND c.target_kind='pr' "
-        "AND c.target_number=r.target_number AND c.family=? "
-        "AND c.epoch=r.execution_epoch AND c.episode_id=r.execution_episode)) LIMIT 1",
-        (repository, repository, _FAMILY),
-    ).fetchone()
-    if orphan_round is not None:
-        raise WorkflowAuthorityError("review execution import has an orphan round")
-
-    expected_origins: dict[str, tuple[object, ...]] = {}
-    for decision in decisions:
+    for candidate, decision in zip(plan.candidates, decisions, strict=True):
+        key = WorkflowKey(repository, PullRequestRef(candidate.pr))
+        if load_review_execution_import_decision(db, key) != decision:
+            raise WorkflowAuthorityError("review execution original target decision changed")
+        snapshot = load_review_workflow_row(db, key)
+        if isinstance(decision, BlockedReviewExecutionMigration):
+            if snapshot is None or snapshot.execution != decision:
+                raise WorkflowAuthorityError("review execution migration blocker changed")
+            continue
+        if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
+            raise WorkflowAuthorityError("review execution import current authority is absent")
+        execution = snapshot.execution
+        if (execution.origin != decision.origin
+                or not same_execution_episode(execution.binding, decision.checkpoint.state.binding)):
+            raise WorkflowAuthorityError("review execution import ancestry changed")
         encoded = encode_workflow(decision)
         receipt = ImportedReviewExecutionOriginReceipt(
             decision.origin, decision.checkpoint, plan.plan_digest, plan.source_digest,
             plan.inventory_digest, hashlib.sha256(encoded.encode()).hexdigest(),
         )
-        expected_origins[decision.origin.evidence_id] = (
-            _ORIGIN, repository, decision.origin.evidence_id, activated, encode_workflow(receipt),
-        )
-    origin_by_id = {row[2]: row for row in origins}
-    if len(origin_by_id) != len(origins) or any(
-        origin_by_id.get(key) != value for key, value in expected_origins.items()
-    ):
-        raise WorkflowAuthorityError("review execution import origin receipt changed")
-
-    seen_origin_ids: set[str] = set()
-    for pr, component in component_by_pr.items():
-        snapshot = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
-        if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
-            raise WorkflowAuthorityError("review execution import current authority is absent")
-        execution = snapshot.execution
-        if component[5] != execution.binding.execution_episode:
-            raise WorkflowAuthorityError("review execution import component disagrees with workflow")
-        seen_origin_ids.add(execution.origin.evidence_id)
-        if pr in expected_imports:
-            decision = decision_by_pr[pr]
-            if (execution.origin != decision.origin
-                    or not same_execution_episode(execution.binding, decision.checkpoint.state.binding)):
-                raise WorkflowAuthorityError("review execution import ancestry changed")
-        elif execution.origin.kind is not ReviewExecutionOriginKind.INITIALIZED:
-            raise WorkflowAuthorityError("review execution import has an unplanned imported component")
-    if seen_origin_ids != set(origin_by_id):
-        raise WorkflowAuthorityError("review execution import has a missing or extra origin")
+        stored, claimed_at = _read_execution_origin(db, (repository, "pr", candidate.pr), execution)
+        if stored != receipt or claimed_at != parsed:
+            raise WorkflowAuthorityError("review execution import origin receipt changed")
     return True
 
 
-def verify_committed_empty_review_execution_import(
-    db: sqlite3.Connection, plan: EmptyReviewExecutionImportPlan,
+def verify_committed_review_execution_import(
+    db: sqlite3.Connection, plan: ReviewExecutionImportPlan,
 ) -> bool:
     """Prove a committed import with a temporary SQLite row/value read ceiling.
 
@@ -433,7 +258,7 @@ def verify_committed_empty_review_execution_import(
     """
     if not isinstance(db, sqlite3.Connection) or not db.in_transaction:
         raise ValueError("review execution import replay requires an open SQL transaction")
-    if not isinstance(plan, EmptyReviewExecutionImportPlan):
+    if not isinstance(plan, ReviewExecutionImportPlan):
         raise ValueError("review execution import replay requires a typed plan")
     getlimit = getattr(db, "getlimit", None)
     setlimit = getattr(db, "setlimit", None)
@@ -449,7 +274,7 @@ def verify_committed_empty_review_execution_import(
         raise WorkflowAuthorityError("review execution import SQL length guard is unavailable") from exc
     try:
         try:
-            return _verify_committed_empty_review_execution_import(db, plan)
+            return _verify_committed_review_execution_import(db, plan)
         except sqlite3.Error as exc:
             raise WorkflowAuthorityError("review execution import SQL source exceeds length guard or is unreadable") from exc
     finally:

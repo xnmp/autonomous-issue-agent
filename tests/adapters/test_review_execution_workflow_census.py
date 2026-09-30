@@ -51,7 +51,7 @@ def test_census_returns_every_canonical_open_pr_and_is_read_only(tmp_path):
     assert len(result.source_digest) == 64
 
 
-def test_missing_or_terminal_row_refuses_membership(tmp_path):
+def test_missing_open_row_refuses_and_terminal_row_is_retained(tmp_path):
     store = _store(tmp_path)
     with store.transaction() as db:
         _add(db, 7)
@@ -61,8 +61,9 @@ def test_missing_or_terminal_row_refuses_membership(tmp_path):
 
     assert isinstance(missing, BlockedRetainedReviewWorkflows)
     assert "missing=(8,)" in missing.reason
-    assert isinstance(terminal, BlockedRetainedReviewWorkflows)
-    assert "terminal_or_extra=(7,)" in terminal.reason
+    assert isinstance(terminal, CompleteRetainedReviewWorkflows)
+    assert terminal.listing.numbers == ()
+    assert tuple(item.snapshot.revision.fence.key.target.number for item in terminal.sources) == (7,)
 
 
 def test_blob_and_case_aliases_block_instead_of_being_skipped(tmp_path):

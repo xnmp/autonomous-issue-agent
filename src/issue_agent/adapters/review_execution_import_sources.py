@@ -10,12 +10,13 @@ import hashlib
 import json
 import os
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime
 
 from ..domain.review_execution_activation import (
     BlockedLegacyReviewGenerationReceipts, BlockedLegacyReviewRuns,
-    BlockedLegacySubmissionSettlementStorage, CompleteLegacyReviewGenerationReceipts,
-    CompleteLegacyReviewRuns,
+    CompleteLegacyReviewGenerationReceipts, CompleteLegacyReviewRuns,
+    CompleteLegacyReviewSubmissions, CompleteLegacyReviewSubmissionReceipts,
+    CompleteLegacyReviewRounds, CompleteLegacyReviewOutcomeReceipts,
 )
 from ..domain.review_execution_counter_mapping import (
     BlockedLegacyCounterMapping, BlockedLegacyOpenCounterLinks, CompleteLegacyCounterMapping,
@@ -31,10 +32,12 @@ from .deployment_authority import deployment_effect_barrier
 from .resolve_activation import LegacyRoots
 from .review_execution_activation import (
     BlockedLegacyExecutionFileValues, CompleteLegacyExecutionRootFiles,
-    CompleteLegacySubmissionSettlementStorage, revalidate_complete_legacy_execution_file_values,
+    revalidate_complete_legacy_execution_file_values,
     has_unattributed_historical_review_files,
     revalidate_complete_legacy_review_generation_receipts, revalidate_complete_legacy_review_runs,
-    select_legacy_review_execution_files, verify_complete_legacy_submission_settlement_storage,
+    select_legacy_review_execution_files, read_complete_legacy_review_submissions,
+    read_complete_legacy_review_submission_receipts, read_complete_legacy_review_rounds,
+    read_complete_legacy_review_outcome_receipts,
 )
 from .review_execution_counter_links import revalidate_complete_legacy_open_counter_links
 from .workflow_codec import encode_workflow
@@ -166,15 +169,22 @@ class ObservedLegacyExecutionSqlImportSources:
     """Caller-held complete SQL inventories; no activation authority yet."""
 
     runs: CompleteLegacyReviewRuns
-    settlement: CompleteLegacySubmissionSettlementStorage
+    commands: CompleteLegacyReviewSubmissions
+    receipts: CompleteLegacyReviewSubmissionReceipts
+    rounds: CompleteLegacyReviewRounds
+    outcomes: CompleteLegacyReviewOutcomeReceipts
     generation: CompleteLegacyReviewGenerationReceipts
 
     def __post_init__(self) -> None:
         if (not isinstance(self.runs, CompleteLegacyReviewRuns)
-                or not isinstance(self.settlement, CompleteLegacySubmissionSettlementStorage)
+                or not isinstance(self.commands, CompleteLegacyReviewSubmissions)
+                or not isinstance(self.receipts, CompleteLegacyReviewSubmissionReceipts)
+                or not isinstance(self.rounds, CompleteLegacyReviewRounds)
+                or not isinstance(self.outcomes, CompleteLegacyReviewOutcomeReceipts)
                 or not isinstance(self.generation, CompleteLegacyReviewGenerationReceipts)
-                or len({self.runs.lineage.repository, self.settlement.repository,
-                         self.generation.repository}) != 1):
+                or len({self.runs.lineage.repository, self.commands.repository,
+                         self.receipts.repository, self.rounds.repository,
+                         self.outcomes.repository, self.generation.repository}) != 1):
             raise ValueError("SQL import sources require complete same-repository inventories")
 
     @property
@@ -183,8 +193,9 @@ class ObservedLegacyExecutionSqlImportSources:
 
     @property
     def source_digest(self) -> str:
-        source = (self.runs.source_digest, self.settlement.source_digest,
-                  self.generation.source_digest)
+        source = (self.runs.source_digest, self.commands.source_digest,
+                  self.receipts.source_digest, self.rounds.source_digest,
+                  self.outcomes.source_digest, self.generation.source_digest)
         return hashlib.sha256(json.dumps(source, separators=(",", ":")).encode()).hexdigest()
 
 
@@ -248,10 +259,6 @@ def verify_legacy_execution_import_sources(
                 not isinstance(now, datetime) or now.tzinfo is None or now.utcoffset() is None
             )):
         raise ValueError("execution import source verification requires configured review ownership")
-    # The source clock remains part of the stopped operator contract.
-    audit_time = datetime.now(timezone.utc)
-    if now is not None and now > audit_time:
-        audit_time = now
     control_path = _held_control_path(counters)
     if control_path is None:
         return BlockedLegacyExecutionSqlImportSources("execution import source barriers are no longer held")
@@ -268,30 +275,23 @@ def verify_legacy_execution_import_sources(
     if (writer.repository != observed.repository or writer.owner_id != lineage.current_owner
             or configured_prior_owners != lineage.configured_prior_owners):
         return BlockedLegacyExecutionSqlImportSources("execution import owner lineage differs from configuration")
-    unsupported = tuple(kind for kind, values in (
-        ("runs", observed.runs.runs), ("commands", observed.settlement.commands.submissions),
-        ("submission receipts", observed.settlement.receipts.receipts),
-        ("rounds", observed.settlement.round_storage.rounds.rounds),
-        ("generation receipts", observed.generation.receipts),
-    ) if values)
-    if unsupported:
-        return BlockedLegacyExecutionSqlImportSources(
-            f"recorded review {', '.join(unsupported)} require target-scoped R1 assessment; "
-            "retired membership certificates grant no import authority",
-        )
     runs = revalidate_complete_legacy_review_runs(db, observed.runs)
     if isinstance(runs, BlockedLegacyReviewRuns):
         return BlockedLegacyExecutionSqlImportSources(runs.reason)
-    settlement = verify_complete_legacy_submission_settlement_storage(
-        db, observed.settlement.commands, observed.settlement.receipts,
-        observed.settlement.round_storage,
+    raw_sets = (
+        (read_complete_legacy_review_submissions(db, observed.repository), CompleteLegacyReviewSubmissions),
+        (read_complete_legacy_review_submission_receipts(db, observed.repository), CompleteLegacyReviewSubmissionReceipts),
+        (read_complete_legacy_review_rounds(db, observed.repository), CompleteLegacyReviewRounds),
+        (read_complete_legacy_review_outcome_receipts(db, observed.repository), CompleteLegacyReviewOutcomeReceipts),
     )
-    if isinstance(settlement, BlockedLegacySubmissionSettlementStorage):
-        return BlockedLegacyExecutionSqlImportSources(settlement.reason)
+    for current_set, expected_type in raw_sets:
+        if not isinstance(current_set, expected_type):
+            return BlockedLegacyExecutionSqlImportSources(current_set.reason)
+    commands, receipts, rounds, outcomes = (item for item, _ in raw_sets)
     generation = revalidate_complete_legacy_review_generation_receipts(db, observed.generation)
     if isinstance(generation, BlockedLegacyReviewGenerationReceipts):
         return BlockedLegacyExecutionSqlImportSources(generation.reason)
-    current = ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
+    current = ObservedLegacyExecutionSqlImportSources(runs, commands, receipts, rounds, outcomes, generation)
     if current != observed or current.source_digest != observed.source_digest:
         return BlockedLegacyExecutionSqlImportSources("execution SQL sources changed after inventory")
     deaths = attribute_complete_legacy_review_deaths(runs, counters.mapping)

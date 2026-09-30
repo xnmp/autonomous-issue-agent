@@ -12,12 +12,15 @@ from issue_agent.adapters.control_path import control_store_path
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.resolve_activation import distinct_roots
 from issue_agent.adapters.review_execution_activation import (
-    CompleteLegacyExecutionRootFiles, CompleteLegacySubmissionSettlementStorage,
-    read_complete_legacy_execution_root_files, read_complete_legacy_review_generation_receipts,
-    read_complete_legacy_review_outcome_receipts, read_complete_legacy_review_rounds,
-    read_complete_legacy_review_runs, read_complete_legacy_review_submission_receipts,
-    read_complete_legacy_review_submissions, read_legacy_review_owner_lineage,
-    verify_complete_legacy_round_outcome_storage, verify_complete_legacy_submission_settlement_storage,
+    CompleteLegacyExecutionRootFiles,
+    read_complete_legacy_execution_root_files,
+    read_complete_legacy_review_generation_receipts,
+    read_complete_legacy_review_outcome_receipts,
+    read_complete_legacy_review_rounds,
+    read_complete_legacy_review_runs,
+    read_complete_legacy_review_submission_receipts,
+    read_complete_legacy_review_submissions,
+    read_legacy_review_owner_lineage,
 )
 from issue_agent.adapters.review_execution_counter_links import read_complete_legacy_open_counter_links
 from issue_agent.adapters.review_execution_import_sources import ObservedLegacyExecutionSqlImportSources
@@ -80,11 +83,8 @@ def _sql_sources(cfg, control):
         receipts = read_complete_legacy_review_submission_receipts(db, cfg.repo)
         rounds = read_complete_legacy_review_rounds(db, cfg.repo)
         outcomes = read_complete_legacy_review_outcome_receipts(db, cfg.repo)
-        storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcomes)
-        settlement = verify_complete_legacy_submission_settlement_storage(db, commands, receipts, storage)
         generation = read_complete_legacy_review_generation_receipts(db, cfg.repo)
-    assert isinstance(settlement, CompleteLegacySubmissionSettlementStorage)
-    return ObservedLegacyExecutionSqlImportSources(runs, settlement, generation)
+    return ObservedLegacyExecutionSqlImportSources(runs, commands, receipts, rounds, outcomes, generation)
 
 
 @pytest.fixture
@@ -300,3 +300,131 @@ def test_shared_role_root_accepts_the_complete_reviewed_representation(rig, dedu
     assert not activation.activate(plan, files, links, sql).idempotent
     gateway.unavailable = True
     assert activation.activate(plan, files, links, sql).idempotent
+
+
+def test_mixed_activation_keeps_blocker_on_rediscovery_and_sql_only_retry(rig):
+    from pathlib import Path
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.review_execution import BlockedReviewExecutionMigration, CurrentReviewExecution
+    cfg, control, gateway, _, _, links, sql, _, activation = rig
+    (Path(cfg.review_state_dir) / "pr-9.round").write_text("3")
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
+                                                      ("steward", cfg.steward_state_dir)))
+    plan = activation.plan(files, links, sql)
+    assert tuple(candidate.pr for candidate in plan.candidates) == (9, 10)
+    assert not activation.activate(plan, files, links, sql).idempotent
+    writer = WorkflowWriter(cfg.repo, "review", owner_identity_for_target(cfg.repo, cfg.target_dir, "review"))
+    workflow = SQLiteReviewWorkflowControl(control, writer, gateway=gateway, ceiling=5,
+                                          trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"))
+    key = WorkflowKey(cfg.repo, PullRequestRef(9))
+    observed = workflow.ensure_observed_workflow(key)
+    assert isinstance(observed.snapshot.execution, BlockedReviewExecutionMigration)
+    with control.transaction() as db:
+        clean = load_review_workflow_row(db, WorkflowKey(cfg.repo, PullRequestRef(10)))
+        assert isinstance(clean.execution, CurrentReviewExecution)
+        assert db.execute("SELECT COUNT(*) FROM workflow_components WHERE family='review_execution'").fetchone()[0] == 1
+    before = _dump(control)
+    gateway.unavailable = True
+    assert activation.activate(plan, None, None, None).idempotent
+    assert _dump(control) == before
+
+
+def test_terminal_file_blocker_survives_later_first_discovery(rig):
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.domain.review_execution_migration import BlockedReviewExecutionMigration
+    from issue_agent.domain.review_preflight import require_review_execution_eligibility
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    cfg, control, gateway, _, _, links, sql, _, activation = rig
+    Path(cfg.review_state_dir, "pr-11.round").write_text("4")
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
+                                                      ("steward", cfg.steward_state_dir)))
+    plan = activation.plan(files, links, sql)
+    assert tuple(candidate.pr for candidate in plan.candidates) == (9, 10, 11)
+    assert not activation.activate(plan, files, links, sql).idempotent
+    key = WorkflowKey(cfg.repo, PullRequestRef(11))
+    with control.transaction() as db:
+        assert isinstance(load_review_workflow_row(db, key).execution, BlockedReviewExecutionMigration)
+    gateway.views[11] = PRView(11, head_ref_name="work/11", head_ref_oid="b" * 40,
+                              labels=frozenset({Label.AI_PR_OPEN}))
+    gateway.reviews[11] = CompleteReviews(())
+    writer = WorkflowWriter(cfg.repo, "review", owner_identity_for_target(cfg.repo, cfg.target_dir, "review"))
+    workflow = SQLiteReviewWorkflowControl(control, writer, gateway=gateway, ceiling=5,
+                                          trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"))
+    snapshot = workflow.ensure_observed_workflow(key).snapshot
+    assert isinstance(snapshot.execution, BlockedReviewExecutionMigration)
+    assert snapshot.execution.history == plan.candidates[2]
+    with pytest.raises(ValueError, match="migration is blocked"):
+        require_review_execution_eligibility(snapshot, "b" * 40, 5)
+    with control.transaction() as db:
+        assert load_review_workflow_row(db, key) == snapshot
+        assert db.execute("SELECT count(*) FROM workflow_components WHERE family='review_execution' AND target_number=11").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='review-execution-origin' AND key LIKE '%:pr:11:%'").fetchone()[0] == 0
+    before = _dump(control)
+    gateway.unavailable = True
+    assert activation.activate(plan, None, None, None).idempotent
+    assert _dump(control) == before
+
+
+def test_pending_round_returns_refuse_first_publication_even_with_attributed_history(rig):
+    cfg, control, _gateway, _, files, links, _, _, activation = rig
+    with control.transaction() as db:
+        db.execute("INSERT INTO review_execution_rounds VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                   ("prior-round", cfg.repo, "pr", 9, 1, "prior-episode", 0, 1,
+                    "prior-claim", "{}", "{}", None, None))
+    sql = _sql_sources(cfg, control)
+    before = _dump(control)
+    with pytest.raises(ReviewExecutionActivationRefused, match="retained.*not canonical"):
+        activation.plan(files, links, sql)
+    assert _dump(control) == before
+
+
+@pytest.mark.parametrize("corruption", ("missing_decision", "wrong_epoch", "malformed_decision"))
+def test_selected_blocker_corruption_refuses_reader_and_retry(rig, corruption):
+    cfg, control, _gateway, _, _, links, sql, _, activation = rig
+    Path(cfg.review_state_dir, "pr-9.round").write_text("3")
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
+                                                      ("steward", cfg.steward_state_dir)))
+    plan = activation.plan(files, links, sql)
+    activation.activate(plan, files, links, sql)
+    with control.transaction() as db:
+        predicate = "repository='o/r' AND family='review_execution' AND target_number=9"
+        if corruption == "missing_decision":
+            db.execute("DELETE FROM workflow_activation_imports WHERE " + predicate)
+        elif corruption == "wrong_epoch":
+            db.execute("UPDATE workflow_activation_imports SET epoch=2 WHERE " + predicate)
+        else:
+            db.execute("UPDATE workflow_activation_imports SET decision_json='{}' WHERE " + predicate)
+    before = _dump(control)
+    with control.transaction() as db:
+        with pytest.raises(WorkflowAuthorityError):
+            load_review_workflow_row(db, WorkflowKey(cfg.repo, PullRequestRef(9)))
+    with pytest.raises(WorkflowAuthorityError):
+        activation.activate(plan, None, None, None)
+    assert _dump(control) == before
+
+
+@pytest.mark.parametrize("failure", ("factory", "outbox"))
+def test_activation_event_failure_rolls_back_terminal_and_eligible_publication(rig, failure):
+    cfg, control, _, _, _, links, sql, _, activation = rig
+    Path(cfg.review_state_dir, "pr-11.round").write_text("4")
+    files = read_complete_legacy_execution_root_files((("fix", cfg.state_dir), ("review", cfg.review_state_dir),
+                                                      ("steward", cfg.steward_state_dir)))
+    plan = activation.plan(files, links, sql)
+    now = datetime.now(timezone.utc)
+    producer = Producer("offline-review", cfg.repo, "review", 123, "boot")
+    def factory(payload, correlation):
+        if failure == "factory":
+            raise ValueError("activation event factory failed")
+        return EventEnvelope(payload, new_event_id(now), 0, now, now, 0, producer, correlation)
+    control.bind_event_outbox(factory, lambda _event: None)
+    if failure == "outbox":
+        with control.transaction() as db:
+            db.execute("CREATE TRIGGER fail_activation_event BEFORE INSERT ON event_outbox "
+                       "BEGIN SELECT RAISE(ABORT,'activation outbox failed'); END")
+    before = _dump(control)
+    with pytest.raises((ValueError, sqlite3.IntegrityError), match="activation.*failed"):
+        activation.activate(plan, files, links, sql)
+    assert _dump(control) == before

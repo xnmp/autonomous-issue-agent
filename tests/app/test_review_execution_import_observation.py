@@ -61,7 +61,7 @@ def test_complete_empty_sources_feed_configured_activation_without_writing(rig) 
     observed = _collect(rig)
     assert isinstance(observed, ObservedLegacyExecutionSqlImportSources)
     assert not observed.runs.runs
-    assert not observed.settlement.commands.submissions
+    assert not observed.commands.submissions
     plan = activation.plan(files, links, observed)
     assert tuple(item.pr for item in plan.candidates) == (9, 10)
     assert _dump(control) == before
@@ -73,7 +73,7 @@ def test_complete_empty_sources_feed_configured_activation_without_writing(rig) 
         ).fetchone()[0] == 1
 
 
-def test_recorded_history_is_held_for_target_scoped_r1_assessment(round_rig) -> None:
+def test_recorded_history_is_observed_without_reconstructing_scalar_history(round_rig) -> None:
     control, gateway, selection, _, plan, command = confirmed_copy(round_rig)
     workflow_for(control, gateway).record_review(command.command_id)
     key = selection.expected.fence.key
@@ -83,8 +83,9 @@ def test_recorded_history_is_held_for_target_scoped_r1_assessment(round_rig) -> 
         result = observe_legacy_execution_sql_import_sources(
             db, key.repository, OWNER, now=certified_at,
         )
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "target-scoped R1" in result.reason
+    assert isinstance(result, ObservedLegacyExecutionSqlImportSources)
+    assert dict(result.commands.submissions[0].command_fields)["command_id"] == command.command_id
+    assert dict(result.rounds.rounds[0].fields)["round_id"] == plan.round.round_id
     assert _dump(control) == before
 
 
@@ -114,12 +115,14 @@ def test_orphan_outcome_receipt_is_held_without_writing(rig) -> None:
             (cfg.repo, "orphan-round", datetime.now(timezone.utc).isoformat(), "{}"),
         )
     stale = _collect(rig)
-    assert isinstance(stale, BlockedLegacyExecutionSqlImportSources)
+    assert isinstance(stale, ObservedLegacyExecutionSqlImportSources)
     certified_at = datetime.now(timezone.utc)
     before = _dump(control)
     result = _collect(rig, now=certified_at)
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "target-scoped R1" in result.reason or "outcome" in result.reason
+    assert isinstance(result, ObservedLegacyExecutionSqlImportSources)
+    assert dict(result.outcomes.receipts[0].fields)["key"] == "orphan-round"
+    with pytest.raises(ValueError, match="unassigned unattributed_receipt"):
+        rig[-1].plan(rig[4], rig[5], result)
     assert _dump(control) == before
 
 
@@ -128,14 +131,16 @@ def test_unregistered_submission_command_blocks_collection(rig) -> None:
     with control.transaction() as db:
         _insert_lifecycle_command(db, "unregistered-import-command", state="pending")
         db.execute(
-            "UPDATE lifecycle_commands SET repository=? WHERE command_id=?",
-            (cfg.repo, "unregistered-import-command"),
+            "UPDATE lifecycle_commands SET repository=?,executor_identity=? WHERE command_id=?",
+            (cfg.repo, owner_identity_for_target(cfg.repo, cfg.target_dir, "review"), "unregistered-import-command"),
         )
     certified_at = datetime.now(timezone.utc)
     before = _dump(control)
     result = _collect(rig, now=certified_at)
-    assert isinstance(result, BlockedLegacyExecutionSqlImportSources)
-    assert "target-scoped R1" in result.reason or "command" in result.reason
+    assert isinstance(result, ObservedLegacyExecutionSqlImportSources)
+    assert dict(result.commands.submissions[0].command_fields)["command_id"] == "unregistered-import-command"
+    with pytest.raises(ValueError, match="not quiescent"):
+        rig[-1].plan(rig[4], rig[5], result)
     assert _dump(control) == before
 
 

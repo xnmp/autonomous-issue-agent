@@ -9,17 +9,15 @@ from ..domain.review_execution_activation import (
     CompleteLegacyReviewGenerationReceipts, CompleteLegacyReviewOutcomeReceipts,
     CompleteLegacyReviewRounds, CompleteLegacyReviewRuns,
     CompleteLegacyReviewSubmissionReceipts, CompleteLegacyReviewSubmissions,
-    CompleteLegacyRoundOutcomeStorage, LegacyReviewOwnerLineage,
+    LegacyReviewOwnerLineage,
     MAX_LEGACY_REVIEW_OWNERS,
 )
 from ..domain.workflow_identity import canonical_workflow_repository, validate_workflow_identifier
 from .review_execution_activation import (
-    CompleteLegacySubmissionSettlementStorage, read_complete_legacy_review_generation_receipts,
+    read_complete_legacy_review_generation_receipts,
     read_complete_legacy_review_outcome_receipts, read_complete_legacy_review_rounds,
     read_complete_legacy_review_runs, read_complete_legacy_review_submission_receipts,
     read_complete_legacy_review_submissions, read_legacy_review_owner_lineage,
-    verify_complete_legacy_round_outcome_storage,
-    verify_complete_legacy_submission_settlement_storage,
 )
 from .review_execution_import_sources import (
     BlockedLegacyExecutionSqlImportSources, ObservedLegacyExecutionSqlImportSources,
@@ -79,34 +77,11 @@ def observe_legacy_execution_sql_import_sources(
             outcomes = read_complete_legacy_review_outcome_receipts(db, repository)
             if not isinstance(outcomes, CompleteLegacyReviewOutcomeReceipts):
                 return BlockedLegacyExecutionSqlImportSources(outcomes.reason)
-            unsupported = tuple(kind for kind, values in (
-                ("runs", runs.runs), ("commands", commands.submissions),
-                ("submission receipts", receipts.receipts), ("rounds", rounds.rounds),
-                ("outcome receipts", outcomes.receipts),
-            ) if values)
-            if unsupported:
-                return BlockedLegacyExecutionSqlImportSources(
-                    f"recorded review {', '.join(unsupported)} require target-scoped R1 assessment; "
-                    "retired membership certificates grant no import authority",
-                )
-            storage = verify_complete_legacy_round_outcome_storage(db, rounds, outcomes)
-            if not isinstance(storage, CompleteLegacyRoundOutcomeStorage):
-                return BlockedLegacyExecutionSqlImportSources(storage.reason)
-            settlement = verify_complete_legacy_submission_settlement_storage(
-                db, commands, receipts, storage,
-            )
-            if not isinstance(settlement, CompleteLegacySubmissionSettlementStorage):
-                return BlockedLegacyExecutionSqlImportSources(settlement.reason)
             generation = read_complete_legacy_review_generation_receipts(db, repository)
             if not isinstance(generation, CompleteLegacyReviewGenerationReceipts):
                 return BlockedLegacyExecutionSqlImportSources(generation.reason)
-            if generation.receipts:
-                return BlockedLegacyExecutionSqlImportSources(
-                    "recorded review generation receipts require target-scoped R1 assessment; "
-                    "retired membership certificates grant no import authority",
-                )
             return ObservedLegacyExecutionSqlImportSources(
-                runs, settlement, generation,
+                runs, commands, receipts, rounds, outcomes, generation,
             )
     except (WorkflowAuthorityError, SqlReadBudgetExceeded) as exc:
         return BlockedLegacyExecutionSqlImportSources((str(exc) or "execution SQL source is unreadable")[:512])

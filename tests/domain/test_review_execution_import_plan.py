@@ -12,7 +12,7 @@ from issue_agent.domain.review_execution_counter_mapping import LegacyOpenPRCoun
 from issue_agent.domain.review_execution_history_import import ReviewImportNoHistoryObserved
 from issue_agent.domain.review_execution_import_plan import (
     BlockedZeroHistoryReviewImport, EligibleZeroHistoryReviewImport,
-    EmptyReviewExecutionImportPlan,
+    ReviewExecutionImportPlan,
     ZeroHistoryImportBlockerKind, propose_zero_history_review_execution,
     screen_zero_history_review_import,
 )
@@ -160,7 +160,7 @@ def test_stale_or_future_remote_observation_cannot_propose_an_import():
 def test_whole_repository_plan_binds_every_pr_and_avoids_decision_digest_cycle():
     eligible = _screen(_facts())
     assert isinstance(eligible, EligibleZeroHistoryReviewImport)
-    plan = EmptyReviewExecutionImportPlan(
+    plan = ReviewExecutionImportPlan(
         "o/r", OpenPullRequestsListed((9,)), 2,
         eligible.history.source_digest, "c" * 64, "d" * 64, (eligible,), NOW,
     )
@@ -195,7 +195,7 @@ def test_fresh_reread_preserves_reviewed_plan_identity_when_facts_are_unchanged(
     assert isinstance(first, EligibleZeroHistoryReviewImport)
     assert isinstance(second, EligibleZeroHistoryReviewImport)
     assert first.source_digest == second.source_digest
-    original = EmptyReviewExecutionImportPlan(
+    original = ReviewExecutionImportPlan(
         "o/r", OpenPullRequestsListed((9,)), 2,
         first.history.source_digest, "c" * 64, "d" * 64, (first,), NOW,
     )
@@ -224,3 +224,38 @@ def test_remote_review_order_does_not_change_source_identity():
     assert isinstance(first, EligibleZeroHistoryReviewImport)
     assert isinstance(second, EligibleZeroHistoryReviewImport)
     assert first.source_digest == second.source_digest
+
+
+def test_mixed_plan_retains_terminal_blocker_and_grants_only_verified_empty_target():
+    from issue_agent.domain.review_execution_history_import import (
+        ReviewImportHistoryBlocked, ReviewImportBlocker, ReviewImportBlockerKind, ReviewImportSource,
+    )
+    clean = _screen(_facts())
+    blocked = ReviewImportHistoryBlocked(7, (ReviewImportBlocker(
+        ReviewImportBlockerKind.ORIGIN, (ReviewImportSource("round", "old-round", "f" * 64),),
+    ),))
+    plan = ReviewExecutionImportPlan("o/r", OpenPullRequestsListed((9,)), 2,
+                                    clean.history.source_digest, "c" * 64, "d" * 64,
+                                    (blocked, clean), NOW)
+    held, decision = plan.decisions_at(NOW)
+    from issue_agent.domain.review_execution_migration import BlockedReviewExecutionMigration
+    assert isinstance(held, BlockedReviewExecutionMigration) and held.history == blocked
+    assert decision.checkpoint.state.binding.rejection.fence.key.target.number == 9
+    assert decision.checkpoint.through_sequence == 0
+    assert decision.checkpoint.state == type(decision.checkpoint.state)(decision.checkpoint.state.binding)
+    assert plan.candidates[0] == blocked
+    assert replace(plan, candidates=(clean,)).plan_digest != plan.plan_digest
+    with pytest.raises(ValueError, match="every listed PR"):
+        replace(plan, candidates=(clean, blocked))
+
+
+def test_plan_bounds_terminal_targets_as_well_as_open_listing():
+    from issue_agent.domain.review_execution_migration import (
+        ReviewImportHistoryBlocked, ReviewImportBlocker, ReviewImportBlockerKind, ReviewImportSource,
+    )
+    blocker = ReviewImportBlocker(ReviewImportBlockerKind.ORIGIN,
+                                 (ReviewImportSource("round", "prior-round", "a" * 64),))
+    candidates = tuple(ReviewImportHistoryBlocked(pr, (blocker,)) for pr in range(1, 4098))
+    with pytest.raises(ValueError, match="every listed PR"):
+        ReviewExecutionImportPlan("o/r", OpenPullRequestsListed(()), 1, "b" * 64,
+                                  "c" * 64, "d" * 64, candidates, NOW)
