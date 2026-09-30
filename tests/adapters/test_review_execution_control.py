@@ -180,6 +180,241 @@ def test_preflight_refuses_absent_changed_or_unproven_parent_claim_without_write
     assert_unpaid(store)
 
 
+def _measure_current_read(store, key):
+    import time
+    from issue_agent.adapters.sql_read_budget import bounded_sql_source_reads
+
+    instructions = 0
+    statements = []
+
+    def progress():
+        nonlocal instructions
+        instructions += 1
+        return 0
+
+    with store.transaction() as db:
+        db.set_progress_handler(progress, 1)
+        db.set_trace_callback(statements.append)
+        started = time.perf_counter()
+        try:
+            with bounded_sql_source_reads(db, 1024 * 1024) as budget:
+                snapshot = load_review_workflow_row(db, key)
+            elapsed = time.perf_counter() - started
+        finally:
+            db.set_progress_handler(None, 0)
+            db.set_trace_callback(None)
+        pending_query = next(statement for statement in statements if statement.startswith(
+            'SELECT round_id,generation,sequence,plan_json,planning_json,closure_json,outcome_json ',
+        ))
+        plan = tuple(row[3] for row in db.execute('EXPLAIN QUERY PLAN ' + pending_query))
+        assert any('review_execution_rounds_generation_pending' in step for step in plan)
+        assert all('SCAN ' not in step for step in plan)
+        gates_query = next(statement for statement in statements if statement.startswith(
+            'SELECT * FROM workflow_gates WHERE ',
+        ))
+        gate_plan = tuple(row[3] for row in db.execute('EXPLAIN QUERY PLAN ' + gates_query))
+        assert any('workflow_gates_current' in step for step in gate_plan)
+        assert all('SCAN ' not in step and 'TEMP B-TREE' not in step for step in gate_plan)
+        plan += gate_plan
+    return snapshot, (budget.rows, budget.source_bytes, instructions, elapsed, plan)
+
+
+def test_real_sequential_round_history_keeps_current_reads_bounded(rig):
+    import time
+    from issue_agent.domain.review_rounds import FinalizedReviewRound
+
+    store, initial, _, selection, control = rig
+    key = selection.expected.fence.key
+    checkpoints = (10, 1000, 5000)
+    measurements = []
+    started = time.perf_counter()
+    for sequence in range(1, checkpoints[-1] + 1):
+        if sequence > 1:
+            assert store.claim_dispatch('o/r', 'review', -9, AgentKind.REVIEW.name, OWNER, frozenset())
+        occurrence = store.active_dispatch_claims('o/r', 'review')[0].claim_key
+        snapshot = current(store, selection)
+        plan = control.preflight(replace(
+            selection, request_id=f's7:round:{sequence}', expected=snapshot.revision,
+            binding=snapshot.execution.binding, claim_occurrence_id=occurrence,
+            observation=replace(selection.observation, observed_at=store.now()), failure_ceiling=0,
+        ))
+        assert store.release_dispatch_claim('o/r', 'review', -9, OWNER)
+        control.seal_abandoned_planning(plan.round.round_id)
+        result = control.finalize_abandoned_round(plan.round.round_id)
+        assert isinstance(result, FinalizedReviewRound)
+        if sequence in checkpoints:
+            completed, measured = _measure_current_read(store, key)
+            assert completed.execution.last_sequence == sequence
+            assert completed.execution.baseline.through_sequence == sequence
+            assert completed.execution.state == initial.execution.state
+            assert completed.episode == initial.episode
+            with store.transaction() as db:
+                assert db.execute('SELECT COUNT(*) FROM review_execution_rounds WHERE outcome_json IS NOT NULL').fetchone()[0] == sequence
+                assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-round-outcome'").fetchone()[0] == sequence
+            assert control.finalize_abandoned_round(plan.round.round_id) == result
+            assert_unpaid(store)
+            measurements.append(measured)
+            print(f'S7 rounds={sequence} rows={measured[0]} bytes={measured[1]} vm={measured[2]} '
+                  f'read_seconds={measured[3]:.6f} history_seconds={time.perf_counter()-started:.3f} '
+                  f'plan={measured[4]}', flush=True)
+    assert all(measured[0] == measurements[0][0] for measured in measurements)
+    # Decimal sequence/version widths can change; retired rows cannot add selected sources.
+    assert all(measured[1] <= measurements[0][1] + 256 for measured in measurements)
+
+
+def test_real_zero_round_generations_have_no_lifetime_limit(rig):
+    import time
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.adapters.workflow_rows import read_current_review_pending
+    from issue_agent.domain.review_execution import MAX_EXECUTION_SUFFIX
+    from issue_agent.domain.review_workflow import CountingRule
+    from issue_agent.domain.workflow import (
+        CancelRearm, ContinueGrantedRearm, KeepGuidance, OperatorActor, RequestRearm, WorkflowCommitted,
+    )
+    from tests.adapters.test_review_productive_settlement import confirmed_escalation
+
+    store, gateway, selection, control, plan, command = confirmed_escalation(rig, cause='ceiling')
+    workflow = SQLiteReviewWorkflowControl(
+        store, WorkflowWriter('o/r', 'review', OWNER), gateway=gateway, ceiling=1,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule('review-bot[bot]'),
+    )
+    assert isinstance(workflow.settle_submission(command.command_id), WorkflowCommitted)
+    initial = current(store, selection)
+    key = initial.revision.fence.key
+    actor = OperatorActor('operator', 'test')
+    request_id = 's7:rearm:1'
+    started = time.perf_counter()
+    measurements = []
+    assert isinstance(workflow.request_rearm(RequestRearm(
+        request_id, initial.revision, initial.gates[0].gate_id, KeepGuidance(),
+        expected_binding=initial.binding,
+    ), actor), WorkflowCommitted)
+    for advance in range(1, MAX_EXECUTION_SUFFIX + 2):
+        if advance > 1:
+            pending = current(store, selection)
+            assert isinstance(workflow.cancel_rearm(CancelRearm(
+                f's7:cancel:{advance}', pending.revision, request_id, 'stop', expected_binding=pending.binding,
+            ), actor), WorkflowCommitted)
+            stopped = current(store, selection)
+            next_request = f's7:rearm:{advance}'
+            assert isinstance(workflow.continue_rearm(ContinueGrantedRearm(
+                next_request, stopped.revision, request_id, expected_binding=stopped.binding,
+            ), actor), WorkflowCommitted)
+            request_id = next_request
+        if advance in (10, 1000, MAX_EXECUTION_SUFFIX + 1):
+            advanced, measured = _measure_current_read(store, key)
+            assert advanced.revision.fence.generation == initial.revision.fence.generation + advance
+            assert advanced.execution.last_sequence == initial.execution.last_sequence == plan.round.sequence
+            assert advanced.execution.state.failures == initial.execution.state.failures
+            assert advanced.execution.state.pin_deferrals == initial.execution.state.pin_deferrals
+            assert advanced.gates
+            with pytest.raises(ValueError, match='held by workflow recovery'):
+                control.preflight(replace(
+                    selection, request_id=f's7:held:{advance}', expected=advanced.revision,
+                    binding=advanced.execution.binding,
+                ))
+            with store.transaction() as db:
+                assert read_current_review_pending(db, advanced.execution) == ()
+                assert db.execute('SELECT COUNT(*) FROM review_execution_rounds').fetchone()[0] == 1
+                assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-execution-generation'").fetchone()[0] == advance
+                for table in ('runs', 'leases', 'budget_reservations', 'charges'):
+                    assert db.execute(f'SELECT COUNT(*) FROM {table}').fetchone()[0] == 0
+            assert control.finalize_completed_round(plan.round.round_id).outcome.round == plan.round
+            measurements.append(measured)
+            print(f'S7 generations={advance} rows={measured[0]} bytes={measured[1]} vm={measured[2]} '
+                  f'read_seconds={measured[3]:.6f} history_seconds={time.perf_counter()-started:.3f} '
+                  f'plan={measured[4]}', flush=True)
+    assert all(measured[0] == measurements[0][0] for measured in measurements)
+    assert all(measured[1] <= measurements[0][1] + 1024 for measured in measurements)
+    assert all(measured[2] <= measurements[0][2] + 128 for measured in measurements)
+
+
+def test_pending_capacity_open_gap_and_reordered_paid_returns_survive_restart(rig, monkeypatch):
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.adapters.review_execution_control import SQLiteReviewExecutionControl
+    from issue_agent.adapters.workflow_rows import read_current_review_pending
+    from issue_agent.domain import review_preflight
+    from issue_agent.domain.contracts import Money
+    from issue_agent.domain.outcome import AgentResult, ExitReason
+    from tests.adapters.test_review_execution_admission import request
+    from tests.adapters.test_review_execution_launch import register
+    from tests.adapters.test_review_execution_return import returned, settlement
+    from tests.adapters.test_review_execution_stage import stage
+
+    # The domain suite exercises the real 4096-slot limit. A two-slot boundary
+    # isolates adapter refusal, money and recovery without another long history.
+    monkeypatch.setattr(review_preflight, 'MAX_EXECUTION_SUFFIX', 2)
+    store, initial, gateway, selection, control = rig
+    rounds = []
+    children = []
+    pending_measurements = []
+    for index in (1, 2):
+        plan = control.preflight(replace(selection, request_id=f's7:paid:{index}',
+                                         expected=current(store, selection).revision))
+        child_stage = stage(plan)
+        control.register_stage(plan.round.round_id, current(store, selection).revision, child_stage)
+        proposed = request(child_stage.children[0], index=index, cap=200)
+        assert store.reserve(proposed).admitted
+        register(store, proposed)
+        control.seal_completed_planning(plan.round.round_id, current(store, selection).revision)
+        rounds.append(plan)
+        children.append(proposed)
+        pending_measurements.append(_measure_current_read(store, selection.expected.fence.key)[1])
+    before_refusal = dump(store)
+    with pytest.raises(ValueError, match='pending capacity'):
+        control.preflight(replace(selection, request_id='s7:over-capacity',
+                                  expected=current(store, selection).revision))
+    assert dump(store) == before_refusal
+    assert pending_measurements[1][0] > pending_measurements[0][0]
+    assert pending_measurements[1][1] > pending_measurements[0][1]
+    failed = AgentResult(True, status='error', exit_reason=ExitReason.AGENT_ERROR)
+    later = returned(store, children[1], result=failed)
+    later_payment = settlement(children[1], amount=13)
+    assert not store.settle_review_return(later_payment, later).idempotent
+    later_result = control.finalize_completed_round(rounds[1].round.round_id)
+    with store.transaction() as db:
+        waiting = load_review_workflow_row(db, selection.expected.fence.key)
+        assert waiting.execution.baseline.through_sequence == 0
+        assert waiting.execution.state.failures == initial.execution.state.failures + 1
+        assert len(read_current_review_pending(db, waiting.execution)) == 2
+    assert store.snapshot(children[0].scope).settled == Money('USD', 13)
+    assert store.snapshot(children[0].scope).reserved == Money('USD', 60)
+    assert store.receipt('unrelated-write', 'other/repository', 's7', {'value':'unrelated'})
+    assert current(store, selection) == waiting
+    reopened = SQLiteControlStore(store.path, now=store.now)
+    reopened.initialize()
+    reopened.bind_event_outbox(store._event_factory, lambda event: None)
+    recovered = SQLiteReviewExecutionControl(reopened, WorkflowWriter('o/r', 'review', OWNER), gateway)
+    assert current(reopened, selection) == waiting
+    assert recovered.finalize_completed_round(rounds[1].round.round_id) == later_result
+    assert reopened.settle_review_return(later_payment, later).idempotent
+    earlier = returned(reopened, children[0], result=failed)
+    earlier_payment = settlement(children[0], amount=11)
+    assert not reopened.settle_review_return(earlier_payment, earlier).idempotent
+    first_result = recovered.finalize_completed_round(rounds[0].round.round_id)
+    with reopened.transaction() as db:
+        completed = load_review_workflow_row(db, selection.expected.fence.key)
+        assert completed.execution.baseline.through_sequence == 2
+        assert completed.execution.state.failures == initial.execution.state.failures + 2
+        assert read_current_review_pending(db, completed.execution) == ()
+        assert db.execute('SELECT COUNT(*),SUM(amount_micros) FROM charges').fetchone()[:] == (2, 24)
+    assert reopened.snapshot(children[0].scope).settled == Money('USD', 24)
+    assert reopened.snapshot(children[0].scope).reserved == Money('USD', 0)
+    before_retry = dump(reopened)
+    assert reopened.settle_review_return(earlier_payment, earlier).idempotent
+    assert recovered.finalize_completed_round(rounds[0].round.round_id) == first_result
+    assert recovered.finalize_completed_round(rounds[1].round.round_id) == later_result
+    assert dump(reopened) == before_retry
+    with pytest.raises(ValueError, match='allowance is exhausted'):
+        recovered.preflight(replace(selection, request_id='s7:exhausted', expected=completed.revision))
+    assert dump(reopened) == before_retry
+    next_plan = recovered.preflight(replace(
+        selection, request_id='s7:after-gap', expected=completed.revision,
+        failure_ceiling=initial.execution.state.failures + 3,
+    ))
+    assert next_plan.round.sequence == 3
+
+
 @pytest.mark.parametrize("change", ["head", "partial_reviews", "unavailable", "linked_identity"])
 def test_fresh_remote_evidence_must_match_selection_and_claim_linkage(rig, change):
     store, _, gateway, selection, control = rig

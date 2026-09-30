@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 34
+SCHEMA_VERSION = 35
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2272,6 +2272,11 @@ DROP TRIGGER review_workflow_source_update;
 DROP TABLE review_archive_identity_members;
 DROP TABLE review_archive_identity_certifications;
 DROP TABLE review_archive_source_versions;
+"""),
+    SchemaMigration(35, """
+CREATE INDEX workflow_gates_current
+    ON workflow_gates(repository,target_kind,target_number,gate_id)
+    WHERE state<>'closed';
 """),
 )
 

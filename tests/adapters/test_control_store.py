@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 35))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 36))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -121,6 +121,7 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        35: ("DROP INDEX workflow_gates_current",),
         # Recreate retired projections only to construct the old fixture schema.
         34: tuple(statement for migration in _SCHEMA_MIGRATIONS if 27 <= migration.version <= 32
                   for statement in _sql_statements(migration.source)),
@@ -3419,7 +3420,7 @@ def test_v34_upgrades_populated_schema32_copy_preserving_money_effects_binding_a
         assert tuple(tuple(row) for row in db.execute(
             'SELECT version,source_digest FROM schema_migrations WHERE version<=32 ORDER BY version',
         )) == tuple(tuple(row) for row in history)
-        assert db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 34
+        assert db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == EXPECTED_SCHEMA_VERSIONS[-1]
         assert not db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'review_archive_%'").fetchall()
         assert not db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND sql LIKE '%review_archive_source_versions%'").fetchall()
     assert copy.reserve(active).admitted
@@ -3458,12 +3459,12 @@ def test_v34_failure_rolls_back_retirement_and_reopens_previous_coherent_schema(
     SQLiteControlStore(copy.path, now=lambda: NOW).initialize()
     with copy.transaction() as db:
         assert _retained_schema_rows(db) == before
-        assert db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 34
+        assert db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == EXPECTED_SCHEMA_VERSIONS[-1]
     from tests.adapters.test_control_store_connection_lifecycle import _authority_bytes
     assert _authority_bytes(source) == original
 
 
-def test_v33_binary_refuses_schema34_without_mutating_authority(tmp_path, monkeypatch):
+def test_v33_binary_refuses_new_schema_without_mutating_authority(tmp_path, monkeypatch):
     import issue_agent.adapters.control_store as control_module
 
     store = _store(tmp_path)
