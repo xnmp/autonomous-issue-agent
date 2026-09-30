@@ -8,7 +8,7 @@ import os
 import sqlite3
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from threading import Event
@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 34))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 35))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -118,7 +118,12 @@ def _initialize_in_process(path: str, start, results) -> None:
 def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     # This constructs test fixtures, not a production downgrade: migrations
     # which rewrite rows need their historical inputs seeded by the caller.
+    from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
+
     removals = {
+        # Recreate retired projections only to construct the old fixture schema.
+        34: tuple(statement for migration in _SCHEMA_MIGRATIONS if 27 <= migration.version <= 32
+                  for statement in _sql_statements(migration.source)),
         33: ("DROP INDEX review_execution_rounds_generation_pending",),
         32: ("DROP TABLE review_archive_identity_members",
              "DROP TABLE review_archive_identity_certifications",
@@ -2928,7 +2933,7 @@ def _seed_v24_workflow_history(store):
     review = encode_workflow((FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 3),
                               ReviewEpisode("review:legacy", "review guidance\nexact", ReviewedBaseline(
                                   "a" * 40, "c" * 64, 2, ImportedBaseline("import:review")))))
-    with sqlite3.connect(store.path) as db:
+    with closing(sqlite3.connect(store.path)) as db, db:
         _historical_fixture(db, 24)
         for family, epoch in (("resolve", 2), ("review_rejections", 3)):
             db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r', ?, ?, 'source', 'inventory', ?)",
@@ -3350,3 +3355,142 @@ def test_claim_lifecycle_receipt_conflict_rolls_back_its_entire_authority_change
             store.claim_dispatch("o/r", "fix", 42, "RESOLVE", "successor", frozenset({"file.py"}))
     with sqlite3.connect(store.path) as db:
         assert tuple(db.iterdump()) == before
+
+
+def _retained_schema_rows(db):
+    retired = {'review_archive_identity_members', 'review_archive_identity_certifications',
+               'review_archive_source_versions', 'schema_migrations'}
+    tables = tuple(row[0] for row in db.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+    ) if row[0] not in retired)
+    return {table: tuple(sorted((tuple(row) for row in db.execute(
+        'SELECT * FROM "' + table.replace('"', '""') + '"',
+    )), key=repr)) for table in tables}
+
+
+def _populated_schema32_copy(tmp_path):
+    from tests.adapters.test_control_store_connection_lifecycle import _authority_bytes, _backup_and_collect
+
+    source = _store(tmp_path)
+    first, active = _request(1, cap=200), _request(2, cap=200)
+    assert source.reserve(first).admitted and source.reserve(active).admitted
+    payment = SettlementRequest(first.run_id, Money('USD', 25), PricingBasis.PROVIDER_REPORTED,
+                                's6-paid', None, None, None)
+    assert source.settle(payment).disposition is AccountingDisposition.AVAILABLE
+    command = LifecycleCommand(CommandId('s6-command'), 's6-effect', CommandKind.POST_COMMENT,
+                               'issue/1', 'head', {'body': 'done'}, repository='o/r', executor_identity='o/r:fix')
+    source.enqueue_command(command)
+    source.begin_command(command.command_id)
+    effect = EffectReceipt(command.command_id, 'broker', NOW, NOW, EffectStatus.SUCCEEDED,
+                           remote_object_id='comment:s6')
+    assert source.record_effect(effect)
+    _seed_v24_workflow_history(source)
+    source.initialize()
+    with source.transaction() as db:
+        _historical_fixture(db, 32)
+    before = _authority_bytes(source)
+    copy = tmp_path / 'schema32-copy.db'
+    _backup_and_collect(source, copy)
+    copied = SQLiteControlStore(str(copy), now=lambda: NOW)
+    Path(copied.authority_witness_path).write_bytes(Path(source.authority_witness_path).read_bytes())
+    return source, copied, before, active, payment, command, effect
+
+
+def test_v34_preserves_predecessor_migration_sources_and_digests():
+    from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS
+
+    # Pinned at accepted S4/S5 d7ef565 before the forward-only retirement.
+    encoded = json.dumps(tuple((migration.version, migration.source, migration.transform_spec, migration.digest)
+                               for migration in _SCHEMA_MIGRATIONS if migration.version <= 33),
+                         ensure_ascii=True, separators=(',', ':')).encode()
+    assert hashlib.sha256(encoded).hexdigest() == '03bf29fd7238a15690a0ef185adcff55b4d2ec81104cc6eb999ecd90a93201a0'
+
+
+def test_v34_upgrades_populated_schema32_copy_preserving_money_effects_binding_and_retry(tmp_path):
+    from tests.adapters.test_control_store_connection_lifecycle import _authority_bytes
+
+    source, copy, original, active, payment, command, effect = _populated_schema32_copy(tmp_path)
+    with copy.transaction() as db:
+        before = _retained_schema_rows(db)
+        history = tuple(db.execute('SELECT version,source_digest FROM schema_migrations ORDER BY version'))
+    copy.initialize()
+    with copy.transaction() as db:
+        assert _retained_schema_rows(db) == before
+        assert tuple(tuple(row) for row in db.execute(
+            'SELECT version,source_digest FROM schema_migrations WHERE version<=32 ORDER BY version',
+        )) == tuple(tuple(row) for row in history)
+        assert db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 34
+        assert not db.execute("SELECT name FROM sqlite_master WHERE name LIKE 'review_archive_%'").fetchall()
+        assert not db.execute("SELECT name FROM sqlite_master WHERE type='trigger' AND sql LIKE '%review_archive_source_versions%'").fetchall()
+    assert copy.reserve(active).admitted
+    assert copy.settle(payment).idempotent
+    assert copy.enqueue_command(command).state == 'succeeded'
+    assert copy.record_effect(effect)
+    assert copy.snapshot(_scope()).settled == Money('USD', 25)
+    assert copy.snapshot(_scope()).committed == Money('USD', 85)
+    assert copy.snapshot(_scope()).reserved == Money('USD', 60)
+    with copy.transaction() as db:
+        assert _retained_schema_rows(db) == before
+    assert _authority_bytes(source) == original
+
+
+def test_v34_failure_rolls_back_retirement_and_reopens_previous_coherent_schema(tmp_path):
+    source, copy, original, *_ = _populated_schema32_copy(tmp_path)
+    with copy.transaction() as db:
+        before = _retained_schema_rows(db)
+        prior_triggers = tuple(row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
+        ))
+
+    def interrupt(version, stage):
+        if version == 34 and stage == 'before_commit':
+            raise RuntimeError('retirement interrupted')
+
+    with pytest.raises(RuntimeError, match='retirement interrupted'):
+        SQLiteControlStore(copy.path, now=lambda: NOW, migration_observer=interrupt).initialize()
+    with copy.transaction() as db:
+        assert db.execute('PRAGMA integrity_check').fetchone()[0] == 'ok'
+        assert db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 33
+        assert _retained_schema_rows(db) == before
+        assert tuple(row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
+        )) == prior_triggers
+    SQLiteControlStore(copy.path, now=lambda: NOW).initialize()
+    with copy.transaction() as db:
+        assert _retained_schema_rows(db) == before
+        assert db.execute('SELECT MAX(version) FROM schema_migrations').fetchone()[0] == 34
+    from tests.adapters.test_control_store_connection_lifecycle import _authority_bytes
+    assert _authority_bytes(source) == original
+
+
+def test_v33_binary_refuses_schema34_without_mutating_authority(tmp_path, monkeypatch):
+    import issue_agent.adapters.control_store as control_module
+
+    store = _store(tmp_path)
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+    monkeypatch.setattr(control_module, 'SCHEMA_VERSION', 33)
+    with pytest.raises(IncompatibleSchema, match='newer than 33'):
+        SQLiteControlStore(store.path, now=lambda: NOW).initialize()
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == before
+
+
+def test_v34_unrelated_writes_need_no_retired_projection_witness(tmp_path):
+    store = _store(tmp_path)
+    with store.transaction() as db:
+        remaining = tuple(row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
+        ))
+        assert remaining == ('dispatch_claims_occurrence_insert', 'dispatch_claims_occurrence_update',
+                             'runs_require_workflow_episode_insert', 'runs_require_workflow_episode_update',
+                             'runs_review_attachment_insert', 'runs_review_attachment_update',
+                             'workflow_retry_grant_insert', 'workflow_retry_grant_update')
+    assert store.claim_dispatch('o/r', 'review', -9, 'REVIEW', 's6-owner', frozenset())
+    with pytest.raises(sqlite3.IntegrityError, match='occurrence is immutable'):
+        with store.transaction() as db:
+            db.execute("UPDATE dispatch_claims SET occurrence_id='changed' WHERE repository='o/r'")
+    assert store.reserve(_request(1)).admitted
+    assert store.claim('unrelated', 'other/repository', 'key')
+    assert store.release(RunId('run-1'), 'cancelled').disposition is AccountingDisposition.AVAILABLE
+    store.integrity_check()

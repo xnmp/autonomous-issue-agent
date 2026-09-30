@@ -239,7 +239,7 @@ def test_schema32_upgrade_preserves_current_authority_without_mutating_historica
     reopened = SQLiteControlStore(store.path, now=store.now)
     reopened.initialize()
     with reopened.transaction() as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 33
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 34
         assert db.execute("SELECT source_digest FROM schema_migrations WHERE version=32").fetchone()[0] == old_digest
         assert db.execute("SELECT episode_json FROM workflows WHERE target_kind='pr'").fetchone()[0] == retained
         assert load_review_workflow_row(db, before.revision.fence.key) == before

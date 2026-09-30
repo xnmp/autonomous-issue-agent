@@ -144,3 +144,20 @@ def test_old_certificate_and_unrelated_retained_history_do_not_gate_admission(ri
             "review-execution-generation", "unrelated/repository", "retained:malformed", store.now().isoformat(), "malformed",
         ))
     assert control.preflight(selection).round.sequence == 1
+
+
+def test_schema34_legacy_file_mutations_do_not_regain_current_review_authority(rig, tmp_path):
+    from issue_agent.adapters.store import Store
+
+    store, _, _, selection, control = rig
+    before = current(store, selection)
+    legacy = Store(str(tmp_path / 'legacy-review'))
+    legacy.set_infra_deaths(-9, 0)
+    legacy.set_round(9, 10**12)
+    legacy.save_pr_session(9, 'foreign-session')
+    assert legacy.get_infra_deaths(-9) == 0
+    assert legacy.get_round(9) == 10**12
+    store.initialize()
+    assert current(store, selection) == before
+    assert control.preflight(selection).round.sequence == 1
+    assert current(store, selection).execution.state == before.execution.state

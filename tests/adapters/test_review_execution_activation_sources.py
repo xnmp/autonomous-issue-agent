@@ -603,10 +603,6 @@ def test_complete_round_inventory_bounds_unrelated_table_rows(rig, monkeypatch):
     with closing(store._connect()) as db:
         db.execute("PRAGMA foreign_keys=OFF")
         db.execute("BEGIN")
-        db.execute(
-            "INSERT INTO review_archive_source_versions(source,scope,version) "
-            "VALUES ('round_rows',CAST('other/repo' AS BLOB),0)",
-        )
         for index in (2, 3):
             db.execute(
                 "INSERT INTO review_execution_rounds "

@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 33
+SCHEMA_VERSION = 34
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2191,6 +2191,87 @@ END;
     SchemaMigration(33, """
 CREATE INDEX review_execution_rounds_generation_pending
 ON review_execution_rounds(repository,target_number,execution_epoch,execution_episode,generation,sequence);
+"""),
+    SchemaMigration(34, """
+DROP TRIGGER review_all_round_source_delete;
+DROP TRIGGER review_all_round_source_insert;
+DROP TRIGGER review_all_round_source_update;
+DROP TRIGGER review_archive_dedupe_minus_one_insert;
+DROP TRIGGER review_archive_dedupe_no_replace_insert;
+DROP TRIGGER review_archive_dedupe_no_replace_update;
+DROP TRIGGER review_archive_source_version_overflow;
+DROP TRIGGER review_checkpoint_source_delete;
+DROP TRIGGER review_checkpoint_source_insert;
+DROP TRIGGER review_checkpoint_source_minus_one_insert;
+DROP TRIGGER review_checkpoint_source_no_replace_insert;
+DROP TRIGGER review_checkpoint_source_no_replace_update;
+DROP TRIGGER review_checkpoint_source_update;
+DROP TRIGGER review_component_source_delete;
+DROP TRIGGER review_component_source_insert;
+DROP TRIGGER review_component_source_update;
+DROP TRIGGER review_generation_source_delete;
+DROP TRIGGER review_generation_source_insert;
+DROP TRIGGER review_generation_source_update;
+DROP TRIGGER review_identity_certifications_delete;
+DROP TRIGGER review_identity_certifications_insert;
+DROP TRIGGER review_identity_certifications_update;
+DROP TRIGGER review_identity_members_delete;
+DROP TRIGGER review_identity_members_insert;
+DROP TRIGGER review_identity_members_update;
+DROP TRIGGER review_lifecycle_command_source_delete;
+DROP TRIGGER review_lifecycle_command_source_insert;
+DROP TRIGGER review_lifecycle_command_source_update;
+DROP TRIGGER review_lifecycle_effect_source_delete;
+DROP TRIGGER review_lifecycle_effect_source_insert;
+DROP TRIGGER review_lifecycle_effect_source_update;
+DROP TRIGGER review_lineage_budget_reservations_delete;
+DROP TRIGGER review_lineage_budget_reservations_insert;
+DROP TRIGGER review_lineage_budget_reservations_update;
+DROP TRIGGER review_lineage_charges_delete;
+DROP TRIGGER review_lineage_charges_insert;
+DROP TRIGGER review_lineage_charges_update;
+DROP TRIGGER review_lineage_dedupe_keys_delete;
+DROP TRIGGER review_lineage_dedupe_keys_insert;
+DROP TRIGGER review_lineage_dedupe_keys_update;
+DROP TRIGGER review_lineage_dispatch_claims_delete;
+DROP TRIGGER review_lineage_dispatch_claims_insert;
+DROP TRIGGER review_lineage_dispatch_claims_update;
+DROP TRIGGER review_lineage_leases_delete;
+DROP TRIGGER review_lineage_leases_insert;
+DROP TRIGGER review_lineage_leases_update;
+DROP TRIGGER review_lineage_quota_debits_delete;
+DROP TRIGGER review_lineage_quota_debits_insert;
+DROP TRIGGER review_lineage_quota_debits_update;
+DROP TRIGGER review_lineage_reservation_limits_delete;
+DROP TRIGGER review_lineage_reservation_limits_insert;
+DROP TRIGGER review_lineage_reservation_limits_update;
+DROP TRIGGER review_lineage_reservation_recovery_delete;
+DROP TRIGGER review_lineage_reservation_recovery_insert;
+DROP TRIGGER review_lineage_reservation_recovery_update;
+DROP TRIGGER review_lineage_run_cancellation_intents_delete;
+DROP TRIGGER review_lineage_run_cancellation_intents_insert;
+DROP TRIGGER review_lineage_run_cancellation_intents_update;
+DROP TRIGGER review_lineage_runs_delete;
+DROP TRIGGER review_lineage_runs_insert;
+DROP TRIGGER review_lineage_runs_update;
+DROP TRIGGER review_lineage_workflow_evidence_delete;
+DROP TRIGGER review_lineage_workflow_evidence_insert;
+DROP TRIGGER review_lineage_workflow_evidence_update;
+DROP TRIGGER review_receipt_source_delete;
+DROP TRIGGER review_receipt_source_insert;
+DROP TRIGGER review_receipt_source_update;
+DROP TRIGGER review_round_source_delete;
+DROP TRIGGER review_round_source_insert;
+DROP TRIGGER review_round_source_no_replace_insert;
+DROP TRIGGER review_round_source_no_replace_update;
+DROP TRIGGER review_round_source_update;
+DROP TRIGGER review_workflow_round_source_insert;
+DROP TRIGGER review_workflow_source_delete;
+DROP TRIGGER review_workflow_source_insert;
+DROP TRIGGER review_workflow_source_update;
+DROP TABLE review_archive_identity_members;
+DROP TABLE review_archive_identity_certifications;
+DROP TABLE review_archive_source_versions;
 """),
 )
 
