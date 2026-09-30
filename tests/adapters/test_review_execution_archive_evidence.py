@@ -65,6 +65,16 @@ from tests.adapters.test_review_productive_settlement import confirmed_copy, wor
 
 
 def _complete_source_passes(store, key, now, *, initial=False):
+    from issue_agent.adapters.review_archive_identity import advance_review_archive_identity_audit
+    from issue_agent.domain.review_archive_identity import CompletedReviewArchiveIdentities
+
+    for _ in range(64):
+        with store.transaction() as db:
+            identities = advance_review_archive_identity_audit(db, now=now)
+        if isinstance(identities, CompletedReviewArchiveIdentities):
+            break
+    else:
+        raise AssertionError("archive identity audit did not complete")
     for advance, completed in (
         (advance_review_round_archive_audit, CompletedReviewRoundArchiveScan),
         (advance_review_round_receipt_archive_audit, CompletedReviewRoundReceiptArchiveAudit),
@@ -97,6 +107,7 @@ def _complete_source_passes(store, key, now, *, initial=False):
 
 
 def _complete(store, key, now):
+    _complete_source_passes(store, key, now)
     for _ in range(64):
         with store.transaction() as db:
             state = advance_review_checkpoint_archive_audit(db, key, now=now)
@@ -104,7 +115,6 @@ def _complete(store, key, now):
             break
     else:
         raise AssertionError("checkpoint audit did not complete")
-    _complete_source_passes(store, key, now)
 
 
 def test_initial_archive_join_precedes_first_checkpoint_and_has_no_writes(active):
@@ -151,7 +161,7 @@ def test_initial_archive_join_detects_an_unclaimed_checkpoint_receipt(rig):
             (REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, key.repository,
              receipt_id, now.isoformat(), encode_workflow(manifest.receipt)),
         )
-        with pytest.raises(WorkflowAuthorityError, match="checkpoint absence pass is stale"):
+        with pytest.raises(WorkflowAuthorityError, match="archive .* census is stale"):
             observe_initial_review_execution_archive_evidence(db, key, now=now)
     binding = manifest.receipt.previous_checkpoint.state.binding
     for _ in range(64):
@@ -167,13 +177,10 @@ def test_initial_archive_join_detects_an_unclaimed_checkpoint_receipt(rig):
             "DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
             (REVIEW_EXECUTION_CHECKPOINT_NAMESPACE, key.repository, receipt_id),
         )
-    for _ in range(64):
-        with store.transaction() as db:
-            state = advance_initial_checkpoint_absence_audit(db, binding, now=now)
-        if isinstance(state, CompletedInitialCheckpointAbsence):
-            break
-    else:
-        raise AssertionError("repaired checkpoint absence audit did not complete")
+    _complete_source_passes(store, key, now, initial=True)
+    with store.transaction() as db:
+        state = advance_initial_checkpoint_absence_audit(db, binding, now=now)
+    assert isinstance(state, CompletedInitialCheckpointAbsence)
     with store.transaction() as db:
         restored = observe_initial_review_execution_archive_evidence(db, key, now=now)
     assert restored.checkpoint_absence == state
@@ -183,7 +190,7 @@ def test_initial_archive_join_detects_an_unclaimed_checkpoint_receipt(rig):
             "VALUES ('review-checkpoint-application',?,'orphan:after-repair',?, '{}')",
             (key.repository, now.isoformat()),
         )
-        with pytest.raises(WorkflowAuthorityError, match="checkpoint absence pass is stale"):
+        with pytest.raises(WorkflowAuthorityError, match="archive .* census is stale"):
             observe_initial_review_execution_archive_evidence(db, key, now=now)
     for _ in range(64):
         with store.transaction() as db:
@@ -508,7 +515,7 @@ def test_archive_join_rejects_foreign_checkpoint_source_after_completed_pass(act
         )
         after = read_review_archive_source_versions(db, key.repository)
         assert after.checkpoint_sources == before.checkpoint_sources + 1
-        with pytest.raises(WorkflowAuthorityError, match="checkpoint census is stale"):
+        with pytest.raises(WorkflowAuthorityError, match="archive .* census is stale"):
             observe_review_execution_archive_evidence(db, key, now=now)
 
 
@@ -592,7 +599,7 @@ def test_archive_join_rechecks_current_checkpoint_application(active, damage):
                 "WHERE namespace=? AND scope=? AND key=?",
                 (REVIEW_CHECKPOINT_APPLICATION_NAMESPACE, key.repository, tip),
             )
-        with pytest.raises(WorkflowAuthorityError, match="checkpoint application"):
+        with pytest.raises(WorkflowAuthorityError, match="archive .* census is stale"):
             observe_review_execution_archive_evidence(db, key, now=now)
 
 
@@ -614,7 +621,7 @@ def test_archive_join_rejects_valid_application_change_after_completed_pass(acti
         )
         after = read_review_checkpoint_application_source(db, key.repository, tip)
         assert after.source_sha256 != before.source_sha256
-        with pytest.raises(WorkflowAuthorityError, match="application changed"):
+        with pytest.raises(WorkflowAuthorityError, match="archive .* census is stale"):
             observe_review_execution_archive_evidence(db, key, now=now)
 
 

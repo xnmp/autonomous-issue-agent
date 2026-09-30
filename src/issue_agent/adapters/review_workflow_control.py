@@ -952,6 +952,11 @@ class SQLiteReviewWorkflowControl:
         except ValueError as exc:
             raise WorkflowAuthorityError(f"review proposal refused: {exc}") from exc
         self._validate_receipts(db, prior, transition, facts)
+        if (transition.snapshot.revision.fence.generation != prior.revision.fence.generation
+                and isinstance(prior.execution, ActivatedReviewExecution)):
+            from .review_execution_archive_gate import require_review_execution_archive_admission
+
+            require_review_execution_archive_admission(db, key, prior.execution, now=self._now())
         # Enqueued commands load the new aggregate before this transaction ends;
         # its generation boundary requires the accepted transition receipt.
         committed = record_commit(db, self._control, self._writer.repository, transition, encoded)

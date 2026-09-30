@@ -705,6 +705,10 @@ class SQLiteReviewExecutionControl:
             if release is not None and release.status is not ReleaseStatus.VERIFIED:
                 raise WorkflowAuthorityError("review preflight is held by unverified release projection")
             now = self._control.now()
+            if isinstance(snapshot.execution, ActivatedReviewExecution):
+                from .review_execution_archive_gate import require_review_execution_archive_admission
+
+                require_review_execution_archive_admission(db, key, snapshot.execution, now=now)
             plan = plan_review_preflight(snapshot, selection, now=now)
             if not isinstance(snapshot.execution, ActivatedReviewExecution):
                 raise WorkflowAuthorityError("review execution is inactive")

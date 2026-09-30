@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-09-29. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-09-30. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -485,6 +485,8 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
 `domain/review_activation.py`, `domain/review_exemptions.py`, `domain/review_linkage.py`,
 `domain/review_execution.py` (phase-4 pure ordered execution projection; runtime cutover pending),
+`domain/review_execution_archive_gate.py` (typed certification and admission policy; settlement remains independent),
+`domain/review_archive_identity.py` (immutable global identity census progress and projection generation),
 `domain/review_execution_activation.py` (typed execution import sources, complete owner-run and round observations, abandoned-run attribution, plain recorded review baseline proof and registered command-to-round links),
 `domain/review_execution_counter_mapping.py` (offline attribution of legacy issue and negated-PR counter files from complete open-PR linkage observations; shared issue keys block),
 `domain/review_execution_death_import.py` (observational whole-set attribution of abandoned owner runs and current counter files; ambiguous or cross-PR deaths block),
@@ -564,6 +566,15 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/review_round_receipt_sweep.py` (bounded indexed read-only pages, canonical payload attribution and exact finalized-round member payload checks; no audit authority),
 `adapters/review_round_receipt_owner.py` (bounded read-only source-to-round member join for bound, named and command-keyed receipts, with open rounds pending; no complete census or admission authority),
 `adapters/review_execution_compaction.py` (transaction-local retired-source proposal and checkpoint receipt reconstruction; no compaction authority),
+`adapters/review_execution_checkpoint_commit.py` (transaction-local source-verified checkpoint/application publication with a savepoint and post-write archive certification),
+`adapters/review_execution_import_observation.py` (read-only complete configured SQL import source collection with a cumulative source budget; no cursor advancement or activation authority),
+`adapters/review_execution_archive_gate.py` (bounded certificate integrity reads and separate admission checks),
+`adapters/review_execution_archive_admission_audit.py` (one bounded page per archive source family and transactional admission recertification),
+`adapters/review_execution_archive_claim.py` (archived dispatch creation/terminal claim lineage),
+`adapters/review_execution_archive_round.py` (finalized round command, effect, transition and accounting lineage),
+`adapters/review_execution_transition_proof.py` (small generation proof for compacted reads; accepted historical payloads remain audited),
+`adapters/review_archive_identity.py` (paged Unicode-normalized identity projection with mutation witnesses and per-page receipts),
+`adapters/sql_read_budget.py` (opt-in transaction result-byte/row meter and temporary SQLite value bound; page and point queries bound engine work separately),
 `adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
 `adapters/review_execution_import_sources.py` (barrier-held legacy file/PR-link and SQL source revalidation, including current registration/lifecycle command membership before counter attribution),
 `adapters/review_execution_import_commit.py` (transaction-local atomic publication of a revalidated zero-history execution plan),

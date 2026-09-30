@@ -9,6 +9,25 @@ acceptance through the production fix-daemon composition `6905184`). The
 **review-rejection slice and phase 3 are accepted** at `a7214bf`; see the
 [verification record](2026-09-27-review-slice-verification.md). Current work is
 phase 4 under the [review execution design](2026-09-27-phase-4-review-execution-design.md).
+
+Checkpoint 138 adds atomic checkpoint publication, bounded compacted reads and
+a durable archive admission gate. Its full `make test` passed: 3,358 domain,
+3,799 adapter and 2,924 app tests (10,081 total), 123 hook checks, parity, all four architecture
+contracts and both Pyrefly checks. Runtime maintenance and convergence during
+continuing writes remain open. The final gate includes the independently reviewed
+fixture-selector isolation repair and bounded import-source collector. The user confirmed that no additional historical source is
+available and directed ambiguous historical PRs to remain blocked. The full
+acceptance plan remains active: phase 4 is **0/7** and phases 1–3 are **3/6**.
+See the [remaining milestones](2026-09-29-phase-4-remaining-milestones.md),
+[runtime compaction design](2026-09-30-phase-4-runtime-compaction-design.md), and
+[hook fixture incident and recovery](2026-09-30-hook-fixture-incident.md).
+
+## Phase 4 checkpoint history
+
+The following records describe successive checkpoints. Statements about missing
+writers or refusal of compacted loads refer to those earlier stages; checkpoint
+138 supersedes those foundation gaps while leaving the runtime duties open.
+
 The current offline source checkpoints inventory durable generation receipts,
 match complete accepted transition chains to typed stale-settlement witnesses,
 and classify every potentially successful review submission against complete

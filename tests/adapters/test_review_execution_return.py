@@ -1,7 +1,7 @@
 """Raw child evidence and accounting settle together before round decisions."""
 
 from dataclasses import replace
-from datetime import timedelta
+from datetime import datetime, timedelta
 import sqlite3
 
 import pytest
@@ -85,7 +85,7 @@ def test_conflicting_return_or_money_cannot_rewrite_accepted_evidence(admitted, 
     assert read_return(store, proposed) == evidence and dump(store) == before
 
 
-def test_indeterminate_spend_retains_money_and_raw_return_until_reconciliation(admitted):
+def test_indeterminate_spend_retains_money_and_raw_return_until_reconciliation(admitted, monkeypatch):
     store, selection, proposed = admitted
     register(store, proposed)
     snapshot = current(store, selection)
@@ -98,6 +98,8 @@ def test_indeterminate_spend_retains_money_and_raw_return_until_reconciliation(a
         assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
         assert db.execute("SELECT policy FROM reservation_recovery").fetchone()[0] == "reconcile_only"
     before = dump(store)
+    retry_at = store.now() + timedelta(hours=1)
+    monkeypatch.setattr(store, "_now", lambda: retry_at)
     assert store.record_reservation_retained(proposed.run_id, "usage unavailable", returned_review=evidence)
     assert dump(store) == before
     result = store.settle_review_return(settlement(proposed, basis=PricingBasis.RECONCILED), evidence)
@@ -105,6 +107,26 @@ def test_indeterminate_spend_retains_money_and_raw_return_until_reconciliation(a
     assert store.snapshot(proposed.scope).reserved.micros == 0
     assert store.snapshot(proposed.scope).committed.micros == 12
     assert read_return(store, proposed) == evidence
+
+
+def test_retention_reason_change_updates_recovery_without_rewriting_completion(admitted, monkeypatch):
+    store, _, proposed = admitted
+    register(store, proposed)
+    evidence = returned(store, proposed)
+    assert store.record_reservation_retained(proposed.run_id, "usage unavailable", returned_review=evidence)
+    with store.transaction() as db:
+        run_before = tuple(db.execute("SELECT * FROM runs WHERE run_id=?", (str(proposed.run_id),)).fetchone())
+    retry_at = store.now() + timedelta(hours=1)
+    monkeypatch.setattr(store, "_now", lambda: retry_at)
+    assert store.record_reservation_retained(proposed.run_id, "provider reconciliation pending", returned_review=evidence)
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT * FROM runs WHERE run_id=?", (str(proposed.run_id),)).fetchone()) == run_before
+        recovery = db.execute("SELECT policy,reason,updated_at FROM reservation_recovery WHERE run_id=?",
+                              (str(proposed.run_id),)).fetchone()
+        assert tuple(recovery[:2]) == ("reconcile_only", "provider reconciliation pending")
+        assert datetime.fromisoformat(recovery["updated_at"].replace("Z", "+00:00")) == retry_at
+    assert read_return(store, proposed) == evidence
+    assert store.snapshot(proposed.scope).reserved.micros == 60
 
 
 def test_reconciler_first_still_captures_exact_return_without_changing_settled_money(admitted):

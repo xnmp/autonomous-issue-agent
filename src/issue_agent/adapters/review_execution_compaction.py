@@ -1,9 +1,9 @@
-"""Transaction-local observations for a future review execution checkpoint writer."""
+"""Transaction-local source proposals for atomic review execution checkpoints."""
 
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from ..domain.review_checkpoint_application import (
     ReviewCheckpointApplicationProposal, build_review_checkpoint_application_proposal,
@@ -113,19 +113,24 @@ def _read_suffix_outcomes(
 def observe_review_checkpoint_manifest(
     db: sqlite3.Connection, key: WorkflowKey, through_sequence: int,
     *, max_source_bytes: int = MAX_CHECKPOINT_MANIFEST_SOURCE_BYTES,
+    verify_lineage: bool = False,
 ) -> ObservedReviewCheckpointManifest:
     """Rebuild a retired source proposal from canonical SQL in one snapshot.
 
     Retired receipt payloads are classified locally. A writer must still census
     unclaimed rows and receipts, verify external command/effect and transition
-    lineage, and publish an audit gate atomically.
+    lineage, and publish an audit gate atomically. The committed writer enables
+    full lineage verification and requires a current paged identity projection.
     The retained-field ceiling is passed to retired round and generation page
     readers before each payload fetch and charges repeated retired receipt
-    reads. It does not bound the canonical loader, origin read, or peak memory.
+    reads. The committed writer additionally meters every indirect SQL result,
+    including the canonical loader and origin read. Neither budget bounds
+    peak memory or SQLite scan and sort work; point and page bounds still apply.
     """
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or not isinstance(key, WorkflowKey)
             or type(through_sequence) is not int
+            or type(verify_lineage) is not bool
             or type(max_source_bytes) is not int
             or not 1 <= max_source_bytes <= MAX_CHECKPOINT_MANIFEST_SOURCE_BYTES):
         raise ValueError("checkpoint manifest requires a transaction and bounded inputs")
@@ -169,7 +174,19 @@ def observe_review_checkpoint_manifest(
                 if classified.source.source != observed.source:
                     raise WorkflowAuthorityError("checkpoint manifest retired receipt set changed")
                 source_bytes += classified.source_bytes
-                round_sources.append(observed.source)
+                source = observed.source
+                if verify_lineage:
+                    from .review_execution_archive_round import observe_review_execution_archive_round
+
+                    if source_bytes >= max_source_bytes:
+                        raise WorkflowAuthorityError("checkpoint manifest source stream exceeds its byte bound")
+                    lineage = observe_review_execution_archive_round(
+                        db, source.round, max_source_bytes=max_source_bytes - source_bytes,
+                        indexed_identities=True,
+                    )
+                    source_bytes += lineage.source_bytes
+                    source = replace(source, lineage_sha256=lineage.source_sha256)
+                round_sources.append(source)
             next_sequence = page.next_sequence
         if tuple(source.round for source in round_sources) != tuple(
             outcome.round for outcome in plan.retired_outcomes

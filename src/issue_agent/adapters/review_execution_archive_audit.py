@@ -202,7 +202,12 @@ def advance_review_generation_archive_audit(
                 or origin.execution_epoch != epoch or origin.execution_episode != episode):
             raise WorkflowAuthorityError("generation archive audit cursor changed its episode")
         if isinstance(state, (BlockedReviewGenerationArchiveScan, BlockedReviewGenerationArchiveSweep)):
-            return state
+            if now < state.detected_at:
+                raise ValueError("generation archive audit time moved backwards")
+            if stored_version is None or stored_version == source_version:
+                return state
+            state = (state.scan if isinstance(state, BlockedReviewGenerationArchiveScan)
+                     else state.prior)
         if current_generation < generation_scan.through_generation:
             if isinstance(state, (ReviewGenerationArchiveScan, CompletedReviewGenerationArchiveScan)):
                 generation = (state.next_generation if isinstance(state, ReviewGenerationArchiveScan)

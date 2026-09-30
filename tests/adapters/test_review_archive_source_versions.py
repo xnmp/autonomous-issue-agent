@@ -74,6 +74,50 @@ def _insert_lifecycle_effect(db, command_id="fixture:command"):
     )
 
 
+_LINEAGE_INSERTS = {
+    "dedupe_keys": "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                   "VALUES ('lineage','o/r','lineage:key','2026-09-29T00:00:00+00:00','{}')",
+    "dispatch_claims": "INSERT INTO dispatch_claims(repository,role,target,leg,owner_id,owner_pid,"
+                       "owner_start_ticks,paths_json,claimed_at,occurrence_id) VALUES "
+                       "('o/r','review','pr:91','REVIEW','lineage',1,1,'[]',"
+                       "'2026-09-29T00:00:00+00:00','lineage:claim')",
+    "runs": "INSERT INTO runs(run_id,dispatch_id,kind,owner_id,state,config_version) "
+            "VALUES ('lineage:run','lineage:dispatch','REVIEW','lineage','completed','test')",
+    "leases": "INSERT INTO leases(run_id,dispatch_id,owner_id,pid,pgid,started_at) "
+              "VALUES ('lineage:run','lineage:dispatch','lineage',1,1,"
+              "'2026-09-29T00:00:00+00:00')",
+    "budget_reservations": "INSERT INTO budget_reservations(reservation_id,run_id,repository,dimension,"
+                           "period_id,period_start,period_end,period_timezone,currency,maximum_micros,"
+                           "cap_micros,model,rate_card_id,rate_card_version,quote_effective_at,"
+                           "config_version,state,created_at,updated_at) VALUES "
+                           "('lineage:reservation','lineage:run','o/r','daily','2026-09-29',"
+                           "'2026-09-29T00:00:00+00:00','2026-09-30T00:00:00+00:00','UTC','USD',"
+                           "1,1,'model','card','1','2026-09-29T00:00:00+00:00','test','settled',"
+                           "'2026-09-29T00:00:00+00:00','2026-09-29T00:00:00+00:00')",
+    "reservation_recovery": "INSERT INTO reservation_recovery(run_id,policy,updated_at) "
+                            "VALUES ('lineage:run','reconcile_only','2026-09-29T00:00:00+00:00')",
+    "charges": "INSERT INTO charges(run_id,provider_receipt_id,amount_micros,currency,basis,settled_at) "
+               "VALUES ('lineage:run','lineage:receipt',1,'USD','synthetic',"
+               "'2026-09-29T00:00:00+00:00')",
+    "workflow_evidence": "INSERT INTO workflow_evidence(evidence_id,repository,target_kind,target_number,"
+                         "kind,payload_json) VALUES ('lineage:evidence','o/r','pr',91,'observation','{}')",
+    "reservation_limits": "INSERT INTO reservation_limits(run_id,repository,dimension,period_id,"
+                          "period_start,period_end,period_timezone,currency,cap_micros) VALUES "
+                          "('lineage:run','o/r','daily','2026-09-29','2026-09-29T00:00:00+00:00',"
+                          "'2026-09-30T00:00:00+00:00','UTC','USD',1)",
+    "quota_debits": "INSERT INTO quota_debits(run_id,quota,units,calculation_version) "
+                    "VALUES ('lineage:run','review',1,'1')",
+    "run_cancellation_intents": "INSERT INTO run_cancellation_intents(run_id,dispatch_id,kind,"
+                                "reason,created_at) VALUES ('lineage:run','lineage:dispatch','REVIEW',"
+                                "'operator','2026-09-29T00:00:00+00:00')",
+}
+
+
+def _lineage_versions(db):
+    return (read_review_lifecycle_source_version(db),
+            read_review_archive_source_versions(db, "o/r").workflow_rows)
+
+
 def test_review_archive_mutation_witnesses_follow_round_rows_and_receipts(active):
     store, snapshot = active
     with store.transaction() as db:
@@ -105,7 +149,9 @@ def test_review_receipt_witness_covers_every_selected_namespace_and_rekeys(activ
         all_inserted = read_review_archive_source_versions(db, "o/r")
         assert all_inserted.round_receipts == len(ROUND_RECEIPT_NAMESPACES)
         _insert_receipt(db, "other-namespace", "unrelated")
-        assert read_review_archive_source_versions(db, "o/r") == all_inserted
+        unrelated = read_review_archive_source_versions(db, "o/r")
+        assert unrelated.round_receipts == all_inserted.round_receipts
+        assert unrelated.workflow_rows == all_inserted.workflow_rows + 1
         db.execute(
             "UPDATE dedupe_keys SET namespace=CAST(namespace AS BLOB) "
             "WHERE namespace='review-round-stage'",
@@ -456,7 +502,6 @@ def test_archive_witness_rejects_implicit_dedupe_source_replacement(active, name
             "SELECT rowid FROM dedupe_keys WHERE namespace=? AND key='source:key'",
             (namespace,),
         ).fetchone()[0]
-        before = read_review_archive_source_versions(db, "o/r")
         if operation == "update":
             _insert_receipt(db, "other-namespace", "unrelated:key")
             mutation = (
@@ -469,6 +514,7 @@ def test_archive_witness_rejects_implicit_dedupe_source_replacement(active, name
                 "VALUES (?,'other-namespace','o/r','unrelated:key',"
                 "'2026-09-29T00:00:00+00:00','{}')"
             )
+        before = read_review_archive_source_versions(db, "o/r")
         with pytest.raises(sqlite3.IntegrityError, match="replacement would hide"):
             db.execute(mutation, (source_rowid,))
         assert read_review_archive_source_versions(db, "o/r") == before
@@ -529,7 +575,7 @@ def test_checkpoint_witness_covers_origin_checkpoint_and_application_sources(act
             )
         inserted = read_review_archive_source_versions(db, "o/r")
         assert inserted.checkpoint_sources == before.checkpoint_sources + 3
-        assert inserted.workflow_rows == before.workflow_rows
+        assert inserted.workflow_rows == before.workflow_rows + 3
         db.execute(
             "UPDATE dedupe_keys SET namespace=CAST(namespace AS BLOB) "
             "WHERE namespace='review-execution-origin' AND key='origin:fixture'",
@@ -585,7 +631,6 @@ def test_checkpoint_witness_rejects_implicit_dedupe_replacement(active, operatio
             "SELECT rowid FROM dedupe_keys WHERE namespace='review-checkpoint-application' "
             "AND key='application:fixture'",
         ).fetchone()[0]
-        before = read_review_archive_source_versions(db, "o/r")
         if operation == "insert":
             mutation = (
                 "INSERT OR REPLACE INTO dedupe_keys(rowid,namespace,scope,key,claimed_at,payload_json) "
@@ -598,6 +643,7 @@ def test_checkpoint_witness_rejects_implicit_dedupe_replacement(active, operatio
                 "UPDATE OR REPLACE dedupe_keys SET rowid=? "
                 "WHERE namespace='unrelated' AND key='replacement:fixture'"
             )
+        before = read_review_archive_source_versions(db, "o/r")
         with pytest.raises(sqlite3.IntegrityError, match="replacement would hide"):
             db.execute(mutation, (source_rowid,))
         assert read_review_archive_source_versions(db, "o/r") == before
@@ -651,7 +697,7 @@ def test_checkpoint_and_workflow_witnesses_survive_v29_migration(active):
         ).rowcount
         after = read_review_archive_source_versions(db, "o/r")
         assert workflow_updates > 0
-        assert (after.checkpoint_sources, after.workflow_rows) == (1, workflow_updates)
+        assert (after.checkpoint_sources, after.workflow_rows) == (1, workflow_updates + 1)
 
 
 def test_checkpoint_and_workflow_witnesses_rollback_with_source_mutations(active):
@@ -670,7 +716,7 @@ def test_checkpoint_and_workflow_witnesses_rollback_with_source_mutations(active
         ).rowcount
         changed = read_review_archive_source_versions(db, "o/r")
         assert changed.checkpoint_sources == baseline.checkpoint_sources + 1
-        assert changed.workflow_rows == baseline.workflow_rows + workflow_updates
+        assert changed.workflow_rows == baseline.workflow_rows + workflow_updates + 1
         db.rollback()
     with store.transaction() as db:
         assert read_review_archive_source_versions(db, "o/r") == baseline
@@ -726,6 +772,106 @@ def test_lifecycle_witness_covers_command_and_effect_mutations(active):
         db.execute("DELETE FROM effect_receipts WHERE command_id='fixture:command'")
         db.execute("DELETE FROM lifecycle_commands WHERE command_id='fixture:command'")
         assert read_review_lifecycle_source_version(db) == inserted + 4
+
+
+@pytest.mark.parametrize("table", tuple(_LINEAGE_INSERTS))
+def test_lineage_source_insert_update_delete_advance_both_freshness_witnesses(active, table):
+    store, _ = active
+    with closing(store._connect()) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("BEGIN")
+        before = _lineage_versions(db)
+        db.execute(_LINEAGE_INSERTS[table])
+        inserted = _lineage_versions(db)
+        assert inserted == tuple(version + 1 for version in before)
+        db.execute(f"UPDATE {table} SET rowid=rowid WHERE rowid=(SELECT max(rowid) FROM {table})")
+        updated = _lineage_versions(db)
+        assert updated == tuple(version + 1 for version in inserted)
+        db.execute(f"DELETE FROM {table} WHERE rowid=(SELECT max(rowid) FROM {table})")
+        deleted = _lineage_versions(db)
+        assert deleted == tuple(version + 1 for version in updated)
+        db.rollback()
+    with store.transaction() as db:
+        assert _lineage_versions(db) == before
+
+
+@pytest.mark.parametrize("table", ("dedupe_keys", "charges", "workflow_evidence"))
+def test_lineage_source_replacement_cannot_hide_from_freshness(active, table):
+    store, _ = active
+    with closing(store._connect()) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("BEGIN")
+        db.execute(_LINEAGE_INSERTS[table])
+        before = _lineage_versions(db)
+        columns = {
+            "dedupe_keys": "namespace,scope,key,claimed_at,payload_json",
+            "charges": "run_id,provider_receipt_id,amount_micros,currency,basis,settled_at",
+            "workflow_evidence": "evidence_id,repository,target_kind,target_number,kind,payload_json",
+        }[table]
+        db.execute(
+            f"INSERT OR REPLACE INTO {table}({columns}) "
+            f"SELECT {columns} FROM {table} WHERE rowid=(SELECT max(rowid) FROM {table})",
+        )
+        after = _lineage_versions(db)
+        assert after == tuple(version + 1 for version in before)
+        db.rollback()
+
+
+@pytest.mark.parametrize("table", ("dedupe_keys", "charges", "workflow_evidence"))
+def test_lineage_source_witness_missing_or_overflow_blocks_mutation(active, table):
+    store, _ = active
+    with closing(store._connect()) as db:
+        db.execute("PRAGMA foreign_keys=OFF")
+        db.execute("BEGIN")
+        db.execute(_LINEAGE_INSERTS[table])
+        original = db.execute(f"SELECT rowid FROM {table} ORDER BY rowid DESC LIMIT 1").fetchone()[0]
+        db.execute("UPDATE review_archive_source_versions SET version=? "
+                   "WHERE source='lifecycle_rows' AND scope=X''", (MAX_ARCHIVE_SOURCE_VERSION,))
+        with pytest.raises(sqlite3.IntegrityError, match="overflow"):
+            db.execute(f"UPDATE {table} SET rowid=rowid WHERE rowid=?", (original,))
+        db.execute("DELETE FROM review_archive_source_versions "
+                   "WHERE source='lifecycle_rows' AND scope=X''")
+        with pytest.raises(WorkflowAuthorityError, match="lifecycle row mutation witness"):
+            read_review_lifecycle_source_version(db)
+        with pytest.raises(sqlite3.IntegrityError, match="lifecycle source witness"):
+            db.execute(f"UPDATE {table} SET rowid=rowid WHERE rowid=?", (original,))
+        db.rollback()
+
+
+def test_lineage_witness_v32_upgrade_covers_existing_sources(active):
+    store, _ = active
+    with store.transaction() as db:
+        db.execute(_LINEAGE_INSERTS["dedupe_keys"])
+    with closing(sqlite3.connect(store.path)) as db:
+        _historical_fixture(db, 31)
+        db.commit()
+    store.initialize()
+    with store.transaction() as db:
+        before = _lineage_versions(db)
+        db.execute("UPDATE dedupe_keys SET payload_json='[]' "
+                   "WHERE namespace='lineage' AND key='lineage:key'")
+        assert _lineage_versions(db) == tuple(version + 1 for version in before)
+
+
+@pytest.mark.parametrize("source", ("lifecycle_rows", "workflow_rows"))
+def test_lineage_mutation_requires_each_freshness_witness(active, source):
+    store, _ = active
+    with store.transaction() as db:
+        db.execute(_LINEAGE_INSERTS["dedupe_keys"])
+        db.execute("UPDATE review_archive_source_versions SET version=? "
+                   "WHERE source=? AND scope=X''", (MAX_ARCHIVE_SOURCE_VERSION, source))
+        with pytest.raises(sqlite3.IntegrityError, match="overflow"):
+            db.execute("UPDATE dedupe_keys SET payload_json='[]' "
+                       "WHERE namespace='lineage' AND key='lineage:key'")
+        db.execute("DELETE FROM review_archive_source_versions WHERE source=? AND scope=X''",
+                   (source,))
+        with pytest.raises(WorkflowAuthorityError, match="mutation witness"):
+            if source == "lifecycle_rows":
+                read_review_lifecycle_source_version(db)
+            else:
+                read_review_archive_source_versions(db, "o/r")
+        with pytest.raises(sqlite3.IntegrityError, match="source witness"):
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='lineage' AND key='lineage:key'")
 
 
 def test_lifecycle_witness_catches_implicit_replacement(active):

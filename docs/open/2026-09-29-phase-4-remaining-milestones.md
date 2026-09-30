@@ -16,12 +16,33 @@ milestone rather than adding another progress unit.
 | Milestone | Status | Observable acceptance result |
 | --- | --- | --- |
 | **1. Close review import evidence** | Doing | A complete, bounded and freshness-checked source set yields either one deterministic import decision or a specific blocker for every review PR. Link registrations to commands and rounds; resolve or explicitly block historical submissions, refused-ceiling prior state, ordered resets, death attribution, issue counters, sessions, and delivered/current verdict holds. Demonstrate a valid multi-round import fixture and malformed, ambiguous, missing, and changed-source refusals. |
-| **2. Commit review authority atomically** | To do | An isolated SQLite transaction imports the verified decision and writes the execution component, origin, checkpoint and source receipts together. Exact retry is inert; failure rolls back all authority changes. Compacted hot reads stay bounded and reject corrupt or stale evidence. The durable archive audit and admission gate block incomplete, changed, or overdue sources. |
+| **2. Commit review authority atomically** | Doing | An isolated SQLite transaction imports the verified decision and writes the execution component, origin, checkpoint and source receipts together. Exact retry is inert; failure rolls back all authority changes. Compacted hot reads stay bounded and reject corrupt or stale evidence. The durable archive audit and admission gate block incomplete, changed, or overdue sources. |
 | **3. Complete the review production slice offline** | To do | Scheduler, child reservation, submission settlement, recovery, operator and dashboard all use the same execution authority. Selected legacy runtime readers/writers are removed or fenced. Composed fault tests, shadow comparison, quiescence check, offline activation rehearsal, and rollback reconciliation pass without two live authorities. No live deployment is implied. |
 | **4. Migrate consumed replies and fix repair** | To do | Consumed human replies and fix repair session, model, branch, and resume state have typed PR/issue-scoped authority and durable receipts. Replayed or reordered replies cannot repeat or erase a continuation. Shadow results match supported legacy cases; ambiguous legacy data blocks import. Retire replaced runtime file paths. |
 | **5. Migrate remaining fix recovery** | To do | CI, review, and rebase allowances; infrastructure deaths; machine/budget holds; self-clear state; and PR remediation markers use one durable authority. Recovery, duplicate delivery, restart, operator action, and rollback tests preserve unrelated holds and accounting. Shadow and offline cutover evidence cover every selected legacy reader and writer. |
 | **6. Migrate steward continuation** | To do | Triage/groom baselines and stalls use scoped durable episodes and ordered receipts. Restart and duplicate-result tests show the same eligibility and continuation decisions as the shadow; ambiguous history blocks import. Replaced steward runtime paths are fenced or removed. |
 | **7. Accept phase 4 as one system** | To do | Cross-family daemon/effect/accounting tests pass, selected legacy Store suffixes and temporary flags are retired, shadow differences are resolved or documented blockers, rollback retains SQL authority, independent adversarial review finds no blocking issue, and full `make test` is green. Record exactly which offline activation/rehearsal ran and which live actions remain paused. |
+
+## Milestone 2 execution checklist
+
+This checklist exposes the existing acceptance duties within milestone 2; it
+adds no milestones and does not change the 0/7 acceptance count. Complete a row
+with behavior evidence, not another helper or an elapsed-time estimate. Further
+operator transport work is parked until these blockers close.
+
+| Duty | Current evidence / next observable result |
+| --- | --- |
+| Atomic publication, canonical compacted read, archive gate | Implemented and independently reviewed. Final combined `make test` passed 10,081 Python tests, 123 hook checks, parity, four architecture contracts and both Pyrefly checks; includes collector and fixture hardening. |
+| First-checkpoint bootstrap and pre-transition maintenance | Bootstrap verified with 17 behavioral tests and independent Luna review. Maintenance, bootstrap and SQL budget pass 64 focused tests; review found missing production caller enforcement, which remains to be wired. Changes are in an isolated snapshot awaiting integration. |
+| Audit convergence and bounded retention | Continuing source writes must not force endless origin rescans. Settlement/recovery stays available; source mutation, replacement and cursor corruption must be covered. Real pilot exposes quadratic replay; no convergent implementation is accepted. |
+| Renewed episode origin | Prior/new binding, reset state and execution-ceiling rearm completion must have one immutable source-backed origin. Canonical read still refuses this kind. |
+| Capacity and lifetime bounds | Prove open-prefix/byte refusal without partial authority, more than 4,096 rounds and generation advances, and actual 10/1,000/>5,000-history profiles. Pilot reached a verified checkpoint at 512 real rounds in 295.94s; its latest audit took 16.57s. The 1,000 run was stopped after projecting beyond its 600s cap; larger cases remain unaccepted. |
+| Integrated milestone acceptance | Independent adversarial review, full `make test`, explicit retained-source/settlement outcomes and all preceding evidence. Accept milestone 2 only here. |
+
+Status correction on 2026-09-30: the previous hour advanced and tested foundation
+work without closing a milestone. Operator retry development began before the
+first milestone's compaction blockers were resolved. That work is now parked;
+this checklist and the bootstrap result define the immediate execution order.
 
 Milestone 1 evidence in progress: checkpoint 131 links one bounded
 registration to its recorded command, effect, preflight, round, and planned
@@ -93,6 +114,28 @@ passed (3,332 domain, 3,663 adapter, 2,909 app tests, hooks, governor, gate
 parity, four architecture contracts and both Pyrefly checks); the milestone
 count is unchanged.
 
+Checkpoint 138 composes offline checkpoint publication,
+bounded compacted reads, indexed archived identities, complete round/claim/
+accounting lineage and a durable admission certificate. Independent Sol/Luna
+reviews found and verified fixes for atomicity, cursor provenance and SQL meter
+holes. The retention retry regression exposed by the full gate is fixed and
+passes focused recovery tests. The final isolated full `make test` passed:
+3,358 domain, 3,796 adapter and 2,909 app tests, 123 hook checks, parity,
+four architecture contracts and both Pyrefly checks. Its log is
+`/tmp/phase4-checkpoint-isolated-gate.log`. Runtime maintenance, audit convergence during continuing writes,
+5,000 real-round/generation profiles, renewed origins and historical import
+proofs remain open. The measured selected-identity profile and next design are
+recorded in [runtime compaction continuation](2026-09-30-phase-4-runtime-compaction-design.md).
+
+The user confirmed on 2026-09-30 that no additional historical chronology source
+exists; ambiguous historical PRs remain blocked. A full-suite retry exposed
+unsafe hook fixture setup after concurrent scratch deletion and accidentally
+mutated local and remote Git refs. Local work is recovered; fixture hardening passed independent Sol/Luna review,
+eight injected-failure regressions and the complete gate. The approved atomic remote rollback restored `dev` and deleted the fixture
+branch. The no-push instruction remains in force for accepted work. See the
+[incident record](2026-09-30-hook-fixture-incident.md). This failed run is not
+acceptance evidence.
+
 ## Progress rule
 
 For each milestone, record the accepting commit, behavior-level test or
@@ -106,3 +149,17 @@ Update the phase-4 milestone count when a gate is accepted. Keep the existing
 six-phase board at **3/6** until milestone 7 is accepted. Live activation and
 deployment remain subject to the existing pause and separate authorization;
 offline tests or a controlled double must never be reported as live cutover.
+
+Final checkpoint note: the first isolated full gate passed, but the fresh
+complete-diff review subsequently found inherited Git repository selectors could
+escape fixture isolation. The additional repair and another complete gate remain
+required before the checkpoint commit. Its evidence does not accept a milestone.
+
+The final foundation tree also adds the production read-only SQL import collector,
+which composes complete existing inventories under the cumulative SQL meter
+and requires a fresh matched registration/lifecycle census. Fifteen behavioral
+cases cover configured prior owners, malformed/oversized/pending/changed sources,
+read-only behavior, nonempty observations and real empty-history activation.
+Fresh main-checkout collector/source/service tests pass; its final full gate is
+pending. Operator CLI, durable original-plan retry and copied rehearsal remain
+open.

@@ -1,47 +1,46 @@
 # Phase 4 — execution origin and bounded compaction contract
 
-Date: 2026-09-28 Australia/Sydney. Contract for offline implementation;
-the pure prefix planner, checkpoint cursor, imported-origin read prerequisite,
-fresh first-observation origin, digest-bound generation receipts and typed
-checkpoint source manifest are implemented. The canonical reader verifies
-checkpoint row identity, one predecessor, the final retired generation source
-pair, and the final retired round row and receipt set, but refuses every
-compacted component until complete archive membership and the audit gate
-can be verified.
-The transaction-local manifest observer now reconstructs expected retired
-round and generation streams and a candidate receipt. Its remaining byte
-budget is passed into retired round and generation page readers before payload
-fetch. Repeated retired receipt reads are charged; the canonical load and origin
-read are still outside that bound, and the budget is not a peak-memory guarantee.
-It neither surveys unclaimed archive rows nor certifies
-external command/effect and transition lineage, so it cannot authorize a
-checkpoint write. It now classifies each retired round's local receipt
-payloads and charges the repeat reads before reading the next round.
-On SQLite 3.43+, canonical active-round loads now point-check the indexed
-suffix with metadata byte lengths and stop before an overbudget payload fetch.
-SQLite documents this optimization for
-[`octet_length(column)`](https://www.sqlite.org/lang_corefunc.html#octet_length).
-The older SQLite fallback uses a length expression that may materialize one
-oversized row; a strict writer/admission bound must establish a platform floor
-or another bounded read before cutover. Receipt and origin reads remain separate
-from this active-round budget.
-Production import and renewal writers, the checkpoint writer, bounded
-compacted hot reads and the complete audit remain pending. A durable offline
-cursor now scans expected generation sources and the retained receipt
-namespace in bounded pages, comparing the set and the prior pass digest. It
-has no admission or compaction authority. Execution authority is not
-activated. Read with the
+Date: 2026-09-30 Australia/Sydney. Contract for offline implementation.
+Checkpoint 138 adds atomic checkpoint publication, certified
+compacted reads and a paged archive admission runner. Publication requires
+complete current source passes and full claim, accounting, command/effect and
+accepted transition lineage. It writes checkpoint/application receipts, the
+component and a typed archive certificate in one transaction, with an internal
+savepoint protecting callers that catch a failure before committing.
+
+Canonical compacted reads check the origin, exact checkpoint and application,
+one predecessor, the final retired generation source pair and round receipts,
+then replay the bounded active suffix. Overdue or discrepant archive evidence
+holds new preflight, paid reservation, launch and generation advance; canonical
+integrity, settlement and recovery remain available. Exact retries precede
+eligibility checks. Only a complete fresh audit renews the deadline.
+
+A schema-owned global identity projection supports bounded selected source
+lookups, with independent page receipts and projection mutation witnesses.
+The scoped SQL meter includes canonical load, origin and repeated receipt
+reads in the cumulative returned-source budget and restores SQLite row/value
+limits on exit. It is not a bound on all engine input work or peak memory.
+The strict writer/reader path requires SQLite 3.43 or newer and uses
+[`octet_length(column)`](https://www.sqlite.org/lang_corefunc.html#octet_length)
+before payload fetch. Older SQLite remains supported only on the existing
+uncompacted observational path.
+
+Automatic runtime maintenance, audit convergence under ongoing source writes,
+real 5,000-round/generation profiles, renewed episode origins and historical
+imports remain pending. The foundation is offline; no real deployment has
+activated execution authority. See the
+[runtime continuation and measured bounds](2026-09-30-phase-4-runtime-compaction-design.md).
+Read with the
 [execution design](2026-09-27-phase-4-review-execution-design.md),
 [generation-boundary finding](2026-09-28-phase-4-generation-boundary.md), and
 [phase 4 progress](2026-09-27-phase-4-progress.md).
 
-A separate transaction-local observer now streams one compacted checkpoint's
-retired generation and round sources through a pure state reducer, compares
-both ordered source digests and the projected state with its receipt, and
-checks the recorded first following boundary choice. Its byte ceiling is
-accounted after individually bounded source reads. It does not establish
-checkpoint-chain membership, an unclaimed-source census, a strict cumulative
-SQL read bound, or the durable paged admission gate.
+The transaction-local manifest observer streams each newly retired prefix
+through a pure state reducer, compares ordered source digests and projected
+state, and checks the first following boundary choice. The publication path
+composes it with complete source membership, current indexed identities,
+lineage and the cumulative SQL meter; the observational helper alone still
+does not grant publication authority.
 
 ## Reason for a separate checkpoint
 

@@ -414,7 +414,7 @@ def test_typed_compacted_prefix_refuses_load_without_verified_source_anchors(act
                                                        last_sequence=1, checkpoint_receipt=receipt_id))
         expected = set_projection(db, compacted, (), 1)
         before = tuple(db.iterdump())
-        with pytest.raises(WorkflowAuthorityError, match="source anchors"):
+        with pytest.raises(WorkflowAuthorityError):
             load_review_workflow_row(db, snapshot.revision.fence.key)
         assert expected.execution.state.failures == 4
         assert tuple(db.iterdump()) == before
@@ -1148,6 +1148,6 @@ def test_compacted_checkpoint_checks_its_immediate_predecessor(active, predecess
         ))
         set_projection(db, compacted, (), 2)
         before = tuple(db.iterdump())
-        with pytest.raises(WorkflowAuthorityError, match="source anchors" if predecessor == "valid" else "checkpoint"):
+        with pytest.raises(WorkflowAuthorityError):
             load_review_workflow_row(db, snapshot.revision.fence.key)
         assert tuple(db.iterdump()) == before

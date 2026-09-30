@@ -172,7 +172,11 @@ def advance_review_round_archive_audit(
                 or prior.origin_receipt != execution.origin):
             raise WorkflowAuthorityError("round archive cursor changed its execution episode")
         if isinstance(state, BlockedReviewRoundArchiveScan):
-            return state
+            if now < state.detected_at:
+                raise ValueError("round archive audit time moved backwards")
+            if stored_version is None or stored_version == round_rows_version:
+                return state
+            state = state.prior
         if now < (state.started_at if isinstance(state, ReviewRoundArchiveScan) else state.completed_at):
             raise ValueError("round archive audit time moved backwards")
         try:

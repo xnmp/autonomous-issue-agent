@@ -323,11 +323,14 @@ def fold_checkpoint_round_stream(
     _digest(stream_sha256, "checkpoint round stream")
     if not isinstance(source, ReviewExecutionCompactionRoundSource):
         raise ValueError("checkpoint round stream requires a typed source")
-    encoded = "\0".join((
+    parts = (
         str(source.round.sequence), source.round.round_id,
         str(source.round.binding.rejection.fence.generation),
         source.row_sha256, source.receipt_set_sha256,
-    )).encode()
+    )
+    if source.lineage_sha256 is not None:
+        parts += (source.lineage_sha256,)
+    encoded = "\0".join(parts).encode()
     return hashlib.sha256(bytes.fromhex(stream_sha256) + encoded).hexdigest()
 
 

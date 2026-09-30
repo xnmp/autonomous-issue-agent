@@ -240,7 +240,11 @@ def advance_review_round_receipt_archive_audit(
     rowid, state, stored_versions = _read_state(db, key.repository, audit_key)
     if isinstance(state, (BlockedReviewRoundReceiptArchiveScan,
                           BlockedReviewRoundReceiptArchiveSweep)):
-        return state
+        if now < state.detected_at:
+            raise ValueError("round receipt audit time moved backwards")
+        if stored_versions is None or stored_versions == current_versions:
+            return state
+        state = state.prior
     try:
         frontier = _finalized_frontier(db, execution)
     except (WorkflowAuthorityError, sqlite3.Error) as exc:

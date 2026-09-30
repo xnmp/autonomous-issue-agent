@@ -7,7 +7,114 @@ with `CLAUDE.md`, `AGENTS.md`, the
 [execution design](2026-09-27-phase-4-review-execution-design.md), and the
 [origin and compaction contract](2026-09-28-phase-4-compaction-contract.md).
 
-## Continuation after checkpoint 137
+## Current continuation — checkpoint publication foundation
+
+Current priority and running gate are in the
+[focused milestone-2 handover](2026-09-30-phase-4-m2-focused-handover.md).
+Operator transport is parked until milestone-2 compaction blockers close.
+
+Checkpoint 138 adds atomic publication, compacted hot reads and archive
+admission together. The complete isolated `make test` passed: 3,358 domain,
+3,799 adapter and 2,924 app tests (10,081 total), 123 hook checks, parity,
+four architecture contracts and both Pyrefly checks. Phase 4 remains 0/7
+and the six-phase plan remains 3/6. All seven services remain inactive.
+
+Continuation warning: the later full-gate retry suffered a scratch cleanup race.
+Unsafe hook fixture setup then made accidental local commits and remote pushes.
+Local `dev` is restored to `c4404a2`, and all 44 pending files matched their saved
+checksums before subsequent authorized hardening changes. All seven services
+remain inactive. Approved remote repair completed; see the
+[incident record](2026-09-30-hook-fixture-incident.md). Fail-closed hook fixture setup passed independent Sol/Luna review, eleven
+injected-failure/selector regressions and all 123 hook checks in the full gate. Scratch
+for the hardened hook suite must resolve outside the source and invoking checkouts.
+
+- `review_execution_checkpoint_commit.commit_review_execution_checkpoint`
+  requires a caller-held write transaction and current complete source passes.
+  It publishes checkpoint/application receipts, component and typed gate
+  atomically, including rollback if a caller catches failure inside the outer
+  transaction. Exact publication retry precedes deadline checks.
+- `review_execution_archive_round` and `review_execution_archive_claim` join
+  local closures to dispatch creation/termination, child admission/launch/
+  return/accounting, command/effect, baseline and accepted transition lineage.
+  Schema 32 witnesses the additional paid/claim/source tables in both lifecycle
+  and workflow revisions; unchanged retention retries now avoid redundant
+  updates instead of invalidating provenance.
+- `sql_read_budget` meters cumulative returned source bytes/rows before fetch,
+  restores row/value limits and scopes authorizers. The writer and compacted
+  reader require SQLite 3.43+. It does not bound all engine input work, temporary
+  sorting or peak Python memory. Repeated reads count toward nested budgets.
+- `review_archive_identity` scans global dedupe/round/claim identities in
+  128-row, 1 MiB pages and supports indexed normalized lookups. Cursor progress
+  requires a separate canonical page receipt. Projection witnesses detect
+  member/certification mutation; repaired scans use a new cohort, so old orphan
+  members cannot suppress a new census. Periodic receipt/orphan retention still
+  needs bounded collection.
+- `review_execution_archive_gate` separates integrity from new-work eligibility.
+  Compacted canonical reads verify exact anchors and bounded suffixes. New
+  preflight, paid reservation, launch and generation advance enforce the deadline;
+  settlement and recovery remain writable. The internal paged admission runner
+  recertifies only after all source passes complete and can recover after a
+  repaired discrepancy. It has no periodic runtime wiring yet.
+
+Independent reviews found and verified fixes for caller-caught partial writes,
+malformed publication pointers, cursor provenance, projection cohort reuse and
+SQL window-function overrides. The actual retained-identity profile, limitations
+and next runtime design are in
+[runtime compaction continuation](2026-09-30-phase-4-runtime-compaction-design.md).
+Modern paid/copied/abandoned rounds, multiple checkpoints, a zero-new-round
+generation checkpoint and an open-prefix gap have outcome-level tests. This
+does not prove a historical multi-round import or 5,000 real rounds/generations.
+
+Next: resolve incremental audit convergence under continuing writes, then wire
+bounded per-tick maintenance and automatic checkpoints before suffix/byte
+limits. A global version-only relaxation is unsafe. Sol is profiling actual
+production-control histories separately; preserve this tested foundation before
+integrating that next slice. Historical/terminal imports, renewed origins,
+review runtime retirement and the other continuation families remain pending.
+
+### Operator transport prerequisites
+
+Read-only Sol investigation found that the configured plan/activation service
+still depends on caller-supplied typed observations. The complete SQL source
+collector exists only in the activation test fixture. Production transport needs
+explicit bounded audit preparation, configured owner lineage and complete
+run/submission/receipt/round/outcome/generation observations, followed by current
+matched registration membership. An incomplete census remains pending/blocked.
+
+Later digest-only CLI retry also needs a bounded retained-plan reader: the current
+SQL verifier requires the original typed plan, which cannot necessarily be
+rederived after activation or legacy source disappearance. Keep exact retry
+independent of fresh legacy reads.
+
+A copied rehearsal must include all selected review execution files and relocate
+its database to the configured canonical authority path. Compare source contents
+and decisions across copies; paths and inodes legitimately change plan identity.
+The current configured gateway performs read-only network observations. A fully
+networkless rehearsal additionally requires a complete captured gateway snapshot;
+do not label a live-read copy rehearsal as networkless.
+
+The completed full gate is `/tmp/phase4-checkpoint-isolated-gate.log` (exec
+session `39986`, exit 0). Its outside-checkout scratch path is recorded in
+`/tmp/phase4-checkpoint-isolated-gate-scratch-path`. The invalid incident run
+supplies no acceptance evidence. No push or live activation is authorized.
+
+The production SQL observation collector and its 15 behavioral tests are now
+integrated in the main checkout for the final foundation gate. Sol authored it
+in `/tmp/phase4-source-collector-kiltu4wd`; Luna's fresh review found no blocker.
+Fresh main-checkout tests pass for the collector, import source verifier and
+configured activation service. The architecture manifest includes the module.
+It reuses the existing Observed/Blocked variants, caller-held transactions and
+cumulative SQL budget; it does not advance censuses or mint activation authority.
+
+The next operator transport increment needs an atomically retained original
+ordered PR set and per-PR source/binding proof. Digest-only retry must reject a
+coherently removed imported PR even when the remaining activation digest is
+unchanged, and run before fresh files/GitHub/liveness reads. Root owns this
+receipt, codec and retry seam. CLI composition can then reuse configured readers
+and activation. Use only Sol/Luna subagents. Ambiguous historical PRs remain
+blocked by the user's direction.
+
+## Historical planning after checkpoint 137
 
 Latest coherent checkpoint: `96d4c13`, configured offline activation. Its
 final full gate and independent Luna review are recorded below. The checkout
@@ -1922,3 +2029,8 @@ order a durable clock.
 Use Sol or Luna for subagents. Run full `make test` before each coherent
 commit. Keep the six-phase progress board updated at accepted checkpoints;
 the user explicitly requested it on 2026-09-28.
+
+Final checkpoint note: the first isolated full gate passed, but the fresh
+complete-diff review subsequently found inherited Git repository selectors could
+escape fixture isolation. The additional repair and another complete gate remain
+required before the checkpoint commit. Its evidence does not accept a milestone.

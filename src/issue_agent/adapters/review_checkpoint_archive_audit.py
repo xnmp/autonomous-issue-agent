@@ -71,6 +71,16 @@ _LEGACY_SEGMENT_FIELDS = frozenset((
 ))
 
 
+def _round_lineage_source(db, observed, receipt):
+    last = receipt.last_round_source
+    if last is not None and last.lineage_sha256 is not None:
+        from .review_execution_archive_round import observe_review_execution_archive_round
+
+        lineage = observe_review_execution_archive_round(db, observed.source.round, indexed_identities=True)
+        return replace(observed.source, lineage_sha256=lineage.source_sha256)
+    return observed.source
+
+
 def _audit_key(key: WorkflowKey, epoch: int, episode: str) -> str:
     if type(epoch) is not int or epoch < 1:
         raise WorkflowAuthorityError("checkpoint audit has an invalid execution epoch")
@@ -433,7 +443,11 @@ def advance_review_checkpoint_archive_audit(
     source_versions = read_review_archive_source_versions(db, key.repository)
     rowid, state, stored_versions, prior_baseline = _read_state(db, key.repository, audit_key)
     if isinstance(state, BlockedReviewCheckpointArchiveAudit):
-        return state
+        if now < state.detected_at:
+            raise ValueError("checkpoint archive audit time moved backwards")
+        if stored_versions is None or stored_versions == source_versions:
+            return state
+        state = state.prior
     if isinstance(state, ReviewCheckpointArchiveSegment):
         raise WorkflowAuthorityError("checkpoint audit cursor has an invalid version")
     legacy_reason = (_legacy_discrepancy(db, key.repository, audit_key)
@@ -597,7 +611,9 @@ def advance_review_checkpoint_archive_audit(
                         pending, observed.outcome,
                     )
                     result = ReviewCheckpointArchiveReplaySegment(
-                        advance_review_checkpoint_archive_round(segment, observed.source),
+                        advance_review_checkpoint_archive_round(
+                            segment, _round_lineage_source(db, observed, receipt),
+                        ),
                         ReviewCheckpointArchivePendingBoundary(
                             advanced.progress, replay.source, replay.through_sequence,
                         ),
@@ -621,7 +637,9 @@ def advance_review_checkpoint_archive_audit(
                 if classified.source.source != observed.source:
                     raise WorkflowAuthorityError("checkpoint round changed during classification")
                 result = ReviewCheckpointArchiveReplaySegment(
-                    advance_review_checkpoint_archive_round(segment, observed.source),
+                    advance_review_checkpoint_archive_round(
+                        segment, _round_lineage_source(db, observed, receipt),
+                    ),
                     advance_checkpoint_replay_tail_round(replay, observed.outcome),
                 )
             else:

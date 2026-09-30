@@ -101,7 +101,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 31
+SCHEMA_VERSION = 32
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1409,6 +1409,74 @@ def _claim_lifecycle_receipt(
     )
 
 
+def _review_execution_lineage_migration() -> str:
+    # A global witness also covers REPLACE's implicit deletion when SQLite's
+    # recursive delete triggers are disabled: every replacement inserts a row.
+    tables = (
+        "dedupe_keys", "dispatch_claims", "runs", "leases", "budget_reservations",
+        "reservation_recovery", "charges", "workflow_evidence", "reservation_limits",
+        "quota_debits", "run_cancellation_intents",
+    )
+    identities = """CREATE TABLE review_archive_identity_members (
+    source_table TEXT NOT NULL,
+    source_rowid INTEGER NOT NULL,
+    snapshot_sha256 TEXT NOT NULL,
+    first TEXT NOT NULL,
+    second TEXT NOT NULL,
+    third TEXT NOT NULL,
+    types_json TEXT NOT NULL,
+    values_json TEXT NOT NULL,
+    PRIMARY KEY(source_table,source_rowid)
+) WITHOUT ROWID;
+CREATE INDEX review_archive_identity_lookup ON review_archive_identity_members
+    (source_table,snapshot_sha256,first,second,third);
+CREATE TABLE review_archive_identity_certifications (
+    round_rows_version INTEGER NOT NULL,
+    lifecycle_version INTEGER NOT NULL,
+    projection_version INTEGER NOT NULL,
+    state_json TEXT NOT NULL,
+    PRIMARY KEY(round_rows_version,lifecycle_version,projection_version)
+) WITHOUT ROWID;
+INSERT INTO review_archive_source_versions(source,scope,version)
+VALUES ('identity_members',X'',0);
+"""
+    identities += "\n".join(
+        f"""CREATE TRIGGER review_identity_{table}_{event.lower()}
+AFTER {event} ON review_archive_identity_{table}
+BEGIN
+    SELECT RAISE(ABORT,'identity projection witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='identity_members' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='identity_members' AND scope=X'';
+END;"""
+        for table in ("members", "certifications") for event in ("INSERT", "UPDATE", "DELETE")
+    )
+    return identities + "\n" + "\n".join(
+        f"""CREATE TRIGGER review_lineage_{table}_{event.lower()}
+AFTER {event} ON {table}
+BEGIN
+    SELECT RAISE(ABORT,'lifecycle source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='lifecycle_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='lifecycle_rows' AND scope=X'';
+    SELECT RAISE(ABORT,'workflow source witness is absent')
+    WHERE NOT EXISTS (
+        SELECT 1 FROM review_archive_source_versions
+        WHERE source='workflow_rows' AND scope=X''
+    );
+    UPDATE review_archive_source_versions SET version=version+1
+    WHERE source='workflow_rows' AND scope=X'';
+END;"""
+        for table in tables for event in ("INSERT", "UPDATE", "DELETE")
+    )
+
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -2119,6 +2187,7 @@ BEGIN
     WHERE source='lifecycle_rows' AND scope=X'';
 END;
 """),
+    SchemaMigration(32, _review_execution_lineage_migration()),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -2273,7 +2342,7 @@ class SQLiteControlStore:
                     )
             if database_exists:
                 self.integrity_check()
-            with self._connect(create=not database_exists) as db:
+            with closing(self._connect(create=not database_exists)) as db, db:
                 applied = self._migration_history(db)
                 if not applied and self._has_user_schema(db):
                     raise IncompatibleSchema(
@@ -2282,7 +2351,7 @@ class SQLiteControlStore:
             self._validate_migration_history(applied)
             for migration in _SCHEMA_MIGRATIONS:
                 self._apply_schema_migration(migration)
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 final_history = self._migration_history(db)
             self._validate_migration_history(
                 final_history, require_current=True
@@ -2301,7 +2370,7 @@ class SQLiteControlStore:
         if not self._database_exists() or not self._authority_witness_exists():
             raise CorruptControlStore("operator control requires initialized authority")
         self._validate_authority_witness()
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             self._validate_migration_history(self._migration_history(db), require_current=True)
 
     @contextmanager
@@ -2518,7 +2587,7 @@ class SQLiteControlStore:
 
     def _apply_schema_migration(self, migration: SchemaMigration) -> None:
         applied = False
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             try:
                 db.execute("BEGIN IMMEDIATE")
                 history = self._migration_history(db)
@@ -2569,7 +2638,7 @@ class SQLiteControlStore:
                 "control-store authority database does not exist"
             )
         try:
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 result = db.execute("PRAGMA quick_check").fetchone()[0]
                 if result != "ok":
                     raise CorruptControlStore(
@@ -2777,7 +2846,7 @@ class SQLiteControlStore:
 
         if not owner_id:
             raise ValueError("deployment owner identity is required")
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             self._assert_owner_active(db, owner_id)
 
     def bind_active_owner(self, owner_id: str) -> None:
@@ -2964,7 +3033,7 @@ class SQLiteControlStore:
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             try:
                 db.execute("BEGIN IMMEDIATE")
                 if self._bound_owner_id is not None:
@@ -3373,6 +3442,12 @@ class SQLiteControlStore:
                 or recovery["policy"] != "spawn_pending"):
             raise ControlStoreError("review launch requires an active unlaunched reservation")
         snapshot = require_review_binding(db, admission.child.round.binding.rejection)
+        if isinstance(snapshot.execution, ActivatedReviewExecution):
+            from .review_execution_archive_gate import require_review_execution_archive_admission
+
+            require_review_execution_archive_admission(
+                db, snapshot.revision.fence.key, snapshot.execution, now=self.now(),
+            )
         if (admission.admitted_revision.fence != snapshot.revision.fence
                 or admission.admitted_revision.version > snapshot.revision.version):
             raise ControlStoreError("review launch admission revision is stale or impossible")
@@ -3434,7 +3509,7 @@ class SQLiteControlStore:
             )
 
     def leases(self, owner_id: str | None = None) -> tuple[Lease, ...]:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = (
                 db.execute(
                     "SELECT l.run_id, l.dispatch_id, l.owner_id, l.pid, "
@@ -3467,7 +3542,7 @@ class SQLiteControlStore:
     ) -> PublicationAuthority | None:
         """Return authority only for an active, supervised paid run."""
 
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             row = db.execute(
                 "SELECT b.repository, r.owner_id, r.dispatch_id, l.pgid, "
                 "l.process_start_ticks, r.workflow_binding_json FROM runs r "
@@ -3534,7 +3609,7 @@ class SQLiteControlStore:
                 raise ValueError("liveness probe is required")
             alive = is_alive
             scoped_owner = owner_id
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = (
                 db.execute(
                     "SELECT l.run_id, l.dispatch_id, l.owner_id, l.pid, "
@@ -3628,7 +3703,7 @@ class SQLiteControlStore:
     def active_reservation_runs(
         self, owner_id: str | None = None
     ) -> tuple[RunId, ...]:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = (
                 db.execute(
                     "SELECT b.run_id FROM budget_reservations b JOIN runs r "
@@ -3652,7 +3727,7 @@ class SQLiteControlStore:
         """Return active reservations old enough to be outside spawn grace."""
 
         cutoff = _stamp(created_before)
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = db.execute(
                 "SELECT b.run_id FROM budget_reservations b JOIN runs r "
                 "ON r.run_id=b.run_id WHERE b.state='active' "
@@ -3718,8 +3793,9 @@ class SQLiteControlStore:
             now = _stamp(self._now())
             db.execute(
                 "UPDATE reservation_recovery SET policy='reconcile_only', "
-                "reason=?, updated_at=? WHERE run_id=?",
-                (reason, now, str(run_id)),
+                "reason=?, updated_at=? WHERE run_id=? "
+                "AND (policy IS NOT 'reconcile_only' OR reason IS NOT ?)",
+                (reason, now, str(run_id), reason),
             )
             db.execute(
                 "UPDATE runs SET "
@@ -3727,7 +3803,9 @@ class SQLiteControlStore:
                 "THEN state ELSE 'completed' END, "
                 "outcome=CASE WHEN state IN ('completed','cancelled','abandoned') "
                 "THEN outcome ELSE 'spend_unreconciled' END, "
-                "completed_at=COALESCE(completed_at, ?) WHERE run_id=?",
+                "completed_at=COALESCE(completed_at, ?) WHERE run_id=? "
+                "AND (state NOT IN ('completed','cancelled','abandoned') "
+                "OR completed_at IS NULL)",
                 (now, str(run_id)),
             )
             db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),))
@@ -3843,7 +3921,7 @@ class SQLiteControlStore:
     ) -> tuple[RunCancellationIntent, ...]:
         if not owner_id:
             raise ValueError("run owner is required")
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = db.execute(
                 "SELECT i.run_id, i.dispatch_id, i.kind, i.issue_number, "
                 "i.reason FROM run_cancellation_intents i JOIN runs r "
@@ -3867,7 +3945,7 @@ class SQLiteControlStore:
         )
 
     def has_cancellation_intent(self, run_id: RunId) -> bool:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             return (
                 db.execute(
                     "SELECT 1 FROM run_cancellation_intents WHERE run_id=?",
@@ -3896,7 +3974,7 @@ class SQLiteControlStore:
 
         if not owner_id:
             raise ValueError("run owner identity is required")
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = db.execute(
                 "SELECT dispatch_id FROM runs "
                 "WHERE owner_id=? AND state='abandoned' ORDER BY completed_at",
@@ -3980,7 +4058,7 @@ class SQLiteControlStore:
             raise ProcessLookupError("dispatch owner identity is unavailable")
         target = _dispatch_claim_target(issue)
         encoded_paths = _json(sorted(paths))
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             observed = self._dispatch_claim_observations(
                 db, repository, role
             )
@@ -4288,7 +4366,7 @@ class SQLiteControlStore:
         review indefinitely.
         """
 
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = db.execute(
                 "SELECT dc.target, dc.leg, dc.owner_id, dc.owner_pid, "
                 "dc.owner_start_ticks, dc.claimed_at, dc.occurrence_id, dcr.run_id, r.state "
@@ -4371,7 +4449,7 @@ class SQLiteControlStore:
 
         if not namespace or not scope:
             raise ValueError("level namespace and scope are required")
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = db.execute(
                 "SELECT key, payload_json FROM level_state "
                 "WHERE namespace=? AND scope=? ORDER BY key",
@@ -4625,7 +4703,7 @@ class SQLiteControlStore:
 
     def snapshot(self, scope: BudgetScope) -> AccountingSnapshot:
         try:
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 settled, reserved = self._balance(db, scope)
         except sqlite3.DatabaseError as exc:
             return AccountingSnapshot(
@@ -4872,6 +4950,15 @@ class SQLiteControlStore:
                     db, request, workspace_verified=workspace_verified,
                     review_parent_identity=review_parent_identity,
                 )
+                if (request.review_child is not None
+                        and isinstance(workflow_snapshot, ReviewWorkflowSnapshot)
+                        and isinstance(workflow_snapshot.execution, ActivatedReviewExecution)):
+                    from .review_execution_archive_gate import require_review_execution_archive_admission
+
+                    require_review_execution_archive_admission(
+                        db, workflow_snapshot.revision.fence.key, workflow_snapshot.execution,
+                        now=self.now(),
+                    )
                 committed = Money.zero(request.scope.currency)
                 for limit in limits:
                     settled, reserved = self._balance(db, limit.scope)
@@ -6757,7 +6844,7 @@ class SQLiteControlStore:
         equal to this value is our own published history — the agent may
         rewrite it; anything else was written by someone else and must be
         incorporated, not replaced."""
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             row = db.execute(
                 "SELECT r.remote_revision FROM effect_receipts AS r "
                 "JOIN lifecycle_commands AS c ON c.command_id=r.command_id "
@@ -6785,7 +6872,7 @@ class SQLiteControlStore:
         if executor_identity is not None:
             predicates.append("executor_identity=?")
             params.append(executor_identity)
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             rows = db.execute(
                 "SELECT * FROM lifecycle_commands WHERE "
                 + " AND ".join(predicates)
@@ -6803,7 +6890,7 @@ class SQLiteControlStore:
         )
 
     def command_reconciliation(self, command_id: CommandId) -> CommandReconciliation | None:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             row = db.execute("SELECT workflow_reconciliation_json FROM lifecycle_commands WHERE command_id=?", (str(command_id),)).fetchone()
         if row is None:
             raise KeyError(str(command_id))
@@ -7492,7 +7579,7 @@ class SQLiteControlStore:
     def latest_command(self, logical_key: str) -> PendingCommand | None:
         if not logical_key:
             raise ValueError("logical command key is required")
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             row = db.execute(
                 "SELECT * FROM lifecycle_commands WHERE logical_key=? "
                 "ORDER BY occurrence DESC LIMIT 1",
@@ -8222,7 +8309,7 @@ class SQLiteControlStore:
         )
 
     def effect_receipt(self, command_id: CommandId) -> EffectReceipt | None:
-        with self._connect() as db:
+        with closing(self._connect()) as db, db:
             row = db.execute(
                 "SELECT * FROM effect_receipts WHERE command_id=?",
                 (str(command_id),),
@@ -8282,7 +8369,7 @@ class SQLiteControlStore:
         emitted = 0
         processed = 0
         while processed < limit:
-            with self._connect() as db:
+            with closing(self._connect()) as db, db:
                 row = (
                     db.execute(
                         "SELECT outbox_id, event_json FROM event_outbox "
@@ -8329,7 +8416,7 @@ class SQLiteControlStore:
     def backup(self, destination: str) -> None:
         target = os.path.abspath(destination)
         os.makedirs(os.path.dirname(target), mode=0o700, exist_ok=True)
-        with self._connect() as source, sqlite3.connect(target) as dest:
+        with closing(self._connect()) as source, closing(sqlite3.connect(target)) as dest, source, dest:
             source.backup(dest)
         os.chmod(target, stat.S_IRUSR | stat.S_IWUSR)
 
@@ -8592,6 +8679,8 @@ class SQLiteControlStore:
         return int(settled), int(reserved)
 
     def _connect(self, *, create: bool = False) -> sqlite3.Connection:
+        from .sql_read_budget import BudgetedSqlConnection
+
         mode = "rwc" if create else "rw"
         uri = f"{Path(self.path).as_uri()}?mode={mode}"
         try:
@@ -8600,6 +8689,7 @@ class SQLiteControlStore:
                 timeout=self.busy_timeout_ms / 1000,
                 isolation_level=None,
                 uri=True,
+                factory=BudgetedSqlConnection,
             )
         except sqlite3.OperationalError as exc:
             if not create and not os.path.exists(self.path):

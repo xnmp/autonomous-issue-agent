@@ -659,6 +659,7 @@ def _read_checkpoint_receipt_row(
 def _check_execution_checkpoint_receipt(
     db: sqlite3.Connection, repository: str, execution: ActivatedReviewExecution,
     origin: ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt,
+    *, certified: bool = False,
 ) -> None:
     receipt_id = execution.checkpoint_receipt
     if receipt_id is None:
@@ -691,6 +692,23 @@ def _check_execution_checkpoint_receipt(
         if round_source.receipt_set_sha256 != receipt.last_round_source.receipt_set_sha256:
             raise WorkflowAuthorityError("review execution checkpoint round receipts changed after compaction")
     if receipt.last_generation_source is not None:
+        if certified:
+            from .review_execution_transition_proof import read_review_execution_transition_proof
+            from .review_execution_activation import _generation_receipt_parts, _read_recording_source
+
+            fields, _ = _read_recording_source(
+                db, "review-execution-generation", repository,
+                receipt.last_generation_source.cursor.receipt_id,
+            )
+            boundary, namespace, key, _ = _generation_receipt_parts(dict(fields)["payload_json"])
+            if (namespace != receipt.last_generation_source.accepted_namespace
+                    or key != receipt.last_generation_source.accepted_key):
+                raise WorkflowAuthorityError("checkpoint generation proof source changed")
+            read_review_execution_transition_proof(
+                db, repository, boundary,
+                expected_receipt_sha256=receipt.last_generation_source.receipt_sha256,
+            )
+            return
         from .review_execution_activation import verify_checkpoint_generation_anchor
 
         verify_checkpoint_generation_anchor(
@@ -916,6 +934,12 @@ def _check_execution_projection(
         _check_imported_execution_origin(db, scope, execution, origin, claimed)
     else:
         _check_initialized_execution_origin(db, scope, execution, origin, claimed)
+    certified = execution.checkpoint_receipt is not None
+    if certified:
+        from .sql_read_budget import BudgetedSqlConnection
+
+        if not isinstance(db, BudgetedSqlConnection) or sqlite3.sqlite_version_info < (3, 43, 0):
+            raise WorkflowAuthorityError("compacted review authority requires metered SQLite 3.43+ reads")
     episode_scope = (scope[0], scope[2], execution.binding.execution_epoch, execution.binding.execution_episode)
     latest = db.execute(
         "SELECT rowid AS source_rowid,typeof(sequence) AS sequence_type "
@@ -939,6 +963,11 @@ def _check_execution_projection(
         db, episode_scope, execution.checkpoint.through_sequence, suffix_count,
     )
     for boundary in execution.boundaries:
+        if certified:
+            from .review_execution_transition_proof import read_review_execution_transition_proof
+
+            read_review_execution_transition_proof(db, scope[0], boundary)
+            continue
         receipt = db.execute(
             "SELECT payload_json FROM dedupe_keys WHERE namespace='review-execution-generation' "
             "AND scope=? AND key=?", (scope[0], boundary.receipt_id),
@@ -996,9 +1025,11 @@ def _check_execution_projection(
         ).hexdigest()):
             raise WorkflowAuthorityError("review generation boundary release identity changed")
     if execution.checkpoint.through_sequence or execution.checkpoint.boundary_cursor is not None:
-        _check_execution_checkpoint_receipt(db, scope[0], execution, origin)
-        # The typed chain alone cannot prove the retired source digests or audit gate.
-        raise WorkflowAuthorityError("review execution checkpoint source anchors are not yet verified")
+        _check_execution_checkpoint_receipt(db, scope[0], execution, origin, certified=certified)
+    if certified:
+        from .review_execution_archive_gate import read_review_execution_archive_gate
+
+        read_review_execution_archive_gate(db, revision.fence.key, execution)
     outcomes: list[ReviewRoundOutcome] = []
     rows = db.execute(
         "SELECT round_id,generation,sequence,claim_occurrence_id,plan_json,planning_json,closure_json,outcome_json "
@@ -1312,6 +1343,18 @@ def load_resolve_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> Workf
 
 
 def load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
+    from .sql_read_budget import BudgetedSqlConnection, SqlReadBudgetExceeded, bounded_sql_source_reads
+
+    if isinstance(db, BudgetedSqlConnection) and db.in_transaction and sqlite3.sqlite_version_info >= (3, 43, 0):
+        try:
+            with bounded_sql_source_reads(db, 2**27):
+                return _load_review_workflow_row(db, key)
+        except SqlReadBudgetExceeded as exc:
+            raise WorkflowAuthorityError(str(exc)) from exc
+    return _load_review_workflow_row(db, key)
+
+
+def _load_review_workflow_row(db: sqlite3.Connection, key: WorkflowKey) -> ReviewWorkflowSnapshot | None:
     """Review-rejection authority for a PR; an issue key is never read as review."""
     activation, row = _row_or_absence(db, key, WorkflowFamily.REVIEW_REJECTIONS)
     if row is None:

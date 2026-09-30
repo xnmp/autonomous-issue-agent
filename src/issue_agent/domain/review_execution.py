@@ -1268,12 +1268,15 @@ class ReviewExecutionCompactionRoundSource:
     round: ReviewRoundIdentity
     row_sha256: str
     receipt_set_sha256: str
+    lineage_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.round, ReviewRoundIdentity):
             raise ValueError("compaction round source requires a typed round")
         _archive_audit_digest(self.row_sha256, "compaction round row digest")
         _archive_audit_digest(self.receipt_set_sha256, "compaction round receipt digest")
+        if self.lineage_sha256 is not None:
+            _archive_audit_digest(self.lineage_sha256, "compaction round lineage digest")
 
 
 @dataclass(frozen=True)
@@ -1367,9 +1370,12 @@ def build_review_execution_checkpoint_receipt(
         if (not isinstance(source, ReviewExecutionCompactionRoundSource)
                 or source.round != outcome.round):
             raise ValueError("checkpoint receipt has an unverified round source order")
-        encoded = "\0".join((str(source.round.sequence), source.round.round_id,
-                             str(source.round.binding.rejection.fence.generation),
-                             source.row_sha256, source.receipt_set_sha256)).encode()
+        parts = (str(source.round.sequence), source.round.round_id,
+                 str(source.round.binding.rejection.fence.generation),
+                 source.row_sha256, source.receipt_set_sha256)
+        if source.lineage_sha256 is not None:
+            parts += (source.lineage_sha256,)
+        encoded = "\0".join(parts).encode()
         round_digest = hashlib.sha256(bytes.fromhex(round_digest) + encoded).hexdigest()
     generation_digest = _EMPTY_ARCHIVE_AUDIT_DIGEST
     for source, boundary in zip(generation_sources, plan.retired_boundaries, strict=True):

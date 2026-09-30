@@ -27,6 +27,8 @@ from ..domain import review_registration_membership_audit as registration_member
 from ..domain import review_initial_checkpoint_absence as initial_checkpoint_absence
 from ..domain import review_checkpoint_stream_replay as checkpoint_replay
 from ..domain import review_checkpoint_application as checkpoint_application
+from ..domain import review_execution_archive_gate as archive_gate
+from ..domain import review_archive_identity as archive_identity
 from ..domain import review_preflight as preflight
 from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
@@ -48,6 +50,10 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    archive_identity.ScanningReviewArchiveIdentities,
+    archive_identity.CompletedReviewArchiveIdentities,
+    archive_identity.BlockedReviewArchiveIdentities,
+    archive_identity.ReviewArchiveIdentityCursor,
     RearmObservation,
     workspace.ResolveWorkspaceObserved, w.ResolveRearmAcceptance,
     workspace.ObservedResolveBase, workspace.NoPriorResolveAdmission,
@@ -157,6 +163,8 @@ _VALUES = (
     checkpoint_application.ApplyCheckpointTailByFollowingBoundary,
     checkpoint_application.ReviewCheckpointApplicationReceipt,
     checkpoint_application.ReviewCheckpointApplicationProposal,
+    archive_gate.CertifiedReviewExecutionArchive,
+    archive_gate.BlockedReviewExecutionArchive,
     rx.ReviewExecutionCheckpoint, rx.ReviewExecutionCompactionRoundSource,
     rx.ReviewExecutionCheckpointReceipt,
     rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,
@@ -207,6 +215,7 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS = {
+    "ReviewExecutionCompactionRoundSource": {"lineage_sha256": None},
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
@@ -242,7 +251,8 @@ def _encode(value: object, depth: int = 0) -> object:
                 for field in fields(value)
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
-                if field.name != "expected_binding" or getattr(value, field.name) is not None
+                if (field.name not in {"expected_binding", "lineage_sha256"}
+                    or getattr(value, field.name) is not None)
             },
         }
     if isinstance(value, datetime):

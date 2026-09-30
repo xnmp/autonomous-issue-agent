@@ -93,3 +93,66 @@ source-revalidated empty-history activation, rather than a synthetic origin.
 Modern rounds after that activation prove composed behavior; they do not prove
 missing legacy chronology or authorize a historical import. Keep services
 paused and use Sol/Luna agents, uv and Pyrefly; agents do not commit.
+# Checkpoint publication and archive admission composition (after 137)
+
+Implement checkpoint publication, a durable typed audit gate and bounded
+compacted canonical reads as one coherent change. The parent owns shared gate
+types, codec registration, schema witnesses, workflow projection and hot-path
+admission signatures. Independent helpers may add bounded archival claim or
+round lineage joins without changing those seams.
+
+- Domain values stay pure and immutable; adapters own SQL. Every observer,
+  writer and audit step requires an explicit caller-held SQL transaction.
+- Reuse workflow codec, checkpoint manifest/application, source-version and
+  completed archive observers. Bound retained field sizes before fetching
+  payloads; charge repeated reads to the cumulative budget.
+- A checkpoint writer verifies current pre-write source passes and publishes
+  receipts/component/gate atomically using post-write mutation versions.
+- Integrity reads validate receipts and a gate's identity. Separate admission
+  checks reject blocked/overdue gates only after exact retry checks, before new
+  preflight, child reservation, generation advance, renewal or compaction.
+  Settlement, finalization and recovery continue while admission is held.
+- Archived claim proof must bind exact preflight owner/target/occurrence to
+  creation and terminal receipts (or an explicitly verified still-live claim),
+  reject contradictory lifecycle events, and retain a source digest and byte
+  charge. Claim source mutations must participate in audit freshness.
+- Tests use real SQLite controls/receipts and assert authority, allowance and
+  money outcomes. Do not fabricate checkpoint certificates to bypass a writer.
+
+# Retained review import plan and operator transport (next increment)
+
+Prepare this work in the disposable source collector snapshot while the main
+foundation gate runs. Root owns pure retained-plan variants, codec registration,
+atomic publication, common SQL replay signatures and cross-cutting bounds.
+An implementation agent may own the operator CLI or focused tests after those
+seams exist; agents must not independently extend them.
+
+- Keep the original ordered PR membership, per-PR source digest and rejection
+  binding in immutable SQL receipts minted in the activation transaction.
+  Reuse the existing deterministic sequence-zero derivation and canonical replay;
+  do not infer original membership from currently retained imports.
+- Digest-only exact retry uses SQL only and precedes files, GitHub and liveness.
+  A partial receipt or coherently deleted original PR is a conflict. Later valid
+  rounds, generation advances and initialized PRs preserve import ancestry.
+- Reuse configured source readers and activation barriers; no alternate authority,
+  new worker or implicit audit completion. New collector remains observational.
+- Domain stays pure; adapters own SQLite; app composes configuration and CLI.
+  Bound identity metadata and payload before fetch and all retained membership.
+- Use uv/Pyrefly, real control-store outcome tests and Sol/Luna reviewers. Services
+  stay paused, historical ambiguities stay blocked, no accepted work is pushed.
+
+# Milestone 2 focused parallel work
+
+The bootstrap implementation agent owns only its new adapter/tests in the
+isolated M2 snapshot. A profiling agent owns only temporary scale scripts/logs
+and databases, and may not change source, schema, codec, public APIs or shared
+fixtures. Root owns shared state and integration; Luna reviews bootstrap.
+
+Reuse actual configured activation, production control, source audits and atomic
+checkpoint writer. Profile identical bounded suffixes at actual round/generation
+frontiers, with rows/returned bytes/VM work/time. No fabricated authority or
+receipt bypasses. Keep source history complete. Compare checkpoint cadences to
+identify the actual bottleneck; do not misreport unrelated identity growth as
+round history. Bound each experiment and return measurements, the first failing
+contract and its minimal reproduction. Main production stays fixed during the
+full gate. uv/Pyrefly, Sol/Luna, paused services, no target/remote mutation.
