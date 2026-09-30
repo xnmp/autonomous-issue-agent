@@ -33,8 +33,8 @@ operator transport work is parked until these blockers close.
 | Duty | Current evidence / next observable result |
 | --- | --- |
 | Atomic publication, canonical compacted read, archive gate | Implemented and independently reviewed. Final combined `make test` passed 10,081 Python tests, 123 hook checks, parity, four architecture contracts and both Pyrefly checks; includes collector and fixture hardening. |
-| First-checkpoint bootstrap and pre-transition maintenance | Bootstrap verified with 17 behavioral tests and independent Luna review. Maintenance, bootstrap and SQL budget pass 64 focused tests; review found missing production caller enforcement, which remains to be wired. Changes are in an isolated snapshot awaiting integration. |
-| Audit convergence and bounded retention | Continuing source writes must not force endless origin rescans. Settlement/recovery stays available; source mutation, replacement and cursor corruption must be covered. Real pilot exposes quadratic replay; no convergent implementation is accepted. |
+| First-checkpoint bootstrap and pre-transition maintenance | Integrated and verified as checkpoint 139. A real 128-round test verifies default-threshold publication, persisted audit progress, inert exact retry, stale-proposal conflict and successful fresh preflight. Five new cases cover initial/compacted open-round finalization and finalized payload corruption. Independent Luna review is clear; corrected full `make test` passed 10,123 Python tests, 123 hook checks, parity, four architecture contracts and both Pyrefly checks. |
+| Audit convergence and bounded retention | Continuing source writes must not force endless origin rescans. Settlement/recovery stays available; source mutation, replacement and cursor corruption must be covered. Real pilot exposes quadratic replay. An isolated bounded mutation-capture/reader prototype passes 20 cases and 181 control-store cases; centralized capture restores 200/200 concurrent reservations, with higher cost than schema 32. Adversarial review found malformed numeric envelope acceptance; repair and prefix certification/reuse remain open. No convergent implementation is accepted. |
 | Renewed episode origin | Prior/new binding, reset state and execution-ceiling rearm completion must have one immutable source-backed origin. Canonical read still refuses this kind. |
 | Capacity and lifetime bounds | Prove open-prefix/byte refusal without partial authority, more than 4,096 rounds and generation advances, and actual 10/1,000/>5,000-history profiles. Pilot reached a verified checkpoint at 512 real rounds in 295.94s; its latest audit took 16.57s. The 1,000 run was stopped after projecting beyond its 600s cap; larger cases remain unaccepted. |
 | Integrated milestone acceptance | Independent adversarial review, full `make test`, explicit retained-source/settlement outcomes and all preceding evidence. Accept milestone 2 only here. |
@@ -150,16 +150,18 @@ six-phase board at **3/6** until milestone 7 is accepted. Live activation and
 deployment remain subject to the existing pause and separate authorization;
 offline tests or a controlled double must never be reported as live cutover.
 
-Final checkpoint note: the first isolated full gate passed, but the fresh
-complete-diff review subsequently found inherited Git repository selectors could
-escape fixture isolation. The additional repair and another complete gate remain
-required before the checkpoint commit. Its evidence does not accept a milestone.
+Final foundation checkpoint: complete-diff review found inherited Git repository
+selectors could escape fixture isolation. The repair, eleven injected-failure
+regressions and another complete gate passed. The coherent foundation is
+committed locally as `1d76569`; it has not been pushed. Its evidence does not
+accept a milestone.
 
 The final foundation tree also adds the production read-only SQL import collector,
 which composes complete existing inventories under the cumulative SQL meter
 and requires a fresh matched registration/lifecycle census. Fifteen behavioral
 cases cover configured prior owners, malformed/oversized/pending/changed sources,
 read-only behavior, nonempty observations and real empty-history activation.
-Fresh main-checkout collector/source/service tests pass; its final full gate is
-pending. Operator CLI, durable original-plan retry and copied rehearsal remain
-open.
+The collector is included in the final foundation gate: 3,358 domain, 3,799
+adapter and 2,924 app tests, 123 hook checks, parity, four architecture contracts
+and both Pyrefly checks passed. Operator CLI, durable original-plan retry and
+copied rehearsal remain open.

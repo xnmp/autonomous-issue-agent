@@ -34,7 +34,7 @@ def _two_open_rounds(active):
 def _stored(store):
     with closing(store._connect()) as db:
         row = db.execute(
-            "SELECT payload_json FROM level_state WHERE namespace='review-round-archive-scan'",
+            "SELECT payload_json FROM level_state WHERE namespace='review-round-archive-scan-v2'",
         ).fetchone()
         assert row is not None
         return decode_workflow(row["payload_json"], ReviewRoundArchiveCursor).state
@@ -193,14 +193,14 @@ def test_round_archive_audit_restarts_an_unversioned_completed_cursor(active):
         completed = advance_review_round_archive_audit(db, key, now=now)
         db.execute(
             "UPDATE level_state SET payload_json=? "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
             (encode_workflow(completed),),
         )
     with store.transaction() as db:
         restarted = advance_review_round_archive_audit(db, key, now=now)
         row = db.execute(
             "SELECT payload_json FROM level_state "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
         ).fetchone()
     assert isinstance(restarted, CompletedReviewRoundArchiveScan)
     assert decode_workflow(row["payload_json"], ReviewRoundArchiveCursor).state == restarted
@@ -218,7 +218,7 @@ def test_round_archive_audit_rechecks_unversioned_completed_membership(active, m
     with store.transaction() as db:
         db.execute(
             "UPDATE level_state SET payload_json=? "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
             (encode_workflow(completed),),
         )
         db.execute(
@@ -244,7 +244,7 @@ def test_round_archive_audit_preserves_an_unversioned_blocker(active):
         blocked = BlockedReviewRoundArchiveScan(completed, "prior discrepancy", None, now)
         db.execute(
             "UPDATE level_state SET payload_json=? "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
             (encode_workflow(blocked),),
         )
     with store.transaction() as db:
@@ -263,13 +263,13 @@ def test_round_archive_audit_rejects_malformed_source_version(active, invalid):
         advance_review_round_archive_audit(db, key, now=now)
         row = db.execute(
             "SELECT payload_json FROM level_state "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
         ).fetchone()
         payload = json.loads(row["payload_json"])
         payload["value"]["fields"]["round_rows_version"] = invalid
         db.execute(
             "UPDATE level_state SET payload_json=? "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
             (json.dumps(payload, sort_keys=True, separators=(",", ":")),),
         )
         with pytest.raises(WorkflowAuthorityError, match="cursor is malformed"):

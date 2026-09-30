@@ -156,11 +156,17 @@ def test_overdue_certificate_blocks_new_public_preflight_but_replays_old_one(rig
     monkeypatch.setattr(store, "_now", lambda: gate.next_due_at)
     fresh = _next_selection(rig, store, observed_at=gate.next_due_at)
     before = dump(store)
-    with pytest.raises(WorkflowAuthorityError, match="overdue"):
+    with pytest.raises(WorkflowAuthorityError, match="awaits archive maintenance"):
         rig[4].preflight(fresh)
-    assert dump(store) == before
+    after_maintenance = dump(store)
+    assert after_maintenance != before
+    with store.transaction() as db:
+        after = load_review_workflow_row(db, key)
+        assert after == snapshot
+        assert read_review_execution_archive_gate(db, key, after.execution) == gate
+        assert db.execute("SELECT COUNT(*) FROM review_execution_rounds").fetchone()[0] == 1
     assert rig[4].preflight(rig[3]) == plan
-    assert dump(store) == before
+    assert dump(store) == after_maintenance
 
 
 def test_overdue_certificate_allows_parent_loss_recovery_of_existing_round(rig, monkeypatch):

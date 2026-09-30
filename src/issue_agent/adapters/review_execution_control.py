@@ -4,6 +4,10 @@ from dataclasses import dataclass, replace
 import hashlib
 import sqlite3
 
+from ..domain.review_execution_compaction_maintenance import (
+    BlockedReviewExecutionMaintenance, PendingReviewExecutionMaintenance,
+    ReviewExecutionMaintenanceResult,
+)
 from ..domain.fix import breaker_key
 from ..domain.contracts import CommandKind, LifecycleCommand
 from ..domain.review_preflight import ReviewPreflightSelection, plan_review_preflight
@@ -44,6 +48,7 @@ from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_ho
 from .review_round_sources import read_review_round_sources
 from .review_workflow_control import SQLiteReviewWorkflowControl
 from .process_supervisor import ProcessSupervisor
+from .sql_read_budget import MAX_SQL_READ_BYTES
 from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import (
     REVIEW_ABANDONMENT_NAMESPACE, REVIEW_OUTCOME_NAMESPACE, REVIEW_PREPARATION_NAMESPACE,
@@ -101,6 +106,25 @@ class SQLiteReviewExecutionControl:
         self._gateway = gateway
         self._preparation_control = preparation_control
         self._round_cursor = _START_CURSOR
+
+    def maintain_archive(
+        self, key: WorkflowKey, *, round_threshold: int = 128,
+        generation_threshold: int = 32, payload_threshold: int = 65536,
+        max_source_bytes: int = MAX_SQL_READ_BYTES,
+    ) -> ReviewExecutionMaintenanceResult:
+        """Run before deriving a proposal; compaction may change its revision."""
+        from .review_execution_compaction_maintenance import (
+            advance_review_execution_compaction_maintenance,
+        )
+
+        if not isinstance(key, WorkflowKey) or key.repository != self._writer.repository:
+            raise ValueError("review maintenance requires the configured writer repository")
+        with self._control.transaction() as db:
+            return advance_review_execution_compaction_maintenance(
+                db, key, now=self._control.now(), round_threshold=round_threshold,
+                generation_threshold=generation_threshold,
+                payload_threshold=payload_threshold, max_source_bytes=max_source_bytes,
+            )
 
     def reconcile_review_rounds(self) -> ReviewRoundSweep:
         """Fence abandoned planning and finalize one indexed page of terminal rounds."""
@@ -663,6 +687,18 @@ class SQLiteReviewExecutionControl:
             if claim is None:
                 raise WorkflowAuthorityError("review parent claim occurrence is absent")
             parent_pid, parent_start_ticks = claim["owner_pid"], claim["owner_start_ticks"]
+
+        # Persist audit progress separately: a deferred proposal must not roll
+        # back the maintenance that will make a later proposal admissible.
+        maintenance = self.maintain_archive(key)
+        if isinstance(maintenance, PendingReviewExecutionMaintenance):
+            raise WorkflowAuthorityError(
+                f"review preflight awaits archive maintenance: {maintenance.stage.value}",
+            )
+        if isinstance(maintenance, BlockedReviewExecutionMaintenance):
+            raise WorkflowAuthorityError(f"review preflight archive maintenance blocked: {maintenance.reason}")
+        if maintenance.revision != selection.expected:
+            raise WorkflowRevisionConflict(maintenance.revision, "review preflight aggregate version changed")
 
         if not ProcessSupervisor.matches_identity(parent_pid, parent_start_ticks):
             raise WorkflowAuthorityError("review parent claim process is no longer live")

@@ -29,7 +29,22 @@ from .workflow_rows import (
 )
 
 
-_AUDIT_NAMESPACE = "review-round-archive-scan"
+_AUDIT_NAMESPACE = "review-round-archive-scan-v2"
+_ALLOCATION_FIELDS = (
+    "round_id", "repository", "target_kind", "target_number", "execution_epoch",
+    "execution_episode", "generation", "sequence", "claim_occurrence_id",
+)
+
+
+def _allocation_digest(fields: tuple) -> str:
+    # Planning, closure and outcome remain mutable until finalization. Their
+    # full row digest belongs to the receipt audit's finalized-prefix baseline;
+    # this census protects immutable allocation membership, including open rows.
+    values = dict(fields)
+    allocation = tuple((name, values[name]) for name in _ALLOCATION_FIELDS)
+    return hashlib.sha256(json.dumps(
+        allocation, ensure_ascii=True, separators=(",", ":"),
+    ).encode()).hexdigest()
 
 
 def _audit_key(key: WorkflowKey, epoch: int, episode: str) -> str:
@@ -240,7 +255,7 @@ def advance_review_round_archive_audit(
     elif isinstance(page, ObservedReviewCheckpointRoundSweepPage):
         fingerprints = tuple(ReviewRoundArchiveFingerprint(
             source.source_rowid, dict(source.fields)["sequence"],
-            dict(source.fields)["round_id"], source.source_digest,
+            dict(source.fields)["round_id"], _allocation_digest(source.fields),
         ) for source in page.sources)
         result = advance_review_round_archive_scan(
             state, fingerprints, page.next_rowid, page.upper_rowid,

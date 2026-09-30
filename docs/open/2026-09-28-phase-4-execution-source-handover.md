@@ -7,21 +7,23 @@ with `CLAUDE.md`, `AGENTS.md`, the
 [execution design](2026-09-27-phase-4-review-execution-design.md), and the
 [origin and compaction contract](2026-09-28-phase-4-compaction-contract.md).
 
-## Current continuation — checkpoint publication foundation
+## Current continuation — bootstrap and preflight maintenance
 
-Current priority and running gate are in the
+Current priority and completed gate are in the
 [focused milestone-2 handover](2026-09-30-phase-4-m2-focused-handover.md).
 Operator transport is parked until milestone-2 compaction blockers close.
 
-Checkpoint 138 adds atomic publication, compacted hot reads and archive
-admission together. The complete isolated `make test` passed: 3,358 domain,
-3,799 adapter and 2,924 app tests (10,081 total), 123 hook checks, parity,
+Checkpoint 138 is committed locally at `1d76569`. Checkpoint 139 adds bounded
+initial archive bootstrap and production preflight maintenance, including
+default-threshold compaction, committed deferral progress and exact retry.
+Its complete `make test` passed: 3,358 domain,
+3,841 adapter and 2,924 app tests (10,123 total), 123 hook checks, parity,
 four architecture contracts and both Pyrefly checks. Phase 4 remains 0/7
 and the six-phase plan remains 3/6. All seven services remain inactive.
 
 Continuation warning: the later full-gate retry suffered a scratch cleanup race.
 Unsafe hook fixture setup then made accidental local commits and remote pushes.
-Local `dev` is restored to `c4404a2`, and all 44 pending files matched their saved
+Local `dev` was restored to `c4404a2`, and all 44 pending files matched their saved
 checksums before subsequent authorized hardening changes. All seven services
 remain inactive. Approved remote repair completed; see the
 [incident record](2026-09-30-hook-fixture-incident.md). Fail-closed hook fixture setup passed independent Sol/Luna review, eleven
@@ -65,21 +67,22 @@ Modern paid/copied/abandoned rounds, multiple checkpoints, a zero-new-round
 generation checkpoint and an open-prefix gap have outcome-level tests. This
 does not prove a historical multi-round import or 5,000 real rounds/generations.
 
-Next: resolve incremental audit convergence under continuing writes, then wire
-bounded per-tick maintenance and automatic checkpoints before suffix/byte
-limits. A global version-only relaxation is unsafe. Sol is profiling actual
-production-control histories separately; preserve this tested foundation before
-integrating that next slice. Historical/terminal imports, renewed origins,
+Next: resolve incremental audit convergence under continuing writes and complete
+periodic/generation maintenance wiring before suffix/byte limits. Preflight
+maintenance is integrated and verified; a global version-only relaxation is
+unsafe. The isolated mutation prototype still needs certified prefix coverage
+and complete row/absence-key ownership before it can change authority decisions.
+Historical/terminal imports, renewed origins,
 review runtime retirement and the other continuation families remain pending.
 
 ### Operator transport prerequisites
 
-Read-only Sol investigation found that the configured plan/activation service
-still depends on caller-supplied typed observations. The complete SQL source
-collector exists only in the activation test fixture. Production transport needs
-explicit bounded audit preparation, configured owner lineage and complete
-run/submission/receipt/round/outcome/generation observations, followed by current
-matched registration membership. An incomplete census remains pending/blocked.
+The foundation now includes a production read-only SQL source collector under
+the cumulative read meter, with configured owner lineage and complete existing
+inventories. It requires fresh matched registration/lifecycle membership and
+does not advance audits or publish authority. Production operator transport and
+retained original-plan retry remain parked. An incomplete census stays pending
+or blocked.
 
 Later digest-only CLI retry also needs a bounded retained-plan reader: the current
 SQL verifier requires the original typed plan, which cannot necessarily be

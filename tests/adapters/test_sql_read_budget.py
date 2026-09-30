@@ -379,3 +379,68 @@ def test_older_sqlite_and_missing_limit_api_fail_before_scope_mutation(monkeypat
         with bounded_sql_source_reads(db, 10):
             pass
     db.close()
+
+
+
+def test_nested_savepoint_rollback_preserves_cumulative_read_charges():
+    db = _db()
+    with bounded_sql_source_reads(db, 10) as outer:
+        assert db.execute("SELECT payload FROM source WHERE n=7").fetchone()[0] == b"abc"
+        db.execute("SAVEPOINT bounded_publication")
+        db.execute("INSERT INTO source VALUES (?, ?)", (b"zz", 11))
+        with bounded_sql_source_reads(db, 10):
+            assert db.execute("SELECT payload FROM source WHERE n=11").fetchone()[0] == b"zz"
+        db.execute("ROLLBACK TO bounded_publication")
+        db.execute("RELEASE bounded_publication")
+        assert db.execute("SELECT payload FROM source WHERE n=9").fetchone()[0] == b"de"
+        with pytest.raises(SqlReadBudgetExceeded):
+            db.execute("SELECT payload FROM source")
+        assert outer.source_bytes == 7
+    assert db.execute("SELECT n FROM source ORDER BY n").fetchall() == [(7,), (9,)]
+    assert db.in_transaction
+    db.close()
+
+
+@pytest.mark.parametrize("sql", [
+    "SAVEPOINT bounded; SELECT payload FROM source",
+    "RELEASE bounded RETURNING payload",
+    "ROLLBACK", "COMMIT", "BEGIN",
+])
+def test_nested_control_forms_cannot_bypass_reads_or_end_the_caller_transaction(sql):
+    db = _db()
+    with bounded_sql_source_reads(db, 100):
+        with pytest.raises(SqlReadBudgetExceeded):
+            db.execute(sql)
+    assert db.in_transaction
+    assert db.execute("SELECT payload FROM source ORDER BY n").fetchall() == [(b"abc",), (b"de",)]
+    db.close()
+
+
+def test_nested_savepoints_still_obey_and_restore_the_caller_authorizer():
+    db = _db()
+    def reject_savepoints(action, first, second, database, trigger):
+        return sqlite3.SQLITE_DENY if action == sqlite3.SQLITE_SAVEPOINT else sqlite3.SQLITE_OK
+    db.set_authorizer(reject_savepoints)
+    with pytest.raises(SqlReadBudgetExceeded):
+        with bounded_sql_source_reads(db, 100):
+            db.execute("SAVEPOINT bounded")
+    with pytest.raises(sqlite3.DatabaseError):
+        db.execute("SAVEPOINT bounded")
+    assert db.in_transaction
+    db.close()
+
+
+@pytest.mark.parametrize("factory", (sqlite3.Cursor, lambda db: sqlite3.Cursor(db)))
+def test_unmetered_cursor_factory_cannot_be_retained_before_scope(factory):
+    db = sqlite3.connect(":memory:", factory=BudgetedSqlConnection)
+    try:
+        db.execute("CREATE TABLE retained(value BLOB)")
+        db.execute("INSERT INTO retained VALUES (?)", (b"x" * 20,))
+        with pytest.raises(SqlReadBudgetExceeded, match="metered cursor factory"):
+            db.cursor(factory)
+        cursor = db.cursor()
+        with bounded_sql_source_reads(db, 1):
+            with pytest.raises(SqlReadBudgetExceeded, match="cumulative bound"):
+                cursor.execute("SELECT value FROM retained")
+    finally:
+        db.close()

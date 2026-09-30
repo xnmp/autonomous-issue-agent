@@ -404,12 +404,12 @@ def test_archive_join_rejects_unversioned_round_completion(active):
     with store.transaction() as db:
         row = db.execute(
             "SELECT payload_json FROM level_state "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
         ).fetchone()
         completed = decode_workflow(row["payload_json"], ReviewRoundArchiveCursor).state
         db.execute(
             "UPDATE level_state SET payload_json=? "
-            "WHERE namespace='review-round-archive-scan'",
+            "WHERE namespace='review-round-archive-scan-v2'",
             (encode_workflow(completed),),
         )
         with pytest.raises(WorkflowAuthorityError, match="round-row census is stale"):

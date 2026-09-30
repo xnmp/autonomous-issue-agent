@@ -268,32 +268,28 @@ def test_unchanged_fresh_pr_read_remains_eligible_when_the_authority_clock_advan
 
 
 def test_linked_issue_sql_hold_that_lands_after_remote_read_is_checked_before_commit(rig, monkeypatch):
+    from issue_agent.adapters import review_execution_control
     from issue_agent.adapters.workflow_rows import load_resolve_workflow_row, persist_workflow_snapshot
     from issue_agent.domain.workflow import EvidenceUnavailable, NoAuthorizedRemediation, OpenGate
     from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
 
     store, _, _, _, control = rig
     selection = linked_selection(rig)
-    original_transaction = store.transaction
-    transactions = 0
+    original_read = review_execution_control.review_linked_issue_holds
     accepted_hold = []
 
-    @contextmanager
-    def hold_before_acceptance():
-        nonlocal transactions
-        transactions += 1
-        if transactions == 2:
-            with original_transaction() as db:
-                issue = load_resolve_workflow_row(db, WorkflowKey("o/r", IssueRef(7)))
-                gate = OpenGate("late-issue-hold", issue.revision.fence.generation,
-                                EvidenceUnavailable("linked issue", store.now(), 3, "operator attention"),
-                                NoAuthorizedRemediation("resolve this issue hold"))
-                persist_workflow_snapshot(db, replace(issue, gates=(gate,)))
-            accepted_hold.append(dump(store))
-        with original_transaction() as db:
-            yield db
+    def hold_after_read(*args):
+        holds = original_read(*args)
+        with store.transaction() as db:
+            issue = load_resolve_workflow_row(db, WorkflowKey("o/r", IssueRef(7)))
+            gate = OpenGate("late-issue-hold", issue.revision.fence.generation,
+                            EvidenceUnavailable("linked issue", store.now(), 3, "operator attention"),
+                            NoAuthorizedRemediation("resolve this issue hold"))
+            persist_workflow_snapshot(db, replace(issue, gates=(gate,)))
+        accepted_hold.append(dump(store))
+        return holds
 
-    monkeypatch.setattr(store, "transaction", hold_before_acceptance)
+    monkeypatch.setattr(review_execution_control, "review_linked_issue_holds", hold_after_read)
     with pytest.raises(WorkflowAuthorityError, match="linked issue workflow"):
         control.preflight(selection)
     assert dump(store) == accepted_hold[0]

@@ -92,6 +92,13 @@ class BudgetedSqlConnection(sqlite3.Connection):
     def _preflight_read(self, sql: str, parameters: Any) -> None:
         statement = sql.strip().rstrip(";")
         head = statement.split(None, 1)[0].casefold() if statement else ""
+        # Nested publishers use transaction-local savepoints under the same
+        # cumulative meter. Ending the caller's transaction remains forbidden.
+        if re.fullmatch(
+            r"(?:SAVEPOINT|RELEASE(?: SAVEPOINT)?|ROLLBACK(?: TRANSACTION)? TO(?: SAVEPOINT)?)"
+            r"\s+[A-Za-z_][A-Za-z_0-9]{0,127}", statement, re.IGNORECASE,
+        ):
+            return
         if head not in {"select", "with"}:
             if (head not in {"insert", "update", "delete"}
                     or re.search(r"\b(select|returning|with)\b", statement, re.IGNORECASE)):
@@ -129,10 +136,14 @@ class BudgetedSqlConnection(sqlite3.Connection):
         return super().cursor(BudgetedSqlCursor).execute(sql, parameters)
 
     def cursor(self, factory: Any = None) -> sqlite3.Cursor:
+        if factory is not None and factory is not BudgetedSqlCursor:
+            # A cursor retained from before a budget scope must still meter
+            # later execution. Custom factories can override that contract.
+            raise SqlReadBudgetExceeded("SQL source connection requires its metered cursor factory")
         if self._source_budgets:
             # There is one metered route; a raw cursor would bypass preflight.
             raise SqlReadBudgetExceeded("SQL source budget requires connection.execute")
-        return super().cursor(BudgetedSqlCursor) if factory is None else super().cursor(factory)
+        return super().cursor(BudgetedSqlCursor)
 
     def executemany(self, sql: str, parameters: Any, /) -> sqlite3.Cursor:
         return super().cursor(BudgetedSqlCursor).executemany(sql, parameters)

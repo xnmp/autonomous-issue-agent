@@ -1,6 +1,6 @@
 # Phase 4 — focused milestone 2 continuation
 
-Updated 2026-09-30, 14:30 AEST. Goal remains all seven phase-4 milestones,
+Updated 2026-09-30, 16:00 AEST. Goal remains all seven phase-4 milestones,
 then the six-phase architecture plan. Phase 4 is 0/7 and phases 1–3 are 3/6.
 Read CLAUDE.md and the [fixed milestone-2 execution checklist](2026-09-29-phase-4-remaining-milestones.md).
 
@@ -13,7 +13,7 @@ checklist without changing the seven agreed acceptance units.
 
 ## Main checkout and gate
 
-Checkpoint 138 contains the foundation, collector, fixture isolation and
+Checkpoint 138 at local `1d76569` contains the foundation, collector, fixture isolation and
 documentation. Exec session 9799 completed `make test` successfully; log:
 `/tmp/phase4-foundation-collector-tiered-gate.log`. Scratch pointer:
 `/tmp/phase4-foundation-collector-tiered-gate-scratch-path`.
@@ -25,9 +25,10 @@ stand in for this final combined gate. The failed collector gate exposed an
 upward app import in adapter tests; collector tests are now in tests/app and
 both layout checks pass.
 
-## Verified first-checkpoint bootstrap (isolated, not integrated)
+## Integrated bootstrap and preflight maintenance (checkpoint 139 verified)
 
-Snapshot `/tmp/phase4-m2-bootstrap-3umflxi_` contains:
+The original snapshot `/tmp/phase4-m2-bootstrap-3umflxi_` contained the following;
+these files are now integrated in main:
 
 - Root-owned `domain/review_execution_archive_bootstrap.py` with typed pending,
   blocker and existing completed observational evidence result.
@@ -43,16 +44,54 @@ Snapshot `/tmp/phase4-m2-bootstrap-3umflxi_` contains:
 - 17 bootstrap tests, 2 layout checks and Pyrefly pass. Luna independently ran
   all 17 tests and cleared the repaired result.
 
-Maintenance in this snapshot: Root defined immutable maintenance result
+Maintenance: Root defined immutable maintenance result
 variants and the public `SQLiteReviewExecutionControl.maintain_archive` wrapper.
 Sol owns only new compaction-maintenance adapter/tests. It must choose a real
 contiguous finalized prefix, preserve open gaps, bootstrap/recertify through
 bounded calls, publish only with complete current evidence, and return the new
 revision before a new proposal is derived. No silent operator rebasing. Root
-owns all shared seams and integration. Maintenance, bootstrap and meter pass
-64 focused tests. Luna found missing production caller enforcement; root must
-wire maintenance before proposal derivation without rebasing stale proposals.
-These files are outside the completed main gate.
+owns all shared seams and integration. Preflight now exact-retries first, runs
+maintenance in a separate committed transaction, persists bounded progress on
+deferral and conflicts captured revisions changed by publication. Sol's 128-real-round
+default-threshold regression passes; its maintenance module passes 11 cases.
+Root repaired open-round false discrepancies by hashing immutable allocation
+identity in the v2 round census; the finalized receipt audit and checkpoint replay
+still verify full source payloads. Five new cases verify legitimate finalization
+and finalized outcome/planning/closure corruption refusal. The retained raw-cursor
+factory bypass is closed; all 39 SQL meter tests pass. Luna's complete diff review
+is clear. Gate 70040 was stopped at exit130 for two missed namespace test queries;
+after correction, all 44 related cases pass. Corrected full gate is exec session
+20911 completed at exit0; `/tmp/phase4-m2-maintenance-final-gate.log` records
+3,358 domain, 3,841 adapter and 2,924 app tests (10,123 total), 123 hook checks,
+parity, four architecture contracts and both Pyrefly checks. Commit this coherent
+main slice locally after confirming services remain paused; no push.
+
+## Isolated next convergence prototype
+
+Snapshot `/tmp/phase4-m2-convergence-v4xowjw9` contains root-owned proposed schema33,
+typed observations and source capture, plus Sol's bounded read-only mutation-page
+adapter and 20 cases. It captures exact old/new bounded identities and actual
+replacement deletes, keeps ignored duplicates inert, checks independent global
+source witnesses and declares retention gaps. No prefix certificate, reuse,
+admission or checkpoint authority is granted by this prototype. All source
+ownership/certified-prefix duties remain to be implemented.
+
+Main32 admitted 200/200 concurrent reservations in about2.2s; initial33 admitted
+199/200 in about7.4s with one lock timeout. Flattening envelopes alone did not
+restore the contract. Root centralized capture through an INSTEAD OF INSERT
+view trigger: generated DDL fell from94,961 to60,544 bytes; 200/200 admissions
+passed in5.20s, maximum BEGIN wait4.03s below the unchanged5s timeout.
+All181 store cases pass, including raw corruption writers configured for the
+enforced capture mode and early SQLite<3.43 refusal. Oversized text/blob identity
+bytes stay uncaptured with exact length. Luna found impossible numeric captures
+being accepted by the reader; Sol is repairing this. No main integration yet.
+
+Read-only design review requires reverse ownership edges for both observed rows
+and absent lookup keys: inserting a previously absent lease/charge/receipt can
+invalidate an old segment. Journal observations alone cannot certify a prefix.
+The current full audits remain authoritative. Prototype performance evidence:
+`/tmp/phase4-m2-capture-cost-results.md`; design:
+`/tmp/phase4-m2-convergence-proposal.md`.
 
 ## Actual-history profiling
 
