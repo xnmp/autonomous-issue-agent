@@ -36,6 +36,7 @@ from ..domain.review_rounds import (
     ReviewSubmissionConfirmed, ReviewSubmissionRegistration,
     StaleReviewProductivitySettlement, finalize_review_round,
     CurrentReviewOutcomeReceipt,
+    CurrentStaleReviewProductivitySettlement,
 )
 from ..domain.review_preflight import ReviewPreflightSelection
 from ..domain.review_workflow_policy import (
@@ -1446,6 +1447,81 @@ def read_review_outcome_receipt(
     return decode_workflow(row["payload_json"], tuple | CurrentReviewOutcomeReceipt)
 
 
+def require_current_review_productivity_receipt(
+    db: sqlite3.Connection, receipt: CurrentReviewOutcomeReceipt,
+) -> None:
+    if not isinstance(receipt.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+        return
+    confirmed = tuple(item for item in receipt.facts.submissions
+                      if isinstance(item.result, ReviewSubmissionConfirmed))
+    if len(confirmed) != 1:
+        raise WorkflowAuthorityError("current productivity lacks one exact confirmed submission")
+    round = receipt.outcome.round
+    scope = round.binding.rejection.fence.key.repository
+    stale = receipt.expected.fence.generation > round.binding.rejection.fence.generation
+    keys = ((REVIEW_STALE_PRODUCTIVITY_NAMESPACE, round.round_id),) if stale else (
+        ("review-recorded-submission", confirmed[0].plan.command_id),
+        (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, round.round_id),
+        (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, round.round_id),
+    )
+    for namespace, key in keys:
+        row = db.execute(
+            "SELECT payload_json,claimed_at FROM dedupe_keys WHERE namespace=? AND scope=? AND key=? "
+            "AND reusable_after IS NULL AND typeof(payload_json)='text' "
+            "AND typeof(claimed_at)='text' AND length(CAST(claimed_at AS BLOB)) BETWEEN 1 AND 128 "
+            "AND length(CAST(payload_json AS BLOB)) BETWEEN 1 AND ?",
+            (namespace, scope, key, MAX_WORKFLOW_PAYLOAD_BYTES),
+        ).fetchone()
+        if row is None:
+            continue
+        try:
+            claimed = datetime.fromisoformat(row["claimed_at"])
+            if claimed.tzinfo is None or claimed.utcoffset() is None:
+                raise ValueError("productivity receipt requires an aware claim time")
+            if stale:
+                witness = decode_workflow(row["payload_json"], CurrentStaleReviewProductivitySettlement)
+                if witness.receipt == receipt:
+                    return
+            elif namespace == "review-recorded-submission":
+                if decode_workflow(row["payload_json"], WorkflowRevision) == receipt.expected:
+                    return
+            else:
+                marker = decode_workflow(row["payload_json"], tuple)
+                if (len(marker) != 3 or marker[1] != receipt.expected
+                        or not isinstance(marker[2], str) or len(marker[2]) > 128):
+                    continue
+                settled_at = datetime.fromisoformat(marker[2])
+                if settled_at.tzinfo is None or settled_at.utcoffset() is None:
+                    raise ValueError("productivity settlement requires an aware time")
+                # SQL receipt stamps retain milliseconds; the marker preserves source precision.
+                if settled_at.replace(microsecond=settled_at.microsecond // 1000 * 1000) != claimed:
+                    continue
+                evidence_id = marker[0] if namespace == REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE else (
+                    marker[0].observation_evidence_id if isinstance(marker[0], CeilingProductivityDecision) else None
+                )
+                evidence = db.execute(
+                    "SELECT payload_json FROM workflow_evidence WHERE evidence_id=? AND repository=? "
+                    "AND target_kind='pr' AND target_number=? AND kind='observation' "
+                    "AND length(CAST(payload_json AS BLOB))<=?",
+                    (evidence_id, scope, round.binding.rejection.fence.key.target.number,
+                     MAX_WORKFLOW_PAYLOAD_BYTES),
+                ).fetchone() if isinstance(evidence_id, str) else None
+                if evidence is None:
+                    continue
+                observed = decode_workflow(evidence["payload_json"], RecordedPullRequest).observation
+                if observed.key != round.binding.rejection.fence.key:
+                    continue
+                if namespace == REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE:
+                    if observed.head_sha != receipt.facts.plan.head_sha or observed.state is not PullRequestState.OPEN:
+                        return
+                elif (marker[0].escalation.submission.binding == round.binding.rejection
+                      and str(marker[0].escalation.submission.command_id) == confirmed[0].plan.command_id):
+                    return
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError("current productivity receipt is malformed") from exc
+    raise WorkflowAuthorityError("current productive outcome lacks its exact joint settlement receipt")
+
+
 def _read_current_round_outcome(
     db: sqlite3.Connection, episode: tuple[str, int, int, str], sequence: int,
 ) -> ReviewRoundOutcome:
@@ -1463,6 +1539,8 @@ def _read_current_round_outcome(
         raise WorkflowAuthorityError("current execution reference lacks its exact outcome receipt")
     facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
     outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+    if isinstance(captured_receipt, CurrentReviewOutcomeReceipt):
+        require_current_review_productivity_receipt(db, captured_receipt)
     matching_receipt = (
         captured_receipt.facts == facts and captured_receipt.outcome == outcome
         if isinstance(captured_receipt, CurrentReviewOutcomeReceipt)

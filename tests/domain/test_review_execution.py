@@ -44,6 +44,7 @@ from issue_agent.domain.review_execution import (
     CurrentReviewExecution, OpenReviewExecutionRound, CompletedReviewExecutionRound,
     allocate_current_review_round, reduce_current_review_execution,
     finalize_current_review_round, advance_current_review_generation,
+    freeze_current_review_generation,
 )
 from issue_agent.domain.review_workflow import ReviewEpisode, ReviewFamilyEpisodes, ReviewWorkflowSnapshot
 from issue_agent.domain.workflow import ObservedTransition, WorkflowMutation
@@ -1295,6 +1296,17 @@ def test_current_pending_duplicate_delivery_is_inert_and_conflicting_identity_re
     completed = finalize_current_review_round(result.execution, result.pending, failed(1))
     with pytest.raises(ValueError, match="exact receipt"):
         finalize_current_review_round(completed.execution, (), failed(1))
+
+
+@pytest.mark.parametrize("applied", [None, [], (False,), (0,), (1,), (3,), (2, 2)])
+def test_current_generation_freeze_rejects_malformed_retired_future_and_duplicate_identities(applied):
+    execution, pending = allocate_pending(current_execution(), 2)
+    completed = finalize_current_review_round(execution, pending, failed(1)).execution
+    with pytest.raises(ValueError):
+        freeze_current_review_generation(
+            completed, WorkflowRevision(binding().rejection.fence, 4),
+            WorkflowRevision(binding(1).rejection.fence, 5), WorkflowMutation.REQUEST_REARM, applied,
+        )
 
 
 @pytest.mark.parametrize("bad", [None, [], (None,), ()])

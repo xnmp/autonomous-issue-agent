@@ -23,7 +23,10 @@ from .identity import login_eq
 from .labels import LIFECYCLE_LABELS, Label
 from .review import EscalationCause
 from .review_rejection import validate_commit_sha
-from .review_execution import ActivatedReviewExecution, advance_review_execution_generation
+from .review_execution import (
+    ActivatedReviewExecution, CurrentReviewExecution, advance_review_execution_generation,
+    freeze_current_review_generation,
+)
 from .review_workflow import (
     MAX_COUNTED_REVIEWS, BoundReviewSubmission, CancelledReviewRearm, CompleteReviews, CompletedReviewRearm,
     CountedReview, CountingRule, DismissCountedReview, EnsureReviewProjection, FreshReviewRequired,
@@ -398,6 +401,10 @@ def _advanced_execution(
     applied_sequences: tuple[int, ...],
 ):
     execution = snapshot.execution
+    if isinstance(execution, CurrentReviewExecution):
+        return freeze_current_review_generation(
+            execution, snapshot.revision, revision, mutation, applied_sequences,
+        )[0]
     return (
         advance_review_execution_generation(
             execution, snapshot.revision, revision, mutation, applied_sequences,

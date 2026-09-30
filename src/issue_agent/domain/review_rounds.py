@@ -520,6 +520,35 @@ class CurrentReviewOutcomeReceipt:
 
 
 @dataclass(frozen=True)
+class CurrentStaleReviewProductivitySettlement:
+    """Harness witness that an exact confirmed old verdict cannot reset this generation."""
+
+    receipt: CurrentReviewOutcomeReceipt
+    settled_binding: ReviewExecutionBinding
+    command_id: str
+    effect_receipt_id: str
+
+    def __post_init__(self) -> None:
+        identifier(self.command_id, "stale productivity command")
+        identifier(self.effect_receipt_id, "stale productivity effect receipt")
+        if (not isinstance(self.receipt, CurrentReviewOutcomeReceipt)
+                or not isinstance(self.settled_binding, ReviewExecutionBinding)):
+            raise ValueError("current stale settlement requires its exact outcome receipt and binding")
+        outcome = self.receipt.outcome
+        matches = tuple(item for item in self.receipt.facts.submissions
+                        if item.plan.command_id == self.command_id
+                        and isinstance(item.result, ReviewSubmissionConfirmed)
+                        and item.result.receipt_id == self.effect_receipt_id)
+        if (not isinstance(outcome.disposition, (PaidReviewProgress, CopiedReviewProgress))
+                or len(matches) != 1
+                or not same_execution_episode(outcome.round.binding, self.settled_binding)
+                or self.receipt.expected.fence != self.settled_binding.rejection.fence
+                or self.settled_binding.rejection.fence.generation
+                <= outcome.round.binding.rejection.fence.generation):
+            raise ValueError("current stale settlement lacks its exact confirmed verdict and later generation")
+
+
+@dataclass(frozen=True)
 class StaleReviewProductivitySettlement:
     """The writer's generation witness captured atomically with a stale round."""
 

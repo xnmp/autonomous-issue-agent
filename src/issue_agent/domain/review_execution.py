@@ -1825,20 +1825,36 @@ def advance_current_review_generation(
     from_revision: WorkflowRevision, to_revision: WorkflowRevision, mutation: WorkflowMutation,
 ) -> tuple[CurrentReviewExecution, ReviewExecutionGenerationBoundary]:
     """Freeze the accepted projection; old open rounds remain separately recoverable."""
+    validated = reduce_current_review_execution(execution, pending)
+    if validated.execution.state != execution.state:
+        raise ValueError("current execution state disagrees with its pending projection")
+    return freeze_current_review_generation(
+        execution, from_revision, to_revision, mutation,
+        tuple(item.round.sequence for item in sorted(pending, key=lambda item: item.round.sequence)
+              if isinstance(item, CompletedReviewExecutionRound)),
+    )
+
+
+def freeze_current_review_generation(
+    execution: CurrentReviewExecution, from_revision: WorkflowRevision, to_revision: WorkflowRevision,
+    mutation: WorkflowMutation, applied_sequences: tuple[int, ...],
+) -> tuple[CurrentReviewExecution, ReviewExecutionGenerationBoundary]:
+    """Carry trusted SQL state; the adapter supplies identities from its validated pending rows."""
     if (not isinstance(execution, CurrentReviewExecution)
             or not isinstance(from_revision, WorkflowRevision)
             or not isinstance(to_revision, WorkflowRevision)
             or from_revision.fence != execution.binding.rejection.fence):
         raise ValueError("generation advance requires current authority and its exact revision")
-    validated = reduce_current_review_execution(execution, pending)
-    if validated.execution.state != execution.state:
-        raise ValueError("current execution state disagrees with its pending projection")
+    if not isinstance(applied_sequences, tuple) or any(
+        type(sequence) is not int or sequence <= execution.baseline.through_sequence
+        or sequence > execution.last_sequence for sequence in applied_sequences
+    ):
+        raise ValueError("generation freeze requires selected pending finalized identities")
     binding = replace(execution.binding, rejection=replace(execution.binding.rejection, fence=to_revision.fence))
     after = carry_review_execution_generation(execution.state, binding, execution.last_sequence)
     boundary = ReviewExecutionGenerationBoundary(
         execution.state, after, execution.last_sequence,
-        tuple(item.round.sequence for item in sorted(pending, key=lambda item: item.round.sequence)
-              if isinstance(item, CompletedReviewExecutionRound)),
+        applied_sequences,
         review_generation_receipt_id(execution.binding, to_revision.fence.generation),
         from_revision, to_revision, mutation,
     )

@@ -25,6 +25,7 @@ from ..domain.review_rounds import (
     ReviewSubmissionRegistration, finalize_review_round,
     StaleReviewProductivitySettlement,
     CurrentReviewOutcomeReceipt,
+    CurrentStaleReviewProductivitySettlement,
 )
 from ..domain.review_workflow import ObservedPullRequest, PullRequestState, RecordedPullRequest, ReviewWorkflowSnapshot
 from ..domain.review_evidence import ReviewEvidenceKind
@@ -66,7 +67,7 @@ from .workflow_rows import (
     verified_review_completed_seal,
     verified_review_parent_abandonment,
     load_current_review_workflow_row, read_current_review_pending,
-    read_review_outcome_receipt,
+    read_review_outcome_receipt, require_current_review_productivity_receipt,
 )
 
 
@@ -169,14 +170,9 @@ class SQLiteReviewExecutionControl:
             stale = round.binding.rejection.fence.generation < current.binding.rejection.fence.generation
             if stale and round.sequence > current.generation_start_sequence:
                 raise WorkflowAuthorityError("stale outcome exceeds its allocated generation cutoff")
-            if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
-                confirmed = tuple(item.plan.command_id for item in facts.submissions
-                                  if isinstance(item.result, ReviewSubmissionConfirmed))
-                if (len(confirmed) != 1 or db.execute(
-                        "SELECT 1 FROM dedupe_keys WHERE namespace='review-recorded-submission' "
-                        "AND scope=? AND key=?", (self._writer.repository, confirmed[0]),
-                ).fetchone() is None):
-                    raise WorkflowAuthorityError("current productive outcome requires joint rejection settlement")
+            require_current_review_productivity_receipt(
+                db, CurrentReviewOutcomeReceipt(facts, result.outcome, expected, self._writer.owner_id),
+            )
             execution = current if stale else finalize_current_review_round(
                 current, read_current_review_pending(db, current), result.outcome,
             ).execution
@@ -426,7 +422,7 @@ class SQLiteReviewExecutionControl:
                 raise WorkflowAuthorityError("review round lacks its preflight")
             _, _, plan, row = stored
             snapshot = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)
-            if snapshot is None or not isinstance(snapshot.execution, ActivatedReviewExecution):
+            if snapshot is None or not isinstance(snapshot.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
                 raise WorkflowAuthorityError("review execution workflow is absent or inactive")
             facts = self._read_round_facts(db, round_id)
             result = finalize_review_round(facts)
@@ -442,6 +438,10 @@ class SQLiteReviewExecutionControl:
             )
             if not isinstance(result, (FinalizedReviewRound, DeferredReviewPreparation)):
                 raise WorkflowAuthorityError("review preparation requires its bounded schedule")
+            if isinstance(snapshot.execution, CurrentReviewExecution):
+                return self._finalize_current_nonproductive_in_tx(
+                    db, snapshot, facts, result, preparation_error,
+                )
             receipt = db.execute(
                 "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
                 (REVIEW_OUTCOME_NAMESPACE, self._writer.repository, round_id),
@@ -511,6 +511,45 @@ class SQLiteReviewExecutionControl:
                     })
             return result
 
+    def _finalize_current_nonproductive_in_tx(
+        self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot, facts: ReviewRoundFacts,
+        result: FinalizedReviewRound | DeferredReviewPreparation, preparation_error: str | None,
+    ) -> FinalizedReviewRound | DeferredReviewPreparation:
+        with self._control.mutation_savepoint(db):
+            round = facts.plan.round
+            receipt = read_review_outcome_receipt(db, self._writer.repository, round.round_id)
+            if receipt is not None:
+                if not isinstance(receipt, CurrentReviewOutcomeReceipt):
+                    raise WorkflowAuthorityError("current finalized round lacks its current exact receipt")
+                return self._write_current_outcome_in_tx(db, facts, receipt.expected)
+            if isinstance(result.outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
+                confirmed = tuple(item.plan.command_id for item in facts.submissions
+                                  if isinstance(item.result, ReviewSubmissionConfirmed))
+                if len(confirmed) != 1:
+                    raise WorkflowAuthorityError("productive review lacks one confirmed submission")
+                stale = round.binding.rejection.fence.generation < snapshot.revision.fence.generation
+                self._settle_productive_in_tx(db, confirmed[0], snapshot, stale=stale)
+                return result
+            if isinstance(result, DeferredReviewPreparation):
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (REVIEW_PREPARATION_NAMESPACE, self._writer.repository, round.round_id,
+                     _stamp(self._control.now()), encode_workflow((facts, result.failures))),
+                )
+            accepted = self._write_current_outcome_in_tx(db, facts, snapshot.revision)
+            if isinstance(result, DeferredReviewPreparation):
+                assert preparation_error is not None and self._preparation_control is not None
+                if snapshot.revision.fence.generation == round.binding.rejection.fence.generation:
+                    self._preparation_control._record_evidence_in_tx(
+                        db, round.binding.rejection.fence.key, facts.plan.head_sha,
+                        ReviewEvidenceKind.RUNTIME_PREPARATION, error=preparation_error,
+                    )
+                else:
+                    self._control._transition(db, "review_round", round.round_id, "preparation_superseded", {
+                        "settled_generation": snapshot.revision.fence.generation,
+                    })
+            return accepted
+
     def _project_outcomes(
         self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot, plan: ReviewRoundPlan,
     ) -> ActivatedReviewExecution:
@@ -536,6 +575,17 @@ class SQLiteReviewExecutionControl:
         ceiling: CeilingProductivityDecision | None = None,
     ) -> None:
         """Join a confirmed verdict to its sealed round in the baseline's SQL transaction."""
+        with self._control.mutation_savepoint(db):
+            self._settle_productive_sources_in_tx(
+                db, command_id, after_rejection, stale=stale,
+                superseded_evidence_id=superseded_evidence_id, ceiling=ceiling,
+            )
+
+    def _settle_productive_sources_in_tx(
+        self, db: sqlite3.Connection, command_id: str, after_rejection: ReviewWorkflowSnapshot,
+        *, stale: bool = False, superseded_evidence_id: str | None = None,
+        ceiling: CeilingProductivityDecision | None = None,
+    ) -> None:
         self._control._assert_owner_active(db, self._writer.owner_id)
         registration = read_review_submission_registration(db, self._writer.repository, command_id)
         if registration is None:
@@ -546,7 +596,7 @@ class SQLiteReviewExecutionControl:
         parent_owner, selection, plan, row = stored
         settled_at = self._control.now()
         if (plan.round != registration.round or registration.submission not in plan.submissions
-                or not isinstance(after_rejection.execution, ActivatedReviewExecution)
+                or not isinstance(after_rejection.execution, (ActivatedReviewExecution, CurrentReviewExecution))
                 or not same_execution_episode(after_rejection.execution.binding, plan.round.binding)
                 or plan.round.binding.rejection.fence.generation > after_rejection.revision.fence.generation
                 or (stale and plan.round.binding.rejection.fence.generation
@@ -605,6 +655,35 @@ class SQLiteReviewExecutionControl:
                            and isinstance(submission.result, ReviewSubmissionConfirmed)
                            for submission in facts.submissions)):
             raise WorkflowAuthorityError("review verdict has no sealed, settled productive round")
+        if isinstance(after_rejection.execution, CurrentReviewExecution):
+            if load_current_review_workflow_row(db, plan.round.binding.rejection.fence.key) != after_rejection:
+                raise WorkflowAuthorityError("current productive settlement changed its captured workflow")
+            receipt = CurrentReviewOutcomeReceipt(
+                facts, result.outcome, after_rejection.revision, self._writer.owner_id,
+            )
+            if stale:
+                submission = next(item for item in facts.submissions if item.plan.command_id == command_id)
+                assert isinstance(submission.result, ReviewSubmissionConfirmed)
+                witness = CurrentStaleReviewProductivitySettlement(
+                    receipt, after_rejection.execution.binding, command_id, submission.result.receipt_id,
+                )
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (REVIEW_STALE_PRODUCTIVITY_NAMESPACE, self._writer.repository, plan.round.round_id,
+                     _stamp(settled_at), encode_workflow(witness)),
+                )
+            for namespace, marker in (
+                (REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE, superseded_evidence_id),
+                (REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, ceiling),
+            ):
+                if marker is not None:
+                    db.execute(
+                        "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                        (namespace, self._writer.repository, plan.round.round_id, _stamp(settled_at),
+                         encode_workflow((marker, after_rejection.revision, settled_at.isoformat()))),
+                    )
+            self._write_current_outcome_in_tx(db, facts, after_rejection.revision)
+            return
         stale_settlement: StaleReviewProductivitySettlement | None = None
         if stale:
             persisted = load_review_workflow_row(db, plan.round.binding.rejection.fence.key)

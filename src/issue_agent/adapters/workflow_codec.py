@@ -186,6 +186,7 @@ _VALUES = (
     rr.ReviewParentAbandoned, rr.ReviewSealedParentAbandoned,
     rr.ReviewRoundFacts, rr.ReviewRoundAwaitingEvidence,
     rr.CurrentReviewOutcomeReceipt,
+    rr.CurrentStaleReviewProductivitySettlement,
     rr.StaleReviewProductivitySettlement,
     rr.FinalizedReviewRound, rr.DeferredReviewPreparation,
     preflight.ReviewPreflightSelection,
