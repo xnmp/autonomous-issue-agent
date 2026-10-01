@@ -110,7 +110,7 @@ def controlled_publication_context(monkeypatch):
         accounting_runtime, "_fix_publication_context",
         lambda _role, cwd: accounting_runtime._FixPublicationContext(
             str(Path(cwd).resolve()), "fix/7-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
-        ),
+        ) if _role == "fix" else None,
     )
 
 
@@ -755,29 +755,35 @@ def test_triage_promotion_finishes_advisory_recurrence_after_own_transition(tmp_
     seed(tmp_path)
     remote = PersistentGitHub(tmp_path / "github.db")
     remote.seed_pr(pr(300, state="MERGED", closing_issue=42, title="Original defect"))
-    provider = Provider(result=AgentResult(is_error=False, structured={
+    provider = Provider(result=AgentResult(is_error=False, cost_usd=0.01, structured={
         "verdict": "ready", "plain_summary": "clear", "acceptance_criteria": ["works"],
         "creator_questions": [], "owner_questions": [], "blocked_by_issues": [],
         "recurrence_of": 42,
     }))
     client = compose(tmp_path, role="steward", provider=provider)
     state = Store(state_dir=str(tmp_path / "steward"))
+    from tests.fakes.accounted_steward import install_steward
+    install_steward(client.control, (7,))
+    client.remote.comment_author = "steward-bot"
+    runtime = AccountingRuntime(provider, client.control, "o/r", "steward", None, None, None, "test", "claude",
+        BudgetPolicy({("steward", "TRIAGE"): Money("USD", 750_000)}), owner_id="o/r:steward")
     workflow = StewardWorkflow(
         StewardWorkflowConfig(
             triage=TriageTaskConfig("steward-bot", triage_prompt="test"),
             triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
-            log=client.log.append, fix_bot="fix-bot", repo="o/r",
+            log=client.log.append, fix_bot="fix-bot", repo="o/r", dedupe=client.control, owner_id="o/r:steward",
         ),
-        client.remote, state, provider, client.daemon.executor,
+        client.remote, state, runtime, client.daemon.executor,
     )
     client.daemon.executor._run_agent = lambda action: asyncio.run(workflow.triage(action.number))
     client.daemon.decide = lambda _: [RunAgent(AgentKind.TRIAGE, 7)]
     client.daemon.tick()
     after = client.remote.get_issue(7)
-    assert after.has(Label.AI_READY)
+    assert after.has(Label.AI_READY), client.log
     assert after.has(Label.RECURRENCE)
     assert any("#42" in comment.body and "PR #300" in comment.body for comment in after.comments)
-    assert state.get_triage_at(7) == after.updated_at
+    assert client.control.read_steward(resolve_snapshot(7).revision.fence.key).component.state.triage.baseline_at == after.updated_at
+    assert state.get_triage_at(7) == ""
     restarted = compose(tmp_path, role="steward", decide=lambda _: [])
     restarted.daemon.tick()
     assert restarted.control.pending_commands() == ()

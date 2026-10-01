@@ -365,6 +365,14 @@ class AccountingRuntime(AgentRuntime):
         correlated_run_id, _leg_id = self._identity.get()
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
         continuations = ()
+        if task.steward_input is not None:
+            selected = task.steward_input
+            if (self.role != "steward" or kind != selected.lane.value.upper()
+                    or number != selected.selection.binding.fence.key.target.number
+                    or issue != number or workflow != selected.selection.binding):
+                return _return_refused("selected steward input requires its exact lane and issue context")
+            capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
+            continuations = (cc.StewardPurchase(capture, selected.lane, selected.input_at, selected.stall_ceiling),)
         if task.issue_reply is not None:
             selected = task.issue_reply
             if isinstance(selected, cc.LinkedPRIssueReplyInput):

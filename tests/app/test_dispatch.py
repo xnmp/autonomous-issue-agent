@@ -433,7 +433,7 @@ def test_multi_review_routes_to_workflow():
 
 def test_triage_routes_to_steward_workflow():
     iss = IssueView(7, title="Add export", body="want it", author="alice",
-                    comments=(Comment("alice", "please add export"),), updated_at="t_post")
+                    comments=(Comment("alice", "please add export"),), updated_at="2026-09-14T10:00:00+00:00")
     gw = FakeGateway(issues={7: iss})
     store = FakeStore()
     runner = FakeRunner(AgentResult(
@@ -443,9 +443,13 @@ def test_triage_routes_to_steward_workflow():
                     "acceptance_criteria": []},
     ))
     d = _dispatcher(gw, store, runner)
+    from dataclasses import fields
+    from tests.fakes.accounted_steward import AccountedStewardWorkflow, triage_lane
+    original = d.steward_workflow
+    d.steward_workflow = AccountedStewardWorkflow(**{field.name: getattr(original, field.name) for field in fields(original)})
     asyncio.run(d.dispatch(RunAgent(AgentKind.TRIAGE, 7)))
     assert ("relabel", "issue", 7, None, "ai-triage") in gw.calls
-    assert store.triage_at[7] == "t_post"
+    assert triage_lane(store, 7).baseline_at == iss.updated_at
 
 
 def _ci_dispatcher(

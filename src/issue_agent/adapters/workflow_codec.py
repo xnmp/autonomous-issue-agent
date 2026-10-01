@@ -30,6 +30,7 @@ from ..domain.contracts import WorkflowAttemptIdentity, ContinuationAdmission
 from ..domain import continuation_components as cc
 from ..domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
 from ..domain.labels import Label
+from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
 from ..domain.outcome import Adjudication
@@ -44,10 +45,12 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    IssueCompletionGuard,
     ContinuationImportPlan, ContinuationImportTarget,
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState,
-    cc.StewardLaneState, cc.StewardState, cc.ContinuationImportBlocker,
+    cc.StewardLaneState, cc.StewardState, cc.StewardAttemptSource, cc.StewardCommandGuard,
+    cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.ContinuationImportBlocker,
     cc.InactiveIssueRecovery, cc.InactivePRRepair, cc.InactiveSteward,
     cc.BlockedIssueRecovery, cc.BlockedPRRepair, cc.BlockedSteward,
     cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward,
@@ -138,7 +141,8 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
-    cc.RepairAllowance, cc.StewardLane,
+    LifecycleOperation,
+    cc.RepairAllowance, cc.StewardLane, cc.StewardFailureKind,
     migration.ReviewImportBlockerKind,
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
@@ -166,6 +170,7 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS = {
+    "StewardLaneState": {"delivery_source": None, "attempted_at": ""},
     "WorkflowSnapshot": {
         "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}},
         "steward": {"type": "InactiveSteward", "fields": {}},
@@ -216,7 +221,10 @@ def _encode(value: object, depth: int = 0) -> object:
                 for field in fields(value)
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
-                if ((field.name not in {"expected_binding", "lineage_sha256"}
+                if (not (type(value) is cc.StewardLaneState and (
+                        field.name == "delivery_source" and value.delivery_source is None
+                        or field.name == "attempted_at" and not value.attempted_at))
+                    and (field.name not in {"expected_binding", "lineage_sha256"}
                      or getattr(value, field.name) is not None)
                     and not (field.name == "grant" and isinstance(getattr(value, field.name), rw.ReviewRejectionGrant))
                     and not (field.name in {"issue_recovery", "steward", "pr_repair"}
@@ -311,6 +319,10 @@ def _decode(value: object, depth: int = 0) -> object:
     if set(value) != {"type", "fields"} or not isinstance(payload, dict):
         raise WorkflowEncodingError("malformed workflow fields")
     legacy = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
+    if tag == "StewardLaneState" and set(payload) <= {field.name for field in fields(constructor)} and {
+        "baseline_at", "stalls", "infra_failures", "pending_delivery"
+    } <= set(payload):
+        payload = {**legacy, **payload}
     if legacy and set(payload) == {field.name for field in fields(constructor)} - legacy.keys():
         payload = {**legacy, **payload}
     if set(payload) != {field.name for field in fields(constructor)}:

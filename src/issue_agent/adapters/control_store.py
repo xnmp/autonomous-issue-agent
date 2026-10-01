@@ -161,9 +161,10 @@ def _review_refusal_receipt_id(refusal: ReviewChildAdmissionRefusal) -> str:
 
 
 def target_has_work_admissions(db: sqlite3.Connection, key: WorkflowKey) -> bool:
+    prefix = json.dumps((*workflow_scope(key), WorkflowFamily.RESOLVE.value), ensure_ascii=False, separators=(",", ":"))[:-1] + ","
     return db.execute(
         "SELECT 1 FROM runs WHERE workflow_episode_key>=? AND workflow_episode_key<? "
-        "AND kind<>'ROUTE' LIMIT 1", workflow_run_scope_bounds(key),
+        "AND kind<>'ROUTE' LIMIT 1", (prefix, prefix + "\uffff"),
     ).fetchone() is not None
 
 
@@ -2911,20 +2912,6 @@ class SQLiteControlStore:
                 """,
             ),
             (
-                "dispatch claim and bound run owners disagree",
-                """
-                SELECT dcr.run_id
-                FROM dispatch_claim_runs AS dcr
-                JOIN dispatch_claims AS dc
-                  ON dc.repository=dcr.repository
-                 AND dc.role=dcr.role
-                 AND dc.target=dcr.target
-                JOIN runs AS r ON r.run_id=dcr.run_id
-                WHERE dc.owner_id<>r.owner_id
-                LIMIT 1
-                """,
-            ),
-            (
                 "retired owner scope disagrees with its successor",
                 """
                 SELECT retired.owner_id
@@ -2943,6 +2930,20 @@ class SQLiteControlStore:
                 raise CorruptControlStore(
                     f"control-store semantic integrity failed: {detail} "
                     f"({row[0]})"
+                )
+
+        from .workflow_commit import owns_command
+        from ..domain.workflow_identity import WorkflowWriter
+        for row in db.execute(
+            "SELECT r.run_id,r.owner_id,r.continuations_json,dc.repository,dc.role,dc.owner_id AS successor "
+            "FROM dispatch_claim_runs dcr JOIN dispatch_claims dc "
+            "ON dc.repository=dcr.repository AND dc.role=dcr.role AND dc.target=dcr.target "
+            "JOIN runs r ON r.run_id=dcr.run_id WHERE dc.owner_id<>r.owner_id"
+        ):
+            if (row["continuations_json"] == encode_workflow(()) or not owns_command(
+                    db, WorkflowWriter(row["repository"], row["role"], row["successor"]), row["owner_id"])):
+                raise CorruptControlStore(
+                    f"dispatch claim and bound run owners disagree ({row['run_id']})"
                 )
 
         for row in db.execute(
@@ -3014,6 +3015,9 @@ class SQLiteControlStore:
         )
         if not prior:
             return (0, 0)
+        if any(deployment_role(repository, f"{canonical_repository(candidate.partition(':')[0])}:{candidate.partition(':')[2]}") != role
+               for candidate in prior):
+            raise ValueError("prior owner adoption must retain repository and role")
         placeholders = ",".join("?" for _candidate in prior)
         with deployment_effect_barrier(
             self.path,
@@ -3037,8 +3041,8 @@ class SQLiteControlStore:
                         f"{repository}:{role}"
                     )
             runs = db.execute(
-                f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders})",
-                (owner_id, *prior),
+                f"UPDATE runs SET owner_id=? WHERE owner_id IN ({placeholders}) AND continuations_json=?",
+                (owner_id, *prior, encode_workflow(())),
             ).rowcount
             db.execute(
                 f"UPDATE leases SET owner_id=? WHERE owner_id IN ({placeholders})",
@@ -3424,11 +3428,6 @@ class SQLiteControlStore:
                 raise ControlStoreError(
                     f"process lease has no reserved run: {run_id}"
                 )
-            if run["owner_id"] != expected_owner_id:
-                raise RetiredOwnerError(
-                    f"reserved run owner changed from {expected_owner_id!r} "
-                    f"to {run['owner_id']!r} before process registration"
-                )
             if run["state"] in {"completed", "cancelled", "abandoned"}:
                 raise ControlStoreError(
                     f"process lease cannot attach to terminal run: {run_id}"
@@ -3452,10 +3451,17 @@ class SQLiteControlStore:
                 (str(run_id),),
             ).fetchone()
             if existing is not None:
+                from .workflow_commit import owns_command
+                from ..domain.workflow_identity import WorkflowWriter
+                repository = expected_owner_id.partition(":")[0]
                 identical = (
                     int(existing["pid"]) == pid
                     and int(existing["pgid"]) == pgid
                     and int(existing["process_start_ticks"]) == process_start_ticks
+                    and existing["owner_id"] == expected_owner_id
+                    and existing["dispatch_id"] == run["dispatch_id"]
+                    and (run["owner_id"] == expected_owner_id or owns_command(
+                        db, WorkflowWriter(repository, deployment_role(repository, expected_owner_id), expected_owner_id), run["owner_id"]))
                 )
                 if not identical:
                     raise ControlStoreError(
@@ -3473,6 +3479,11 @@ class SQLiteControlStore:
                     pgid,
                     _parse_stamp(existing["started_at"]),
                     process_start_ticks,
+                )
+            if run["owner_id"] != expected_owner_id:
+                raise RetiredOwnerError(
+                    f"reserved run owner changed from {expected_owner_id!r} "
+                    f"to {run['owner_id']!r} before process registration"
                 )
             if run["workflow_binding_json"] is not None:
                 captured = decode_workflow(run["workflow_binding_json"], WorkflowBinding)
@@ -3672,7 +3683,7 @@ class SQLiteControlStore:
                 db.execute(
                     "SELECT l.run_id, l.dispatch_id, l.owner_id, l.pid, "
                     "l.pgid, l.started_at, l.process_start_ticks FROM leases l JOIN runs r "
-                    "ON r.run_id=l.run_id WHERE r.owner_id=? "
+                    "ON r.run_id=l.run_id WHERE l.owner_id=? "
                     "ORDER BY l.started_at",
                     (owner_id,),
                 ).fetchall()
@@ -3768,12 +3779,14 @@ class SQLiteControlStore:
             alive = is_alive
             scoped_owner = owner_id
         with closing(self._connect()) as db, db:
+            if scoped_owner is not None:
+                self._assert_owner_active(db, scoped_owner)
             rows = (
                 db.execute(
                     "SELECT l.run_id, l.dispatch_id, l.owner_id, l.pid, "
                     "l.pgid, l.process_start_ticks, l.started_at "
                     "FROM leases l JOIN runs r "
-                    "ON r.run_id=l.run_id WHERE r.owner_id=? "
+                    "ON r.run_id=l.run_id WHERE l.owner_id=? "
                     "ORDER BY l.started_at",
                     (scoped_owner,),
                 ).fetchall()
@@ -3862,12 +3875,13 @@ class SQLiteControlStore:
         self, owner_id: str | None = None
     ) -> tuple[RunId, ...]:
         with closing(self._connect()) as db, db:
+            owners = self._recovery_owners(db, owner_id) if owner_id is not None else ()
             rows = (
                 db.execute(
                     "SELECT b.run_id FROM budget_reservations b JOIN runs r "
                     "ON r.run_id=b.run_id WHERE b.state='active' "
-                    "AND r.owner_id=? ORDER BY b.created_at",
-                    (owner_id,),
+                    f"AND r.owner_id IN ({','.join('?' for _ in owners)}) ORDER BY b.created_at",
+                    owners,
                 ).fetchall()
                 if owner_id is not None
                 else db.execute(
@@ -3886,11 +3900,12 @@ class SQLiteControlStore:
 
         cutoff = _stamp(created_before)
         with closing(self._connect()) as db, db:
+            owners = self._recovery_owners(db, owner_id)
             rows = db.execute(
                 "SELECT b.run_id FROM budget_reservations b JOIN runs r "
                 "ON r.run_id=b.run_id WHERE b.state='active' "
-                "AND r.owner_id=? AND b.created_at<=? ORDER BY b.created_at",
-                (owner_id, cutoff),
+                f"AND r.owner_id IN ({','.join('?' for _ in owners)}) AND b.created_at<=? ORDER BY b.created_at",
+                (*owners, cutoff),
             ).fetchall()
         return tuple(RunId(row["run_id"]) for row in rows)
 
@@ -4020,13 +4035,14 @@ class SQLiteControlStore:
             raise ValueError("run owner and cancellation reason are required")
         intents: list[RunCancellationIntent] = []
         with self.transaction() as db:
+            owners = self._recovery_owners(db, owner_id)
             rows = db.execute(
                 "SELECT r.run_id, r.dispatch_id, r.kind, r.state FROM runs r "
                 "JOIN budget_reservations b ON b.run_id=r.run_id "
-                "WHERE r.owner_id=? AND b.state='active' "
+                f"WHERE r.owner_id IN ({','.join('?' for _ in owners)}) AND b.state='active' "
                 "AND r.state NOT IN ('completed','cancelled','abandoned') "
                 "ORDER BY b.created_at",
-                (owner_id,),
+                owners,
             ).fetchall()
             now = _stamp(self._now())
             for row in rows:
@@ -4081,12 +4097,13 @@ class SQLiteControlStore:
         if not owner_id:
             raise ValueError("run owner is required")
         with closing(self._connect()) as db, db:
+            owners = self._recovery_owners(db, owner_id)
             rows = db.execute(
                 "SELECT i.run_id, i.dispatch_id, i.kind, i.issue_number, "
                 "i.reason FROM run_cancellation_intents i JOIN runs r "
-                "ON r.run_id=i.run_id WHERE r.owner_id=? "
+                f"ON r.run_id=i.run_id WHERE r.owner_id IN ({','.join('?' for _ in owners)}) "
                 "AND i.handover_written_at IS NULL ORDER BY i.created_at",
-                (owner_id,),
+                owners,
             ).fetchall()
         return tuple(
             RunCancellationIntent(
@@ -4134,10 +4151,11 @@ class SQLiteControlStore:
         if not owner_id:
             raise ValueError("run owner identity is required")
         with closing(self._connect()) as db, db:
+            owners = self._recovery_owners(db, owner_id)
             rows = db.execute(
                 "SELECT dispatch_id FROM runs "
-                "WHERE owner_id=? AND state='abandoned' ORDER BY completed_at",
-                (owner_id,),
+                f"WHERE owner_id IN ({','.join('?' for _ in owners)}) AND state='abandoned' ORDER BY completed_at",
+                owners,
             ).fetchall()
         counts: dict[int, int] = {}
         for row in rows:
@@ -5428,6 +5446,8 @@ class SQLiteControlStore:
         for purchase in request.continuations:
             capture = purchase.capture
             key = capture.binding.fence.key
+            if isinstance(purchase, cc.StewardPurchase):
+                self._require_steward_dispatch(request.dispatch_id, request.kind, purchase)
             if isinstance(purchase, cc.IssueReplyPurchase) or (
                     isinstance(purchase, cc.IssueRecoveryPurchase) and request.workflow is not None
                     and request.workflow.authority.family is WorkflowFamily.RESOLVE
@@ -5965,6 +5985,311 @@ class SQLiteControlStore:
         if not isinstance(state, cc.StewardState):
             raise ValueError("steward return requires typed state")
         return self._settle_continuation(request, admission, state, WorkflowFamily.STEWARD)
+
+    def read_steward(self, key: WorkflowKey) -> cc.StewardSelection:
+        from .workflow_rows import load_issue_aggregate
+        with self.transaction() as db:
+            aggregate = load_issue_aggregate(db, key)
+            return cc.select_steward(aggregate) if aggregate is not None else cc.InactiveSteward()
+
+    def steward_admission(self, attempt: WorkflowAttemptIdentity) -> cc.StewardAttemptSource:
+        with self.transaction() as db:
+            return self._steward_admission(db, attempt)
+
+    @staticmethod
+    def _require_steward_dispatch(dispatch_id: str, kind: str, purchase: cc.StewardPurchase) -> None:
+        try:
+            if not isinstance(dispatch_id, str) or len(dispatch_id.encode()) > MAX_WORKFLOW_PAYLOAD_BYTES:
+                raise ValueError("steward dispatch exceeds its bound")
+            dispatch = json.loads(dispatch_id)
+            key = purchase.capture.binding.fence.key
+            if (not isinstance(dispatch, dict) or dispatch.get("repository") != key.repository
+                    or dispatch.get("role") != "steward" or dispatch.get("kind") != kind
+                    or kind != purchase.lane.value.upper() or type(dispatch.get("issue")) is not int
+                    or dispatch["issue"] != key.target.number or type(dispatch.get("number")) is not int
+                    or dispatch["number"] != key.target.number or dispatch.get("leg_id") != purchase.capture.leg_id):
+                raise ValueError("steward dispatch changed its selected issue, lane or leg")
+        except (ValueError, TypeError) as exc:
+            raise WorkflowAuthorityError("steward admission lacks its exact bounded dispatch identity") from exc
+
+    def _steward_admission(self, db: sqlite3.Connection, attempt: WorkflowAttemptIdentity) -> cc.StewardAttemptSource:
+        if not isinstance(attempt, WorkflowAttemptIdentity) or attempt.binding.authority.family is not WorkflowFamily.STEWARD:
+            raise WorkflowAuthorityError("steward return requires its actual family attempt")
+        key = attempt.binding.fence.key
+        receipt_key = self._continuation_receipt_key(attempt.run_id, WorkflowFamily.STEWARD)
+        row = db.execute(
+            "SELECT d.payload_json,r.continuations_json,r.owner_id,r.kind,r.workflow_binding_json,r.dispatch_id,b.state "
+            "FROM runs r JOIN budget_reservations b USING(run_id) JOIN dedupe_keys d "
+            "ON d.namespace='continuation-admission' AND d.scope=b.workload_repository AND d.key=? "
+            "WHERE r.run_id=? AND b.workload_repository=?",
+            (receipt_key, str(attempt.run_id), key.repository),
+        ).fetchone()
+        if row is None:
+            raise WorkflowAuthorityError("steward return lost its selected immutable run admission")
+        captured = decode_workflow(row["payload_json"], tuple)
+        if (len(captured) != 2 or not isinstance(captured[0], cc.StewardPurchase)
+                or not isinstance(captured[1], ContinuationAdmission) or captured[1].attempt != attempt
+                or captured[0].capture.binding != attempt.binding or captured[0].capture.leg_id != attempt.leg_id
+                or captured[1].admission_version != captured[0].capture.revision.version + 1
+                or captured[0] not in decode_workflow(row["continuations_json"], tuple)
+                or row["workflow_binding_json"] != encode_workflow(attempt.binding)
+                or deployment_role(key.repository, row["owner_id"]) != "steward"
+                or row["kind"] != captured[0].lane.value.upper()):
+            raise WorkflowAuthorityError("steward return disagrees with its selected lane and run")
+        self._require_steward_dispatch(row["dispatch_id"], row["kind"], captured[0])
+        if row["state"] != "settled" or db.execute("SELECT 1 FROM charges WHERE run_id=?", (str(attempt.run_id),)).fetchone() is None:
+            raise WorkflowAuthorityError("steward return requires retained actual money settlement")
+        return cc.StewardAttemptSource(captured[1], captured[0].lane, captured[0].baseline_at)
+
+    def record_steward_outcome(self, outcome: cc.StewardReturned,
+                               commands: tuple[LifecycleCommand, ...] = ()) -> bool:
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        if not isinstance(outcome, (cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped)):
+            raise ValueError("steward outcome must be a fixed classified return")
+        source = outcome.source
+        key = source.admission.attempt.binding.fence.key
+        receipt_key = self._continuation_receipt_key(source.admission.attempt.run_id, WorkflowFamily.STEWARD)
+        if (not isinstance(commands, tuple) or any(not isinstance(command, LifecycleCommand) for command in commands)
+                or (tuple(str(command.command_id) for command in commands) != outcome.commands
+                    if isinstance(outcome, (cc.StewardVerdict, cc.StewardStopped)) else bool(commands))):
+            raise ValueError("steward outcome requires its exact bounded command set")
+        encoded = encode_workflow((source.admission, outcome))
+        with self.transaction() as db, self.mutation_savepoint(db):
+            if self._steward_admission(db, source.admission.attempt) != source:
+                raise WorkflowAuthorityError("steward outcome changed its admitted input")
+            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                               (key.repository, receipt_key)).fetchone()
+            if prior is not None:
+                if prior[0] != encoded:
+                    raise WorkflowAuthorityError("steward outcome conflicts with its immutable result")
+                for command in commands:
+                    row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(command.command_id),)).fetchone()
+                    if row is None:
+                        raise WorkflowAuthorityError("steward retry lost its exact verdict command")
+                    stored = _command_from_row(row)
+                    from .workflow_commit import owns_command
+                    from ..domain.workflow_identity import WorkflowWriter
+                    if (stored != replace(command, executor_identity=stored.executor_identity)
+                            or not owns_command(db, WorkflowWriter(key.repository, "steward", stored.executor_identity),
+                                                command.executor_identity)):
+                        raise WorkflowAuthorityError("steward retry changed its exact verdict command")
+                return False
+            aggregate = load_issue_aggregate(db, key)
+            selection = cc.select_steward(aggregate) if aggregate is not None else cc.InactiveSteward()
+            state = cc.steward_return_state(selection, outcome) if isinstance(selection, cc.SelectedSteward) else None
+            if state is not None:
+                component = replace(selection.component, state=state,
+                                    watermarks=replace(selection.component.watermarks, last_applied=source.admission.admission_version))
+                after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version + 1), steward=component)
+                persist_workflow_snapshot(db, after)
+                for command in commands:
+                    self._enqueue_command(db, command, registering_steward_verdict=True)
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
+                       (key.repository, receipt_key, _stamp(self._now()), encoded))
+            event = ControlTransitionCommitted("steward_return", receipt_key, "applied" if state is not None else "stale", {})
+            if self._event_factory is None:
+                raise WorkflowAuthorityError("steward return event sink is unbound")
+            self.enqueue_event(self._event_factory(event, Correlation(issue=key.target.number, run_id=str(source.admission.attempt.run_id))), db)
+            return state is not None
+
+    def _steward_effect(self, db: sqlite3.Connection, command_id: str) -> EffectStatus | None:
+        row = db.execute("SELECT c.state,c.attempt_owner,r.* FROM lifecycle_commands c LEFT JOIN effect_receipts r USING(command_id) "
+                         "WHERE c.command_id=?", (command_id,)).fetchone()
+        if row is None:
+            raise WorkflowAuthorityError("steward verdict lost an owed command")
+        if row["status"] is None:
+            if row["state"] in ("succeeded", "permanent_failure", "unknown_outcome", "retryable_failure"):
+                raise WorkflowAuthorityError("steward verdict lost its selected effect receipt")
+            return None
+        if row["status"] != row["state"] or row["executor_identity"] != row["attempt_owner"]:
+            raise WorkflowAuthorityError("steward verdict lost its exact terminal effect")
+        receipt = EffectReceipt(CommandId(command_id), row["executor_identity"], _parse_stamp(row["started_at"]),
+                                _parse_stamp(row["completed_at"]), EffectStatus(row["status"]),
+                                row["remote_object_id"], row["remote_revision"], row["error"])
+        if _receipt_digest(receipt) != row["receipt_digest"]:
+            raise WorkflowAuthorityError("steward verdict effect receipt conflicts with its source")
+        return receipt.status if receipt.status in (EffectStatus.SUCCEEDED, EffectStatus.PERMANENT_FAILURE) else None
+
+    def _require_steward_command_source(self, db: sqlite3.Connection, command: LifecycleCommand) -> cc.StewardCommandGuard:
+        guard = decode_workflow(command.payload.get("steward_guard"), cc.StewardCommandGuard)
+        if self._steward_admission(db, guard.source.admission.attempt) != guard.source:
+            raise WorkflowAuthorityError("steward command lost its immutable selected source")
+        self._steward_effect(db, str(command.command_id))
+        return guard
+
+    def _validate_steward_command(self, db: sqlite3.Connection, command: LifecycleCommand, *, registering: bool = False,
+                                  settling: bool = False, refusing: bool = False) -> tuple[LifecycleCommand, ...]:
+        from .workflow_rows import load_issue_aggregate
+        from .workflow_commit import owns_command
+        from ..domain.workflow_identity import WorkflowWriter
+        guard = decode_workflow(command.payload.get("steward_guard"), cc.StewardCommandGuard)
+        source = guard.source
+        key = source.admission.attempt.binding.fence.key
+        if (command.workflow is not None or command.repository != key.repository
+                or command.target != f"issue:{key.target.number}"
+                or command.kind not in {CommandKind.POST_COMMENT, CommandKind.RELABEL, CommandKind.CLOSE_ISSUE, CommandKind.ADD_DEPENDENCY}
+                or deployment_role(key.repository, command.executor_identity) != "steward"
+                or command.idempotency_key != f"steward-verdict:{source.admission.attempt.run_id}:{guard.position}"):
+            raise WorkflowAuthorityError("steward verdict command disagrees with its fixed family source")
+        if not settling:
+            self._assert_owner_active(db, command.executor_identity)
+        owner = db.execute("SELECT owner_id FROM runs WHERE run_id=?", (str(source.admission.attempt.run_id),)).fetchone()
+        if owner is None or not owns_command(db, WorkflowWriter(key.repository, "steward", command.executor_identity), owner[0]):
+            raise WorkflowAuthorityError("steward command does not belong to its admitted owner")
+        if self._steward_admission(db, source.admission.attempt) != source:
+            raise WorkflowAuthorityError("steward command changed its selected run input")
+        aggregate = load_issue_aggregate(db, key)
+        selection = cc.select_steward(aggregate) if aggregate is not None else cc.InactiveSteward()
+        if not isinstance(selection, cc.SelectedSteward) or selection.binding != source.admission.attempt.binding:
+            raise WorkflowAuthorityError("steward command belongs to an older component or generation")
+        if selection.component.gates and not settling and not registering:
+            raise WorkflowAuthorityError("steward command has unresolved component holds")
+        lane = selection.component.state.triage if source.lane is cc.StewardLane.TRIAGE else selection.component.state.groom
+        if (lane.delivery_source != source or guard.position >= len(lane.pending_delivery)
+                or lane.pending_delivery[guard.position] != str(command.command_id)
+                or selection.component.watermarks.last_admitted != source.admission.admission_version
+                or selection.component.watermarks.last_applied != source.admission.admission_version):
+            raise WorkflowAuthorityError("steward command lost its exact owed verdict")
+        prefix = []
+        for position, command_id in enumerate(lane.pending_delivery[:guard.position]):
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (command_id,)).fetchone()
+            if row is None:
+                raise WorkflowAuthorityError("steward verdict lost a predecessor command")
+            prior = _command_from_row(row)
+            prior_guard = decode_workflow(prior.payload.get("steward_guard"), cc.StewardCommandGuard)
+            if prior_guard != replace(guard, position=position):
+                raise WorkflowAuthorityError("steward verdict predecessor changed its exact facts")
+            if not registering:
+                status = self._steward_effect(db, command_id)
+                if status is not EffectStatus.SUCCEEDED and not (refusing and status is EffectStatus.PERMANENT_FAILURE):
+                    raise WorkflowAuthorityError("steward verdict awaits its exact predecessor delivery")
+            prefix.append(prior)
+        return tuple(prefix)
+
+    def steward_command_predecessors(self, command: LifecycleCommand) -> tuple[LifecycleCommand, ...]:
+        with self.transaction() as db:
+            return self._validate_steward_command(db, command)
+
+    def steward_command_is_stopped(self, command: LifecycleCommand) -> bool:
+        with self.transaction() as db:
+            guard = self._require_steward_command_source(db, command)
+            source = guard.source
+            key = source.admission.attempt.binding.fence.key
+            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                (key.repository, self._continuation_receipt_key(source.admission.attempt.run_id, WorkflowFamily.STEWARD))).fetchone()
+            result = decode_workflow(row[0], tuple) if row is not None else ()
+            return len(result) == 2 and isinstance(result[1], cc.StewardStopped) and result[1].source == source
+
+    def complete_steward_delivery(self, source: cc.StewardAttemptSource, observed) -> bool:
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        from .effects import action_from_command
+        from ..domain.actions import PostComment, Relabel, CloseIssue
+        from ..domain.world import IssueView
+        if not isinstance(observed, IssueView) or observed.number != source.admission.attempt.binding.fence.key.target.number:
+            raise ValueError("steward delivery requires its selected observed issue")
+        key = source.admission.attempt.binding.fence.key
+        with self.transaction() as db, self.mutation_savepoint(db):
+            if self._steward_admission(db, source.admission.attempt) != source:
+                raise WorkflowAuthorityError("steward delivery changed its admitted source")
+            aggregate = load_issue_aggregate(db, key)
+            selection = cc.select_steward(aggregate) if aggregate is not None else cc.InactiveSteward()
+            if not isinstance(selection, cc.SelectedSteward):
+                return False
+            lane = selection.component.state.triage if source.lane is cc.StewardLane.TRIAGE else selection.component.state.groom
+            if lane.delivery_source != source or selection.binding != source.admission.attempt.binding:
+                return False
+            outcome_row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                (key.repository, self._continuation_receipt_key(source.admission.attempt.run_id, WorkflowFamily.STEWARD))).fetchone()
+            outcome = decode_workflow(outcome_row[0], tuple) if outcome_row is not None else ()
+            if (len(outcome) != 2 or outcome[0] != source.admission
+                    or not isinstance(outcome[1], (cc.StewardVerdict, cc.StewardStopped))
+                    or outcome[1].source != source or outcome[1].commands != lane.pending_delivery):
+                raise WorkflowAuthorityError("steward delivery lost its immutable classified outcome")
+            commands, rows, statuses = [], [], []
+            for command_id in lane.pending_delivery:
+                row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (command_id,)).fetchone()
+                if row is None:
+                    raise WorkflowAuthorityError("steward delivery lost a selected verdict command")
+                command = _command_from_row(row)
+                self._validate_steward_command(db, command, registering=True, settling=True)
+                commands.append(command)
+                rows.append(row)
+                statuses.append(self._steward_effect(db, command_id))
+            delivered_comments = []
+            for command, status in zip(commands, statuses):
+                if status is not EffectStatus.SUCCEEDED:
+                    continue
+                action = action_from_command(command)
+                body = action.body if isinstance(action, PostComment) else action.comment if isinstance(action, (Relabel, CloseIssue)) else ""
+                if not body:
+                    continue
+                receipt = db.execute("SELECT remote_revision FROM effect_receipts WHERE command_id=?", (str(command.command_id),)).fetchone()
+                facts = decode_workflow(receipt[0], tuple) if receipt is not None and receipt[0] is not None else ()
+                if len(facts) != 1 or not isinstance(facts[0], tuple) or len(facts[0]) != 3 or facts[0][1] != body:
+                    raise WorkflowAuthorityError("steward delivery lost its exact comment facts")
+                delivered_comments.append(facts[0])
+            failed = EffectStatus.PERMANENT_FAILURE in statuses
+            if failed:
+                first = statuses.index(EffectStatus.PERMANENT_FAILURE)
+                if any(status is not EffectStatus.SUCCEEDED for status in statuses[:first]):
+                    return False
+                # Ordered admission proves an untouched suffix never bought a
+                # remote attempt. Executing/uncertain debt stays in recovery.
+                if any(status is None and (row["state"] != "pending" or row["attempts"] != 0 or row["attempt_owner"] is not None)
+                       for row, status in zip(rows[first+1:], statuses[first+1:])):
+                    return False
+                for command, status in zip(commands[first+1:], statuses[first+1:]):
+                    if status is not None:
+                        continue
+                    self._validate_steward_command(db, command, settling=True, refusing=True)
+                    self._mark_executing(db, command.command_id)
+                    now = self._now()
+                    receipt = EffectReceipt(command.command_id, command.executor_identity, now, now, EffectStatus.PERMANENT_FAILURE,
+                        error="selected predecessor permanently refused before this suffix command could start")
+                    self._insert_effect(db, receipt, _receipt_digest(receipt))
+                guard = decode_workflow(commands[first].payload["steward_guard"], cc.StewardCommandGuard)
+                failed_action = action_from_command(commands[first])
+                failed_body = failed_action.body if isinstance(failed_action, PostComment) else failed_action.comment if isinstance(failed_action, (Relabel, CloseIssue)) else ""
+                prefix = tuple(action_from_command(c) for c in commands[:first])
+                unchanged = cc.steward_completion_matches(guard, observed, prefix, delivered_comments=tuple(delivered_comments))
+                own_at = observed.updated_at if first and unchanged else None
+                partial = cc.steward_completion_matches(guard, observed, prefix, partial=failed_action, delivered_comments=tuple(delivered_comments))
+                if not unchanged and partial:
+                    captured = db.execute("SELECT remote_revision FROM effect_receipts WHERE command_id=?", (str(commands[first].command_id),)).fetchone()
+                    exact = decode_workflow(captured[0], tuple) if captured is not None and captured[0] is not None else ()
+                    observed_facts = tuple((c.author,c.body,c.created_at) for c in observed.comments)
+                    if (not failed_body or len(exact) != 1 or not isinstance(exact[0], tuple) or len(exact[0]) != 3
+                            or exact[0][1] != failed_body or exact[0] not in observed_facts
+                            or exact[0] in (*guard.facts.comments, *delivered_comments)
+                            or not isinstance(exact[0][0], str) or exact[0][0].casefold() != guard.writer_login.casefold()):
+                        return False
+                    own_at = observed.updated_at
+                state = cc.steward_stopped_state(selection, source, own_at, lost_verdict=isinstance(outcome[1], cc.StewardVerdict))
+            else:
+                if any(status is not EffectStatus.SUCCEEDED for status in statuses):
+                    return False
+                last = commands[-1]
+                action = action_from_command(last)
+                last_body = action.body if isinstance(action, PostComment) else action.comment if isinstance(action, (Relabel, CloseIssue)) else ""
+                prefix_comments = tuple(delivered_comments[:-1] if last_body else delivered_comments)
+                guard = decode_workflow(last.payload["steward_guard"], cc.StewardCommandGuard)
+                unchanged = (all(fact in tuple((c.author,c.body,c.created_at) for c in observed.comments) for fact in delivered_comments)
+                    and cc.steward_completion_matches(guard, observed, tuple(action_from_command(c) for c in commands[:-1]),
+                        partial=action, delivered_comments=prefix_comments))
+                own_at = observed.updated_at if unchanged else None
+                state = (cc.steward_stopped_state(selection, source, own_at) if isinstance(outcome[1], cc.StewardStopped)
+                         else cc.steward_delivered_state(selection, source, own_at or source.input_at))
+            if state is None:
+                return False
+            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version + 1),
+                            steward=replace(selection.component, state=state))
+            persist_workflow_snapshot(db, after)
+            event = ControlTransitionCommitted("steward_delivery", str(source.admission.attempt.run_id),
+                "failed" if failed else "delivered", {"input_at": source.input_at})
+            if self._event_factory is None:
+                raise WorkflowAuthorityError("steward delivery event sink is unbound")
+            self.enqueue_event(self._event_factory(event, Correlation(issue=key.target.number)), db)
+            return True
 
     def _settle_continuation(self, request: SettlementRequest, admission: ContinuationAdmission,
                              state, family: WorkflowFamily) -> SettlementResult:
@@ -6986,6 +7311,7 @@ class SQLiteControlStore:
     def _enqueue_command(
         self, db: sqlite3.Connection, command: LifecycleCommand, *,
         registering_review_submission: bool = False,
+        registering_steward_verdict: bool = False,
     ) -> PendingCommand:
         """Use the existing outbox inside either a command or workflow transaction."""
         payload = _json(command.payload)
@@ -6994,6 +7320,7 @@ class SQLiteControlStore:
         self._assert_owner_active(db, command.executor_identity)
         self._validate_workflow_command(
             db, command, registering_review_submission=registering_review_submission,
+            registering_steward_verdict=registering_steward_verdict,
             allow_blocked_submission_retry=True,
         )
         row = db.execute(
@@ -7063,8 +7390,12 @@ class SQLiteControlStore:
     def _validate_workflow_command(
         self, db: sqlite3.Connection, command: LifecycleCommand, *,
         registering_review_submission: bool = False,
+        registering_steward_verdict: bool = False,
         allow_blocked_submission_retry: bool = False,
     ) -> None:
+        if registering_steward_verdict or "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+            self._validate_steward_command(db, command, registering=registering_steward_verdict)
+            return
         binding = command.workflow
         publication = command.kind in {CommandKind.PUBLISH_BRANCH, CommandKind.OPEN_PULL_REQUEST, CommandKind.UPDATE_PULL_REQUEST_BODY}
         captured_run = self._publication_command_run(db, command) if publication else None
@@ -7181,6 +7512,8 @@ class SQLiteControlStore:
         executing the same recurrence twice.
         """
 
+        if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+            raise WorkflowAuthorityError("a selected steward verdict cannot acquire a new command occurrence")
         payload = _json(command.payload)
         payload_digest = _command_payload_digest(command, payload)
         now = _stamp(self._now())
@@ -7475,6 +7808,12 @@ class SQLiteControlStore:
             for number in claimed:
                 self._event(db, EscalationRaised("pr", number), correlation=Correlation(pr=number))
         return tuple(claimed)
+
+    @classmethod
+    def _recovery_owners(cls, db: sqlite3.Connection, owner_id: str) -> tuple[str, ...]:
+        cls._assert_owner_active(db, owner_id)
+        repository, separator, _ = owner_id.partition(":")
+        return cls._owner_lineage(db, repository, owner_id) if separator else (owner_id,)
 
     @staticmethod
     def _owner_lineage(db: sqlite3.Connection, repository: str, owner_id: str) -> tuple[str, ...]:
@@ -8516,6 +8855,8 @@ class SQLiteControlStore:
 
     def _replace_effect_receipt(self, db: sqlite3.Connection, command: LifecycleCommand) -> None:
         """All receipt replacement paths retain migrated authority evidence."""
+        if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+            self._validate_steward_command(db, command, settling=True)
         self._archive_workflow_receipt(db, command)
         db.execute("DELETE FROM effect_receipts WHERE command_id=?", (str(command.command_id),))
 
@@ -8561,13 +8902,16 @@ class SQLiteControlStore:
 
         if receipt.status is not EffectStatus.SUCCEEDED:
             raise ValueError("unknown effect can only resolve to succeeded here")
-        with self.transaction() as db:
+        with self.transaction() as db, self.mutation_savepoint(db):
             row = db.execute(
                 "SELECT * FROM lifecycle_commands WHERE command_id=?",
                 (str(receipt.command_id),),
             ).fetchone()
             if row is None:
                 raise ControlStoreError("command is not awaiting reconciliation")
+            command = _command_from_row(row)
+            if "steward_guard" in command.payload:
+                self._require_steward_command_source(db, command)
             state = str(row["state"])
             if state == EffectStatus.SUCCEEDED.value:
                 settled = db.execute(
@@ -8596,7 +8940,7 @@ class SQLiteControlStore:
             if state not in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
                 raise ControlStoreError("command is not awaiting reconciliation")
             command = _command_from_row(row)
-            if command.workflow is not None:
+            if command.workflow is not None or "steward_guard" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow reconciliation receipt requires the current command owner")
@@ -8631,21 +8975,30 @@ class SQLiteControlStore:
 
         if receipt.status is not EffectStatus.PERMANENT_FAILURE:
             raise ValueError("an exhausted command must receipt permanent_failure")
-        with self.transaction() as db:
+        with self.transaction() as db, self.mutation_savepoint(db):
             row = db.execute(
                 "SELECT * FROM lifecycle_commands WHERE command_id=?",
                 (str(receipt.command_id),),
             ).fetchone()
             if row is None:
                 raise KeyError(str(receipt.command_id))
+            command = _command_from_row(row)
+            if "steward_guard" in command.payload:
+                self._require_steward_command_source(db, command)
             if row["state"] != EffectStatus.RETRYABLE_FAILURE.value:
                 return False
             command = _command_from_row(row)
-            if command.workflow is not None:
+            if command.workflow is not None or "steward_guard" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow exhaustion receipt requires the current command owner")
                 db.execute("UPDATE lifecycle_commands SET attempt_owner=? WHERE command_id=?", (receipt.executor_identity, str(receipt.command_id)))
+            if "steward_guard" in command.payload:
+                captured = db.execute("SELECT remote_revision FROM effect_receipts WHERE command_id=?", (str(receipt.command_id),)).fetchone()
+                retained = captured[0] if captured is not None else None
+                if receipt.remote_revision is not None and receipt.remote_revision != retained:
+                    raise WorkflowAuthorityError("steward exhaustion changed its captured partial identity")
+                receipt = replace(receipt, remote_revision=retained)
             self._replace_effect_receipt(db, command)
             self._insert_effect(db, receipt, _receipt_digest(receipt))
             return True
@@ -8658,6 +9011,11 @@ class SQLiteControlStore:
                 (str(receipt.command_id),),
             ).fetchone()
             if row is not None:
+                command_row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(receipt.command_id),)).fetchone()
+                if command_row is not None:
+                    command = _command_from_row(command_row)
+                    if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+                        self._require_steward_command_source(db, command)
                 return row["receipt_digest"] == digest
             self._insert_effect(db, receipt, digest)
             self._settle_authorized_retry(db, receipt)
@@ -8672,6 +9030,10 @@ class SQLiteControlStore:
         if command_row is None:
             raise ControlStoreError(f"receipt {receipt.command_id} has no lifecycle command")
         command = _command_from_row(command_row)
+        if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+            self._validate_steward_command(db, command, settling=True, refusing=receipt.status is EffectStatus.PERMANENT_FAILURE)
+            if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
+                raise ControlStoreError("steward effect receipt does not match its captured attempt owner")
         # Retiring/adopting a deployment changes the command executor, not the
         # identity that actually began this attempt and may receipt its result.
         if command.workflow is not None and (not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]):
@@ -9296,7 +9658,7 @@ def _command_from_row(row: sqlite3.Row) -> LifecycleCommand:
     payload = json.loads(row["payload_json"])
     if not isinstance(payload, dict):
         raise CorruptControlStore("lifecycle command payload is not an object")
-    return LifecycleCommand(
+    command = LifecycleCommand(
         CommandId(row["command_id"]),
         row["idempotency_key"],
         CommandKind(row["kind"]),
@@ -9308,6 +9670,14 @@ def _command_from_row(row: sqlite3.Row) -> LifecycleCommand:
         row["executor_identity"],
         decode_workflow(row["workflow_binding_json"], WorkflowBinding) if row["workflow_binding_json"] is not None else None,
     )
+    if ("steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:")
+            or "logical_key" in row.keys() and row["logical_key"].startswith("steward-verdict:")):
+        guard = decode_workflow(command.payload.get("steward_guard"), cc.StewardCommandGuard)
+        logical = f"steward-verdict:{guard.source.admission.attempt.run_id}:{guard.position}"
+        if (command.idempotency_key != logical or str(command.command_id) != hashlib.sha256(logical.encode()).hexdigest()
+                or _command_payload_digest(command, _json(command.payload)) != row["payload_digest"]):
+            raise CorruptControlStore("steward verdict command disagrees with its immutable guard")
+    return command
 
 
 def _encoded_command_binding(command: LifecycleCommand) -> str | None:

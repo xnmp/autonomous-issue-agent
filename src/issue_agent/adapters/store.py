@@ -639,10 +639,8 @@ class Store:
 
     # ── triage updatedAt baseline ──
     def get_triage_at(self, issue: int) -> str:
+        """Stopped legacy-source observation; runtime continuity lives in SQLite."""
         return self._read(self.triage_at_path(issue))
-
-    def set_triage_at(self, issue: int, at: str) -> None:
-        self._write(self.triage_at_path(issue), at)
 
     # ── steward stall counters (ADR 0012) ──
     # Consecutive PAID steward legs that returned no usable verdict for this
@@ -654,9 +652,9 @@ class Store:
     # (which records that leg's baseline instead, so the next series only
     # starts once a human moves the issue on).
     def _stall_path(self, issue: int, leg: str) -> str:
-        if leg == "groom":
-            return self.issue_path(issue, "steward-stalls-groom")
-        return self.issue_path(issue, "steward-stalls-triage")
+        if leg != "groom":
+            raise ValueError("triage continuity requires durable steward authority")
+        return self.issue_path(issue, "steward-stalls-groom")
 
     def get_steward_stalls(self, issue: int, leg: str) -> int:
         return self._read_int(self._stall_path(issue, leg))

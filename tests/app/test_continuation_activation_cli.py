@@ -520,3 +520,19 @@ def test_issue_reply_shadow_preserves_timestamp_count_and_owned_branch(stopped, 
     assert result["issue_reply_shadow"] == [{"issue": 7, "legacy": ["2026-10-01T00:00:00Z", 4, "fix/7-reply"], "imported": ["2026-10-01T00:00:00Z", 4, "fix/7-reply"], "agrees": True}]
     assert next(target for target in result["targets"] if target["number"] == 8)["eligible"] is False
     assert dump(control) == before
+
+
+def test_triage_shadow_preserves_baseline_and_stalls_and_blocks_unknown_history(stopped, capsys):
+    _, control, env = stopped
+    state = Path(env["STEWARD_STATE_DIR"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "triage-7.at").write_text("2026-10-01T00:00:00Z\n")
+    (state / "issue-7.steward-stalls-triage").write_text("2")
+    (state / "triage-8.at").write_text("unknown")
+    before = dump(control)
+    code, result, error = command(capsys, "steward", "shadow")
+    assert code == 0, error
+    assert result["triage_shadow"] == [{"issue":7, "legacy":["2026-10-01T00:00:00Z",2],
+                                       "imported":["2026-10-01T00:00:00Z",2], "agrees":True}]
+    assert next(target for target in result["targets"] if target["number"] == 8)["eligible"] is False
+    assert dump(control) == before

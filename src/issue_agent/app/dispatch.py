@@ -177,6 +177,8 @@ class DispatchConfig:
             fix_bot=self.fix_bot,
             repo=self.repo,
             error_ceiling=self.steward_error_ceiling,
+            owner_id=self.deployment_owner_id,
+            config_version=self.config_version,
         )
 
     def jira_workflow_config(self) -> JiraSyncWorkflowConfig:

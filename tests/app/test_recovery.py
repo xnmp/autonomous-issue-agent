@@ -331,7 +331,7 @@ def test_dead_lease_with_recovered_spend_keeps_one_abandoned_terminal_outcome(
     )
     store.reserve(
         request,
-        lease=Lease(run_id, "dispatch", "owner", 999_999, 999_999, now),
+        lease=Lease(run_id, "dispatch", request.owner_id, 999_999, 999_999, now),
     )
 
     class Reconciler:

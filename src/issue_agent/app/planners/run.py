@@ -9,7 +9,7 @@ from ...domain.agent_task import RunIntent, RuntimeName
 from ...domain.effort import Effort
 from ...domain.resolve_return import ResolveInputs
 from ...domain.resolve_split import AdjudicationInput, ReauthorInput, SplitContext, SplitImplement, SplitInput
-from ...domain.continuation_components import IssueReplyInput, LinkedPRIssueReplyInput
+from ...domain.continuation_components import IssueReplyInput, LinkedPRIssueReplyInput, StewardInput
 
 
 @dataclass(frozen=True, init=False)
@@ -29,6 +29,7 @@ class PlannedRun:
     resolve_inputs: ResolveInputs | None
     split_input: SplitInput | None
     issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None
+    steward_input: StewardInput | None
 
     def __init__(
         self,
@@ -52,6 +53,7 @@ class PlannedRun:
         resolve_inputs: ResolveInputs | None = None,
         split_input: SplitInput | None = None,
         issue_reply: IssueReplyInput | LinkedPRIssueReplyInput | None = None,
+        steward_input: StewardInput | None = None,
     ) -> None:
         selected_intent = intent or (
             prompt
@@ -84,6 +86,9 @@ class PlannedRun:
         if issue_reply is not None and not isinstance(issue_reply, (IssueReplyInput, LinkedPRIssueReplyInput)):
             raise ValueError("issue reply launch inputs must be validated")
         object.__setattr__(self, "issue_reply", issue_reply)
+        if steward_input is not None and not isinstance(steward_input, StewardInput):
+            raise ValueError("steward launch input must be validated")
+        object.__setattr__(self, "steward_input", steward_input)
 
     @property
     def prompt(self) -> str:
@@ -134,4 +139,5 @@ def compose_runtime_plan(plan: PlannedRun) -> RuntimePlan:
         resolve_inputs=plan.resolve_inputs,
         split_input=plan.split_input,
         issue_reply=plan.issue_reply,
+        steward_input=plan.steward_input,
     )

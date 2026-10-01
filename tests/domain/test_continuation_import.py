@@ -44,6 +44,14 @@ def test_steward_lanes_preserve_independent_baselines_and_stalls():
     assert (value.triage.baseline_at, value.triage.stalls, value.groom.baseline_at, value.groom.stalls) == ("2026-10-01T00:00:00Z", 2, "", 3)
 
 
+@pytest.mark.parametrize("field,value", [("triage-at", "yesterday"), ("triage-at", ""),
+                                         ("steward-stalls-triage", ""), ("steward-stalls-triage", "-1"),
+                                         ("steward-stalls-triage", "1.5"), ("steward-stalls-triage", "1" * 1000)])
+def test_malformed_selected_triage_history_stays_blocked(field, value):
+    result = classify_record(record(WorkflowFamily.STEWARD, **{field:value}))
+    assert isinstance(result, tuple) and result
+
+
 def test_unreadable_present_source_never_becomes_zero():
     original = record()
     fields = tuple((name, LegacyUnreadable("oversized") if name == "resumes" else source) for name, source in original.fields)

@@ -1185,6 +1185,9 @@ class SQLiteWorkflowControl:
 
     def _assert_target_quiescent(self, db: sqlite3.Connection, key: WorkflowKey) -> None:
         selected = load_issue_aggregate(db, key)
+        if selected is not None and isinstance(selected.steward, cc.ActiveSteward) and (
+                selected.steward.state.triage.pending_delivery or selected.steward.state.groom.pending_delivery):
+            raise WorkflowAuthorityError("target has an owed steward delivery")
         if isinstance(selected, WorkflowSnapshot) and isinstance(selected.issue_recovery, cc.ActiveIssueRecovery):
             self._control._require_issue_reply_projection(db, key, selected.issue_recovery.state.consumed_reply_at)
         lower, upper = workflow_run_scope_bounds(key)
@@ -1520,8 +1523,12 @@ class SQLiteWorkflowControl:
         replayed = replay_or_conflict(db, self.writer.repository, prior, transition, encoded)
         if replayed is not None:
             return replayed
-        if transition.snapshot.binding != prior.binding and isinstance(prior.issue_recovery, cc.ActiveIssueRecovery):
-            self._control._require_issue_reply_projection(db, prior.binding.fence.key, prior.issue_recovery.state.consumed_reply_at)
+        if transition.snapshot.binding != prior.binding:
+            if isinstance(prior.steward, cc.ActiveSteward) and (
+                    prior.steward.state.triage.pending_delivery or prior.steward.state.groom.pending_delivery):
+                raise WorkflowAuthorityError("generation change has an owed steward delivery")
+            if isinstance(prior.issue_recovery, cc.ActiveIssueRecovery):
+                self._control._require_issue_reply_projection(db, prior.binding.fence.key, prior.issue_recovery.state.consumed_reply_at)
         observations = self._validate_evidence(db, prior, transition)
         admission = self._validate_attempt_run(db, transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else None
         accepted_preflight = None

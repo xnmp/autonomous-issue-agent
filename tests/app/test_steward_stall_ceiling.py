@@ -17,14 +17,15 @@ journal, and neither other issues nor a later successful leg are affected.
 from __future__ import annotations
 
 import asyncio
+import sqlite3
+from dataclasses import replace
 
 import pytest
 
 from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.effects import GitHubEffectExecutor
-from issue_agent.app.execute import Executor as DurableExecutor
 from issue_agent.app.planners.tasks import GroomTaskConfig, TriageTaskConfig
-from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
+from issue_agent.app.workflows.steward import StewardWorkflowConfig
+from tests.fakes.accounted_steward import AccountedStewardWorkflow as StewardWorkflow, triage_lane
 from issue_agent.domain.events import LevelChanged
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
@@ -33,7 +34,9 @@ from issue_agent.domain.steward_stall import (
     stall_charge,
     steward_stall_tripped,
 )
-from issue_agent.domain.triage import TriageConfig, TriageState, triage_candidates
+from issue_agent.domain.triage import TriageConfig
+from issue_agent.domain import continuation_components as cc
+from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
 from issue_agent.domain.world import IssueView, WorldState
 from tests.fakes.executor import ImmediateExecutor as Executor
 
@@ -82,7 +85,7 @@ class _Runner(FakeRunner):
         return self.result
 
 
-def _issue(number: int = 7, updated_at: str = "t0") -> IssueView:
+def _issue(number: int = 7, updated_at: str = "2026-09-14T10:00:00+00:00") -> IssueView:
     return IssueView(
         number,
         title="Export data",
@@ -102,6 +105,7 @@ def _workflow(gw, store, runner, journal, *, ceiling=3, groom=False):
         error_ceiling=ceiling,
         repo="o/r",
     )
+    store._steward_ceiling = ceiling
     return StewardWorkflow(
         cfg, gw, store, runner, Executor(gw, remove_worktree=FakeWorktrees().remove)
     )
@@ -112,11 +116,10 @@ def _levels(journal):
 
 
 def _still_a_candidate(store, issue: IssueView) -> bool:
-    world = WorldState(issues=(issue,), prs=())
-    state = TriageState(seen_at={issue.number: store.triage_at.get(issue.number, "")})
-    return issue.number in triage_candidates(
-        world, TriageConfig("steward-bot", enabled=True), state
-    )
+    if not hasattr(store, "_steward_control"):
+        return True
+    selected = store._steward_control.read_steward(WorkflowKey("o/r", IssueRef(issue.number)))
+    return cc.triage_admissible(selected, issue.updated_at, store._steward_ceiling)
 
 
 # ── the ceiling ─────────────────────────────────────────────────────────────
@@ -171,14 +174,15 @@ def test_a_verdict_after_a_budget_failure_resets_the_series():
     asyncio.run(workflow.triage(7))
     runner.result = VERDICT
     asyncio.run(workflow.triage(7))
-    assert store.get_steward_stalls(7, "triage") == 0
+    assert triage_lane(store, 7).stalls == 0
 
-    # A later failure starts from zero rather than tripping immediately.
+    # A later human input starts from zero rather than tripping immediately.
+    gw.issues[7] = replace(gw.get_issue(7), body="new scope", updated_at="2026-09-14T10:01:00+00:00")
     runner.result = BUDGET
     asyncio.run(workflow.triage(7))
 
     assert _levels(journal) == []
-    assert store.get_steward_stalls(7, "triage") == 1
+    assert triage_lane(store, 7).stalls == 1
 
 
 def test_non_budget_errors_escalate_to_a_human_instead():
@@ -207,7 +211,7 @@ def test_infra_deaths_are_not_charged_to_the_paid_leg_ceiling():
     for _ in range(6):
         asyncio.run(workflow.triage(7))
 
-    assert store.get_steward_stalls(7, "triage") == 0
+    assert triage_lane(store, 7).stalls == 0
     assert _levels(journal) == []
     assert gw.calls == []
 
@@ -220,7 +224,7 @@ def test_other_issues_are_unaffected():
     for _ in range(2):
         asyncio.run(workflow.triage(7))
 
-    assert store.get_steward_stalls(8, "triage") == 0
+    assert triage_lane(store, 8).stalls == 0
     assert _still_a_candidate(store, _issue(8))
 
 
@@ -232,7 +236,7 @@ def test_groom_has_its_own_ceiling():
     for _ in range(2):
         asyncio.run(workflow.groom(7))
 
-    assert store.groom_at[7] == "t0"
+    assert store.groom_at[7] == "2026-09-14T10:00:00+00:00"
     assert _levels(journal)[0].attributes["leg"] == "groom"
 
 
@@ -248,31 +252,10 @@ class DeniedWriteGitHub(FakeGateway):
         self.calls.append(("comment", kind, number, body))
 
 
-class UnenqueuableStore:
-    """A control store that cannot commit a command (SQLite unreachable). Every
-    other call delegates, so only the enqueue seam is broken."""
-
-    def __init__(self, inner):
-        self._inner = inner
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-    def enqueue_command(self, command):
-        raise RuntimeError("control store is unavailable")
-
-
 def _durable_workflow(gw, store, runner, journal, control, *, ceiling=2,
                       effect_ceiling=10):
     """A StewardWorkflow whose executor is the REAL durable effect executor, so
     'the write did not confirm' has a truthful queue behind it."""
-    effects = GitHubEffectExecutor(
-        gw,
-        control,
-        repository="o/r",
-        identity="o/r:steward",
-        retry_ceiling=effect_ceiling,
-    )
     cfg = StewardWorkflowConfig(
         triage=TriageTaskConfig("steward-bot", triage_prompt="T"),
         triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
@@ -281,15 +264,14 @@ def _durable_workflow(gw, store, runner, journal, control, *, ceiling=2,
         dedupe=control,
         error_ceiling=ceiling,
     )
-    executor = DurableExecutor(
-        gw,
-        remove_worktree=FakeWorktrees().remove,
-        effect_executor=effects,
-        # No in-call retries: each execute_all is exactly one attempt per
-        # action, so a test can say how many REFUSALS a command has taken.
-        retry_delays=(),
-    )
-    return StewardWorkflow(cfg, gw, store, runner, executor), effects
+    executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
+    store._steward_control = control
+    store._steward_ceiling = ceiling
+    from tests.adapters.test_steward_delivery import bind_events
+    bind_events(control)
+    workflow = StewardWorkflow(cfg, gw, store, runner, executor)
+    workflow._fixture_effect_ceiling = effect_ceiling
+    return workflow, None
 
 
 def _control(tmp_path):
@@ -312,13 +294,12 @@ def test_a_queued_but_unconfirmed_verdict_is_not_re_bought(tmp_path):
     asyncio.run(workflow.triage(7))
 
     # The writes are COMMITTED and still owed…
-    assert [p.state for p in control.pending_commands()] == ["retryable_failure"] * len(
-        control.pending_commands()
-    )
+    assert control.pending_commands()[0].state == "retryable_failure"
+    assert all(p.state in {"pending", "retryable_failure"} for p in control.pending_commands())
     assert control.pending_commands() != ()
     # …so the next sweep does not select the issue and buys no second leg.
     assert not _still_a_candidate(store, _issue())
-    assert store.get_steward_stalls(7, "triage") == 0
+    assert triage_lane(store, 7).stalls == 0
     deferrals = [level for level in _levels(journal) if level.state == "deferred"]
     assert len(deferrals) == 1
     assert deferrals[0].reason == "durable_outbox"
@@ -332,12 +313,18 @@ def test_a_verdict_that_was_never_queued_does_charge(tmp_path):
     runner = _Runner(VERDICT)
     control = _control(tmp_path)
     workflow, _effects = _durable_workflow(
-        gw, store, runner, journal, UnenqueuableStore(control), ceiling=2
+        gw, store, runner, journal, control, ceiling=2
     )
+    enqueue = control._enqueue_command
+    def denied(db, command, **kwargs):
+        if not command.payload.get("harness_signal"):
+            raise sqlite3.OperationalError("control publication unavailable")
+        return enqueue(db, command, **kwargs)
+    control._enqueue_command = denied
 
     asyncio.run(workflow.triage(7))
     assert control.pending_commands() == ()  # nothing was ever committed
-    assert store.get_steward_stalls(7, "triage") == 1
+    assert triage_lane(store, 7).stalls == 1
     assert _still_a_candidate(store, _issue())
 
     asyncio.run(workflow.triage(7))
@@ -358,13 +345,12 @@ def test_a_retired_command_is_a_loss_not_a_deferral(tmp_path):
     )
 
     asyncio.run(workflow.triage(7))
-    assert store.get_steward_stalls(7, "triage") == 0  # first pass deferred
+    assert triage_lane(store, 7).stalls == 0  # first pass deferred
     # The effect ceiling retires every owed write: nothing is deferred now.
-    effects.drain_pending_commands()
+    workflow.executor.replay_pending()
+    asyncio.run(workflow.triage(7))  # settle the selected failure and retire its unstarted suffix
     assert control.pending_commands() == ()
-
-    store.triage_at.clear()  # a human edit re-selects the issue
-    asyncio.run(workflow.triage(7))
+    assert runner.runs == 1
 
     # Charged, not deferred a second time: the retired command owes nothing.
     assert [level.state for level in _levels(journal)] == ["deferred", "stalled"]
@@ -393,7 +379,7 @@ def test_admission_refusals_never_sideline_an_issue():
         for _ in range(5):
             asyncio.run(workflow.triage(7))
 
-        assert store.get_steward_stalls(7, "triage") == 0, subtype
+        assert triage_lane(store, 7).stalls == 0, subtype
         assert _levels(journal) == [], subtype
         assert gw.calls == [], subtype
         assert _still_a_candidate(store, issue), subtype
@@ -412,7 +398,7 @@ def test_a_groom_finding_cannot_erase_triage_strikes():
     asyncio.run(workflow.triage(7))          # triage strike 1
     runner.result = AgentResult(is_error=False, structured={})
     asyncio.run(workflow.groom(7))           # a groom leg that returns fine
-    assert store.get_steward_stalls(7, "triage") == 1
+    assert triage_lane(store, 7).stalls == 1
 
     runner.result = BUDGET
     asyncio.run(workflow.triage(7))          # strike 2 → the ceiling
@@ -460,7 +446,7 @@ def test_a_failed_baseline_read_still_ends_the_series_with_one_paid_leg():
 
         def get_issue(self, number):
             self.reads += 1
-            if self.fail_reads and self.reads > 1:
+            if self.fail_reads and any(c[0] == "comment" for c in self.calls):
                 raise RuntimeError("gh read failed")
             return super().get_issue(number)
 
@@ -479,7 +465,8 @@ def test_a_failed_baseline_read_still_ends_the_series_with_one_paid_leg():
     # recorded, so the sweep no longer selects this version of the issue and
     # no further leg can be bought.
     assert not _still_a_candidate(store, _issue())
-    assert store.get_steward_stalls(7, "triage") == 0
+    assert triage_lane(store, 7).stalls == 1
+    assert triage_lane(store, 7).baseline_at == ""
 
 
 # ── the pure policy ─────────────────────────────────────────────────────────

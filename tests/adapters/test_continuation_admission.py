@@ -203,7 +203,8 @@ def test_steward_only_shell_persists_and_admits_without_resolve_authority(tmp_pa
     selected = cc.select_steward(shell)
     purchase = cc.StewardPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:triage"),
                                   cc.StewardLane.TRIAGE, NOW.isoformat(), 2)
-    requested = replace(request("triage"), workflow=selected.binding, owner_id="o/r:steward:test", kind="TRIAGE")
+    requested = replace(request("triage"), workflow=selected.binding, owner_id="o/r:steward:test", kind="TRIAGE",
+        dispatch_id=json.dumps({"repository":"o/r", "role":"steward", "kind":"TRIAGE", "issue":7, "number":7, "leg_id":"leg:triage"}))
     assert store.reserve_steward(requested, purchase).admitted
     admitted = receipt(store, requested.run_id, WorkflowFamily.STEWARD)
     output = cc.StewardState(triage=cc.StewardLaneState(stalls=1))

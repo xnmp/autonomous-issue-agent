@@ -3716,17 +3716,31 @@ def build_steward_daemon(
         # this only runs on a genuinely fresh world.
         report_recurrences(world)
         errors: dict[int, str] = {}
-        seen = {i.number: _control_value(errors, i.number, store.get_triage_at, "") for i in world.issues}
+        from ..domain import continuation_components as cc
+        triage_state = {
+            i.number: _control_value(errors, i.number,
+                lambda n: control.read_steward(WorkflowKey(cfg.repo, IssueRef(n))), cc.InactiveSteward())
+            for i in world.issues
+        }
+        for i in world.issues:
+            selected = triage_state[i.number]
+            if isinstance(selected, cc.SelectedSteward) and selected.component.state.triage.delivery_source is not None:
+                source = selected.component.state.triage.delivery_source
+                if _control_value(errors, i.number,
+                        lambda n: control.complete_steward_delivery(source, gateway.get_issue(n)), False):
+                    triage_state[i.number] = control.read_steward(WorkflowKey(cfg.repo, IssueRef(i.number)))
+        seen = {number: selected.component.state.triage.baseline_at if isinstance(selected, cc.SelectedSteward) else ""
+                for number, selected in triage_state.items()}
         groom_seen = {i.number: _control_value(errors, i.number, store.get_groom_at, "") for i in world.issues}
         groom_content = {i.number: _control_value(errors, i.number, store.get_groom_content, "") for i in world.issues}
         infra = {i.number: _control_value(errors, i.number, store.get_infra_deaths, 0) for i in world.issues}
         for i in world.issues:
-            for leg in ("triage", "groom"):
-                _control_value(errors, i.number, lambda n: store.get_steward_stalls(n, leg), 0)
+            _control_value(errors, i.number, lambda n: store.get_steward_stalls(n, "groom"), 0)
         for target, reason in errors.items():
             steward_log(f"issue #{target} held: {reason}")
         world = replace(world, issues=tuple(i for i in world.issues if i.number not in errors))
         state = TriageState(seen_at=seen)
+        updated_at = {i.number: i.updated_at for i in world.issues}
         deaths = control.abandoned_dispatch_counts(owner_id)
 
         def exhausted(n: int) -> bool:
@@ -3736,7 +3750,8 @@ def build_steward_daemon(
         actions = [
             RunAgent(AgentKind.TRIAGE, n)
             for n in triage_candidates(world, tcfg_dom, state)
-            if not exhausted(n)
+            if not exhausted(n) and cc.triage_admissible(triage_state[n],
+                updated_at[n], cfg.steward_error_ceiling)
         ]
         actions.extend(
             adr_steward_actions(world.prs, adrs, steward_runtime.bot)

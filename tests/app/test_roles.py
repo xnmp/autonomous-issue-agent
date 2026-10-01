@@ -1004,6 +1004,9 @@ def _steward_decide(
     )
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
+    from tests.fakes.accounted_steward import install_steward
+    install_steward(control, (30, 31))
+    object.__setattr__(store, "_steward_control", control)
     cfg = HarnessConfig(repo="o/r", target_dir=str(tmp_path), **cfg_kw)
     owner_id = roles._owner_identity(cfg, "steward")
     for index, target in enumerate(process_deaths):
@@ -1035,12 +1038,18 @@ def _steward_decide(
 
 
 def _triaged(number=30):
-    return WorldState(issues=(IssueView(number, title="t", body="b", updated_at="T1"),))
+    return WorldState(issues=(IssueView(number, title="t", body="b", updated_at="2026-09-14T10:00:00+00:00"),))
 
 
-def test_corrupt_steward_counter_holds_only_its_issue(tmp_path, monkeypatch):
+def test_blocked_steward_component_holds_only_its_issue(tmp_path, monkeypatch):
     decide, store = _steward_decide(tmp_path, monkeypatch)
-    (tmp_path / "issue-30.steward-stalls-triage").write_text("oops")
+    from issue_agent.domain.continuation_components import BlockedSteward, ContinuationImportBlocker
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef, FamilyAuthority, WorkflowFamily
+    control = store._steward_control
+    read = control.read_steward
+    blocked = BlockedSteward(WorkflowKey("o/r", IssueRef(30)), FamilyAuthority(WorkflowFamily.STEWARD, 1),
+        "fixture-blocked", (ContinuationImportBlocker("issue-30.steward-stalls-triage", "unknown counter"),))
+    monkeypatch.setattr(control, "read_steward", lambda key: blocked if key.target.number == 30 else read(key))
     world = WorldState(issues=(_triaged(30).issues[0], _triaged(31).issues[0]))
     assert decide(world) == [RunAgent(AgentKind.TRIAGE, 31)]
 
@@ -1063,7 +1072,13 @@ def test_the_steward_still_triages_a_healthy_issue(tmp_path, monkeypatch):
     identical to a bounded one on the test above."""
     decide, store = _steward_decide(tmp_path, monkeypatch)
     assert decide(_triaged()) == [RunAgent(AgentKind.TRIAGE, 30)]
-    store.set_triage_at(30, "T1")
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    with store._steward_control.transaction() as db:
+        aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(30)))
+        component = aggregate.steward
+        persist_workflow_snapshot(db, replace(aggregate, steward=replace(component,
+            state=replace(component.state, triage=replace(component.state.triage, baseline_at=_triaged().issues[0].updated_at)))))
     assert decide(_triaged()) == [], "unchanged since last triage — not the ceiling"
 
 
@@ -1082,8 +1097,8 @@ def test_the_steward_suppression_is_per_issue(tmp_path, monkeypatch):
     for _ in range(5):
         store.bump_infra_deaths(30)
     world = WorldState(issues=(
-        IssueView(30, title="t", body="b", updated_at="T1"),
-        IssueView(31, title="t", body="b", updated_at="T1"),
+        IssueView(30, title="t", body="b", updated_at="2026-09-14T10:00:00+00:00"),
+        IssueView(31, title="t", body="b", updated_at="2026-09-14T10:00:00+00:00"),
     ))
 
     assert decide(world) == [RunAgent(AgentKind.TRIAGE, 31)]

@@ -4,6 +4,7 @@ import inspect
 import os
 import re
 import tempfile
+from pathlib import Path
 import pytest
 
 from issue_agent.adapters import store as store_module
@@ -315,10 +316,17 @@ def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
     assert s.get_ci_rerun_head(100) == ""
 
 
-def test_triage_at():
+def test_stopped_legacy_triage_baseline_remains_readable():
     s, _ = _store()
-    s.set_triage_at(7, "t_post")
+    Path(s.triage_at_path(7)).write_text("t_post")
     assert s.get_triage_at(7) == "t_post"
+
+
+@pytest.mark.parametrize("method", ["get_steward_stalls", "bump_steward_stalls", "clear_steward_stalls"])
+def test_retired_triage_file_counter_cannot_be_runtime_authority(method):
+    s, _ = _store()
+    with pytest.raises(ValueError, match="durable steward"):
+        getattr(s, method)(7, "triage")
 
 
 def test_phase_roundtrip():
@@ -424,7 +432,8 @@ def test_every_issue_accessor_suffix_is_covered_by_exactly_one_cleaner():
     # review M4: a new accessor with an unlisted suffix must fail this test
     # instead of silently leaking a STATE_DIR file forever (introspects the
     # module: accessors' suffix strings vs _ISSUE_SUFFIXES).
-    assert _accessor_suffixes("issue_path") == set(store_module._ISSUE_SUFFIXES)
+    # The retired triage counter still needs cleanup in existing state roots.
+    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage"} == set(store_module._ISSUE_SUFFIXES)
 
 
 def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
@@ -534,6 +543,7 @@ def _triage_at_has_a_cleaner() -> bool:
 
 def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
+    used.add(("issue_path", "steward-stalls-triage"))
     used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
 

@@ -171,3 +171,22 @@ def issue_reply_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContin
         after = (target.state.consumed_reply_at, target.state.resumes, target.state.remembered_branch)
         comparisons.append((target.key, before, after))
     return tuple(comparisons)
+
+
+def triage_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[str, int], tuple[str, int]], ...]:
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.StewardState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.STEWARD)
+        if len(found) > 1:
+            raise ValueError("eligible triage shadow has ambiguous source ownership")
+        fields = dict(found[0].fields) if found else {}
+        baseline, stalls = fields.get("triage-at", LegacyAbsent()), fields.get("steward-stalls-triage", LegacyAbsent())
+        if not isinstance(baseline, (LegacyAbsent, LegacyPresent)) or not isinstance(stalls, (LegacyAbsent, LegacyPresent)):
+            raise ValueError("eligible triage shadow has unreadable selected input")
+        before = (baseline.text.strip() if isinstance(baseline, LegacyPresent) else "",
+                  int(stalls.text.strip()) if isinstance(stalls, LegacyPresent) else 0)
+        after = (target.state.triage.baseline_at, target.state.triage.stalls)
+        comparisons.append((target.key, before, after))
+    return tuple(comparisons)

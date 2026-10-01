@@ -24,7 +24,7 @@ from ..domain.actions import (
     Target,
     UpdateBranch,
 )
-from ..domain.labels import Label
+from ..domain.labels import ADVISORY_LABELS, Label
 from ..domain.eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from ..domain.lifecycle import (
     AllowedEligibility, completion_guard, completion_matches, issue_eligibility,
@@ -32,6 +32,7 @@ from ..domain.lifecycle import (
 )
 from ..domain.repository import canonical_repository
 from ..domain.workflow_identity import WorkflowBinding, WorkflowFamily
+from ..domain import continuation_components as cc
 from ..domain.workflow import (
     ActiveReconciliation, ReconciliationOnly, RetiredUncertainCommand,
     RetryBegan, RetryDeclined,
@@ -63,7 +64,7 @@ from .review_effects import (
     is_review_family, read_pull_request, review_family_op,
 )
 from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
-from .workflow_codec import encode_workflow
+from .workflow_codec import decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
@@ -202,8 +203,10 @@ class ImmediateGitHubEffectExecutor:
     def handles(self, action: Action) -> bool:
         return GitHubEffectExecutor.handles(self, action)
 
-    def _validate_completion(self, action, *, partial=False):
-        return GitHubEffectExecutor._validate_completion(self, action, partial=partial)
+    def _validate_completion(self, action, *, partial=False, steward_guard=None):
+        return GitHubEffectExecutor._validate_completion(
+            self, action, partial=partial, steward_guard=steward_guard
+        )
 
     def _close_state_matches(self, action):
         return GitHubEffectExecutor._close_state_matches(self, action)
@@ -628,7 +631,7 @@ class GitHubEffectExecutor:
             if reconciled is True:
                 return self.effects.resolve_unknown(
                     command,
-                    EffectOutcome(True, EffectStatus.SUCCEEDED),
+                    self._steward_success(command),
                 )
             if reconciled is None:
                 raise UnknownEffectOutcome(
@@ -642,10 +645,7 @@ class GitHubEffectExecutor:
                 # new command identity for an effect that already landed.
                 return self.effects.execute(
                     command,
-                    lambda: EffectOutcome(
-                        True,
-                        EffectStatus.SUCCEEDED,
-                    ),
+                    lambda: self._steward_success(command),
                 )
         if (
             pending.state != "pending"
@@ -666,7 +666,11 @@ class GitHubEffectExecutor:
                 "target — decision stale, discarded; next tick re-decides"
             )
 
+        selected_body = (action.body if isinstance(action, PostComment) else action.comment if isinstance(action, (CloseIssue, Relabel)) else "") if "steward_guard" in command.payload else ""
+        prior_receipt = self.store.effect_receipt(command.command_id) if selected_body else None
+
         def apply_and_verify() -> EffectOutcome[bool]:
+            before_comments = tuple((c.author, c.body, c.created_at) for c in self.gateway.get_issue(action.number).comments) if selected_body else ()
             applied = self._apply(action, command)
             if isinstance(action, (CancelWorkflowRuns, RerunFailedChecks)):
                 # These effects' postcondition is that GitHub ACCEPTED the
@@ -691,7 +695,7 @@ class GitHubEffectExecutor:
                     f"{command.command_id}: remote postcondition is unavailable"
                 )
             if outcome:
-                return EffectOutcome(True, EffectStatus.SUCCEEDED)
+                return self._steward_success(command)
             if isinstance(action, RerunFailedChecks):
                 # Terminal, not retryable (ADR 0012 ceiling, issue #177). A
                 # refusal means the captured runs no longer match the observed
@@ -708,10 +712,17 @@ class GitHubEffectExecutor:
                         "this head"
                     ),
                 )
+            partial_revision = None
+            if selected_body:
+                candidates = self._steward_comment_candidates(command, selected_body)
+                if len(candidates) == 1 and (candidates[0] not in before_comments
+                        or prior_receipt is not None and prior_receipt.remote_revision == encode_workflow(candidates)):
+                    partial_revision = encode_workflow(candidates)
             return EffectOutcome(
                 False,
                 EffectStatus.RETRYABLE_FAILURE,
                 error="GitHub did not confirm the requested remote state",
+                remote_revision=partial_revision,
             )
 
         return self.effects.execute(command, apply_and_verify)
@@ -985,7 +996,11 @@ class GitHubEffectExecutor:
         # Review-family projections run last in a pass, so a re-arm whose
         # dismissals all land in this pass also restores its trigger in it.
         runnable.sort(key=lambda pending: (
-            pending.command.kind is CommandKind.RELABEL and is_review_family(pending.command)))
+            pending.command.kind is CommandKind.RELABEL and is_review_family(pending.command),
+            str(decode_workflow(pending.command.payload["steward_guard"], cc.StewardCommandGuard).source.admission.attempt.run_id)
+            if "steward_guard" in pending.command.payload else "",
+            decode_workflow(pending.command.payload["steward_guard"], cc.StewardCommandGuard).position
+            if "steward_guard" in pending.command.payload else 0))
         for pending in runnable:
             command = pending.command
             if command.kind not in self.owned_kinds or (
@@ -997,6 +1012,8 @@ class GitHubEffectExecutor:
                 reconciliation = self.store.command_reconciliation(command.command_id)
                 if isinstance(reconciliation, (ReconciliationOnly, RetiredUncertainCommand)):
                     applied = self._reconcile_uncertain(command, reconciliation, pending.attempts)
+                elif "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+                    applied = self._execute(action_from_command(command), pending)
                 elif _unresolved_workflow_command(pending):
                     applied = self._reconcile_scheduled(pending, raise_unresolved=False)
                 elif command.kind is CommandKind.SUBMIT_REVIEW:
@@ -1261,31 +1278,42 @@ class GitHubEffectExecutor:
         command: LifecycleCommand | None = None,
     ):
         """Apply one effect, re-validating its completion facts between writes."""
+        selected_guard = None
+        if command is not None and ("steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:")):
+            current = self._steward_completion_view(command)
+            if current is None:
+                raise StaleExpectedRevision(f"{command.target}: steward completion facts changed")
+            if isinstance(action, (Relabel, CloseIssue)):
+                guard = decode_workflow(command.payload.get("steward_guard"), cc.StewardCommandGuard)
+                selected_guard = guard
+                operation = (LifecycleOperation.GROOM if isinstance(action, Relabel) and action.add in ADVISORY_LABELS
+                             else guard.facts.operation)
+                action = replace(action, completion_guard=completion_guard(current, operation))
         if isinstance(action, Relabel):
             if _is_compound_relabel(action):
-                self._validate_completion(action, partial=True)
+                self._validate_completion(action, partial=True, steward_guard=selected_guard)
                 current = self.gateway.get_issue(action.number)
-                if action.comment and not any(
-                    item.body == action.comment for item in current.comments
-                ):
+                comment_present = (bool(self._steward_comment_candidates(command, action.comment))
+                    if command is not None and "steward_guard" in command.payload else any(item.body == action.comment for item in current.comments))
+                if action.comment and not comment_present:
                     self.gateway.comment("issue", action.number, action.comment)
-                    self._validate_completion(action, partial=True)
+                    self._validate_completion(action, partial=True, steward_guard=selected_guard)
                 for label in action.added_labels:
                     current = self.gateway.get_issue(action.number)
                     if label not in current.labels:
                         self.gateway.relabel(
                             "issue", action.number, None, label.value
                         )
-                        self._validate_completion(action, partial=True)
+                        self._validate_completion(action, partial=True, steward_guard=selected_guard)
                 for label in action.removed_labels:
                     current = self.gateway.get_issue(action.number)
                     if label in current.labels:
                         self.gateway.relabel(
                             "issue", action.number, label.value, None
                         )
-                        self._validate_completion(action, partial=True)
+                        self._validate_completion(action, partial=True, steward_guard=selected_guard)
                 return True
-            self._validate_completion(action, partial=True)
+            self._validate_completion(action, partial=True, steward_guard=selected_guard)
             removals = action.removed_labels
             self.gateway.relabel(
                 _TARGET[action.target],
@@ -1294,7 +1322,7 @@ class GitHubEffectExecutor:
                 action.add.value if action.add else None,
             )
             for label in removals[1:]:
-                self._validate_completion(action, partial=True)
+                self._validate_completion(action, partial=True, steward_guard=selected_guard)
                 self.gateway.relabel(
                     _TARGET[action.target], action.number, label.value, None
                 )
@@ -1307,21 +1335,22 @@ class GitHubEffectExecutor:
                 if self.reconcile(action) is True:
                     return True
                 raise UnknownEffectOutcome("closed target has an incomplete disposition; reconcile remaining effects")
-            self._validate_completion(action, partial=True)
-            has_comment = (
+            self._validate_completion(action, partial=True, steward_guard=selected_guard)
+            has_comment = (bool(self._steward_comment_candidates(command, action.comment))
+                if command is not None and "steward_guard" in command.payload else
                 self.gateway.has_comment("issue", action.number, action.comment)
                 if isinstance(self.gateway, CommentVerifier)
                 else any(c.body == action.comment for c in self.gateway.get_issue(action.number).comments)
             )
             if action.comment and not has_comment:
                 self.gateway.comment("issue", action.number, action.comment)
-            self._validate_completion(action, partial=True)
+            self._validate_completion(action, partial=True, steward_guard=selected_guard)
             for label in action.add_labels:
                 self.gateway.relabel("issue", action.number, None, label.value)
-                self._validate_completion(action, partial=True)
+                self._validate_completion(action, partial=True, steward_guard=selected_guard)
             for label in action.remove_labels:
                 self.gateway.relabel("issue", action.number, label.value, None)
-                self._validate_completion(action, partial=True)
+                self._validate_completion(action, partial=True, steward_guard=selected_guard)
             if not self._close_state_matches(action):
                 self.gateway.close_issue(action.number, action.reason, "")
             return True
@@ -1396,7 +1425,9 @@ class GitHubEffectExecutor:
     ) -> bool | None:
         if isinstance(action, Relabel):
             if _is_compound_relabel(action):
-                self._validate_completion(action, partial=True)
+                self._validate_completion(action, partial=True, steward_guard=
+                    decode_workflow(command.payload["steward_guard"], cc.StewardCommandGuard)
+                    if command is not None and "steward_guard" in command.payload else None)
                 current = self.gateway.get_issue(action.number)
                 return (
                     all(label in current.labels for label in action.added_labels)
@@ -1406,10 +1437,11 @@ class GitHubEffectExecutor:
                     )
                     and (
                         not action.comment
-                        or any(
+                        or (bool(self._steward_comment_candidates(command, action.comment))
+                            if command is not None and "steward_guard" in command.payload else any(
                             item.body == action.comment
                             for item in current.comments
-                        )
+                        ))
                     )
                 )
             if not isinstance(self.gateway, LabelVerifier):
@@ -1428,6 +1460,8 @@ class GitHubEffectExecutor:
             )
             return added and removed
         if isinstance(action, PostComment):
+            if command is not None and "steward_guard" in command.payload:
+                return bool(self._steward_comment_candidates(command, action.body))
             if not isinstance(self.gateway, CommentVerifier):
                 return None
             return self.gateway.has_comment(
@@ -1446,6 +1480,8 @@ class GitHubEffectExecutor:
                     return False
             if not action.comment:
                 return True
+            if command is not None and "steward_guard" in command.payload:
+                return bool(self._steward_comment_candidates(command, action.comment))
             if not isinstance(self.gateway, CommentVerifier):
                 return None
             return self.gateway.has_comment(
@@ -1702,6 +1738,8 @@ class GitHubEffectExecutor:
         of a still-open pull request (its marker's absence was just proven by
         the caller's postcondition read; the store re-checks the binding).
         """
+        if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+            return self._steward_completion_view(command) is not None
         op = review_family_op(command)
         if op is not None:
             check = self._check_review(op, command)
@@ -1733,6 +1771,8 @@ class GitHubEffectExecutor:
         return self._revision_matches(command)
 
     def _revision_matches(self, command: LifecycleCommand) -> bool:
+        if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
+            return self._steward_completion_view(command) is not None
         if command.kind is CommandKind.RELABEL:
             action = action_from_command(command)
             if isinstance(action, Relabel) and action.hold_guard is not None:
@@ -1760,7 +1800,75 @@ class GitHubEffectExecutor:
             )
         return current == command.expected_revision
 
-    def _validate_completion(self, action: Action, *, partial: bool = False) -> None:
+    def _steward_completion_view(self, command: LifecycleCommand):
+        guard = decode_workflow(command.payload.get("steward_guard"), cc.StewardCommandGuard)
+        predecessors = self.store.steward_command_predecessors(command)
+        current = self.gateway.get_issue(guard.source.admission.attempt.binding.fence.key.target.number)
+        action = action_from_command(command)
+        if isinstance(action, (PostComment, Relabel)) and action.harness_signal:
+            if not self.store.steward_command_is_stopped(command):
+                raise WorkflowAuthorityError("steward harness notice lacks its fixed stopped outcome")
+            return current
+        delivered = self._steward_delivered_comments(predecessors)
+        if not cc.steward_completion_matches(guard, current, tuple(action_from_command(item) for item in predecessors), partial=action,
+                                             delivered_comments=delivered):
+            return None
+        operation = (LifecycleOperation.GROOM if isinstance(action, Relabel) and action.add in ADVISORY_LABELS
+                     else guard.facts.operation)
+        permission_view = self._steward_permission_view(current, action, guard)
+        if not isinstance(action, PostComment) and not isinstance(completion_eligibility(permission_view, operation, action), AllowedEligibility):
+            return None
+        return current
+
+    def _steward_delivered_comments(self, predecessors: tuple[LifecycleCommand, ...]) -> tuple:
+        delivered = []
+        for prior in predecessors:
+            action = action_from_command(prior)
+            body = action.body if isinstance(action, PostComment) else action.comment if isinstance(action, (Relabel, CloseIssue)) else ""
+            if not body:
+                continue
+            receipt = self.store.effect_receipt(prior.command_id)
+            if receipt is None or receipt.status is not EffectStatus.SUCCEEDED or receipt.remote_revision is None:
+                raise WorkflowAuthorityError("steward predecessor lacks exact delivered comment facts")
+            facts = decode_workflow(receipt.remote_revision, tuple)
+            if len(facts) != 1 or not isinstance(facts[0], tuple) or len(facts[0]) != 3 or facts[0][1] != body:
+                raise WorkflowAuthorityError("steward predecessor comment facts conflict with its command")
+            delivered.append(facts[0])
+        return tuple(delivered)
+
+    def _steward_comment_candidates(self, command: LifecycleCommand, body: str) -> tuple:
+        guard = decode_workflow(command.payload["steward_guard"], cc.StewardCommandGuard)
+        predecessors = self.store.steward_command_predecessors(command)
+        previous = (*guard.facts.comments, *self._steward_delivered_comments(predecessors))
+        current = self.gateway.get_issue(guard.source.admission.attempt.binding.fence.key.target.number)
+        return tuple((comment.author, comment.body, comment.created_at) for comment in current.comments
+                           if comment.body == body and guard.writer_login
+                           and comment.author.casefold() == guard.writer_login.casefold()
+                           and (comment.author, comment.body, comment.created_at) not in previous)
+
+    def _steward_success(self, command: LifecycleCommand) -> EffectOutcome[bool]:
+        if "steward_guard" not in command.payload:
+            return EffectOutcome(True, EffectStatus.SUCCEEDED)
+        action = action_from_command(command)
+        body = action.body if isinstance(action, PostComment) else action.comment if isinstance(action, (Relabel, CloseIssue)) else ""
+        if not body:
+            return EffectOutcome(True, EffectStatus.SUCCEEDED)
+        candidates = self._steward_comment_candidates(command, body)
+        if len(candidates) != 1:
+            raise UnknownEffectOutcome("steward delivered comment identity is absent or ambiguous")
+        return EffectOutcome(True, EffectStatus.SUCCEEDED, remote_revision=encode_workflow(candidates))
+
+    @staticmethod
+    def _steward_permission_view(current, action: Action, guard: cc.StewardCommandGuard):
+        if isinstance(action, (Relabel, CloseIssue)):
+            added = action.added_labels if isinstance(action, Relabel) else action.add_labels
+            removed = action.removed_labels if isinstance(action, Relabel) else action.remove_labels
+            labels = (current.labels - (frozenset(added) - guard.facts.labels)) | (frozenset(removed) & guard.facts.labels)
+            return replace(current, labels=labels)
+        return current
+
+    def _validate_completion(self, action: Action, *, partial: bool = False,
+                             steward_guard: cc.StewardCommandGuard | None = None) -> None:
         if not isinstance(action, (Relabel, CloseIssue)):
             return
         if action.completion_guard is None:
@@ -1784,9 +1892,27 @@ class GitHubEffectExecutor:
                 comment = action.comment
         if not completion_matches(guard, current, removed=removed, added=added, comment=comment):
             raise StaleExpectedRevision(f"issue:{action.number}: completion facts changed")
-        permission = completion_eligibility(current, guard.operation, action)
+        permission_view = self._steward_permission_view(current, action, steward_guard) if steward_guard is not None else current
+        permission = completion_eligibility(permission_view, guard.operation, action)
         if not isinstance(permission, AllowedEligibility):
             raise StaleExpectedRevision(f"issue:{action.number}: completion held: {permission}")
+
+def commands_for_steward_verdict(actions: tuple[Action, ...], source: cc.StewardAttemptSource,
+                                 facts: IssueCompletionGuard, *, identity: str, writer_login: str,
+                                 config_version: str = "") -> tuple[LifecycleCommand, ...]:
+    if not isinstance(actions, tuple) or not 1 <= len(actions) <= 64:
+        raise ValueError("steward verdict requires a bounded fixed action set")
+    commands = []
+    for position, action in enumerate(actions):
+        guard = cc.StewardCommandGuard(source, facts, position, writer_login)
+        logical = f"steward-verdict:{source.admission.attempt.run_id}:{position}"
+        command = command_for_action(action, config_version, expected_revision=None,
+                                     payload_extra={"steward_guard": encode_workflow(guard)},
+                                     repository=source.admission.attempt.binding.fence.key.repository,
+                                     executor_identity=identity)
+        commands.append(replace(command, command_id=CommandId(hashlib.sha256(logical.encode()).hexdigest()), idempotency_key=logical))
+    return tuple(commands)
+
 
 def command_for_action(
     action: Action,

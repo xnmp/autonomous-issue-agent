@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING
 from .agent_task import RuntimeName
 from .refs import issue_from_branch
 from .contracts import ContinuationAdmission
+from .eligibility import IssueCompletionGuard, LifecycleOperation
 from .workflow_identity import (
     MAX_WORKFLOW_GATES, ContinuationComponentIdentity, FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
@@ -118,12 +119,65 @@ class PRRepairState:
             validate_workflow_integer(getattr(self, name), name)
 
 
+class StewardLane(str, Enum):
+    TRIAGE = "triage"
+    GROOM = "groom"
+
+
+@dataclass(frozen=True)
+class StewardAttemptSource:
+    admission: ContinuationAdmission
+    lane: StewardLane
+    input_at: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.admission, ContinuationAdmission)
+                or self.admission.attempt.binding.authority.family is not WorkflowFamily.STEWARD
+                or not isinstance(self.lane, StewardLane)):
+            raise ValueError("steward delivery requires its exact family admission and lane")
+        _timestamp(self.input_at, "steward delivery input")
+        if not self.input_at:
+            raise ValueError("steward delivery requires its admitted input baseline")
+
+
+@dataclass(frozen=True)
+class StewardCommandGuard:
+    source: StewardAttemptSource
+    facts: IssueCompletionGuard
+    position: int
+    writer_login: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_text(self.writer_login, "steward command writer login")
+        if not isinstance(self.source, StewardAttemptSource) or not isinstance(self.facts, IssueCompletionGuard):
+            raise ValueError("steward command requires exact admitted completion facts")
+        if self.facts.operation not in {LifecycleOperation.COMPLETE_TRIAGE, LifecycleOperation.CLOSE, LifecycleOperation.GROOM}:
+            raise ValueError("steward command requires fixed steward completion facts")
+        from .labels import Label
+        if not isinstance(self.facts.labels, frozenset) or any(not isinstance(label, Label) for label in self.facts.labels):
+            raise ValueError("steward completion labels must be typed")
+        for value in (self.facts.title, self.facts.body, self.facts.author, self.facts.state_reason):
+            validate_workflow_text(value, "steward completion fact", limit=65536, empty=True)
+        if not isinstance(self.facts.comments, tuple) or len(self.facts.comments) > 1024:
+            raise ValueError("steward completion comments must be bounded")
+        for comment in self.facts.comments:
+            if not isinstance(comment, tuple) or len(comment) != 3:
+                raise ValueError("steward completion comment requires its exact author/body/time")
+            for value in comment:
+                validate_workflow_text(value, "steward completion comment", limit=65536, empty=True)
+        validate_workflow_integer(self.position, "steward verdict position")
+        if self.position >= MAX_WORKFLOW_GATES:
+            raise ValueError("steward verdict exceeds its fixed command bound")
+
+
 @dataclass(frozen=True)
 class StewardLaneState:
     baseline_at: str = ""
     stalls: int = 0
     infra_failures: int = 0
     pending_delivery: tuple[str, ...] = ()
+    delivery_source: StewardAttemptSource | None = None
+    attempted_at: str = ""
 
     def __post_init__(self) -> None:
         _timestamp(self.baseline_at, "steward input baseline")
@@ -135,6 +189,12 @@ class StewardLaneState:
             validate_workflow_identifier(command, "steward delivery command")
         if len(set(self.pending_delivery)) != len(self.pending_delivery):
             raise ValueError("steward delivery commands must be distinct")
+        _timestamp(self.attempted_at, "steward attempted input")
+        if self.delivery_source is not None:
+            if not isinstance(self.delivery_source, StewardAttemptSource) or not self.pending_delivery:
+                raise ValueError("steward delivery source requires owed command references")
+            if self.attempted_at != self.delivery_source.input_at:
+                raise ValueError("steward delivery belongs to its exact attempted input")
 
 
 @dataclass(frozen=True)
@@ -413,11 +473,6 @@ class RepairAllowance(str, Enum):
     SELF_CLEAR = "self_clears"
 
 
-class StewardLane(str, Enum):
-    TRIAGE = "triage"
-    GROOM = "groom"
-
-
 @dataclass(frozen=True)
 class IssueRecoveryPurchase:
     capture: ContinuationCapture
@@ -518,6 +573,184 @@ class StewardPurchase:
         validate_workflow_integer(self.stall_ceiling, "steward stall ceiling", minimum=1)
 
 
+@dataclass(frozen=True)
+class StewardInput:
+    selection: SelectedSteward
+    lane: StewardLane
+    input_at: str
+    stall_ceiling: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selection, SelectedSteward):
+            raise ValueError("steward input requires current selected authority")
+        StewardPurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "input"),
+                        self.lane, self.input_at, self.stall_ceiling)
+        if not self.input_at:
+            raise ValueError("steward input requires a nonempty baseline")
+
+
+class StewardFailureKind(str, Enum):
+    PAID = "paid_attempt"
+    INFRASTRUCTURE = "infrastructure"
+
+
+@dataclass(frozen=True)
+class StewardFailed:
+    source: StewardAttemptSource
+    kind: StewardFailureKind
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, StewardAttemptSource) or not isinstance(self.kind, StewardFailureKind):
+            raise ValueError("steward failure requires its exact admitted source and classification")
+
+
+@dataclass(frozen=True)
+class StewardVerdict:
+    source: StewardAttemptSource
+    commands: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, StewardAttemptSource):
+            raise ValueError("steward verdict requires its exact admitted source")
+        if not isinstance(self.commands, tuple) or not 1 <= len(self.commands) <= MAX_WORKFLOW_GATES:
+            raise ValueError("steward verdict requires bounded owed command references")
+        for command in self.commands:
+            validate_workflow_identifier(command, "steward verdict command")
+        if len(set(self.commands)) != len(self.commands):
+            raise ValueError("steward verdict command references must be distinct")
+
+
+@dataclass(frozen=True)
+class StewardStopped:
+    source: StewardAttemptSource
+    commands: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        StewardVerdict(self.source, self.commands)
+
+
+StewardReturned = StewardFailed | StewardVerdict | StewardStopped
+
+
+def steward_return_state(selection: SelectedSteward, outcome: StewardReturned) -> StewardState | None:
+    if not isinstance(outcome, (StewardFailed, StewardVerdict, StewardStopped)):
+        raise ValueError("steward return requires a classified immutable outcome")
+    source = outcome.source
+    if not continuation_return_is_current(selection, source.admission):
+        return None
+    lane = selection.component.state.triage if source.lane is StewardLane.TRIAGE else selection.component.state.groom
+    if lane.attempted_at != source.input_at or lane.pending_delivery:
+        raise ValueError("steward return disagrees with its selected input episode")
+    if isinstance(outcome, (StewardVerdict, StewardStopped)):
+        lane = replace(lane, pending_delivery=outcome.commands, delivery_source=source,
+                       stalls=lane.stalls + isinstance(outcome, StewardStopped))
+    else:
+        lane = replace(lane, stalls=lane.stalls + (outcome.kind is StewardFailureKind.PAID))
+    return replace(selection.component.state, **{source.lane.value: lane})
+
+
+def _steward_delivery_lane(selection: SelectedSteward, source: StewardAttemptSource, delivered_at: str) -> StewardLaneState | None:
+    if not isinstance(selection, SelectedSteward) or not isinstance(source, StewardAttemptSource):
+        raise ValueError("steward delivery requires a selected source")
+    lane = selection.component.state.triage if source.lane is StewardLane.TRIAGE else selection.component.state.groom
+    watermarks = selection.component.watermarks
+    if (lane.delivery_source != source or not lane.pending_delivery
+            or selection.binding != source.admission.attempt.binding
+            or watermarks.last_admitted != source.admission.admission_version
+            or watermarks.last_applied != source.admission.admission_version):
+        return None
+    _timestamp(delivered_at, "delivered steward baseline")
+    if not delivered_at or reply_advances(source.input_at, delivered_at) or reply_advances(lane.baseline_at, delivered_at):
+        raise ValueError("steward delivery cannot move its baseline backwards")
+    return lane
+
+
+def steward_delivered_state(selection: SelectedSteward, source: StewardAttemptSource, delivered_at: str) -> StewardState | None:
+    lane = _steward_delivery_lane(selection, source, delivered_at)
+    if lane is None:
+        return None
+    lane = replace(lane, baseline_at=delivered_at, stalls=0, pending_delivery=(), delivery_source=None)
+    return replace(selection.component.state, **{source.lane.value: lane})
+
+
+def steward_stopped_state(selection: SelectedSteward, source: StewardAttemptSource, own_notice_at: str | None,
+                          *, lost_verdict: bool = False) -> StewardState | None:
+    lane = _steward_delivery_lane(selection, source, own_notice_at or source.input_at)
+    if lane is None:
+        return None
+    lane = replace(lane, pending_delivery=(), delivery_source=None, stalls=lane.stalls + lost_verdict,
+                   attempted_at=own_notice_at or lane.attempted_at)
+    return replace(selection.component.state, **{source.lane.value: lane})
+
+
+def steward_completion_matches(guard: StewardCommandGuard, issue, predecessors: tuple, *, partial=None,
+                               delivered_comments: tuple = ()) -> bool:
+    """Only exact receipted predecessors may change the admitted decision facts."""
+    from .actions import AddDependency, CloseIssue, PostComment, Relabel
+    from .lifecycle import completion_matches
+    if not isinstance(guard, StewardCommandGuard) or not isinstance(predecessors, tuple) or len(predecessors) != guard.position:
+        raise ValueError("steward completion requires its exact confirmed prefix")
+    labels = guard.facts.labels
+    expected_comments = []
+    for action in predecessors:
+        if isinstance(action, PostComment):
+            expected_comments.append(action.body)
+        elif isinstance(action, Relabel):
+            labels = (labels - frozenset(action.removed_labels)) | frozenset(action.added_labels)
+            if action.comment:
+                expected_comments.append(action.comment)
+        elif not isinstance(action, AddDependency):
+            raise ValueError("steward verdict cannot mutate after an issue closure")
+    remaining = list(issue.comments)
+    confirmed = []
+    for original in guard.facts.comments:
+        found = next((comment for comment in remaining if (comment.author, comment.body, comment.created_at) == original), None)
+        if found is None:
+            return False
+        remaining.remove(found)
+        confirmed.append(found)
+    if len(expected_comments) != len(delivered_comments):
+        return False
+    for body, delivered in zip(expected_comments, delivered_comments):
+        if not isinstance(delivered, tuple) or len(delivered) != 3 or delivered[1] != body:
+            return False
+        found = next((comment for comment in remaining if (comment.author, comment.body, comment.created_at) == delivered), None)
+        if found is None:
+            return False
+        remaining.remove(found)
+        confirmed.append(found)
+    # The original comments are already verified; confirmed additions become
+    # part of the next decision's baseline, while unrelated additions refuse it.
+    facts = replace(guard.facts, labels=labels,
+                    comments=tuple((comment.author, comment.body, comment.created_at) for comment in confirmed))
+    if isinstance(partial, PostComment):
+        removed, added, comment = (), (), partial.body
+    elif isinstance(partial, Relabel):
+        removed, added, comment = partial.removed_labels, partial.added_labels, partial.comment
+    elif isinstance(partial, CloseIssue):
+        removed, added, comment = partial.remove_labels, partial.add_labels, partial.comment
+    else:
+        removed, added, comment = (), (), ""
+    if comment and any(c.body == comment and (not guard.writer_login or c.author.casefold() != guard.writer_login.casefold())
+                       for c in remaining):
+        return False
+    if isinstance(partial, CloseIssue) and issue.state == "closed" and issue.state_reason == partial.reason:
+        issue = replace(issue, state="open", state_reason=facts.state_reason)
+    return completion_matches(facts, issue, removed=removed, added=added, comment=comment)
+
+
+def triage_admissible(selection: StewardSelection, input_at: str, ceiling: int) -> bool:
+    if not isinstance(selection, SelectedSteward):
+        return False
+    try:
+        consume_steward(selection, StewardPurchase(
+            ContinuationCapture(selection.binding, selection.revision, "triage:preflight"),
+            StewardLane.TRIAGE, input_at, ceiling), selection.revision.version + 1)
+    except ValueError:
+        return False
+    return True
+
+
 ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | PRRepairPurchase | StewardPurchase
 
 
@@ -562,6 +795,12 @@ def consume_steward(selection: SelectedSteward, purchase: StewardPurchase, versi
     lane = component.state.triage if purchase.lane is StewardLane.TRIAGE else component.state.groom
     if (component.gates or (component.watermarks.last_admitted > component.watermarks.last_applied
                            and component.watermarks.last_admitted_fence == selection.revision.fence)
-            or lane.pending_delivery or lane.stalls >= purchase.stall_ceiling):
+            or lane.pending_delivery or (lane.stalls >= purchase.stall_ceiling
+                                        and (not lane.attempted_at or not reply_advances(purchase.baseline_at, lane.attempted_at)))
+            or purchase.lane is StewardLane.TRIAGE and not reply_advances(purchase.baseline_at, lane.baseline_at)):
         raise ValueError("steward purchase is held, pending delivery or exhausted")
+    if purchase.lane is StewardLane.TRIAGE:
+        lane = replace(lane, attempted_at=purchase.baseline_at,
+                       stalls=0 if lane.attempted_at and reply_advances(purchase.baseline_at, lane.attempted_at) else lane.stalls)
+        component = replace(component, state=replace(component.state, triage=lane))
     return replace(component, watermarks=component.watermarks.admit(version, selection.revision.fence))

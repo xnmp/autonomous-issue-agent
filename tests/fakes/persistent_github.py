@@ -214,7 +214,7 @@ class PersistentGitHub:
         assert kind == "issue"
         self._call("comment", number, body)
         self._update(number, lambda issue: issue["comments"].append({
-            "author": "fix-bot", "body": body, "created_at": issue["updated_at"],
+            "author": getattr(self, "comment_author", "fix-bot"), "body": body, "created_at": issue["updated_at"],
         }))
         self.fault("comment_applied")
 
