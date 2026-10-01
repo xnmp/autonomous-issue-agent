@@ -10,7 +10,7 @@ from ...adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from ...domain import workflow as w
 from ...domain.review_control import (
     ActionOffered, DismissalObligation, ProjectionObligation, evidence_hold, rearm_obligations, refused_projection,
-    review_gate_actions,
+    review_gate_actions, execution_recovery_choices,
 )
 from ...domain.review_dispatch_record import (
     RecordedDispatch, RecordedReviewDecision, ReviewDeferred, ReviewInFlight, ReviewNotAdmitted, ReviewTerminal,
@@ -21,6 +21,7 @@ from ...domain.review_rearm import (
     UnreadableHoldRestoration,
 )
 from ...domain.review_rejection import MAX_COUNTED_REVIEWS, ReviewProjectionRefused, ReviewRejectionCeiling
+from ...domain.review_execution import CurrentReviewExecution, BlockedReviewExecutionMigration
 from ...domain.review_workflow import (
     BoundReviewSubmission, CancelledReviewRearm, CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm,
     ReviewRearmIntent, SupersededReviewRearm,
@@ -82,6 +83,7 @@ def _hold(gate: w.OpenGate, view: ReviewControlView) -> wire.ReviewHoldState:
 
 def _cause_kind(cause: w.GateCause) -> wire.ReviewCauseKind:
     kinds: tuple[tuple[type, wire.ReviewCauseKind], ...] = (
+        (w.ReviewExecutionCeiling, "review_execution_ceiling"), (w.ReviewVerdictHold, "review_verdict_hold"),
         (ReviewRejectionCeiling, "review_rejection_ceiling"), (w.RemoteOutcomeUncertain, "remote_uncertain"),
         (w.RetryAuthorizationRequired, "retry_authorization_required"), (w.EvidenceUnavailable, "evidence_unavailable"),
         (w.RearmNeedsDecision, "rearm_needs_decision"), (ReviewProjectionRefused, "review_projection_refused"),
@@ -97,6 +99,15 @@ def _cause(cause: w.GateCause, gate: w.OpenGate, view: ReviewControlView) -> wir
     if facts is not None:
         return wire.ReviewGateFactsUnavailableCause(kind="facts_unavailable", underlying=_cause_kind(cause),
                                                     reason=facts.reason)
+    if isinstance(cause, w.ReviewExecutionCeiling):
+        return wire.ReviewExecutionCeilingCause(
+            kind="review_execution_ceiling", execution_epoch=cause.execution_epoch,
+            execution_episode=cause.execution_episode, head_sha=cause.head_sha,
+            failures=cause.failures, ceiling=cause.ceiling,
+        )
+    if isinstance(cause, w.ReviewVerdictHold):
+        return wire.ReviewVerdictHoldCause(kind="review_verdict_hold",
+            submission_command_id=cause.submission_command_id, head_sha=cause.head_sha)
     if isinstance(cause, ReviewRejectionCeiling):
         hold = _hold(gate, view)
         return wire.ReviewRejectionCeilingCause(
@@ -227,6 +238,28 @@ def unavailable_review_control(error: BaseException) -> wire.ReviewUnavailableCo
     return wire.ReviewUnavailableControl(status="unavailable", reason=control_error(error))
 
 
+def _execution(view: ReviewControlView) -> wire.ReviewExecution:
+    execution = view.snapshot.execution
+    if isinstance(execution, BlockedReviewExecutionMigration):
+        return wire.ReviewExecutionBlocked(kind="blocked", execution_epoch=execution.authority.epoch,
+            blockers=[wire.ReviewMigrationBlocker(kind=blocker.kind.value,
+                sources=[wire.ReviewMigrationSource(kind=source.kind, identity=source.identity, digest=source.digest)
+                         for source in blocker.sources]) for blocker in execution.history.blockers])
+    if not isinstance(execution, CurrentReviewExecution):
+        return wire.ReviewExecutionInactive()
+    choices = [wire.ReviewGate(gate_id=gate.gate_id, state="open", opened_generation=gate.opened_generation,
+        cause=_cause(gate.cause, gate, view),
+        remediation=wire.ReviewNoRemediation(kind="none_authorized", reason="Only the selected fixed recovery is authorized."),
+        actions=[wire.ReviewActionOffered(state="offered", operation=action.command.value, effect=action.effect)
+                 if isinstance(action, ActionOffered) else wire.ReviewActionRefused(
+                     state="refused", operation=action.command.value, reason=action.reason)], pending_retry=None)
+        for gate, action in execution_recovery_choices(view)]
+    return wire.ReviewExecutionCurrent(kind="current", execution_epoch=execution.binding.execution_epoch,
+        execution_episode=execution.binding.execution_episode, failures=execution.state.failures,
+        failure_ceiling=view.execution_ceiling, pin_deferrals=execution.state.pin_deferrals,
+        displayed_round=execution.state.displayed_round, recovery_choices=choices)
+
+
 def unavailable_review_command(error: BaseException) -> wire.ReviewCommandResult:
     """The stable request identity makes an uncertain response safe to replay."""
     return wire.ReviewCommandResult(
@@ -252,6 +285,7 @@ def read_review_control(
     state = result.snapshot
     observation = result.observation
     return wire.ReviewAvailableControl(
+        execution=_execution(result),
         status="available",
         expected=wire.ReviewExpected(
             repository=key.repository, pull_request=pr, family="review_rejections", epoch=state.authority.epoch,

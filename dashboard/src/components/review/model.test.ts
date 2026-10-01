@@ -5,10 +5,37 @@ import {
   reviewablePullRequests, sameBinding,
 } from "./model";
 import {
-  decisionGate, pendingRearm, reviewBinding, reviewCeilingGate, reviewControl, reviewRetryGate,
+  currentExecution, decisionGate, executionGate, pendingRearm, reviewBinding, reviewCeilingGate, reviewControl, reviewRetryGate,
 } from "./test-fixtures";
 
 describe("prepareReviewCommand", () => {
+  it("captures the exact inspected execution and revision when renewing, with no rejection authorization", () => {
+    const command = prepareReviewCommand(reviewControl({ execution: currentExecution() }),
+      { operation: "renew_execution", gateId: "execution-12", guidance: { kind: "keep" } }, "renew-1");
+    expect(command).toEqual({ operation: "renew_execution", expected: reviewBinding, request_id: "renew-1",
+      gate_id: "execution-12", guidance: { kind: "keep" }, execution_epoch: 7, execution_episode: "execution-episode-12" });
+  });
+
+  it("releases only the harness-selected confirmed verdict command", () => {
+    const gate = executionGate({ gate_id: "verdict-12", cause: { kind: "review_verdict_hold",
+      submission_command_id: "confirmed-submission", head_sha: "a".repeat(40) },
+      actions: [{ state: "offered", operation: "release_verdict", effect: "Releases this verdict only." }] });
+    const command = prepareReviewCommand(reviewControl({ execution: currentExecution([gate]) }),
+      { operation: "release_verdict", gateId: gate.gate_id, guidance: { kind: "clear" } }, "release-1");
+    expect(command).toMatchObject({ operation: "release_verdict", execution_epoch: 7,
+      execution_episode: "execution-episode-12", submission_command_id: "confirmed-submission", expected: reviewBinding });
+  });
+
+  it("never prepares a renewal for blocked history or a known unfinished old episode", () => {
+    const refused = executionGate({ actions: [{ state: "refused", operation: "renew_execution", reason: "old rounds must settle" }] });
+    expect(() => prepareReviewCommand(reviewControl({ execution: currentExecution([refused]) }),
+      { operation: "renew_execution", gateId: refused.gate_id, guidance: { kind: "keep" } }, "renew-1"))
+      .toThrow("old rounds must settle");
+    expect(() => prepareReviewCommand(reviewControl({ execution: { kind: "blocked", execution_epoch: 7,
+      blockers: [{ kind: "origin", sources: [{ kind: "file", identity: "unassigned-counter", digest: "a".repeat(64) }] }] } }),
+      { operation: "renew_execution", gateId: "execution-12", guidance: { kind: "keep" } }, "renew-1"))
+      .toThrow(/no longer available/);
+  });
   it("binds a re-arm request to the inspected revision and gate, never to a review set", () => {
     const command = prepareReviewCommand(reviewControl(), { operation: "request_rearm", gateId: "ceiling-12", guidance: { kind: "set", text: "Check the parser." } }, "id-1");
     expect(command).toEqual({

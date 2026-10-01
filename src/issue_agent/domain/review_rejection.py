@@ -135,6 +135,34 @@ class ReviewRejectionCeiling:
 
 
 @dataclass(frozen=True)
+class ReviewExecutionCeiling:
+    execution_epoch: int
+    execution_episode: str
+    head_sha: str
+    failures: int
+    ceiling: int
+
+    def __post_init__(self) -> None:
+        validate_workflow_integer(self.execution_epoch, "execution epoch", minimum=1)
+        validate_workflow_identifier(self.execution_episode, "execution episode")
+        validate_commit_sha(self.head_sha, "execution ceiling head")
+        validate_workflow_integer(self.failures, "execution failures")
+        validate_workflow_integer(self.ceiling, "execution ceiling", minimum=1)
+        if self.failures < self.ceiling:
+            raise ValueError("execution renewal requires exhausted allowance")
+
+
+@dataclass(frozen=True)
+class ReviewVerdictHold:
+    submission_command_id: str
+    head_sha: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.submission_command_id, "selected verdict command")
+        validate_commit_sha(self.head_sha, "selected verdict head")
+
+
+@dataclass(frozen=True)
 class ReviewProjectionRefused:
     """A ceiling release's pull request projection was refused by its hold guard.
 

@@ -10,7 +10,7 @@ from issue_agent.domain.resolve_rearm import PendingRetry, RearmObservation
 from issue_agent.domain.review_control import (
     ActionOffered, ActionRefused, DismissalObligation, EvidenceHold, ProjectionObligation, RefusedProjection,
     ReviewOperatorCommand, UnlabelledObligation, evidence_hold, rearm_obligations, refused_projection,
-    review_gate_actions,
+    review_gate_actions, execution_recovery_choices,
 )
 from issue_agent.domain.review import UNPRODUCTIVE_ROUND_HOLD
 from issue_agent.domain.review_dispatch_record import (
@@ -40,6 +40,42 @@ from tests.fakes.review_workflow import (
 
 
 TRIGGER = Label.AI_PR_OPEN
+
+
+@pytest.mark.parametrize("blocked", [False, True])
+def test_execution_renewal_choice_uses_captured_head_and_refuses_unfinished_old_episode(blocked):
+    from tests.domain.test_review_preflight import active, exhausted
+
+    snapshot, _ = exhausted(*active())
+    control = view(snapshot, decision=decided(key=snapshot.revision.fence.key),
+                   execution_ceiling=5, execution_episode_open=blocked)
+    ((gate, action),) = execution_recovery_choices(control)
+    assert gate.cause.head_sha == HEAD
+    assert action.command is ReviewOperatorCommand.RENEW_EXECUTION
+    assert isinstance(action, ActionRefused if blocked else ActionOffered)
+    assert "settle" in action.reason if blocked else "other holds remain" in action.effect
+    assert control.snapshot == snapshot
+
+
+def test_missing_captured_head_or_inactive_authority_offers_no_execution_recovery():
+    from tests.domain.test_review_preflight import active, exhausted
+
+    snapshot, _ = exhausted(*active())
+    assert execution_recovery_choices(view(snapshot, execution_ceiling=5)) == ()
+    assert execution_recovery_choices(view(held(), decision=decided(), execution_ceiling=5)) == ()
+
+
+@pytest.mark.parametrize("fact", ["run", "closed"])
+def test_known_current_refusal_is_visible_on_execution_recovery(fact):
+    from tests.domain.test_review_preflight import active, exhausted
+
+    snapshot, _ = exhausted(*active())
+    decision = decided(key=snapshot.revision.fence.key,
+                       state=PullRequestState.CLOSED if fact == "closed" else PullRequestState.OPEN)
+    ((_, action),) = execution_recovery_choices(view(snapshot, decision=decision, execution_ceiling=5,
+                                                    review_runs_active=fact == "run"))
+    assert isinstance(action, ActionRefused)
+    assert "drain" in action.reason if fact == "run" else "not open" in action.reason
 
 
 def gated(*gates, generation=0):

@@ -21,13 +21,11 @@ from ...adapters.dashweb import actions, costchart, ghdata, system, usage, verif
 from ...adapters.control_store import SQLiteControlStore
 from ...adapters.control_path import control_store_path
 from ...adapters.event_log import EventLog
-from ...adapters.github import parse_pr
 from ...adapters.journal import default_ledger_path
 from ...adapters.operator_effects import build_operator_effects
 from ...adapters.store import Store
 from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
-from ...domain.fix import breaker_key
 from ...domain.labels import Label
 
 # (target, number, labels added, labels removed) — one applied park/unpark move.
@@ -368,68 +366,29 @@ class Backend:
         )
 
     def _review_unproductive_rounds(
-        self,
-        name: str,
-        snapshot: dash.Snapshot,
-        row: dash.IssueRow,
-        gh_prs: Mapping[int, Mapping],
+        self, snapshot: dash.Snapshot, row: dash.IssueRow,
     ) -> tuple[dict[int, int | None], list[str]]:
-        """Read the same two durable sources as ``roles._review_unproductive_rounds``.
+        """Read selected Current execution allowance without initializing authority."""
+        from contextlib import closing
+        from ...adapters.workflow_rows import load_review_workflow_row
+        from ...domain.review_execution import CurrentReviewExecution
+        from ...domain.workflow_identity import PullRequestRef, WorkflowKey
 
-        File counters cover failures the process survived. Abandoned dispatches
-        in the control database cover deaths it did not. Both key namespaces
-        are summed because a transient closing-issue lookup failure can write a
-        death under ``-PR`` while the next successful poll reads the issue key.
-        """
-        if not row.prs:
-            return {}, []
         counts: dict[int, int | None] = {number: None for number in row.prs}
         warnings: list[str] = []
-        review_path = next(
-            (
-                path
-                for role, path in zip(dash.ROLE_NAMES, cli.journal_paths(name))
-                if role == "review"
-            ),
-            "",
-        )
-        state_dir = os.path.dirname(review_path)
-        if not state_dir:
-            return counts, ["review breaker state directory is unavailable"]
-
-        process_deaths: dict[int, int] = {}
-        if self.control_db_path:
-            owner_id = config.owner_identity_for_target(
-                snapshot.repo, snapshot.target_dir, "review"
-            )
-            try:
-                process_deaths = SQLiteControlStore(
-                    self.control_db_path
-                ).abandoned_dispatch_counts(owner_id)
-            except Exception as exc:  # noqa: BLE001 - detail degrades honestly
-                return counts, [
-                    f"review abandoned-dispatch counts unavailable ({_detail(exc)})"
-                ]
-
-        store = Store(state_dir)
-        for number in row.prs:
-            raw = gh_prs.get(number)
-            if not isinstance(raw, Mapping) or not {
-                "headRefName", "closingIssuesReferences"
-            }.issubset(raw):
-                warnings.append(
-                    f"PR #{number} breaker key unavailable from GitHub details"
-                )
-                continue
-            try:
-                pr = parse_pr({**raw, "number": number})
-            except (AttributeError, TypeError, ValueError):
-                warnings.append(f"PR #{number} breaker key is malformed")
-                continue
-            counts[number] = sum(
-                store.get_infra_deaths(key) + process_deaths.get(key, 0)
-                for key in {breaker_key(pr), -number}
-            )
+        if not row.prs:
+            return counts, warnings
+        if not self.control_db_path:
+            return counts, ["review execution control database is unavailable"]
+        try:
+            with closing(SQLiteControlStore(self.control_db_path)._connect()) as db:
+                db.execute("BEGIN")
+                for number in row.prs:
+                    state = load_review_workflow_row(db, WorkflowKey(snapshot.repo, PullRequestRef(number)))
+                    if state is not None and isinstance(state.execution, CurrentReviewExecution):
+                        counts[number] = state.execution.state.failures
+        except Exception as exc:  # noqa: BLE001 - unreadable authority never becomes zero
+            return {number: None for number in row.prs}, [f"review execution state unavailable ({_detail(exc)})"]
         return counts, warnings
 
     def issues(self, name: str) -> dict:
@@ -590,13 +549,7 @@ class Backend:
         budget_caps, unproductive_cap = self._cached_detail_limits(
             name, snap.repo
         )
-        if enriched:
-            unproductive_rounds, breaker_warnings = self._review_unproductive_rounds(
-                name, snap, row, gh_prs
-            )
-        else:
-            unproductive_rounds = {pr: None for pr in row.prs}
-            breaker_warnings = []
+        unproductive_rounds, breaker_warnings = self._review_unproductive_rounds(snap, row)
         warnings.extend(breaker_warnings)
         detail = snapshots.issue_detail(
             row,

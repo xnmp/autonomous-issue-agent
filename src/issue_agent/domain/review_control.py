@@ -25,6 +25,8 @@ from .review_dispatch_record import RecordedReviewDecision, ReviewTerminal
 from .review_rejection import PullRequestState
 from .review_evidence import ReviewEvidenceKind, review_evidence_gate_kind
 from .review_rearm import ReviewControlView
+from .review_execution import CurrentReviewExecution
+from .review_rejection import ReviewExecutionCeiling, ReviewVerdictHold
 from .review_workflow import (
     CancelledReviewRearm, CountedReview, PendingReviewRearm, ReviewProjectionPlan,
     ReviewProjectionRefused, ReviewRejectionCeiling, ReviewWorkflowSnapshot, SupersededReviewRearm,
@@ -32,8 +34,9 @@ from .review_workflow import (
 from .review_workflow_policy import (
     REVIEW_REARM_OBSERVATION_GATE_PREFIX, RearmKeptHolds, continue_rearm_kept_holds, request_rearm_kept_holds,
     review_ceiling_rearm_refusal, review_dismissal_command_id, review_release_command_id,
+    review_execution_ceiling_gate_id, review_verdict_release_gate_id,
 )
-from .workflow import EvidenceUnavailable, OpenGate, RearmNeedsDecision, RearmingGate, RetryAuthorizationRequired
+from .workflow import EvidenceUnavailable, NoAuthorizedRemediation, OpenGate, RearmNeedsDecision, RearmingGate, RetryAuthorizationRequired
 from .workflow_reconciliation import is_prewrite_gate
 
 
@@ -42,6 +45,8 @@ class ReviewOperatorCommand(str, Enum):
     CONTINUE_REARM = "continue_rearm"
     CANCEL_REARM = "cancel_rearm"
     AUTHORIZE_RETRY = "authorize_retry"
+    RENEW_EXECUTION = "renew_execution"
+    RELEASE_VERDICT = "release_verdict"
 
 
 @dataclass(frozen=True)
@@ -62,7 +67,54 @@ GateAction = ActionOffered | ActionRefused
 
 # Commands whose acceptance re-reads the pull request (and refuses one that is not open).
 _REREADS = frozenset({ReviewOperatorCommand.REQUEST_REARM, ReviewOperatorCommand.CONTINUE_REARM,
-                      ReviewOperatorCommand.AUTHORIZE_RETRY})
+                      ReviewOperatorCommand.AUTHORIZE_RETRY, ReviewOperatorCommand.RENEW_EXECUTION,
+                      ReviewOperatorCommand.RELEASE_VERDICT})
+
+
+def execution_recovery_choices(view: ReviewControlView) -> tuple[tuple[OpenGate, GateAction], ...]:
+    """Current recovery choices derived from selected authority and captured daemon facts."""
+    execution = view.snapshot.execution
+    if not isinstance(execution, CurrentReviewExecution):
+        return ()
+    decision = view.decision
+    basis = decision.basis if isinstance(decision, RecordedReviewDecision) else None
+    head = basis.head_sha if basis is not None else None
+    if head is None:
+        return ()
+    refusal = ("one review recovery intent is already pending" if isinstance(view.snapshot.intent, PendingReviewRearm)
+        else _DRAINING if view.review_runs_active else
+        "the captured pull request is not open" if basis is not None and basis.state is not PullRequestState.OPEN
+        else None)
+    result: list[tuple[OpenGate, GateAction]] = []
+    if view.execution_ceiling > 0 and execution.state.failures >= view.execution_ceiling:
+        gate = OpenGate(review_execution_ceiling_gate_id(view.snapshot, head, view.execution_ceiling),
+            view.snapshot.revision.fence.generation,
+            ReviewExecutionCeiling(execution.binding.execution_epoch, execution.binding.execution_episode,
+                head, execution.state.failures, view.execution_ceiling),
+            NoAuthorizedRemediation("the selected execution episode requires an operator renewal"))
+        reason = refusal or ("every unfinished old-episode round must settle before renewal"
+                            if view.execution_episode_open else None)
+        action = ActionRefused(ReviewOperatorCommand.RENEW_EXECUTION, reason) if reason else ActionOffered(
+            ReviewOperatorCommand.RENEW_EXECUTION,
+            "Renews only the selected execution allowance once. Rejection allowance and other holds remain; "
+            "the existing projection must be verified before recovery completes.")
+        result.append((gate, action))
+    existing = {_opened_id(gate) for gate in view.snapshot.gates}
+    for receipt in view.confirmed_verdicts:
+        gate_id = review_verdict_release_gate_id(view.snapshot, receipt.submission)
+        if gate_id in existing:
+            continue
+        gate = OpenGate(gate_id, view.snapshot.revision.fence.generation,
+            ReviewVerdictHold(receipt.submission.command_id, receipt.head_sha),
+            NoAuthorizedRemediation("the selected confirmed verdict requires an explicit release"))
+        reason = refusal or ("the captured head differs from the selected confirmed verdict"
+                             if head != receipt.head_sha else None)
+        action = ActionRefused(ReviewOperatorCommand.RELEASE_VERDICT, reason) if reason else ActionOffered(
+            ReviewOperatorCommand.RELEASE_VERDICT,
+            "Releases only this confirmed verdict hold. Execution allowance and other holds remain; "
+            "no reviews are dismissed and the projection must be verified.")
+        result.append((gate, action))
+    return tuple(result)
 
 _DRAINING = ("a review run for this pull request is still live; it must drain before a re-arm is accepted "
              "(refresh after it settles)")
@@ -248,6 +300,25 @@ def _gate_actions(view: ReviewControlView, gate: OpenGate | RearmingGate) -> tup
         return _continue(view, gate)
     if isinstance(cause, RetryAuthorizationRequired):
         return (_retry(view, gate),)
+    if isinstance(cause, ReviewVerdictHold):
+        command = ReviewOperatorCommand.RELEASE_VERDICT
+        receipt = next((item for item in view.confirmed_verdicts
+            if item.submission.command_id == cause.submission_command_id and item.head_sha == cause.head_sha), None)
+        if receipt is None:
+            return (ActionRefused(command, "the selected confirmed verdict source is unavailable"),)
+        if isinstance(intent, PendingReviewRearm):
+            return (ActionRefused(command, "one review recovery intent is already pending"),)
+        if not isinstance(view.snapshot.execution, CurrentReviewExecution):
+            return (ActionRefused(command, "current execution authority is unavailable"),)
+        if view.review_runs_active:
+            return (ActionRefused(command, _DRAINING),)
+        decision = view.decision
+        basis = decision.basis if isinstance(decision, RecordedReviewDecision) else None
+        if basis is None or basis.head_sha != cause.head_sha:
+            return (ActionRefused(command, "a captured current head must match the selected confirmed verdict"),)
+        return (ActionOffered(command,
+            "Releases only this confirmed verdict hold. Execution allowance and other holds remain; "
+            "no reviews are dismissed and the projection must be verified."),)
     return ()
 
 

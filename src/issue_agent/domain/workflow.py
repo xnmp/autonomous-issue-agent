@@ -18,7 +18,7 @@ from .workflow_identity import (
     WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowTarget, target_family,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
 )
-from .review_rejection import ReviewProjectionRefused, ReviewRearmPreflight, ReviewRejectionCeiling
+from .review_rejection import ReviewExecutionCeiling, ReviewVerdictHold, ReviewProjectionRefused, ReviewRearmPreflight, ReviewRejectionCeiling
 from .world import Comment, IssueView
 from .labels import Label
 from .resolve_split import NeedsAdjudication, SplitContinuation, SplitImplement, split_sources
@@ -277,9 +277,9 @@ class RearmNeedsDecision:
             raise ValueError("rearm stop reason must be typed")
 
 
-GateCause = (ResolveCeiling | ReviewRejectionCeiling | RemoteOutcomeUncertain | RetryAuthorizationRequired
+GateCause = (ResolveCeiling | ReviewRejectionCeiling | ReviewExecutionCeiling | ReviewVerdictHold | RemoteOutcomeUncertain | RetryAuthorizationRequired
              | EvidenceUnavailable | RearmNeedsDecision | ReviewProjectionRefused)
-_CAUSES = (ResolveCeiling, ReviewRejectionCeiling, RemoteOutcomeUncertain, RetryAuthorizationRequired, EvidenceUnavailable,
+_CAUSES = (ResolveCeiling, ReviewRejectionCeiling, ReviewExecutionCeiling, ReviewVerdictHold, RemoteOutcomeUncertain, RetryAuthorizationRequired, EvidenceUnavailable,
            RearmNeedsDecision, ReviewProjectionRefused)
 
 
@@ -398,6 +398,30 @@ class RequestRearm:
         if not isinstance(self.guidance, (KeepGuidance, ClearGuidance, SetGuidance)):
             raise ValueError("guidance edit must be typed")
         _operator_binding(self.expected, self.expected_binding)
+
+
+@dataclass(frozen=True)
+class RequestReviewExecutionRenewal(RequestRearm):
+    execution_epoch: int
+    execution_episode: str
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if target_family(self.expected.fence.key.target) is not WorkflowFamily.REVIEW_REJECTIONS:
+            raise ValueError("execution renewal requires a review target")
+        if self.expected_binding is None:
+            raise ValueError("execution renewal requires its captured rejection binding")
+        _count(self.execution_epoch, "execution epoch", minimum=1)
+        _text(self.execution_episode, "execution episode")
+
+
+@dataclass(frozen=True)
+class RequestReviewVerdictRelease(RequestReviewExecutionRenewal):
+    submission_command_id: CommandId
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        _text(self.submission_command_id, "selected verdict command")
 
 
 @dataclass(frozen=True)
@@ -651,7 +675,7 @@ class WorkflowSnapshot:
             raise ValueError("gate identities must be unique")
         if any(g.opened_generation > self.revision.fence.generation for g in opened):
             raise ValueError("a gate cannot originate in a future generation")
-        if any(isinstance(g.cause, (ReviewRejectionCeiling, ReviewProjectionRefused)) for g in opened):
+        if any(isinstance(g.cause, (ReviewRejectionCeiling, ReviewExecutionCeiling, ReviewVerdictHold, ReviewProjectionRefused)) for g in opened):
             raise ValueError("a resolve workflow cannot hold a review rejection cause")
         if self.intent is not None and not isinstance(
             self.intent, (PendingRearm, CompletedRearm, SupersededRearm, CancelledRearm)

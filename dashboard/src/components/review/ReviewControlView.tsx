@@ -40,6 +40,8 @@ const CAUSE_NAMES: Record<Extract<ReviewGateCause, { kind: "facts_unavailable" }
   evidence_unavailable: "evidence",
   rearm_needs_decision: "stopped re-arm",
   review_projection_refused: "refused relabel",
+  review_execution_ceiling: "execution allowance",
+  review_verdict_hold: "confirmed verdict",
 };
 
 const READS: Record<Extract<ReviewDaemonDecision, { state: "recorded" }>["read"], string> = {
@@ -52,6 +54,10 @@ const short = (sha: string) => sha.slice(0, 12);
 
 function GateCause({ cause }: { cause: ReviewGateCause }) {
   switch (cause.kind) {
+    case "review_execution_ceiling": return <><strong>Review execution allowance exhausted</strong>
+      <p>{cause.failures} failed rounds / {cause.ceiling} allowed. Renewal preserves rejection allowance and other holds.</p></>;
+    case "review_verdict_hold": return <><strong>Confirmed verdict hold</strong>
+      <p>Selected confirmed ESCALATE at head <span className="mono">{short(cause.head_sha)}</span>.</p></>;
     case "review_rejection_ceiling": return <>
       <strong>Review rejection ceiling</strong>
       <p>{plural(cause.counted_total, "counted bot rejection")} / {cause.ceiling} allowed, by <span className="mono">{cause.review_bot}</span> at head <span className="mono">{short(cause.head_sha)}</span>.</p>
@@ -177,7 +183,13 @@ function CommandDetails({ command }: { command: ReviewCommand }) {
       <dt>Generation / version</dt><dd className="mono">{scope.generation} / {scope.version}</dd>
       <dt>Episode</dt><dd className="mono">{scope.episode_id}</dd>
     </dl>
-    {command.operation === "request_rearm" && <p>Guidance: {command.guidance.kind === "keep" ? "Keep existing guidance" : command.guidance.kind === "clear" ? "Clear existing guidance" : <span className="resolve-prose">{command.guidance.text}</span>}</p>}
+    {(command.operation === "request_rearm" || command.operation === "renew_execution"
+      || command.operation === "release_verdict") && <p>Guidance: {command.guidance.kind === "keep" ? "Keep existing guidance" : command.guidance.kind === "clear" ? "Clear existing guidance" : <span className="resolve-prose">{command.guidance.text}</span>}</p>}
+    {(command.operation === "renew_execution" || command.operation === "release_verdict") && <>
+      <p>Execution epoch {command.execution_epoch}; selected episode <span className="mono">{command.execution_episode}</span>.</p>
+      <p>Rejection allowance and unrelated holds remain.</p>
+    </>}
+    {command.operation === "release_verdict" && <p>Selected submission <span className="mono">{command.submission_command_id}</span>. No reviews are dismissed.</p>}
     {command.operation === "continue_rearm" && <p>Continue <span className="mono">{command.stopped_request_id}</span>. No new authorization.</p>}
     {command.operation === "cancel_rearm" && <><p>Cancel request <span className="mono">{command.request_id}</span>.</p><p className="resolve-prose">{command.reason}</p></>}
     {command.operation === "authorize_retry" && <><p>Authorize one execution of command <span className="mono">{command.command_id}</span>.</p><p>Absence evidence (the harness’s own read): <span className="mono">{command.evidence_id}</span></p></>}
@@ -229,6 +241,23 @@ export function ReviewControlView(props: ReviewControlViewProps) {
         </p>}
       </div>
       {control?.status === "available" && <>
+        {control.execution?.kind === "current" && <section aria-label="Review execution state">
+          <h3>Review execution</h3>
+          <p>Failed rounds {control.execution.failures}/{control.execution.failure_ceiling || "unlimited"}; pin deferrals {control.execution.pin_deferrals}; displayed round {control.execution.displayed_round}.</p>
+          <details><summary>Execution binding</summary><p>Epoch {control.execution.execution_epoch}; episode <span className="mono">{control.execution.execution_episode}</span>.</p></details>
+          {control.execution.recovery_choices.map((gate) => <div key={gate.gate_id}>
+            <GateCause cause={gate.cause} />
+            <div hidden={operationLocksActions(operation)}><ReviewCommandForm control={control} gate={gate} disabled={locked} onPrepare={props.onPrepare} /></div>
+          </div>)}
+        </section>}
+        {control.execution?.kind === "blocked" && <section aria-label="Blocked review execution">
+          <h3>Review execution migration blocked</h3>
+          <p>Historical evidence cannot grant execution. No reset action is available; resolve these selected sources before stopped migration.</p>
+          <ul>{control.execution.blockers.map((blocker) => <li key={blocker.kind}>{blocker.kind.replaceAll("_", " ")}
+            <ul>{blocker.sources.map((source) => <li key={`${source.kind}:${source.identity}`}>{source.kind}: <span className="mono">{source.identity}</span></li>)}</ul>
+          </li>)}</ul>
+        </section>}
+        {control.execution?.kind === "inactive" && <p>{control.execution.reason} No execution reset is available.</p>}
         {control.gates.length > 0 && <ul className="resolve-gates">{control.gates.map((gate: ReviewGate) => <li key={gate.gate_id}>
           <div className="resolve-gate-heading"><GateCause cause={gate.cause} /><span className="resolve-state">{gate.state}</span></div>
           {gate.pending_retry && <p className="resolve-pending" role="status">One retry authorized, waiting for the executor. <span className="mono">{gate.pending_retry.authorization_id}</span></p>}

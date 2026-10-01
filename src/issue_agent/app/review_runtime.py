@@ -113,11 +113,12 @@ def compose_review_control(
     external_holds: Callable[[ObservedPullRequest, object], tuple[str, ...]],
     trailers: Callable[[int], object] | None,
     runtime_preflight: Callable[[], str | None] | None = None,
+    execution_ceiling: int = 0,
 ) -> SQLiteReviewWorkflowControl:
     return SQLiteReviewWorkflowControl(
         control, WorkflowWriter(repository, "review", owner_id), gateway=gateway, ceiling=ceiling,
         trigger_label=trigger_label, rule=CountingRule(review_bot), external_holds=external_holds,
-        trailers=trailers, runtime_preflight=runtime_preflight,
+        trailers=trailers, runtime_preflight=runtime_preflight, execution_ceiling=execution_ceiling,
     )
 
 
@@ -135,6 +136,7 @@ def configured_review_control(
     trailers = getattr(gateway, "pr_commit_messages", None)
     return compose_review_control(
         control, gateway, repository=cfg.repo, owner_id=owner_id, ceiling=review.max_rejections,
+        execution_ceiling=review.max_unproductive_rounds,
         trigger_label=Label(review.trigger_label), review_bot=review.bot,
         external_holds=review_external_holds(
             lambda view: current_review_failures(control, cfg.repo, view.number),

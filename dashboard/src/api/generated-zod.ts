@@ -706,14 +706,27 @@ const ReviewDaemonUnreadable = z.object({
   reason: z.string(),
   state: z.literal("unreadable"),
 });
-const ReviewExpected = z.object({
-  episode_id: z.string().min(1).max(512),
-  epoch: z.number().int().gte(1).lte(9007199254740991),
-  family: z.literal("review_rejections"),
-  generation: z.number().int().gte(0).lte(9007199254740991),
-  pull_request: z.number().int().gte(1).lte(9007199254740991),
-  repository: z.string().min(1).max(512),
-  version: z.number().int().gte(0).lte(9007199254740991),
+const ReviewExecutionInactive = z
+  .object({
+    kind: z.literal("inactive").default("inactive"),
+    reason: z
+      .string()
+      .default("Review execution requires explicit stopped migration."),
+  })
+  .partial();
+const ReviewMigrationSource = z.object({
+  digest: z.string(),
+  identity: z.string(),
+  kind: z.string(),
+});
+const ReviewMigrationBlocker = z.object({
+  kind: z.string(),
+  sources: z.array(ReviewMigrationSource),
+});
+const ReviewExecutionBlocked = z.object({
+  blockers: z.array(ReviewMigrationBlocker),
+  execution_epoch: z.number().int(),
+  kind: z.literal("blocked"),
 });
 const ReviewActionOffered = z.object({
   effect: z.string(),
@@ -722,6 +735,8 @@ const ReviewActionOffered = z.object({
     "continue_rearm",
     "cancel_rearm",
     "authorize_retry",
+    "renew_execution",
+    "release_verdict",
   ]),
   state: z.literal("offered"),
 });
@@ -731,9 +746,24 @@ const ReviewActionRefused = z.object({
     "continue_rearm",
     "cancel_rearm",
     "authorize_retry",
+    "renew_execution",
+    "release_verdict",
   ]),
   reason: z.string(),
   state: z.literal("refused"),
+});
+const ReviewExecutionCeilingCause = z.object({
+  ceiling: z.number().int(),
+  execution_episode: z.string(),
+  execution_epoch: z.number().int(),
+  failures: z.number().int(),
+  head_sha: z.string(),
+  kind: z.literal("review_execution_ceiling"),
+});
+const ReviewVerdictHoldCause = z.object({
+  head_sha: z.string(),
+  kind: z.literal("review_verdict_hold"),
+  submission_command_id: z.string(),
 });
 const ReviewCountedReview = z.object({
   author: z.string(),
@@ -814,6 +844,8 @@ const ReviewGateFactsUnavailableCause = z.object({
   kind: z.literal("facts_unavailable"),
   reason: z.string(),
   underlying: z.enum([
+    "review_execution_ceiling",
+    "review_verdict_hold",
     "review_rejection_ceiling",
     "remote_uncertain",
     "retry_authorization_required",
@@ -841,6 +873,8 @@ const ReviewGate = z.object({
     z.discriminatedUnion("state", [ReviewActionOffered, ReviewActionRefused])
   ),
   cause: z.discriminatedUnion("kind", [
+    ReviewExecutionCeilingCause,
+    ReviewVerdictHoldCause,
     ReviewRejectionCeilingCause,
     ReviewRemoteUncertainCause,
     ReviewRetryAuthorizationRequiredCause,
@@ -857,6 +891,25 @@ const ReviewGate = z.object({
     ReviewAttemptedRemediation,
   ]),
   state: z.enum(["open", "rearming"]),
+});
+const ReviewExecutionCurrent = z.object({
+  displayed_round: z.number().int(),
+  execution_episode: z.string(),
+  execution_epoch: z.number().int(),
+  failure_ceiling: z.number().int(),
+  failures: z.number().int(),
+  kind: z.literal("current"),
+  pin_deferrals: z.number().int(),
+  recovery_choices: z.array(ReviewGate),
+});
+const ReviewExpected = z.object({
+  episode_id: z.string().min(1).max(512),
+  epoch: z.number().int().gte(1).lte(9007199254740991),
+  family: z.literal("review_rejections"),
+  generation: z.number().int().gte(0).lte(9007199254740991),
+  pull_request: z.number().int().gte(1).lte(9007199254740991),
+  repository: z.string().min(1).max(512),
+  version: z.number().int().gte(0).lte(9007199254740991),
 });
 const ReviewObservation = z.object({
   failed_reads: z.number().int(),
@@ -882,6 +935,13 @@ const ReviewAvailableControl = z.object({
     ReviewDaemonUnrecorded,
     ReviewDaemonUnreadable,
   ]),
+  execution: z
+    .discriminatedUnion("kind", [
+      ReviewExecutionInactive,
+      ReviewExecutionBlocked,
+      ReviewExecutionCurrent,
+    ])
+    .optional(),
   expected: ReviewExpected,
   gates: z.array(ReviewGate),
   guidance: z.string(),
@@ -946,12 +1006,41 @@ const ReviewAuthorizeRetry = z.object({
   gate_id: z.string().min(1).max(512),
   operation: z.literal("authorize_retry"),
 });
+const ReviewRequestExecutionRenewal = z.object({
+  execution_episode: z.string().min(1).max(512),
+  execution_epoch: z.number().int().gte(1).lte(9007199254740991),
+  expected: ReviewExpected,
+  gate_id: z.string().min(1).max(512),
+  guidance: z.discriminatedUnion("kind", [
+    KeepGuidance,
+    ClearGuidance,
+    SetGuidance,
+  ]),
+  operation: z.literal("renew_execution"),
+  request_id: z.string().min(1).max(512),
+});
+const ReviewRequestVerdictRelease = z.object({
+  execution_episode: z.string().min(1).max(512),
+  execution_epoch: z.number().int().gte(1).lte(9007199254740991),
+  expected: ReviewExpected,
+  gate_id: z.string().min(1).max(512),
+  guidance: z.discriminatedUnion("kind", [
+    KeepGuidance,
+    ClearGuidance,
+    SetGuidance,
+  ]),
+  operation: z.literal("release_verdict"),
+  request_id: z.string().min(1).max(512),
+  submission_command_id: z.string().min(1).max(512),
+});
 const api_review_command_api_repos__name__pulls__pr__review_control_commands_post_Body =
   z.discriminatedUnion("operation", [
     ReviewRequestRearm,
     ReviewContinueRearm,
     ReviewCancelRearm,
     ReviewAuthorizeRetry,
+    ReviewRequestExecutionRenewal,
+    ReviewRequestVerdictRelease,
   ]);
 const ReviewCommandResult = z.object({
   control: z.discriminatedUnion("status", [
@@ -1124,9 +1213,14 @@ export const schemas = {
   ReviewDaemonRecorded,
   ReviewDaemonUnrecorded,
   ReviewDaemonUnreadable,
-  ReviewExpected,
+  ReviewExecutionInactive,
+  ReviewMigrationSource,
+  ReviewMigrationBlocker,
+  ReviewExecutionBlocked,
   ReviewActionOffered,
   ReviewActionRefused,
+  ReviewExecutionCeilingCause,
+  ReviewVerdictHoldCause,
   ReviewCountedReview,
   ReviewHoldUncontested,
   ReviewHoldContested,
@@ -1142,6 +1236,8 @@ export const schemas = {
   ReviewNoRemediation,
   ReviewAttemptedRemediation,
   ReviewGate,
+  ReviewExecutionCurrent,
+  ReviewExpected,
   ReviewObservation,
   ReviewAvailableControl,
   ReviewMigrationRequiredControl,
@@ -1151,6 +1247,8 @@ export const schemas = {
   ReviewContinueRearm,
   ReviewCancelRearm,
   ReviewAuthorizeRetry,
+  ReviewRequestExecutionRenewal,
+  ReviewRequestVerdictRelease,
   api_review_command_api_repos__name__pulls__pr__review_control_commands_post_Body,
   ReviewCommandResult,
   WorkflowFamiliesAvailable,

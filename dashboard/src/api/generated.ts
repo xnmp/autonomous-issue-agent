@@ -1350,7 +1350,7 @@ export interface components {
              * Operation
              * @enum {string}
              */
-            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry";
+            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry" | "renew_execution" | "release_verdict";
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -1363,7 +1363,7 @@ export interface components {
              * Operation
              * @enum {string}
              */
-            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry";
+            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry" | "renew_execution" | "release_verdict";
             /** Reason */
             reason: string;
             /**
@@ -1417,6 +1417,8 @@ export interface components {
              * @description The review daemon's recorded dispatch decision, never derived by this API.
              */
             daemon: components["schemas"]["ReviewDaemonRecorded"] | components["schemas"]["ReviewDaemonUnrecorded"] | components["schemas"]["ReviewDaemonUnreadable"];
+            /** Execution */
+            execution?: components["schemas"]["ReviewExecutionInactive"] | components["schemas"]["ReviewExecutionBlocked"] | components["schemas"]["ReviewExecutionCurrent"];
             expected: components["schemas"]["ReviewExpected"];
             /** Gates */
             gates: components["schemas"]["ReviewGate"][];
@@ -1743,6 +1745,71 @@ export interface components {
             /** Unresolved Since */
             unresolved_since: string;
         };
+        /** ReviewExecutionBlocked */
+        ReviewExecutionBlocked: {
+            /** Blockers */
+            blockers: components["schemas"]["ReviewMigrationBlocker"][];
+            /** Execution Epoch */
+            execution_epoch: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "blocked";
+        };
+        /** ReviewExecutionCeilingCause */
+        ReviewExecutionCeilingCause: {
+            /** Ceiling */
+            ceiling: number;
+            /** Execution Episode */
+            execution_episode: string;
+            /** Execution Epoch */
+            execution_epoch: number;
+            /** Failures */
+            failures: number;
+            /** Head Sha */
+            head_sha: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "review_execution_ceiling";
+        };
+        /** ReviewExecutionCurrent */
+        ReviewExecutionCurrent: {
+            /** Displayed Round */
+            displayed_round: number;
+            /** Execution Episode */
+            execution_episode: string;
+            /** Execution Epoch */
+            execution_epoch: number;
+            /** Failure Ceiling */
+            failure_ceiling: number;
+            /** Failures */
+            failures: number;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "current";
+            /** Pin Deferrals */
+            pin_deferrals: number;
+            /** Recovery Choices */
+            recovery_choices: components["schemas"]["ReviewGate"][];
+        };
+        /** ReviewExecutionInactive */
+        ReviewExecutionInactive: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "inactive";
+            /**
+             * Reason
+             * @default Review execution requires explicit stopped migration.
+             */
+            reason: string;
+        };
         /** ReviewExpected */
         ReviewExpected: {
             /** Episode Id */
@@ -1779,7 +1846,7 @@ export interface components {
             /** Actions */
             actions: (components["schemas"]["ReviewActionOffered"] | components["schemas"]["ReviewActionRefused"])[];
             /** Cause */
-            cause: components["schemas"]["ReviewRejectionCeilingCause"] | components["schemas"]["ReviewRemoteUncertainCause"] | components["schemas"]["ReviewRetryAuthorizationRequiredCause"] | components["schemas"]["ReviewEvidenceUnavailableCause"] | components["schemas"]["ReviewRearmNeedsDecisionCause"] | components["schemas"]["ReviewProjectionRefusedCause"] | components["schemas"]["ReviewGateFactsUnavailableCause"];
+            cause: components["schemas"]["ReviewExecutionCeilingCause"] | components["schemas"]["ReviewVerdictHoldCause"] | components["schemas"]["ReviewRejectionCeilingCause"] | components["schemas"]["ReviewRemoteUncertainCause"] | components["schemas"]["ReviewRetryAuthorizationRequiredCause"] | components["schemas"]["ReviewEvidenceUnavailableCause"] | components["schemas"]["ReviewRearmNeedsDecisionCause"] | components["schemas"]["ReviewProjectionRefusedCause"] | components["schemas"]["ReviewGateFactsUnavailableCause"];
             /** Gate Id */
             gate_id: string;
             /** Opened Generation */
@@ -1812,7 +1879,7 @@ export interface components {
              * Underlying
              * @enum {string}
              */
-            underlying: "review_rejection_ceiling" | "remote_uncertain" | "retry_authorization_required" | "evidence_unavailable" | "rearm_needs_decision" | "review_projection_refused";
+            underlying: "review_execution_ceiling" | "review_verdict_hold" | "review_rejection_ceiling" | "remote_uncertain" | "retry_authorization_required" | "evidence_unavailable" | "rearm_needs_decision" | "review_projection_refused";
         };
         /**
          * ReviewHoldContested
@@ -1867,6 +1934,13 @@ export interface components {
              */
             kind: "imported";
         };
+        /** ReviewMigrationBlocker */
+        ReviewMigrationBlocker: {
+            /** Kind */
+            kind: string;
+            /** Sources */
+            sources: components["schemas"]["ReviewMigrationSource"][];
+        };
         /**
          * ReviewMigrationRequiredControl
          * @description Review dispatch and operator re-arm require explicit family activation.
@@ -1883,6 +1957,15 @@ export interface components {
              * @enum {string}
              */
             status: "migration_required";
+        };
+        /** ReviewMigrationSource */
+        ReviewMigrationSource: {
+            /** Digest */
+            digest: string;
+            /** Identity */
+            identity: string;
+            /** Kind */
+            kind: string;
         };
         /** ReviewNoRemediation */
         ReviewNoRemediation: {
@@ -2046,6 +2129,25 @@ export interface components {
             /** Unresolved Since */
             unresolved_since: string;
         };
+        /** ReviewRequestExecutionRenewal */
+        ReviewRequestExecutionRenewal: {
+            /** Execution Episode */
+            execution_episode: string;
+            /** Execution Epoch */
+            execution_epoch: number;
+            expected: components["schemas"]["ReviewExpected"];
+            /** Gate Id */
+            gate_id: string;
+            /** Guidance */
+            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "renew_execution";
+            /** Request Id */
+            request_id: string;
+        };
         /**
          * ReviewRequestRearm
          * @description Authorize dismissal of exactly the gate's observed counted bot reviews; the set is never on the wire.
@@ -2063,6 +2165,27 @@ export interface components {
             operation: "request_rearm";
             /** Request Id */
             request_id: string;
+        };
+        /** ReviewRequestVerdictRelease */
+        ReviewRequestVerdictRelease: {
+            /** Execution Episode */
+            execution_episode: string;
+            /** Execution Epoch */
+            execution_epoch: number;
+            expected: components["schemas"]["ReviewExpected"];
+            /** Gate Id */
+            gate_id: string;
+            /** Guidance */
+            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "release_verdict";
+            /** Request Id */
+            request_id: string;
+            /** Submission Command Id */
+            submission_command_id: string;
         };
         /** ReviewRetryAuthorizationRequiredCause */
         ReviewRetryAuthorizationRequiredCause: {
@@ -2136,6 +2259,18 @@ export interface components {
              * @enum {string}
              */
             kind: "unlabelled";
+        };
+        /** ReviewVerdictHoldCause */
+        ReviewVerdictHoldCause: {
+            /** Head Sha */
+            head_sha: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "review_verdict_hold";
+            /** Submission Command Id */
+            submission_command_id: string;
         };
         /** RoleHealth */
         RoleHealth: {
@@ -2790,7 +2925,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ReviewRequestRearm"] | components["schemas"]["ReviewContinueRearm"] | components["schemas"]["ReviewCancelRearm"] | components["schemas"]["ReviewAuthorizeRetry"];
+                "application/json": components["schemas"]["ReviewRequestRearm"] | components["schemas"]["ReviewContinueRearm"] | components["schemas"]["ReviewCancelRearm"] | components["schemas"]["ReviewAuthorizeRetry"] | components["schemas"]["ReviewRequestExecutionRenewal"] | components["schemas"]["ReviewRequestVerdictRelease"];
             };
         };
         responses: {

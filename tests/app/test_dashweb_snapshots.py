@@ -12,6 +12,7 @@ import pytest
 
 from issue_agent.adapters.dashweb import ghdata, system
 from issue_agent.adapters.store import Store
+from tests.adapters.test_review_execution_control import rig as current_review_rig
 from issue_agent.app.dashweb import service, snapshots
 from issue_agent.domain import dashboard as dash
 from issue_agent.domain.events import (
@@ -2904,50 +2905,33 @@ def test_issue_detail_uses_cached_deployment_leg_and_unproductive_caps(monkeypat
     assert len(reads) == len(service._DETAIL_CONFIG_FIELDS)
 
 
-def test_issue_detail_matches_both_durable_review_breaker_sources(
-    monkeypatch, tmp_path
+def test_issue_detail_reads_current_execution_allowance_and_ignores_retired_file_counters(
+    monkeypatch, tmp_path, current_review_rig,
 ):
+    from tests.adapters.test_review_execution_control import dump
+
+    store, _, _, _, _ = current_review_rig
     backend = v2_backend(monkeypatch)
-    backend.control_db_path = str(tmp_path / "control.db")
+    backend.control_db_path = store.path
+    original = backend.snapshot("demo")
+    deployment = replace(build([RESOLVE, {**REVIEW_LEG, "number": 9}]), schema_version=2)
+    backend.snapshot = lambda _name: replace(original, deployment=deployment)
     review_dir = tmp_path / "review"
     review_dir.mkdir()
-    Store(str(review_dir)).set_infra_deaths(7, 2)
-    Store(str(review_dir)).set_infra_deaths(-12, 1)
-    monkeypatch.setattr(
-        service.cli,
-        "journal_paths",
-        lambda _name: [
-            str(tmp_path / "fix" / "journal.jsonl"),
-            str(review_dir / "journal.jsonl"),
-            str(tmp_path / "steward" / "journal.jsonl"),
-        ],
-    )
-    owners = []
-
-    class Control:
-        def __init__(self, path):
-            assert path == backend.control_db_path
-
-        def abandoned_dispatch_counts(self, owner_id):
-            owners.append(owner_id)
-            return {7: 4, -12: 5}
-
-    monkeypatch.setattr(service, "SQLiteControlStore", Control)
+    files = Store(str(review_dir))
+    files.set_infra_deaths(7, 2)
+    files.set_infra_deaths(-9, 1)
+    before = dump(store)
 
     first = backend.issue("demo", 7)
     assert first is not None
-    assert first["steps"][1]["review"]["unproductive_rounds"] is None
-
-    detail = eventually(
-        lambda: backend.issue("demo", 7),
-        lambda current: (
-            current is not None
-            and current["steps"][1]["review"]["unproductive_rounds"] is not None
-        ),
-    )
-    assert detail is not None
-    assert detail["steps"][1]["review"]["unproductive_rounds"] == 12
-    assert owners == ["o/r:review:621811f2e56e1555"]
+    assert first["steps"][1]["review"]["unproductive_rounds"] == 3
+    files.set_infra_deaths(7, 99)
+    files.set_infra_deaths(-9, 99)
+    second = backend.issue("demo", 7)
+    assert second is not None
+    assert second["steps"][1]["review"]["unproductive_rounds"] == 3
+    assert dump(store) == before
 
 
 def test_cards_carry_the_verification_reason_for_issue_and_pr(monkeypatch):

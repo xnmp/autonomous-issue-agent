@@ -7,7 +7,7 @@ import type {
 export { requestIdProblem } from "../resolve/model";
 
 export type ReviewDraft =
-  | { operation: "request_rearm"; gateId: string; guidance: ReviewGuidance }
+  | { operation: "request_rearm" | "renew_execution" | "release_verdict"; gateId: string; guidance: ReviewGuidance }
   | { operation: "continue_rearm"; gateId: string; stoppedRequestId: string }
   | { operation: "cancel_rearm"; gateId: string; requestId: string; reason: string }
   | { operation: "authorize_retry"; gateId: string };
@@ -37,12 +37,24 @@ export function gateAction(gate: ReviewGate, operation: ReviewDraft["operation"]
  * only buy a 409 or 422 for something the operator was shown.
  */
 export function prepareReviewCommand(control: AvailableReviewControl, draft: ReviewDraft, id: string): ReviewCommand {
-  const gate = control.gates.find((item) => item.gate_id === draft.gateId);
+  const gates = control.execution?.kind === "current"
+    ? [...control.gates, ...control.execution.recovery_choices] : control.gates;
+  const gate = gates.find((item) => item.gate_id === draft.gateId);
   const action = gate && gateAction(gate, draft.operation);
   if (!gate || !action) throw new Error(STALE);
   if (action.state === "refused") throw new Error(action.reason);
   const expected = control.expected;
   switch (draft.operation) {
+    case "renew_execution":
+    case "release_verdict": {
+      const execution = control.execution;
+      if (execution?.kind !== "current" || (draft.operation === "renew_execution"
+        ? gate.cause.kind !== "review_execution_ceiling" : gate.cause.kind !== "review_verdict_hold")) throw new Error(STALE);
+      if (draft.guidance.kind === "set" && !draft.guidance.text.trim()) throw new Error("Enter guidance or choose Keep or Clear.");
+      return parseReviewCommand({ operation: draft.operation, expected, request_id: id, gate_id: gate.gate_id,
+        guidance: draft.guidance, execution_epoch: execution.execution_epoch, execution_episode: execution.execution_episode,
+        ...(gate.cause.kind === "review_verdict_hold" ? { submission_command_id: gate.cause.submission_command_id } : {}) });
+    }
     case "request_rearm":
       if (draft.guidance.kind === "set" && !draft.guidance.text.trim()) throw new Error("Enter guidance or choose Keep or Clear.");
       return parseReviewCommand({ operation: draft.operation, expected, request_id: id, gate_id: gate.gate_id, guidance: draft.guidance });

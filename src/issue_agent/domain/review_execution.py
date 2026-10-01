@@ -247,6 +247,14 @@ class ImportedReviewSession:
 
 
 @dataclass(frozen=True)
+class RenewedReviewSessionSource:
+    evidence_id: str
+
+    def __post_init__(self) -> None:
+        identifier(self.evidence_id, "renewed session origin")
+
+
+@dataclass(frozen=True)
 class NoReviewSession:
     pass
 
@@ -255,13 +263,13 @@ class NoReviewSession:
 class ReusableReviewSession:
     runtime: RuntimeName
     handle: str
-    source: LaunchedReviewChild | ImportedReviewSession
+    source: LaunchedReviewChild | ImportedReviewSession | RenewedReviewSessionSource
 
     def __post_init__(self) -> None:
         if not isinstance(self.runtime, RuntimeName):
             raise ValueError("review session requires its runtime")
         validate_review_session_handle(self.handle)
-        if not isinstance(self.source, (LaunchedReviewChild, ImportedReviewSession)):
+        if not isinstance(self.source, (LaunchedReviewChild, ImportedReviewSession, RenewedReviewSessionSource)):
             raise ValueError("review session requires verified source provenance")
         if isinstance(self.source, LaunchedReviewChild) and self.source.child.kind is not ReviewChildKind.REVIEWER:
             raise ValueError("only a reviewer invocation can supply the reusable session")
@@ -561,8 +569,8 @@ class ReviewExecutionState:
                 source.child.round.binding != self.binding or source.child.round.sequence != self.session_sequence
             ):
                 raise ValueError("session projection disagrees with its producer binding or sequence")
-            if isinstance(source, ImportedReviewSession) and self.session_sequence != 0:
-                raise ValueError("an imported session precedes activated execution rounds")
+            if isinstance(source, (ImportedReviewSession, RenewedReviewSessionSource)) and self.session_sequence != 0:
+                raise ValueError("an origin-carried session precedes this episode's execution rounds")
 
 
 @dataclass(frozen=True)
@@ -819,14 +827,86 @@ class CurrentReviewExecution:
                     and isinstance(state.session.source, ImportedReviewSession)
                     and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED):
                 raise ValueError("an imported session requires an imported execution origin")
+            if (isinstance(state.session, ReusableReviewSession)
+                    and isinstance(state.session.source, RenewedReviewSessionSource)
+                    and (self.origin.kind is not ReviewExecutionOriginKind.RENEWED
+                         or state.session.source.evidence_id != self.origin.evidence_id)):
+                raise ValueError("a renewed session requires its exact renewed origin")
         if (self.last_sequence == 0 and self.origin.kind is not ReviewExecutionOriginKind.IMPORTED
                 and (self.state.failures or self.state.pin_deferrals
-                     or not isinstance(self.state.session, NoReviewSession))):
+                     or not isinstance(self.state.session, NoReviewSession)
+                     and not isinstance(self.state.session.source, RenewedReviewSessionSource))):
             raise ValueError("a fresh execution origin cannot invent prior allowance or session")
 
     @property
     def binding(self) -> ReviewExecutionBinding:
         return self.state.binding
+
+
+@dataclass(frozen=True)
+class RenewedReviewExecutionOriginReceipt:
+    """One operator grant, without prior states or an execution ancestry chain."""
+
+    origin: ReviewExecutionOrigin
+    checkpoint: ReviewExecutionCheckpoint
+    previous_binding: ReviewExecutionBinding
+    request_id: str
+    expected: WorkflowRevision
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.origin, ReviewExecutionOrigin)
+                or self.origin.kind is not ReviewExecutionOriginKind.RENEWED
+                or not isinstance(self.checkpoint, ReviewExecutionCheckpoint)
+                or self.checkpoint.through_sequence != 0
+                or self.checkpoint.boundary_cursor is not None
+                or not isinstance(self.previous_binding, ReviewExecutionBinding)
+                or not isinstance(self.expected, WorkflowRevision)):
+            raise ValueError("renewed origin requires one exact sequence-zero grant")
+        identifier(self.request_id, "execution renewal request")
+        after = self.checkpoint.state.binding
+        before = self.previous_binding
+        if (before.rejection.fence != self.expected.fence
+                or after.rejection.fence.key != before.rejection.fence.key
+                or after.rejection.fence.generation != before.rejection.fence.generation + 1
+                or after.rejection.authority != before.rejection.authority
+                or after.rejection.episode_id != before.rejection.episode_id
+                or after.execution_epoch != before.execution_epoch
+                or after.execution_episode == before.execution_episode):
+            raise ValueError("renewed origin must replace only its selected execution episode")
+        CurrentReviewExecution(self.origin, self.checkpoint, self.checkpoint.state, 0, 0)
+
+
+def renew_current_review_execution(
+    execution: CurrentReviewExecution, expected: WorkflowRevision,
+    rejection: WorkflowBinding, request_id: str,
+) -> tuple[CurrentReviewExecution, RenewedReviewExecutionOriginReceipt]:
+    """Reset the selected allowance, retaining display and compatible handle facts.
+
+    The adapter separately proves complete old-episode quiescence at acceptance;
+    this current-generation check cannot certify older retained work.
+    """
+    if (not isinstance(execution, CurrentReviewExecution)
+            or execution.baseline.through_sequence != execution.last_sequence
+            or not isinstance(expected, WorkflowRevision)
+            or not isinstance(rejection, WorkflowBinding)
+            or expected.fence != execution.binding.rejection.fence):
+        raise ValueError("execution renewal requires a terminal current suffix")
+    identifier(request_id, "execution renewal request")
+    before = execution.binding
+    key = before.rejection.fence.key
+    parts = (key.repository, str(key.target.number), str(before.rejection.authority.epoch),
+             before.rejection.episode_id, str(before.execution_epoch), before.execution_episode,
+             str(expected.fence.generation), str(expected.version), request_id)
+    digest = hashlib.sha256("\0".join(parts).encode()).hexdigest()
+    origin = ReviewExecutionOrigin(ReviewExecutionOriginKind.RENEWED, "review-execution-renewal:" + digest)
+    binding = ReviewExecutionBinding(rejection, execution.binding.execution_epoch, "review-execution-renewed:" + digest)
+    session = execution.state.session
+    if isinstance(session, ReusableReviewSession):
+        session = ReusableReviewSession(session.runtime, session.handle, RenewedReviewSessionSource(origin.evidence_id))
+    state = ReviewExecutionState(binding, session=session, displayed_round=execution.state.displayed_round)
+    checkpoint = ReviewExecutionCheckpoint(0, state, execution.baseline.policy)
+    receipt = RenewedReviewExecutionOriginReceipt(origin, checkpoint, execution.binding, request_id, expected)
+    return CurrentReviewExecution(origin, checkpoint, state, 0, 0), receipt
 
 
 ReviewExecutionComponent = ExecutionNotActivated | ActivatedReviewExecution | CurrentReviewExecution | BlockedReviewExecutionMigration

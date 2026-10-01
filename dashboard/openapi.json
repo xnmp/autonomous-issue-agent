@@ -3471,7 +3471,9 @@
               "request_rearm",
               "continue_rearm",
               "cancel_rearm",
-              "authorize_retry"
+              "authorize_retry",
+              "renew_execution",
+              "release_verdict"
             ],
             "title": "Operation",
             "type": "string"
@@ -3501,7 +3503,9 @@
               "request_rearm",
               "continue_rearm",
               "cancel_rearm",
-              "authorize_retry"
+              "authorize_retry",
+              "renew_execution",
+              "release_verdict"
             ],
             "title": "Operation",
             "type": "string"
@@ -3687,6 +3691,28 @@
               }
             ],
             "title": "Daemon"
+          },
+          "execution": {
+            "discriminator": {
+              "mapping": {
+                "blocked": "#/components/schemas/ReviewExecutionBlocked",
+                "current": "#/components/schemas/ReviewExecutionCurrent",
+                "inactive": "#/components/schemas/ReviewExecutionInactive"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewExecutionInactive"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewExecutionBlocked"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewExecutionCurrent"
+              }
+            ],
+            "title": "Execution"
           },
           "expected": {
             "$ref": "#/components/schemas/ReviewExpected"
@@ -4557,6 +4583,157 @@
         "title": "ReviewEvidenceUnavailableCause",
         "type": "object"
       },
+      "ReviewExecutionBlocked": {
+        "additionalProperties": false,
+        "properties": {
+          "blockers": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewMigrationBlocker"
+            },
+            "title": "Blockers",
+            "type": "array"
+          },
+          "execution_epoch": {
+            "title": "Execution Epoch",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "blocked",
+            "enum": [
+              "blocked"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "execution_epoch",
+          "blockers"
+        ],
+        "title": "ReviewExecutionBlocked",
+        "type": "object"
+      },
+      "ReviewExecutionCeilingCause": {
+        "additionalProperties": false,
+        "properties": {
+          "ceiling": {
+            "title": "Ceiling",
+            "type": "integer"
+          },
+          "execution_episode": {
+            "title": "Execution Episode",
+            "type": "string"
+          },
+          "execution_epoch": {
+            "title": "Execution Epoch",
+            "type": "integer"
+          },
+          "failures": {
+            "title": "Failures",
+            "type": "integer"
+          },
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "kind": {
+            "const": "review_execution_ceiling",
+            "enum": [
+              "review_execution_ceiling"
+            ],
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "execution_epoch",
+          "execution_episode",
+          "head_sha",
+          "failures",
+          "ceiling"
+        ],
+        "title": "ReviewExecutionCeilingCause",
+        "type": "object"
+      },
+      "ReviewExecutionCurrent": {
+        "additionalProperties": false,
+        "properties": {
+          "displayed_round": {
+            "title": "Displayed Round",
+            "type": "integer"
+          },
+          "execution_episode": {
+            "title": "Execution Episode",
+            "type": "string"
+          },
+          "execution_epoch": {
+            "title": "Execution Epoch",
+            "type": "integer"
+          },
+          "failure_ceiling": {
+            "title": "Failure Ceiling",
+            "type": "integer"
+          },
+          "failures": {
+            "title": "Failures",
+            "type": "integer"
+          },
+          "kind": {
+            "const": "current",
+            "enum": [
+              "current"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "pin_deferrals": {
+            "title": "Pin Deferrals",
+            "type": "integer"
+          },
+          "recovery_choices": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewGate"
+            },
+            "title": "Recovery Choices",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "execution_epoch",
+          "execution_episode",
+          "failures",
+          "failure_ceiling",
+          "pin_deferrals",
+          "displayed_round",
+          "recovery_choices"
+        ],
+        "title": "ReviewExecutionCurrent",
+        "type": "object"
+      },
+      "ReviewExecutionInactive": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "const": "inactive",
+            "default": "inactive",
+            "enum": [
+              "inactive"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "reason": {
+            "default": "Review execution requires explicit stopped migration.",
+            "title": "Reason",
+            "type": "string"
+          }
+        },
+        "title": "ReviewExecutionInactive",
+        "type": "object"
+      },
       "ReviewExpected": {
         "additionalProperties": false,
         "properties": {
@@ -4672,12 +4849,20 @@
                 "rearm_needs_decision": "#/components/schemas/ReviewRearmNeedsDecisionCause",
                 "remote_uncertain": "#/components/schemas/ReviewRemoteUncertainCause",
                 "retry_authorization_required": "#/components/schemas/ReviewRetryAuthorizationRequiredCause",
+                "review_execution_ceiling": "#/components/schemas/ReviewExecutionCeilingCause",
                 "review_projection_refused": "#/components/schemas/ReviewProjectionRefusedCause",
-                "review_rejection_ceiling": "#/components/schemas/ReviewRejectionCeilingCause"
+                "review_rejection_ceiling": "#/components/schemas/ReviewRejectionCeilingCause",
+                "review_verdict_hold": "#/components/schemas/ReviewVerdictHoldCause"
               },
               "propertyName": "kind"
             },
             "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReviewExecutionCeilingCause"
+              },
+              {
+                "$ref": "#/components/schemas/ReviewVerdictHoldCause"
+              },
               {
                 "$ref": "#/components/schemas/ReviewRejectionCeilingCause"
               },
@@ -4777,6 +4962,8 @@
           },
           "underlying": {
             "enum": [
+              "review_execution_ceiling",
+              "review_verdict_hold",
               "review_rejection_ceiling",
               "remote_uncertain",
               "retry_authorization_required",
@@ -4901,6 +5088,28 @@
         "title": "ReviewImportedBaseline",
         "type": "object"
       },
+      "ReviewMigrationBlocker": {
+        "additionalProperties": false,
+        "properties": {
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          },
+          "sources": {
+            "items": {
+              "$ref": "#/components/schemas/ReviewMigrationSource"
+            },
+            "title": "Sources",
+            "type": "array"
+          }
+        },
+        "required": [
+          "kind",
+          "sources"
+        ],
+        "title": "ReviewMigrationBlocker",
+        "type": "object"
+      },
       "ReviewMigrationRequiredControl": {
         "additionalProperties": false,
         "description": "Review dispatch and operator re-arm require explicit family activation.",
@@ -4936,6 +5145,30 @@
           "active_families"
         ],
         "title": "ReviewMigrationRequiredControl",
+        "type": "object"
+      },
+      "ReviewMigrationSource": {
+        "additionalProperties": false,
+        "properties": {
+          "digest": {
+            "title": "Digest",
+            "type": "string"
+          },
+          "identity": {
+            "title": "Identity",
+            "type": "string"
+          },
+          "kind": {
+            "title": "Kind",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "identity",
+          "digest"
+        ],
+        "title": "ReviewMigrationSource",
         "type": "object"
       },
       "ReviewNoRemediation": {
@@ -5377,6 +5610,79 @@
         "title": "ReviewRemoteUncertainCause",
         "type": "object"
       },
+      "ReviewRequestExecutionRenewal": {
+        "additionalProperties": false,
+        "properties": {
+          "execution_episode": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Execution Episode",
+            "type": "string"
+          },
+          "execution_epoch": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Execution Epoch",
+            "type": "integer"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "gate_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "guidance": {
+            "discriminator": {
+              "mapping": {
+                "clear": "#/components/schemas/ClearGuidance",
+                "keep": "#/components/schemas/KeepGuidance",
+                "set": "#/components/schemas/SetGuidance"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeepGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/ClearGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/SetGuidance"
+              }
+            ],
+            "title": "Guidance"
+          },
+          "operation": {
+            "const": "renew_execution",
+            "enum": [
+              "renew_execution"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "request_id",
+          "gate_id",
+          "guidance",
+          "execution_epoch",
+          "execution_episode"
+        ],
+        "title": "ReviewRequestExecutionRenewal",
+        "type": "object"
+      },
       "ReviewRequestRearm": {
         "additionalProperties": false,
         "description": "Authorize dismissal of exactly the gate's observed counted bot reviews; the set is never on the wire.",
@@ -5435,6 +5741,86 @@
           "guidance"
         ],
         "title": "ReviewRequestRearm",
+        "type": "object"
+      },
+      "ReviewRequestVerdictRelease": {
+        "additionalProperties": false,
+        "properties": {
+          "execution_episode": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Execution Episode",
+            "type": "string"
+          },
+          "execution_epoch": {
+            "maximum": 9007199254740991.0,
+            "minimum": 1.0,
+            "title": "Execution Epoch",
+            "type": "integer"
+          },
+          "expected": {
+            "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "gate_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Gate Id",
+            "type": "string"
+          },
+          "guidance": {
+            "discriminator": {
+              "mapping": {
+                "clear": "#/components/schemas/ClearGuidance",
+                "keep": "#/components/schemas/KeepGuidance",
+                "set": "#/components/schemas/SetGuidance"
+              },
+              "propertyName": "kind"
+            },
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/KeepGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/ClearGuidance"
+              },
+              {
+                "$ref": "#/components/schemas/SetGuidance"
+              }
+            ],
+            "title": "Guidance"
+          },
+          "operation": {
+            "const": "release_verdict",
+            "enum": [
+              "release_verdict"
+            ],
+            "title": "Operation",
+            "type": "string"
+          },
+          "request_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Request Id",
+            "type": "string"
+          },
+          "submission_command_id": {
+            "maxLength": 512,
+            "minLength": 1,
+            "title": "Submission Command Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "operation",
+          "expected",
+          "request_id",
+          "gate_id",
+          "guidance",
+          "execution_epoch",
+          "execution_episode",
+          "submission_command_id"
+        ],
+        "title": "ReviewRequestVerdictRelease",
         "type": "object"
       },
       "ReviewRetryAuthorizationRequiredCause": {
@@ -5624,6 +6010,34 @@
           "kind"
         ],
         "title": "ReviewUnlabelledObligation",
+        "type": "object"
+      },
+      "ReviewVerdictHoldCause": {
+        "additionalProperties": false,
+        "properties": {
+          "head_sha": {
+            "title": "Head Sha",
+            "type": "string"
+          },
+          "kind": {
+            "const": "review_verdict_hold",
+            "enum": [
+              "review_verdict_hold"
+            ],
+            "title": "Kind",
+            "type": "string"
+          },
+          "submission_command_id": {
+            "title": "Submission Command Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "kind",
+          "submission_command_id",
+          "head_sha"
+        ],
+        "title": "ReviewVerdictHoldCause",
         "type": "object"
       },
       "RoleHealth": {
@@ -7020,6 +7434,8 @@
                     "authorize_retry": "#/components/schemas/ReviewAuthorizeRetry",
                     "cancel_rearm": "#/components/schemas/ReviewCancelRearm",
                     "continue_rearm": "#/components/schemas/ReviewContinueRearm",
+                    "release_verdict": "#/components/schemas/ReviewRequestVerdictRelease",
+                    "renew_execution": "#/components/schemas/ReviewRequestExecutionRenewal",
                     "request_rearm": "#/components/schemas/ReviewRequestRearm"
                   },
                   "propertyName": "operation"
@@ -7036,6 +7452,12 @@
                   },
                   {
                     "$ref": "#/components/schemas/ReviewAuthorizeRetry"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewRequestExecutionRenewal"
+                  },
+                  {
+                    "$ref": "#/components/schemas/ReviewRequestVerdictRelease"
                   }
                 ],
                 "title": "Body"

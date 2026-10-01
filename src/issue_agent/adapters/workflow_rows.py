@@ -14,6 +14,7 @@ from ..domain.review_workflow import (
     AnyWorkflowSnapshot, CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, PendingReviewRearm, PullRequestState,
     RecordedPullRequest, ReviewEpisode,
     ReviewFamilyEpisodes, ReviewRearmIntent, ReviewWorkflowSnapshot, SupersededReviewRearm,
+    ReviewExecutionRenewalGrant,
 )
 from ..domain.review_execution import (
     MAX_EXECUTION_SUFFIX,
@@ -24,6 +25,7 @@ from ..domain.review_execution import (
     ImportedReviewExecutionDecision,
     ImportedReviewExecutionOriginReceipt,
     InitializedReviewExecutionOriginReceipt,
+    RenewedReviewExecutionOriginReceipt,
     initialized_review_execution,
     ReviewExecutionCheckpoint,
     ReviewExecutionGenerationBoundary,
@@ -632,7 +634,7 @@ def load_review_execution_import_decision(
 
 def _read_execution_origin(
     db: sqlite3.Connection, scope: tuple[str, str, int], execution: ActivatedReviewExecution | CurrentReviewExecution,
-) -> tuple[ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt, datetime]:
+) -> tuple[ImportedReviewExecutionOriginReceipt | InitializedReviewExecutionOriginReceipt | RenewedReviewExecutionOriginReceipt, datetime]:
     origin_id = execution.origin.evidence_id
     origin_rowid = _unique_text_identity_rowid(
         db, "dedupe_keys", (("namespace", REVIEW_EXECUTION_ORIGIN_NAMESPACE),
@@ -664,7 +666,9 @@ def _read_execution_origin(
         receipt_type = (ImportedReviewExecutionOriginReceipt
                         if execution.origin.kind is ReviewExecutionOriginKind.IMPORTED
                         else InitializedReviewExecutionOriginReceipt
-                        if execution.origin.kind is ReviewExecutionOriginKind.INITIALIZED else None)
+                        if execution.origin.kind is ReviewExecutionOriginKind.INITIALIZED
+                        else RenewedReviewExecutionOriginReceipt
+                        if execution.origin.kind is ReviewExecutionOriginKind.RENEWED else None)
         if receipt_type is None:
             raise ValueError("unsupported execution origin cause")
         captured = decode_workflow(row["payload_json"], receipt_type)
@@ -685,6 +689,47 @@ def _read_execution_origin(
             or initial_checkpoint and checkpoint != captured.checkpoint):
         raise WorkflowAuthorityError("review execution origin disagrees with its component")
     return captured, claimed
+
+
+def _check_renewed_execution_origin(
+    db: sqlite3.Connection, scope: tuple[str, str, int], captured: RenewedReviewExecutionOriginReceipt,
+) -> None:
+    from ..domain.workflow import AuthorizedOperatorCommand, RequestReviewExecutionRenewal, RequestReviewVerdictRelease
+
+    row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-request' AND scope=? AND key=? "
+        "AND reusable_after IS NULL AND length(CAST(payload_json AS BLOB))<=?",
+        (scope[0], captured.request_id, MAX_WORKFLOW_PAYLOAD_BYTES),
+    ).fetchone()
+    try:
+        accepted = json.loads(row["payload_json"]) if row is not None else None
+        if (not isinstance(accepted, dict) or set(accepted) != {"mutation", "expected", "snapshot", "audit", "commands"}
+                or accepted.get("mutation") != "request_rearm"):
+            raise ValueError("renewal lacks its accepted request transition")
+        audit = decode_workflow(accepted["audit"], AuthorizedOperatorCommand)
+        snapshot = decode_workflow(accepted["snapshot"], ReviewWorkflowSnapshot)
+        command = audit.command
+        execution = snapshot.execution
+        grant = snapshot.intent.grant if snapshot.intent is not None else None
+        if (not isinstance(command, RequestReviewExecutionRenewal)
+                or isinstance(command, RequestReviewVerdictRelease)
+                or command.request_id != captured.request_id or command.expected != captured.expected
+                or decode_workflow(accepted["expected"], WorkflowRevision) != captured.expected
+                or snapshot.revision.version != captured.expected.version + 1
+                or command.expected_binding != captured.previous_binding.rejection
+                or command.execution_epoch != captured.previous_binding.execution_epoch
+                or command.execution_episode != captured.previous_binding.execution_episode
+                or not isinstance(execution, CurrentReviewExecution)
+                or execution.origin != captured.origin or execution.baseline != captured.checkpoint
+                or not isinstance(grant, ReviewExecutionRenewalGrant)
+                or grant.origin_evidence_id != captured.origin.evidence_id
+                or grant.original_request_id != captured.request_id
+                or grant.previous_episode != captured.previous_binding.execution_episode
+                or grant.renewed_episode != captured.checkpoint.state.binding.execution_episode
+                or grant.execution_epoch != captured.previous_binding.execution_epoch):
+            raise ValueError("renewal origin disagrees with its accepted transition")
+    except (ValueError, TypeError, KeyError, WorkflowEncodingError) as exc:
+        raise WorkflowAuthorityError("renewed execution origin lacks its exact accepted transition") from exc
 
 
 def _check_initialized_execution_origin(
@@ -1309,6 +1354,8 @@ def _check_current_execution(
     origin, claimed = _read_execution_origin(db, scope, execution)
     if isinstance(origin, ImportedReviewExecutionOriginReceipt):
         _check_imported_execution_origin(db, scope, execution, origin, claimed)
+    elif isinstance(origin, RenewedReviewExecutionOriginReceipt):
+        _check_renewed_execution_origin(db, scope, origin)
     else:
         _check_initialized_execution_origin(db, scope, execution, origin, claimed)
     origin_generation = origin.checkpoint.state.binding.rejection.fence.generation

@@ -22,6 +22,7 @@ from .review_workflow import (
 from .review_workflow_policy import (
     OBSERVATION_MAX_AGE_SECONDS, ceiling_reached_again, complete_review_rearm, review_projection_obsolete, review_rearm_observation_gate_id,
     review_rearm_stop_reason, supersede_review_rearm,
+    ReviewSubmissionReceipt,
 )
 from .labels import Label
 from .workflow import (
@@ -313,10 +314,22 @@ class ReviewControlView:
     # The configured review trigger acceptance plans a release with; the view
     # describes a re-arm with the same kept-holds predicate acceptance uses.
     trigger_label: Label = field(kw_only=True)
+    execution_ceiling: int = field(default=0, kw_only=True)
+    execution_episode_open: bool = field(default=False, kw_only=True)
+    confirmed_verdicts: tuple[ReviewSubmissionReceipt, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
         if not isinstance(self.snapshot, ReviewWorkflowSnapshot):
             raise ValueError("review control view requires current workflow authority")
+        if type(self.execution_ceiling) is not int or not 0 <= self.execution_ceiling <= 2**63 - 1:
+            raise ValueError("execution view requires a bounded configured ceiling")
+        if type(self.execution_episode_open) is not bool:
+            raise ValueError("execution view requires verified unfinished membership")
+        if (not isinstance(self.confirmed_verdicts, tuple) or len(self.confirmed_verdicts) > MAX_WORKFLOW_GATES + 1
+                or any(not isinstance(item, ReviewSubmissionReceipt) or not item.escalated
+                       or item.submission.binding.fence.key != self.snapshot.revision.fence.key
+                       for item in self.confirmed_verdicts)):
+            raise ValueError("execution view requires this target's selected confirmed verdicts")
         if not isinstance(self.trigger_label, Label) or self.trigger_label is Label.NEEDS_HUMAN_REVIEW:
             raise ValueError("the review trigger is a label other than the attention hold")
         if self.requested_id is not None:

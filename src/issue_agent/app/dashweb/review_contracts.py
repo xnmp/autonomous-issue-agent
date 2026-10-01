@@ -70,6 +70,44 @@ class ReviewContinueRearm(ClosedContract):
                                       expected_binding=self.expected.binding())
 
 
+class ReviewRequestExecutionRenewal(ClosedContract):
+    operation: Literal["renew_execution"]
+    expected: ReviewExpected
+    request_id: Identifier
+    gate_id: Identifier
+    guidance: Guidance
+    execution_epoch: Positive
+    execution_episode: Identifier
+
+    def command(self) -> w.RequestReviewExecutionRenewal:
+        guidance = (w.SetGuidance(self.guidance.text) if isinstance(self.guidance, SetGuidance)
+                    else w.ClearGuidance() if isinstance(self.guidance, ClearGuidance) else w.KeepGuidance())
+        return w.RequestReviewExecutionRenewal(
+            self.request_id, self.expected.revision(), self.gate_id, guidance,
+            self.execution_epoch, self.execution_episode, expected_binding=self.expected.binding(),
+        )
+
+
+class ReviewRequestVerdictRelease(ClosedContract):
+    operation: Literal["release_verdict"]
+    expected: ReviewExpected
+    request_id: Identifier
+    gate_id: Identifier
+    guidance: Guidance
+    execution_epoch: Positive
+    execution_episode: Identifier
+    submission_command_id: Identifier
+
+    def command(self) -> w.RequestReviewVerdictRelease:
+        guidance = (w.SetGuidance(self.guidance.text) if isinstance(self.guidance, SetGuidance)
+                    else w.ClearGuidance() if isinstance(self.guidance, ClearGuidance) else w.KeepGuidance())
+        return w.RequestReviewVerdictRelease(
+            self.request_id, self.expected.revision(), self.gate_id, guidance,
+            self.execution_epoch, self.execution_episode, w.CommandId(self.submission_command_id),
+            expected_binding=self.expected.binding(),
+        )
+
+
 class ReviewCancelRearm(ClosedContract):
     operation: Literal["cancel_rearm"]
     expected: ReviewExpected
@@ -98,7 +136,8 @@ class ReviewAuthorizeRetry(ClosedContract):
         )
 
 
-ReviewCommandBody = ReviewRequestRearm | ReviewContinueRearm | ReviewCancelRearm | ReviewAuthorizeRetry
+ReviewCommandBody = (ReviewRequestRearm | ReviewContinueRearm | ReviewCancelRearm | ReviewAuthorizeRetry
+                     | ReviewRequestExecutionRenewal | ReviewRequestVerdictRelease)
 ReviewCommand = Annotated[ReviewCommandBody, Field(discriminator="operation")]
 
 
@@ -161,6 +200,21 @@ class ReviewRemoteUncertainCause(ClosedContract):
     last_error: str
 
 
+class ReviewExecutionCeilingCause(ClosedContract):
+    kind: Literal["review_execution_ceiling"]
+    execution_epoch: int
+    execution_episode: str
+    head_sha: str
+    failures: int
+    ceiling: int
+
+
+class ReviewVerdictHoldCause(ClosedContract):
+    kind: Literal["review_verdict_hold"]
+    submission_command_id: str
+    head_sha: str
+
+
 class ReviewRetryAuthorizationRequiredCause(ClosedContract):
     kind: Literal["retry_authorization_required"]
     command_id: str
@@ -193,6 +247,7 @@ class ReviewProjectionRefusedCause(ClosedContract):
 
 
 ReviewCauseKind = Literal[
+    "review_execution_ceiling", "review_verdict_hold",
     "review_rejection_ceiling", "remote_uncertain", "retry_authorization_required", "evidence_unavailable",
     "rearm_needs_decision", "review_projection_refused",
 ]
@@ -210,6 +265,7 @@ class ReviewGateFactsUnavailableCause(ClosedContract):
 
 
 ReviewGateCause = Annotated[
+    ReviewExecutionCeilingCause | ReviewVerdictHoldCause |
     ReviewRejectionCeilingCause | ReviewRemoteUncertainCause | ReviewRetryAuthorizationRequiredCause
     | ReviewEvidenceUnavailableCause | ReviewRearmNeedsDecisionCause | ReviewProjectionRefusedCause
     | ReviewGateFactsUnavailableCause,
@@ -231,7 +287,7 @@ class ReviewAttemptedRemediation(ClosedContract):
 
 ReviewRemediation = Annotated[ReviewNoRemediation | ReviewAttemptedRemediation, Field(discriminator="kind")]
 
-ReviewOperation = Literal["request_rearm", "continue_rearm", "cancel_rearm", "authorize_retry"]
+ReviewOperation = Literal["request_rearm", "continue_rearm", "cancel_rearm", "authorize_retry", "renew_execution", "release_verdict"]
 
 
 class ReviewActionOffered(ClosedContract):
@@ -469,7 +525,46 @@ class ReviewObservation(ClosedContract):
     last_error: str
 
 
+class ReviewExecutionInactive(ClosedContract):
+    kind: Literal["inactive"] = "inactive"
+    reason: str = "Review execution requires explicit stopped migration."
+
+
+class ReviewMigrationSource(ClosedContract):
+    kind: str
+    identity: str
+    digest: str
+
+
+class ReviewMigrationBlocker(ClosedContract):
+    kind: str
+    sources: list[ReviewMigrationSource]
+
+
+class ReviewExecutionBlocked(ClosedContract):
+    kind: Literal["blocked"]
+    execution_epoch: int
+    blockers: list[ReviewMigrationBlocker]
+
+
+class ReviewExecutionCurrent(ClosedContract):
+    kind: Literal["current"]
+    execution_epoch: int
+    execution_episode: str
+    failures: int
+    failure_ceiling: int
+    pin_deferrals: int
+    displayed_round: int
+    recovery_choices: list[ReviewGate]
+
+
+ReviewExecution = Annotated[
+    ReviewExecutionInactive | ReviewExecutionBlocked | ReviewExecutionCurrent, Field(discriminator="kind"),
+]
+
+
 class ReviewAvailableControl(ClosedContract):
+    execution: ReviewExecution = Field(default_factory=ReviewExecutionInactive)
     status: Literal["available"]
     expected: ReviewExpected
     workflow_held: bool = Field(description="SQLite workflow holds only, not a remote readiness assertion; acceptance re-reads GitHub.")

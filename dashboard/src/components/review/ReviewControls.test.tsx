@@ -6,7 +6,7 @@ import type { ReviewControl, ReviewDaemonDecision, ReviewDispatch, ReviewGate } 
 import { reviewRetryKey } from "./retry-journal";
 import { ReviewControls } from "./ReviewControls";
 import {
-  AS_OF, DECIDED_AT, decisionGate, pendingRearm, REVIEW_OUTCOME_STATUS, reviewAbsent, reviewBinding, reviewCeilingGate,
+  AS_OF, DECIDED_AT, currentExecution, decisionGate, pendingRearm, REVIEW_OUTCOME_STATUS, reviewAbsent, reviewBinding, reviewCeilingGate,
   reviewControl, reviewControlResponse, reviewDaemon, reviewJson, reviewMigrationRequired, reviewResult,
   reviewRetryGate, reviewUnavailable,
 } from "./test-fixtures";
@@ -57,6 +57,31 @@ function show(control: ReviewControl) {
 const gateItem = (text: RegExp | string) => screen.getByText(text).closest("li") as HTMLElement;
 
 describe("statuses", () => {
+  it("explains the blocked source and never offers an execution reset", async () => {
+    const { r } = show(reviewControl({ gates: [], execution: { kind: "blocked", execution_epoch: 7,
+      blockers: [{ kind: "origin", sources: [{ kind: "file", identity: "unassigned-counter", digest: "a".repeat(64) }] }] } }));
+    expect(await screen.findByRole("heading", { name: "Review execution migration blocked" })).toBeVisible();
+    expect(screen.getByText(/unassigned-counter/)).toBeVisible();
+    expect(screen.queryByRole("button", { name: /Renew|Release selected/ })).not.toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Refresh status" }));
+    expect(r.posts).toEqual([]);
+  });
+
+  it("shows Current allowance and captures renewal before confirming it", async () => {
+    const user = userEvent.setup();
+    const control = reviewControl({ execution: currentExecution() });
+    const { r } = show(control);
+    r.command(() => reviewJson(reviewResult("accepted", control), 202));
+    await user.click(await screen.findByRole("button", { name: "Renew execution allowance" }));
+    await user.click(screen.getByRole("button", { name: "Review command" }));
+    expect(screen.getByRole("heading", { name: "Review command" })).toHaveFocus();
+    expect(r.posts).toEqual([]);
+    await user.click(screen.getByRole("button", { name: "Confirm command" }));
+    expect(r.posts).toEqual([expect.objectContaining({ operation: "renew_execution", execution_epoch: 7,
+      execution_episode: "execution-episode-12", expected: reviewBinding, gate_id: "execution-12" })]);
+    expect(await screen.findByRole("heading", { name: "Command recorded" })).toBeVisible();
+    expect(screen.getByText("Review rejection ceiling")).toBeVisible();
+  });
   it("explains an absent workflow instead of hiding the panel the legacy refusal points at", async () => {
     show(reviewAbsent);
     expect(await screen.findByRole("heading", { name: /Review control PR #12/ })).toBeVisible();

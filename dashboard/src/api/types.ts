@@ -59,7 +59,8 @@ export type ReviewDaemonDecision = AvailableReviewControl["daemon"];
 export type ReviewDispatch = Extract<ReviewDaemonDecision, { state: "recorded" }>["dispatch"];
 export type WorkflowFamilies = Schema["WorkflowFamiliesAvailable"] | Schema["WorkflowFamiliesUnavailable"];
 export type ReviewCommand =
-  | Schema["ReviewRequestRearm"] | Schema["ReviewContinueRearm"] | Schema["ReviewCancelRearm"] | Schema["ReviewAuthorizeRetry"];
+  | Schema["ReviewRequestRearm"] | Schema["ReviewContinueRearm"] | Schema["ReviewCancelRearm"] | Schema["ReviewAuthorizeRetry"]
+  | Schema["ReviewRequestExecutionRenewal"] | Schema["ReviewRequestVerdictRelease"];
 export type ReviewCommandResult = Schema["ReviewCommandResult"];
 export type ReviewGuidance = Schema["ReviewRequestRearm"]["guidance"];
 

@@ -44,15 +44,16 @@ from ..domain.review_evidence import (
 from ..domain.review_execution import (
     initialized_review_execution, BlockedReviewExecutionMigration,
     CurrentReviewExecution, CompletedReviewExecutionRound, freeze_current_review_generation,
+    renew_current_review_execution,
 )
 from ..domain.review_rounds import (
     FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed,
 )
-from ..domain.review_rejection import CountingRule, ReviewProjectionRefused, ReviewRejectionCeiling
+from ..domain.review_rejection import CountingRule, ReviewProjectionRefused, ReviewRejectionCeiling, ReviewVerdictHold
 from ..domain.review_workflow import (
     CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, ObservedPullRequest, PendingReviewRearm,
     PullRequestState, PullRequestUnavailable, RecordedPullRequest, ReviewRearmIntent, ReviewRearmPreflight,
-    ReviewWorkflowRead, ReviewWorkflowSnapshot, SupersededReviewRearm,
+    ReviewWorkflowRead, ReviewWorkflowSnapshot, SupersededReviewRearm, BoundReviewSubmission, ReviewedBaseline,
 )
 from ..domain.review_workflow_policy import (
     ESCALATION_PROJECTION_PREFIX, OBSERVATION_MAX_AGE_SECONDS, CeilingEscalation, EscalationHoldPresent,
@@ -68,6 +69,7 @@ from ..domain.workflow import (
     ActiveReconciliation, AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, ContinueGrantedRearm,
     HeldProjection, NoAuthorizedRemediation, ObservedTransition, OpenGate, OperatorActor, RearmingGate,
     ReconciliationOnly, ReconciliationPolicy, RemoteOutcomeUncertain, RequestRearm, RetiredSettledCommand,
+    RequestReviewExecutionRenewal, RequestReviewVerdictRelease,
     RetiredUncertainCommand, RetryAuthorizationRequired, RetryDisposition, StopReason, WorkflowChanged,
     WorkflowCommitted, WorkflowConflict, WorkflowMigrationRequired, WorkflowMutation, WorkflowRejected,
     WorkflowRejection, WorkflowUnavailable, WorkflowUnchanged, WorkflowAbsent,
@@ -104,7 +106,7 @@ from .workflow_rows import (
     REVIEW_CEILING_PRODUCTIVITY_NAMESPACE, REVIEW_SUPERSEDED_PRODUCTIVITY_NAMESPACE,
     insert_initialized_review_execution_origin, insert_workflow_component, encode_workflow_episodes,
     load_review_execution_import_decision,
-    read_current_review_pending,
+    read_current_review_pending, REVIEW_EXECUTION_ORIGIN_NAMESPACE, _read_current_round_outcome,
 )
 
 # Deployment barriers are always taken in this order (ADR 0015 acceptance).
@@ -217,6 +219,7 @@ class SQLiteReviewWorkflowControl:
         policy: ReconciliationPolicy = ReconciliationPolicy(),
         trailers: Callable[[int], object] | None = None,
         runtime_preflight: Callable[[], str | None] | None = None,
+        execution_ceiling: int = 0,
     ) -> None:
         if not isinstance(control, SQLiteControlStore) or not isinstance(writer, WorkflowWriter):
             raise ValueError("review workflow control requires the existing store and a typed writer")
@@ -226,6 +229,8 @@ class SQLiteReviewWorkflowControl:
             raise ValueError("review workflow control requires a read-only pull request review gateway")
         if type(ceiling) is not int or not -(2**63) <= ceiling <= 2**63 - 1:
             raise ValueError("review rejection ceiling must be a bounded integer")
+        if type(execution_ceiling) is not int or not 0 <= execution_ceiling <= 2**63 - 1:
+            raise ValueError("review execution ceiling must be a bounded nonnegative integer")
         if not isinstance(trigger_label, Label) or trigger_label is Label.NEEDS_HUMAN_REVIEW:
             raise ValueError("review trigger must be a label other than the attention hold")
         if not isinstance(rule, CountingRule) or not isinstance(policy, ReconciliationPolicy) or not callable(external_holds):
@@ -238,6 +243,7 @@ class SQLiteReviewWorkflowControl:
         self._writer = writer
         self._gateway = gateway
         self._ceiling = ceiling
+        self._execution_ceiling = execution_ceiling
         self._trigger = trigger_label
         self._rule = rule
         self._external_holds = external_holds
@@ -505,12 +511,29 @@ class SQLiteReviewWorkflowControl:
                     decision: RecordedReviewDecision | UnreadableReviewDecision | None = self._decision(db, key)
                 except WorkflowAuthorityError as exc:
                     decision = UnreadableReviewDecision(_reason(exc)[:512])
+                verdicts: list[ReviewSubmissionReceipt] = []
+                if isinstance(state.execution, CurrentReviewExecution):
+                    selections: list[tuple[str | None, CommandId | None]] = [(None, None)]
+                    selections.extend((gate.gate_id, gate.cause.submission_command_id) for gate in state.gates
+                        if isinstance(gate, OpenGate) and isinstance(gate.cause, ReviewVerdictHold))
+                    for gate_id, identity in selections:
+                        try:
+                            receipt = self._fixed_verdict_receipt(db, state, identity)
+                            if receipt is not None and receipt not in verdicts:
+                                verdicts.append(receipt)
+                        except (WorkflowAuthorityError, ControlStoreError, ValueError, TypeError) as exc:
+                            if gate_id is not None:
+                                unavailable[gate_id] = _reason(exc)
                 return ReviewControlView(
                     state, selected, requested, observation, self._release_projection(db, state), authorizable,
                     refusals, pending, decision, self._hold_restorations(db, key, live),
                     self._active_review_runs(db, key), progress,
                     tuple(GateFactsUnavailable(gate_id, reason[:512]) for gate_id, reason in sorted(unavailable.items())),
                     trigger_label=self._trigger,
+                    execution_ceiling=self._execution_ceiling,
+                    execution_episode_open=self._old_execution_episode_open(db, state)
+                    if isinstance(state.execution, CurrentReviewExecution) else False,
+                    confirmed_verdicts=tuple(verdicts),
                 )
         except (sqlite3.Error, ValueError, TypeError) as exc:
             return WorkflowUnavailable(key, _reason(exc))
@@ -928,8 +951,11 @@ class SQLiteReviewWorkflowControl:
     def _commit(
         self, db: sqlite3.Connection, expected: WorkflowRevision, authorities: tuple[FamilyAuthority, ...],
         transition: WorkflowChanged,
+        *, observation: RecordedPullRequest | None = None,
     ) -> WorkflowCommitted | WorkflowConflict:
         with self._control.mutation_savepoint(db):
+            if observation is not None:
+                self._insert_evidence(db, expected.fence.key, observation)
             return self._commit_in_tx(db, expected, authorities, transition)
 
     def _commit_in_tx(
@@ -1079,10 +1105,70 @@ class SQLiteReviewWorkflowControl:
             now, self._ceiling, self._trigger, self._writer.owner_id, rule=self._rule, observation=observation,
             accepted_preflight=accepted, external_holds=holds, escalation=escalation, submission=submission,
             retry=retry,
+            execution_ceiling=self._execution_ceiling,
+            verdict_receipt=self._fixed_verdict_receipt(db, prior,
+                audit.command.submission_command_id if isinstance(audit.command, RequestReviewVerdictRelease) else None)
+            if isinstance(audit, AuthorizedOperatorCommand)
+            and isinstance(audit.command, RequestReviewExecutionRenewal) else None,
             applied_sequences=self._generation_applied_sequences(db, prior) if (
                 transition.snapshot.revision.fence.generation > prior.revision.fence.generation
             ) else (),
         )
+
+    def _fixed_verdict_receipt(
+        self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot, identity: CommandId | None = None,
+    ) -> ReviewSubmissionReceipt | None:
+        baseline = snapshot.episode.continuation
+        selected = baseline.source.command_id if isinstance(baseline, ReviewedBaseline) and isinstance(
+            baseline.source, BoundReviewSubmission,
+        ) else None
+        if identity is not None:
+            if identity != selected and not any(
+                isinstance(gate, OpenGate) and isinstance(gate.cause, ReviewVerdictHold)
+                and gate.cause.submission_command_id == identity for gate in snapshot.gates
+            ):
+                return None
+        elif selected is not None:
+            identity = selected
+        else:
+            return None
+        try:
+            receipt = load_bound_review_submission(db, CommandId(identity))
+        except KeyError as exc:
+            raise WorkflowAuthorityError("selected verdict command is absent") from exc
+        if not isinstance(receipt, ReviewSubmissionReceipt) or not receipt.escalated:
+            return None
+        registration = read_review_submission_registration(db, self._writer.repository, identity)
+        if registration is None:
+            raise WorkflowAuthorityError("selected verdict lacks its exact registered round source")
+        round = registration.round
+        key = snapshot.revision.fence.key
+        if (registration.submission.command_id != identity or round.binding.rejection.fence.key != key
+                or round.binding.rejection.authority != snapshot.authority
+                or round.binding.rejection.episode_id != snapshot.episode.episode_id):
+            raise WorkflowAuthorityError("selected verdict belongs to another registered component")
+        outcome = _read_current_round_outcome(db,
+            (key.repository, key.target.number, round.binding.execution_epoch, round.binding.execution_episode),
+            round.sequence)
+        if outcome.round != round:
+            raise WorkflowAuthorityError("selected verdict source changed its exact round identity")
+        return receipt
+
+    def _old_execution_episode_open(self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot) -> bool:
+        execution = snapshot.execution
+        if not isinstance(execution, CurrentReviewExecution):
+            return True
+        # Renewal, unlike ordinary reads, must drain every generation of the
+        # old episode. Final round receipts already require classified returns,
+        # money settlement and resolved registered submission effects.
+        binding = execution.binding
+        return db.execute(
+            "SELECT 1 FROM review_execution_rounds INDEXED BY review_execution_rounds_open "
+            "WHERE repository=? AND target_number=? "
+            "AND execution_epoch=? AND execution_episode=? AND outcome_json IS NULL LIMIT 1",
+            (binding.rejection.fence.key.repository, binding.rejection.fence.key.target.number,
+             binding.execution_epoch, binding.execution_episode),
+        ).fetchone() is not None
 
     def _generation_applied_sequences(
         self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot,
@@ -1287,7 +1373,27 @@ class SQLiteReviewWorkflowControl:
                 prior.execution, prior.revision, after.revision, transition.mutation,
                 self._generation_applied_sequences(db, prior),
             )
-            if after.execution != advanced:
+            audit = transition.audit
+            if (isinstance(audit, AuthorizedOperatorCommand)
+                    and isinstance(audit.command, RequestReviewExecutionRenewal)
+                    and not isinstance(audit.command, RequestReviewVerdictRelease)):
+                renewed, origin = renew_current_review_execution(
+                    prior.execution, prior.revision, after.binding, audit.command.request_id,
+                )
+                if after.execution != renewed or self._old_execution_episode_open(db, prior):
+                    raise WorkflowAuthorityError("execution renewal requires the exact quiescent old episode")
+                db.execute(
+                    "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (REVIEW_EXECUTION_ORIGIN_NAMESPACE, self._writer.repository, origin.origin.evidence_id,
+                     self._now().isoformat(), encode_workflow(origin)),
+                )
+                db.execute(
+                    "UPDATE workflow_components SET episode_id=? WHERE repository=? AND target_kind=? "
+                    "AND target_number=? AND family=? AND epoch=? AND episode_id=?",
+                    (renewed.binding.execution_episode, *scope, WorkflowFamily.REVIEW_EXECUTION.value,
+                     prior.execution.binding.execution_epoch, prior.execution.binding.execution_episode),
+                )
+            elif after.execution != advanced:
                 raise WorkflowAuthorityError("generation advance lost its exact current execution freeze")
             db.execute(
                 "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
@@ -1762,8 +1868,7 @@ class SQLiteReviewWorkflowControl:
             return proposal
         if isinstance(proposal, WorkflowUnchanged):
             return WorkflowCommitted(prior, idempotent=True)
-        self._insert_evidence(db, key, recorded)
-        return self._commit(db, prior.revision, (prior.authority,), proposal)
+        return self._commit(db, prior.revision, (prior.authority,), proposal, observation=recorded)
 
     # -- operator acceptance -------------------------------------------------------------------
 
@@ -1892,13 +1997,29 @@ class SQLiteReviewWorkflowControl:
                     return WorkflowRejected(WorkflowRejection.OBSERVATION_UNAVAILABLE, recorded.reason)
                 if self._active_review_runs(db, key):
                     return WorkflowRejected(WorkflowRejection.OTHER_HOLD, "active review runs must drain before a re-arm")
+                if (isinstance(command, RequestReviewExecutionRenewal)
+                        and not isinstance(command, RequestReviewVerdictRelease)
+                        and self._old_execution_episode_open(db, prior)):
+                    return WorkflowRejected(WorkflowRejection.OTHER_HOLD,
+                                            "every old execution episode round must settle before renewal")
                 evidence_id = self._evidence_id(recorded)
                 common = dict(now=self._now(), active_reviews=(), evidence_id=evidence_id,
                               trigger_label=self._trigger, executor_identity=self._writer.owner_id,
                               external_holds=recorded.external_holds,
                               applied_sequences=self._generation_applied_sequences(db, prior))
                 if isinstance(command, RequestRearm):
-                    proposal = request_review_rearm(prior, command, actor, recorded.observation, **common)  # type: ignore[arg-type]
+                    try:
+                        verdict = self._fixed_verdict_receipt(db, prior,
+                            command.submission_command_id if isinstance(command, RequestReviewVerdictRelease) else None) \
+                            if isinstance(command, RequestReviewExecutionRenewal) else None
+                    except (WorkflowAuthorityError, ControlStoreError, ValueError, TypeError) as exc:
+                        return WorkflowRejected(WorkflowRejection.INVALID_SCOPE,
+                                                f"selected verdict evidence is unavailable: {_reason(exc)}")
+                    proposal = request_review_rearm(
+                        prior, command, actor, recorded.observation, **common,  # type: ignore[arg-type]
+                        execution_ceiling=self._execution_ceiling, rearm_rule=self._rule,
+                        verdict_receipt=verdict,
+                    )
                 else:
                     proposal = continue_review_rearm(prior, command, actor, recorded.observation, **common)  # type: ignore[arg-type]
                 return self._apply(db, prior, key, recorded, proposal)

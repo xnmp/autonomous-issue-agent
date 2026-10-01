@@ -65,7 +65,8 @@ _VALUES = (
     w.EvidenceUnavailable, w.RearmNeedsDecision, w.NoAuthorizedRemediation,
     w.RemediationAttempted, w.OpenGate, w.RearmingGate,
     w.KeepGuidance, w.ClearGuidance, w.SetGuidance, w.OperatorActor,
-    w.RequestRearm, w.ContinueGrantedRearm, w.CancelRearm, w.ReconcileGate,
+    w.RequestRearm, w.RequestReviewExecutionRenewal, w.RequestReviewVerdictRelease,
+    w.ContinueGrantedRearm, w.CancelRearm, w.ReconcileGate,
     w.AuthorizeAbsentRetry, w.RenewResolveAllowance, w.EnsureLifecycleProjection,
     w.PendingRearm, w.CompletedRearm, w.SupersededRearm, w.CancelledRearm,
     w.WorkflowSnapshot, w.CommandAbsenceEvidence, w.CommandRetryApplicability,
@@ -78,6 +79,8 @@ _VALUES = (
     rw.FreshReviewRequired, rw.BoundReviewSubmission, rw.ImportedBaseline, rw.ReviewedBaseline,
     rw.ReviewEpisode, rw.DismissCountedReview, rw.RequireFreshReview, rw.EnsureReviewProjection, rw.ReviewProjectionPlan,
     rw.PendingReviewRearm, rw.CompletedReviewRearm, rw.SupersededReviewRearm, rw.CancelledReviewRearm,
+    rw.ReviewRejectionGrant, rw.ReviewExecutionRenewalGrant, rw.ReviewVerdictReleaseGrant,
+    w.ReviewExecutionCeiling, w.ReviewVerdictHold,
     rw.ReviewWorkflowSnapshot, rw.ReviewFamilyEpisodes, rw.SubmittedReviewFact, rw.CompleteReviews, rw.PartialReviews,
     rw.ObservedPullRequest, rw.PullRequestAbsent, rw.PullRequestUnavailable,
     rw.ReviewProjectionRefused, rw.RecordedPullRequest,
@@ -90,7 +93,7 @@ _VALUES = (
     rx.ReviewChildAdmission, rx.ReviewUnlaunchedRelease, rx.ReviewChildAdmissionRefusal, rx.ReviewChildLaunchRegistration,
     review_return.ReviewReturnedEnvelope, review_return.ReturnedReviewChild,
     review_return.ReviewRuntimePreflightStop,
-    rx.LaunchedReviewChild, rx.ImportedReviewSession, rx.NoReviewSession,
+    rx.LaunchedReviewChild, rx.ImportedReviewSession, rx.RenewedReviewSessionSource, rx.NoReviewSession,
     rx.ReusableReviewSession, rx.PreserveReviewSession, rx.ReplaceReviewSession,
     rx.ClearReviewSession, rx.PreserveDisplayedRound, rx.SetDisplayedRound,
     rx.PaidReviewProgress, rx.CopiedReviewProgress, rx.AddReviewStrike,
@@ -102,7 +105,7 @@ _VALUES = (
     rx.ReviewExecutionCheckpoint, rx.ReviewExecutionGenerationBoundary, rx.ReviewExecutionAcceptedTransitionSource,
     rx.ReviewExecutionTransitionProofSource,
     rx.ReviewExecutionOrigin, rx.ImportedReviewExecutionOriginReceipt,
-    rx.InitializedReviewExecutionOriginReceipt,
+    rx.InitializedReviewExecutionOriginReceipt, rx.RenewedReviewExecutionOriginReceipt,
     rx.ImportedReviewExecutionDecision,
     rx.ExecutionNotActivated, rx.ActivatedReviewExecution, rx.CurrentReviewExecution,
     rr.ReviewStagePlan, rr.ReviewSubmissionPlan, rr.ReviewSubmissionRegistration, rr.ReviewRoundPlan,
@@ -163,6 +166,10 @@ _LEGACY_FIELDS = {
     "ContinueGrantedRearm": {"expected_binding": None},
     "CancelRearm": {"expected_binding": None},
     "AuthorizeAbsentRetry": {"expected_binding": None},
+    "PendingReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
+    "CompletedReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
+    "SupersededReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
+    "CancelledReviewRearm": {"grant": {"type": "ReviewRejectionGrant", "fields": {}}},
 }
 
 
@@ -187,8 +194,9 @@ def _encode(value: object, depth: int = 0) -> object:
                 for field in fields(value)
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
-                if (field.name not in {"expected_binding", "lineage_sha256"}
-                    or getattr(value, field.name) is not None)
+                if ((field.name not in {"expected_binding", "lineage_sha256"}
+                     or getattr(value, field.name) is not None)
+                    and not (field.name == "grant" and isinstance(getattr(value, field.name), rw.ReviewRejectionGrant)))
             },
         }
     if isinstance(value, datetime):

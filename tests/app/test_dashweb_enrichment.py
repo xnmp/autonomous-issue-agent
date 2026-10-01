@@ -98,7 +98,7 @@ def _backend(snapshot: dash.Snapshot, gh: BlockingGh) -> service.Backend:
         lambda _name, _repo: ({}, 0)
     )
     backend._review_unproductive_rounds = (  # type: ignore[method-assign]
-        lambda _name, _snapshot, row, _prs: (
+        lambda _snapshot, row: (
             {number: 0 for number in row.prs},
             [],
         )
@@ -180,7 +180,7 @@ def test_issue_detail_does_not_append_poll_warnings_into_the_enrichment_cache() 
         gh,
     )
     backend._review_unproductive_rounds = (  # type: ignore[method-assign]
-        lambda _name, _snapshot, _row, _prs: (
+        lambda _snapshot, _row: (
             {12: 0},
             ["review breaker state unavailable"],
         )

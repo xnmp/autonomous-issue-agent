@@ -504,3 +504,45 @@ def test_historical_observation_replay_accepts_equivalent_caller_gate_order():
     changed["value"]["fields"]["gates"][0]["fields"]["cause"]["fields"]["last_error"] = "changed evidence"
     historical["snapshot"] = json.dumps(changed, sort_keys=True, separators=(",", ":"))
     assert not same_receipt(json.dumps(historical, sort_keys=True, separators=(",", ":")), proposal, current)
+
+
+def test_repeated_renewal_replaces_session_provenance_without_growing_an_ancestry_chain():
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.review_execution import (
+        CurrentReviewExecution, ImportedReviewSession, ReusableReviewSession, RenewedReviewSessionSource,
+        ReviewExecutionCheckpoint, renew_current_review_execution,
+    )
+    from tests.domain.test_review_execution_rearm import next_binding
+    from tests.domain.test_review_preflight import active, exhausted
+
+    snapshot, _ = exhausted(*active())
+    old = snapshot.execution
+    assert isinstance(old, CurrentReviewExecution)
+    state = replace(old.state, session=ReusableReviewSession(
+        RuntimeName.CLAUDE, "original-session", ImportedReviewSession("import:session")))
+    old = replace(old, baseline=replace(old.baseline, state=state), state=state)
+    receipts = []
+    for index in range(100):
+        after, receipt = renew_current_review_execution(old, snapshot.revision, next_binding(snapshot), f"renew:{index}")
+        receipts.append(encode_workflow(receipt))
+        assert after.state.session.handle == "original-session"
+        assert after.state.session.source == RenewedReviewSessionSource(receipt.origin.evidence_id)
+        snapshot = replace(snapshot, revision=replace(snapshot.revision, fence=after.binding.rejection.fence),
+                           execution=after)
+        state = replace(after.state, failures=5)
+        old = replace(after, state=state, baseline=ReviewExecutionCheckpoint(1, state), last_sequence=1)
+    assert len(set(receipts)) == 100
+    assert max(map(len, receipts)) - min(map(len, receipts)) < 150
+
+
+
+def test_fixed_origin_and_default_rejection_grant_round_trip():
+    from issue_agent.domain.review_execution import RenewedReviewExecutionOriginReceipt, renew_current_review_execution
+    from issue_agent.domain.review_workflow import ReviewRejectionGrant
+    from tests.domain.test_review_execution_rearm import next_binding
+    from tests.domain.test_review_preflight import active, exhausted
+
+    snapshot, _ = exhausted(*active())
+    _, receipt = renew_current_review_execution(snapshot.execution, snapshot.revision, next_binding(snapshot), "renew:codec")
+    assert decode_workflow(encode_workflow(receipt), RenewedReviewExecutionOriginReceipt) == receipt
+    assert decode_workflow(encode_workflow(ReviewRejectionGrant()), ReviewRejectionGrant) == ReviewRejectionGrant()

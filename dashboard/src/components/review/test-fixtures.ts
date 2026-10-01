@@ -49,6 +49,22 @@ export function reviewRetryGate(overrides: Partial<ReviewGate> = {}): ReviewGate
   };
 }
 
+export function executionGate(overrides: Partial<ReviewGate> = {}): ReviewGate {
+  return {
+    gate_id: "execution-12", state: "open", opened_generation: 2,
+    cause: { kind: "review_execution_ceiling", execution_epoch: 7, execution_episode: "execution-episode-12",
+      head_sha: HEAD, failures: 5, ceiling: 5 },
+    remediation: { kind: "none_authorized", reason: "the selected execution episode requires an operator renewal" },
+    actions: [{ state: "offered", operation: "renew_execution", effect: "Renews only execution allowance; other holds remain." }],
+    pending_retry: null, ...overrides,
+  };
+}
+
+export function currentExecution(choices = [executionGate()]) {
+  return { kind: "current" as const, execution_epoch: 7, execution_episode: "execution-episode-12",
+    failures: 5, failure_ceiling: 5, pin_deferrals: 2, displayed_round: 19, recovery_choices: choices };
+}
+
 export function decisionGate(overrides: Partial<ReviewGate> = {}): ReviewGate {
   return {
     gate_id: "rearm-stopped:request-12",

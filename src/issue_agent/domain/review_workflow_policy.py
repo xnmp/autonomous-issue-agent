@@ -21,11 +21,11 @@ from .actions import Target
 from .contracts import CommandId, CommandKind, LifecycleCommand, WorkflowAttemptIdentity
 from .identity import login_eq
 from .labels import LIFECYCLE_LABELS, Label
-from .review import EscalationCause
+from .review import EscalationCause, UNPRODUCTIVE_ROUND_HOLD
 from .review_rejection import validate_commit_sha
 from .review_execution import (
     CurrentReviewExecution,
-    freeze_current_review_generation,
+    freeze_current_review_generation, renew_current_review_execution,
 )
 from .review_workflow import (
     MAX_COUNTED_REVIEWS, BoundReviewSubmission, CancelledReviewRearm, CompleteReviews, CompletedReviewRearm,
@@ -33,13 +33,15 @@ from .review_workflow import (
     ObservedPullRequest, PendingReviewRearm, PullRequestAbsent, PullRequestObservation, PullRequestState,
     PullRequestUnavailable, RequireFreshReview, ReviewedBaseline, ReviewEpisode, ReviewProjectionPlan, ReviewRearmPreflight,
     ReviewRejectionCeiling, ReviewWorkflowSnapshot, SubmittedReviewState, SupersededReviewRearm, decisive_reviews,
-    ends_with_advance,
+    ends_with_advance, ReviewRejectionGrant, ReviewExecutionRenewalGrant, ReviewVerdictReleaseGrant, ReviewRearmGrant,
+    ReviewExecutionCeiling, ReviewVerdictHold,
 )
 from .workflow import (
     MAX_WORKFLOW_GATES, AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, ClearGuidance, ContinueGrantedRearm,
     NoAuthorizedRemediation, ObservedTransition, OpenGate, OperatorActor, RearmingGate, RearmNeedsDecision,
     RemoteOutcomeUncertain, RequestRearm, RetryAuthorizationRequired, SetGuidance, StopReason, UnresolvedGate,
     WorkflowChanged, WorkflowMutation, WorkflowRejected, WorkflowRejection, WorkflowTransition, WorkflowUnchanged,
+    RequestReviewExecutionRenewal, RequestReviewVerdictRelease,
 )
 from .workflow_reconciliation import prewrite_evidence_gate_id
 from .workflow_retry import RetryAuthorizationFacts, authorize_absent_retry
@@ -1319,6 +1321,7 @@ def _pending_intent(
     snapshot: ReviewWorkflowSnapshot, request_id: str, gate_id: str, dismissals: tuple[CountedReview, ...],
     authorized: tuple[CountedReview, ...], rule: CountingRule, projection: ReviewProjectionPlan,
     replaces: tuple[CommandId, ...],
+    *, grant: ReviewRearmGrant = ReviewRejectionGrant(),
 ) -> PendingReviewRearm:
     key = snapshot.revision.fence.key
     pr = key.target
@@ -1330,7 +1333,7 @@ def _pending_intent(
         + (RequireFreshReview(pr), EnsureReviewProjection(pr)),
         tuple(review_dismissal_command_id(key, request_id, review.review_id) for review in dismissals)
         + (review_projection_command_id(key, request_id),),
-        authorized, rule, projection, replaces,
+        authorized, rule, projection, replaces, grant=grant,
     )
 
 
@@ -1369,12 +1372,124 @@ def _guidance(snapshot: ReviewWorkflowSnapshot, command: RequestRearm) -> str:
     return snapshot.episode.guidance
 
 
+def review_execution_ceiling_gate_id(snapshot: ReviewWorkflowSnapshot, head_sha: str, ceiling: int) -> str:
+    validate_commit_sha(head_sha, "execution renewal head")
+    execution = snapshot.execution
+    if not isinstance(execution, CurrentReviewExecution):
+        raise ValueError("execution renewal requires current authority")
+    return _identity(snapshot, "review-execution-ceiling", _digest(
+        execution.binding.execution_epoch, execution.binding.execution_episode,
+        snapshot.revision.fence.generation, snapshot.revision.version, head_sha,
+        execution.state.failures, _ceiling_value(ceiling),
+    ))
+
+
+def review_verdict_release_gate_id(snapshot: ReviewWorkflowSnapshot, submission: BoundReviewSubmission) -> str:
+    if not isinstance(submission, BoundReviewSubmission) or submission.binding.fence.key != snapshot.revision.fence.key:
+        raise ValueError("verdict release requires this target's selected submission")
+    return _identity(snapshot, "review-verdict-release", _digest(
+        submission.command_id,
+    ))
+
+
+def _request_fixed_review_rearm(
+    snapshot: ReviewWorkflowSnapshot, command: RequestReviewExecutionRenewal, actor: OperatorActor,
+    pr: ObservedPullRequest, *, evidence_id: str, trigger_label: Label, executor_identity: str,
+    external_holds: tuple[str, ...], execution_ceiling: int, rule: CountingRule | None,
+    verdict_receipt: ReviewSubmissionReceipt | None, applied_sequences: tuple[int, ...],
+) -> WorkflowTransition:
+    execution = snapshot.execution
+    if not isinstance(execution, CurrentReviewExecution):
+        return _reject(WorkflowRejection.INVALID_SCOPE, "migration-blocked or inactive execution cannot be reset")
+    if (command.execution_epoch, command.execution_episode) != (
+        execution.binding.execution_epoch, execution.binding.execution_episode,
+    ):
+        return _reject(WorkflowRejection.INVALID_SCOPE, "request names another execution epoch or episode")
+    if not isinstance(rule, CountingRule):
+        raise ValueError("fixed review recovery requires the harness counting rule")
+    revision = _next(snapshot, advance_generation=True)
+    rejection = WorkflowBinding(revision.fence, snapshot.authority, snapshot.episode.episode_id)
+    grant: ReviewRearmGrant
+    cause: ReviewExecutionCeiling | ReviewVerdictHold
+    holds = _holds(external_holds)
+    basis = snapshot
+    selected_gate: OpenGate | None = None
+    if isinstance(command, RequestReviewVerdictRelease):
+        baseline = snapshot.episode.continuation
+        retained = next((gate for gate in snapshot.gates if isinstance(gate, OpenGate)
+            and isinstance(gate.cause, ReviewVerdictHold)
+            and gate.cause.submission_command_id == command.submission_command_id), None)
+        baseline_matches = (isinstance(baseline, ReviewedBaseline) and verdict_receipt is not None
+            and baseline.source == verdict_receipt.submission and baseline.head_sha == verdict_receipt.head_sha
+            and baseline.patch_id == verdict_receipt.patch_id)
+        if (not isinstance(verdict_receipt, ReviewSubmissionReceipt) or not verdict_receipt.escalated
+                or verdict_receipt.submission.command_id != command.submission_command_id
+                or verdict_receipt.submission.binding.fence.key != snapshot.revision.fence.key
+                or verdict_receipt.submission.binding.authority != snapshot.authority
+                or verdict_receipt.submission.binding.episode_id != snapshot.episode.episode_id
+                or not (baseline_matches or retained is not None
+                        and isinstance(retained.cause, ReviewVerdictHold)
+                        and retained.cause.head_sha == verdict_receipt.head_sha)
+                or pr.head_sha != verdict_receipt.head_sha
+                or command.gate_id != review_verdict_release_gate_id(snapshot, verdict_receipt.submission)):
+            return _reject(WorkflowRejection.INVALID_SCOPE, "release requires the current selected confirmed ESCALATE verdict")
+        grant = ReviewVerdictReleaseGrant(verdict_receipt.submission, verdict_receipt.head_sha)
+        cause = ReviewVerdictHold(command.submission_command_id, verdict_receipt.head_sha)
+        after_execution = _advanced_execution(snapshot, revision, WorkflowMutation.REQUEST_REARM, applied_sequences)
+        if retained is not None:
+            selected_gate = retained
+            basis = replace(snapshot, gates=tuple(gate for gate in snapshot.gates if gate != retained))
+    else:
+        if _ceiling_value(execution_ceiling) <= 0 or execution.state.failures < execution_ceiling:
+            return _reject(WorkflowRejection.NOT_EXHAUSTED, "the execution allowance is not exhausted")
+        if command.gate_id != review_execution_ceiling_gate_id(snapshot, pr.head_sha, execution_ceiling):
+            return _reject(WorkflowRejection.INVALID_SCOPE, "execution exhaustion or head changed before renewal")
+        if execution.baseline.through_sequence != execution.last_sequence:
+            return _reject(WorkflowRejection.OTHER_HOLD, "unfinished execution work must settle before renewal")
+        after_execution, receipt = renew_current_review_execution(execution, snapshot.revision, rejection,
+                                                                 command.request_id)
+        grant = ReviewExecutionRenewalGrant(execution.binding.execution_epoch,
+            execution.binding.execution_episode, after_execution.binding.execution_episode,
+            receipt.origin.evidence_id, command.request_id)
+        cause = ReviewExecutionCeiling(execution.binding.execution_epoch, execution.binding.execution_episode,
+                                      pr.head_sha, execution.state.failures, execution_ceiling)
+        holds = tuple(hold for hold in holds if hold != UNPRODUCTIVE_ROUND_HOLD)
+        if isinstance(verdict_receipt, ReviewSubmissionReceipt) and verdict_receipt.escalated:
+            verdict_id = review_verdict_release_gate_id(snapshot, verdict_receipt.submission)
+            if not any(_open(gate).gate_id == verdict_id for gate in snapshot.gates):
+                if len(snapshot.gates) == MAX_WORKFLOW_GATES:
+                    return _reject(WorkflowRejection.OTHER_HOLD, "the workflow cannot retain its selected verdict hold")
+                basis = replace(snapshot, gates=snapshot.gates + (OpenGate(verdict_id,
+                    snapshot.revision.fence.generation,
+                    ReviewVerdictHold(verdict_receipt.submission.command_id, verdict_receipt.head_sha),
+                    NoAuthorizedRemediation("the selected confirmed verdict requires an explicit release")),))
+    gate = selected_gate or OpenGate(command.gate_id, snapshot.revision.fence.generation, cause,
+                    NoAuthorizedRemediation("only this accepted fixed review recovery grant is authorized"))
+    kept = request_rearm_kept_holds(basis, gate.gate_id, holds, trigger_label)
+    gates = _request_gates(basis) + (RearmingGate(gate, command.request_id),)
+    if len(gates) > MAX_WORKFLOW_GATES:
+        return _reject(WorkflowRejection.OTHER_HOLD, "the workflow cannot hold another pending review decision")
+    projection = _plan(review_projection_command_id(snapshot.revision.fence.key, command.request_id), kept.held,
+                       trigger_label)
+    intent = _pending_intent(snapshot, command.request_id, gate.gate_id, (), (), rule, projection,
+                             kept.covered, grant=grant)
+    after = replace(snapshot, revision=revision, intent=intent, gates=gates, execution=after_execution,
+                    episode=replace(snapshot.episode, guidance=_guidance(snapshot, command),
+                                    continuation=FreshReviewRequired(revision.fence.generation)))
+    preflight = _preflight(snapshot, pr, (), evidence_id, holds)
+    return WorkflowChanged(snapshot.revision, WorkflowMutation.REQUEST_REARM, after,
+        AuthorizedOperatorCommand(actor, command, preflight), _rearm_commands(after, preflight,
+            executor_identity=executor_identity), prior=snapshot)
+
+
 def request_review_rearm(
     snapshot: ReviewWorkflowSnapshot, command: RequestRearm, actor: OperatorActor, pr: PullRequestObservation,
     *, now: datetime, active_reviews: tuple[WorkflowAttemptIdentity, ...], evidence_id: str,
     trigger_label: Label, executor_identity: str, external_holds: tuple[str, ...] = (),
     prior_request: RequestRearm | None = None,
     applied_sequences: tuple[int, ...] = (),
+    execution_ceiling: int = 0, rearm_rule: CountingRule | None = None,
+    verdict_receipt: ReviewSubmissionReceipt | None = None,
 ) -> WorkflowTransition:
     """Authorize dismissal of exactly the gate's observed counted set.
 
@@ -1399,6 +1514,11 @@ def request_review_rearm(
     if failure is not None:
         return failure
     assert isinstance(pr, ObservedPullRequest) and isinstance(pr.reviews, CompleteReviews)
+    if isinstance(command, RequestReviewExecutionRenewal):
+        return _request_fixed_review_rearm(snapshot, command, actor, pr, evidence_id=evidence_id,
+            trigger_label=trigger_label, executor_identity=executor_identity, external_holds=external_holds,
+            execution_ceiling=execution_ceiling, rule=rearm_rule, verdict_receipt=verdict_receipt,
+            applied_sequences=applied_sequences)
     gate = next((g for g in snapshot.gates if isinstance(g, OpenGate) and g.gate_id == command.gate_id), None)
     if gate is None or not isinstance(gate.cause, ReviewRejectionCeiling) or (
         gate.cause.episode_id != snapshot.episode.episode_id
@@ -1465,12 +1585,12 @@ def _retire_rearm(
         command, actor = cancellation
         intent = CancelledReviewRearm(pending.request_id, pending.gate_id, pending.to_generation,
                                       command.cancellation_id, command.reason, verified_commands, retired,
-                                      pending.authorized, pending.rule, pending.projection)
+                                      pending.authorized, pending.rule, pending.projection, grant=pending.grant)
         audit: AuthorizedOperatorCommand | ObservedTransition = AuthorizedOperatorCommand(actor, command)
     else:
         intent = SupersededReviewRearm(pending.request_id, pending.gate_id, pending.to_generation, reason,
                                        evidence_id, verified_commands, retired, pending.authorized, pending.rule,
-                                       pending.projection)
+                                       pending.projection, grant=pending.grant)
         audit = ObservedTransition((evidence_id,))
     generation = snapshot.revision.fence.generation
     gates = tuple(g for g in snapshot.gates
@@ -1570,6 +1690,8 @@ def ceiling_reached_again(pending: PendingReviewRearm, pr: ObservedPullRequest, 
         raise ValueError("re-rejection requires the pending intent and a present observation")
     if not isinstance(pr.reviews, CompleteReviews):
         return False
+    if not isinstance(pending.grant, ReviewRejectionGrant):
+        return False
     authorized = _ids(pending.authorized)
     fresh = tuple(r for r in counted_rejections(pr.reviews, pending.rule) if r.review_id not in authorized)
     return not _ceiling_cleared(fresh, _ceiling_value(ceiling))
@@ -1630,13 +1752,15 @@ def continue_review_rearm(
     gate = next((g for g in snapshot.gates if isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision)
                  and g.cause.stopped_request_id == stopped.request_id), None)
     assert gate is not None
-    counted = counted_rejections(pr.reviews, stopped.rule)
-    if not _ids(counted) <= _ids(stopped.authorized):
+    counted = (counted_rejections(pr.reviews, stopped.rule)
+               if isinstance(stopped.grant, ReviewRejectionGrant) else ())
+    if isinstance(stopped.grant, ReviewRejectionGrant) and not _ids(counted) <= _ids(stopped.authorized):
         return _reject(WorkflowRejection.INVALID_SCOPE,
                        "reviews counted outside the stopped authorization require an explicit new authorization")
     preflight = _preflight(snapshot, pr, counted, evidence_id, external_holds)
     by_id = {review.review_id: review for review in stopped.authorized}
-    dismissals = tuple(by_id[review.review_id] for review in counted)
+    dismissals = (tuple(by_id[review.review_id] for review in counted)
+                  if isinstance(stopped.grant, ReviewRejectionGrant) else ())
     revision = _next(snapshot, advance_generation=True)
     assert isinstance(gate.cause, RearmNeedsDecision)
     gates = tuple(RearmingGate(gate, command.request_id) if g == gate else g
@@ -1645,7 +1769,7 @@ def continue_review_rearm(
     projection = _plan(review_projection_command_id(snapshot.revision.fence.key, command.request_id), kept.held,
                        trigger_label)
     intent = _pending_intent(snapshot, command.request_id, gate.gate_id, dismissals, stopped.authorized, stopped.rule,
-                             projection, kept.covered)
+                             projection, kept.covered, grant=stopped.grant)
     after = replace(
         snapshot, revision=revision, intent=intent,
         episode=replace(snapshot.episode, continuation=FreshReviewRequired(revision.fence.generation)), gates=gates,
@@ -1679,9 +1803,9 @@ def complete_review_rearm(
     ):
         return _reject(WorkflowRejection.OBSERVATION_UNAVAILABLE, "every required remote obligation must be verified")
     counted = counted_rejections(pr.reviews, pending.rule)
-    if _ids(counted) & _ids(pending.authorized):
+    if isinstance(pending.grant, ReviewRejectionGrant) and _ids(counted) & _ids(pending.authorized):
         return _reject(WorkflowRejection.OBSERVATION_UNAVAILABLE, "fresh reviews still count an authorized review")
-    if not _ceiling_cleared(counted, ceiling):
+    if isinstance(pending.grant, ReviewRejectionGrant) and not _ceiling_cleared(counted, ceiling):
         return _reject(WorkflowRejection.OTHER_HOLD, "fresh reviews still reach the rejection ceiling")
     remaining = tuple(g for g in snapshot.gates if _open(g).gate_id != pending.gate_id)
     # Covered uncertainty stays gated after completion but is no independent
@@ -1691,7 +1815,8 @@ def complete_review_rearm(
             return _reject(WorkflowRejection.OTHER_HOLD, "the remote projection must preserve remaining holds")
     elif Label.NEEDS_HUMAN_REVIEW in pr.labels or trigger not in pr.labels:
         return _reject(WorkflowRejection.OTHER_HOLD, "the remote projection has not released the review trigger")
-    intent = CompletedReviewRearm(pending.request_id, pending.gate_id, pending.to_generation, verified_commands)
+    intent = CompletedReviewRearm(pending.request_id, pending.gate_id, pending.to_generation, verified_commands,
+                                grant=pending.grant)
     after = replace(snapshot, revision=_next(snapshot), intent=intent, gates=remaining)
     return WorkflowChanged(snapshot.revision, WorkflowMutation.RECONCILE_REARM, after,
                            ObservedTransition(evidence_ids), prior=snapshot)
@@ -1726,6 +1851,8 @@ class ReviewTransitionFacts:
     # AUTHORIZE_RETRY is re-derived from; minted by the store, never wire input.
     retry: RetryAuthorizationFacts | None = None
     applied_sequences: tuple[int, ...] = ()
+    execution_ceiling: int = 0
+    verdict_receipt: ReviewSubmissionReceipt | None = None
 
 
 def _by_identity(commands: tuple[LifecycleCommand, ...]) -> list[LifecycleCommand]:
@@ -1842,6 +1969,8 @@ def validate_review_transition(
                 evidence_id=evidence_id, trigger_label=facts.trigger_label,
                 executor_identity=facts.executor_identity, external_holds=facts.external_holds,
                 applied_sequences=facts.applied_sequences,
+                execution_ceiling=facts.execution_ceiling, rearm_rule=facts.rule,
+                verdict_receipt=facts.verdict_receipt,
             )
         elif mutation is WorkflowMutation.CONTINUE_REARM and isinstance(audit.command, ContinueGrantedRearm):
             expected = continue_review_rearm(

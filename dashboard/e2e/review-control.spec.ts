@@ -24,6 +24,110 @@ async function drain(page: Page, pr: number) {
 }
 
 test.describe("review operator controls", () => {
+  test("renewing the selected exhausted episode once completes projection and preserves its sibling hold", async ({ page }) => {
+    const errors: string[] = [];
+    page.on("pageerror", (error) => errors.push(error.message));
+    const panel = await openReview(page, 94);
+    await expect(panel.getByText(/Failed rounds 5\/5/)).toBeVisible();
+    await panel.getByRole("button", { name: "Renew execution allowance" }).click();
+    await panel.getByRole("button", { name: "Review command" }).click();
+    const posted = page.waitForRequest("**/api/repos/self/pulls/194/review-control/commands");
+    await panel.getByRole("button", { name: "Confirm command" }).click();
+    expect((await posted).postDataJSON()).toMatchObject({ operation: "renew_execution",
+      execution_epoch: 7, execution_episode: "execution-194", guidance: { kind: "keep" } });
+    await expect(panel.getByRole("heading", { name: "Command recorded" })).toBeVisible();
+    await panel.getByRole("button", { name: "Close result" }).click();
+    const current = panel.getByRole("region", { name: "Current re-arm request" });
+    await expect(current).toContainText("pending");
+    await expect(current.getByRole("listitem")).toHaveCount(1);
+    await expect(panel.getByText(/Failed rounds 0\/5/)).toBeVisible();
+    await drain(page, 194);
+    await panel.getByRole("button", { name: "Refresh status" }).click();
+    await expect(current).toContainText("Every obligation is verified");
+    await expect(panel.getByText(/independent sibling hold/)).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Renew execution allowance" })).toHaveCount(0);
+    const response = await page.request.get(`${BASE}/api/repos/self/pulls/194/review-control`);
+    expect((await response.json()).execution.execution_episode).toBe("renewed-194-1");
+    for (const width of [320, 768]) {
+      await page.setViewportSize({ width, height: 900 });
+      expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+    }
+    expect(errors).toEqual([]);
+    await page.screenshot({ path: test.info().outputPath("renewal-completed-sibling-hold.png"), fullPage: true });
+  });
+
+  test("lost renewal reply and reload replay the original captured request without another grant", async ({ page }) => {
+    const bodies: (string | null)[] = [];
+    await page.route("**/api/repos/self/pulls/195/review-control/commands", async (route) => {
+      bodies.push(route.request().postData());
+      if (bodies.length === 1) { await route.fetch(); await route.abort("failed"); }
+      else await route.continue();
+    });
+    let panel = await openReview(page, 95);
+    await panel.getByRole("button", { name: "Renew execution allowance" }).click();
+    await panel.getByRole("button", { name: "Review command" }).click();
+    await panel.getByRole("button", { name: "Confirm command" }).click();
+    await expect(panel.getByRole("heading", { name: "Command outcome not confirmed" })).toBeVisible();
+    await page.reload();
+    panel = page.getByRole("region", { name: /Review control PR #195/ });
+    await expect(panel.getByRole("heading", { name: "Command outcome not confirmed" })).toBeVisible();
+    expect(bodies).toHaveLength(1);
+    await panel.getByRole("button", { name: "Retry same command" }).click();
+    await expect(panel.getByText(/Original command replayed/)).toBeVisible();
+    expect(bodies).toHaveLength(2);
+    expect(bodies[1]).toBe(bodies[0]);
+    const control = await (await page.request.get(`${BASE}/api/repos/self/pulls/195/review-control`)).json();
+    expect(control.execution.execution_episode).toBe("renewed-195-1");
+    expect(control.current_intent.authorized_reviews).toEqual([]);
+  });
+
+  test("stale renewal confirmation reports conflict and grants no new episode", async ({ page }) => {
+    const panel = await openReview(page, 96);
+    await panel.getByRole("button", { name: "Renew execution allowance" }).click();
+    await panel.getByRole("button", { name: "Review command" }).click();
+    expect((await page.request.post(`${BASE}/fixture/review-revision/196`, { headers: HEADERS })).ok()).toBe(true);
+    await panel.getByRole("button", { name: "Confirm command" }).click();
+    await expect(panel.getByRole("heading", { name: "Command not accepted" })).toBeVisible();
+    await expect(panel.getByText(/workflow revision changed/)).toBeVisible();
+    const control = await (await page.request.get(`${BASE}/api/repos/self/pulls/196/review-control`)).json();
+    expect(control.execution.execution_episode).toBe("execution-196");
+    expect(control.execution.failures).toBe(5);
+    expect(control.current_intent).toBeNull();
+  });
+
+  test("blocked history names the source, has no legacy reset and remains unchanged after polling", async ({ page }) => {
+    await page.route("**/api/repos/self/workflow-families", (route) => route.fulfill({ status: 200,
+      contentType: "application/json", body: JSON.stringify({ status: "available", repository: "o/r",
+        active_families: ["review_rejections"] }) }));
+    const before = await (await page.request.get(`${BASE}/api/repos/self/pulls/197/review-control`)).json();
+    const panel = await openReview(page, 97);
+    await expect(panel.getByRole("heading", { name: "Review execution migration blocked" })).toBeVisible();
+    await expect(panel.getByText("unassigned-review-counter")).toBeVisible();
+    await expect(panel.getByRole("button", { name: /Renew execution|Release selected/ })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Review legacy unblock" })).toBeDisabled();
+    for (let count = 0; count < 3; count += 1) await panel.getByRole("button", { name: "Refresh status" }).click();
+    const after = await (await page.request.get(`${BASE}/api/repos/self/pulls/197/review-control`)).json();
+    expect(after).toEqual(before);
+  });
+
+  test("selected verdict release completes without renewing execution or clearing a sibling hold", async ({ page }) => {
+    const panel = await openReview(page, 98);
+    await panel.getByRole("button", { name: "Release selected verdict hold" }).click();
+    await panel.getByRole("button", { name: "Review command" }).click();
+    const posted = page.waitForRequest("**/api/repos/self/pulls/198/review-control/commands");
+    await panel.getByRole("button", { name: "Confirm command" }).click();
+    expect((await posted).postDataJSON()).toMatchObject({ operation: "release_verdict",
+      execution_episode: "execution-198", submission_command_id: "confirmed-198" });
+    await expect(panel.getByRole("heading", { name: "Command recorded" })).toBeVisible();
+    await panel.getByRole("button", { name: "Close result" }).click();
+    await drain(page, 198);
+    await panel.getByRole("button", { name: "Refresh status" }).click();
+    await expect(panel.getByRole("region", { name: "Current re-arm request" })).toContainText("Every obligation is verified");
+    await expect(panel.getByText(/Failed rounds 5\/5/)).toBeVisible();
+    await expect(panel.getByText(/independent sibling hold/)).toBeVisible();
+    await expect(panel.getByRole("button", { name: "Release selected verdict hold" })).toHaveCount(0);
+  });
+
   test("re-arming a ceiling records pending dismissals, then shows completion once the daemon drains", async ({ page }) => {
     const panel = await openReview(page, 81);
     await expect(panel.getByText("Review rejection ceiling")).toBeVisible();

@@ -40,6 +40,7 @@ from tests.app.review_acceptance_harness import (
     isolate_authority, verdicts, register_review_launch,
 )
 from tests.app.test_review_acceptance import escalate, progress_until
+from tests.adapters.test_review_execution_control import rig as current_execution_rig
 
 BASE = "http://127.0.0.1:8321"
 HEADERS = {"X-Issue-Agent-Dashboard": "1"}
@@ -128,6 +129,50 @@ def escalated(deployment):
 
 
 # -- reads -------------------------------------------------------------------------------------------
+
+
+def test_current_execution_http_poll_stale_renewal_and_original_request_replay_are_bound_and_inert(
+    tmp_path, current_execution_rig,
+):
+    from issue_agent.domain.review_dispatch_record import DecisionBasis, DecisionRead, ReviewNotAdmitted
+    from tests.adapters.test_review_execution_renewal_transactions import workflow_control
+
+    store, before, gateway, selection, _ = current_execution_rig
+    control = workflow_control(current_execution_rig)
+    control.record_dispatch_decision(selection.observation.key, ReviewNotAdmitted(("execution exhausted",)),
+        DecisionBasis(gateway.view.head_ref_oid, selection.observation.state, gateway.view.labels, ()),
+        DecisionRead.REVIEW_READ)
+    api = Api(tmp_path, store.path, store.now, lambda _name, **_kwargs: workflow_control(current_execution_rig))
+    path = "/api/repos/demo/pulls/9/review-control"
+    saved = dump(store.path)
+    gateway.calls.clear()
+    inspected = api.get(path=path).json()
+    assert inspected["execution"]["kind"] == "current"
+    assert inspected["execution"]["failures"] == 3
+    ((choice),) = inspected["execution"]["recovery_choices"]
+    assert choice["actions"][0]["operation"] == "renew_execution"
+    for _ in range(3):
+        assert api.get(path=path).json() == inspected
+    assert dump(store.path) == saved and gateway.calls == []
+    body = {"operation": "renew_execution", "expected": inspected["expected"], "request_id": "http:renew",
+        "gate_id": choice["gate_id"], "guidance": {"kind": "keep"},
+        "execution_epoch": inspected["execution"]["execution_epoch"],
+        "execution_episode": inspected["execution"]["execution_episode"]}
+    stale = {**body, "expected": {**body["expected"], "version": body["expected"]["version"] + 1}}
+    assert api.client.post(path + "/commands", json=stale).status_code == 409
+    assert dump(store.path) == saved
+    accepted = api.client.post(path + "/commands", json=body)
+    assert accepted.status_code == 202, accepted.text
+    after = accepted.json()["control"]
+    assert after["execution"]["failures"] == 0
+    assert after["execution"]["execution_episode"] != before.execution.binding.execution_episode
+    assert after["current_intent"]["authorized_reviews"] == []
+    saved = dump(store.path)
+    gateway.calls.clear()
+    replay = api.client.post(path + "/commands", json=body)
+    assert replay.status_code == 200 and replay.json()["outcome"] == "replayed"
+    assert replay.json()["control"] == after
+    assert dump(store.path) == saved and gateway.calls == []
 
 def test_an_escalated_ceiling_is_projected_read_only_with_its_counted_reviews_and_lever(escalated):
     deployment = escalated.deployment
@@ -1162,3 +1207,27 @@ def test_the_family_status_names_the_active_families(bare):
     active = api.client.get(families)
     assert active.status_code == 200
     assert active.json() == {"status": "available", "repository": REPO, "active_families": ["review_rejections"]}
+
+
+def test_closed_operator_transport_captures_fixed_execution_identity_and_returns_accepted_state(current_execution_rig):
+    from issue_agent.app.dashweb.review_contracts import ReviewRequestExecutionRenewal
+    from issue_agent.app.dashweb.review_control import submit_review_control
+
+    from tests.adapters.test_review_execution_renewal_transactions import renewal_request, workflow_control
+
+    rig = current_execution_rig
+    request = renewal_request(rig)
+    binding = request.expected_binding
+    body = ReviewRequestExecutionRenewal.model_validate({
+        "operation": "renew_execution", "request_id": request.request_id, "gate_id": request.gate_id,
+        "guidance": {"kind": "keep"}, "execution_epoch": request.execution_epoch,
+        "execution_episode": request.execution_episode,
+        "expected": {"repository": "o/r", "pull_request": 9, "family": "review_rejections",
+                     "epoch": binding.authority.epoch, "generation": binding.fence.generation,
+                     "version": request.expected.version, "episode_id": binding.episode_id},
+    })
+    assert body.command() == request
+    result = submit_review_control(workflow_control(rig), 9, body)
+    assert result.outcome == "accepted"
+    assert result.control.current_intent.authorized_reviews == []
+    assert result.control.gates[-1].cause.kind == "review_execution_ceiling"

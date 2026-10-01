@@ -8,7 +8,7 @@ completion can never repopulate it. Values perform no I/O.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
 
@@ -16,23 +16,26 @@ from .contracts import CommandId
 from .labels import Label
 from .review_rejection import (
     MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, CountedReview, CountingRule, PullRequestState, ReviewProjectionRefused,
-    ReviewRearmPreflight, ReviewRejectionCeiling, validate_commit_sha, validate_counted, validate_labels,
+    ReviewExecutionCeiling, ReviewVerdictHold, ReviewRearmPreflight, ReviewRejectionCeiling, validate_commit_sha, validate_counted, validate_labels,
 )
 from .workflow import (
     GUIDANCE_MAX_CHARS, MAX_DETAIL_CHARS, MAX_WORKFLOW_GATES,
     AuthorizedOperatorCommand, ContinueGrantedRearm, OpenGate, RearmNeedsDecision, RearmingGate, RequestRearm,
+    RequestReviewExecutionRenewal, RequestReviewVerdictRelease,
     ResolveCeiling, StopReason, WorkflowAbsent, WorkflowChanged, WorkflowMigrationRequired, WorkflowMutation,
     WorkflowSnapshot, WorkflowUnavailable,
     _command_ids, _count, _items, _text, _time,
 )
 from .review_evidence import is_review_evidence_gate
-from .review_execution import ActivatedReviewExecution, CurrentReviewExecution, ExecutionNotActivated, BlockedReviewExecutionMigration, ReviewExecutionComponent
+from .review_execution import ActivatedReviewExecution, CurrentReviewExecution, ExecutionNotActivated, BlockedReviewExecutionMigration, ReviewExecutionComponent, renew_current_review_execution
 from .workflow_reconciliation import is_prewrite_gate
 from .workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision,
 )
 
 __all__ = [
+    "ReviewRejectionGrant", "ReviewExecutionRenewalGrant", "ReviewVerdictReleaseGrant", "ReviewRearmGrant",
+    "ReviewExecutionCeiling", "ReviewVerdictHold",
     "MAX_COUNTED_REVIEWS", "MAX_OBSERVED_REVIEWS", "CountedReview", "CountingRule", "ReviewRearmPreflight", "ReviewRejectionCeiling",
     "FreshReviewRequired", "BoundReviewSubmission", "ImportedBaseline", "ReviewedBaseline", "ReviewContinuation",
     "ReviewEpisode", "DismissCountedReview", "RequireFreshReview", "EnsureReviewProjection", "ReviewRearmOperation",
@@ -202,6 +205,49 @@ _OPERATIONS = (DismissCountedReview, RequireFreshReview, EnsureReviewProjection)
 
 
 @dataclass(frozen=True)
+class ReviewRejectionGrant:
+    pass
+
+
+@dataclass(frozen=True)
+class ReviewExecutionRenewalGrant:
+    execution_epoch: int
+    previous_episode: str
+    renewed_episode: str
+    origin_evidence_id: str
+    original_request_id: str
+
+    def __post_init__(self) -> None:
+        _count(self.execution_epoch, "execution epoch", minimum=1)
+        for name in ("previous_episode", "renewed_episode", "origin_evidence_id", "original_request_id"):
+            _text(getattr(self, name), name)
+        if self.previous_episode == self.renewed_episode:
+            raise ValueError("execution renewal requires a new episode")
+
+
+@dataclass(frozen=True)
+class ReviewVerdictReleaseGrant:
+    submission: BoundReviewSubmission
+    head_sha: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.submission, BoundReviewSubmission):
+            raise ValueError("verdict release requires its exact bound submission")
+        validate_commit_sha(self.head_sha, "selected verdict head")
+
+
+ReviewRearmGrant = ReviewRejectionGrant | ReviewExecutionRenewalGrant | ReviewVerdictReleaseGrant
+_GRANTS = (ReviewRejectionGrant, ReviewExecutionRenewalGrant, ReviewVerdictReleaseGrant)
+
+
+def _grant(value: object, authorized: tuple[CountedReview, ...] = ()) -> None:
+    if not isinstance(value, _GRANTS):
+        raise ValueError("review intent requires a fixed typed grant")
+    if not isinstance(value, ReviewRejectionGrant) and authorized:
+        raise ValueError("execution renewal and verdict release cannot authorize review dismissal")
+
+
+@dataclass(frozen=True)
 class PendingReviewRearm:
     """`authorized` is the exact counted set the operator accepted; dismissal
     obligations may name only those reviews, and a stopped intent keeps them so
@@ -222,6 +268,7 @@ class PendingReviewRearm:
     rule: CountingRule
     projection: ReviewProjectionPlan
     replaces: tuple[CommandId, ...] = ()
+    grant: ReviewRearmGrant = field(default=ReviewRejectionGrant(), kw_only=True)
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
@@ -241,6 +288,7 @@ class PendingReviewRearm:
         if len(dismissed) > MAX_COUNTED_REVIEWS:
             raise ValueError("review rearm dismissals exceed the counted-review bound")
         validate_counted(self.authorized, "authorized reviews")
+        _grant(self.grant, self.authorized)
         if not set(self.dismissals) <= set(self.authorized):
             raise ValueError("review rearm may dismiss only its authorized counted reviews")
         if len({item.pr for item in self.operations}) != 1:
@@ -287,12 +335,14 @@ class CompletedReviewRearm:
     gate_id: str
     to_generation: int
     verified_commands: tuple[CommandId, ...]
+    grant: ReviewRearmGrant = field(default=ReviewRejectionGrant(), kw_only=True)
 
     def __post_init__(self) -> None:
         _text(self.request_id, "request")
         _text(self.gate_id, "gate")
         _count(self.to_generation, "rearm generation", minimum=1)
         _command_ids(self.verified_commands, "verified commands")
+        _grant(self.grant)
 
 
 @dataclass(frozen=True)
@@ -307,6 +357,7 @@ class SupersededReviewRearm:
     authorized: tuple[CountedReview, ...]
     rule: CountingRule
     projection: ReviewProjectionPlan
+    grant: ReviewRearmGrant = field(default=ReviewRejectionGrant(), kw_only=True)
 
     def __post_init__(self) -> None:
         _projection(self.projection)
@@ -314,6 +365,7 @@ class SupersededReviewRearm:
         _text(self.gate_id, "gate")
         _text(self.evidence_id, "supersession evidence")
         validate_counted(self.authorized, "authorized reviews")
+        _grant(self.grant, self.authorized)
         _rule(self.rule)
         _count(self.to_generation, "rearm generation", minimum=1)
         if not isinstance(self.reason, StopReason) or self.reason is StopReason.OPERATOR_CANCELLED:
@@ -333,6 +385,7 @@ class CancelledReviewRearm:
     authorized: tuple[CountedReview, ...]
     rule: CountingRule
     projection: ReviewProjectionPlan
+    grant: ReviewRearmGrant = field(default=ReviewRejectionGrant(), kw_only=True)
 
     def __post_init__(self) -> None:
         _projection(self.projection)
@@ -340,6 +393,7 @@ class CancelledReviewRearm:
         _text(self.gate_id, "gate")
         _text(self.cancellation_id, "cancellation")
         validate_counted(self.authorized, "authorized reviews")
+        _grant(self.grant, self.authorized)
         _rule(self.rule)
         _text(self.reason, "cancellation reason", limit=MAX_DETAIL_CHARS)
         _count(self.to_generation, "rearm generation", minimum=1)
@@ -398,6 +452,21 @@ class ReviewWorkflowSnapshot:
             raise ValueError("a review workflow cannot hold a resolve ceiling cause")
         if self.intent is not None and not isinstance(self.intent, _INTENTS):
             raise ValueError("intent must be a validated review variant")
+        grant = self.intent.grant if self.intent is not None else None
+        if isinstance(grant, ReviewExecutionRenewalGrant):
+            from .review_execution import ReviewExecutionOriginKind
+            if (not isinstance(self.execution, CurrentReviewExecution)
+                    or self.execution.origin.kind is not ReviewExecutionOriginKind.RENEWED
+                    or self.execution.origin.evidence_id != grant.origin_evidence_id
+                    or self.execution.binding.execution_epoch != grant.execution_epoch
+                    or self.execution.binding.execution_episode != grant.renewed_episode):
+                raise ValueError("renewal grant must name this execution's exact origin and episode")
+        elif isinstance(grant, ReviewVerdictReleaseGrant):
+            binding = grant.submission.binding
+            if (binding.fence.key != self.revision.fence.key or binding.authority != self.authority
+                    or binding.episode_id != self.episode.episode_id
+                    or binding.fence.generation > generation):
+                raise ValueError("verdict grant must belong to this rejection component")
         rearming = tuple(g for g in self.gates if isinstance(g, RearmingGate))
         if isinstance(self.intent, PendingReviewRearm):
             if self.intent.to_generation != generation:
@@ -413,10 +482,27 @@ class ReviewWorkflowSnapshot:
                 raise ValueError("a pending review rearm owes a fresh review from its new generation")
             cause = rearming[0].gate.cause
             if isinstance(cause, ReviewRejectionCeiling):
+                if not isinstance(self.intent.grant, ReviewRejectionGrant):
+                    raise ValueError("a rejection ceiling requires a rejection grant")
                 if not set(self.intent.authorized) <= set(cause.counted):
                     raise ValueError("a review rearm may authorize only the gate's counted reviews")
                 if self.intent.rule != cause.rule:
                     raise ValueError("a review rearm counts under its gate's captured rule")
+            elif isinstance(cause, ReviewExecutionCeiling):
+                grant = self.intent.grant
+                if (not isinstance(grant, ReviewExecutionRenewalGrant)
+                        or (cause.execution_epoch, cause.execution_episode)
+                        != (grant.execution_epoch, grant.previous_episode)
+                        or not isinstance(self.execution, CurrentReviewExecution)
+                        or (self.execution.binding.execution_epoch, self.execution.binding.execution_episode)
+                        != (grant.execution_epoch, grant.renewed_episode)):
+                    raise ValueError("execution ceiling requires its exact renewed episode grant")
+            elif isinstance(cause, ReviewVerdictHold):
+                grant = self.intent.grant
+                if (not isinstance(grant, ReviewVerdictReleaseGrant)
+                        or cause.submission_command_id != grant.submission.command_id
+                        or cause.head_sha != grant.head_sha):
+                    raise ValueError("verdict release requires its exact selected verdict grant")
             elif not isinstance(cause, RearmNeedsDecision) or cause.stopped_request_id == self.intent.request_id:
                 raise ValueError("a review rearm requires a rejection ceiling or an earlier stopped decision")
             elif not set(self.intent.replaces) <= set(cause.obligations):
@@ -730,7 +816,60 @@ def validate_review_change(change: WorkflowChanged) -> None:
     if not isinstance(audit, AuthorizedOperatorCommand) or not isinstance(audit.preflight, ReviewRearmPreflight) or not isinstance(intent, PendingReviewRearm):
         raise ValueError("accepted review rearm requires its preflight and pending intent")
     preflight, dismissed = audit.preflight, _ids(intent.dismissals)
-    if isinstance(audit.command, RequestRearm):
+    if isinstance(audit.command, RequestReviewExecutionRenewal):
+        command = audit.command
+        if intent.authorized or dismissed or preflight.counted:
+            raise ValueError("fixed execution/verdict recovery cannot grant dismissal authority")
+        selected = next((g for g in after.gates if isinstance(g, RearmingGate)
+                         and g.gate.gate_id == command.gate_id), None)
+        if selected is None or selected.request_id != command.request_id:
+            raise ValueError("fixed recovery requires its exact selected pending gate")
+        retained = {g for g in prior.gates if not ends_with_advance(g) and not (
+            isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision))}
+        if isinstance(command, RequestReviewVerdictRelease):
+            grant = intent.grant
+            if (not isinstance(grant, ReviewVerdictReleaseGrant)
+                    or grant.submission.command_id != command.submission_command_id
+                    or selected.gate.cause != ReviewVerdictHold(command.submission_command_id, grant.head_sha)
+                    or not isinstance(prior.execution, CurrentReviewExecution)
+                    or not isinstance(after.execution, CurrentReviewExecution)
+                    or prior.execution.binding.execution_episode != after.execution.binding.execution_episode
+                    or prior.execution.state.failures != after.execution.state.failures
+                    or prior.execution.state.pin_deferrals != after.execution.state.pin_deferrals
+                    or prior.execution.state.displayed_round != after.execution.state.displayed_round):
+                raise ValueError("verdict release cannot renew or change execution allowance")
+            retained = {g for g in retained if not (isinstance(g, OpenGate)
+                and g.gate_id == command.gate_id and g.cause == selected.gate.cause)}
+        else:
+            grant = intent.grant
+            if not isinstance(grant, ReviewExecutionRenewalGrant) or not isinstance(prior.execution, CurrentReviewExecution):
+                raise ValueError("execution renewal requires its captured current grant")
+            renewed, receipt = renew_current_review_execution(prior.execution, prior.revision, after.binding,
+                                                              command.request_id)
+            cause = selected.gate.cause
+            if (after.execution != renewed or grant.execution_epoch != command.execution_epoch
+                    or grant.previous_episode != command.execution_episode
+                    or grant.renewed_episode != renewed.binding.execution_episode
+                    or grant.origin_evidence_id != receipt.origin.evidence_id
+                    or grant.original_request_id != command.request_id
+                    or not isinstance(cause, ReviewExecutionCeiling)
+                    or cause.execution_episode != prior.execution.binding.execution_episode
+                    or cause.failures != prior.execution.state.failures or cause.head_sha != preflight.head_sha):
+                raise ValueError("execution renewal requires exactly its authorized reset")
+            for gate in after.gates:
+                if isinstance(gate, OpenGate) and isinstance(gate.cause, ReviewVerdictHold) and gate not in retained:
+                    baseline = prior.episode.continuation
+                    if (not isinstance(baseline, ReviewedBaseline) or not isinstance(baseline.source, BoundReviewSubmission)
+                            or gate.cause.submission_command_id != baseline.source.command_id
+                            or gate.cause.head_sha != baseline.head_sha):
+                        raise ValueError("renewal may retain only its exact selected verdict source")
+                    retained.add(gate)
+        if set(after.gates) != retained | {selected} or len(after.gates) != len(retained) + 1:
+            raise ValueError("fixed recovery must preserve every unrelated hold")
+        absorbed = tuple(c for g in prior.gates if isinstance(g, OpenGate) and isinstance(g.cause, RearmNeedsDecision)
+                         for c in g.cause.obligations)
+        _validate_coverage(prior, intent, absorbed)
+    elif isinstance(audit.command, RequestRearm):
         gate = next((g for g in prior.gates if isinstance(g, OpenGate) and g.gate_id == audit.command.gate_id), None)
         if gate is None or not isinstance(gate.cause, ReviewRejectionCeiling):
             raise ValueError("a review allowance rearm requires an open review rejection ceiling")
@@ -772,6 +911,8 @@ def validate_review_change(change: WorkflowChanged) -> None:
             raise ValueError("a review continuation cannot widen the stopped authorization")
         if intent.rule != stopped.rule:
             raise ValueError("a review continuation counts under the stopped intent's rule")
+        if intent.grant != stopped.grant:
+            raise ValueError("a review continuation must retain exactly its original grant")
         if not _ids(preflight.counted) <= _ids(stopped.authorized):
             raise ValueError("the preflight counts reviews outside the stopped authorization")
         if not dismissed <= _ids(preflight.counted):

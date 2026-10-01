@@ -261,6 +261,9 @@ REVIEW_PR_OFFSET = 100
 HUGE_CEILING_PR = 183
 # An expired dismissal whose harness read proved it absent: one retry grant.
 REVIEW_RETRY_PR = 182
+EXECUTION_RENEWAL_PRS = frozenset({194, 195, 196})
+EXECUTION_BLOCKED_PR = 197
+EXECUTION_VERDICT_PR = 198
 REVIEW_HEAD = "c" * 40
 REVIEW_BOT = "review-bot[bot]"
 
@@ -280,6 +283,10 @@ class _ReviewState:
     retry_settled: bool = False
     drained: bool = False
     processed: dict = field(default_factory=dict)
+    execution_episode: str = ""
+    execution_failures: int = 5
+    execution_renewals: int = 0
+    verdict_released: bool = False
 
     @property
     def episode_id(self) -> str:
@@ -366,6 +373,16 @@ class ReviewFixture:
         )
 
     def _gates(self, state: _ReviewState) -> list[wc.ReviewGate]:
+        if state.pr in EXECUTION_RENEWAL_PRS or state.pr == EXECUTION_VERDICT_PR:
+            return [wc.ReviewGate(
+                gate_id=f"sibling-{state.pr}", state="open", opened_generation=1,
+                cause=wc.ReviewEvidenceUnavailableCause(kind="evidence_unavailable", evidence="other",
+                    source="independent sibling hold", unresolved_since="2026-09-26T09:00:00+00:00",
+                    failed_reads=3, last_error="sibling source unavailable"),
+                remediation=wc.ReviewNoRemediation(kind="none_authorized", reason="wait for the sibling source"),
+                actions=[], pending_retry=None)]
+        if state.pr == EXECUTION_BLOCKED_PR:
+            return []
         if state.pr == REVIEW_RETRY_PR:
             return [] if state.retry_settled else [self._retry_gate(state)]
         return [] if isinstance(state.current_intent, wc.ReviewCompletedRearm) else [self._ceiling(state)]
@@ -400,7 +417,35 @@ class ReviewFixture:
                                                       owed_since_generation=state.generation),
             daemon=self._daemon(state, gates), current_intent=state.current_intent, requested_id=request_id,
             requested_intent=state.rearms.get(request_id) if request_id else None, observation=None,
+            execution=self._execution(state),
         )
+
+    def _execution(self, state: _ReviewState) -> wc.ReviewExecution:
+        if state.pr == EXECUTION_BLOCKED_PR:
+            return wc.ReviewExecutionBlocked(kind="blocked", execution_epoch=7, blockers=[
+                wc.ReviewMigrationBlocker(kind="origin", sources=[wc.ReviewMigrationSource(
+                    kind="file", identity="unassigned-review-counter", digest="a" * 64)])])
+        if state.pr not in EXECUTION_RENEWAL_PRS and state.pr != EXECUTION_VERDICT_PR:
+            return wc.ReviewExecutionInactive()
+        episode = state.execution_episode or f"execution-{state.pr}"
+        choices = []
+        if state.current_intent is None and (state.execution_failures >= 5 or
+                state.pr == EXECUTION_VERDICT_PR and not state.verdict_released):
+            verdict = state.pr == EXECUTION_VERDICT_PR
+            cause = (wc.ReviewVerdictHoldCause(kind="review_verdict_hold",
+                submission_command_id=f"confirmed-{state.pr}", head_sha=REVIEW_HEAD) if verdict else
+                wc.ReviewExecutionCeilingCause(kind="review_execution_ceiling", execution_epoch=7,
+                    execution_episode=episode, head_sha=REVIEW_HEAD, failures=state.execution_failures, ceiling=5))
+            choices = [wc.ReviewGate(gate_id=f"execution-choice-{state.pr}", state="open",
+                opened_generation=state.generation, cause=cause,
+                remediation=wc.ReviewNoRemediation(kind="none_authorized", reason="explicit operator recovery required"),
+                actions=[wc.ReviewActionOffered(state="offered",
+                    operation="release_verdict" if verdict else "renew_execution",
+                    effect="Releases the selected verdict only." if verdict else
+                    "Renews only execution allowance; rejection allowance and other holds remain.")], pending_retry=None)]
+        return wc.ReviewExecutionCurrent(kind="current", execution_epoch=7, execution_episode=episode,
+            failures=state.execution_failures, failure_ceiling=5, pin_deferrals=0,
+            displayed_round=19, recovery_choices=choices)
 
     def control(self, pr: int, request_id: str | None) -> wc.ReviewControl:
         if pr - REVIEW_PR_OFFSET not in REVIEW_ISSUES:
@@ -438,15 +483,35 @@ class ReviewFixture:
         if body.expected != self._expected(state):
             return wc.ReviewCommandResult(outcome="conflict", reason="the workflow revision changed",
                                           control=self._control(state, None))
-        gate = next((item for item in self._gates(state) if item.gate_id == body.gate_id), None) \
-            if body.operation in ("request_rearm", "authorize_retry") else None
+        execution = self._execution(state)
+        gates = self._gates(state) + (execution.recovery_choices if isinstance(execution, wc.ReviewExecutionCurrent) else [])
+        gate = next((item for item in gates if item.gate_id == body.gate_id), None) \
+            if body.operation in ("request_rearm", "authorize_retry", "renew_execution", "release_verdict") else None
         offered = gate is not None and any(action.state == "offered" and action.operation == body.operation
                                            for action in gate.actions)
-        if body.operation in ("request_rearm", "authorize_retry") and not offered:
+        if body.operation in ("request_rearm", "authorize_retry", "renew_execution", "release_verdict") and not offered:
             refusal = next((action.reason for action in (gate.actions if gate else [])
                             if isinstance(action, wc.ReviewActionRefused)), "the gate does not offer this command")
             return wc.ReviewCommandResult(outcome="rejected", reason=refusal, control=self._control(state, None))
-        if body.operation == "request_rearm":
+        if body.operation in ("renew_execution", "release_verdict"):
+            if not isinstance(execution, wc.ReviewExecutionCurrent) or (body.execution_epoch, body.execution_episode) != (
+                    execution.execution_epoch, execution.execution_episode):
+                return wc.ReviewCommandResult(outcome="conflict", reason="the execution episode changed",
+                                              control=self._control(state, None))
+            if body.operation == "renew_execution":
+                state.execution_renewals += 1
+                state.execution_episode = f"renewed-{state.pr}-{state.execution_renewals}"
+                state.execution_failures = 0
+            else:
+                if body.submission_command_id != f"confirmed-{state.pr}":
+                    return wc.ReviewCommandResult(outcome="rejected", reason="unknown selected verdict",
+                                                  control=self._control(state, None))
+                state.verdict_released = True
+            state.current_intent = wc.ReviewPendingRearm(state="pending", request_id=body.request_id,
+                gate_id=body.gate_id, generation=state.generation + 1, authorized_reviews=[], commands=[
+                    wc.ReviewRearmCommand(command_id=f"projection-{body.request_id[:8]}", status="pending",
+                        obligation=wc.ReviewProjectionObligation(kind="projection", remove=None, add="needs-human-review"))])
+        elif body.operation == "request_rearm":
             state.guidance = (body.guidance.text if body.guidance.kind == "set" else
                               "" if body.guidance.kind == "clear" else state.guidance)
             state.current_intent = self._pending(state, body.request_id)
@@ -756,6 +821,13 @@ def fixture_app():
         if pr - REVIEW_PR_OFFSET not in REVIEW_ISSUES:
             raise HTTPException(404, "no review fixture for this pull request")
         backend._review.drain(pr)
+        return {"ok": True}
+
+    @app.post("/fixture/review-revision/{pr}")
+    async def review_revision(pr: int):
+        if pr not in EXECUTION_RENEWAL_PRS:
+            raise HTTPException(404, "no execution renewal fixture for this pull request")
+        backend._review._state(pr).version += 1
         return {"ok": True}
 
     return app

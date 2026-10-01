@@ -7,6 +7,8 @@ const LABELS: Record<ReviewDraft["operation"], string> = {
   continue_rearm: "Continue stopped re-arm",
   cancel_rearm: "Cancel pending re-arm",
   authorize_retry: "Authorize one retry",
+  renew_execution: "Renew execution allowance",
+  release_verdict: "Release selected verdict hold",
 };
 
 /**
@@ -42,7 +44,7 @@ export function ReviewCommandForm({ control, gate, disabled, onPrepare }: {
   const submit = () => {
     if (disabled || !selected) return;
     const operation = selected.operation;
-    if (operation === "request_rearm") {
+    if (operation === "request_rearm" || operation === "renew_execution" || operation === "release_verdict") {
       if (guidance === "set" && !text.trim()) { setError("Enter guidance, or choose Keep or Clear."); return; }
       onPrepare({ operation, gateId: gate.gate_id, guidance: guidance === "set" ? { kind: "set", text } : { kind: guidance } });
     } else if (operation === "continue_rearm" && gate.cause.kind === "rearm_needs_decision") {
@@ -66,7 +68,8 @@ export function ReviewCommandForm({ control, gate, disabled, onPrepare }: {
       <fieldset disabled={disabled}>
         <legend>{LABELS[selected.operation]}</legend>
         <p>{selected.effect}</p>
-        {selected.operation === "request_rearm" && <>
+        {(selected.operation === "request_rearm" || selected.operation === "renew_execution"
+          || selected.operation === "release_verdict") && <>
           <label htmlFor={`${id}-guidance`}>Guidance for the next paid review</label>
           <select autoFocus id={`${id}-guidance`} value={guidance} onChange={(event) => {
             setGuidance(event.target.value as ReviewGuidance["kind"]); setError(null);
