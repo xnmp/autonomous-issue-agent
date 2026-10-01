@@ -37,15 +37,14 @@ from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
 # Every accessor below writes `issue-N.<suffix>` or `pr-N.<suffix>` via
 # issue_path/pr_path. These two tuples are the SAME suffix universe the
-# accessors use — clear_issue/clear_pr_review derive from them instead of
+# accessors use — clear_issue/clear_pr_state derive from them instead of
 # hand-maintaining a parallel list, and
 # tests/adapters/test_store.py::test_every_*_accessor_suffix_is_covered_by_*
 # introspects the module source to assert every literal suffix an accessor
 # passes to issue_path/pr_path appears in exactly one of these — so a new
 # accessor with an unlisted suffix fails a test instead of silently leaking a
-# STATE_DIR file forever. `session` legitimately appears in BOTH: issue-N.session
-# (resolve/resume/address-review) and pr-N.session (review) are different files
-# in different namespaces, not a collision.
+# STATE_DIR file forever. Retired review session/round files remain stopped
+# import evidence; runtime cleanup cannot alter them.
 #
 # `automerge` is a PR suffix — this is the M4 fix. It used to live in the issue
 # tuple (`issue-N.automerge`), which nothing ever wrote (mark_automerge/
@@ -64,7 +63,7 @@ _ISSUE_SUFFIXES = (
     "steward-stalls-triage", "steward-stalls-groom",
 )
 _PR_SUFFIXES = (
-    "session", "round", "automerge", "ci-rerun-head",
+    "automerge", "ci-rerun-head",
     "ci-cancel-head",
     "update-branch-head", "ci-pending-escalated-head", "resumed-at",
     "stall-sig",
@@ -290,16 +289,6 @@ class Store:
             self._write(path, json.dumps(sorted(normalized)))
         else:
             self._remove(path)
-
-    def get_pr_session(self, pr: int) -> str:
-        return self._session_for_runtime(self._read(self.pr_path(pr, "session")))
-
-    def save_pr_session(self, pr: int, session_id: str) -> None:
-        if session_id:
-            self._write(
-                self.pr_path(pr, "session"),
-                f"{self._runtime_tag()}:{session_id}",
-            )
 
     # ── resume reply mark + counter ──
     def get_resumed_at(self, issue: int) -> str:
@@ -641,12 +630,6 @@ class Store:
         if sha:
             self._write(self.pr_path(pr, "ci-pending-escalated-head"), sha)
 
-    def get_round(self, pr: int) -> int:
-        return self._read_int(self.pr_path(pr, "round"), default=1)
-
-    def set_round(self, pr: int, round_number: int) -> None:
-        self._write(self.pr_path(pr, "round"), str(round_number))
-
     # ── automerge marker ──
     def automerge_enabled(self, pr: int) -> bool:
         return self._read_control(self.pr_path(pr, "automerge")) is not None
@@ -736,11 +719,13 @@ class Store:
             self._remove(self.issue_path(issue, suffix))
         self._remove(self.triage_at_path(issue))
 
-    def clear_pr_review(self, pr: int) -> None:
-        """Full PR-state retirement, incl. the automerge marker (review M4:
+    def clear_pr_state(self, pr: int) -> None:
+        """Retire current file-backed PR state, preserving stopped review evidence.
+
         `automerge` is a PR suffix — it used to live in `clear_issue`, which
         cleared a file nothing wrote, while the real pr-N.automerge marker was
-        cleared by neither cleaner)."""
+        cleared by neither cleaner.
+        """
         for suffix in _PR_SUFFIXES:
             self._remove(self.pr_path(pr, suffix))
 
@@ -790,7 +775,7 @@ class Store:
         issue_key = issue if issue is not None else -pr  # type: ignore[operator]
         if merged:
             if pr is not None:
-                self.clear_pr_review(pr)
+                self.clear_pr_state(pr)
             self.clear_issue(issue_key)
         else:
             self.clear_issue_resume_state(issue_key)

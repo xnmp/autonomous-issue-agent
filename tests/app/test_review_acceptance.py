@@ -8,6 +8,7 @@ provider launches, receipts and ``load_workflow``.
 """
 
 import json
+import asyncio
 import os
 import sqlite3
 from dataclasses import replace
@@ -19,6 +20,8 @@ from issue_agent.adapters.store import Store
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review import ReviewConfig
+from issue_agent.domain.review import ReviewMode
+from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.review_dispatch_record import ReviewNotAdmitted
 from issue_agent.domain.world import IssueView
 from issue_agent.domain.review_workflow import (
@@ -1403,3 +1406,93 @@ def test_process_loss_before_submission_recovers_without_duplicate_money_or_debi
     else:
         assert money == [] and state.execution.state.failures == 0
         assert rounds[0][3] is not None
+
+
+def test_terminal_restart_and_same_head_reopen_preserve_execution_allowance(deployment, monkeypatch):
+    from issue_agent.adapters import control_store
+    from issue_agent.adapters.control_store import IncompatibleSchema, SQLiteControlStore
+
+    failure = AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR, cost_usd=0.1)
+    client = compose_review(deployment, provider=ScriptedProvider([failure]))
+    client.boot()
+    client.tick()
+    before = client.state().execution
+    assert before.state.failures == 1
+    client.remote.external_pr_change(PR, state="CLOSED")
+    restarted = compose_review(deployment, provider=ScriptedProvider([failure]))
+    restarted.boot()
+    restarted.tick(3)
+    assert restarted.provider.tasks == [] and len(restarted.charges()) == 1
+    assert restarted.state().execution == before
+    legacy = Store(restarted.cfg.review_state_dir)
+    paths = {Path(legacy.pr_path(PR, "round")): b"0",
+             Path(legacy.pr_path(PR, "session")): b"claude:obsolete-reopened-session"}
+    for path, value in paths.items():
+        path.write_bytes(value)
+    with restarted.review.control.transaction() as db:
+        sql_before = tuple(db.iterdump())
+    with monkeypatch.context() as old_binary:
+        old_binary.setattr(control_store, "SCHEMA_VERSION", 33)
+        with pytest.raises(IncompatibleSchema, match="newer than 33"):
+            SQLiteControlStore(deployment.control_path).initialize()
+    with restarted.review.control.transaction() as db:
+        assert tuple(db.iterdump()) == sql_before
+    assert {path: path.read_bytes() for path in paths} == paths
+    restarted.remote.seed(IssueView(2, title="Relinked", state="open"))
+    restarted.remote.external_pr_change(PR, state="OPEN", closing_issue=2)
+    restarted.tick()
+    after = restarted.state().execution
+    assert len(restarted.provider.tasks) == 1 and len(restarted.charges()) == 2, restarted.log
+    assert after.state.binding.execution_episode == before.state.binding.execution_episode
+    assert after.last_sequence == before.last_sequence + 1
+    assert after.state.failures == 2 and restarted.submissions() == []
+    assert {path: path.read_bytes() for path in paths} == paths
+
+
+def test_multi_review_out_of_order_child_returns_settle_one_round_and_one_charge_each(deployment):
+    from issue_agent.app.planners.tasks import REVIEW_DIMENSIONS
+
+    class ReversedReturns(ScriptedProvider):
+        def __init__(self):
+            super().__init__()
+            self.arrived = []
+            self.completed = []
+
+        async def run(self, task):
+            self.tasks.append(task)
+            assert self.launch is not None
+            self.launch(task)
+            self.during(task)
+            if len(self.tasks) == 1:
+                return AgentResult(False, cost_usd=0.1, exit_reason=ExitReason.OK,
+                                   structured={"reviewable": True})
+            index = len(self.arrived)
+            ready = asyncio.Event()
+            self.arrived.append(ready)
+            if len(self.arrived) == len(REVIEW_DIMENSIONS):
+                ready.set()
+            await asyncio.wait_for(ready.wait(), timeout=10)
+            self.completed.append(index)
+            if index:
+                self.arrived[index - 1].set()
+            return AgentResult(False, cost_usd=0.1, exit_reason=ExitReason.OK,
+                               structured={"findings": []})
+
+    provider = ReversedReturns()
+    client = compose_review(deployment, provider=provider, mode=ReviewMode.MULTI)
+    client.boot()
+    client.tick()
+    count = len(REVIEW_DIMENSIONS)
+    assert provider.completed == list(reversed(range(count))), client.log
+    assert len(provider.tasks) == len(client.charges()) == count + 1
+    assert sum(amount for _, amount in client.charges()) == (count + 1) * 100_000
+    assert len(client.submissions()) == 1 and client.bot_reviews()[0].state == "APPROVED"
+    state = client.state()
+    assert state.execution.state.failures == 0 and state.execution.state.displayed_round == 1
+    with client.review.control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM review_execution_rounds WHERE outcome_json IS NOT NULL").fetchone()[0] == 1
+    restarted = compose_review(deployment)
+    restarted.boot()
+    restarted.tick(3)
+    assert restarted.provider.tasks == [] and restarted.charges() == client.charges()
+    assert len(restarted.submissions()) == 1 and restarted.state().execution == state.execution

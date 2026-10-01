@@ -92,6 +92,12 @@ def test_composed_inventory_shadow_and_original_plan_retry(execution_deployment,
     assert {item["pr"] for item in report["shadow"]} == set(targets)
     assert all(set(item["comparisons"]) == {"eligibility", "allowance", "session", "holds"} for item in report["shadow"])
     assert {item["pr"] for item in report["shadow"] if item["differences"]} == {9, 11}
+    shadow = {item["pr"]: item for item in report["shadow"]}
+    assert shadow[10]["comparisons"] == {"eligibility": "agrees", "allowance": "agrees_zero",
+                                          "session": "agrees_none", "holds": "agrees_clear"}
+    for pr in (9, 11):
+        assert shadow[pr]["comparisons"]["eligibility"] == "held_pending_history"
+        assert shadow[pr]["new"]["blockers"] and shadow[pr]["new"]["remaining"] is None
     assert (dump(control), file_digests(tuple(str(p) for p in review.iterdir()))) == before
     saved = tmp_path / "original-plan.json"
     saved.write_text(json.dumps(report))

@@ -152,13 +152,12 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
         s.issue_path(5, "ci-retries"),
         s.issue_path(5, "rebase-retries"),
         s.issue_path(5, "review-retries"),
-        s.pr_path(100, "round"),
     ):
         with open(path, "w") as f:
             f.write("not-an-int")
 
     for read in (lambda: s.get_ci_retries(5), lambda: s.get_rebase_retries(5),
-                 lambda: s.get_review_retry(5), lambda: s.get_round(100),
+                 lambda: s.get_review_retry(5),
                  lambda: s.bump_resumes(5)):
         with pytest.raises(ValueError, match="control unavailable"):
             read()
@@ -270,13 +269,6 @@ def test_clear_retries_on_an_untouched_key_is_a_no_op_not_an_error():
     s, _ = _store()
     assert s.clear_retries(-112) == 0  # the negated-PR breaker key namespace
     assert s.get_ci_retries(-112) == 0
-
-
-def test_review_round():
-    s, _ = _store()
-    assert s.get_round(100) == 1  # default
-    s.set_round(100, 3)
-    assert s.get_round(100) == 3
 
 
 def test_automerge_marker():
@@ -409,19 +401,17 @@ def test_cleaners_retain_retired_resolve_files_as_import_evidence():
     ))
 
 
-def test_clear_pr_review():
+def test_clear_pr_state():
     s, _ = _store()
-    s.save_pr_session(100, "rs")
     s.mark_automerge(100)
-    s.clear_pr_review(100)
-    assert s.get_pr_session(100) == ""
+    s.clear_pr_state(100)
     assert s.automerge_enabled(100) is False  # review M4: the real marker, now cleared
 
 
 # ── suffix-coverage (review M4/D8) ──────────────────────────────────────────
 def _accessor_suffixes(path_method: str) -> set[str]:
     """Suffix literals Store passes as the 2nd positional arg to `path_method`
-    (issue_path/pr_path) anywhere in its own source. clear_issue/clear_pr_review/
+    (issue_path/pr_path) anywhere in its own source. clear_issue/clear_pr_state/
     clear_issue_resume_state loop over a suffix VARIABLE (from the module
     constants), never a quoted literal, so they don't inflate this set with
     themselves — only genuine accessors do."""
@@ -624,32 +614,21 @@ def test_legacy_untagged_session_files_belong_to_claude(tmp_path):
     assert Store(str(tmp_path), runtime="codex").get_session(9) == ""
 
 
-def test_pr_sessions_are_tagged_the_same_way(tmp_path):
-    s = Store(str(tmp_path), runtime="claude")
-    s.save_pr_session(41, "rev-1")
-    assert s.get_pr_session(41) == "rev-1"
-    assert Store(str(tmp_path), runtime="codex").get_pr_session(41) == ""
-
-
 def test_runtime_enum_writes_canonical_tags_and_reads_deployed_legacy_tags(
     tmp_path,
 ):
     store = Store(str(tmp_path), runtime=RuntimeName.CODEX)
     store.save_session(7, "session-new")
     store.save_model(7, "gpt-5.6-terra")
-    store.save_pr_session(11, "review-new")
 
     assert (tmp_path / "issue-7.session").read_text() == "codex:session-new"
     assert (tmp_path / "issue-7.model").read_text() == "codex:gpt-5.6-terra"
-    assert (tmp_path / "pr-11.session").read_text() == "codex:review-new"
 
     (tmp_path / "issue-7.session").write_text("RuntimeName.CODEX:session-old")
     (tmp_path / "issue-7.model").write_text("RuntimeName.CODEX:gpt-5.6-terra")
-    (tmp_path / "pr-11.session").write_text("RuntimeName.CODEX:review-old")
 
     assert store.get_session(7) == "session-old"
     assert store.get_model(7) == "gpt-5.6-terra"
-    assert store.get_pr_session(11) == "review-old"
 
 
 def test_model_marker_roundtrip_and_runtime_isolation():
@@ -687,17 +666,19 @@ def test_groom_content_digest_round_trips_and_damps_comment_only_updates():
 
 def test_retired_review_files_survive_cleanup_as_import_evidence():
     s, _ = _store()
-    evidence = {"last-sha": "a" * 40, "patch-id": "b" * 64,
+    evidence = {"session": "claude:review-session", "round": "19",
+                "last-sha": "a" * 40, "patch-id": "b" * 64,
                 "operator-guidance": "Scope: naïve parser — preserve assertions 🚫"}
     for suffix, value in evidence.items():
         with open(s.pr_path(100, suffix), "w", encoding="utf-8") as stream:
             stream.write(value)
-    s.clear_pr_review(100)
+    s.clear_pr_state(100)
     s.cleanup_pr(100, 9, merged=True)
     for suffix, value in evidence.items():
         with open(s.pr_path(100, suffix), encoding="utf-8") as stream:
             assert stream.read() == value
     assert not any(hasattr(s, name) for name in (
+        "get_pr_session", "save_pr_session", "get_round", "set_round", "clear_pr_review",
         "get_last_sha", "set_last_sha", "get_last_patch_id", "set_last_patch_id",
         "get_operator_guidance", "set_operator_guidance", "clear_operator_guidance",
     ))

@@ -83,12 +83,6 @@ class FakeStore:
     def get_session(self, i):
         return self.sessions.get(i, "")
 
-    def save_pr_session(self, p, s):
-        self.pr_sessions[p] = s
-
-    def get_pr_session(self, p):
-        return self.pr_sessions.get(p, "")
-
     def set_last_sha(self, p, s):
         self.last_sha[p] = s
 
@@ -109,12 +103,6 @@ class FakeStore:
 
     def get_ci_rerun_head(self, p):
         return ""
-
-    def set_round(self, p, n):
-        self.rounds[p] = n
-
-    def get_round(self, p):
-        return self.rounds.get(p, 1)
 
     def bump_resumes(self, i):
         self.resumes[i] = self.resumes.get(i, 0) + 1

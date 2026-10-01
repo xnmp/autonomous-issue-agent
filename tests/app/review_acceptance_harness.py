@@ -1,4 +1,4 @@
-"""Composed review-rejection acceptance harness (ADR 0015 review slice, increment 6).
+"""Composed review acceptance harness under ADR 0015 and ADR 0016.
 
 The review daemon is ``roles.compose_review_daemon`` -- the function behind
 ``build_review_daemon`` -- so the observe/decide loop, the active-family
@@ -11,12 +11,14 @@ a real Git repository whose commits are the PR heads.
 
 Operator commands go straight to ``SQLiteReviewWorkflowControl`` (the
 composition's own instance, or a fresh one in a restarted process): the HTTP
-operator transport for review rejections is increment 7.
+operator transport outcomes have separate HTTP and browser coverage.
 
 Simulated: the paid reviewer (``ScriptedProvider``), GitHub
 (``PersistentGitHub``: SQLite, survives restarts, paginated reviews with
-fault points) and family activation, which is a direct authority-epoch row
-because the review activation importer is increment 8. As in the resolve
+fault points). The rejection-family fixture starts with its accepted epoch;
+execution activation uses the real stopped source observer, immutable plan and
+atomic publisher. CLI/shadow/copied-rehearsal cases exercise that same importer
+separately. As in the resolve
 harness each tick joins its dispatches, and every ambient ``datetime.now()``
 follows one persisted clock file so restarts can advance time. These are
 controlled replays, not live deployment evidence.

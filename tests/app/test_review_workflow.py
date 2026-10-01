@@ -124,7 +124,7 @@ def test_the_pr_conversation_reaches_every_review_round_as_untrusted_data():
     pr = PRView(100, head_ref_oid="new", reviews=(prior,), comments=thread)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "APPROVE", "body": "ok"},
@@ -157,7 +157,7 @@ def test_episode_guidance_reaches_the_review_and_re_review_prompts():
     gw = FakeGateway(prs={100: PRView(100, head_ref_oid="new", reviews=(prior,))})
     store = FakeStore()
     review_state(store).set_guidance(100, "native screenshots are impossible here")
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "APPROVE", "body": "fixed"},
@@ -176,7 +176,7 @@ def test_re_review_skips_same_head_but_reviews_a_genuinely_new_head():
         100: PRView(100, head_ref_oid="new", reviews=(prior,)),
     })
     store = FakeStore()
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False,
@@ -202,7 +202,7 @@ def test_external_review_marker_never_becomes_a_resume_session():
     })
     store = FakeStore()
     review_state(store).set_head(100, "old")
-    store.save_pr_session(100, "github-review")
+    store.pr_sessions[100] = "github-review"
 
     gw.diff_text = "genuinely changed diff"
     gw._prs[100] = PRView(
@@ -221,7 +221,7 @@ def test_external_review_marker_never_becomes_a_resume_session():
     assert "Null token" in next_runner.tasks[0].prompt
     assert "Fixes #7" in next_runner.tasks[0].prompt
     assert "check the null-token contract" in next_runner.tasks[0].prompt
-    assert store.get_pr_session(100) == "github-review"
+    assert store.pr_sessions.get(100, "") == "github-review"
 
 
 def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
@@ -237,7 +237,7 @@ def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
     ))
 
     asyncio.run(_workflow(gw, store, first, reviewer_runtime="codex").review(100))
-    assert store.get_pr_session(100) == ""
+    assert store.pr_sessions.get(100, "") == ""
 
     gw._prs[100] = PRView(100, head_ref_oid="new", title="t", body="b", reviews=(prior,))
     setattr(
@@ -254,7 +254,7 @@ def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
     asyncio.run(_workflow(gw, store, second, reviewer_runtime="codex").re_review(100))
 
     assert second.tasks[0].resume is None
-    assert store.get_pr_session(100) == ""
+    assert store.pr_sessions.get(100, "") == ""
 
 
 def test_codex_review_installs_its_hook_in_the_explicit_checkout_before_running():
@@ -465,7 +465,7 @@ def test_delegated_re_review_uses_prior_review_without_session_resume():
     store = FakeStore()
     review_state(store).rounds[100] = 1
     review_state(store).set_head(100, "old")
-    store.save_pr_session(100, "old-session")
+    store.pr_sessions[100] = "old-session"
     runner = FakeRunner(AgentResult(
         is_error=False,
         session_id="new-session",
@@ -485,7 +485,7 @@ def test_re_review_failed_submit_does_not_advance_round():
     gw = FakeGateway(prs={100: pr}, submit_ok=False)
     store = FakeStore()
     review_state(store).rounds[100] = 2
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     review_state(store).set_head(100, "old")
     runner = FakeRunner(AgentResult(
         is_error=False,
@@ -504,7 +504,7 @@ def test_re_review_passes_escalation_to_authority_without_relabelling():
     gw = FakeGateway(prs={815: pr})
     store = FakeStore()
     review_state(store).rounds[815] = 5
-    store.save_pr_session(815, "rs")
+    store.pr_sessions[815] = "rs"
     runner = FakeRunner(AgentResult(
         is_error=False,
         structured={"decision": "ESCALATE", "body": "stuck"},
@@ -533,7 +533,7 @@ def test_review_ceiling_is_reported_to_authority_for_receipt_settlement():
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 4
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     journal = FakeJournal()
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "REQUEST_CHANGES", "body": "still broken"},
@@ -557,7 +557,7 @@ def test_verdict_escalation_reason_names_the_verdict_not_the_ceiling():
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 2
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "ESCALATE", "body": "deadlocked"},
     ))
@@ -578,7 +578,7 @@ def test_ordinary_rejection_does_not_escalate():
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 2
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     journal = FakeJournal()
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "REQUEST_CHANGES", "body": "fix this"},
@@ -600,7 +600,7 @@ def test_multi_review_reports_its_ceiling_to_authority_for_receipt_settlement():
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 4
-    store.save_pr_session(100, "multi")
+    store.pr_sessions[100] = "multi"
     journal = FakeJournal()
     runner = SchemaRunner(
         gate=_gate(),
@@ -628,7 +628,7 @@ def test_failed_authority_submission_never_updates_the_reviewed_baseline():
     asyncio.run(workflow.review(100))
     assert len(runner.tasks) == 1
     assert review_state(store).head(100) == ""
-    assert store.get_pr_session(100) == ""
+    assert store.pr_sessions.get(100, "") == ""
 
 
 def test_multi_review_confirmed_blocking_finding_requests_changes_and_persists():
@@ -887,7 +887,7 @@ def test_multi_re_review_at_ceiling_escalates():
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 4
-    store.save_pr_session(100, "multi")
+    store.pr_sessions[100] = "multi"
     runner = SchemaRunner(
         gate=_gate(),
         dimension=lambda t: _dim([{
@@ -1007,7 +1007,7 @@ def _approved(**kw):
 def _reviewed_pr(store, diff, head="old-sha"):
     """A PR that has ALREADY been reviewed once at `diff` — the state an initial
     review leaves behind."""
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     review_state(store).set_head(100, head)
     review_state(store).rounds[100] = 1
     review_state(store).set_patch(100, patch_signature(diff))
@@ -1186,7 +1186,7 @@ def test_a_pr_with_no_recorded_patch_is_always_reviewed():
     """Pre-existing sessions (reviewed before this existed) have no baseline —
     unknown must mean 'review it', never 'unchanged'."""
     store = PatchStore()
-    store.save_pr_session(100, "rs")
+    store.pr_sessions[100] = "rs"
     review_state(store).set_head(100, "old-sha")
     review_state(store).rounds[100] = 1
     gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
@@ -1235,7 +1235,7 @@ def test_a_multi_agent_re_review_also_skips_an_unchanged_patch():
     short-circuit must precede the fan-out there too."""
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
-    store.save_pr_session(100, "multi")
+    store.pr_sessions[100] = "multi"
     gw = DiffGateway(_REBASED, prs={100: _rebased_pr()})
     runner = SchemaRunner(gate=_gate(), dimension=lambda t: _dim([]),
                           validation=lambda t: _val(True))
@@ -1410,7 +1410,7 @@ def test_review_defers_when_the_pinned_checkout_is_unavailable():
 
     assert runner.tasks == []
     assert not review_state(store).head(100)
-    assert not store.get_pr_session(100)
+    assert not store.pr_sessions.get(100, "")
     # 0d2e295 H3: a deferral paid for nothing — it must NOT feed the
     # unproductive-round counter, or five free deferrals escalate the PR.
     assert store.infra_deaths == {}
@@ -1862,7 +1862,7 @@ def test_unchanged_patch_does_not_copy_an_incomplete_prior_approval():
     )
     gw = _DeclaringGateway(prs={100: current})
     store = FakeStore()
-    store.save_pr_session(100, "github-review")
+    store.pr_sessions[100] = "github-review"
     review_state(store).set_head(100, "old-head")
     review_state(store).set_patch(100, patch_signature(_MODIFYING_DIFF))
     runner = FakeRunner(
@@ -1906,7 +1906,7 @@ def test_mechanical_rebase_preserves_incomplete_approval_ceiling_accounting():
     )
     gw = _DeclaringGateway(prs={100: current})
     store = FakeStore()
-    store.save_pr_session(100, "github-review")
+    store.pr_sessions[100] = "github-review"
     review_state(store).set_head(100, "old-head")
     review_state(store).set_patch(100, patch_signature(_MODIFYING_DIFF))
     runner = FakeRunner(

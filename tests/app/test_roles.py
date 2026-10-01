@@ -2474,7 +2474,7 @@ def test_review_daemon_claim_agrees_with_branch_resolved_issue(tmp_path):
                for c in gateway.calls)
     from issue_agent.app.review_runtime import current_review_failures
     assert current_review_failures(control, "o/r", pr.number) == 0
-    assert store.get_pr_session(pr.number) == ""
+    assert not os.path.exists(store.pr_path(pr.number, "session"))
 
 
 def test_review_daemon_defers_changed_linkage_without_spend_or_retry(

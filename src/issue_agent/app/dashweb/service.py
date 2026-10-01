@@ -1228,15 +1228,11 @@ class Backend:
             pass
 
     def _clear_retry_counters(self, state_dirs: tuple[str, ...], number: int, prs: tuple[int, ...]) -> int:
-        """Reset the per-attempt ceilings in every role's state dir.
+        """Reset the remaining file-backed per-attempt ceilings.
 
-        The operator cannot be asked which role wedged: ci-/rebase-retries are
-        the fix role's, review-retries the review role's. The review role's
-        infra-death ceiling is cleared too — a dead-session loop is precisely
-        what an unblock answers — for the issue and for the negated PR keys
-        (`issue--<pr>.infra-deaths`) `domain.fix.breaker_key` uses when a PR has
-        no resolvable issue. `Store.clear_retries` itself keeps infra-deaths,
-        since no automatic path may reset that ceiling.
+        Review execution and its infrastructure allowance are SQL authority;
+        the review root contains only stopped import evidence. Address-review
+        retries in the fix root remain the fix role's independent allowance.
 
         The resolve episode is not touched: it is SQLite authority (ADR 0015),
         renewed only by a typed re-arm after explicit family activation. The
@@ -1249,14 +1245,11 @@ class Backend:
         keys = [number, *(-pr for pr in prs if pr > 0)]
         cleared = 0
         for role, state_dir in zip(dash.ROLE_NAMES, state_dirs):
-            if not state_dir:
+            if not state_dir or role == "review":
                 continue
             store = Store(state_dir)
             for key in keys:
                 cleared += store.clear_retries(key)
-                if role == "review":
-                    cleared += os.path.exists(store.issue_path(key, "infra-deaths"))
-                    store.clear_infra_deaths(key)
         return cleared
 
     def _issue_prs(self, name: str, number: int) -> list[int]:

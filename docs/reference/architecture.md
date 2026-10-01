@@ -1,15 +1,16 @@
 # Architecture — how the harness works now
 
-Current as of 2026-09-30. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-10-01. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
 
 The [phase-4 simplification roadmap](../open/2026-09-30-phase-4-simplification-roadmap.md)
-and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) define the next
-implementation direction. They have not replaced the runtime described here;
-in particular, archive machinery remains present until its replacement and
-deletion issues pass acceptance.
+and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) govern review
+execution authority. The accepted simplification and review slice use current
+SQL state and a bounded unresolved suffix; archive projections, certificates
+and lifetime verification have been removed. Remaining phase-4 families are
+tracked individually in the roadmap; phase 4 is not yet accepted.
 
 Operator instructions live in [HARNESS.md](../../HARNESS.md); how to point the
 harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
@@ -239,8 +240,34 @@ workflow routing and paid admission. A fresh PR read may validate that target
 but cannot replace it; changed linkage defers to a new observation. An issueless
 PR is claimed by negative PR number without manufacturing a per-issue spend
 scope (ADR 0008).
-Review retry/death ceilings are separately keyed by negative PR number so a
+Review execution allowance belongs to the SQL PR execution episode, so a
 later closing-link edit cannot erase an already-paid unproductive round.
+Current review authority stores a generation-local checkpoint and an ordered,
+bounded unresolved suffix. Immutable round, child admission/launch/return,
+money settlement and submission receipts retain exact retry and recovery
+evidence outside that aggregate. Late older-generation results settle their
+actual spend without resetting current allowance or reviving a session.
+An unresolved round whose existing recovery observations reach their limit
+holds new rounds and paid work; settlement and exact retries remain available.
+
+Stopped execution activation publishes one complete immutable plan, including
+eligible empty targets and explicit source-specific blocked targets. Terminal
+targets do not gain work; ambiguous historical counters, sessions or ownership
+are retained under migration holds. Shadow equivalence applies to supported
+empty inputs; blocked history is reported separately. Copied rehearsal preserves
+source databases, WAL and files. Exact original-plan retry reads only selected
+SQL receipts, even after later legitimate activity.
+
+Execution renewal and selected confirmed verdict release use the existing
+pending operator intent and durable effect rail. Renewal requires complete
+old-episode quiescence and carries a compact origin/session reference, preserving
+rejection allowance and unrelated holds. The dashboard projects this SQL state
+and daemon-captured facts through its existing transport; polls never grant work.
+Store's PR round/session APIs and review-only legacy reset paths are retired.
+Their raw files remain available to stopped import and cannot regain runtime
+authority after restart or rollback; the existing schema fence refuses an older
+binary before it can mutate the current database.
+
 The supported exception is an explicit same-repository checkout repoint:
 `issue-agent start --write-config` records a bounded lineage of exact prior
 checkout identities. The first boot reaps only those process registries and
@@ -491,7 +518,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
 `domain/review_activation.py`, `domain/review_exemptions.py`, `domain/review_linkage.py`,
 `domain/review_execution.py` (pure current execution authority and bounded ordered unresolved-suffix fold),
-`domain/review_execution_activation.py` (typed execution import sources, complete owner-run and round observations, abandoned-run attribution, raw historical recorded-review DTOs and registered command-to-round links),
+`domain/review_execution_activation.py` (typed stopped import identity, ownership and selected raw source observations),
 `domain/review_execution_counter_mapping.py` (offline attribution of legacy issue and negated-PR counter files from complete open-PR linkage observations; shared issue keys block),
 `domain/review_execution_death_import.py` (observational whole-set attribution of abandoned owner runs and current counter files; ambiguous or cross-PR deaths block),
 `domain/review_execution_history_import.py` (pure per-PR classification of inherited review evidence; empty observations remain nonauthoritative and historical sources retain specific blockers),
@@ -499,7 +526,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_execution_migration.py` (immutable sourced blockers and canonical blocked migration decisions; no execution grant),
 `domain/review_execution_session_import.py` (fail-closed classification of legacy session files; real handles retain source evidence but cannot yet grant reuse),
 `domain/review_rounds.py` (pure outer-round plans, verified evidence and finalization),
-`domain/review_receipt_attribution.py` (pure namespace-specific retained receipt shape checks and typed round or command references; no external source authority),
+`domain/review_receipt_attribution.py` (pure selected receipt shape checks and exact round/command references),
 `domain/review_preflight.py` (pure round selection and current paid-work eligibility under captured execution authority),
 `domain/review_return.py` (bounded, unclassified review child result evidence),
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
@@ -539,15 +566,15 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
 `adapters/repository_guidance.py`, `adapters/resolve_activation.py`, `adapters/review_activation.py`, `adapters/review_linkage.py`,
-`adapters/review_execution_activation.py` (bounded read-only execution file and SQL sources, owner lineage, complete round, run, submission command, submission settlement receipt and outcome receipt scans/revalidation, whole-set outcome and submission settlement storage accounting, exact command-to-round registration joins; nonempty chronology-dependent imports held for R1),
+`adapters/review_execution_activation.py` (bounded read-only stopped file and SQL identity/ownership sources; ambiguous history retains source-specific blockers),
 `adapters/review_execution_import_observation.py` (read-only complete configured SQL import source collection with a cumulative source budget; no cursor advancement or activation authority),
-`adapters/review_execution_transition_proof.py` (small generation proof for compacted reads; accepted historical payloads remain audited),
+`adapters/review_execution_transition_proof.py` (bounded selected generation-transition receipt source; no lifetime replay),
 `adapters/sql_read_budget.py` (opt-in transaction result-byte/row meter and temporary SQLite value bound; page and point queries bound engine work separately),
 `adapters/review_execution_counter_links.py` (read-only complete open-PR and linked-issue observations with repository-bound revalidation for counter import),
 `adapters/review_execution_import_sources.py` (barrier-held legacy file/PR-link and SQL source revalidation, including current registration/lifecycle command membership before counter attribution),
-`adapters/review_execution_import_commit.py` (transaction-local atomic publication of a revalidated zero-history execution plan),
-`adapters/review_execution_import_replay.py` (bounded SQL-only exact import retry, canonical origin and current workflow ancestry checks; compacted authority still refuses),
-`adapters/review_execution_workflow_census.py` (bounded transaction-local census of every retained review PR workflow against the complete open listing; terminal rows currently block import),
+`adapters/review_execution_import_commit.py` (atomic mixed eligible/blocked whole-scope publication; blocked workflow identity grants no execution),
+`adapters/review_execution_import_replay.py` (bounded SQL-only original-plan retry against selected epoch, decision, origin and blocker receipts; later activity cannot change that accepted request),
+`adapters/review_execution_workflow_census.py` (stopped activation's bounded retained target inventory against its complete open listing; terminal identities remain visible),
 `adapters/review_effects.py` (guarded review dismissal and PR projection
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),

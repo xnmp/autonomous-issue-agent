@@ -2,6 +2,7 @@
 
 from dataclasses import replace
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -153,10 +154,10 @@ def test_schema34_legacy_file_mutations_do_not_regain_current_review_authority(r
     before = current(store, selection)
     legacy = Store(str(tmp_path / 'legacy-review'))
     legacy.set_infra_deaths(-9, 0)
-    legacy.set_round(9, 10**12)
-    legacy.save_pr_session(9, 'foreign-session')
+    Path(legacy.pr_path(9, "round")).write_text(str(10**12))
+    Path(legacy.pr_path(9, "session")).write_text("claude:foreign-session")
     assert legacy.get_infra_deaths(-9) == 0
-    assert legacy.get_round(9) == 10**12
+    assert Path(legacy.pr_path(9, "round")).read_text() == str(10**12)
     store.initialize()
     assert current(store, selection) == before
     assert control.preflight(selection).round.sequence == 1

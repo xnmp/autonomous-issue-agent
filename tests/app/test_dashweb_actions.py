@@ -447,7 +447,8 @@ def test_an_unblock_journals_one_event_naming_what_it_actually_reset(
     (payload,) = _journalled(dirs)
     assert payload.kind == "operator_unblock" and payload.number == 7
     assert payload.attributes["remove"] == ["needs-human-review"]
-    assert payload.attributes["retries_cleared"] == 2
+    assert payload.attributes["retries_cleared"] == 1
+    assert (dirs["review"] / "issue-7.review-retries").read_text() == "at 5"
     assert payload.attributes["labels_applied"] is True
 
 
@@ -686,7 +687,7 @@ def test_each_target_journals_its_own_label_result(monkeypatch, tmp_path):
     assert succeeded.attributes["remove"] == ["needs-human-review"]
 
 
-def test_unblock_hands_back_the_retry_budget_in_every_role_state_dir(
+def test_legacy_unblock_preserves_retired_review_allowance_evidence_and_resets_fix_retries(
     monkeypatch, tmp_path
 ):
     backend, dirs, _calls = _unblock_backend(monkeypatch, tmp_path)
@@ -702,9 +703,9 @@ def test_unblock_hands_back_the_retry_budget_in_every_role_state_dir(
 
     assert not (dirs["fix"] / "issue-7.ci-retries").exists()
     assert not (dirs["fix"] / "issue-7.rebase-retries").exists()
-    assert not (dirs["review"] / "issue-7.review-retries").exists()
-    assert not (dirs["review"] / "issue-7.infra-deaths").exists()
-    assert not (dirs["review"] / "issue--12.infra-deaths").exists()
+    assert (dirs["review"] / "issue-7.review-retries").read_text() == "at 5"
+    assert (dirs["review"] / "issue-7.infra-deaths").read_text() == "5"
+    assert (dirs["review"] / "issue--12.infra-deaths").read_text() == "5"
     # ADR 0015: the resolve allowance is SQLite authority renewed only by a
     # typed re-arm; the retired file is offline import evidence and survives.
     assert (dirs["fix"] / "issue-7.resolve-retries").read_text() == "4"
