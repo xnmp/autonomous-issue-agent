@@ -13,9 +13,12 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
+from .continuation_components import (
+    InactiveIssueRecovery, InactiveSteward, IssueRecoveryComponent, StewardComponent, validate_component_revision,
+)
 from .workflow_identity import (
     MAX_DETAIL_CHARS, MAX_REARM_COMMANDS, MAX_WORKFLOW_GATES, FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily,
-    WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowTarget, target_family,
+    WorkflowFence, WorkflowKey, WorkflowRevision, WorkflowTarget, target_family, family_owns_target,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
 )
 from .review_rejection import ReviewExecutionCeiling, ReviewVerdictHold, ReviewProjectionRefused, ReviewRearmPreflight, ReviewRejectionCeiling
@@ -642,6 +645,8 @@ class WorkflowSnapshot:
     episode: ResolveEpisode
     gates: tuple[UnresolvedGate, ...] = ()
     intent: RearmIntent | None = None
+    issue_recovery: IssueRecoveryComponent = InactiveIssueRecovery()
+    steward: StewardComponent = InactiveSteward()
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, WorkflowRevision) or not isinstance(
@@ -652,6 +657,8 @@ class WorkflowSnapshot:
             raise ValueError("this snapshot supports only resolve")
         if not isinstance(self.revision.fence.key.target, IssueRef):
             raise ValueError("resolve workflow requires an issue")
+        validate_component_revision(self.issue_recovery, self.revision, WorkflowFamily.ISSUE_RECOVERY)
+        validate_component_revision(self.steward, self.revision, WorkflowFamily.STEWARD)
         continuation = self.episode.continuation
         if continuation.last_applied_admission_version > self.revision.version:
             raise ValueError("continuation cannot originate in a future admission")
@@ -741,7 +748,7 @@ class WorkflowMigrationRequired:
     def __post_init__(self) -> None:
         if not isinstance(self.key, WorkflowKey):
             raise ValueError("migration-required state requires a queried workflow identity")
-        if not isinstance(self.family, WorkflowFamily) or target_family(self.key.target) is not self.family:
+        if not isinstance(self.family, WorkflowFamily) or not family_owns_target(self.family, self.key.target):
             raise ValueError("migration-required family must own the queried target")
 
     @property
@@ -750,6 +757,43 @@ class WorkflowMigrationRequired:
 
 
 WorkflowRead = WorkflowSnapshot | WorkflowAbsent | WorkflowMigrationRequired | WorkflowUnavailable
+
+
+@dataclass(frozen=True)
+class IssueWorkflowShell:
+    """A real issue revision with secondary continuity and no resolve grant."""
+
+    revision: WorkflowRevision
+    issue_recovery: IssueRecoveryComponent = InactiveIssueRecovery()
+    steward: StewardComponent = InactiveSteward()
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.revision, WorkflowRevision) or not isinstance(self.revision.fence.key.target, IssueRef):
+            raise ValueError("an inert issue shell requires its issue target revision")
+        validate_component_revision(self.issue_recovery, self.revision, WorkflowFamily.ISSUE_RECOVERY)
+        validate_component_revision(self.steward, self.revision, WorkflowFamily.STEWARD)
+
+
+@dataclass(frozen=True)
+class IssueFamilyEpisodes:
+    authority: FamilyAuthority
+    episode: ResolveEpisode
+    issue_recovery: IssueRecoveryComponent
+    steward: StewardComponent
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.authority, FamilyAuthority) or self.authority.family is not WorkflowFamily.RESOLVE:
+            raise ValueError("issue family envelope requires resolve authority")
+        if not isinstance(self.episode, ResolveEpisode):
+            raise ValueError("issue family envelope requires its resolve episode")
+
+
+def resolve_from_issue_aggregate(aggregate: WorkflowSnapshot | IssueWorkflowShell) -> WorkflowSnapshot | WorkflowMigrationRequired:
+    if isinstance(aggregate, WorkflowSnapshot):
+        return aggregate
+    if isinstance(aggregate, IssueWorkflowShell):
+        return WorkflowMigrationRequired(aggregate.revision.fence.key, WorkflowFamily.RESOLVE)
+    raise ValueError("resolve selection requires a typed issue aggregate")
 
 
 @dataclass(frozen=True)

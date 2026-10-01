@@ -13,6 +13,7 @@ from datetime import datetime
 from enum import Enum
 
 from .contracts import CommandId
+from .continuation_components import InactivePRRepair, PRRepairComponent, validate_component_revision
 from .labels import Label
 from .review_rejection import (
     MAX_COUNTED_REVIEWS, MAX_OBSERVED_REVIEWS, CountedReview, CountingRule, PullRequestState, ReviewProjectionRefused,
@@ -412,6 +413,7 @@ class ReviewWorkflowSnapshot:
     gates: tuple[OpenGate | RearmingGate, ...] = ()
     intent: ReviewRearmIntent | None = None
     execution: ReviewExecutionComponent = ExecutionNotActivated()
+    pr_repair: PRRepairComponent = InactivePRRepair()
 
     def __post_init__(self) -> None:
         if not isinstance(self.revision, WorkflowRevision) or not isinstance(
@@ -420,6 +422,7 @@ class ReviewWorkflowSnapshot:
             raise ValueError("snapshot requires validated revision, authority and episode")
         if self.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:
             raise ValueError("this snapshot supports only review rejections")
+        validate_component_revision(self.pr_repair, self.revision, WorkflowFamily.PR_REPAIR)
         if not isinstance(self.execution, (ExecutionNotActivated, ActivatedReviewExecution, CurrentReviewExecution, BlockedReviewExecutionMigration)):
             raise ValueError("review snapshot requires a typed execution component")
         if isinstance(self.execution, (ActivatedReviewExecution, CurrentReviewExecution)):
@@ -530,6 +533,7 @@ class ReviewFamilyEpisodes:
     authority: FamilyAuthority
     episode: ReviewEpisode
     execution: ReviewExecutionComponent
+    pr_repair: PRRepairComponent = InactivePRRepair()
 
     def __post_init__(self) -> None:
         if not isinstance(self.authority, FamilyAuthority) or self.authority.family is not WorkflowFamily.REVIEW_REJECTIONS:

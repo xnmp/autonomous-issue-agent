@@ -78,16 +78,26 @@ class WorkflowFamily(str, Enum):
     RESOLVE = "resolve"
     REVIEW_REJECTIONS = "review_rejections"
     REVIEW_EXECUTION = "review_execution"
+    ISSUE_RECOVERY = "issue_recovery"
+    PR_REPAIR = "pr_repair"
+    STEWARD = "steward"
 
 
 def target_family(target: WorkflowTarget) -> WorkflowFamily:
-    """Phase 3 owns one family per target: resolve is issue-owned and review
-    rejection is PR-owned regardless of changing issue linkage (ADR 0015)."""
+    """Select the primary family; secondary components require explicit selection."""
     if isinstance(target, IssueRef):
         return WorkflowFamily.RESOLVE
     if isinstance(target, PullRequestRef):
         return WorkflowFamily.REVIEW_REJECTIONS
     raise ValueError("workflow target must be an issue or pull request identity")
+
+
+def family_owns_target(family: WorkflowFamily, target: WorkflowTarget) -> bool:
+    if not isinstance(family, WorkflowFamily) or not isinstance(target, (IssueRef, PullRequestRef)):
+        raise ValueError("family ownership requires a typed family and target")
+    if family in (WorkflowFamily.RESOLVE, WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.STEWARD):
+        return isinstance(target, IssueRef)
+    return isinstance(target, PullRequestRef)
 
 
 @dataclass(frozen=True)
@@ -132,11 +142,32 @@ class WorkflowBinding:
     def __post_init__(self) -> None:
         if not isinstance(self.fence, WorkflowFence) or not isinstance(self.authority, FamilyAuthority):
             raise ValueError("workflow binding requires a validated fence and authority")
-        if self.authority.family is WorkflowFamily.RESOLVE and not isinstance(self.fence.key.target, IssueRef):
-            raise ValueError("resolve episodes belong to issues, not pull requests")
-        if self.authority.family in (WorkflowFamily.REVIEW_REJECTIONS, WorkflowFamily.REVIEW_EXECUTION) and not isinstance(self.fence.key.target, PullRequestRef):
-            raise ValueError("review episodes belong to pull requests, not issues")
+        if not family_owns_target(self.authority.family, self.fence.key.target):
+            if self.authority.family is WorkflowFamily.RESOLVE:
+                raise ValueError("resolve episodes belong to issues, not pull requests")
+            if self.authority.family in (WorkflowFamily.REVIEW_REJECTIONS, WorkflowFamily.REVIEW_EXECUTION):
+                raise ValueError("review episodes belong to pull requests, not issues")
+            raise ValueError("workflow family cannot bind to this target kind")
         validate_workflow_identifier(self.episode_id, "workflow episode")
+
+
+@dataclass(frozen=True)
+class ContinuationComponentIdentity:
+    key: WorkflowKey
+    authority: FamilyAuthority
+    episode_id: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.key, WorkflowKey) or not isinstance(self.authority, FamilyAuthority)
+                or self.authority.family not in (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD)
+                or not family_owns_target(self.authority.family, self.key.target)):
+            raise ValueError("continuation identity requires its fixed family and target")
+        validate_workflow_identifier(self.episode_id, "continuation episode")
+
+    def bind(self, fence: WorkflowFence) -> WorkflowBinding:
+        if not isinstance(fence, WorkflowFence) or fence.key != self.key:
+            raise ValueError("live continuation binding requires the aggregate target fence")
+        return WorkflowBinding(fence, self.authority, self.episode_id)
 
 
 @dataclass(frozen=True)

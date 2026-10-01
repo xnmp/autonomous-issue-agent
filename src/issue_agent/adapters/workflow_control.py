@@ -69,6 +69,7 @@ from .workflow_commit import (
     replay_or_conflict, retire_rearm_obligation, transition_receipt, update_rearm_state,
 )
 from .workflow_rows import (
+    load_issue_aggregate,
     WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict, load_resolve_workflow_row,
     load_resolve_authority, load_workspace_ack, persist_workflow_snapshot, workflow_scope, insert_workflow_component,
 )
@@ -104,7 +105,10 @@ class SQLiteWorkflowControl:
                 db.execute("BEGIN")
                 if load_resolve_authority(db, key.repository) is None:
                     return WorkflowMigrationRequired(key)
-                snapshot = load_resolve_workflow_row(db, key)
+                from ..domain.workflow import IssueWorkflowShell
+                snapshot = load_issue_aggregate(db, key)
+                if isinstance(snapshot, IssueWorkflowShell):
+                    return WorkflowMigrationRequired(key)
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")

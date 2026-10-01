@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 36))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 37))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -121,6 +121,18 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        36: (
+            "DROP TRIGGER runs_continuation_selections_update",
+            "DROP TRIGGER runs_continuation_identity_update",
+            "ALTER TABLE runs DROP COLUMN continuations_json",
+            next(statement for migration in _SCHEMA_MIGRATIONS if migration.version == 25
+                 for statement in _sql_statements(migration.source) if statement.startswith("CREATE TABLE workflow_components "))
+            .replace("CREATE TABLE workflow_components (", "CREATE TABLE workflow_components_before36 ("),
+            "INSERT INTO workflow_components_before36 SELECT * FROM workflow_components",
+            "DROP TABLE workflow_components",
+            "ALTER TABLE workflow_components_before36 RENAME TO workflow_components",
+            "CREATE INDEX workflow_components_family ON workflow_components(repository,family)",
+        ),
         35: ("DROP INDEX workflow_gates_current",),
         # Recreate retired projections only to construct the old fixture schema.
         34: tuple(statement for migration in _SCHEMA_MIGRATIONS if 27 <= migration.version <= 32
@@ -3359,14 +3371,23 @@ def test_claim_lifecycle_receipt_conflict_rolls_back_its_entire_authority_change
 
 
 def _retained_schema_rows(db):
+    from issue_agent.adapters.workflow_codec import encode_workflow
     retired = {'review_archive_identity_members', 'review_archive_identity_certifications',
                'review_archive_source_versions', 'schema_migrations'}
     tables = tuple(row[0] for row in db.execute(
         "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
     ) if row[0] not in retired)
-    return {table: tuple(sorted((tuple(row) for row in db.execute(
-        'SELECT * FROM "' + table.replace('"', '""') + '"',
-    )), key=repr)) for table in tables}
+    rows = {}
+    for table in tables:
+        columns = [row[1] for row in db.execute('PRAGMA table_info("' + table.replace('"', '""') + '")')]
+        if table == 'runs' and 'continuations_json' in columns:
+            assert not db.execute("SELECT 1 FROM runs WHERE continuations_json<>? LIMIT 1", (encode_workflow(()),)).fetchone()
+            columns.remove('continuations_json')
+        selection = ','.join('"' + name.replace('"', '""') + '"' for name in columns)
+        rows[table] = tuple(sorted((tuple(row) for row in db.execute(
+            'SELECT ' + selection + ' FROM "' + table.replace('"', '""') + '"',
+        )), key=repr))
+    return rows
 
 
 def _populated_schema32_copy(tmp_path):
@@ -3484,6 +3505,7 @@ def test_v34_unrelated_writes_need_no_retired_projection_witness(tmp_path):
             "SELECT name FROM sqlite_master WHERE type='trigger' ORDER BY name",
         ))
         assert remaining == ('dispatch_claims_occurrence_insert', 'dispatch_claims_occurrence_update',
+                             'runs_continuation_identity_update', 'runs_continuation_selections_update',
                              'runs_require_workflow_episode_insert', 'runs_require_workflow_episode_update',
                              'runs_review_attachment_insert', 'runs_review_attachment_update',
                              'workflow_retry_grant_insert', 'workflow_retry_grant_update')

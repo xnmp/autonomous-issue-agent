@@ -26,7 +26,8 @@ from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
 from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
-from ..domain.contracts import WorkflowAttemptIdentity
+from ..domain.contracts import WorkflowAttemptIdentity, ContinuationAdmission
+from ..domain import continuation_components as cc
 from ..domain.labels import Label
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
@@ -42,6 +43,14 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    ContinuationAdmission, identity.ContinuationComponentIdentity,
+    cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState,
+    cc.StewardLaneState, cc.StewardState, cc.ContinuationImportBlocker,
+    cc.InactiveIssueRecovery, cc.InactivePRRepair, cc.InactiveSteward,
+    cc.BlockedIssueRecovery, cc.BlockedPRRepair, cc.BlockedSteward,
+    cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward,
+    w.IssueWorkflowShell, w.IssueFamilyEpisodes,
+    cc.ContinuationCapture, cc.IssueRecoveryPurchase, cc.PRRepairPurchase, cc.StewardPurchase,
     EligibleZeroHistoryReviewImport, ReviewImportNoHistoryObserved, LegacyOpenPRCounterLink,
     migration.ReviewImportSource, migration.ReviewImportBlocker, migration.ReviewImportHistoryBlocked,
     migration.BlockedReviewExecutionMigration,
@@ -127,6 +136,7 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
+    cc.RepairAllowance, cc.StewardLane,
     migration.ReviewImportBlockerKind,
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
@@ -154,6 +164,12 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS = {
+    "WorkflowSnapshot": {
+        "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}},
+        "steward": {"type": "InactiveSteward", "fields": {}},
+    },
+    "ReviewWorkflowSnapshot": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
+    "ReviewFamilyEpisodes": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
@@ -184,7 +200,11 @@ def _encode(value: object, depth: int = 0) -> object:
         return {"type": type(value).__name__, "value": value.value}
     if type(value) in _VALUES and is_dataclass(value):
         return {
-            "type": (_CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
+            "type": ("ReviewWorkflowSnapshotV3" if type(value) is rw.ReviewWorkflowSnapshot and not isinstance(value.pr_repair, cc.InactivePRRepair)
+                     else _CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
+                     else "WorkflowSnapshotV2" if type(value) is w.WorkflowSnapshot and (
+                         not isinstance(value.issue_recovery, cc.InactiveIssueRecovery) or not isinstance(value.steward, cc.InactiveSteward))
+                     else "ReviewFamilyEpisodesV2" if type(value) is rw.ReviewFamilyEpisodes and not isinstance(value.pr_repair, cc.InactivePRRepair)
                      else _CURRENT_ACTIVATED_EXECUTION_TAG if type(value) is rx.ActivatedReviewExecution
                      else _CURRENT_EXECUTION_AUTHORITY_TAG if type(value) is rx.CurrentReviewExecution
                      else _CURRENT_EXECUTION_CHECKPOINT_TAG if type(value) is rx.ReviewExecutionCheckpoint
@@ -196,7 +216,12 @@ def _encode(value: object, depth: int = 0) -> object:
                 # commands retain their required binding; legacy audits omit it.
                 if ((field.name not in {"expected_binding", "lineage_sha256"}
                      or getattr(value, field.name) is not None)
-                    and not (field.name == "grant" and isinstance(getattr(value, field.name), rw.ReviewRejectionGrant)))
+                    and not (field.name == "grant" and isinstance(getattr(value, field.name), rw.ReviewRejectionGrant))
+                    and not (field.name in {"issue_recovery", "steward", "pr_repair"}
+                             and isinstance(getattr(value, field.name), (cc.InactiveIssueRecovery, cc.InactiveSteward, cc.InactivePRRepair))
+                             and (type(value) in (rw.ReviewWorkflowSnapshot, rw.ReviewFamilyEpisodes)
+                                  or type(value) is w.WorkflowSnapshot and isinstance(value.issue_recovery, cc.InactiveIssueRecovery)
+                                  and isinstance(value.steward, cc.InactiveSteward))))
             },
         }
     if isinstance(value, datetime):
@@ -260,7 +285,12 @@ def _decode(value: object, depth: int = 0) -> object:
             raise WorkflowEncodingError("wrong fields for legacy execution checkpoint")
         decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
         return rx.ReviewExecutionCheckpoint(**decoded, boundary_cursor=None)
-    if tag == _CURRENT_REVIEW_SNAPSHOT_TAG:
+    evolved = {"WorkflowSnapshotV2": "WorkflowSnapshot", "ReviewWorkflowSnapshotV3": "ReviewWorkflowSnapshot",
+               "ReviewFamilyEpisodesV2": "ReviewFamilyEpisodes"}
+    strict_evolution = tag in evolved
+    if strict_evolution:
+        tag = evolved[tag]
+    elif tag == _CURRENT_REVIEW_SNAPSHOT_TAG:
         tag = "ReviewWorkflowSnapshot"
     if tag == _CURRENT_ACTIVATED_EXECUTION_TAG:
         tag = "ActivatedReviewExecution"
@@ -278,7 +308,7 @@ def _decode(value: object, depth: int = 0) -> object:
     payload = value.get("fields")
     if set(value) != {"type", "fields"} or not isinstance(payload, dict):
         raise WorkflowEncodingError("malformed workflow fields")
-    legacy = _LEGACY_FIELDS.get(tag, {})
+    legacy = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
     if legacy and set(payload) == {field.name for field in fields(constructor)} - legacy.keys():
         payload = {**legacy, **payload}
     if set(payload) != {field.name for field in fields(constructor)}:

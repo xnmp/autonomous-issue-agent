@@ -17,7 +17,7 @@ from typing import Mapping, NewType
 from zoneinfo import ZoneInfo
 
 from .repository import canonical_repository
-from .workflow_identity import WorkflowBinding, validate_workflow_identifier
+from .workflow_identity import WorkflowBinding, WorkflowFamily, validate_workflow_identifier, validate_workflow_integer
 
 RunId = NewType("RunId", str)
 DispatchId = NewType("DispatchId", str)
@@ -36,6 +36,19 @@ class WorkflowAttemptIdentity:
             raise ValueError("workflow attempt requires a validated binding")
         for name, value in (("run_id", self.run_id), ("leg_id", self.leg_id)):
             validate_workflow_identifier(value, f"workflow attempt {name}")
+
+
+@dataclass(frozen=True)
+class ContinuationAdmission:
+    attempt: WorkflowAttemptIdentity
+    admission_version: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.attempt, WorkflowAttemptIdentity) or self.attempt.binding.authority.family not in (
+            WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD,
+        ):
+            raise ValueError("continuation admission requires a selected fixed component attempt")
+        validate_workflow_integer(self.admission_version, "continuation admission version", minimum=1)
 
 
 _CURRENCY = re.compile(r"^[A-Z]{3}$")
