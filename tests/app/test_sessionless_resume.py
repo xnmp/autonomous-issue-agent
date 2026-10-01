@@ -18,7 +18,7 @@ from issue_agent.domain.world import Comment as WorldComment
 from issue_agent.domain.world import IssueView
 from issue_agent.domain.workflow import AuthoredResolve, FreshResolve
 from tests.fakes.accounted_workflow import seed_resolve, resolve_state, attach_workflow_authority
-from tests.fakes.workflow_authority import resolve_snapshot
+from tests.fakes.workflow_authority import resolve_snapshot, with_issue_recovery
 
 
 def test_sessionless_blocked_reply_dispatches_once_as_resume(tmp_path):
@@ -59,19 +59,19 @@ def test_sessionless_reply_keeps_world_order_when_saved_session_also_waits():
             issue(
                 7,
                 "ai-blocked",
-                comments=(Comment("alice", "first reply", "t1"),),
+                comments=(Comment("alice", "first reply", "2026-10-01T00:00:00Z"),),
             ),
             issue(
                 8,
                 "ai-blocked",
-                comments=(Comment("bob", "second reply", "t2"),),
+                comments=(Comment("bob", "second reply", "2026-10-02T00:00:00Z"),),
             ),
         ]
     )
     store = FakeStore()
     seed_resolve(store, 8, session_id="saved")
     attach_workflow_authority(FakeGateway(issues={8: blocked.issues[1]}), store)
-    state = FixState(resolve_workflows={7: resolve_snapshot(7), 8: resolve_state(store, 8)})
+    state = FixState(resolve_workflows={7: with_issue_recovery(resolve_snapshot(7)), 8: resolve_state(store, 8)})
 
     actions = decide_fix(
         blocked,
@@ -92,8 +92,8 @@ def test_sessionless_reply_starts_fresh_with_issue_and_reply_context():
         title="Choose storage",
         body="The service must persist widgets.",
         comments=(
-            WorldComment("fix-bot", "Which backend?", "t1"),
-            WorldComment("alice", "Use PostgreSQL.", "t2"),
+            WorldComment("fix-bot", "Which backend?", "2026-10-01T00:00:00Z"),
+            WorldComment("alice", "Use PostgreSQL.", "2026-10-02T00:00:00Z"),
         ),
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
@@ -123,8 +123,8 @@ def test_reply_with_session_continues_the_saved_runtime_handle():
         title="t",
         body="b",
         comments=(
-            WorldComment("fix-bot", "question", "t1"),
-            WorldComment("alice", "answer", "t2"),
+            WorldComment("fix-bot", "question", "2026-10-01T00:00:00Z"),
+            WorldComment("alice", "answer", "2026-10-02T00:00:00Z"),
         ),
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
@@ -156,8 +156,8 @@ def test_split_author_reply_stays_in_author_phase():
         title="Choose storage",
         body="The service must persist widgets.",
         comments=(
-            WorldComment("fix-bot", "Which backend?", "t1"),
-            WorldComment("alice", "Use PostgreSQL.", "t2"),
+            WorldComment("fix-bot", "Which backend?", "2026-10-01T00:00:00Z"),
+            WorldComment("alice", "Use PostgreSQL.", "2026-10-02T00:00:00Z"),
         ),
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
@@ -192,8 +192,8 @@ def test_split_implementer_reply_reuses_only_its_current_author_inputs(changed_r
         title="Choose storage",
         body="The service must persist widgets.",
         comments=(
-            WorldComment("fix-bot", "Which backend?", "t1"),
-            WorldComment("alice", "Use PostgreSQL.", "t2"),
+            WorldComment("fix-bot", "Which backend?", "2026-10-01T00:00:00Z"),
+            WorldComment("alice", "Use PostgreSQL.", "2026-10-02T00:00:00Z"),
         ),
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
@@ -211,7 +211,7 @@ def test_split_implementer_reply_reuses_only_its_current_author_inputs(changed_r
         WorldComment(
             "alice",
             "Use SQLite instead." if changed_reply else "Use PostgreSQL.",
-            "t3",
+            "2026-10-03T00:00:00Z",
         ),
     ))
     runner = FakeRunner(
@@ -251,8 +251,8 @@ def test_split_reply_recovery_does_not_rerun_overlap_routing():
         title="Choose storage",
         body="The service must persist widgets.",
         comments=(
-            WorldComment("fix-bot", "Which backend?", "t1"),
-            WorldComment("alice", "Use PostgreSQL.", "t2"),
+            WorldComment("fix-bot", "Which backend?", "2026-10-01T00:00:00Z"),
+            WorldComment("alice", "Use PostgreSQL.", "2026-10-02T00:00:00Z"),
         ),
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})
@@ -299,8 +299,8 @@ def test_split_reply_reaches_contract_adjudicator():
         title="Choose storage",
         body="The service must persist widgets.",
         comments=(
-            WorldComment("fix-bot", "Which backend?", "t1"),
-            WorldComment("alice", "Use PostgreSQL.", "t2"),
+            WorldComment("fix-bot", "Which backend?", "2026-10-01T00:00:00Z"),
+            WorldComment("alice", "Use PostgreSQL.", "2026-10-02T00:00:00Z"),
         ),
     )
     gateway = FakeGateway(issues={5: iss}, pr_for_issue={})

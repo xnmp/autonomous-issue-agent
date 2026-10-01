@@ -3,7 +3,7 @@
 from dataclasses import replace
 
 from tests.domain.builders import Comment, issue, world
-from tests.fakes.workflow_authority import resolve_snapshot
+from tests.fakes.workflow_authority import resolve_snapshot, with_issue_recovery
 
 from issue_agent.domain.actions import AgentKind, Relabel, RunAgent, Target
 from issue_agent.domain.fix import FixConfig, FixState, decide_fix
@@ -14,7 +14,7 @@ from issue_agent.domain.workflow import FreshResolve, ResolveSession
 
 
 def test_fix_bot_reply_after_budget_prompt_dispatches_resume():
-    snapshot = resolve_snapshot(7)
+    snapshot = with_issue_recovery(resolve_snapshot(7))
     source = WorkflowAttemptIdentity(snapshot.binding, RunId("prior-run"), "prior-leg")
     snapshot = replace(snapshot, revision=replace(snapshot.revision, version=1),
                        episode=replace(snapshot.episode, continuation=FreshResolve(
@@ -25,8 +25,8 @@ def test_fix_bot_reply_after_budget_prompt_dispatches_resume():
         7,
         "ai-blocked",
         comments=(
-            Comment("fix-bot", prompt, "t1"),
-            Comment("fix-bot", "Raised the cap; resume from the handover.", "t2"),
+            Comment("fix-bot", prompt, "2026-10-01T00:00:00Z"),
+            Comment("fix-bot", "Raised the cap; resume from the handover.", "2026-10-02T00:00:00Z"),
         ),
     )
     actions = decide_fix(

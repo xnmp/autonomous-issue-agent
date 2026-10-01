@@ -71,7 +71,7 @@ from issue_agent.domain.world import IssueView, PRView, WorldState
 from issue_agent.domain.workflow import FreshResolve, ResolveSession
 from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowKey, WorkflowWriter
 from tests.fakes.review_workflow import held as held_review
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 CFG = FixConfig(fix_bot="fix-bot")
 
@@ -365,7 +365,7 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
     for item in scenario.world.issues:
-        snapshot = resolve_snapshot(item.number)
+        snapshot = with_issue_recovery(resolve_snapshot(item.number))
         if scenario.resolve_session:
             source = WorkflowAttemptIdentity(snapshot.binding, RunId(f"prior:{item.number}"), "prior-leg")
             snapshot = replace(
@@ -680,7 +680,7 @@ def test_simulator_can_detect_an_unbounded_loop():
     written back. The property above is only meaningful because a `decide_fix`
     that ignored its own state entirely would fail it."""
     scenario = _resume_dedup()
-    frozen_state = FixState(resolve_workflows={7: resolve_snapshot(7)})
+    frozen_state = FixState(resolve_workflows={7: with_issue_recovery(resolve_snapshot(7))})
     dispatches = 0
     for _ in range(TICKS):
         decided = decide_fix(scenario.world, scenario.cfg, frozen_state, fixer_busy=False)

@@ -18,6 +18,7 @@ from decimal import InvalidOperation
 from zoneinfo import ZoneInfo
 
 from .runtime_plan import AgentRuntime, RuntimePlan
+from ..domain import continuation_components as cc
 from ..domain.contracts import (
     BudgetScope,
     Money,
@@ -363,6 +364,17 @@ class AccountingRuntime(AgentRuntime):
             )
         correlated_run_id, _leg_id = self._identity.get()
         run_id = RunId(correlated_run_id or uuid.uuid4().hex)
+        continuations = ()
+        if task.issue_reply is not None:
+            selected = task.issue_reply
+            if isinstance(selected, cc.LinkedPRIssueReplyInput):
+                if self.role != "fix" or kind != "PR_RESUME" or workflow is not None or number != selected.pr.number or issue != selected.selection.binding.fence.key.target.number:
+                    return _return_refused("linked PR issue reply requires its exact issue/PR context")
+            elif self.role != "fix" or kind not in {"RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"} or workflow is None or workflow.fence != selected.selection.revision.fence:
+                return _return_refused("selected issue reply requires its captured resolve context")
+            capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
+            continuations = ((cc.IssueReplyPurchase(capture, selected.reply_at) if isinstance(selected, cc.LinkedPRIssueReplyInput)
+                              else cc.IssueRecoveryPurchase(capture, selected.reply_at, selected.branch, 2**63 - 1)),)
         publication = _fix_publication_context(self.role, task.cwd)
         if (
             self.role == "fix"
@@ -390,6 +402,9 @@ class AccountingRuntime(AgentRuntime):
                 "input_fingerprint": run_input_fingerprint(task.intent),
                 "split_input": encode_workflow(task.split_input) if task.split_input is not None else None,
                 "resolve_inputs": encode_workflow(task.resolve_inputs) if task.resolve_inputs is not None else None,
+                **({"issue_reply": encode_workflow((task.issue_reply.reply_at, task.issue_reply.body,
+                    task.issue_reply.branch if isinstance(task.issue_reply, cc.IssueReplyInput) else task.issue_reply.pr.number))}
+                   if task.issue_reply is not None else {}),
                 "split_fingerprint": hashlib.sha256(encode_workflow(task.split_input).encode()).hexdigest() if task.split_input is not None else None,
                 "number": number,
                 "issue": issue,
@@ -429,6 +444,7 @@ class AccountingRuntime(AgentRuntime):
             workflow=workflow,
             adjudication_ceiling=self.max_contract_rounds if workflow is not None and kind == "ADJUDICATE" else None,
             review_child=review_child,
+            continuations=continuations,
         )
         # Paid child ownership is recorded by the runtime's ProcessSupervisor.
         # The daemon itself must not be registered as the reservation lease:

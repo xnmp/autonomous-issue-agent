@@ -223,3 +223,18 @@ def test_pending_watermark_requires_exact_possible_historical_target_fence():
     component = replace(component, watermarks=ContinuationWatermarks(1, 0, other))
     with pytest.raises(ValueError, match="another target"):
         SelectedIssueRecovery(state.revision, component)
+
+
+@pytest.mark.parametrize("reply_at,body,branch", [
+    (None, "answer", "fix/1-reply"), ("invalid", "answer", "fix/1-reply"),
+    ("2026-10-01T00:00:00Z", None, "fix/1-reply"),
+    ("2026-10-01T00:00:00Z", " ", "fix/1-reply"),
+    ("2026-10-01T00:00:00Z", "x" * 65537, "fix/1-reply"),
+    ("2026-10-01T00:00:00Z", "answer", "fix/2-other"),
+])
+def test_selected_issue_reply_refuses_unknown_or_unowned_inputs(reply_at, body, branch):
+    from issue_agent.domain.continuation_components import IssueReplyInput
+    from tests.fakes.workflow_authority import resolve_snapshot, with_issue_recovery
+    selected = select_issue_recovery(with_issue_recovery(resolve_snapshot()))
+    with pytest.raises(ValueError):
+        IssueReplyInput(selected, reply_at, body, branch)

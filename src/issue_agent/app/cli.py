@@ -3414,19 +3414,27 @@ def cmd_review_execution_activation(args) -> int:
     return _cmd_workflow_activation(args, family="review-execution")
 
 
+def cmd_fix_activation(args) -> int:
+    return _cmd_workflow_activation(args, family="fix")
+
+
+def cmd_steward_activation(args) -> int:
+    return _cmd_workflow_activation(args, family="steward")
+
+
 def _cmd_workflow_activation(args, *, family: str) -> int:
     import sqlite3
 
     from ..adapters.control_store import ControlStoreError
-    from . import resolve_activation, review_activation, review_execution_activation
+    from . import resolve_activation, review_activation, review_execution_activation, continuation_activation
 
     activation = resolve_activation if family == "resolve" else review_activation
 
     name = args.name or _resolve_context(args)[2]
     try:
-        transport = review_execution_activation if family == "review-execution" else activation
-        scope = transport.activation_scope(
-            name, harness_root=HARNESS_ROOT, extra_roots=tuple(args.legacy_state_dir))
+        transport = continuation_activation if family in {"fix", "steward"} else review_execution_activation if family == "review-execution" else activation
+        scope = transport.activation_scope(name, harness_root=HARNESS_ROOT, extra_roots=tuple(args.legacy_state_dir),
+                                           **({"family": family} if family in {"fix", "steward"} else {}))
         if args.action in ("inventory", "shadow"):
             result = transport.inspect(scope, shadow=args.action == "shadow")
         elif args.action == "rehearse":
@@ -3441,7 +3449,13 @@ def _cmd_workflow_activation(args, *, family: str) -> int:
             # Old writers cannot be fenced by a table they never read. An empty
             # pgrep is not evidence across PID namespaces, so heartbeats of
             # every deployment of this repository refuse too, failing closed.
-            if isinstance(scope, review_execution_activation.ReviewExecutionActivationScope):
+            if isinstance(scope, continuation_activation.ContinuationActivationScope):
+                if not args.plan_file:
+                    err("continuation activate requires --plan-file with the original complete shadow report")
+                    return 2
+                result = continuation_activation.activate(scope, confirm_plan_digest=args.confirm_plan_digest,
+                            plan_file=args.plan_file, liveness=lambda: tuple(_activation_liveness(name, scope.repository)))
+            elif isinstance(scope, review_execution_activation.ReviewExecutionActivationScope):
                 from dataclasses import replace
                 if not args.plan_file:
                     err("execution activate requires --plan-file with the original complete shadow report")
@@ -3599,7 +3613,8 @@ def build_parser() -> argparse.ArgumentParser:
     sp.set_defaults(func=cmd_publish_base_branch)
 
     for family, handler in (("resolve", cmd_resolve_activation), ("review", cmd_review_activation),
-                            ("review-execution", cmd_review_execution_activation)):
+                            ("review-execution", cmd_review_execution_activation),
+                            ("fix", cmd_fix_activation), ("steward", cmd_steward_activation)):
         sp = sub.add_parser(
             f"{family}-activation",
             help=f"inventory, shadow-compare, rehearse or activate the {family} workflow family",
@@ -3615,7 +3630,7 @@ def build_parser() -> argparse.ArgumentParser:
         sp.add_argument("--legacy-state-dir", action="append", default=[], metavar="DIR",
                         help="additional older/custom state root to import from (repeatable)")
         sp.add_argument("--copy-to", default="", help="rehearse: new empty directory for the isolated copy")
-        if family == "review-execution":
+        if family in {"review-execution", "fix", "steward"}:
             sp.add_argument("--plan-file", default="", help="activate: saved original complete shadow JSON report")
         sp.set_defaults(func=handler)
 

@@ -46,7 +46,7 @@ from ...domain.resolve_split import (
     UnavailableContractRevision,
     split_context,
 )
-from ...domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowKey
+from ...domain.workflow_identity import IssueRef, PullRequestRef, WorkflowBinding, WorkflowKey
 from ...domain.workflow_policy import classify_resolve_attempt, decide_return
 from ...adapters.workflow_rows import WorkflowAuthorityError
 from ...adapters.runtime_plan import AgentRuntime, ContextualRuntime, RunTelemetryRuntime
@@ -78,6 +78,7 @@ from ...domain.effort import (
     escalate,
 )
 from ...domain.labels import Label
+from ...domain import continuation_components as cc
 from ...domain.lifecycle import AllowedEligibility, LifecycleOperation, issue_eligibility
 from ...domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from ...domain.refs import slugify
@@ -454,15 +455,16 @@ class FixWorkflow:
             cwd = self.worktrees.episode_workspace_path(state.intent.workspace)
         else:
             cwd = self.worktrees.ensure(issue, branch)
-        self.store.save_branch(issue, branch)
+        if state is None:
+            self.store.save_branch(issue, branch)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
         self.cfg.log(f"worktree #{issue}: ready on '{branch}' → {cwd}")
         return cwd
 
-    def _resume_branch(self, issue: int, title: str) -> str:
+    def _resume_branch(self, issue: int, title: str, state: WorkflowSnapshot) -> str:
         fallback = f"fix/{issue}-{slugify(title) or 'issue'}"
-        remembered = self.store.get_branch(issue) or ""
+        remembered = state.issue_recovery.state.remembered_branch if isinstance(state.issue_recovery, cc.ActiveIssueRecovery) else ""
         return self.worktrees.branch_for_issue(
             issue, fallback, preferred=remembered
         ) or remembered or fallback
@@ -567,6 +569,16 @@ class FixWorkflow:
         return contextlib.nullcontext(_discard_route_decision)
 
     async def _run_logged(self, label: str, issue: int, task, *, kind: str | None = None):
+        if task.issue_reply is None and task.split_input is not None:
+            context = split_context(task.split_input)
+            if context.reply is not None:
+                assert self.workflow_control is not None
+                state = self._resolve_state(issue, self.runner.workflow_binding)
+                selected = cc.select_issue_recovery(state)
+                if not isinstance(selected, cc.SelectedIssueRecovery):
+                    raise WorkflowAuthorityError("split reply continuation requires migration")
+                if cc.reply_advances(context.reply.created_at, selected.component.state.consumed_reply_at):
+                    task = dataclasses.replace(task, issue_reply=cc.IssueReplyInput(selected, context.reply.created_at, context.reply.body, context.branch))
         return await run_leg(
             self.runner,
             self.cfg.log,
@@ -890,7 +902,7 @@ class FixWorkflow:
             await self.resolve_split(issue, binding=binding)
             return
         iss = self.gateway.get_issue(issue)
-        branch = self._resume_branch(issue, iss.title)
+        branch = self._resume_branch(issue, iss.title, state)
         cwd = self._ensure_cwd(issue, branch, state)
         fix_cfg, deferred_for_overlap = await self._routed_fix_cfg(issue, iss, cwd, binding)
         if deferred_for_overlap:
@@ -1004,8 +1016,6 @@ class FixWorkflow:
     ) -> SplitReply | None:
         latest = fix_domain.last_human_reply(iss, self.cfg.fix_bot)
         if requested:
-            if prior is not None and requested == prior.body:
-                return prior
             if (
                 latest is None
                 or latest.body != requested
@@ -1201,7 +1211,7 @@ class FixWorkflow:
             and checkpoint.split is not None
             else None
         )
-        branch = retained.branch if retained is not None else self._resume_branch(issue, iss.title)
+        branch = retained.branch if retained is not None else self._resume_branch(issue, iss.title, state)
         cwd = self._ensure_cwd(issue, branch, state)
         if retained is not None:
             fix_cfg = self._split_cfg(retained)
@@ -1270,10 +1280,10 @@ class FixWorkflow:
                 checkpoint.split, SplitImplement
             ):
                 return
-        await self._implement_loop(issue, cwd, binding=binding)
+        await self._implement_loop(issue, cwd, binding=binding, selected_reply=reply)
 
     async def _implement_loop(
-        self, issue: int, cwd: str, *, binding: WorkflowBinding,
+        self, issue: int, cwd: str, *, binding: WorkflowBinding, selected_reply: SplitReply | None = None,
     ) -> None:
         while True:
             state = self._resolve_state(issue, binding)
@@ -1392,6 +1402,12 @@ class FixWorkflow:
                 ),
                 split_input=split_input,
             )
+            if selected_reply is not None:
+                selected = cc.select_issue_recovery(state)
+                if not isinstance(selected, cc.SelectedIssueRecovery):
+                    raise WorkflowAuthorityError("selected split reply continuation requires migration")
+                if cc.reply_advances(selected_reply.created_at, selected.component.state.consumed_reply_at):
+                    task = dataclasses.replace(task, issue_reply=cc.IssueReplyInput(selected, selected_reply.created_at, selected_reply.body, context.branch))
             result = await self._run_logged(leg, issue, task, kind=kind)
             returned = self._returned_result(result, binding)
             if outcome.infra_class_failure(result):
@@ -1496,24 +1512,36 @@ class FixWorkflow:
         iss = self.gateway.get_issue(issue)
         pr_existing = self.gateway.pr_for_issue(issue)
         state = None
+        reply_state = None
         effect_binding = binding
         if pr_existing is None:
             state = self._resolve_state(issue, binding)
+            reply_state = state
             assert binding is not None
         else:
             if binding is not None:
-                self._resolve_state(issue, binding, allow_held=True)
+                reply_state = self._resolve_state(issue, binding, allow_held=True)
             elif self.workflow_control is not None:
                 captured = self.workflow_control.load_workflow(WorkflowKey(self.workflow_control.writer.repository, IssueRef(issue)))
                 if not isinstance(captured, WorkflowSnapshot):
                     raise WorkflowAuthorityError("PR reply requires available linked-issue command authority")
                 effect_binding = captured.binding
+                reply_state = captured
             if isinstance(self.runner, ContextualRuntime):
                 self.runner.set_context("fix", "PR_RESUME", pr_existing, issue, workflow=None)
         reply_comment = fix_domain.last_human_reply(iss, self.cfg.fix_bot)
+        selected = cc.select_issue_recovery(reply_state) if reply_state is not None else None
+        if not isinstance(selected, cc.SelectedIssueRecovery):
+            raise WorkflowAuthorityError("issue reply continuation is inactive or migration blocked")
+        if isinstance(selected, cc.SelectedIssueRecovery) and reply_comment is not None and reply_comment.body.strip() and not cc.reply_advances(reply_comment.created_at, selected.component.state.consumed_reply_at):
+            return
         if reply_comment is None or not reply_comment.body.strip():
             if reply_comment is not None:
-                self.store.set_resumed_at(issue, reply_comment.created_at)
+                assert self.workflow_control is not None
+                assert reply_state is not None
+                if self.workflow_control.consume_blank_issue_reply(reply_state.binding, reply_comment.created_at, reply_comment.body):
+                    self.executor.replay_pending()
+                return
             actions = [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_BLOCKED, workflow=effect_binding)]
             if state is not None:
                 self._execute_resolve_actions(issue, actions, state.binding)
@@ -1521,13 +1549,12 @@ class FixWorkflow:
                 self.executor.execute_all(actions)
             return
         reply = reply_comment.body
-        self.store.set_resumed_at(issue, reply_comment.created_at)
         if self.cfg.author_tests_split and state is not None:
             await self.resolve_split(issue, human_reply=reply, binding=binding)
             return
-        branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else self._resume_branch(issue, iss.title)
+        branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else self._resume_branch(issue, iss.title, state)
         cwd = self._ensure_cwd(issue, branch, state)
-        fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
+        fork = selected.component.state.resumes + 1 >= self.cfg.fork_threshold if state is not None else self.store.bump_resumes(issue) >= self.cfg.fork_threshold
         if state is not None:
             session = state.episode.continuation.session
             session_id = session.session_id if session is not None else ""
@@ -1545,6 +1572,11 @@ class FixWorkflow:
             self._resolve_state(issue, binding)
             task = self._guided(task, state)
             task = dataclasses.replace(task, resolve_inputs=ResolveInputs(iss.title, iss.body, iss.author))
+            assert isinstance(selected, cc.SelectedIssueRecovery)
+            task = dataclasses.replace(task, issue_reply=cc.IssueReplyInput(selected, reply_comment.created_at, reply, branch))
+        else:
+            assert pr_existing is not None
+            task = dataclasses.replace(task, issue_reply=cc.LinkedPRIssueReplyInput(selected, reply_comment.created_at, reply, PullRequestRef(pr_existing)))
         result = await self._run_logged("resume", issue, task, kind="RESUME" if state is not None else "PR_RESUME")
         if state is not None:
             assert binding is not None

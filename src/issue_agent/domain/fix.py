@@ -58,6 +58,7 @@ from .exemptions import (
     exemption_status,
 )
 from .identity import login_eq
+from . import continuation_components as cc
 from .labels import Label, priority_rank
 from .lifecycle import (
     AllowedEligibility,
@@ -504,8 +505,8 @@ def last_human_reply(issue: IssueView | PRView, fix_bot: str) -> Comment | None:
 
     Public because BOTH sides of the resume dedup must select the SAME comment:
     the decide-side read (issues_needing_resume, comparing created_at against
-    the resumed-at mark) and the workflow's write side (set_resumed_at after
-    dispatch). When the two sides used different filters the write recorded a
+    the selected continuation marker) and successful admission's captured
+    reply input. When the two sides used different filters the write recorded a
     different comment than the read compared, and one unanswered reply re-fired
     a paid RESUME session every poll (V1/#13).
 
@@ -579,13 +580,20 @@ def _issues_needing_resume(
         workflow = state.resolve_workflows.get(issue.number)
         if not isinstance(workflow, WorkflowSnapshot) or workflow.gates:
             continue
+        selected = cc.select_issue_recovery(workflow)
+        if not isinstance(selected, cc.SelectedIssueRecovery) or selected.component.gates:
+            continue
         has_session = workflow.episode.continuation.session is not None
         if not lifecycle.is_blocked or has_session != require_session:
             continue
         last_at = _last_human_reply_at(issue, cfg.fix_bot)
         if last_at is None:
             continue
-        if last_at != state.resumed_at.get(issue.number, ""):
+        try:
+            advances = cc.reply_advances(last_at, selected.component.state.consumed_reply_at)
+        except ValueError:
+            continue
+        if advances:
             out.append((issue.number, last_at))
     return out
 

@@ -100,7 +100,7 @@ from .deployment_authority import (
 )
 from .review_effects import bound_submission_op, review_family_op
 from .review_execution_claims import load_review_preflight_record, require_review_parent_claim
-from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
+from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
 SCHEMA_VERSION = 36
@@ -642,7 +642,7 @@ class ReservationRequest:
 
     def __post_init__(self) -> None:
         if (not isinstance(self.continuations, tuple) or len(self.continuations) > 3
-                or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in self.continuations)):
+                or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in self.continuations)):
             raise ValueError("reservation requires bounded fixed continuation purchases")
         if len({item.capture.binding.authority.family for item in self.continuations}) != len(self.continuations):
             raise ValueError("reservation selects each continuation family once")
@@ -5335,6 +5335,41 @@ class SQLiteControlStore:
     def _continuation_receipt_key(run_id: RunId, family: WorkflowFamily) -> str:
         return hashlib.sha256(str(run_id).encode()).hexdigest() + ":" + family.value
 
+    @staticmethod
+    def _require_issue_reply_projection(db: sqlite3.Connection, key: WorkflowKey, marker: str, *, allow_unresolved: bool = False) -> None:
+        if not marker:
+            return
+        receipt_key = hashlib.sha256(encode_workflow((key, marker)).encode()).hexdigest()
+        receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='issue-reply-noop' AND scope=? AND key=? AND typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB))<=262144", (key.repository, receipt_key)).fetchone()
+        row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=? AND typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB))<=262144", (receipt_key,)).fetchone()
+        if receipt is None and row is None:
+            return
+        if receipt is None or row is None:
+            raise WorkflowAuthorityError("blank reply lost its selected consumption or projection source")
+        request = decode_workflow(receipt[0], tuple)
+        command = _command_from_row(row)
+        if (len(request) != 4 or not isinstance(request[0], WorkflowBinding)
+                or request[0].fence.key != key or request[1] != marker
+                or command.workflow != request[0] or command.kind is not CommandKind.RELABEL
+                or command.repository != key.repository or command.target != f"issue:{key.target.number}"
+                or command.expected_revision is not None or command.config_version != ""
+                or request[2] != command.executor_identity
+                or request[3] != json.dumps(dict(command.payload), sort_keys=True, separators=(",", ":"))
+                or command.idempotency_key != "issue-reply-noop:" + receipt_key):
+            raise WorkflowAuthorityError("blank reply projection disagrees with its selected source")
+        if row["state"] not in ("succeeded", "permanent_failure"):
+            if allow_unresolved:
+                return
+            raise WorkflowAuthorityError("blank reply re-block projection is still unresolved")
+        effect = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (receipt_key,)).fetchone()
+        if effect is None or effect["status"] != row["state"] or effect["executor_identity"] != row["attempt_owner"]:
+            raise WorkflowAuthorityError("blank reply lost its selected terminal projection effect")
+        settled = EffectReceipt(command.command_id, effect["executor_identity"], _parse_stamp(effect["started_at"]),
+                                _parse_stamp(effect["completed_at"]), EffectStatus(effect["status"]),
+                                effect["remote_object_id"], effect["remote_revision"], effect["error"])
+        if _receipt_digest(settled) != effect["receipt_digest"]:
+            raise WorkflowAuthorityError("blank reply terminal effect disagrees with its receipt")
+
     def _require_continuation_launch(self, db: sqlite3.Connection, run_id: RunId) -> None:
         from .workflow_rows import load_issue_aggregate
         run = db.execute("SELECT r.continuations_json,r.workflow_binding_json,b.workload_repository FROM runs r "
@@ -5342,7 +5377,7 @@ class SQLiteControlStore:
         if run is None:
             return
         purchases = decode_workflow(run["continuations_json"], tuple)
-        if (len(purchases) > 3 or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in purchases)
+        if (len(purchases) > 3 or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in purchases)
                 or len({item.capture.binding.authority.family for item in purchases}) != len(purchases)):
             raise WorkflowAuthorityError("run continuation selections are malformed")
         if run["workflow_binding_json"] is not None:
@@ -5371,8 +5406,8 @@ class SQLiteControlStore:
                     or not cc.continuation_return_is_current(selection, admission)):
                 raise WorkflowAuthorityError("continuation launch admission is stale or held")
 
-    def reserve_issue_recovery(self, request: ReservationRequest, purchase: cc.IssueRecoveryPurchase) -> ReservationResult:
-        if not isinstance(purchase, cc.IssueRecoveryPurchase):
+    def reserve_issue_recovery(self, request: ReservationRequest, purchase: cc.IssueRecoveryPurchase | cc.IssueReplyPurchase) -> ReservationResult:
+        if not isinstance(purchase, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase)):
             raise ValueError("issue recovery reservation requires its typed purchase")
         return self.reserve(replace(request, continuations=(purchase,)))
 
@@ -5393,6 +5428,32 @@ class SQLiteControlStore:
         for purchase in request.continuations:
             capture = purchase.capture
             key = capture.binding.fence.key
+            if isinstance(purchase, cc.IssueReplyPurchase) or (
+                    isinstance(purchase, cc.IssueRecoveryPurchase) and request.workflow is not None
+                    and request.workflow.authority.family is WorkflowFamily.RESOLVE
+                    and request.kind in {"RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"}):
+                try:
+                    if not isinstance(request.dispatch_id, str) or len(request.dispatch_id.encode()) > MAX_WORKFLOW_PAYLOAD_BYTES:
+                        raise ValueError("issue reply dispatch exceeds its bound")
+                    dispatch = json.loads(request.dispatch_id)
+                    if not isinstance(dispatch, dict) or not isinstance(dispatch.get("issue_reply"), str):
+                        raise ValueError("issue reply dispatch lacks its selected input")
+                    inputs = decode_workflow(dispatch["issue_reply"], tuple)
+                except (ValueError, TypeError) as exc:
+                    raise WorkflowAuthorityError("issue reply lacks its exact bounded dispatch input") from exc
+                if (len(inputs) != 3 or inputs[0] != purchase.reply_at or not isinstance(inputs[1], str)
+                        or not inputs[1].strip() or len(inputs[1]) > 65536 or "\x00" in inputs[1]
+                        or dispatch.get("repository") != key.repository or dispatch.get("role") != "fix"
+                        or dispatch.get("kind") != request.kind or type(dispatch.get("issue")) is not int
+                        or dispatch["issue"] != key.target.number or dispatch.get("leg_id") != capture.leg_id):
+                    raise WorkflowAuthorityError("issue reply disagrees with its selected timestamp/body/leg context")
+                if isinstance(purchase, cc.IssueReplyPurchase):
+                    if (request.kind != "PR_RESUME" or request.workflow is not None
+                            or type(dispatch.get("number")) is not int or not 0 < dispatch["number"] < 2**63
+                            or type(inputs[2]) is not int or inputs[2] != dispatch["number"]):
+                        raise WorkflowAuthorityError("linked PR issue reply disagrees with its actual PR context")
+                elif inputs[2] != purchase.branch or dispatch.get("number") != key.target.number or issue_from_branch(purchase.branch) != key.target.number:
+                    raise WorkflowAuthorityError("issue reply disagrees with its selected issue branch")
             aggregate = (load_review_workflow_row(db, key) if isinstance(purchase, cc.PRRepairPurchase)
                          else load_issue_aggregate(db, key))
             if aggregate is None or aggregate.revision != capture.revision:
@@ -5405,11 +5466,12 @@ class SQLiteControlStore:
             version = aggregate.revision.version + 1
             after = updates.get(key, aggregate)
             try:
-                if isinstance(purchase, cc.IssueRecoveryPurchase):
+                if isinstance(purchase, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase)):
                     selection = cc.select_issue_recovery(aggregate)
                     if not isinstance(selection, cc.SelectedIssueRecovery):
                         raise ValueError("issue recovery is inactive or migration blocked")
-                    after = replace(after, issue_recovery=cc.consume_issue_recovery(selection, purchase, version),
+                    self._require_issue_reply_projection(db, key, selection.component.state.consumed_reply_at)
+                    after = replace(after, issue_recovery=(cc.consume_issue_recovery(selection, purchase, version) if isinstance(purchase, cc.IssueRecoveryPurchase) else cc.consume_issue_reply(selection, purchase, version)),
                                     revision=WorkflowRevision(aggregate.revision.fence, version))
                 elif isinstance(purchase, cc.PRRepairPurchase):
                     selection = cc.select_pr_repair(aggregate)
@@ -5502,6 +5564,8 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError("resolve admission requires the repository's fix owner")
         try:
             snapshot = require_resolve_binding(db, binding)
+            if isinstance(snapshot.issue_recovery, cc.ActiveIssueRecovery):
+                self._require_issue_reply_projection(db, binding.fence.key, snapshot.issue_recovery.state.consumed_reply_at)
             dispatch = json.loads(request.dispatch_id)
             if not isinstance(dispatch, dict) or dispatch.get("repository") != binding.fence.key.repository or type(dispatch.get("issue")) is not int or dispatch["issue"] != binding.fence.key.target.number:
                 raise WorkflowAuthorityError("paid dispatch identity disagrees with its workflow")
@@ -5921,7 +5985,7 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("continuation return lacks its immutable run admission")
             captured = decode_workflow(row["payload_json"], tuple)
             if (len(captured) != 2 or captured[1] != admission
-                    or not isinstance(captured[0], (cc.IssueRecoveryPurchase, cc.PRRepairPurchase, cc.StewardPurchase))
+                    or not isinstance(captured[0], (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase))
                     or captured[0].capture.binding != admission.attempt.binding
                     or captured[0].capture.leg_id != admission.attempt.leg_id
                     or captured[0].capture.revision.version + 1 != admission.admission_version

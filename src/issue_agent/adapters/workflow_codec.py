@@ -28,6 +28,7 @@ from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
 from ..domain.contracts import WorkflowAttemptIdentity, ContinuationAdmission
 from ..domain import continuation_components as cc
+from ..domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
 from ..domain.labels import Label
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
@@ -43,6 +44,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    ContinuationImportPlan, ContinuationImportTarget,
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState,
     cc.StewardLaneState, cc.StewardState, cc.ContinuationImportBlocker,
@@ -50,7 +52,7 @@ _VALUES = (
     cc.BlockedIssueRecovery, cc.BlockedPRRepair, cc.BlockedSteward,
     cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward,
     w.IssueWorkflowShell, w.IssueFamilyEpisodes,
-    cc.ContinuationCapture, cc.IssueRecoveryPurchase, cc.PRRepairPurchase, cc.StewardPurchase,
+    cc.ContinuationCapture, cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase,
     EligibleZeroHistoryReviewImport, ReviewImportNoHistoryObserved, LegacyOpenPRCounterLink,
     migration.ReviewImportSource, migration.ReviewImportBlocker, migration.ReviewImportHistoryBlocked,
     migration.BlockedReviewExecutionMigration,

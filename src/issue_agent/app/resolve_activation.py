@@ -12,6 +12,10 @@ import hashlib
 import os
 import uuid
 from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .continuation_activation import ContinuationActivationScope
 
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import SQLiteControlStore
@@ -154,7 +158,7 @@ def report(scope: ActivationScope, evaluation: Evaluation, *, shadow: bool) -> J
     return result
 
 
-def _bind_operator_feed(control: SQLiteControlStore, scope: ActivationScope) -> None:
+def _bind_operator_feed(control: SQLiteControlStore, scope: ActivationScope | ContinuationActivationScope) -> None:
     """Record activation through the committed outbox into the fix role's
     feed under an operator producer, as dashboard interventions do."""
     events = EventLog(

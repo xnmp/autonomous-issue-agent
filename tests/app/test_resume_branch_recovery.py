@@ -18,6 +18,7 @@ from issue_agent.domain.world import Comment, IssueView
 
 from tests.app.test_dispatch import FakeGateway, FakeRunner
 from tests.app.test_fix_workflow import _workflow
+from tests.fakes.accounted_workflow import resolve_state
 from tests.adapters.test_worktree import FakeGit
 
 
@@ -55,8 +56,8 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     git("worktree", "remove", str(original_cwd), "--force")
 
     iss = IssueView(issue, title="Retitled after blocked work", body="body", comments=(
-        Comment("fix-bot", "asking", "t1"),
-        Comment("alice", "continue", "t2"),
+        Comment("fix-bot", "asking", "2026-10-01T00:00:00Z"),
+        Comment("alice", "continue", "2026-10-02T00:00:00Z"),
     ))
     gw = FakeGateway(issues={issue: iss}, pr_for_issue={})
     runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
@@ -70,7 +71,8 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     recovered_cwd = Path(runner.tasks[0].cwd)
     assert git("branch", "--show-current", cwd=recovered_cwd) == original_branch
     assert git("rev-parse", "HEAD", cwd=recovered_cwd) == blocked_commit
-    assert store.get_branch(issue) == original_branch
+    assert resolve_state(store).issue_recovery.state.remembered_branch == original_branch
+    assert store.get_branch(issue) == ""
     assert subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", "refs/heads/fix/5-issue"], cwd=repo,
     ).returncode == 1
@@ -112,8 +114,8 @@ def test_resume_ignores_stale_synthesized_branch_when_recovering_blocked_work(tm
     git("branch", stale_branch, "dev")
 
     iss = IssueView(issue, title="Retitled after blocked work", body="body", comments=(
-        Comment("fix-bot", "asking", "t1"),
-        Comment("alice", "continue", "t2"),
+        Comment("fix-bot", "asking", "2026-10-01T00:00:00Z"),
+        Comment("alice", "continue", "2026-10-02T00:00:00Z"),
     ))
     runner = FakeRunner(AgentResult(is_error=False, status="blocked", session_id="s5"))
     workflow = _workflow(
@@ -140,7 +142,11 @@ def test_resolve_persists_branch_for_future_reply_recovery(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner).resolve(issue))
 
-    assert store.get_branch(issue) == "fix/5-preserve-blocked-work"
+    import json
+    with store._workflow_db._connect() as db:
+        selected = json.loads(db.execute("SELECT dispatch_id FROM runs WHERE kind='RESOLVE'").fetchone()[0])
+    assert selected["publication_branch"] == "fix/5-preserve-blocked-work"
+    assert store.get_branch(issue) == ""
 
 
 def test_branch_for_issue_recovers_a_unique_retained_branch():

@@ -14,6 +14,10 @@ from dataclasses import replace
 from datetime import datetime, timedelta
 
 from ..domain.contracts import EffectStatus, PricingBasis, WorkflowAttemptIdentity
+from ..domain import continuation_components as cc
+from ..domain.actions import Target
+from ..domain.labels import Label
+from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.actions import ClearIssueState, Relabel, RemoveWorktree
 from ..domain.contracts import CommandId
 from ..domain.outcome import budget_exhausted, infra_class_failure
@@ -112,6 +116,48 @@ class SQLiteWorkflowControl:
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")
+
+    def consume_blank_issue_reply(self, binding: WorkflowBinding, reply_at: str, body: str) -> bool:
+        if not isinstance(binding, WorkflowBinding) or not cc.reply_advances(reply_at, ""):
+            raise WorkflowAuthorityError("blank reply requires its exact binding and timestamp")
+        self._scope(binding.fence.key)
+        if not isinstance(body, str) or len(body.encode()) > 65536 or body.strip():
+            raise WorkflowAuthorityError("unpaid reply consumption requires blank content")
+        receipt_key = hashlib.sha256(encode_workflow((binding.fence.key, reply_at)).encode()).hexdigest()
+        command = command_for_action(Relabel(Target.ISSUE, binding.fence.key.target.number, Label.AI_WORKING, Label.AI_BLOCKED, workflow=binding), repository=self.writer.repository, executor_identity=self.writer.owner_id)
+        command = replace(command, command_id=CommandId(receipt_key), idempotency_key="issue-reply-noop:" + receipt_key)
+        request = encode_workflow((binding, reply_at, command.executor_identity, json.dumps(dict(command.payload), sort_keys=True, separators=(",", ":"))))
+        with self._control.transaction() as db, self._control.mutation_savepoint(db):
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='issue-reply-noop' AND scope=? AND key=?", (self.writer.repository, receipt_key)).fetchone()
+            if receipt is not None:
+                if receipt[0] != request:
+                    raise WorkflowAuthorityError("blank reply conflicts with its original consumption")
+                selected_command = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=? AND typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB))<=262144", (receipt_key,)).fetchone()
+                if selected_command is None or _command_from_row(selected_command) != command:
+                    raise WorkflowAuthorityError("blank reply lost its exact original projection command")
+                self._control._require_issue_reply_projection(db, binding.fence.key, reply_at, allow_unresolved=True)
+                return True
+            if db.execute("SELECT 1 FROM lifecycle_commands WHERE command_id=?", (receipt_key,)).fetchone() is not None:
+                raise WorkflowAuthorityError("blank reply lost its selected consumption receipt")
+            prior = load_issue_aggregate(db, binding.fence.key)
+            if not isinstance(prior, WorkflowSnapshot) or prior.binding != binding or HeldProjection(prior).held:
+                raise WorkflowAuthorityError("blank reply requires current unheld resolve authority")
+            selected = cc.select_issue_recovery(prior)
+            if not isinstance(selected, cc.SelectedIssueRecovery) or selected.component.gates:
+                raise WorkflowAuthorityError("blank reply continuation is inactive, blocked or held")
+            if not cc.reply_advances(reply_at, selected.component.state.consumed_reply_at):
+                return False
+            self._control._require_issue_reply_projection(db, binding.fence.key, selected.component.state.consumed_reply_at)
+            component = replace(selected.component, state=replace(selected.component.state, consumed_reply_at=reply_at))
+            after = replace(prior, issue_recovery=component, revision=replace(prior.revision, version=prior.revision.version + 1))
+            self._persist_snapshot(db, after)
+            self._control._enqueue_command(db, command)
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('issue-reply-noop',?,?,?,?)", (self.writer.repository, receipt_key, self._control._now().isoformat(), request))
+            if self._control._event_factory is not None:
+                event = ControlTransitionCommitted("issue_reply", receipt_key, "consumed_blank", {"reply_at": reply_at, "command_id": str(command.command_id)})
+                self._control.enqueue_event(self._control._event_factory(event, Correlation(issue=binding.fence.key.target.number)), db)
+            return True
 
     def resolve_control_view(self, key: WorkflowKey, *, request_id: str | None = None) -> ResolveControlRead:
         """One read snapshot; inspection never schedules recovery or initializes state."""
@@ -1138,6 +1184,9 @@ class SQLiteWorkflowControl:
             yield
 
     def _assert_target_quiescent(self, db: sqlite3.Connection, key: WorkflowKey) -> None:
+        selected = load_issue_aggregate(db, key)
+        if isinstance(selected, WorkflowSnapshot) and isinstance(selected.issue_recovery, cc.ActiveIssueRecovery):
+            self._control._require_issue_reply_projection(db, key, selected.issue_recovery.state.consumed_reply_at)
         lower, upper = workflow_run_scope_bounds(key)
         active = db.execute(
             "SELECT 1 FROM runs r LEFT JOIN leases l USING(run_id) "
@@ -1471,6 +1520,8 @@ class SQLiteWorkflowControl:
         replayed = replay_or_conflict(db, self.writer.repository, prior, transition, encoded)
         if replayed is not None:
             return replayed
+        if transition.snapshot.binding != prior.binding and isinstance(prior.issue_recovery, cc.ActiveIssueRecovery):
+            self._control._require_issue_reply_projection(db, prior.binding.fence.key, prior.issue_recovery.state.consumed_reply_at)
         observations = self._validate_evidence(db, prior, transition)
         admission = self._validate_attempt_run(db, transition.audit) if isinstance(transition.audit, ResolveAttemptResult) else None
         accepted_preflight = None

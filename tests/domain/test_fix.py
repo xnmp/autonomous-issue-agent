@@ -70,6 +70,9 @@ from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
 )
 
+from tests.fakes.workflow_authority import with_issue_recovery
+from issue_agent.domain.continuation_components import IssueRecoveryState
+
 CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
 
 
@@ -88,11 +91,13 @@ def _workflow(number, *, session=False, failures=0, held=False, error=""):
             f"gate-{number}", 2, ResolveCeiling(snapshot.episode.episode_id, failures, 3, error),
             NoAuthorizedRemediation("Operator decision required"),
         ),))
-    return snapshot
+    return with_issue_recovery(snapshot)
 
 
 def _with_session(number=7, **kwargs):
-    return FixState(resolve_workflows={number: _workflow(number, session=True)}, **kwargs)
+    consumed = kwargs.pop("resumed_at", {}).get(number, "")
+    snapshot = with_issue_recovery(_workflow(number, session=True), state=IssueRecoveryState(consumed_reply_at=consumed))
+    return FixState(resolve_workflows={number: snapshot}, **kwargs)
 
 
 def decide_fix(observed, cfg, state, **kwargs):
@@ -569,18 +574,18 @@ def test_inflight_issue_cannot_receive_a_second_pr_leg():
 
 # ── resume dedupe (anti-loop) ──────────────────────────────────────────────────
 def test_resume_needs_session_and_new_reply():
-    iss = issue(7, "ai-blocked", comments=(Comment("alice", "here you go", "t2"),))
+    iss = issue(7, "ai-blocked", comments=(Comment("alice", "here you go", "2026-10-01T00:00:02Z"),))
     w = world(issues=[iss])
     # no session → not eligible
     assert issues_needing_resume(w, FixState(resolve_workflows={7: _workflow(7)}), CFG) == []
     # with a session → eligible
     st = _with_session()
-    assert issues_needing_resume(w, st, CFG) == [(7, "t2")]
+    assert issues_needing_resume(w, st, CFG) == [(7, "2026-10-01T00:00:02Z")]
 
 
 def test_resume_skips_already_resumed_reply():
-    iss = issue(7, "ai-blocked", comments=(Comment("alice", "x", "t2"),))
-    st = _with_session(resumed_at={7: "t2"})
+    iss = issue(7, "ai-blocked", comments=(Comment("alice", "x", "2026-10-01T00:00:02Z"),))
+    st = _with_session(resumed_at={7: "2026-10-01T00:00:02Z"})
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
 
@@ -590,7 +595,7 @@ def test_resume_never_fires_on_a_closed_issue():
     bought a paid resume leg that could only re-ask (keifu #196, 2026-08-10)."""
     iss = issue(
         7, "ai-blocked", state="closed",
-        comments=(Comment("alice", "closing as duplicate of #192", "t2"),),
+        comments=(Comment("alice", "closing as duplicate of #192", "2026-10-01T00:00:02Z"),),
     )
     st = _with_session()
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
@@ -600,7 +605,7 @@ def test_resume_never_fires_on_a_closed_issue():
 def test_resume_ignores_bot_and_fixer_comments():
     iss = issue(
         7, "ai-blocked",
-        comments=(Comment("fix-bot", "asking", "t1"), Comment("ci[bot]", "noise", "t2")),
+        comments=(Comment("fix-bot", "asking", "2026-10-01T00:00:01Z"), Comment("ci[bot]", "noise", "2026-10-01T00:00:02Z")),
     )
     st = _with_session()
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
@@ -614,14 +619,14 @@ def test_resume_accepts_operator_reply_when_operator_is_also_fix_bot():
             Comment(
                 "fix-bot",
                 "**Agent needs input:** choose A or B\n\n_Reply to unblock._",
-                "t1",
+                "2026-10-01T00:00:01Z",
             ),
-            Comment("fix-bot", "Use A.", "t2"),
+            Comment("fix-bot", "Use A.", "2026-10-01T00:00:02Z"),
         ),
     )
     st = _with_session()
 
-    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "2026-10-01T00:00:02Z")]
 
 
 def test_resume_accepts_reply_when_fix_bot_is_an_app_identity():
@@ -630,14 +635,14 @@ def test_resume_accepts_reply_when_fix_bot_is_an_app_identity():
         7,
         "ai-blocked",
         comments=(
-            Comment("fix-bot[bot]", prompt, "t1"),
-            Comment("fix-bot[bot]", "Use A.", "t2"),
+            Comment("fix-bot[bot]", prompt, "2026-10-01T00:00:01Z"),
+            Comment("fix-bot[bot]", "Use A.", "2026-10-01T00:00:02Z"),
         ),
     )
     cfg = FixConfig(fix_bot="fix-bot[bot]")
     st = _with_session()
 
-    assert issues_needing_resume(world(issues=[iss]), st, cfg) == [(7, "t2")]
+    assert issues_needing_resume(world(issues=[iss]), st, cfg) == [(7, "2026-10-01T00:00:02Z")]
 
 
 def test_unblock_prompt_does_not_count_as_its_own_reply():
@@ -648,7 +653,7 @@ def test_unblock_prompt_does_not_count_as_its_own_reply():
             Comment(
                 "fix-bot",
                 "**Agent needs input:** choose A or B\n\n_Reply to unblock._",
-                "t1",
+                "2026-10-01T00:00:01Z",
             ),
         ),
     )
@@ -664,12 +669,12 @@ def test_second_round_unblock_prompt_supersedes_the_original_reply():
         7,
         "ai-blocked",
         comments=(
-            Comment("fix-bot", first, "t1"),
-            Comment("alice", "Use A.", "t2"),
-            Comment("fix-bot", second, "t3"),
+            Comment("fix-bot", first, "2026-10-01T00:00:01Z"),
+            Comment("alice", "Use A.", "2026-10-01T00:00:02Z"),
+            Comment("fix-bot", second, "2026-10-01T00:00:03Z"),
         ),
     )
-    st = _with_session(resumed_at={7: "t2"})
+    st = _with_session(resumed_at={7: "2026-10-01T00:00:02Z"})
 
     assert issues_needing_resume(world(issues=[iss]), st, CFG) == []
 
@@ -680,13 +685,13 @@ def test_author_leg_prompt_accepts_fix_bot_operator_reply():
         7,
         "ai-blocked",
         comments=(
-            Comment("fix-bot", prompt, "t1"),
-            Comment("fix-bot", "Use the documented behavior.", "t2"),
+            Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"),
+            Comment("fix-bot", "Use the documented behavior.", "2026-10-01T00:00:02Z"),
         ),
     )
     st = _with_session()
 
-    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "2026-10-01T00:00:02Z")]
 
 
 def test_quoted_unblock_prompt_is_consumed_as_the_reply():
@@ -695,13 +700,13 @@ def test_quoted_unblock_prompt_is_consumed_as_the_reply():
         7,
         "ai-blocked",
         comments=(
-            Comment("fix-bot", prompt, "t1"),
-            Comment("alice", f"> {prompt}\n\nUse A.", "t2"),
+            Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"),
+            Comment("alice", f"> {prompt}\n\nUse A.", "2026-10-01T00:00:02Z"),
         ),
     )
     st = _with_session()
 
-    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "t2")]
+    assert issues_needing_resume(world(issues=[iss]), st, CFG) == [(7, "2026-10-01T00:00:02Z")]
 
 
 def test_unrelated_bot_noise_after_prompt_does_not_trigger_resume():
@@ -710,8 +715,8 @@ def test_unrelated_bot_noise_after_prompt_does_not_trigger_resume():
         7,
         "ai-blocked",
         comments=(
-            Comment("fix-bot", prompt, "t1"),
-            Comment("ci[bot]", "build finished", "t2"),
+            Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"),
+            Comment("ci[bot]", "build finished", "2026-10-01T00:00:02Z"),
         ),
     )
     st = _with_session()
@@ -723,7 +728,7 @@ def test_resume_dispatch_relabels_blocked_to_working():
     # A blocked issue with a new human reply + a saved session → RESUME dispatch,
     # and the issue must flip ai-blocked → ai-working for the run's duration (so it
     # doesn't read as still-blocked while actively resuming).
-    iss = issue(7, "ai-blocked", comments=(Comment("alice", "go ahead", "t2"),))
+    iss = issue(7, "ai-blocked", comments=(Comment("alice", "go ahead", "2026-10-01T00:00:02Z"),))
     st = _with_session()
     actions = decide_fix(world(issues=[iss]), CFG, st, fixer_busy=False)
     relabels = [a for a in actions if isinstance(a, Relabel)]
@@ -740,12 +745,12 @@ def test_blocked_pr_reply_dispatches_pr_resume_for_linked_issue_session():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     blocked = pr(
         100, "ai-pr-open", "ai-blocked", closing_issue=7,
-        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+        comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")),
     )
     state = FixState(sessions=frozenset({7}))
     w = world(prs=[blocked])
 
-    assert prs_needing_resume(w, state, CFG) == [(100, 7, "t2")]
+    assert prs_needing_resume(w, state, CFG) == [(100, 7, "2026-10-01T00:00:02Z")]
     actions = decide_fix(w, CFG, state, fixer_busy=False)
 
     assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(actions)
@@ -786,14 +791,14 @@ def test_blocked_pr_newer_reply_after_dedupe_dispatches_once_more():
     blocked = pr(
         100, "ai-pr-open", "ai-blocked", closing_issue=7,
         comments=(
-            Comment("fix-bot", prompt, "t1"),
-            Comment("alice", "Use A.", "t2"),
-            Comment("alice", "Actually use B.", "t3"),
+            Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"),
+            Comment("alice", "Use A.", "2026-10-01T00:00:02Z"),
+            Comment("alice", "Actually use B.", "2026-10-01T00:00:03Z"),
         ),
     )
-    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "t2"})
+    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "2026-10-01T00:00:02Z"})
 
-    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "t3")]
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "2026-10-01T00:00:03Z")]
     assert RunAgent(AgentKind.PR_RESUME, 100) in _run_agents(
         decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)
     )
@@ -1593,14 +1598,14 @@ def test_c1_suffixed_fix_bot_does_not_read_its_own_comment_as_a_human_reply():
     # `last_human_reply` under the same asymmetry: the fixer's own bare-login
     # comment must not count as a new human reply, or one unanswered question
     # re-fires a paid RESUME session every poll.
-    iss = issue(7, "ai-blocked", comments=(Comment("fix-bot", "asking", "t1"),))
+    iss = issue(7, "ai-blocked", comments=(Comment("fix-bot", "asking", "2026-10-01T00:00:01Z"),))
     st = _with_session()
     assert issues_needing_resume(world(issues=[iss]), st, SUFFIXED_CFG) == []
     # Anti-vacuity twin: a real human's reply on the same world still resumes.
     iss2 = issue(7, "ai-blocked", comments=(
-        Comment("fix-bot", "asking", "t1"), Comment("alice", "here you go", "t2"),
+        Comment("fix-bot", "asking", "2026-10-01T00:00:01Z"), Comment("alice", "here you go", "2026-10-01T00:00:02Z"),
     ))
-    assert issues_needing_resume(world(issues=[iss2]), st, SUFFIXED_CFG) == [(7, "t2")]
+    assert issues_needing_resume(world(issues=[iss2]), st, SUFFIXED_CFG) == [(7, "2026-10-01T00:00:02Z")]
 
 
 def test_ci_failure_dispatches_fix_ci():
@@ -1755,14 +1760,14 @@ def test_issue_resume_ignores_legacy_session_without_sql_continuation():
     observed = world(issues=[_blocked_issue_with_reply()])
     state = FixState(sessions=frozenset({7}), resolve_workflows={7: _workflow(7)})
     assert issues_needing_resume(observed, state, CFG) == []
-    assert issues_needing_any_resume(observed, state, CFG) == [(7, "t1")]
+    assert issues_needing_any_resume(observed, state, CFG) == [(7, "2026-10-01T00:00:01Z")]
 
 
 @pytest.mark.parametrize("kind,label", [(AgentKind.RESOLVE, "ai-ready"), (AgentKind.RESUME, "ai-blocked")])
 def test_issue_claim_and_dispatch_capture_exact_observed_generation(kind, label):
     original = _workflow(7)
     current = replace(original, revision=WorkflowRevision(replace(original.revision.fence, generation=9), 12))
-    observed = world(issues=[issue(7, label, updated_at="revision-7", comments=(Comment("alice", "continue", "t2"),))])
+    observed = world(issues=[issue(7, label, updated_at="revision-7", comments=(Comment("alice", "continue", "2026-10-01T00:00:02Z"),))])
     actions = raw_decide_fix(observed, CFG, FixState(resolve_workflows={7: current}), fixer_busy=False)
     assert _run_agents(actions) == [RunAgent(kind, 7, workflow=current.binding)]
     claim = next(action for action in actions if isinstance(action, Relabel))
@@ -1775,9 +1780,9 @@ def test_issue_claim_and_dispatch_capture_exact_observed_generation(kind, label)
 def test_pr_repair_retains_pr_authority_without_issue_workflow_binding(kind):
     variants = {
         AgentKind.FIX_CI: pr(100, "ai-pr-open", checks=(Check("unit", bucket="fail"),)),
-        AgentKind.ADDRESS_REVIEW: pr(100, "ai-pr-open", reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1"),)),
+        AgentKind.ADDRESS_REVIEW: pr(100, "ai-pr-open", reviews=(Review("CHANGES_REQUESTED", "review-bot", "2026-10-01T00:00:01Z"),)),
         AgentKind.REBASE: pr(100, "ai-pr-open", mergeable="CONFLICTING"),
-        AgentKind.PR_RESUME: pr(100, "ai-pr-open", "ai-blocked", closing_issue=7, comments=(Comment("alice", "continue", "t2"),)),
+        AgentKind.PR_RESUME: pr(100, "ai-pr-open", "ai-blocked", closing_issue=7, comments=(Comment("alice", "continue", "2026-10-01T00:00:02Z"),)),
     }
     state = FixState(sessions=frozenset({7}))
     actions = raw_decide_fix(world(prs=[variants[kind]]), CFG, state, fixer_busy=False)
@@ -1913,14 +1918,12 @@ def test_infra_ceiling_of_zero_never_escalates():
 
 
 def _blocked_issue_with_reply():
-    return issue(7, "ai-blocked", comments=(Comment("alice", "more context", "t1"),))
+    return issue(7, "ai-blocked", comments=(Comment("alice", "more context", "2026-10-01T00:00:01Z"),))
 
 
 def test_resume_at_infra_ceiling_escalates_from_blocked():
-    # A resume that dies pre-result never consumes the reply (resume_actions
-    # returns nothing on an infra death), so the dedup mark cannot stop the loop
-    # either — only this ceiling can. The issue is ai-blocked here, so that is
-    # the label the escalation removes.
+    # This newer reply remains unconsumed; the existing infrastructure ceiling
+    # refuses it before admission and removes its observed ai-blocked label.
     st = _with_session(infra_deaths={7: 2})
     actions = decide_fix(world(issues=[_blocked_issue_with_reply()]), INFRA_CFG, st,
                          fixer_busy=False)

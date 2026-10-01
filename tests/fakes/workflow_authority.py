@@ -6,6 +6,17 @@ from issue_agent.domain.workflow import OpenGate, RearmingGate, ResolveEpisode, 
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority, IssueRef, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
 )
+from dataclasses import replace
+from issue_agent.domain import continuation_components as cc
+from issue_agent.domain.workflow_identity import ContinuationComponentIdentity
+
+
+def with_issue_recovery(snapshot, *, state=None):
+    component = cc.ActiveIssueRecovery(
+        ContinuationComponentIdentity(snapshot.revision.fence.key, FamilyAuthority(WorkflowFamily.ISSUE_RECOVERY, 1), "fixture-issue-reply"),
+        state or cc.IssueRecoveryState(),
+    )
+    return replace(snapshot, issue_recovery=component)
 
 
 def resolve_snapshot(number=1, *, generation=2, version=0):
@@ -30,6 +41,10 @@ def install_workflow(store, snapshot):
              encode_workflow_episodes(snapshot)),
         )
         insert_workflow_component(db, snapshot.revision.fence.key, snapshot.authority, snapshot.episode.episode_id)
+        if isinstance(getattr(snapshot, "issue_recovery", None), cc.ActiveIssueRecovery):
+            component = snapshot.issue_recovery
+            db.execute("INSERT OR IGNORE INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)", (scope[0], "issue_recovery", 1, "test-source", "test-inventory", "2026-10-01T00:00:00Z"))
+            insert_workflow_component(db, snapshot.revision.fence.key, component.identity.authority, component.identity.episode_id)
         for gate in snapshot.gates:
             opened = gate.gate if isinstance(gate, RearmingGate) else gate
             db.execute(

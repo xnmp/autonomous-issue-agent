@@ -8,7 +8,8 @@ workflow can be extracted/refactored while preserving behavior.
 from dataclasses import replace
 
 from tests.domain.builders import Check, Comment, Review, issue, pr, world
-from tests.fakes.workflow_authority import resolve_snapshot
+from tests.fakes.workflow_authority import resolve_snapshot, with_issue_recovery
+from issue_agent.domain.continuation_components import IssueRecoveryState
 
 from issue_agent.domain.actions import (
     AgentKind,
@@ -33,8 +34,9 @@ def _runs(actions, kind: AgentKind, number: int) -> bool:
     return RunAgent(kind, number, workflow=binding) in actions
 
 
-def _state(*numbers, session=False, **kwargs):
-    snapshots = {number: resolve_snapshot(number) for number in numbers}
+def _state(*numbers, session=False, consumed_reply_at=None, **kwargs):
+    snapshots = {number: with_issue_recovery(resolve_snapshot(number),
+                     state=IssueRecoveryState(consumed_reply_at=(consumed_reply_at or {}).get(number, ""))) for number in numbers}
     if session:
         for number, snapshot in snapshots.items():
             source = WorkflowAttemptIdentity(snapshot.binding, RunId(f"prior-{number}"), f"leg-{number}")
@@ -112,7 +114,7 @@ def test_blocked_issue_with_new_human_reply_resumes_once():
         CFG,
         _state(
             7, session=True,
-            resumed_at={7: "2026-01-01T00:00:00Z"},
+            consumed_reply_at={7: "2026-01-01T00:00:00Z"},
         ),
         fixer_busy=False,
     )

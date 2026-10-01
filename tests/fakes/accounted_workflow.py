@@ -22,7 +22,7 @@ from issue_agent.domain.workflow import FreshResolve, ResolveSession
 from issue_agent.domain.resolve_split import AdjudicationInput, ContractRevision
 from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
 from issue_agent.domain.world import PRView
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 from tests.fakes.legacy_journal import Journal
 
 
@@ -73,6 +73,16 @@ class AccountedFixtureWorkflow(FixWorkflow):
         publication = accounting_runtime._FixPublicationContext(
             f"/wt/issue-{issue}", f"fix/{issue}-fixture", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
         )
+        selected_workspaces = {}
+        original_ensure = self.worktrees.ensure
+
+        def selected_workspace(number, branch):
+            cwd = original_ensure(number, branch)
+            selected_workspaces[cwd] = branch
+            return cwd
+
+        def captured_publication(role, cwd):
+            return dataclasses.replace(publication, cwd=cwd, branch=selected_workspaces.get(cwd, publication.branch))
         contract_head = ""
 
         def captured_revision(_cwd, _issue, capture, branch):
@@ -96,10 +106,11 @@ class AccountedFixtureWorkflow(FixWorkflow):
 
         try:
             with contextlib.ExitStack() as stack:
+                stack.enter_context(patch.object(self.worktrees, "ensure", side_effect=selected_workspace))
                 stack.enter_context(patch.object(
                     accounting_runtime,
                     "_fix_publication_context",
-                    return_value=publication,
+                    side_effect=captured_publication,
                 ))
                 if not isinstance(self.worktrees, Worktrees):
                     stack.enter_context(patch.object(
@@ -152,7 +163,8 @@ def attach_workflow_authority(
         numbers = set(gw.issues) | {p.closing_issue for p in gw.prs.values() if p.closing_issue}
         numbers.add(5)
         for number in numbers:
-            install_workflow(store._workflow_db, seeded if seeded is not None and seeded.revision.fence.key.target.number == number else resolve_snapshot(number))
+            primary = seeded if seeded is not None and seeded.revision.fence.key.target.number == number else resolve_snapshot(number)
+            install_workflow(store._workflow_db, with_issue_recovery(primary))
         object.__setattr__(store, "_workflow_authority", SQLiteWorkflowControl(
             store._workflow_db,
             WorkflowWriter("o/r", "fix", "o/r:fix:fixture"),

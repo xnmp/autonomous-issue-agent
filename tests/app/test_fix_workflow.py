@@ -331,8 +331,8 @@ def test_resume_empty_body_reply_returns_issue_to_blocked():
     # the reaper turned into ai-ready → an unbounded RESOLVE loop. An empty
     # reply must be consumed AND the issue put back to awaiting-human.
     iss = IssueView(5, title="t", body="b", comments=(
-        Comment("fix-bot", "asking", "t1"),
-        Comment("alice", "   ", "t2"),
+        Comment("fix-bot", "asking", "2026-10-01T00:00:01Z"),
+        Comment("alice", "   ", "2026-10-01T00:00:02Z"),
     ))
     gw = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
@@ -341,7 +341,8 @@ def test_resume_empty_body_reply_returns_issue_to_blocked():
     asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
 
     assert runner.tasks == []
-    assert store.get_resumed_at(5) == "t2"
+    assert _resolve_snapshot(store).issue_recovery.state.consumed_reply_at == "2026-10-01T00:00:02Z"
+    assert store.get_resumed_at(5) == ""
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
 
 
@@ -350,8 +351,8 @@ def test_resume_writes_resumed_at_mark():
     # consumed. Without the write, this blocked-again issue re-fires a paid
     # RESUME on the same unchanged thread every poll tick.
     iss = IssueView(5, title="t", body="b", comments=(
-        Comment("fix-bot", "asking", "t1"),
-        Comment("alice", "the answer", "t2"),
+        Comment("fix-bot", "asking", "2026-10-01T00:00:01Z"),
+        Comment("alice", "the answer", "2026-10-01T00:00:02Z"),
     ))
     gw = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
@@ -359,7 +360,8 @@ def test_resume_writes_resumed_at_mark():
 
     asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
 
-    assert store.get_resumed_at(5) == "t2"
+    assert _resolve_snapshot(store).issue_recovery.state.consumed_reply_at == "2026-10-01T00:00:02Z"
+    assert store.get_resumed_at(5) == ""
     assert "the answer" in runner.tasks[0].prompt
 
 
@@ -372,8 +374,8 @@ def test_blocked_resume_forfeits_its_session_so_the_next_reply_goes_fresh():
     # session so the NEXT reply rebuilds from the thread and worktree
     # (fresh-recovery) instead of re-entering the groove.
     iss = IssueView(5, title="t", body="b", comments=(
-        Comment("fix-bot", "**Agent needs input:** x\n\n_Reply to unblock._", "t1"),
-        Comment("alice", "answered", "t2"),
+        Comment("fix-bot", "**Agent needs input:** x\n\n_Reply to unblock._", "2026-10-01T00:00:01Z"),
+        Comment("alice", "answered", "2026-10-01T00:00:02Z"),
     ))
     gw = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
@@ -390,8 +392,8 @@ def test_productive_resume_keeps_its_session():
     # Anti-vacuity twin: forfeiture is for blocked resumes only — a resume
     # that pushes keeps its context for the next round.
     iss = IssueView(5, title="t", body="b", comments=(
-        Comment("fix-bot", "**Agent needs input:** x\n\n_Reply to unblock._", "t1"),
-        Comment("alice", "answered", "t2"),
+        Comment("fix-bot", "**Agent needs input:** x\n\n_Reply to unblock._", "2026-10-01T00:00:01Z"),
+        Comment("alice", "answered", "2026-10-01T00:00:02Z"),
     ))
     gw = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
@@ -506,8 +508,8 @@ def test_resume_without_human_reply_does_not_run():
     # Only fixer/bot comments on the thread → nothing to resume on; no session
     # spend, no resumed-at mark.
     iss = IssueView(5, title="t", body="b", comments=(
-        Comment("fix-bot", "asking", "t1"),
-        Comment("ci[bot]", "noise", "t2"),
+        Comment("fix-bot", "asking", "2026-10-01T00:00:01Z"),
+        Comment("ci[bot]", "noise", "2026-10-01T00:00:02Z"),
     ))
     gw = FakeGateway(issues={5: iss}, pr_for_issue={})
     store = FakeStore()
@@ -1307,15 +1309,14 @@ def test_address_review_error_does_not_touch_the_infra_ceiling(tmp_path):
 
 def _resume_issue():
     return IssueView(5, title="t", body="b", comments=(
-        Comment("fix-bot", "asking", "t1"),
-        Comment("alice", "the answer", "t2"),
+        Comment("fix-bot", "asking", "2026-10-01T00:00:01Z"),
+        Comment("alice", "the answer", "2026-10-01T00:00:02Z"),
     ))
 
 
 def test_resume_infra_death_counts_against_the_infra_ceiling(tmp_path):
-    """resume_actions deliberately does NOTHING on an infra death (the human's
-    reply must not be consumed by a session that never ran), so the issue stays
-    ai-working → reaper → ai-ready → paid again. Nothing else bounds that."""
+    """An admitted reply remains consumed after an infra return. Infrastructure
+    spending evidence advances its own counter without charging resolve debt."""
     gw = FakeGateway(issues={5: _resume_issue()}, pr_for_issue={})
     store = Store(state_dir=str(tmp_path))
     runner = FakeRunner(AgentResult(is_error=True, status="timeout",
@@ -2596,17 +2597,12 @@ def test_replacement_author_resets_real_partial_work_and_reuses_ack_after_crash(
             gateway.issues[5], body="new requirement"
         )
     else:
-        from issue_agent.adapters.workflow_codec import encode_workflow
+        from issue_agent.adapters.workflow_rows import encode_workflow_episodes
         state = _resolve_snapshot(store)
         with store._workflow_db.transaction() as db:
             db.execute(
                 "UPDATE workflows SET version=version+1, episode_json=?",
-                (encode_workflow((
-                    state.authority,
-                    dataclasses.replace(
-                        state.episode, guidance="new operator guidance"
-                    ),
-                )),),
+                (encode_workflow_episodes(dataclasses.replace(state, episode=dataclasses.replace(state.episode, guidance="new operator guidance"))),),
             )
 
     class ReplacementProviderCrash:
@@ -2698,12 +2694,12 @@ def test_changed_author_inputs_require_new_author_before_implementation(changed)
     elif changed == "system":
         options["fix"] = FixTaskConfig("o/r", agent_md="revised instructions", model="m")
     else:
-        from issue_agent.adapters.workflow_codec import encode_workflow
+        from issue_agent.adapters.workflow_rows import encode_workflow_episodes
         state = _resolve_snapshot(store)
         # A changed persisted directive cannot make an old input proof
         # applicable merely because its generation is unchanged.
         with store._workflow_db.transaction() as db:
-            db.execute("UPDATE workflows SET version=version+1, episode_json=?", (encode_workflow((state.authority, dataclasses.replace(state.episode, guidance="revised directive"))),))
+            db.execute("UPDATE workflows SET version=version+1, episode_json=?", (encode_workflow_episodes(dataclasses.replace(state, episode=dataclasses.replace(state.episode, guidance="revised directive"))),))
     runner = SeqRunner([
         AgentResult(is_error=False, status="tests_authored", session_id="replacement-author"),
         AgentResult(is_error=False, status="blocked", session_id="implementation"),

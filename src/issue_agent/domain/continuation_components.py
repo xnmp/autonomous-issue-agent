@@ -8,9 +8,10 @@ from enum import Enum
 from typing import TYPE_CHECKING
 
 from .agent_task import RuntimeName
+from .refs import issue_from_branch
 from .contracts import ContinuationAdmission
 from .workflow_identity import (
-    MAX_WORKFLOW_GATES, ContinuationComponentIdentity, FamilyAuthority, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
+    MAX_WORKFLOW_GATES, ContinuationComponentIdentity, FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
 )
 
@@ -434,6 +435,57 @@ class IssueRecoveryPurchase:
         validate_workflow_integer(self.resume_ceiling, "resume ceiling", minimum=1)
 
 
+def _validate_reply_input(selection: SelectedIssueRecovery, reply_at: str, body: str) -> None:
+    if not isinstance(selection, SelectedIssueRecovery):
+        raise ValueError("issue reply requires selected current continuation authority")
+    _timestamp(reply_at, "selected issue reply")
+    if not reply_at or not reply_advances(reply_at, selection.component.state.consumed_reply_at):
+        raise ValueError("issue reply is absent or already consumed")
+    validate_workflow_text(body, "selected issue reply body", limit=65536)
+    if not body.strip():
+        raise ValueError("paid issue reply must have nonblank content")
+
+
+@dataclass(frozen=True)
+class IssueReplyInput:
+    selection: SelectedIssueRecovery
+    reply_at: str
+    body: str
+    branch: str
+
+    def __post_init__(self) -> None:
+        _validate_reply_input(self.selection, self.reply_at, self.body)
+        validate_workflow_text(self.branch, "selected issue reply branch")
+        if issue_from_branch(self.branch) != self.selection.binding.fence.key.target.number:
+            raise ValueError("selected issue branch belongs to another target")
+
+
+@dataclass(frozen=True)
+class LinkedPRIssueReplyInput:
+    selection: SelectedIssueRecovery
+    reply_at: str
+    body: str
+    pr: PullRequestRef
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.pr, PullRequestRef):
+            raise ValueError("linked PR reply requires its observed PR identity")
+        _validate_reply_input(self.selection, self.reply_at, self.body)
+
+
+@dataclass(frozen=True)
+class IssueReplyPurchase:
+    capture: ContinuationCapture
+    reply_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.capture, ContinuationCapture) or self.capture.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY:
+            raise ValueError("issue reply purchase requires its family capture")
+        _timestamp(self.reply_at, "selected issue reply")
+        if not self.reply_at:
+            raise ValueError("issue reply purchase requires its selected reply")
+
+
 @dataclass(frozen=True)
 class PRRepairPurchase:
     capture: ContinuationCapture
@@ -466,7 +518,17 @@ class StewardPurchase:
         validate_workflow_integer(self.stall_ceiling, "steward stall ceiling", minimum=1)
 
 
-ContinuationPurchase = IssueRecoveryPurchase | PRRepairPurchase | StewardPurchase
+ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | PRRepairPurchase | StewardPurchase
+
+
+def consume_issue_reply(selection: SelectedIssueRecovery, purchase: IssueReplyPurchase, version: int) -> ActiveIssueRecovery:
+    if selection.binding != purchase.capture.binding or selection.revision != purchase.capture.revision:
+        raise ValueError("issue reply capture is stale")
+    component = selection.component
+    if component.gates or not reply_advances(purchase.reply_at, component.state.consumed_reply_at):
+        raise ValueError("issue reply is held or consumed")
+    return replace(component, state=replace(component.state, consumed_reply_at=purchase.reply_at),
+                   watermarks=component.watermarks.admit(version, selection.revision.fence))
 
 
 def consume_issue_recovery(selection: SelectedIssueRecovery, purchase: IssueRecoveryPurchase, version: int) -> ActiveIssueRecovery:

@@ -1841,7 +1841,7 @@ def _fix_state(
     # Only the unselected PR family may consult legacy session files.
     pr_issues = {breaker_key(p) for p in world.prs if breaker_key(p) > 0}
     sessions = frozenset(n for n in pr_issues if read(n, store.has_session, False))
-    resumed = {i.number: read(i.number, store.get_resumed_at, "") for i in world.issues}
+    resumed = {}
     pr_resumed = {p.number: read(p.number, store.get_pr_resumed_at, "", error_key=breaker_key(p)) for p in world.prs}
     automerge = frozenset(p.number for p in world.prs if read(p.number, store.automerge_enabled, False, error_key=breaker_key(p)))
     # Retry counters are keyed by breaker_key(pr): the linked issue number, or the
