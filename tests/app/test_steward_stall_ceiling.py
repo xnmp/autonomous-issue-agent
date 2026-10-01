@@ -25,7 +25,7 @@ import pytest
 from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.app.planners.tasks import GroomTaskConfig, TriageTaskConfig
 from issue_agent.app.workflows.steward import StewardWorkflowConfig
-from tests.fakes.accounted_steward import AccountedStewardWorkflow as StewardWorkflow, triage_lane
+from tests.fakes.accounted_steward import AccountedStewardWorkflow as StewardWorkflow, triage_lane, groom_lane
 from issue_agent.domain.events import LevelChanged
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult, ExitReason
@@ -236,7 +236,7 @@ def test_groom_has_its_own_ceiling():
     for _ in range(2):
         asyncio.run(workflow.groom(7))
 
-    assert store.groom_at[7] == "2026-09-14T10:00:00+00:00"
+    assert groom_lane(store, 7).baseline_at == "" and groom_lane(store, 7).stalls == 2
     assert _levels(journal)[0].attributes["leg"] == "groom"
 
 
@@ -294,7 +294,8 @@ def test_a_queued_but_unconfirmed_verdict_is_not_re_bought(tmp_path):
     asyncio.run(workflow.triage(7))
 
     # The writes are COMMITTED and still owed…
-    assert control.pending_commands()[0].state == "retryable_failure"
+    predecessor = triage_lane(store, 7).pending_delivery[0]
+    assert next(p for p in control.pending_commands() if str(p.command.command_id) == predecessor).state == "retryable_failure"
     assert all(p.state in {"pending", "retryable_failure"} for p in control.pending_commands())
     assert control.pending_commands() != ()
     # …so the next sweep does not select the issue and buys no second leg.

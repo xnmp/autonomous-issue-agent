@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.app.execute import Executor
-from issue_agent.app.planners.tasks import TriageTaskConfig
+from issue_agent.app.planners.tasks import GroomTaskConfig, TriageTaskConfig
 from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
 from issue_agent.domain import continuation_components as cc
 from issue_agent.domain.contracts import Money
@@ -24,6 +24,7 @@ from tests.adapters.test_continuation_admission import active, install_secondary
 from tests.adapters.test_steward_delivery import bind_events, OWNER
 from tests.adapters.test_workflow_admission import NOW
 from tests.app.test_steward_stall_ceiling import BUDGET, INFRA, VERDICT, _Runner
+from tests.app.test_steward_workflows import _Merged
 from tests.fakes.in_memory_github import InMemoryGitHub
 from tests.fakes.workflow_authority import resolve_snapshot
 from test_dispatch import FakeStore
@@ -44,7 +45,7 @@ class DeniedWrites(InMemoryGitHub):
             super().relabel(kind, number, remove, add)
 
 
-def composed(tmp_path, gateway, inner, *, install=True):
+def composed(tmp_path, gateway, inner, *, install=True, groom=False):
     control = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     control.initialize()
     bind_events(control)
@@ -58,7 +59,8 @@ def composed(tmp_path, gateway, inner, *, install=True):
         install_secondary(control, shell, component)
     task = TriageTaskConfig("steward-bot", triage_prompt="T")
     runner = AccountingRuntime(inner, control, "o/r", "steward", None, None, None, "fixture", "claude",
-        BudgetPolicy({("steward", "TRIAGE"): Money.from_major("USD", task.max_budget_usd)}),
+        BudgetPolicy({("steward", "TRIAGE"): Money.from_major("USD", task.max_budget_usd),
+                      ("steward", "GROOM"): Money.from_major("USD", 0.75)}),
         RateTable("fixture", "1", "USD", {}, UnknownModelPolicy.USE_FALLBACK, ModelRates(1,1,1,1)),
         owner_id=OWNER)
     effects = GitHubEffectExecutor(gateway, control, repository="o/r", identity=OWNER)
@@ -66,7 +68,8 @@ def composed(tmp_path, gateway, inner, *, install=True):
     files = FakeStore()
     workflow = StewardWorkflow(StewardWorkflowConfig(task,
         TriageConfig("steward-bot", enabled=True, promote=True), lambda message: None,
-        dedupe=control, repo="o/r", owner_id=OWNER), gateway, files, runner, executor)
+        dedupe=control, repo="o/r", owner_id=OWNER,
+        groom=GroomTaskConfig("steward-bot") if groom else None), gateway, files, runner, executor)
     return workflow, control, files, revision.fence.key
 
 
@@ -102,6 +105,83 @@ def test_inactive_steward_refuses_before_paid_runtime(tmp_path):
     with control.transaction() as db:
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
     assert files.triage_at == {}
+
+
+def test_inactive_groom_refuses_before_paid_runtime(tmp_path):
+    inner = _Runner(replace(VERDICT, structured={}, cost_usd=0.01))
+    workflow, control, _, _ = composed(tmp_path, InMemoryGitHub((issue(),)), inner,
+                                      install=False, groom=True)
+    workflow.runner.set_context("steward", "GROOM", 7, 7)
+    asyncio.run(workflow.groom(7))
+    assert inner.runs == 0 and not control.pending_commands()
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+
+
+def test_no_finding_groom_records_success_once_without_body_mutation(tmp_path):
+    gateway = InMemoryGitHub((issue(),))
+    inner = _Runner(replace(VERDICT, structured={}, cost_usd=0.01))
+    workflow, control, files, key = composed(tmp_path, gateway, inner, groom=True)
+    workflow.runner.set_context("steward", "GROOM", 7, 7)
+    original_triage = control.read_steward(key).component.state.triage
+    asyncio.run(workflow.groom(7))
+    asyncio.run(workflow.groom(7))
+    selected = control.read_steward(key).component
+    assert inner.runs == 1 and selected.state.groom.baseline_at == issue().updated_at
+    assert selected.state.triage == original_triage
+    assert gateway.get_issue(7).body == issue().body and gateway.calls == []
+    assert files.groom_at == {} and files.groom_content == {}
+
+
+class AdvisoryGateway(DeniedWrites):
+    def recently_merged_issues(self, author, limit=30):
+        return (_Merged(42, 300),)
+
+
+def test_owed_groom_advisory_recovers_before_sibling_purchase(tmp_path):
+    gateway = AdvisoryGateway((issue(),))
+    inner = _Runner(replace(VERDICT, structured={"resolved_by": 42}, cost_usd=0.01))
+    workflow, control, files, key = composed(tmp_path, gateway, inner, groom=True)
+    workflow.cfg = replace(workflow.cfg, fix_bot="fix-bot")
+    asyncio.run(workflow.groom(7))
+    owed = control.read_steward(key).component.state
+    assert owed.groom.pending_delivery and owed.groom.baseline_at == ""
+    assert owed.groom_content.successful == ""
+    asyncio.run(workflow.groom(7))
+    asyncio.run(workflow.triage(7))
+    assert inner.runs == 1 and control.read_steward(key).component.state.triage == owed.triage
+    gateway.denied = False
+    asyncio.run(workflow.groom(7))
+    delivered = control.read_steward(key).component.state
+    assert not delivered.groom.pending_delivery and delivered.groom_content.successful
+    assert delivered.triage == owed.triage
+    assert Label.MAYBE_RESOLVED in gateway.get_issue(7).labels
+    assert len(gateway.comments[("issue", 7)]) == 1 and gateway.get_issue(7).body == issue().body
+    asyncio.run(workflow.groom(7))
+    assert inner.runs == 1 and files.groom_at == {} and files.groom_content == {}
+    inner.result = replace(VERDICT, cost_usd=0.01)
+    asyncio.run(workflow.triage(7))
+    assert inner.runs == 2
+    assert control.read_steward(key).component.state.groom == delivered.groom
+    assert control.read_steward(key).component.state.groom_content == delivered.groom_content
+
+
+def test_owed_triage_delivery_reenables_groom_without_resetting_it(tmp_path):
+    gateway = DeniedWrites((issue(),))
+    inner = _Runner(replace(VERDICT, cost_usd=0.01))
+    workflow, control, _, key = composed(tmp_path, gateway, inner, groom=True)
+    asyncio.run(workflow.triage(7))
+    before = control.read_steward(key).component.state
+    asyncio.run(workflow.groom(7))
+    assert inner.runs == 1 and control.read_steward(key).component.state.groom == before.groom
+    gateway.denied = False
+    asyncio.run(workflow.triage(7))
+    after = control.read_steward(key).component.state
+    assert not after.triage.pending_delivery and after.groom == before.groom
+    assert after.groom_content == before.groom_content
+    inner.result = replace(VERDICT, structured={}, cost_usd=0.01)
+    asyncio.run(workflow.groom(7))
+    assert inner.runs == 2 and control.read_steward(key).component.state.triage == after.triage
 
 
 def test_stopped_notice_retains_ceiling_without_claiming_success(tmp_path):

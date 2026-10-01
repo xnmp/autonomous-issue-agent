@@ -50,7 +50,7 @@ _VALUES = (
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState,
     cc.StewardLaneState, cc.StewardState, cc.StewardAttemptSource, cc.StewardCommandGuard,
-    cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.ContinuationImportBlocker,
+    cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.GroomContent, cc.GroomNoFinding, cc.ContinuationImportBlocker,
     cc.InactiveIssueRecovery, cc.InactivePRRepair, cc.InactiveSteward,
     cc.BlockedIssueRecovery, cc.BlockedPRRepair, cc.BlockedSteward,
     cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward,
@@ -170,6 +170,9 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS = {
+    "StewardState": {"groom_content": {"type": "GroomContent", "fields": {"attempted": "", "successful": ""}}},
+    "StewardAttemptSource": {"content_signature": ""},
+    "StewardPurchase": {"content_signature": ""},
     "StewardLaneState": {"delivery_source": None, "attempted_at": ""},
     "WorkflowSnapshot": {
         "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}},
@@ -224,6 +227,10 @@ def _encode(value: object, depth: int = 0) -> object:
                 if (not (type(value) is cc.StewardLaneState and (
                         field.name == "delivery_source" and value.delivery_source is None
                         or field.name == "attempted_at" and not value.attempted_at))
+                    and not (type(value) in {cc.StewardAttemptSource, cc.StewardPurchase}
+                             and field.name == "content_signature" and not value.content_signature)
+                    and not (type(value) is cc.StewardState and field.name == "groom_content"
+                             and value.groom_content == cc.GroomContent())
                     and (field.name not in {"expected_binding", "lineage_sha256"}
                      or getattr(value, field.name) is not None)
                     and not (field.name == "grant" and isinstance(getattr(value, field.name), rw.ReviewRejectionGrant))

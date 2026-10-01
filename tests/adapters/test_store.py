@@ -322,11 +322,15 @@ def test_stopped_legacy_triage_baseline_remains_readable():
     assert s.get_triage_at(7) == "t_post"
 
 
-@pytest.mark.parametrize("method", ["get_steward_stalls", "bump_steward_stalls", "clear_steward_stalls"])
-def test_retired_triage_file_counter_cannot_be_runtime_authority(method):
+def test_stopped_groom_sources_survive_issue_cleanup():
     s, _ = _store()
-    with pytest.raises(ValueError, match="durable steward"):
-        getattr(s, method)(7, "triage")
+    evidence = {s.groom_at_path(7): "2026-10-01T00:00:00Z",
+                s.groom_content_path(7): "a" * 64,
+                s.issue_path(7, "steward-stalls-groom"): "3"}
+    for path, value in evidence.items():
+        Path(path).write_text(value)
+    s.clear_issue(7)
+    assert {path: Path(path).read_text() for path in evidence} == evidence
 
 
 def test_phase_roundtrip():
@@ -666,7 +670,7 @@ def test_groom_content_digest_round_trips_and_damps_comment_only_updates():
     s, _ = _store()
     for body in ("Steps:\n1. click\n", "Steps:\r\n1. click\r\n"):
         issue = IssueView(9, title="Login crashes", body=body, updated_at="after-comment")
-        s.set_groom_content(9, grooming_content(issue))
+        Path(s.groom_content_path(9)).write_text(grooming_content(issue))
         assert s.get_groom_content(9) == grooming_content(issue)
         assert grooming_candidates(
             WorldState(issues=(issue,)), {9: "before-comment"}, True,

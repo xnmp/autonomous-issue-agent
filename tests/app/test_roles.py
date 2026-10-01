@@ -3309,3 +3309,51 @@ def test_a_pr_with_no_resolvable_issue_is_still_deferred(tmp_path):
 
     assert plan.actions == ()
     assert [hold.pr for hold in plan.deferred] == [617]
+
+
+def test_groom_dispatch_reads_sql_signature_and_preserves_triage(tmp_path, monkeypatch):
+    from pathlib import Path
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.triage import grooming_content
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    decide, store = _steward_decide(tmp_path, monkeypatch, steward_triage=False, steward_groom=True)
+    world = _triaged()
+    assert decide(world) == [RunAgent(AgentKind.GROOM, 30)]
+    # Retired raw sources are import evidence and cannot change runtime authority.
+    Path(store.groom_at_path(30)).write_text("unknown stopped baseline")
+    Path(store.groom_content_path(30)).write_text("unknown stopped signature")
+    with store._steward_control.transaction() as db:
+        aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(30)))
+        component = aggregate.steward
+        triage = component.state.triage
+        signature = grooming_content(world.issues[0])
+        state = replace(component.state, groom=cc.StewardLaneState(baseline_at=world.issues[0].updated_at),
+                        groom_content=cc.GroomContent(signature, signature))
+        persist_workflow_snapshot(db, replace(aggregate, steward=replace(component, state=state)))
+    own_comment_tick = replace(world, issues=(replace(world.issues[0], updated_at="2026-09-14T11:00:00+00:00"),))
+    assert decide(own_comment_tick) == []
+    human_tick = replace(world, issues=(replace(world.issues[0], body="New human body", updated_at="2026-09-14T12:00:00+00:00"),))
+    assert decide(human_tick) == [RunAgent(AgentKind.GROOM, 30)]
+    assert store._steward_control.read_steward(WorkflowKey("o/r", IssueRef(30))).component.state.triage == triage
+
+
+def test_exhausted_groom_targets_do_not_starve_eligible_sibling(tmp_path, monkeypatch):
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.triage import grooming_content
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from tests.fakes.accounted_steward import install_steward
+    decide, store = _steward_decide(tmp_path, monkeypatch, steward_triage=False, steward_groom=True)
+    control = store._steward_control
+    install_steward(control, range(30, 36))
+    issues = tuple(_triaged(n).issues[0] for n in range(30, 36))
+    assert decide(WorldState(issues=issues)) == [RunAgent(AgentKind.GROOM, n) for n in range(30, 35)]
+    for issue in issues[:5]:
+        with control.transaction() as db:
+            aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue.number)))
+            component = aggregate.steward
+            state = replace(component.state, groom=cc.StewardLaneState(stalls=3, attempted_at=issue.updated_at),
+                            groom_content=cc.GroomContent(attempted=grooming_content(issue)))
+            persist_workflow_snapshot(db, replace(aggregate, steward=replace(component, state=state)))
+    assert decide(WorldState(issues=issues)) == [RunAgent(AgentKind.GROOM, 35)]

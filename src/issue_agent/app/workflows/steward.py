@@ -12,7 +12,6 @@ from ...adapters.effects import commands_for_steward_verdict
 from ...domain import continuation_components as cc
 from ...domain import triage as triage_dom
 from ...domain import steward as steward_dom
-from ...domain.contracts import EffectStatus
 from ...domain.events import (
     Correlation,
     IssueGroomed,
@@ -38,7 +37,6 @@ from ...domain.ports import (
     ActionExecutor,
     ControlStore,
     EventSink,
-    PendingEffectReads,
     RecentMergesReads,
     WorkflowGitHubReads,
     WorkflowState,
@@ -249,10 +247,11 @@ class StewardWorkflow:
             )
         )
 
-    def _journal_triage_level(self, issue: int, state: str, reason: str, **attributes) -> None:
+    def _journal_steward_level(self, issue: int, state: str, reason: str,
+                               *, lane: cc.StewardLane = cc.StewardLane.TRIAGE, **attributes) -> None:
         if self.cfg.journal is not None:
             self.cfg.journal.emit(TelemetryEvent(
-                LevelChanged(f"issue:{issue}:steward:triage", state, reason, {"leg": "triage", **attributes}),
+                LevelChanged(f"issue:{issue}:steward:{lane.value}", state, reason, {"leg": lane.value, **attributes}),
                 Correlation(issue=issue),
             ))
 
@@ -264,198 +263,35 @@ class StewardWorkflow:
         # telemetry dedupe key before the remote advisory write succeeds.
         return False
 
-    def _record_groom_baseline(self, issue: int, fallback: IssueView) -> None:
-        """Write the durable marker the leg's candidate predicate reads, so a
-        stalled issue stops being re-selected. Re-read AFTER any escalation
-        write when possible: a comment moves `updatedAt`, and recording the
-        pre-comment value re-selects the issue once on the next sweep.
-
-        When the re-read fails, the leg's ALREADY-FETCHED view is the baseline.
-        Recording the pre-escalation timestamp costs at most one extra
-        re-selection if the escalation comment landed; leaving no baseline at
-        all buys a full paid leg every sweep with no ceiling — the exact class
-        this module exists to close (adversarial review, 2026-08-02)."""
-        leg = "groom"
-        try:
-            updated = self.gateway.get_issue(issue)
-        except Exception as exc:  # noqa: BLE001 — see docstring
-            self.cfg.log(
-                f"{leg} #{issue}: baseline re-read failed ({exc}); recording "
-                "the leg's own view of the issue instead"
-            )
-            updated = fallback
-        self.store.set_groom_at(issue, updated.updated_at)
-        self.store.set_groom_content(issue, triage_dom.grooming_content(updated))
-
-    def _deferred_to_outbox(self, issue: int) -> bool:
-        """Whether this issue's writes are STILL OWED by the durable queue.
-
-        `execute_all` returning False means "not confirmed", which covers two
-        opposite worlds: the commands were committed and will be retried by the
-        outbox without paying for another leg, or nothing was ever enqueued
-        (the store was unreachable, the revision unreadable, no effect executor
-        was wired). Only the second one loses the verdict, so only the second
-        may charge a paid-leg ceiling.
-
-        Fails CLOSED — no reader, an unreadable queue, or no matching row all
-        answer "not deferred", which charges. Over-charging costs at most
-        `error_ceiling` legs; under-charging is the unbounded loop.
-        """
-        store = self.cfg.dedupe
-        if not isinstance(store, PendingEffectReads):
-            return False
-        target = f"issue:{issue}"
-        try:
-            pending = store.pending_commands()
-        except Exception as exc:  # noqa: BLE001 — see docstring
-            self.cfg.log(f"pending-effect read failed for #{issue}: {exc}")
-            return False
-        return any(
-            entry.command.target == target
-            and entry.state != EffectStatus.PERMANENT_FAILURE.value
-            for entry in pending
-        )
-
-    def _groom_write_unconfirmed(self, issue: int, view: IssueView) -> None:
-        """Tail for a leg whose verdict returned but whose writes did not
-        confirm. Charges the paid-leg ceiling ONLY when the writes were never
-        committed — see `_deferred_to_outbox`."""
-        leg = "groom"
-        if not self._deferred_to_outbox(issue):
-            self.cfg.log(
-                f"{leg} #{issue}: verdict write was never queued — will retry"
-            )
-            self._groom_stall(issue, "write_not_queued", "write_not_queued",
-                        view, budget=False)
-            return
-        self.cfg.log(
-            f"{leg} #{issue}: verdict queued but not confirmed — delivery "
-            "deferred to the durable outbox, not re-bought"
-        )
-        journal = self.cfg.journal
-        if journal is not None:
-            journal.emit(
-                TelemetryEvent(
-                    LevelChanged(
-                        f"issue:{issue}:steward:{leg}",
-                        "deferred",
-                        "durable_outbox",
-                        {"leg": leg},
-                    ),
-                    Correlation(issue=issue),
-                )
-            )
-        # The paid work is done and the writes are owed by a queue that has its
-        # own ADR 0012 ceiling (EFFECT_RETRY_CEILING). Record the baseline so no
-        # further leg is bought, and end the stall series.
-        self._record_groom_baseline(issue, view)
-        self.store.clear_steward_stalls(issue, leg)
-
-    def _charge_groom_stall(
-        self, issue: int, result: AgentResult, view: IssueView
-    ) -> None:
-        """Account one paid leg that returned no usable verdict (ADR 0012).
-
-        Below the ceiling this is exactly the previous behaviour — log and let
-        the next sweep re-select the issue. At the ceiling the issue's baseline
-        is recorded anyway, which is what stops the harness buying the same
-        leg again on the same unchanged issue.
-        """
-        leg = "groom"
-        status = result.status or result.envelope_subtype or "error"
-        if stall_charge(result.exit_reason, result.envelope_subtype) == 0:
-            # An infra death made no attempt, and an admission refusal never
-            # started one. The infra-death breaker (roles.decide) owns the
-            # first; the second is a deployment condition, not a property of
-            # this issue, and must never sideline it.
-            self.cfg.log(
-                f"{leg} #{issue}: {status} — no attempt was made, "
-                "not charged to the stall ceiling"
-            )
-            return
-        # `status` may be AGENT-AUTHORED on some paths (declared_status reads
-        # the structured envelope): fine for the local log line above, but the
-        # escalation body and journal are harness authority, and the revision
-        # guard is disabled for them precisely because they carry no agent
-        # output (ADR 0012). `detail` is therefore minted from harness-owned
-        # fields only.
-        detail = result.envelope_subtype or (
-            result.exit_reason.value if result.exit_reason else "error"
-        )
-        self._groom_stall(
-            issue,
-            status,
-            detail,
-            view,
-            budget=budget_exhausted(result.exit_reason)
-            or MAX_BUDGET_STATUS in (result.status, result.envelope_subtype),
-        )
-
-    def _groom_stall(
-        self,
-        issue: int,
-        status: str,
-        detail: str,
-        view: IssueView,
-        *,
-        budget: bool,
-    ) -> None:
-        """One charge against this issue's consecutive-failure ceiling."""
-        leg = "groom"
-        ceiling = self.cfg.error_ceiling
-        stalls = self.store.bump_steward_stalls(issue, leg)
-        if not steward_stall_tripped(stalls, ceiling):
-            self.cfg.log(
-                f"{leg} #{issue}: {status} — no verdict, will retry "
-                f"({stalls}/{ceiling})"
-            )
-            return
-        self.cfg.log(
-            f"{leg} #{issue}: {status} — {stalls} consecutive failures, "
-            f"ceiling {ceiling} reached; no further paid {leg} legs for this "
-            "version of the issue"
-        )
-        # Result deliberately unchecked: these are harness-owned signals minted
-        # without a revision guard, so an unconfirmed one is committed to the
-        # durable queue and retried there under EFFECT_RETRY_CEILING. Re-running
-        # this trip to re-deliver them would buy another paid leg to say the
-        # same thing — and would post a second comment, since the attempt count
-        # in the body defeats the executor's content-level idempotence.
-        self.executor.execute_all(
-            steward_stall_actions(issue, leg, stalls, budget=budget, detail=detail)
-        )
-        journal = self.cfg.journal
-        if journal is not None:
-            journal.emit(
-                TelemetryEvent(
-                    LevelChanged(
-                        f"issue:{issue}:steward:{leg}",
-                        "stalled",
-                        "budget_ceiling" if budget else "error_ceiling",
-                        {
-                            "leg": leg,
-                            "attempts": stalls,
-                            "ceiling": ceiling,
-                            # Harness-minted token, never the agent-authored
-                            # status string (see _charge_groom_stall).
-                            "status": detail,
-                        },
-                    ),
-                    Correlation(issue=issue),
-                )
-            )
-        # Order matters: the baseline is read after the escalation writes, and
-        # the counter is reset so a human-edited issue starts a fresh series.
-        # _record_groom_baseline cannot fail (it falls back to the leg's own view),
-        # so a trip always ends its series — no held state, no re-bought legs.
-        self._record_groom_baseline(issue, view)
-        self.store.clear_steward_stalls(issue, leg)
-
     async def groom(self, issue: int) -> None:
         """Classify an issue once per content version and apply safe findings."""
         if self.cfg.groom is None:
             return
+        control = self.cfg.dedupe
+        if not isinstance(control, StewardControl) or not self.cfg.owner_id or not isinstance(self.runner, ContextualRuntime):
+            self.cfg.log(f"groom #{issue}: durable steward authority is unavailable")
+            return
+        selection = control.read_steward(WorkflowKey(self.cfg.repo, IssueRef(issue)))
+        if not isinstance(selection, cc.SelectedSteward):
+            self.cfg.log(f"groom #{issue}: steward component is inactive or blocked")
+            return
+        lane = selection.component.state.groom
+        if lane.pending_delivery:
+            self.executor.replay_pending()
+            if lane.delivery_source is not None:
+                control.complete_steward_delivery(lane.delivery_source, self.gateway.get_issue(issue))
+            return
         iss = self.gateway.get_issue(issue)
+        signature = triage_dom.grooming_content(iss)
+        try:
+            prospective = cc.consume_steward(selection, cc.StewardPurchase(
+                cc.ContinuationCapture(selection.binding, selection.revision, "groom:preflight"),
+                cc.StewardLane.GROOM, iss.updated_at, self.cfg.error_ceiling, signature), selection.revision.version + 1)
+        except ValueError:
+            self.cfg.log(f"groom #{issue}: selected continuity refuses admission")
+            return
+        selected = cc.StewardInput(selection, cc.StewardLane.GROOM, iss.updated_at, self.cfg.error_ceiling, signature)
+        self.runner.set_context("steward", "GROOM", issue, issue, workflow=selection.binding)
         merged = self._recent_merges()
         result = await run_leg(
             self.runner,
@@ -467,17 +303,30 @@ class StewardWorkflow:
                 True,
                 ("global", "repository", "issue"),
             ),
-            task_builders.build_groom_task(
+            replace(task_builders.build_groom_task(
                 issue,
                 as_untrusted(iss.title),
                 as_untrusted(iss.body),
                 self.cfg.groom,
                 as_untrusted(_merge_lines(merged)),
-            ),
+            ), steward_input=selected),
         )
-        if result.is_error or not isinstance(result.structured, dict):
-            self._charge_groom_stall(issue, result, iss)
+        if result.workflow_attempt is None:
+            self.cfg.log(f"groom #{issue}: no admitted attempt returned")
             return
+        source = control.steward_admission(result.workflow_attempt)
+        if result.is_error or not isinstance(result.structured, dict):
+            charged = stall_charge(result.exit_reason, result.envelope_subtype)
+            self._record_steward_failure(source, iss, prospective.state.groom.stalls + charged,
+                charged=charged, budget=budget_exhausted(result.exit_reason) or MAX_BUDGET_STATUS in (result.status, result.envelope_subtype),
+                detail=result.envelope_subtype or (result.exit_reason.value if result.exit_reason else "error"))
+            return
+        fresh = self.gateway.get_issue(issue)
+        if (not completion_matches(completion_guard(iss, LifecycleOperation.GROOM), fresh)
+                or not isinstance(issue_eligibility(fresh, LifecycleOperation.GROOM), AllowedEligibility)):
+            control.record_steward_outcome(cc.StewardFailed(source, cc.StewardFailureKind.PAID))
+            return
+        iss = fresh
         raw = result.structured
         claim = steward_dom.parse_groom_disposition(raw.get("disposition"))
         duplicate_decision: steward_dom.DuplicateDecision | None = None
@@ -488,13 +337,8 @@ class StewardWorkflow:
                 try:
                     referenced = self.gateway.get_issue(claim.issue)
                 except GhUnavailable:
-                    self._groom_stall(
-                        issue,
-                        "validation_read_failed",
-                        "validation_read_failed",
-                        iss,
-                        budget=False,
-                    )
+                    self._record_steward_failure(source, iss, prospective.state.groom.stalls + 1,
+                        charged=1, budget=False, detail="validation_read_failed")
                     return
                 except (AttributeError, KeyError, TypeError, ValueError):
                     # A benign "not found" read is evidence that the claim does
@@ -531,15 +375,11 @@ class StewardWorkflow:
                     iss.title, iss.body, iss.author, iss.comments
                 ):
                     self.cfg.log(f"groom #{issue}: duplicate closure deferred; source facts changed")
+                    control.record_steward_outcome(cc.StewardFailed(source, cc.StewardFailureKind.PAID))
                     return
             except GhUnavailable:
-                self._groom_stall(
-                    issue,
-                    "revalidation_read_failed",
-                    "revalidation_read_failed",
-                    iss,
-                    budget=False,
-                )
+                self._record_steward_failure(source, iss, prospective.state.groom.stalls + 1,
+                    charged=1, budget=False, detail="revalidation_read_failed")
                 return
             except (AttributeError, KeyError, TypeError, ValueError):
                 action_reference = None
@@ -571,8 +411,26 @@ class StewardWorkflow:
                 issue, resolved_by=resolved_by, stale_reference=stale_reference,
                 merged_by_issue=merged_by_issue,
             )
-        if not self.executor.execute_all(actions):
-            self._groom_write_unconfirmed(issue, iss)
+        if not actions:
+            control.record_steward_outcome(cc.GroomNoFinding(source))
+            return
+        commands = commands_for_steward_verdict(tuple(actions), source,
+            completion_guard(iss, LifecycleOperation.CLOSE if isinstance(duplicate_decision, steward_dom.ValidatedDuplicateOf)
+                             else LifecycleOperation.GROOM),
+            identity=self.cfg.owner_id, writer_login=self.cfg.groom.steward_bot, config_version=self.cfg.config_version)
+        try:
+            if not control.record_steward_outcome(cc.StewardVerdict(source, tuple(str(command.command_id) for command in commands)), commands):
+                return
+        except sqlite3.OperationalError:
+            self._record_steward_failure(source, iss, prospective.state.groom.stalls + 1,
+                charged=1, budget=False, detail="write_not_queued")
+            return
+        self.executor.replay_pending()
+        if not control.complete_steward_delivery(source, self.gateway.get_issue(issue)):
+            self._journal_steward_level(issue, "deferred", "durable_outbox", lane=cc.StewardLane.GROOM)
+            return
+        delivered = control.read_steward(selection.binding.fence.key)
+        if not isinstance(delivered, cc.SelectedSteward) or delivered.component.state.groom.stalls:
             return
         if (
             not isinstance(duplicate_decision, steward_dom.ValidatedDuplicateOf)
@@ -585,33 +443,29 @@ class StewardWorkflow:
             duplicate_decision, steward_dom.ValidatedDuplicateOf
         ) and stale_reference.strip():
             self._journal_groomed(issue, "stale", ref=stale_reference.strip())
-        # Record after writes because comments update GitHub's timestamp. That
-        # makes an unchanged issue one-shot while a later human edit reopens the
-        # advisory scan without relying on process memory.
-        updated = self.gateway.get_issue(issue)
-        self.store.set_groom_at(issue, updated.updated_at)
-        self.store.set_groom_content(issue, triage_dom.grooming_content(updated))
-        self.store.clear_steward_stalls(issue, "groom")
 
-    def _record_triage_failure(self, source: cc.StewardAttemptSource, view: IssueView, stalls: int,
+    def _record_steward_failure(self, source: cc.StewardAttemptSource, view: IssueView, stalls: int,
                                *, charged: int, budget: bool, detail: str) -> None:
         control = self.cfg.dedupe
         assert isinstance(control, StewardControl)
         issue = view.number
+        leg = source.lane.value
         if charged and steward_stall_tripped(stalls, self.cfg.error_ceiling):
-            actions = tuple(steward_stall_actions(issue, "triage", stalls, budget=budget, detail=detail))
-            commands = commands_for_steward_verdict(actions, source, completion_guard(view, LifecycleOperation.COMPLETE_TRIAGE),
-                identity=self.cfg.owner_id, writer_login=self.cfg.triage_cfg.steward_bot if self.cfg.triage_cfg else "",
+            actions = tuple(steward_stall_actions(issue, leg, stalls, budget=budget, detail=detail))
+            operation = LifecycleOperation.GROOM if source.lane is cc.StewardLane.GROOM else LifecycleOperation.COMPLETE_TRIAGE
+            writer = self.cfg.groom.steward_bot if source.lane is cc.StewardLane.GROOM and self.cfg.groom else self.cfg.triage_cfg.steward_bot if self.cfg.triage_cfg else ""
+            commands = commands_for_steward_verdict(actions, source, completion_guard(view, operation),
+                identity=self.cfg.owner_id, writer_login=writer,
                 config_version=self.cfg.config_version)
             recorded = control.record_steward_outcome(cc.StewardStopped(source, tuple(str(command.command_id) for command in commands)), commands)
             if recorded:
-                self._journal_triage_level(issue, "stalled", "budget_ceiling" if budget else "error_ceiling",
-                    attempts=stalls, ceiling=self.cfg.error_ceiling, status=detail)
+                self._journal_steward_level(issue, "stalled", "budget_ceiling" if budget else "error_ceiling",
+                    lane=source.lane, attempts=stalls, ceiling=self.cfg.error_ceiling, status=detail)
             self.executor.replay_pending()
             try:
                 after = self.gateway.get_issue(issue)
             except Exception as exc:
-                self.cfg.log(f"triage #{issue}: stopped delivery remains owed ({exc})")
+                self.cfg.log(f"{leg} #{issue}: stopped delivery remains owed ({exc})")
                 return
             control.complete_steward_delivery(source, after)
         else:
@@ -637,7 +491,7 @@ class StewardWorkflow:
                     settled = control.read_steward(selection.binding.fence.key)
                     if (isinstance(settled, cc.SelectedSteward) and lane.stalls < self.cfg.error_ceiling
                             <= settled.component.state.triage.stalls):
-                        self._journal_triage_level(issue, "stalled", "error_ceiling",
+                        self._journal_steward_level(issue, "stalled", "error_ceiling",
                             attempts=settled.component.state.triage.stalls, ceiling=self.cfg.error_ceiling, status="write_retired")
             return
         try:
@@ -684,7 +538,7 @@ class StewardWorkflow:
             charged = stall_charge(result.exit_reason, result.envelope_subtype)
             stalls = prospective.state.triage.stalls + charged
             detail = result.envelope_subtype or (result.exit_reason.value if result.exit_reason else "error")
-            self._record_triage_failure(source, iss, stalls, charged=charged,
+            self._record_steward_failure(source, iss, stalls, charged=charged,
                 budget=budget_exhausted(result.exit_reason) or MAX_BUDGET_STATUS in (result.status, result.envelope_subtype), detail=detail)
             return
         fresh = self.gateway.get_issue(issue)
@@ -787,14 +641,14 @@ class StewardWorkflow:
                 return
         except sqlite3.OperationalError:
             # Atomic publication rolled back; only this settled attempt is lost.
-            self._record_triage_failure(source, iss, prospective.state.triage.stalls + 1,
+            self._record_steward_failure(source, iss, prospective.state.triage.stalls + 1,
                 charged=1, budget=False, detail="write_not_queued")
             return
         self.executor.replay_pending()
         after = self.gateway.get_issue(issue)
         if not control.complete_steward_delivery(source, after):
             self.cfg.log(f"triage #{issue}: verdict delivery remains owed")
-            self._journal_triage_level(issue, "deferred", "durable_outbox")
+            self._journal_steward_level(issue, "deferred", "durable_outbox")
             if closing:
                 self._journal_triage_close(issue, "close_unconfirmed", verdict.close_state)
             return

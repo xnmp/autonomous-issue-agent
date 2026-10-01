@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -124,11 +124,28 @@ class StewardLane(str, Enum):
     GROOM = "groom"
 
 
+def _groom_signature(value: str) -> None:
+    validate_workflow_text(value, "groom content signature", limit=64, empty=True)
+    if value and (len(value) != 64 or any(c not in "0123456789abcdef" for c in value)):
+        raise ValueError("groom content signature requires a canonical SHA-256 digest")
+
+
+@dataclass(frozen=True)
+class GroomContent:
+    attempted: str = ""
+    successful: str = ""
+
+    def __post_init__(self) -> None:
+        _groom_signature(self.attempted)
+        _groom_signature(self.successful)
+
+
 @dataclass(frozen=True)
 class StewardAttemptSource:
     admission: ContinuationAdmission
     lane: StewardLane
     input_at: str
+    content_signature: str = ""
 
     def __post_init__(self) -> None:
         if (not isinstance(self.admission, ContinuationAdmission)
@@ -138,6 +155,9 @@ class StewardAttemptSource:
         _timestamp(self.input_at, "steward delivery input")
         if not self.input_at:
             raise ValueError("steward delivery requires its admitted input baseline")
+        _groom_signature(self.content_signature)
+        if self.lane is StewardLane.TRIAGE and self.content_signature:
+            raise ValueError("triage source cannot claim grooming content")
 
 
 @dataclass(frozen=True)
@@ -158,6 +178,10 @@ class StewardCommandGuard:
             raise ValueError("steward completion labels must be typed")
         for value in (self.facts.title, self.facts.body, self.facts.author, self.facts.state_reason):
             validate_workflow_text(value, "steward completion fact", limit=65536, empty=True)
+        if self.source.lane is StewardLane.GROOM and self.source.content_signature:
+            from .triage import grooming_content_signature
+            if grooming_content_signature(self.facts.title, self.facts.body) != self.source.content_signature:
+                raise ValueError("groom completion facts differ from the purchased content")
         if not isinstance(self.facts.comments, tuple) or len(self.facts.comments) > 1024:
             raise ValueError("steward completion comments must be bounded")
         for comment in self.facts.comments:
@@ -201,10 +225,14 @@ class StewardLaneState:
 class StewardState:
     triage: StewardLaneState = StewardLaneState()
     groom: StewardLaneState = StewardLaneState()
+    # Saved pre-groom import plans include the original state repr in their digest.
+    groom_content: GroomContent = field(default=GroomContent(), repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.triage, StewardLaneState) or not isinstance(self.groom, StewardLaneState):
             raise ValueError("steward continuity requires fixed triage and groom lanes")
+        if not isinstance(self.groom_content, GroomContent):
+            raise ValueError("steward grooming requires fixed input and successful content")
 
 
 @dataclass(frozen=True)
@@ -563,6 +591,7 @@ class StewardPurchase:
     lane: StewardLane
     baseline_at: str
     stall_ceiling: int
+    content_signature: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, ContinuationCapture) or self.capture.binding.authority.family is not WorkflowFamily.STEWARD:
@@ -571,6 +600,9 @@ class StewardPurchase:
             raise ValueError("steward purchase requires a fixed lane")
         _timestamp(self.baseline_at, "selected steward baseline")
         validate_workflow_integer(self.stall_ceiling, "steward stall ceiling", minimum=1)
+        _groom_signature(self.content_signature)
+        if self.lane is StewardLane.TRIAGE and self.content_signature:
+            raise ValueError("triage purchase cannot claim grooming content")
 
 
 @dataclass(frozen=True)
@@ -579,12 +611,13 @@ class StewardInput:
     lane: StewardLane
     input_at: str
     stall_ceiling: int
+    content_signature: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, SelectedSteward):
             raise ValueError("steward input requires current selected authority")
         StewardPurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "input"),
-                        self.lane, self.input_at, self.stall_ceiling)
+                        self.lane, self.input_at, self.stall_ceiling, self.content_signature)
         if not self.input_at:
             raise ValueError("steward input requires a nonempty baseline")
 
@@ -629,24 +662,38 @@ class StewardStopped:
         StewardVerdict(self.source, self.commands)
 
 
-StewardReturned = StewardFailed | StewardVerdict | StewardStopped
+@dataclass(frozen=True)
+class GroomNoFinding:
+    source: StewardAttemptSource
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.source, StewardAttemptSource) or self.source.lane is not StewardLane.GROOM
+                or not self.source.content_signature):
+            raise ValueError("groom no-finding requires its exact admitted content")
+
+
+StewardReturned = StewardFailed | StewardVerdict | StewardStopped | GroomNoFinding
 
 
 def steward_return_state(selection: SelectedSteward, outcome: StewardReturned) -> StewardState | None:
-    if not isinstance(outcome, (StewardFailed, StewardVerdict, StewardStopped)):
+    if not isinstance(outcome, (StewardFailed, StewardVerdict, StewardStopped, GroomNoFinding)):
         raise ValueError("steward return requires a classified immutable outcome")
     source = outcome.source
     if not continuation_return_is_current(selection, source.admission):
         return None
     lane = selection.component.state.triage if source.lane is StewardLane.TRIAGE else selection.component.state.groom
-    if lane.attempted_at != source.input_at or lane.pending_delivery:
+    if (lane.attempted_at != source.input_at or lane.pending_delivery
+            or source.lane is StewardLane.GROOM and selection.component.state.groom_content.attempted != source.content_signature):
         raise ValueError("steward return disagrees with its selected input episode")
-    if isinstance(outcome, (StewardVerdict, StewardStopped)):
+    if isinstance(outcome, GroomNoFinding):
+        lane = replace(lane, baseline_at=source.input_at, stalls=0)
+    elif isinstance(outcome, (StewardVerdict, StewardStopped)):
         lane = replace(lane, pending_delivery=outcome.commands, delivery_source=source,
                        stalls=lane.stalls + isinstance(outcome, StewardStopped))
     else:
         lane = replace(lane, stalls=lane.stalls + (outcome.kind is StewardFailureKind.PAID))
-    return replace(selection.component.state, **{source.lane.value: lane})
+    state = replace(selection.component.state, **{source.lane.value: lane})
+    return replace(state, groom_content=replace(state.groom_content, successful=source.content_signature)) if isinstance(outcome, GroomNoFinding) else state
 
 
 def _steward_delivery_lane(selection: SelectedSteward, source: StewardAttemptSource, delivered_at: str) -> StewardLaneState | None:
@@ -670,7 +717,8 @@ def steward_delivered_state(selection: SelectedSteward, source: StewardAttemptSo
     if lane is None:
         return None
     lane = replace(lane, baseline_at=delivered_at, stalls=0, pending_delivery=(), delivery_source=None)
-    return replace(selection.component.state, **{source.lane.value: lane})
+    state = replace(selection.component.state, **{source.lane.value: lane})
+    return replace(state, groom_content=replace(state.groom_content, successful=source.content_signature)) if source.lane is StewardLane.GROOM else state
 
 
 def steward_stopped_state(selection: SelectedSteward, source: StewardAttemptSource, own_notice_at: str | None,
@@ -746,9 +794,21 @@ def triage_admissible(selection: StewardSelection, input_at: str, ceiling: int) 
         consume_steward(selection, StewardPurchase(
             ContinuationCapture(selection.binding, selection.revision, "triage:preflight"),
             StewardLane.TRIAGE, input_at, ceiling), selection.revision.version + 1)
+        return True
     except ValueError:
         return False
-    return True
+
+
+def groom_admissible(selection: StewardSelection, input_at: str, signature: str, ceiling: int) -> bool:
+    if not isinstance(selection, SelectedSteward):
+        return False
+    try:
+        consume_steward(selection, StewardPurchase(
+            ContinuationCapture(selection.binding, selection.revision, "groom:preflight"),
+            StewardLane.GROOM, input_at, ceiling, signature), selection.revision.version + 1)
+        return True
+    except ValueError:
+        return False
 
 
 ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | PRRepairPurchase | StewardPurchase
@@ -789,18 +849,30 @@ def consume_pr_repair(selection: SelectedPRRepair, purchase: PRRepairPurchase, v
 
 
 def consume_steward(selection: SelectedSteward, purchase: StewardPurchase, version: int) -> ActiveSteward:
+    if not purchase.baseline_at:
+        raise ValueError("steward purchase requires a nonempty input baseline")
     if selection.binding != purchase.capture.binding or selection.revision != purchase.capture.revision:
         raise ValueError("steward capture is stale")
     component = selection.component
     lane = component.state.triage if purchase.lane is StewardLane.TRIAGE else component.state.groom
+    content = component.state.groom_content
+    if purchase.lane is StewardLane.GROOM and (
+            not purchase.content_signature or purchase.content_signature == content.successful
+            or lane.baseline_at and not reply_advances(purchase.baseline_at, lane.baseline_at)
+            or lane.attempted_at and (reply_advances(lane.attempted_at, purchase.baseline_at)
+                or purchase.content_signature != content.attempted and not reply_advances(purchase.baseline_at, lane.attempted_at))):
+        raise ValueError("groom input is absent, already delivered or older than its selected attempt")
+    newer_input = (bool(content.attempted) and purchase.content_signature != content.attempted
+                   if purchase.lane is StewardLane.GROOM else bool(lane.attempted_at) and reply_advances(purchase.baseline_at, lane.attempted_at))
     if (component.gates or (component.watermarks.last_admitted > component.watermarks.last_applied
                            and component.watermarks.last_admitted_fence == selection.revision.fence)
-            or lane.pending_delivery or (lane.stalls >= purchase.stall_ceiling
-                                        and (not lane.attempted_at or not reply_advances(purchase.baseline_at, lane.attempted_at)))
+            or component.state.triage.pending_delivery or component.state.groom.pending_delivery
+            or (lane.stalls >= purchase.stall_ceiling and not newer_input)
             or purchase.lane is StewardLane.TRIAGE and not reply_advances(purchase.baseline_at, lane.baseline_at)):
         raise ValueError("steward purchase is held, pending delivery or exhausted")
-    if purchase.lane is StewardLane.TRIAGE:
-        lane = replace(lane, attempted_at=purchase.baseline_at,
-                       stalls=0 if lane.attempted_at and reply_advances(purchase.baseline_at, lane.attempted_at) else lane.stalls)
-        component = replace(component, state=replace(component.state, triage=lane))
+    lane = replace(lane, attempted_at=purchase.baseline_at, stalls=0 if newer_input else lane.stalls)
+    state = replace(component.state, **{purchase.lane.value: lane})
+    if purchase.lane is StewardLane.GROOM:
+        state = replace(state, groom_content=replace(content, attempted=purchase.content_signature))
+    component = replace(component, state=state)
     return replace(component, watermarks=component.watermarks.admit(version, selection.revision.fence))

@@ -119,7 +119,11 @@ def grooming_content(issue: IssueView) -> str:
     raw issue text would make comment-only updates look like body edits. Hex
     output is immune to both transformations.
     """
-    source = f"{issue.title}\0{issue.body}".encode("utf-8")
+    return grooming_content_signature(issue.title, issue.body)
+
+
+def grooming_content_signature(title: str, body: str) -> str:
+    source = f"{title}\0{body}".encode("utf-8")
     return hashlib.sha256(source).hexdigest()
 
 

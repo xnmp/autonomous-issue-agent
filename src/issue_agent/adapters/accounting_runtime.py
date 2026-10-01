@@ -372,7 +372,8 @@ class AccountingRuntime(AgentRuntime):
                     or issue != number or workflow != selected.selection.binding):
                 return _return_refused("selected steward input requires its exact lane and issue context")
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
-            continuations = (cc.StewardPurchase(capture, selected.lane, selected.input_at, selected.stall_ceiling),)
+            continuations = (cc.StewardPurchase(capture, selected.lane, selected.input_at, selected.stall_ceiling,
+                                               selected.content_signature),)
         if task.issue_reply is not None:
             selected = task.issue_reply
             if isinstance(selected, cc.LinkedPRIssueReplyInput):

@@ -102,3 +102,82 @@ def test_unknown_or_unbounded_verdict_commands_refuse(commands):
     _, source = admitted()
     with pytest.raises(ValueError):
         cc.StewardVerdict(source, commands)
+
+
+def groom_attempt(*, lane=cc.StewardLaneState(), content=cc.GroomContent(), signature="a" * 64):
+    before = selected()
+    assert isinstance(before, cc.SelectedSteward)
+    before = replace(before, component=replace(before.component,
+        state=replace(before.component.state, groom=lane, groom_content=content)))
+    purchase = cc.StewardPurchase(cc.ContinuationCapture(before.binding, before.revision, "groom:first"),
+                                  cc.StewardLane.GROOM, AT, 3, signature)
+    version = before.revision.version + 1
+    component = cc.consume_steward(before, purchase, version)
+    source = cc.StewardAttemptSource(ContinuationAdmission(
+        WorkflowAttemptIdentity(before.binding, RunId("run:groom"), purchase.capture.leg_id), version),
+        cc.StewardLane.GROOM, AT, signature)
+    return cc.SelectedSteward(replace(before.revision, version=version), component), source
+
+
+def test_successful_no_finding_groom_consumes_content_without_effects():
+    selection, source = groom_attempt()
+    state = cc.steward_return_state(selection, cc.GroomNoFinding(source))
+    assert state is not None
+    assert state.groom.baseline_at == AT and not state.groom.pending_delivery
+    assert state.groom_content.successful == source.content_signature
+    assert state.triage == selection.component.state.triage
+    completed = replace(selection, component=replace(selection.component, state=state,
+        watermarks=replace(selection.component.watermarks, last_applied=source.admission.admission_version)))
+    assert not cc.groom_admissible(completed, "2026-10-02T00:00:00Z", source.content_signature, 3)
+    assert cc.steward_return_state(completed, cc.GroomNoFinding(source)) is None
+
+
+def test_groom_stall_episode_changes_only_with_monotonic_new_content():
+    lane = cc.StewardLaneState(stalls=3, attempted_at="2026-09-30T00:00:00Z")
+    content = cc.GroomContent(attempted="a" * 64)
+    with pytest.raises(ValueError):
+        groom_attempt(lane=lane, content=content)
+    new, _ = groom_attempt(lane=lane, content=content, signature="b" * 64)
+    assert new.component.state.groom.stalls == 0
+    assert new.component.state.groom_content.attempted == "b" * 64
+    assert new.component.state.groom_content.successful == ""
+    with pytest.raises(ValueError):
+        groom_attempt(lane=replace(lane, attempted_at=AT), content=content, signature="b" * 64)
+
+
+@pytest.mark.parametrize("first", [cc.StewardLane.TRIAGE, cc.StewardLane.GROOM])
+def test_owed_delivery_fences_sibling_admission_without_resetting_sibling(first):
+    selection, source = admitted() if first is cc.StewardLane.TRIAGE else groom_attempt()
+    state = cc.steward_return_state(selection, cc.StewardVerdict(source, ("selected:command",)))
+    assert state is not None
+    owed = replace(selection, component=replace(selection.component, state=state,
+        watermarks=replace(selection.component.watermarks, last_applied=source.admission.admission_version)))
+    sibling = cc.StewardLane.GROOM if first is cc.StewardLane.TRIAGE else cc.StewardLane.TRIAGE
+    purchase = cc.StewardPurchase(cc.ContinuationCapture(owed.binding, owed.revision, "sibling"), sibling,
+                                  "2026-10-02T00:00:00Z", 3, "b" * 64 if sibling is cc.StewardLane.GROOM else "")
+    with pytest.raises(ValueError):
+        cc.consume_steward(owed, purchase, owed.revision.version + 1)
+    delivered = cc.steward_delivered_state(owed, source, AT)
+    assert delivered is not None
+    assert getattr(delivered, sibling.value) == getattr(owed.component.state, sibling.value)
+    if sibling is cc.StewardLane.GROOM:
+        assert delivered.groom_content == owed.component.state.groom_content
+    ready = replace(owed, component=replace(owed.component, state=delivered))
+    cc.consume_steward(ready, purchase, ready.revision.version + 1)
+
+
+@pytest.mark.parametrize("signature", [None, "", "a" * 63, "a" * 65, "g" * 64, "A" * 64, "a" * 65537])
+def test_absent_or_malformed_groom_input_refuses(signature):
+    with pytest.raises(ValueError):
+        groom_attempt(signature=signature)
+
+
+def test_late_groom_no_finding_cannot_erase_new_signature_or_stalls():
+    before, source = groom_attempt()
+    newer = replace(before, revision=replace(before.revision, fence=replace(before.revision.fence, generation=3)),
+        component=replace(before.component, state=replace(before.component.state,
+            groom=cc.StewardLaneState(stalls=3, attempted_at="2026-10-02T00:00:00Z"),
+            groom_content=cc.GroomContent("b" * 64, "c" * 64))))
+    assert cc.steward_return_state(newer, cc.GroomNoFinding(source)) is None
+    assert newer.component.state.groom_content == cc.GroomContent("b" * 64, "c" * 64)
+    assert newer.component.state.groom.stalls == 3

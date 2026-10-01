@@ -12,7 +12,7 @@ from issue_agent.adapters.workflow_rows import insert_workflow_component, load_i
 from issue_agent.app.execute import Executor
 from issue_agent.app.workflows.steward import StewardWorkflow
 from issue_agent.domain.contracts import Money
-from issue_agent.domain.continuation_components import InactiveSteward
+from issue_agent.domain.continuation_components import InactiveSteward, StewardLane
 from issue_agent.domain.pricing import BudgetPolicy, ModelRates, RateTable, UnknownModelPolicy
 from issue_agent.domain.workflow import IssueWorkflowShell
 from issue_agent.domain.workflow_identity import IssueRef, WorkflowFamily, WorkflowKey
@@ -50,8 +50,12 @@ def triage_lane(store, issue):
     return store._steward_control.read_steward(WorkflowKey("o/r", IssueRef(issue))).component.state.triage
 
 
+def groom_lane(store, issue):
+    return store._steward_control.read_steward(WorkflowKey("o/r", IssueRef(issue))).component.state.groom
+
+
 class AccountedStewardWorkflow(StewardWorkflow):
-    async def triage(self, issue):
+    def _prepare(self, lane):
         if not hasattr(self.store, "_steward_control"):
             directory = TemporaryDirectory(prefix="steward-fixture-")
             self.store._steward_directory = directory
@@ -61,13 +65,22 @@ class AccountedStewardWorkflow(StewardWorkflow):
             self.store._steward_control = control
         control = self.store._steward_control
         install_steward(control, self.gateway.issues)
-        self.gateway.comment_author = self.cfg.triage_cfg.steward_bot
+        self.gateway.comment_author = self.cfg.groom.steward_bot if lane is StewardLane.GROOM else self.cfg.triage_cfg.steward_bot
         if not isinstance(self.runner, AccountingRuntime):
             self.runner = AccountingRuntime(self.runner, control, "o/r", "steward", None, None, None, "fixture", "claude",
-                BudgetPolicy({("steward", "TRIAGE"): Money.from_major("USD", self.cfg.triage.max_budget_usd)}),
+                BudgetPolicy({("steward", "TRIAGE"): Money.from_major("USD", self.cfg.triage.max_budget_usd),
+                              ("steward", "GROOM"): Money.from_major("USD", self.cfg.groom.max_budget_usd if self.cfg.groom else 0.75)}),
                 RateTable("fixture", "1", "USD", {}, UnknownModelPolicy.USE_FALLBACK, ModelRates(1, 1, 1, 1)), owner_id=OWNER)
             self.cfg = replace(self.cfg, dedupe=control, repo="o/r", owner_id=OWNER)
             self.executor = Executor(self.gateway, remove_worktree=lambda n: None,
                 effect_executor=GitHubEffectExecutor(self.gateway, control, repository="o/r", identity=OWNER,
                     retry_ceiling=getattr(self, "_fixture_effect_ceiling", 10)), retry_delays=())
+    async def triage(self, issue):
+        self._prepare(StewardLane.TRIAGE)
         await super().triage(issue)
+
+    async def groom(self, issue):
+        if self.cfg.groom is None:
+            return
+        self._prepare(StewardLane.GROOM)
+        await super().groom(issue)

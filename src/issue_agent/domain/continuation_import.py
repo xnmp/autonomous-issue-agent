@@ -30,6 +30,12 @@ def digest(value: object) -> str:
                                      ensure_ascii=True).encode()).hexdigest()
 
 
+def _plan_state_identity(state: ImportedState | None) -> object:
+    if isinstance(state, cc.StewardState) and state.groom_content != cc.GroomContent():
+        return (repr(state), repr(state.groom_content))
+    return repr(state)
+
+
 @dataclass(frozen=True)
 class LegacyContinuationRecord:
     key: WorkflowKey
@@ -109,7 +115,7 @@ class ContinuationImportPlan:
                        self.source_digest, self.inventory_digest, self.file_digest,
                        tuple((t.family.value, t.key.target.number, t.source_digest,
                               None if t.revision is None else (t.revision.fence.generation, t.revision.version),
-                              t.authority_digest, repr(t.state), tuple((b.source, b.reason) for b in t.blockers)) for t in self.targets)))
+                              t.authority_digest, _plan_state_identity(t.state), tuple((b.source, b.reason) for b in t.blockers)) for t in self.targets)))
 
 
 def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[cc.ContinuationImportBlocker, ...]:
@@ -122,7 +128,17 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
         reason = source.reason if not isinstance(source, LegacyPresent) else ""
         if isinstance(source, LegacyPresent):
             text = source.text.strip()
-            if name in {"session", "model", "machine-block", "budget-block", "self-clear-ceiling", "ci-history", "stall-sig", "groom-content"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
+            if name == "groom-content":
+                if not re.fullmatch(r"[0-9a-f]{64}", text):
+                    reason = "malformed canonical title/body SHA-256 signature"
+            elif name in {"triage-at", "groom-at"}:
+                try:
+                    cc.StewardLaneState(baseline_at=text)
+                except ValueError as exc:
+                    reason = str(exc)
+                if not text:
+                    reason = "empty present continuation field"
+            elif name in {"session", "model", "machine-block", "budget-block", "self-clear-ceiling", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
             elif name in {"resumes", "ci-retries", "review-retries", "rebase-retries", "infra-deaths", "self-clears", "steward-stalls-triage", "steward-stalls-groom"}:
                 if not re.fullmatch(r"0|[1-9][0-9]{0,18}", text) or int(text) > 2**63 - 1:
@@ -134,6 +150,9 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
             blockers.append(cc.ContinuationImportBlocker("legacy:" + digest((record.root, name)), f"{name}: {reason}"))
     if blockers:
         return tuple(blockers)
+    if values.get("groom-content") and not values.get("groom-at"):
+        return (cc.ContinuationImportBlocker("legacy:" + digest((record.root, "groom-content")),
+                "groom-content: signature has no matching observed groom-at"),)
     try:
         count = lambda name: int(values.get(name, "0"))
         if record.family is WorkflowFamily.ISSUE_RECOVERY:
@@ -146,7 +165,8 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
             return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
                                     infra_failures=count("infra-deaths"))
         return cc.StewardState(cc.StewardLaneState(values.get("triage-at", ""), count("steward-stalls-triage"), count("infra-deaths")),
-                              cc.StewardLaneState(values.get("groom-at", ""), count("steward-stalls-groom"), count("infra-deaths")))
+                              cc.StewardLaneState(values.get("groom-at", ""), count("steward-stalls-groom"), count("infra-deaths")),
+                              cc.GroomContent(values.get("groom-content", ""), values.get("groom-content", "")))
     except (ValueError, TypeError) as exc:
         return (cc.ContinuationImportBlocker("legacy:" + record.source_digest, str(exc)),)
 
@@ -188,5 +208,24 @@ def triage_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuatio
         before = (baseline.text.strip() if isinstance(baseline, LegacyPresent) else "",
                   int(stalls.text.strip()) if isinstance(stalls, LegacyPresent) else 0)
         after = (target.state.triage.baseline_at, target.state.triage.stalls)
+        comparisons.append((target.key, before, after))
+    return tuple(comparisons)
+
+
+def groom_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[str, str, int], tuple[str, str, int]], ...]:
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.StewardState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.STEWARD)
+        if len(found) > 1:
+            raise ValueError("eligible groom shadow has ambiguous source ownership")
+        fields = dict(found[0].fields) if found else {}
+        values = tuple(fields.get(name, LegacyAbsent()) for name in ("groom-at", "groom-content", "steward-stalls-groom"))
+        if any(not isinstance(value, (LegacyAbsent, LegacyPresent)) for value in values):
+            raise ValueError("eligible groom shadow has unreadable selected input")
+        baseline, signature, stalls = tuple(value.text.strip() if isinstance(value, LegacyPresent) else "" for value in values)
+        before = (baseline, signature, int(stalls or "0"))
+        after = (target.state.groom.baseline_at, target.state.groom_content.successful, target.state.groom.stalls)
         comparisons.append((target.key, before, after))
     return tuple(comparisons)

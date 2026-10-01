@@ -13,7 +13,7 @@ from issue_agent.adapters.journal import read_events
 from tests.fakes.executor import ImmediateExecutor as Executor
 from issue_agent.app.workflows.jira import JiraSyncWorkflow, JiraSyncWorkflowConfig
 from issue_agent.app.workflows.steward import StewardWorkflowConfig
-from tests.fakes.accounted_steward import AccountedStewardWorkflow as StewardWorkflow, triage_lane
+from tests.fakes.accounted_steward import AccountedStewardWorkflow as StewardWorkflow, triage_lane, groom_lane
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.events import TriageDispositionRecorded
@@ -317,7 +317,7 @@ def test_grooming_flags_a_resolved_open_issue_once_and_never_closes_it(tmp_path)
     groomed = [e for e in read_events(journal.path) if e.get("event") == "groomed"]
     assert len(groomed) == 1
     assert groomed[0]["kind"] == "resolved_by"
-    assert store.groom_at[9] == "2026-09-14T10:01:00+00:00"
+    assert groom_lane(store, 9).baseline_at == "2026-09-14T10:01:00+00:00"
 
 
 def test_an_all_null_grooming_verdict_is_exactly_no_finding(tmp_path):

@@ -60,7 +60,7 @@ _ISSUE_SUFFIXES = (
     "self-clears", "self-clear-ceiling",
     "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
     "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
-    "steward-stalls-triage", "steward-stalls-groom",
+    "steward-stalls-triage",
 )
 _PR_SUFFIXES = (
     "automerge", "ci-rerun-head",
@@ -642,43 +642,13 @@ class Store:
         """Stopped legacy-source observation; runtime continuity lives in SQLite."""
         return self._read(self.triage_at_path(issue))
 
-    # ── steward stall counters (ADR 0012) ──
-    # Consecutive PAID steward legs that returned no usable verdict for this
-    # issue. PER LEG, not shared: triage and groom select on independent
-    # predicates (`grooming_candidates` has no untriaged filter), so a groom
-    # leg that cheerfully reports "no finding" would otherwise erase the triage
-    # strikes that were about to stop an unbuyable issue. Cleared by a leg of
-    # the SAME kind that returns and lands a verdict, and by the trip itself
-    # (which records that leg's baseline instead, so the next series only
-    # starts once a human moves the issue on).
-    def _stall_path(self, issue: int, leg: str) -> str:
-        if leg != "groom":
-            raise ValueError("triage continuity requires durable steward authority")
-        return self.issue_path(issue, "steward-stalls-groom")
-
-    def get_steward_stalls(self, issue: int, leg: str) -> int:
-        return self._read_int(self._stall_path(issue, leg))
-
-    def bump_steward_stalls(self, issue: int, leg: str) -> int:
-        path = self._stall_path(issue, leg)
-        n = self._read_int(path) + 1
-        self._write(path, str(n))
-        return n
-
-    def clear_steward_stalls(self, issue: int, leg: str) -> None:
-        self._write(self._stall_path(issue, leg), "0")
-
     def get_groom_at(self, issue: int) -> str:
+        """Stopped legacy-source observation; runtime continuity lives in SQLite."""
         return self._read(self.groom_at_path(issue))
 
-    def set_groom_at(self, issue: int, at: str) -> None:
-        self._write(self.groom_at_path(issue), at)
-
     def get_groom_content(self, issue: int) -> str:
+        """Stopped legacy-source observation; runtime continuity lives in SQLite."""
         return self._read(self.groom_content_path(issue))
-
-    def set_groom_content(self, issue: int, content: str) -> None:
-        self._write(self.groom_content_path(issue), content)
 
     # ── author/implementer phase (AUTHOR_TESTS_SPLIT) ──
     # "" (no file) = not started / single-pass; "authoring" = author leg ran and is

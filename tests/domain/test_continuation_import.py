@@ -63,3 +63,45 @@ def test_fixed_complete_field_set_cannot_omit_unknown_evidence():
     original = record()
     with pytest.raises(ValueError):
         LegacyContinuationRecord(original.key, original.family, original.root, original.fields[:-1])
+
+
+@pytest.mark.parametrize("value", ["", "a" * 63, "a" * 65, "A" * 64, "g" * 64, "a" * 4096],
+                         ids=["empty", "short", "long", "uppercase", "nonhex", "huge"])
+def test_malformed_or_huge_groom_content_is_source_specifically_blocked(value):
+    result = classify_record(record(WorkflowFamily.STEWARD, **{"groom-at":"2026-10-01T00:00:00Z", "groom-content":value}))
+    assert isinstance(result, tuple) and result
+    assert any(blocker.reason.startswith("groom-content:") for blocker in result)
+
+
+def test_groom_content_without_observed_baseline_stays_blocked():
+    result = classify_record(record(WorkflowFamily.STEWARD, **{"groom-content":"a" * 64}))
+    assert isinstance(result, tuple) and "matching observed groom-at" in result[0].reason
+
+
+def test_imported_groom_signature_and_stalls_preserve_independent_triage():
+    state = classify_record(record(WorkflowFamily.STEWARD, **{
+        "triage-at":"2026-09-30T00:00:00Z", "steward-stalls-triage":"1",
+        "groom-at":"2026-10-01T00:00:00Z", "groom-content":"a" * 64, "steward-stalls-groom":"3"}))
+    assert isinstance(state, cc.StewardState)
+    assert state.groom.baseline_at == "2026-10-01T00:00:00Z" and state.groom.stalls == 3
+    assert state.groom_content == cc.GroomContent("a" * 64, "a" * 64)
+    assert state.triage.baseline_at == "2026-09-30T00:00:00Z" and state.triage.stalls == 1
+
+
+def test_baseline_only_groom_import_keeps_content_explicitly_unknown():
+    state = classify_record(record(WorkflowFamily.STEWARD, **{"groom-at":"2026-10-01T00:00:00Z"}))
+    assert isinstance(state, cc.StewardState)
+    assert state.groom.baseline_at == "2026-10-01T00:00:00Z"
+    assert state.groom_content == cc.GroomContent()
+
+
+def test_nonempty_groom_content_remains_part_of_import_plan_identity():
+    from dataclasses import replace
+    from issue_agent.domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
+    selected = record(WorkflowFamily.STEWARD)
+    state = cc.StewardState(groom_content=cc.GroomContent("b" * 64, "b" * 64))
+    target = ContinuationImportTarget(selected.key, selected.family, None, "a" * 64,
+                                      state)
+    plan = ContinuationImportPlan("o/r", (WorkflowFamily.STEWARD,), 1, "a" * 64, "c" * 64, "d" * 64, (target,))
+    other = replace(target, state=replace(state, groom_content=cc.GroomContent("c" * 64, "c" * 64)))
+    assert plan.plan_digest != replace(plan, targets=(other,)).plan_digest

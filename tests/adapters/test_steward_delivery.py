@@ -46,7 +46,7 @@ def bind_events(store):
     store.bind_event_outbox(factory, lambda event: None)
 
 
-def admitted(tmp_path):
+def admitted(tmp_path, *, lane=cc.StewardLane.TRIAGE):
     store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     bind_events(store)
@@ -58,18 +58,21 @@ def admitted(tmp_path):
                    (*workflow_scope(revision.fence.key), revision.fence.generation, revision.version, encode_workflow(shell)))
     install_secondary(store, shell, component)
     selection = cc.select_steward(shell)
+    issue = IssueView(7, updated_at=NOW.isoformat(), labels=frozenset({Label.AI_TRIAGE}), title="Triage me")
+    from issue_agent.domain.triage import grooming_content
+    signature = grooming_content(issue) if lane is cc.StewardLane.GROOM else ""
     purchase = cc.StewardPurchase(cc.ContinuationCapture(selection.binding, selection.revision, "leg:triage"),
-                                  cc.StewardLane.TRIAGE, NOW.isoformat(), 3)
-    paid = replace(request("triage"), workflow=selection.binding, owner_id=OWNER, kind="TRIAGE",
-        dispatch_id=json.dumps({"repository":"o/r", "role":"steward", "kind":"TRIAGE", "issue":7, "number":7, "leg_id":"leg:triage"}))
+                                  lane, NOW.isoformat(), 3, signature)
+    paid = replace(request("triage"), workflow=selection.binding, owner_id=OWNER, kind=lane.value.upper(),
+        dispatch_id=json.dumps({"repository":"o/r", "role":"steward", "kind":lane.value.upper(), "issue":7, "number":7, "leg_id":"leg:triage"}))
     assert store.reserve_steward(paid, purchase).admitted
     assert store.settle(money(paid.run_id)).disposition is AccountingDisposition.AVAILABLE
     source = store.steward_admission(WorkflowAttemptIdentity(selection.binding, paid.run_id, "leg:triage"))
-    issue = IssueView(7, updated_at=NOW.isoformat(), labels=frozenset({Label.AI_TRIAGE}), title="Triage me")
     gateway = InMemoryGitHub((issue,))
     actions = (PostComment(Target.ISSUE, 7, "Triage accepted"),
                Relabel(Target.ISSUE, 7, Label.AI_TRIAGE, Label.AI_READY))
-    commands = commands_for_steward_verdict(actions, source, completion_guard(issue, LifecycleOperation.COMPLETE_TRIAGE), identity=OWNER, writer_login="fix-bot")
+    commands = commands_for_steward_verdict(actions, source, completion_guard(issue,
+        LifecycleOperation.GROOM if lane is cc.StewardLane.GROOM else LifecycleOperation.COMPLETE_TRIAGE), identity=OWNER, writer_login="fix-bot")
     outcome = cc.StewardVerdict(source, tuple(str(command.command_id) for command in commands))
     return store, gateway, source, commands, outcome, paid.scope
 
@@ -86,18 +89,20 @@ def executor(store, gateway):
     return GitHubEffectExecutor(gateway, store, repository="o/r", identity=OWNER)
 
 
-def test_whole_queued_verdict_recovers_after_restart_without_repurchase(verdict):
-    store, gateway, source, commands, outcome, scope = verdict
+@pytest.mark.parametrize("lane", [cc.StewardLane.TRIAGE, cc.StewardLane.GROOM])
+def test_whole_queued_verdict_recovers_after_restart_without_repurchase(tmp_path, lane):
+    store, gateway, source, commands, outcome, scope = admitted(tmp_path, lane=lane)
+    assert store.record_steward_outcome(outcome, commands)
     key = source.admission.attempt.binding.fence.key
     assert len(store.runnable_commands(repository="o/r", executor_identity=OWNER, diagnose=lambda message: None)) == 2
-    assert store.read_steward(key).component.state.triage.baseline_at == ""
+    assert getattr(store.read_steward(key).component.state, lane.value).baseline_at == ""
     assert not store.complete_steward_delivery(source, gateway.get_issue(7))
     restarted = SQLiteControlStore(store.path, now=lambda: NOW)
     bind_events(restarted)
     selection = restarted.read_steward(key)
     newer = cc.StewardPurchase(cc.ContinuationCapture(selection.binding, selection.revision, "leg:new"),
-                               cc.StewardLane.TRIAGE, (NOW + timedelta(minutes=1)).isoformat(), 3)
-    refused = replace(request("again"), workflow=selection.binding, owner_id=OWNER, kind="TRIAGE")
+                               lane, (NOW + timedelta(minutes=1)).isoformat(), 3, source.content_signature)
+    refused = replace(request("again"), workflow=selection.binding, owner_id=OWNER, kind=lane.value.upper())
     assert not restarted.reserve_steward(refused, newer).admitted
     assert executor(restarted, gateway).drain_pending_commands() == 2
     assert gateway.comments[("issue", 7)] == ["Triage accepted"]
@@ -106,7 +111,7 @@ def test_whole_queued_verdict_recovers_after_restart_without_repurchase(verdict)
     assert restarted.complete_steward_delivery(source, replace(gateway.get_issue(7), updated_at=delivered_at))
     assert not restarted.complete_steward_delivery(source, replace(gateway.get_issue(7), updated_at=delivered_at))
     assert not restarted.record_steward_outcome(outcome, commands)
-    assert restarted.read_steward(key).component.state.triage.baseline_at == delivered_at
+    assert getattr(restarted.read_steward(key).component.state, lane.value).baseline_at == delivered_at
     assert executor(restarted, gateway).drain_pending_commands() == 0
     assert restarted.snapshot(scope).settled.micros == 1
 
@@ -387,8 +392,9 @@ def test_compound_relabel_cannot_reconcile_an_old_captured_comment(tmp_path):
 
 @pytest.mark.parametrize('kind',['close','relabel'])
 @pytest.mark.parametrize('point',['comment','last_write'])
-def test_lost_reply_exact_compound_delivery(tmp_path,kind,point):
-    store,gateway,source,_,_,_=admitted(tmp_path); view=gateway.get_issue(7)
+@pytest.mark.parametrize("lane", [cc.StewardLane.TRIAGE, cc.StewardLane.GROOM])
+def test_lost_reply_exact_compound_delivery(tmp_path,kind,point,lane):
+    store,gateway,source,_,_,_=admitted(tmp_path,lane=lane); view=gateway.get_issue(7)
     guard=completion_guard(view,LifecycleOperation.CLOSE if kind=='close' else LifecycleOperation.COMPLETE_TRIAGE)
     action=CloseIssue(7,'completed','Exact selected explanation',remove_labels=(Label.AI_TRIAGE,),add_labels=(Label.AI_CLOSED,)) if kind=='close' else Relabel(Target.ISSUE,7,Label.AI_TRIAGE,Label.AI_READY,comment='Exact selected explanation',completion_guard=guard,expected_revision=NOW.isoformat())
     commands=commands_for_steward_verdict((action,),source,guard,identity=OWNER,writer_login='fix-bot')
@@ -404,6 +410,62 @@ def test_lost_reply_exact_compound_delivery(tmp_path,kind,point):
     assert store.pending_commands()[0].state=='unknown_outcome'
     effects.drain_pending_commands()
     assert store.complete_steward_delivery(source,gateway.get_issue(7))
-    assert not store.read_steward(source.admission.attempt.binding.fence.key).component.state.triage.pending_delivery
+    assert not getattr(store.read_steward(source.admission.attempt.binding.fence.key).component.state, lane.value).pending_delivery
     assert len(gateway.get_issue(7).comments)==1
     with store.transaction() as db: assert db.execute('SELECT count(*) FROM charges').fetchone()[0]==1
+
+
+def test_empty_groom_input_refuses_before_money_or_authority_writes(tmp_path):
+    store, _, source, _, _, _ = admitted(tmp_path)
+    assert store.record_steward_outcome(cc.StewardFailed(source, cc.StewardFailureKind.PAID))
+    selected = store.read_steward(source.admission.attempt.binding.fence.key)
+    purchase = cc.StewardPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:groom"),
+                                  cc.StewardLane.GROOM, "", 3, "a" * 64)
+    paid = replace(request("empty-groom"), workflow=selected.binding, owner_id=OWNER, kind="GROOM",
+        dispatch_id=json.dumps({"repository":"o/r", "role":"steward", "kind":"GROOM", "issue":7, "number":7, "leg_id":"leg:groom"}))
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+    assert not store.reserve_steward(paid, purchase).admitted
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == before
+
+
+@pytest.mark.parametrize("operation", [LifecycleOperation.GROOM, LifecycleOperation.CLOSE])
+def test_groom_verdict_cannot_rebind_purchased_content(tmp_path, operation):
+    store, gateway, source, _, _, _ = admitted(tmp_path, lane=cc.StewardLane.GROOM)
+    changed = replace(gateway.get_issue(7), body="Human input not classified by this purchase")
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+    with pytest.raises(ValueError, match="purchased content"):
+        commands_for_steward_verdict((PostComment(Target.ISSUE, 7, "Old advice"),), source,
+            completion_guard(changed, operation), identity=OWNER, writer_login="fix-bot")
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == before
+    assert gateway.calls == []
+
+
+def test_no_finding_return_rolls_back_when_outer_caller_catches_error(tmp_path, monkeypatch):
+    store, _, source, _, _, _ = admitted(tmp_path, lane=cc.StewardLane.GROOM)
+    outcome = cc.GroomNoFinding(source)
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER reject_no_finding BEFORE INSERT ON event_outbox BEGIN SELECT RAISE(ABORT,'return failed'); END")
+        before = tuple(db.iterdump())
+        @contextmanager
+        def borrowed():
+            yield db
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "transaction", borrowed)
+            with pytest.raises(sqlite3.IntegrityError, match="return failed"):
+                store.record_steward_outcome(outcome)
+        assert tuple(db.iterdump()) == before
+        db.execute("DROP TRIGGER reject_no_finding")
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at) VALUES ('outer','test','marker','now')")
+    assert store.record_steward_outcome(outcome)
+    assert not store.record_steward_outcome(outcome)
+    current = store.read_steward(source.admission.attempt.binding.fence.key)
+    assert current.component.state.groom_content.successful == source.content_signature
+    assert current.component.state.groom.baseline_at == source.input_at
+    assert current.component.state.triage == cc.StewardLaneState()
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='outer'").fetchone()[0] == 1
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1

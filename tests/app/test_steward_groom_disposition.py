@@ -4,7 +4,8 @@ from dataclasses import replace
 from issue_agent.adapters.journal import read_events
 from issue_agent.app.planners.schemas import GROOM_SCHEMA
 from issue_agent.app.planners.tasks import GroomTaskConfig, TriageTaskConfig
-from issue_agent.app.workflows.steward import StewardWorkflow, StewardWorkflowConfig
+from issue_agent.app.workflows.steward import StewardWorkflowConfig
+from tests.fakes.accounted_steward import AccountedStewardWorkflow as StewardWorkflow
 from issue_agent.domain.labels import Label
 from issue_agent.domain.outcome import AgentResult
 from issue_agent.domain.triage import TriageConfig
@@ -23,7 +24,7 @@ def _workflow(tmp_path, referenced: IssueView):
         body="Opening a report crashes",
         author="alice",
         labels=frozenset({Label.AI_TRIAGE}),
-        updated_at="before",
+        updated_at="2026-09-14T10:00:00+00:00",
     )
     gateway = FakeGateway(issues={196: current, referenced.number: referenced})
     runner = FakeRunner(AgentResult(
@@ -133,7 +134,7 @@ def test_groom_revalidates_both_issues_before_close(tmp_path):
     first_current = gateway.issues[196]
     fresh_current = replace(first_current, state_reason="reopened")
     reads = {
-        196: [first_current, fresh_current],
+        196: [first_current, first_current, fresh_current],
         42: [done, done],
     }
 

@@ -6039,12 +6039,13 @@ class SQLiteControlStore:
         self._require_steward_dispatch(row["dispatch_id"], row["kind"], captured[0])
         if row["state"] != "settled" or db.execute("SELECT 1 FROM charges WHERE run_id=?", (str(attempt.run_id),)).fetchone() is None:
             raise WorkflowAuthorityError("steward return requires retained actual money settlement")
-        return cc.StewardAttemptSource(captured[1], captured[0].lane, captured[0].baseline_at)
+        return cc.StewardAttemptSource(captured[1], captured[0].lane, captured[0].baseline_at,
+                                      captured[0].content_signature)
 
     def record_steward_outcome(self, outcome: cc.StewardReturned,
                                commands: tuple[LifecycleCommand, ...] = ()) -> bool:
         from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
-        if not isinstance(outcome, (cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped)):
+        if not isinstance(outcome, (cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.GroomNoFinding)):
             raise ValueError("steward outcome must be a fixed classified return")
         source = outcome.source
         key = source.admission.attempt.binding.fence.key

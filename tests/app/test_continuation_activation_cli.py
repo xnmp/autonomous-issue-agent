@@ -97,6 +97,8 @@ def test_steward_rehearsal_leaves_source_and_primary_authority_unchanged(stopped
     state = Path(env["STEWARD_STATE_DIR"])
     state.mkdir(parents=True)
     (state / "triage-7.at").write_text("2026-10-01T00:00:00Z")
+    (state / "groom-7.at").write_text("2026-10-01T00:00:00Z")
+    (state / "groom-7.content").write_text("a" * 64)
     (state / "issue-8.steward-stalls-groom").write_text("malformed")
     (state / "events-v2.jsonl").write_text("retained source feed\n")
     before = dump(control)
@@ -535,4 +537,58 @@ def test_triage_shadow_preserves_baseline_and_stalls_and_blocks_unknown_history(
     assert result["triage_shadow"] == [{"issue":7, "legacy":["2026-10-01T00:00:00Z",2],
                                        "imported":["2026-10-01T00:00:00Z",2], "agrees":True}]
     assert next(target for target in result["targets"] if target["number"] == 8)["eligible"] is False
+    assert dump(control) == before
+
+
+def test_groom_shadow_matches_supported_content_and_blocks_ambiguous_source(stopped, capsys):
+    _, control, env = stopped
+    state = Path(env["STEWARD_STATE_DIR"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "groom-7.at").write_text("2026-10-01T00:00:00Z\n")
+    (state / "groom-7.content").write_text("a" * 64 + "\n")
+    (state / "issue-7.steward-stalls-groom").write_text("2")
+    (state / "groom-8.content").write_text("a" * 64)
+    before = dump(control)
+    code, result, error = command(capsys, "steward", "shadow")
+    assert code == 0, error
+    expected = ["2026-10-01T00:00:00Z", "a" * 64, 2]
+    assert result["groom_shadow"] == [{"issue":7, "legacy":expected, "imported":expected, "agrees":True}]
+    assert next(target for target in result["targets"] if target["number"] == 8)["eligible"] is False
+    assert dump(control) == before
+
+
+def test_oversized_groom_file_stays_visibly_blocked(stopped, capsys):
+    _, control, env = stopped
+    state = Path(env["STEWARD_STATE_DIR"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "groom-7.at").write_text("2026-10-01T00:00:00Z")
+    (state / "groom-7.content").write_text("a" * 65537)
+    before = dump(control)
+    code, result, error = command(capsys, "steward", "shadow")
+    assert code == 0, error
+    target = next(target for target in result["targets"] if target["number"] == 7)
+    assert target["eligible"] is False
+    assert any("groom-content" in blocker for blocker in target["blockers"])
+    assert result["groom_shadow"] == [] and dump(control) == before
+
+
+def test_pre_t2_literal_plan_retains_digest_and_sql_only_retry_after_cleanup(stopped, capsys, monkeypatch):
+    from issue_agent.adapters.continuation_activation import read_import_plan
+    _, control, env = stopped
+    saved = Path(__file__).parents[1] / "fixtures" / "workflow_steward_import_pre_t2.json"
+    report = json.loads(saved.read_text())
+    original = read_import_plan(str(saved))
+    assert original.plan_digest == report["plan_digest"]
+    with control.transaction() as db:
+        publish_continuation_import(db, original, now=datetime(2026,10,1,tzinfo=timezone.utc), control=control)
+    state = Path(env["STEWARD_STATE_DIR"])
+    state.mkdir(parents=True, exist_ok=True)
+    (state / "triage-7.at").write_text("2026-10-01T00:00:00Z")
+    (state / "triage-7.at").unlink()
+    before = dump(control)
+    monkeypatch.setattr(continuation_activation, "evaluate", lambda *args: pytest.fail("retry inspected raw source"))
+    monkeypatch.setattr(cli, "_activation_liveness", lambda *args: pytest.fail("retry inspected current work"))
+    code, retry, error = command(capsys, "steward", "activate", "--plan-file", str(saved),
+                                 "--confirm-plan-digest", report["plan_digest"])
+    assert code == 0 and retry["status"] == "already_active_with_this_plan", error
     assert dump(control) == before

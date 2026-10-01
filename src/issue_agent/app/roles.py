@@ -123,6 +123,7 @@ from ..domain.triage import (
     adr_steward_actions,
     parse_codeowners_default,
     grooming_candidates,
+    grooming_content,
     triage_candidates,
 )
 from ..domain.jira import jira_phase, jira_sync_needed
@@ -3724,23 +3725,24 @@ def build_steward_daemon(
         }
         for i in world.issues:
             selected = triage_state[i.number]
-            if isinstance(selected, cc.SelectedSteward) and selected.component.state.triage.delivery_source is not None:
-                source = selected.component.state.triage.delivery_source
-                if _control_value(errors, i.number,
-                        lambda n: control.complete_steward_delivery(source, gateway.get_issue(n)), False):
-                    triage_state[i.number] = control.read_steward(WorkflowKey(cfg.repo, IssueRef(i.number)))
+            if isinstance(selected, cc.SelectedSteward):
+                for lane in (selected.component.state.triage, selected.component.state.groom):
+                    if lane.delivery_source is not None and _control_value(errors, i.number,
+                            lambda n: control.complete_steward_delivery(lane.delivery_source, gateway.get_issue(n)), False):
+                        triage_state[i.number] = control.read_steward(WorkflowKey(cfg.repo, IssueRef(i.number)))
         seen = {number: selected.component.state.triage.baseline_at if isinstance(selected, cc.SelectedSteward) else ""
                 for number, selected in triage_state.items()}
-        groom_seen = {i.number: _control_value(errors, i.number, store.get_groom_at, "") for i in world.issues}
-        groom_content = {i.number: _control_value(errors, i.number, store.get_groom_content, "") for i in world.issues}
+        groom_seen = {number: selected.component.state.groom.baseline_at if isinstance(selected, cc.SelectedSteward) else ""
+                      for number, selected in triage_state.items()}
+        groom_content = {number: selected.component.state.groom_content.successful if isinstance(selected, cc.SelectedSteward) else ""
+                         for number, selected in triage_state.items()}
         infra = {i.number: _control_value(errors, i.number, store.get_infra_deaths, 0) for i in world.issues}
-        for i in world.issues:
-            _control_value(errors, i.number, lambda n: store.get_steward_stalls(n, "groom"), 0)
         for target, reason in errors.items():
             steward_log(f"issue #{target} held: {reason}")
         world = replace(world, issues=tuple(i for i in world.issues if i.number not in errors))
         state = TriageState(seen_at=seen)
         updated_at = {i.number: i.updated_at for i in world.issues}
+        signatures = {i.number: grooming_content(i) for i in world.issues}
         deaths = control.abandoned_dispatch_counts(owner_id)
 
         def exhausted(n: int) -> bool:
@@ -3756,15 +3758,17 @@ def build_steward_daemon(
         actions.extend(
             adr_steward_actions(world.prs, adrs, steward_runtime.bot)
         )
+        groom_world = replace(world, issues=tuple(i for i in world.issues
+            if not exhausted(i.number) and cc.groom_admissible(triage_state[i.number], updated_at[i.number],
+                signatures[i.number], cfg.steward_error_ceiling)))
         actions.extend(
             RunAgent(AgentKind.GROOM, n)
             for n in grooming_candidates(
-                world,
+                groom_world,
                 groom_seen,
                 groom_enabled,
                 groom_content,
             )
-            if not exhausted(n)
         )
         if jira_on:
             for i in world.issues:
