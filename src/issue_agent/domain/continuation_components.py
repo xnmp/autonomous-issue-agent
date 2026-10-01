@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING
 
 from .agent_task import RuntimeName
 from .refs import issue_from_branch
-from .contracts import ContinuationAdmission
+from .contracts import ContinuationAdmission, SettlementRequest, WorkflowAttemptIdentity
 from .eligibility import IssueCompletionGuard, LifecycleOperation
 from .workflow_identity import (
     MAX_WORKFLOW_GATES, ContinuationComponentIdentity, FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
@@ -82,6 +82,20 @@ class RepairSession:
 
 
 @dataclass(frozen=True)
+class RepairModel:
+    source: ContinuationAdmission
+    runtime: RuntimeName
+    model: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, ContinuationAdmission) or self.source.attempt.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("repair model requires its PR repair admission")
+        if not isinstance(self.runtime, RuntimeName):
+            raise ValueError("repair model requires a typed runtime")
+        validate_workflow_text(self.model, "actual repair model")
+
+
+@dataclass(frozen=True)
 class IssueRecoveryState:
     consumed_reply_at: str = ""
     resumes: int = 0
@@ -109,14 +123,27 @@ class PRRepairState:
     rebase_failures: int = 0
     infra_failures: int = 0
     self_clears: int = 0
+    resumes: int = field(default=0, repr=False)
+    actual_model: RepairModel | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed PR reply")
         validate_workflow_text(self.branch, "repair branch", empty=True)
         if self.session is not None and not isinstance(self.session, RepairSession):
             raise ValueError("PR repair continuity requires a typed session")
+        validate_workflow_integer(self.resumes, "repair resumes")
+        if self.actual_model is not None and not isinstance(self.actual_model, RepairModel):
+            raise ValueError("actual repair model requires typed provenance")
         for name in ("ci_failures", "review_failures", "rebase_failures", "infra_failures", "self_clears"):
             validate_workflow_integer(getattr(self, name), name)
+
+
+def retire_pr_repair_continuity(state: PRRepairState, merged: bool) -> PRRepairState:
+    if not isinstance(state, PRRepairState) or type(merged) is not bool:
+        raise ValueError("repair retirement requires typed continuity and terminal outcome")
+    # A closed-unmerged requeue clears only resume-blocking state. Remembered
+    # branch/model, fork count and existing failure debt retain their old meaning.
+    return PRRepairState() if merged else replace(state, session=None, consumed_reply_at="")
 
 
 class StewardLane(str, Enum):
@@ -319,8 +346,10 @@ class ActivePRRepair:
 
     def __post_init__(self) -> None:
         _active(self.identity, WorkflowFamily.PR_REPAIR, self.state, PRRepairState, self.watermarks, self.gates)
-        if self.state.session is not None:
-            source = self.state.session.source
+        for selected in (self.state.session, self.state.actual_model):
+            if selected is None:
+                continue
+            source = selected.source
             prior = source.attempt.binding
             if (prior.fence.key != self.identity.key or prior.authority != self.identity.authority
                     or prior.episode_id != self.identity.episode_id
@@ -388,9 +417,10 @@ def validate_component_revision(component: object, revision: WorkflowRevision, f
         if any((gate.gate if isinstance(gate, RearmingGate) else gate).opened_generation > revision.fence.generation
                for gate in component.gates):
             raise ValueError("component hold cannot originate in a future target generation")
-    if isinstance(component, ActivePRRepair) and component.state.session is not None:
-        if component.state.session.source.attempt.binding.fence.generation > revision.fence.generation:
-            raise ValueError("repair session cannot originate in a future target generation")
+    if isinstance(component, ActivePRRepair):
+        for selected in (component.state.session, component.state.actual_model):
+            if selected is not None and selected.source.attempt.binding.fence.generation > revision.fence.generation:
+                raise ValueError("repair continuity cannot originate in a future target generation")
 
 
 @dataclass(frozen=True)
@@ -575,14 +605,105 @@ class PRRepairPurchase:
     reply_at: str = ""
     allowance: RepairAllowance = RepairAllowance.INFRA
     ceiling: int = 1
+    branch: str = ""
+    handoff: RepairHandoff | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, ContinuationCapture) or self.capture.binding.authority.family is not WorkflowFamily.PR_REPAIR:
             raise ValueError("PR repair purchase requires its family capture")
+        validate_workflow_text(self.branch, "purchased repair branch", empty=True)
+        if self.handoff is not None and (not isinstance(self.handoff, RepairHandoff) or self.handoff.branch != self.branch
+                or self.handoff.pr != self.capture.binding.fence.key.target):
+            raise ValueError("purchased repair handoff differs from its PR/branch")
         _timestamp(self.reply_at, "selected PR reply")
         if not isinstance(self.allowance, RepairAllowance):
             raise ValueError("PR repair purchase requires a fixed allowance")
         validate_workflow_integer(self.ceiling, "repair allowance ceiling", minimum=1)
+
+
+@dataclass(frozen=True)
+class RepairHandoff:
+    source: WorkflowAttemptIdentity
+    handle: str
+    runtime: RuntimeName
+    model: str
+    branch: str
+    pr: PullRequestRef
+    resumes: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.source, WorkflowAttemptIdentity) or self.source.binding.authority.family is not WorkflowFamily.RESOLVE:
+            raise ValueError("repair handoff requires its exact resolve source")
+        if not isinstance(self.pr, PullRequestRef):
+            raise ValueError("repair handoff requires its exact destination PR")
+        validate_workflow_integer(self.resumes, "handed off resume count")
+        validate_workflow_identifier(self.handle, "resolve handoff session")
+        validate_workflow_text(self.model, "resolve handoff model", empty=True)
+        validate_workflow_text(self.branch, "resolve handoff branch")
+        if not isinstance(self.runtime, RuntimeName):
+            raise ValueError("resolve handoff requires typed runtime")
+
+
+@dataclass(frozen=True)
+class PRRepairInput:
+    selection: SelectedPRRepair
+    branch: str
+    runtime: RuntimeName
+    handoff: RepairHandoff | None = None
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selection, SelectedPRRepair) or not isinstance(self.runtime, RuntimeName):
+            raise ValueError("repair input requires selected authority and runtime")
+        validate_workflow_text(self.branch, "current remote repair branch")
+        if self.handoff is not None and (not isinstance(self.handoff, RepairHandoff) or self.handoff.branch != self.branch
+                or self.handoff.runtime is not self.runtime or self.handoff.pr != self.selection.binding.fence.key.target):
+            raise ValueError("repair handoff differs from selected branch/runtime")
+
+    @property
+    def session(self) -> RepairSession | RepairHandoff | None:
+        state = self.selection.component.state
+        session = state.session
+        if session is not None and session.runtime is self.runtime and state.branch == self.branch:
+            return session
+        return self.handoff if state.actual_model is None else None
+
+    @property
+    def model(self) -> str:
+        state = self.selection.component.state
+        model = state.actual_model
+        if model is not None and model.runtime is self.runtime:
+            return model.model
+        return self.session.model if self.session is not None else ""
+
+
+@dataclass(frozen=True)
+class PRRepairNotLaunched:
+    admission: ContinuationAdmission
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.admission, ContinuationAdmission) or self.admission.attempt.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("unlaunched repair requires its exact admission")
+
+
+@dataclass(frozen=True)
+class PRRepairResult:
+    admission: ContinuationAdmission
+    state: PRRepairState
+    settlement: SettlementRequest
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.admission, ContinuationAdmission)
+                or self.admission.attempt.binding.authority.family is not WorkflowFamily.PR_REPAIR
+                or not isinstance(self.state, PRRepairState) or not isinstance(self.settlement, SettlementRequest)
+                or self.settlement.run_id != self.admission.attempt.run_id):
+            raise ValueError("repair result requires its exact paid admission and settlement")
+        if (self.state.session is not None and self.state.session.source != self.admission
+                or self.state.actual_model is None or self.state.actual_model.source != self.admission):
+            raise ValueError("repair output requires its exact admitted provenance")
+        if self.state.session is not None and (
+                self.state.session.runtime is not self.state.actual_model.runtime
+                or self.state.session.model != self.state.actual_model.model):
+            raise ValueError("repair handle must come from the actual returned runtime and model")
 
 
 @dataclass(frozen=True)
@@ -845,6 +966,8 @@ def consume_pr_repair(selection: SelectedPRRepair, purchase: PRRepairPurchase, v
             or purchase.reply_at and not reply_advances(purchase.reply_at, component.state.consumed_reply_at)):
         raise ValueError("PR repair purchase is held, consumed or exhausted")
     state = replace(component.state, consumed_reply_at=purchase.reply_at) if purchase.reply_at else component.state
+    if purchase.handoff is not None:
+        state = replace(state, resumes=max(state.resumes, purchase.handoff.resumes))
     return replace(component, state=state, watermarks=component.watermarks.admit(version, selection.revision.fence))
 
 

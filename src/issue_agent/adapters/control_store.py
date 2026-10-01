@@ -38,6 +38,7 @@ from ..domain.contracts import (
     PriceQuote,
     PricingBasis,
     ReservationId,
+    SettlementRequest,
     RunId,
     TokenUsage,
     WorkflowAttemptIdentity,
@@ -718,26 +719,6 @@ class ReservationResult:
     @property
     def admitted(self) -> bool:
         return self.disposition is AccountingDisposition.AVAILABLE
-
-
-@dataclass(frozen=True)
-class SettlementRequest:
-    run_id: RunId
-    amount: Money
-    basis: PricingBasis
-    provider_receipt_id: str
-    usage: TokenUsage | None
-    rate_card_id: str | None
-    rate_card_version: str | None
-
-    def __post_init__(self) -> None:
-        if not str(self.run_id) or not self.provider_receipt_id:
-            raise ValueError("run and provider receipt identities are required")
-        if (
-            self.basis is PricingBasis.CONFIGURED_RATE_CARD
-            and (not self.rate_card_id or not self.rate_card_version)
-        ):
-            raise ValueError("configured charges require rate-card provenance")
 
 
 @dataclass(frozen=True)
@@ -5497,6 +5478,19 @@ class SQLiteControlStore:
                     selection = cc.select_pr_repair(aggregate)
                     if not isinstance(selection, cc.SelectedPRRepair):
                         raise ValueError("PR repair is inactive or migration blocked")
+                    if purchase.branch:
+                        self._validate_pr_repair_sources(db, selection)
+                    if purchase.handoff is not None:
+                        from .workflow_control import SQLiteWorkflowControl
+                        from ..domain.workflow_identity import WorkflowWriter
+                        dispatch = json.loads(request.dispatch_id)
+                        source_issue = purchase.handoff.source.binding.fence.key.target.number
+                        if dispatch.get("issue") != source_issue:
+                            raise WorkflowAuthorityError("repair handoff differs from actual linked issue")
+                        bound = SQLiteWorkflowControl(self, WorkflowWriter(key.repository, "fix", request.owner_id), resolve_ceiling=0)
+                        verified = bound._pr_repair_handoff(db, source_issue, key.target, purchase.branch, purchase.handoff.runtime)
+                        if verified != purchase.handoff:
+                            raise WorkflowAuthorityError("repair handoff changed before paid admission")
                     after = replace(after, pr_repair=cc.consume_pr_repair(selection, purchase, version),
                                     revision=WorkflowRevision(aggregate.revision.fence, version))
                 else:
@@ -5973,12 +5967,79 @@ class SQLiteControlStore:
         return self._settle_continuation(request, admission, state, WorkflowFamily.ISSUE_RECOVERY)
 
     def settle_pr_repair(self, request: SettlementRequest, admission: ContinuationAdmission,
-                         state: cc.PRRepairState) -> SettlementResult:
+                         state: cc.PRRepairState, *, writer=None) -> SettlementResult:
         if not isinstance(state, cc.PRRepairState):
             raise ValueError("PR repair return requires typed state")
         if state.session is not None and state.session.source != admission:
             raise ValueError("PR repair return session requires its exact admission")
-        return self._settle_continuation(request, admission, state, WorkflowFamily.PR_REPAIR)
+        return self._settle_continuation(request, admission, state, WorkflowFamily.PR_REPAIR, writer=writer)
+
+    def pr_repair_admission(self, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
+        with self.transaction() as db:
+            return self._pr_repair_admission(db, attempt)
+
+    def _pr_repair_admission(self, db, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
+        if attempt.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise WorkflowAuthorityError("repair lookup requires its family attempt")
+        key = attempt.binding.fence.key
+        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
+            (key.repository, self._continuation_receipt_key(attempt.run_id, WorkflowFamily.PR_REPAIR))).fetchone()
+        if raw is None:
+            raise WorkflowAuthorityError("repair output lacks its selected admission receipt")
+        admission = decode_workflow(raw[0], tuple)[1]
+        if not isinstance(admission, ContinuationAdmission) or admission.attempt != attempt:
+            raise WorkflowAuthorityError("repair output conflicts with its admitted attempt")
+        self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
+        return admission
+    def capture_pr_repair_result(self, returned: cc.PRRepairResult, writer) -> None:
+        if not isinstance(returned, cc.PRRepairResult):
+            raise ValueError("repair capture requires typed returned evidence")
+        admission = returned.admission
+        key = admission.attempt.binding.fence.key
+        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, WorkflowFamily.PR_REPAIR)
+        encoded = encode_workflow(returned)
+        with self.transaction() as db:
+            purchase, run = self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
+            self._require_repair_writer(db, writer, admission, run["owner_id"])
+            if run["reservation_state"] == "released":
+                raise WorkflowAuthorityError("released repair reservation cannot produce paid output")
+            dispatch = json.loads(run['dispatch_id'])
+            if (not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch
+                    or returned.state.branch != purchase.branch
+                    or dispatch.get('kind') != 'FIX_CI' or dispatch.get('number') != key.target.number
+                    or dispatch.get('runtime') != returned.state.actual_model.runtime.value):
+                raise WorkflowAuthorityError("repair output changed its admitted branch, lane or runtime")
+            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?",
+                (key.repository, receipt_key)).fetchone()
+            if prior is not None:
+                if prior[0] != encoded:
+                    raise WorkflowAuthorityError("repair result conflicts with its immutable receipt")
+                return
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('pr-repair-result',?,?,?,?)",
+                (key.repository, receipt_key, _stamp(self._now()), encoded))
+
+    def settle_pr_repair_result(self, returned: cc.PRRepairResult, writer) -> SettlementResult:
+        # Capture survives an interrupted money/continuity transaction. Restart
+        # uses this exact output and charge, never an in-memory provider envelope.
+        self.capture_pr_repair_result(returned, writer)
+        return self.settle_pr_repair(returned.settlement, returned.admission, returned.state, writer=writer)
+
+    def reconcile_pr_repair_returns(self, writer) -> int:
+        with self.transaction() as db:
+            self._assert_owner_active(db, writer.owner_id)
+            lineage = self._owner_lineage(db, writer.repository, writer.owner_id)
+            owners = ",".join("?" for _ in lineage)
+            rows = db.execute("SELECT raw.payload_json FROM dedupe_keys raw JOIN runs r "
+                "ON r.run_id=json_extract(raw.payload_json,'$.value.fields.admission.fields.attempt.fields.run_id') "
+                "LEFT JOIN dedupe_keys done ON done.namespace='continuation-return' AND done.scope=raw.scope AND done.key=raw.key "
+                f"WHERE raw.namespace='pr-repair-result' AND raw.scope=? AND r.owner_id IN ({owners}) AND done.key IS NULL "
+                "ORDER BY raw.claimed_at,raw.key LIMIT 32", (writer.repository, *lineage)).fetchall()
+        completed = 0
+        for row in rows:
+            returned = decode_workflow(row[0], cc.PRRepairResult)
+            settled = self.settle_pr_repair_result(returned, writer)
+            completed += int(settled.disposition is AccountingDisposition.AVAILABLE)
+        return completed
 
     def settle_steward(self, request: SettlementRequest, admission: ContinuationAdmission,
                        state: cc.StewardState) -> SettlementResult:
@@ -5991,6 +6052,33 @@ class SQLiteControlStore:
         with self.transaction() as db:
             aggregate = load_issue_aggregate(db, key)
             return cc.select_steward(aggregate) if aggregate is not None else cc.InactiveSteward()
+
+    def _validate_pr_repair_sources(self, db, selected: cc.SelectedPRRepair) -> None:
+        state = selected.component.state
+        proofs: dict[ContinuationAdmission, cc.PRRepairState] = {}
+        for reference, field in ((state.session, "session"), (state.actual_model, "actual_model")):
+            if reference is None:
+                continue
+            source = reference.source
+            if source not in proofs:
+                self._continuation_return_admission(db, source, WorkflowFamily.PR_REPAIR)
+                row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                    (selected.binding.fence.key.repository, self._continuation_receipt_key(source.attempt.run_id, WorkflowFamily.PR_REPAIR))).fetchone()
+                payload = decode_workflow(row[0], tuple) if row is not None else ()
+                if len(payload) != 2 or payload[0] != source or not isinstance(payload[1], cc.PRRepairState):
+                    raise WorkflowAuthorityError("selected repair continuity lost its exact applied output receipt")
+                proofs[source] = payload[1]
+            if getattr(proofs[source], field) != reference:
+                raise WorkflowAuthorityError("selected repair continuity lost its exact applied output receipt")
+
+    def read_pr_repair(self, key: WorkflowKey) -> cc.PRRepairSelection:
+        from .workflow_rows import load_review_workflow_row
+        with self.transaction() as db:
+            aggregate = load_review_workflow_row(db, key)
+            selected = cc.select_pr_repair(aggregate) if aggregate is not None else cc.InactivePRRepair()
+            if isinstance(selected, cc.SelectedPRRepair):
+                self._validate_pr_repair_sources(db, selected)
+            return selected
 
     def steward_admission(self, attempt: WorkflowAttemptIdentity) -> cc.StewardAttemptSource:
         with self.transaction() as db:
@@ -6292,8 +6380,44 @@ class SQLiteControlStore:
             self.enqueue_event(self._event_factory(event, Correlation(issue=key.target.number)), db)
             return True
 
+    def _require_repair_writer(self, db, writer, admission, historical_owner):
+        from .workflow_commit import owns_command
+        if writer is None or writer.repository != admission.attempt.binding.fence.key.repository or writer.role != "fix":
+            raise WorkflowAuthorityError("repair output requires its current bound fix writer")
+        self._assert_owner_active(db, writer.owner_id)
+        if not owns_command(db, writer, historical_owner):
+            raise WorkflowAuthorityError("repair output belongs to another deployment owner")
+
+    def _continuation_return_admission(self, db, admission: ContinuationAdmission, family: WorkflowFamily):
+        key = admission.attempt.binding.fence.key
+        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, family)
+        row = db.execute(
+            "SELECT d.payload_json,r.owner_id,r.dispatch_id,r.continuations_json,r.workflow_binding_json,b.state AS reservation_state FROM dedupe_keys d JOIN runs r ON r.run_id=? "
+            "JOIN budget_reservations b USING(run_id) WHERE d.namespace='continuation-admission' "
+            "AND d.scope=? AND d.key=? AND b.workload_repository=?",
+            (str(admission.attempt.run_id), key.repository, receipt_key, key.repository),
+        ).fetchone()
+        if row is None:
+            raise WorkflowAuthorityError("continuation return lacks its immutable run admission")
+        captured = decode_workflow(row["payload_json"], tuple)
+        if (len(captured) != 2 or captured[1] != admission
+                or not isinstance(captured[0], (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase))
+                or captured[0].capture.binding != admission.attempt.binding
+                or captured[0].capture.leg_id != admission.attempt.leg_id
+                or captured[0].capture.revision.version + 1 != admission.admission_version
+                or deployment_role(key.repository, row["owner_id"]) != ("steward" if family is WorkflowFamily.STEWARD else "fix")):
+            raise WorkflowAuthorityError("continuation return conflicts with its exact admission")
+        if captured[0] not in decode_workflow(row["continuations_json"], tuple):
+            raise WorkflowAuthorityError("continuation return was never selected on its actual run")
+        if row["workflow_binding_json"] is not None:
+            principal = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
+            if (principal.fence.key == key and principal.fence != admission.attempt.binding.fence
+                    or principal.authority.family is family and principal != admission.attempt.binding):
+                raise WorkflowAuthorityError("continuation return conflicts with its actual run binding")
+        return captured[0], row
+
     def _settle_continuation(self, request: SettlementRequest, admission: ContinuationAdmission,
-                             state, family: WorkflowFamily) -> SettlementResult:
+                             state, family: WorkflowFamily, *, writer=None) -> SettlementResult:
         from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
         if (not isinstance(admission, ContinuationAdmission) or request.run_id != admission.attempt.run_id
                 or admission.attempt.binding.authority.family is not family):
@@ -6301,29 +6425,15 @@ class SQLiteControlStore:
         key = admission.attempt.binding.fence.key
         receipt_key = self._continuation_receipt_key(request.run_id, family)
         with self.transaction() as db, self.mutation_savepoint(db):
-            row = db.execute(
-                "SELECT d.payload_json,r.owner_id,r.dispatch_id,r.continuations_json,r.workflow_binding_json FROM dedupe_keys d JOIN runs r ON r.run_id=? "
-                "JOIN budget_reservations b USING(run_id) WHERE d.namespace='continuation-admission' "
-                "AND d.scope=? AND d.key=? AND b.workload_repository=?",
-                (str(request.run_id), key.repository, receipt_key, key.repository),
-            ).fetchone()
-            if row is None:
-                raise WorkflowAuthorityError("continuation return lacks its immutable run admission")
-            captured = decode_workflow(row["payload_json"], tuple)
-            if (len(captured) != 2 or captured[1] != admission
-                    or not isinstance(captured[0], (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase))
-                    or captured[0].capture.binding != admission.attempt.binding
-                    or captured[0].capture.leg_id != admission.attempt.leg_id
-                    or captured[0].capture.revision.version + 1 != admission.admission_version
-                    or deployment_role(key.repository, row["owner_id"]) != ("steward" if family is WorkflowFamily.STEWARD else "fix")):
-                raise WorkflowAuthorityError("continuation return conflicts with its exact admission")
-            if captured[0] not in decode_workflow(row["continuations_json"], tuple):
-                raise WorkflowAuthorityError("continuation return was never selected on its actual run")
-            if row["workflow_binding_json"] is not None:
-                principal = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
-                if (principal.fence.key == key and principal.fence != admission.attempt.binding.fence
-                        or principal.authority.family is family and principal != admission.attempt.binding):
-                    raise WorkflowAuthorityError("continuation return conflicts with its actual run binding")
+            purchase, run = self._continuation_return_admission(db, admission, family)
+            if isinstance(purchase, cc.PRRepairPurchase) and purchase.branch:
+                self._require_repair_writer(db, writer, admission, run["owner_id"])
+                if state.branch != purchase.branch:
+                    raise WorkflowAuthorityError("repair return changed its purchased branch")
+                raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?",
+                    (key.repository, receipt_key)).fetchone()
+                if raw is None or decode_workflow(raw[0], cc.PRRepairResult) != cc.PRRepairResult(admission, state, request):
+                    raise WorkflowAuthorityError("repair settlement conflicts with its captured result")
             prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
                                (key.repository, receipt_key)).fetchone()
             encoded = encode_workflow((admission, state))
@@ -6348,7 +6458,7 @@ class SQLiteControlStore:
                 elif isinstance(selection, cc.SelectedPRRepair):
                     if not isinstance(aggregate, ReviewWorkflowSnapshot):
                         raise WorkflowAuthorityError("repair return lost its PR aggregate")
-                    applied = replace(state, consumed_reply_at=component.state.consumed_reply_at)
+                    applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes)
                     after = replace(aggregate, revision=revision, pr_repair=replace(component, state=applied, watermarks=watermarks))
                 else:
                     from ..domain.workflow import IssueWorkflowShell
@@ -7089,7 +7199,7 @@ class SQLiteControlStore:
     def release(self, run_id: RunId, reason: str) -> ReleaseResult:
         if not reason:
             raise ValueError("reservation release reason is required")
-        with self.transaction() as db:
+        with self.transaction() as db, self.mutation_savepoint(db):
             return self._release(db, run_id, reason)
 
     def release_unlaunched(
@@ -7099,7 +7209,7 @@ class SQLiteControlStore:
 
         if not reason:
             raise ValueError("reservation release reason is required")
-        with self.transaction() as db:
+        with self.transaction() as db, self.mutation_savepoint(db):
             recovery = db.execute(
                 "SELECT rr.policy, r.state AS run_state, "
                 "EXISTS(SELECT 1 FROM leases l WHERE l.run_id=rr.run_id) "
@@ -7214,6 +7324,26 @@ class SQLiteControlStore:
             )
             return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
+    def _finish_unlaunched_pr_repair(self, db, run_id: RunId) -> None:
+        from .workflow_rows import persist_workflow_snapshot
+        run = db.execute("SELECT continuations_json FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
+        for purchase in decode_workflow(run[0], tuple):
+            if not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch:
+                continue
+            admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
+            key = admission.attempt.binding.fence.key
+            receipt_key = self._continuation_receipt_key(run_id, WorkflowFamily.PR_REPAIR)
+            if db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?", (key.repository, receipt_key)).fetchone():
+                raise WorkflowAuthorityError("unlaunched repair contradicts a captured paid output")
+            aggregate = load_review_workflow_row(db, key)
+            selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+            if isinstance(selected, cc.SelectedPRRepair) and cc.continuation_return_is_current(selected, admission):
+                after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
+                    pr_repair=replace(selected.component, watermarks=replace(selected.component.watermarks, last_applied=admission.admission_version)))
+                persist_workflow_snapshot(db, after)
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
+                (key.repository, receipt_key, _stamp(self._now()), encode_workflow((admission, cc.PRRepairNotLaunched(admission)))))
+
     def _release(
         self,
         db: sqlite3.Connection,
@@ -7295,6 +7425,8 @@ class SQLiteControlStore:
                 "VALUES ('review-execution-release',?,?,?,?)",
                 (repository, str(run_id), now, encode_workflow(review_release)),
             )
+        if never_launched is not None:
+            self._finish_unlaunched_pr_repair(db, run_id)
         self._transition(
             db,
             "reservation",

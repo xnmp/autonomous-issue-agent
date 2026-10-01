@@ -54,7 +54,13 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
     guidance = guidance_reader(tmp_path, "Preserve regression assertions; diagnose persistent failure.")
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="continued"))
 
-    asyncio.run(_ci_dispatcher(gateway, store, runner, operator_guidance=guidance).dispatch(RunAgent(kind, 100)))
+    dispatcher = _ci_dispatcher(gateway, store, runner, operator_guidance=guidance)
+    if kind is AgentKind.FIX_CI:
+        runner.result = replace(runner.result, session_id="old-blocked-session")
+        asyncio.run(dispatcher.fix_workflow.fix_ci(100))
+        runner.tasks.clear()
+        runner.result = replace(runner.result, session_id="continued")
+    asyncio.run(dispatcher.dispatch(RunAgent(kind, 100)))
 
     task = runner.tasks[0]
     assert task.resume == "old-blocked-session"

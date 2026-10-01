@@ -88,10 +88,19 @@ ERRORED_RUN = outcome.AgentResult(is_error=True)
 
 @pytest.fixture(autouse=True)
 def controlled_publication_context(monkeypatch):
+    selected_branches = {}
+    original_ensure = _FakeWorktrees.ensure
+
+    def ensure(worktrees, issue, branch):
+        cwd = original_ensure(worktrees, issue, branch)
+        selected_branches[cwd] = branch
+        return cwd
+
+    monkeypatch.setattr(_FakeWorktrees, "ensure", ensure)
     monkeypatch.setattr(
         accounting_runtime, "_fix_publication_context",
         lambda _role, cwd: accounting_runtime._FixPublicationContext(
-            cwd, f"fix/{cwd.rsplit('-', 1)[-1]}-test", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
+            cwd, selected_branches[cwd], "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin",
         ),
     )
 
@@ -376,7 +385,12 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
             )
         install_workflow(control, snapshot)
     for item in scenario.world.prs:
-        install_workflow(control, replace(held_review(key=WorkflowKey("o/r", PullRequestRef(item.number))), gates=()))
+        from issue_agent.domain.workflow_identity import WorkflowFamily
+        from tests.adapters.test_continuation_admission import active, install_secondary
+        primary = replace(held_review(key=WorkflowKey("o/r", PullRequestRef(item.number))), gates=())
+        install_workflow(control, primary)
+        component = active(primary.revision.fence.key, WorkflowFamily.PR_REPAIR)
+        install_secondary(control, replace(primary, pr_repair=component), component)
     workflow = SQLiteWorkflowControl(
         control, WorkflowWriter("o/r", "fix", "o/r:fix"),
         resolve_ceiling=scenario.cfg.max_resolve_retries,

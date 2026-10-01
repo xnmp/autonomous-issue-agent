@@ -38,7 +38,7 @@ from issue_agent.domain.labels import Label
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 from tests.fakes.review_authority import with_review_authority, review_state
 from tests.fakes.accounted_dispatch import with_resolve_authority
-from tests.fakes.accounted_workflow import resolve_state
+from tests.fakes.accounted_workflow import resolve_state, pr_repair_state
 from tests.fakes.accounted_workflow import attach_workflow_authority
 
 
@@ -439,7 +439,7 @@ def _ci_dispatcher(
         operator_guidance=operator_guidance or (lambda pr: review_state(store).guidance.get(pr, "")),
     )
     executor = Executor(gw, remove_worktree=FakeWorktrees().remove)
-    return AgentDispatcher(
+    return with_resolve_authority(AgentDispatcher(
         cfg,
         gw,
         store,
@@ -447,7 +447,7 @@ def _ci_dispatcher(
         runner,
         executor,
         dispatch_claim_target=dispatch_claim_target,
-    )
+    ))
 
 
 def _ci_pr():
@@ -485,7 +485,7 @@ def test_fix_ci_uses_observed_claim_issue_when_live_lookup_fails():
     asyncio.run(d.dispatch(action))
 
     assert "SonarQube Code Analysis" in runner.tasks[0].prompt
-    assert store.sessions[5] == "c5"
+    assert pr_repair_state(store).session.handle == "c5"
 
 
 def test_fix_ci_defers_when_fresh_pr_linkage_disagrees_with_claim():
@@ -994,7 +994,7 @@ def test_fix_ci_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))  # completes: the bad action is isolated, not raised
 
-    assert store.get_session(5) == "c-live"              # money spent → persisted
+    assert pr_repair_state(store).session.handle == "c-live"
     assert store.get_ci_retries(5) == 1                   # the attempt DID count
     assert not any(c[0] == "relabel" for c in gw.calls)    # the ai-blocked write never landed
     assert store.get_infra_deaths(5) == 0                  # isolated at the action level, not the session level

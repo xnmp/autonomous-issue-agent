@@ -1133,7 +1133,7 @@ def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
     runtime = JournalingRuntime(inner, journal, repo="o/r", role="fix")
     gw = FakeGateway(
         issues={5: IssueView(5, title="t", body="b")},
-        prs={100: PRView(100)},
+        prs={100: PRView(100, head_ref_name="fix/5-context", closing_issue=5)},
     )
     gw.pr_issues[100] = 5
     control = SQLiteControlStore(str(tmp_path / "control.sqlite"))
@@ -1152,7 +1152,8 @@ def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
         def reset(self, issue):
             pass
 
-    d = AgentDispatcher(
+    from tests.fakes.accounted_dispatch import with_resolve_authority
+    d = with_resolve_authority(AgentDispatcher(
         cfg,
         gw,
         Store(str(tmp_path / "state")),
@@ -1160,7 +1161,7 @@ def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
         runtime,
         Executor(gw),
         journal=journal,
-    )
+    ))
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))
 
     run = [e for e in read_events(journal.path) if e["event"] == "agent_run"][0]

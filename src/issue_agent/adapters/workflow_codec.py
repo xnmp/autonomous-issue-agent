@@ -26,7 +26,7 @@ from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
 from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
-from ..domain.contracts import WorkflowAttemptIdentity, ContinuationAdmission
+from ..domain.contracts import WorkflowAttemptIdentity, ContinuationAdmission, Money, TokenUsage, UsageSource, PricingBasis, SettlementRequest
 from ..domain import continuation_components as cc
 from ..domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
 from ..domain.labels import Label
@@ -45,7 +45,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
-    IssueCompletionGuard,
+    IssueCompletionGuard, Money, TokenUsage, SettlementRequest, cc.RepairModel, cc.PRRepairResult, cc.PRRepairNotLaunched, cc.RepairHandoff,
     ContinuationImportPlan, ContinuationImportTarget,
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState,
@@ -141,6 +141,7 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
+    UsageSource, PricingBasis,
     LifecycleOperation,
     cc.RepairAllowance, cc.StewardLane, cc.StewardFailureKind,
     migration.ReviewImportBlockerKind,
@@ -169,7 +170,7 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
-_LEGACY_FIELDS = {
+_LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "StewardState": {"groom_content": {"type": "GroomContent", "fields": {"attempted": "", "successful": ""}}},
     "StewardAttemptSource": {"content_signature": ""},
     "StewardPurchase": {"content_signature": ""},
@@ -182,6 +183,8 @@ _LEGACY_FIELDS = {
     "ReviewFamilyEpisodes": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
+    "PRRepairState": {"resumes": 0, "actual_model": None},
+    "PRRepairPurchase": {"branch": "", "handoff": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
     "ResolveAttemptResult": {"split": None},
@@ -224,7 +227,10 @@ def _encode(value: object, depth: int = 0) -> object:
                 for field in fields(value)
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
-                if (not (type(value) is cc.StewardLaneState and (
+                if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None))
+                    and not (type(value) is cc.PRRepairPurchase and (field.name == "branch" and not value.branch
+                        or field.name == "handoff" and value.handoff is None))
+                    and not (type(value) is cc.StewardLaneState and (
                         field.name == "delivery_source" and value.delivery_source is None
                         or field.name == "attempted_at" and not value.attempted_at))
                     and not (type(value) in {cc.StewardAttemptSource, cc.StewardPurchase}
@@ -325,10 +331,10 @@ def _decode(value: object, depth: int = 0) -> object:
     payload = value.get("fields")
     if set(value) != {"type", "fields"} or not isinstance(payload, dict):
         raise WorkflowEncodingError("malformed workflow fields")
-    legacy = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
-    if tag == "StewardLaneState" and set(payload) <= {field.name for field in fields(constructor)} and {
-        "baseline_at", "stalls", "infra_failures", "pending_delivery"
-    } <= set(payload):
+    legacy: dict[str, object] = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
+    required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}
+                if tag == "StewardLaneState" else {field.name for field in fields(constructor)} - legacy.keys())
+    if tag in {"StewardLaneState", "PRRepairState", "PRRepairPurchase"} and required <= set(payload) <= {field.name for field in fields(constructor)}:
         payload = {**legacy, **payload}
     if legacy and set(payload) == {field.name for field in fields(constructor)} - legacy.keys():
         payload = {**legacy, **payload}

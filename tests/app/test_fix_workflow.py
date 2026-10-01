@@ -43,6 +43,7 @@ from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 from tests.fakes.accounted_workflow import (
     AccountedFixtureWorkflow, attach_workflow_authority,
+    pr_repair_state,
     seed_resolve as _seed_resolve, resolve_state as _resolve_snapshot,
 )
 
@@ -70,7 +71,7 @@ class RetryRecordingStore(FakeStore):
         return self.rebase_retries.get(issue, 0)
 
 
-def _workflow(gw, store, runner, wt=None, **cfg_overrides):
+def _workflow(gw, store, runner, wt=None, *, pr_repair_authority=True, **cfg_overrides):
     cfg_kwargs = dict(
         base_branch="dev",
         # Pinned model: these tests predate difficulty routing and assert leg
@@ -94,7 +95,7 @@ def _workflow(gw, store, runner, wt=None, **cfg_overrides):
         clear_issue_state=getattr(store, "cleanup_pr", None),
     )
     attach_workflow_authority(
-        gw, store, max_contract_rounds=cfg.max_contract_rounds
+        gw, store, max_contract_rounds=cfg.max_contract_rounds, pr_repair=pr_repair_authority
     )
     return AccountedFixtureWorkflow(cfg, gw, store, worktrees, runner, executor, workflow_control=store._workflow_authority)
 
@@ -185,7 +186,7 @@ def test_fix_ci_records_retry_and_writes_no_label_on_push():
 
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
-    assert store.sessions[5] == "c5"
+    assert pr_repair_state(store).session.handle == "c5"
     assert "unit" in runner.tasks[0].prompt
     # review M22/D9: a pushed leg makes NO label write. The clear-ai-working
     # relabel this used to assert removed a label nothing ever added — a `gh pr
@@ -2102,15 +2103,23 @@ def test_fix_ci_inherits_the_resolves_routed_model():
     """The resolve routed to a tiered model; the repair leg resuming that
     session must run the SAME reasoner, not the configured default (#21)."""
     store = FakeStore()
-    store.models[5] = "gpt-routed"
-    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="c5"))
-
-    asyncio.run(_workflow(
-        _failing_ci_pr(), store, runner,
+    gateway = _failing_ci_pr()
+    gateway.issues[5] = IssueView(5, title="token", body="issue")
+    gateway._pr_for_issue[5] = 100
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="resolved"))
+    workflow = _workflow(
+        gateway, store, runner,
         fix=FixTaskConfig("o/r", agent_md="AM"),  # unpinned — routing owns model
-    ).fix_ci(100))
+    )
+    workflow.cfg = dataclasses.replace(workflow.cfg, fix=dataclasses.replace(workflow.cfg.fix, model="gpt-routed"))
+    asyncio.run(workflow.resolve(5))
+    workflow.cfg = dataclasses.replace(workflow.cfg, fix=dataclasses.replace(workflow.cfg.fix, model=None))
+    runner.tasks.clear()
+    runner.result = dataclasses.replace(runner.result, session_id="c5")
+    asyncio.run(workflow.fix_ci(100))
 
     assert runner.tasks[0].model == "gpt-routed"
+    assert runner.tasks[0].resume == "resolved"
 
 
 def test_fix_ci_pinned_model_beats_the_stored_marker():
@@ -2670,14 +2679,17 @@ def test_selected_runtime_enum_is_normalized_in_durable_session_provenance():
     assert session.model == "m"
 
 
-def test_pr_only_repair_does_not_require_a_selected_resolve_authority_row():
+@pytest.mark.parametrize("resolve_activated", [True, False])
+def test_pr_only_repair_does_not_require_a_selected_resolve_authority_row(resolve_activated):
     gateway = FakeGateway(prs={100: _ci_pr_at("a" * 40, "unit")})
     store = FakeStore()
     runner = _pushed_runner()
     workflow = _workflow(gateway, store, runner)
     with store._workflow_db.transaction() as db:
-        db.execute("DELETE FROM workflow_components")
-        db.execute("DELETE FROM workflows")
+        db.execute("DELETE FROM workflow_components WHERE target_kind='issue'")
+        db.execute("DELETE FROM workflows WHERE target_kind='issue'")
+        if not resolve_activated:
+            db.execute("DELETE FROM workflow_authority_epochs WHERE family='resolve'")
     asyncio.run(workflow.fix_ci(100))
     assert len(runner.tasks) == 1
 

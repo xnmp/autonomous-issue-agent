@@ -33,6 +33,8 @@ def digest(value: object) -> str:
 def _plan_state_identity(state: ImportedState | None) -> object:
     if isinstance(state, cc.StewardState) and state.groom_content != cc.GroomContent():
         return (repr(state), repr(state.groom_content))
+    if isinstance(state, cc.PRRepairState) and (state.resumes or state.actual_model is not None):
+        return (repr(state), state.resumes, repr(state.actual_model))
     return repr(state)
 
 

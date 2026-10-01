@@ -4,8 +4,9 @@ from typing import Protocol, runtime_checkable
 from contextlib import AbstractContextManager
 
 from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
-from .continuation_components import StewardSelection, StewardAttemptSource, StewardReturned
+from .continuation_components import PRRepairSelection, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
 from .world import IssueView
+from .agent_task import RuntimeName
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
 from .resolve_split import ContractResetCompleted, ResetIntent, ReauthorResetIntent, ContractRevision
 from .resolve_workspace import ObservedResolveBase, ResolveWorkspaceObserved, EpisodeWorkspacePrepared
@@ -21,7 +22,7 @@ from .workflow_retry import RetryAbsenceRead
 from .review_rearm import PendingReviewRecovery, ReleaseProjection, ReviewControlRead
 from .review_workflow import ReviewWorkflowRead
 from .workflow_identity import (
-    FamilyAuthority, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
+    FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowKey, WorkflowRevision, WorkflowWriter,
 )
 
 
@@ -44,6 +45,14 @@ class WorkflowControl(Protocol):
     def writer(self) -> WorkflowWriter: ...
 
     def load_workflow(self, key: WorkflowKey) -> WorkflowRead: ...
+
+    def read_pr_repair(self, key: WorkflowKey) -> PRRepairSelection: ...
+
+    def reconcile_pr_repair_returns(self) -> int: ...
+
+    def pr_repair_handoff(self, issue: int, pr: PullRequestRef, branch: str, runtime: RuntimeName) -> RepairHandoff | None: ...
+
+    def cleanup_pr_repair(self, key: WorkflowKey, merged: bool) -> None: ...
 
     def consume_blank_issue_reply(self, binding: WorkflowBinding, reply_at: str, body: str) -> bool: ...
 

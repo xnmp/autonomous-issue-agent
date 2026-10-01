@@ -168,6 +168,26 @@ class PricingBasis(str, Enum):
 
 
 @dataclass(frozen=True)
+class SettlementRequest:
+    run_id: RunId
+    amount: Money
+    basis: PricingBasis
+    provider_receipt_id: str
+    usage: TokenUsage | None
+    rate_card_id: str | None
+    rate_card_version: str | None
+
+    def __post_init__(self) -> None:
+        if not str(self.run_id) or not self.provider_receipt_id:
+            raise ValueError("run and provider receipt identities are required")
+        if (
+            self.basis is PricingBasis.CONFIGURED_RATE_CARD
+            and (not self.rate_card_id or not self.rate_card_version)
+        ):
+            raise ValueError("configured charges require rate-card provenance")
+
+
+@dataclass(frozen=True)
 class PriceQuote:
     model: str
     rate_card_id: str

@@ -360,7 +360,7 @@ class FixWorkflow:
         control = self.workflow_control
         if control is None:
             return 0
-        completed = 0
+        completed = control.reconcile_pr_repair_returns()
         for pending in control.pending_returns(limit=32):
             if isinstance(pending, UnavailableResolveReturn):
                 self.cfg.log(f"resolve result {pending.record_key}: authority unavailable; next audit {pending.next_read_at.isoformat()}: {pending.reason}")
@@ -444,7 +444,7 @@ class FixWorkflow:
                 issue, target, number, pr, blocker, blocked_head
             ))
 
-    def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None) -> str:
+    def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None, *, remember: bool = True) -> str:
         from ...domain.workflow import CompletedRearm
 
         if state is not None and isinstance(state.intent, CompletedRearm):
@@ -455,7 +455,7 @@ class FixWorkflow:
             cwd = self.worktrees.episode_workspace_path(state.intent.workspace)
         else:
             cwd = self.worktrees.ensure(issue, branch)
-        if state is None:
+        if state is None and remember:
             self.store.save_branch(issue, branch)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
@@ -789,7 +789,7 @@ class FixWorkflow:
         )
 
     def _repair_fix_cfg(
-        self, issue: int, leg: str, *, iss=None, review_rounds: int = 0
+        self, issue: int, leg: str, *, iss=None, review_rounds: int = 0, inherited_model: str | None = None
     ) -> FixTaskConfig | None:
         """Effort-escalated config for a leg that resumes an existing session
         (address-review / fix-CI / rebase / resume). Its model stays attached to
@@ -805,7 +805,7 @@ class FixWorkflow:
         # live transcript. A pinned FIX_MODEL still wins; no stored marker
         # (pre-#21 sessions, unrouted resolves) keeps today's fallback.
         if not cfg.model:
-            inherited = self.store.get_model(issue)
+            inherited = self.store.get_model(issue) if inherited_model is None else inherited_model
             if inherited:
                 cfg = dataclasses.replace(cfg, model=None if inherited == "<runtime-default>" else inherited)
         # Behind the kill switch: with escalation off nothing reads the labels,
@@ -1870,19 +1870,32 @@ class FixWorkflow:
         p, issue = dispatch
         if issue is None:
             return
+        control = self.workflow_control
+        selected = control.read_pr_repair(WorkflowKey(control.writer.repository, PullRequestRef(pr))) if control is not None else None
+        if not isinstance(selected, cc.SelectedPRRepair):
+            self.cfg.log(f"fix-ci #{pr}: PR repair continuity is inactive or blocked")
+            return
         # Read before any repair side effect: an unavailable active-review read
         # raises a workflow hold and defers the whole repair (ADR 0015).
+        control.reconcile_pr_repair_returns()
+        selected = control.read_pr_repair(selected.binding.fence.key)
+        if not isinstance(selected, cc.SelectedPRRepair):
+            return
+        runtime = RuntimeName(self._resolve_runtime_name())
+        handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
+                   if selected.component.state.actual_model is None and selected.component.state.session is None else None)
+        repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff)
         guidance = self._pr_guidance(p.number)
-        cwd = self._ensure_cwd(issue, p.head_ref_name)
-        attempt = make_attempt(
-            p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"]
-        )
-        task = self._ci_task(p, issue, cwd)
+        cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
+        attempt = make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"])
+        task = dataclasses.replace(self._ci_task(p, issue, cwd,
+            session_id=repair.session.handle if repair.session is not None else "",
+            fix_cfg=self._repair_fix_cfg(issue, "fix-ci", inherited_model=repair.model)), pr_repair_input=repair)
+        self.runner.set_context("fix", "FIX_CI", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged("fix-ci", issue, task, p, kind="FIX_CI", guidance=guidance)
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
-        self.store.save_session(issue, result.session_id)
         # An externally-killed session made no attempt, so it must not march the
         # CI breaker toward needs-human-review (FAILURE-MODES #58: six SIGKILLs on
         # one PR burned the whole budget on work that never ran). Neither did a

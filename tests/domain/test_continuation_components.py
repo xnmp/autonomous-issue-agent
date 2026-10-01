@@ -238,3 +238,24 @@ def test_selected_issue_reply_refuses_unknown_or_unowned_inputs(reply_at, body, 
     selected = select_issue_recovery(with_issue_recovery(resolve_snapshot()))
     with pytest.raises(ValueError):
         IssueReplyInput(selected, reply_at, body, branch)
+
+
+@pytest.mark.parametrize("branch,runtime", [(None, RuntimeName.CLAUDE), ("", RuntimeName.CLAUDE),
+    ("x" * 65537, RuntimeName.CLAUDE), ("fix/7-ci", None), ("fix/7-ci", "claude")])
+def test_repair_launch_refuses_missing_huge_or_untyped_inputs(branch, runtime):
+    from issue_agent.domain import continuation_components as cc
+    base = gated()
+    assert isinstance(base, ReviewWorkflowSnapshot)
+    component = cc.ActivePRRepair(identity(base.revision.fence.key, WorkflowFamily.PR_REPAIR), cc.PRRepairState())
+    selected = cc.select_pr_repair(replace(base, pr_repair=component))
+    with pytest.raises(ValueError):
+        cc.PRRepairInput(selected, branch, runtime)
+
+
+def test_repair_retirement_preserves_requeue_debt_but_retires_merged_state():
+    from issue_agent.domain import continuation_components as cc
+    state = cc.PRRepairState(branch="fix/7-ci", resumes=4, ci_failures=3, infra_failures=2)
+    requeued = cc.retire_pr_repair_continuity(state, False)
+    assert (requeued.resumes, requeued.ci_failures, requeued.infra_failures, requeued.branch) == (4, 3, 2, "fix/7-ci")
+    merged = cc.retire_pr_repair_continuity(state, True)
+    assert (merged.resumes, merged.ci_failures, merged.infra_failures, merged.branch) == (0, 0, 0, "")

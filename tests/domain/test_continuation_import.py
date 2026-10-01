@@ -105,3 +105,11 @@ def test_nonempty_groom_content_remains_part_of_import_plan_identity():
     plan = ContinuationImportPlan("o/r", (WorkflowFamily.STEWARD,), 1, "a" * 64, "c" * 64, "d" * 64, (target,))
     other = replace(target, state=replace(state, groom_content=cc.GroomContent("c" * 64, "c" * 64)))
     assert plan.plan_digest != replace(plan, targets=(other,)).plan_digest
+
+
+@pytest.mark.parametrize("value", ["claude:handle", "codex:handle", "handle", "unknown:handle", "x" * 65536],
+                         ids=["claude", "codex", "untagged", "unknown-runtime", "bounded-large"])
+def test_pr_repair_ambiguous_legacy_session_is_blocked_without_new_continuity(value):
+    result = classify_record(record(WorkflowFamily.PR_REPAIR, session=value))
+    assert isinstance(result, tuple) and result
+    assert all(isinstance(item, cc.ContinuationImportBlocker) and item.source and item.reason for item in result)

@@ -73,7 +73,7 @@ from .workflow_commit import (
     replay_or_conflict, retire_rearm_obligation, transition_receipt, update_rearm_state,
 )
 from .workflow_rows import (
-    load_issue_aggregate,
+    load_issue_aggregate, load_review_workflow_row, load_family_authority,
     WORKSPACE_ACK_NAMESPACE, WorkflowAuthorityError, WorkflowRevisionConflict, load_resolve_workflow_row,
     load_resolve_authority, load_workspace_ack, persist_workflow_snapshot, workflow_scope, insert_workflow_component,
 )
@@ -101,6 +101,68 @@ class SQLiteWorkflowControl:
     def _scope(self, key: WorkflowKey) -> None:
         if not isinstance(key, WorkflowKey) or key.repository != self.writer.repository or not isinstance(key.target, IssueRef):
             raise WorkflowAuthorityError("workflow is outside the bound resolve writer scope")
+
+    def reconcile_pr_repair_returns(self) -> int:
+        return self._control.reconcile_pr_repair_returns(self.writer)
+
+    def pr_repair_handoff(self, issue: int, pr, branch: str, runtime) -> cc.RepairHandoff | None:
+        with self._control.transaction() as db:
+            return self._pr_repair_handoff(db, issue, pr, branch, runtime)
+
+    def _pr_repair_handoff(self, db, issue: int, pr, branch: str, runtime) -> cc.RepairHandoff | None:
+        self._pr_repair_scope(WorkflowKey(self.writer.repository, pr))
+        key = WorkflowKey(self.writer.repository, IssueRef(issue))
+        self._control._assert_owner_active(db, self.writer.owner_id)
+        if load_family_authority(db, WorkflowFamily.RESOLVE, key.repository) is None:
+            return None
+        state = load_resolve_workflow_row(db, key)
+        if state is None:
+            return None
+        session = state.episode.continuation.session
+        if session is None or session.runtime != runtime.value:
+            return None
+        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='workflow-return' AND scope=? AND key=?",
+            (key.repository, str(session.source.run_id))).fetchone()
+        if raw is None:
+            raise WorkflowAuthorityError("repair handoff lacks its exact returned resolve receipt")
+        returned = decode_workflow(raw[0], ReturnedResolve)
+        self._return_prior(db, returned)
+        done = self._return_disposition(db, returned)
+        run = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(session.source.run_id),)).fetchone()
+        dispatch = json.loads(run[0]) if run is not None else {}
+        if (returned.attempt != session.source or returned.session != session or session.source.binding != state.binding
+                or not isinstance(done, FinalizedResolveReturn) or not isinstance(done.linkage, LinkedPrPresent)
+                or done.linkage.pr != pr.number or dispatch.get('publication_branch') != branch
+                or dispatch.get('issue') != issue):
+            raise WorkflowAuthorityError("repair handoff has unsupported source, branch or classification")
+        if not isinstance(state.issue_recovery, cc.ActiveIssueRecovery):
+            raise WorkflowAuthorityError("repair handoff has unknown issue resume/fork history")
+        return cc.RepairHandoff(session.source, session.session_id, runtime, session.model, branch, pr, state.issue_recovery.state.resumes)
+    def cleanup_pr_repair(self, key: WorkflowKey, merged: bool) -> None:
+        self._pr_repair_scope(key)
+        with self._control.transaction() as db, self._control.mutation_savepoint(db):
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            state = load_review_workflow_row(db, key)
+            if state is None or not isinstance(state.pr_repair, cc.ActivePRRepair):
+                return
+            component = state.pr_repair
+            if (component.watermarks.last_admitted > component.watermarks.last_applied
+                    and component.watermarks.last_admitted_fence == state.revision.fence):
+                raise WorkflowAuthorityError("repair cleanup requires its selected paid output settled")
+            continuity = cc.retire_pr_repair_continuity(component.state, merged)
+            if continuity != component.state:
+                after = replace(state, revision=WorkflowRevision(state.revision.fence, state.revision.version + 1),
+                    pr_repair=replace(component, state=continuity))
+                persist_workflow_snapshot(db, after)
+
+    def _pr_repair_scope(self, key: WorkflowKey) -> None:
+        from ..domain.workflow_identity import PullRequestRef
+        if not isinstance(key, WorkflowKey) or key.repository != self.writer.repository or not isinstance(key.target, PullRequestRef):
+            raise WorkflowAuthorityError("PR repair is outside the bound writer scope")
+
+    def read_pr_repair(self, key: WorkflowKey) -> cc.PRRepairSelection:
+        self._pr_repair_scope(key)
+        return self._control.read_pr_repair(key)
 
     def load_workflow(self, key: WorkflowKey) -> WorkflowRead:
         self._scope(key)

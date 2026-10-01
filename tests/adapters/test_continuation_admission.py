@@ -35,7 +35,7 @@ def active(key, family):
 def install_secondary(store, aggregate, component):
     key = aggregate.revision.fence.key
     with store.transaction() as db:
-        db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
+        db.execute("INSERT OR IGNORE INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
                    (key.repository, component.identity.authority.family.value, 1, "test-source", "test-plan", NOW.isoformat()))
         insert_workflow_component(db, key, component.identity.authority, component.identity.episode_id)
         db.execute("UPDATE workflows SET episode_json=? WHERE repository=? AND target_kind=? AND target_number=?",

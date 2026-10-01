@@ -84,7 +84,7 @@ from ..domain.ci import parse_timestamp
 from ..domain.workflow import (
     ObservedIssue, WorkflowAbsent, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
 )
-from ..domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
+from ..domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey, WorkflowWriter
 from ..domain.workflow_ports import WorkflowControl
 from ..domain.lifecycle import pr_lifecycle, retry_breaker
 from ..domain import review as review_dom
@@ -2653,13 +2653,23 @@ def compose_fix_daemon(
         alert_cmd=cfg.alert_cmd,
         log=log,
     )
+    workflow_control = SQLiteWorkflowControl(
+        control, WorkflowWriter(cfg.repo, "fix", owner_id),
+        resolve_ceiling=cfg.max_resolve_retries,
+        max_contract_rounds=fix_runtime.max_contract_rounds,
+    )
+    def cleanup_fix_state(pr, issue, merged):
+        if pr is not None:
+            workflow_control.cleanup_pr_repair(WorkflowKey(cfg.repo, PullRequestRef(pr)), merged)
+        store.cleanup_pr(pr, issue, merged)
+
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=log,
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
         mark_ci_cancel=store.set_ci_cancel_head,
         mark_branch_update=store.set_update_branch_head,
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
-        clear_issue_state=store.cleanup_pr,
+        clear_issue_state=cleanup_fix_state,
         reset_ci_retries=store.reset_ci_episode,
         retire_machine_block=store.complete_machine_self_clear,
         retire_budget_block=store.complete_budget_self_clear,
@@ -2692,11 +2702,6 @@ def compose_fix_daemon(
         repository=cfg.repo,
         role="fix",
         owner_id=owner_id,
-    )
-    workflow_control = SQLiteWorkflowControl(
-        control, WorkflowWriter(cfg.repo, "fix", owner_id),
-        resolve_ceiling=cfg.max_resolve_retries,
-        max_contract_rounds=fix_runtime.max_contract_rounds,
     )
     dispatcher = AgentDispatcher(
         dcfg, gateway, store, worktrees, fix_runner, executor,

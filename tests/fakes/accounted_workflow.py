@@ -54,7 +54,7 @@ class AccountedFixtureWorkflow(FixWorkflow):
         inner = original.inner if isinstance(original, JournalingRuntime) else original
         maximum = self.cfg.fix.max_budget_usd
         limits = {("fix", stage): Money.from_major("USD", maximum) for stage in (
-            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE",
+            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "FIX_CI",
         )}
         limits[("fix", "ROUTE")] = Money.from_major("USD", self.cfg.fix.router_budget_usd)
         accounted = AccountingRuntime(
@@ -130,6 +130,11 @@ class AccountedFixtureWorkflow(FixWorkflow):
             if isinstance(original, JournalingRuntime):
                 original.inner = inner
 
+    async def fix_ci(self, pr, *, issue_hint=None):
+        issue = issue_hint or self.gateway.issue_for_pr(pr)
+        with self._accounted(issue, "FIX_CI", None):
+            await super().fix_ci(pr, issue_hint=issue_hint)
+
     async def resolve(self, issue, *, binding=None):
         binding = binding or resolve_state(self.store, issue).binding
         with self._accounted(issue, "RESOLVE", binding):
@@ -142,8 +147,34 @@ class AccountedFixtureWorkflow(FixWorkflow):
 
 
 
+def install_pr_repair_authority(gateway, store):
+    from issue_agent.domain.continuation_components import InactivePRRepair
+    from issue_agent.domain.workflow_identity import PullRequestRef, WorkflowFamily, WorkflowKey
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row, workflow_scope
+    from tests.fakes.review_workflow import held
+    from tests.adapters.test_continuation_admission import active, install_secondary
+    for number in gateway.prs:
+        key = WorkflowKey("o/r", PullRequestRef(number))
+        with store._workflow_db.transaction() as db:
+            exists = db.execute("SELECT 1 FROM workflows WHERE repository=? AND target_kind=? AND target_number=?",
+                                workflow_scope(key)).fetchone()
+            primary = load_review_workflow_row(db, key) if exists is not None else None
+        if primary is None:
+            primary = dataclasses.replace(held(key=key), gates=())
+            install_workflow(store._workflow_db, primary)
+        elif not isinstance(primary.pr_repair, InactivePRRepair):
+            continue
+        component = active(key, WorkflowFamily.PR_REPAIR)
+        install_secondary(store._workflow_db, dataclasses.replace(primary, pr_repair=component), component)
+
+
+def pr_repair_state(store, pr=100):
+    from issue_agent.domain.workflow_identity import PullRequestRef
+    return store._workflow_authority.read_pr_repair(WorkflowKey("o/r", PullRequestRef(pr))).component.state
+
+
 def attach_workflow_authority(
-    gw, store, *, resolve_ceiling=20, max_contract_rounds=2
+    gw, store, *, resolve_ceiling=20, max_contract_rounds=2, pr_repair=False
 ):
     # Every gateway instance models a fresh authoritative observation. Some
     # tests deliberately reuse one control store across several instances, so
@@ -171,4 +202,6 @@ def attach_workflow_authority(
             resolve_ceiling=resolve_ceiling,
             max_contract_rounds=max_contract_rounds,
         ))
+    if pr_repair:
+        install_pr_repair_authority(gw, store)
     return store._workflow_authority

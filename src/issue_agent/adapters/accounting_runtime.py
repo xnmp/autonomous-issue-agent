@@ -384,6 +384,18 @@ class AccountingRuntime(AgentRuntime):
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
             continuations = ((cc.IssueReplyPurchase(capture, selected.reply_at) if isinstance(selected, cc.LinkedPRIssueReplyInput)
                               else cc.IssueRecoveryPurchase(capture, selected.reply_at, selected.branch, 2**63 - 1)),)
+        if task.pr_repair_input is not None:
+            selected = task.pr_repair_input
+            if (self.role != "fix" or kind != "FIX_CI" or workflow != selected.selection.binding
+                    or number != selected.selection.binding.fence.key.target.number or issue is None
+                    or selected.runtime.value != self.runtime_name or continuations):
+                return _return_refused("selected repair input requires its exact PR, runtime and family context")
+            session = selected.session
+            if (task.resume or "") != (session.handle if session is not None else ""):
+                return _return_refused("repair launch handle differs from selected continuity")
+            capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
+            continuations = (cc.PRRepairPurchase(capture, allowance=cc.RepairAllowance.CI, ceiling=2**63-1,
+                                                 branch=selected.branch, handoff=selected.handoff),)
         publication = _fix_publication_context(self.role, task.cwd)
         if (
             self.role == "fix"
@@ -400,6 +412,8 @@ class AccountingRuntime(AgentRuntime):
                 ),
                 exit_reason=ExitReason.AGENT_ERROR,
             )
+        if task.pr_repair_input is not None and publication.branch != task.pr_repair_input.branch:
+            return _return_refused("repair checkout differs from the current remote branch")
         dispatch_id = json.dumps(
             {
                 "repository": self.repository,
@@ -655,12 +669,15 @@ class AccountingRuntime(AgentRuntime):
         return self._settle_result(
             run_id, task.model or result.model or reserved_model, result,
             returned=returned, returned_review=review_return,
+            repair_input=task.pr_repair_input, attempt=result.workflow_attempt,
         )
 
     def _settle_result(
         self, run_id: RunId, model: str | None, result: AgentResult, *,
         returned: ReturnedResolve | None = None,
         returned_review: ReturnedReviewChild | None = None,
+        repair_input: cc.PRRepairInput | None = None,
+        attempt: WorkflowAttemptIdentity | None = None,
     ) -> AgentResult:
         if returned_review is not None:
             stopped = self.store.settle_review_preflight_stop(returned_review)
@@ -831,7 +848,18 @@ class AccountingRuntime(AgentRuntime):
         except (ValueError, TypeError, OverflowError):
             retain_invalid_accounting()
             raise
-        if returned_review is not None:
+        if repair_input is not None:
+            assert attempt is not None
+            admission = self.store.pr_repair_admission(attempt)
+            runtime = RuntimeName(self.runtime_name)
+            actual_model = cc.RepairModel(admission, runtime, result.model or model or "<runtime-default>")
+            session = (cc.RepairSession(admission, result.session_id, runtime, actual_model.model)
+                       if result.session_id and not (infra_class_failure(result) or budget_exhausted(result.exit_reason)) else None)
+            state = replace(repair_input.selection.component.state, branch=repair_input.branch,
+                            session=session, actual_model=actual_model)
+            writer = WorkflowWriter(self.repository, self.role, self.owner_id or f"{self.repository}:{self.role}")
+            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request), writer)
+        elif returned_review is not None:
             settlement = self.store.settle_review_return(request, returned_review)
         elif returned is None:
             settlement = self.store.settle(request)
