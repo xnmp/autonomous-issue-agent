@@ -1072,6 +1072,31 @@ def test_a_raise_path_death_is_counted_once_not_twice(tmp_path):
 # loop. Driven through the REAL `build_steward_daemon` closure, not a
 # re-implementation of its gate: a test that restates the implementation cannot
 # fail when the implementation is deleted.
+def _charge_steward_infra(store, number, *, reclaim=False):
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from issue_agent.domain.contracts import WorkflowAttemptIdentity
+    from tests.adapters.test_continuation_admission import money
+    from tests.adapters.test_workflow_admission import request
+    control = store._steward_control
+    selected = control.read_steward(WorkflowKey("o/r", IssueRef(number)))
+    leg = f"triage:{number}:{selected.revision.version}"
+    purchase = cc.StewardPurchase(cc.ContinuationCapture(selected.binding, selected.revision, leg),
+        cc.StewardLane.TRIAGE, _triaged(number).issues[0].updated_at, 3, infra_ceiling=5)
+    paid = replace(request(leg), workflow=selected.binding, owner_id=store._steward_owner, kind="TRIAGE",
+        dispatch_id=json.dumps({"repository":"o/r", "role":"steward", "issue":number, "number":number,
+                               "kind":"TRIAGE", "leg_id":leg}))
+    assert control.reserve_steward(paid, purchase).admitted
+    if reclaim:
+        control.register_process_lease(paid.run_id, expected_owner_id=store._steward_owner,
+            pid=123, pgid=123, process_start_ticks=99)
+        assert control.reclaim_dead_leases(store._steward_owner, lambda pid, start: False) == (paid.run_id,)
+    else:
+        assert control.settle(money(paid.run_id)).disposition is AccountingDisposition.AVAILABLE
+        source = control.steward_admission(WorkflowAttemptIdentity(selected.binding, paid.run_id, leg))
+        assert control.record_steward_outcome(cc.StewardFailed(source, cc.StewardFailureKind.INFRASTRUCTURE))
+
+
 def _steward_decide(
     tmp_path, monkeypatch, *, process_deaths: tuple[int, ...] = (), **cfg_kw
 ):
@@ -1088,23 +1113,19 @@ def _steward_decide(
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
     from tests.fakes.accounted_steward import install_steward
+    from tests.adapters.test_steward_delivery import bind_events
+    bind_events(control)
     install_steward(control, (30, 31))
     object.__setattr__(store, "_steward_control", control)
     cfg = HarnessConfig(repo="o/r", target_dir=str(tmp_path), **cfg_kw)
     owner_id = roles._owner_identity(cfg, "steward")
-    for index, target in enumerate(process_deaths):
-        run_id = RunId(f"dead-{index}")
-        control.start_run(
-            run_id,
-            json.dumps({"breaker_key": target}),
-            "TRIAGE",
-            owner_id,
-            "test",
-        )
-        control.complete_run(run_id, state="abandoned", outcome="dead_lease")
+    object.__setattr__(store, "_steward_owner", owner_id)
+    for target in process_deaths:
+        _charge_steward_infra(store, target, reclaim=True)
     monkeypatch.setattr(roles, "_control_store", lambda *_args: control)
     gw = FakeGateway()
     gw.build_triage_world = lambda: WorldState()   # observe is never called here
+    gw.build_steward_world = lambda: WorldState()
     daemon = roles.build_steward_daemon(cfg, gw, store, FakeRunner(AgentResult(is_error=False)))
 
     def decide(world):
@@ -1145,7 +1166,7 @@ def test_the_steward_stops_dispatching_for_an_issue_whose_sessions_keep_dying(
 
     for _ in range(5):
         assert decide(world) == [RunAgent(AgentKind.TRIAGE, 30)]  # anti-vacuity
-        store.bump_infra_deaths(30)
+        _charge_steward_infra(store, 30)
 
     assert decide(world) == [], "5 dead sessions must stop the paid loop"
 
@@ -1165,6 +1186,66 @@ def test_the_steward_still_triages_a_healthy_issue(tmp_path, monkeypatch):
     assert decide(_triaged()) == [], "unchanged since last triage — not the ceiling"
 
 
+def test_jira_legacy_death_gate_preserves_its_own_history(tmp_path, monkeypatch):
+    from issue_agent.app import roles
+    from issue_agent.adapters.runtime_plan import McpServer
+    from issue_agent.domain.contracts import RunId
+    monkeypatch.setattr(roles, "mcp_servers_from_file", lambda *args, **kwargs:
+        (McpServer(name="atlassian", config={"type": "http"}, tools="mcp__atlassian__*"),))
+    decide, store = _steward_decide(tmp_path, monkeypatch, steward_triage=False,
+        jira_sync=True, jira_project_key="ABC", max_infra_deaths=2)
+    world = replace(_triaged(), issues=(replace(_triaged().issues[0], labels=frozenset({Label.AI_READY})),))
+    assert decide(world) == [RunAgent(AgentKind.JIRA_SYNC, 30)]
+    store.bump_infra_deaths(30)
+    assert decide(world) == [RunAgent(AgentKind.JIRA_SYNC, 30)]
+    control = store._steward_control
+    control.start_run(RunId("legacy-jira-death"), json.dumps({"breaker_key": 30}),
+        "JIRA_SYNC", store._steward_owner, "fixture", state="abandoned")
+    assert decide(world) == []
+    assert control.abandoned_dispatch_counts(store._steward_owner) == {30: 1}
+
+
+def test_real_steward_policy_does_not_change_jira_deterministic_charge(tmp_path, monkeypatch):
+    from issue_agent.app import roles
+    from issue_agent.adapters.runtime_plan import McpServer
+    from tests.app.test_dispatch import RaisingRunner
+    monkeypatch.setattr(roles, "mcp_servers_from_file", lambda *args, **kwargs:
+        (McpServer(name="atlassian", config={"type": "http"}, tools="mcp__atlassian__*"),))
+    daemon = _steward_daemon(tmp_path, MAX_INFRA_DEATHS="3", JIRA_SYNC="1", JIRA_PROJECT_KEY="ABC")
+    dispatcher = _steward_dispatcher(daemon)
+    assert dispatcher.steward_workflow.cfg.infra_ceiling == 3
+    dispatcher.jira_workflow.gateway = FakeGateway(issues={30:
+        IssueView(30, title="t", body="b", labels=frozenset({Label.AI_READY}))})
+    dispatcher.jira_workflow.runner = RaisingRunner(RuntimeError("exceeded maximum buffer size"))
+    with pytest.raises(RuntimeError):
+        asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.JIRA_SYNC, 30)))
+    assert dispatcher.store.get_infra_deaths(30) == 1
+
+
+def test_modern_steward_reclaim_does_not_feed_jira_legacy_gate(tmp_path, monkeypatch):
+    from issue_agent.domain.contracts import RunId
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from tests.fakes.accounted_steward import install_steward
+    from tests.app.test_steward_component_workflow import issue
+    daemon = _steward_daemon(tmp_path, MAX_INFRA_DEATHS="3")
+    dispatcher = _steward_dispatcher(daemon)
+    accounting = dispatcher.runner.inner
+    control = accounting.store
+    install_steward(control, (7,))
+    dispatcher.steward_workflow.gateway = FakeGateway(issues={7: issue()})
+    assert control.claim_dispatch("o/r", "steward", 7, "TRIAGE", accounting.owner_id, frozenset())
+    async def die(task):
+        control.register_process_lease(RunId(task.env["ISSUE_AGENT_RUN_ID"]),
+            expected_owner_id=accounting.owner_id, pid=123, pgid=123, process_start_ticks=99)
+        assert control.reclaim_dead_leases(accounting.owner_id, lambda *_: False)
+        raise RuntimeError("exceeded maximum buffer size")
+    monkeypatch.setattr(accounting.inner, "run", die)
+    with pytest.raises(RuntimeError):
+        asyncio.run(dispatcher.steward_workflow.triage(7))
+    assert control.read_steward(WorkflowKey("o/r", IssueRef(7))).component.state.triage.infra_failures == 3
+    assert control.abandoned_dispatch_counts(accounting.owner_id) == {}
+
+
 def test_the_stewards_ceiling_also_sees_a_process_death(tmp_path, monkeypatch):
     """Control-store abandonments bound the paid loop after daemon death."""
     decide, store = _steward_decide(
@@ -1178,7 +1259,7 @@ def test_the_stewards_ceiling_also_sees_a_process_death(tmp_path, monkeypatch):
 def test_the_steward_suppression_is_per_issue(tmp_path, monkeypatch):
     decide, store = _steward_decide(tmp_path, monkeypatch)
     for _ in range(5):
-        store.bump_infra_deaths(30)
+        _charge_steward_infra(store, 30)
     world = WorldState(issues=(
         IssueView(30, title="t", body="b", updated_at="2026-09-14T10:00:00+00:00"),
         IssueView(31, title="t", body="b", updated_at="2026-09-14T10:00:00+00:00"),

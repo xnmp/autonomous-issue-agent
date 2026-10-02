@@ -124,6 +124,7 @@ class DispatchConfig:
     # ADR 0012: consecutive verdict-less paid steward legs allowed per issue
     # version before the steward stops re-buying and escalates.
     steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
+    steward_infra_ceiling: int = 0
     # Deployment-wide infra breaker (app.infra_breaker.InfraBreaker). None keeps
     # per-issue ceilings as the only bound, which is every hand-built config.
     infra_breaker: InfraBreakerPort | None = None
@@ -183,6 +184,7 @@ class DispatchConfig:
             fix_bot=self.fix_bot,
             repo=self.repo,
             error_ceiling=self.steward_error_ceiling,
+            infra_ceiling=self.steward_infra_ceiling,
             owner_id=self.deployment_owner_id,
             config_version=self.config_version,
         )
@@ -539,7 +541,8 @@ class AgentDispatcher:
             )
             bound_review = (self.cfg.role == "review" and action.workflow is not None
                             and action.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW})
-            if not bound_review and self.cfg.role != "fix":
+            if not bound_review and self.cfg.role != "fix" and (
+                    self.cfg.role != "steward" or action.kind is AgentKind.JIRA_SYNC):
                 try:
                     if det is not None and self.cfg.max_infra_deaths > 0:
                         charged = max(

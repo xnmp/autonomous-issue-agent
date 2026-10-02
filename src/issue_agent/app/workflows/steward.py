@@ -73,6 +73,7 @@ class StewardWorkflowConfig:
     # ADR 0012: how many consecutive verdict-less paid legs one version of one
     # issue may buy before the steward stops and asks an operator.
     error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
+    infra_ceiling: int = 0
     owner_id: str = ""
     config_version: str = ""
 
@@ -286,11 +287,13 @@ class StewardWorkflow:
         try:
             prospective = cc.consume_steward(selection, cc.StewardPurchase(
                 cc.ContinuationCapture(selection.binding, selection.revision, "groom:preflight"),
-                cc.StewardLane.GROOM, iss.updated_at, self.cfg.error_ceiling, signature), selection.revision.version + 1)
+                cc.StewardLane.GROOM, iss.updated_at, self.cfg.error_ceiling, signature,
+                self.cfg.infra_ceiling), selection.revision.version + 1)
         except ValueError:
             self.cfg.log(f"groom #{issue}: selected continuity refuses admission")
             return
-        selected = cc.StewardInput(selection, cc.StewardLane.GROOM, iss.updated_at, self.cfg.error_ceiling, signature)
+        selected = cc.StewardInput(selection, cc.StewardLane.GROOM, iss.updated_at, self.cfg.error_ceiling,
+                                   signature, self.cfg.infra_ceiling)
         self.runner.set_context("steward", "GROOM", issue, issue, workflow=selection.binding)
         merged = self._recent_merges()
         result = await run_leg(
@@ -497,11 +500,13 @@ class StewardWorkflow:
         try:
             prospective = cc.consume_steward(selection, cc.StewardPurchase(
                 cc.ContinuationCapture(selection.binding, selection.revision, "triage:preflight"),
-                cc.StewardLane.TRIAGE, iss.updated_at, self.cfg.error_ceiling), selection.revision.version + 1)
+                cc.StewardLane.TRIAGE, iss.updated_at, self.cfg.error_ceiling,
+                infra_ceiling=self.cfg.infra_ceiling), selection.revision.version + 1)
         except ValueError:
             self.cfg.log(f"triage #{issue}: selected continuity refuses admission")
             return
-        selected = cc.StewardInput(selection, cc.StewardLane.TRIAGE, iss.updated_at, self.cfg.error_ceiling)
+        selected = cc.StewardInput(selection, cc.StewardLane.TRIAGE, iss.updated_at, self.cfg.error_ceiling,
+                                   infra_ceiling=self.cfg.infra_ceiling)
         self.runner.set_context("steward", "TRIAGE", issue, issue, workflow=selection.binding)
         self.cfg.log(f"triage #{issue}: classifying")
         thread = "\n\n---\n\n".join(f"@{c.author}: {c.body}" for c in iss.comments)

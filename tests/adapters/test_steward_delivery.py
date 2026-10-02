@@ -282,6 +282,129 @@ def test_adoption_retains_immutable_purchase_and_recovers_lease_money(tmp_path):
     assert store.active_reservation_runs(SUCCESSOR)==()
     store.integrity_check()
 
+
+@pytest.mark.parametrize("reclaimed_first", [False, True])
+def test_steward_return_and_reclaim_charge_one_lane_once(tmp_path, reclaimed_first):
+    store, paid = running_steward(tmp_path)
+    key = paid.workflow.fence.key
+    if reclaimed_first:
+        assert store.reclaim_dead_leases(OWNER, lambda pid, start: False) == (paid.run_id,)
+        state = store.read_steward(key).component.state
+        assert state.triage.infra_failures == 1 and state.triage.stalls == 0
+        assert state.groom == cc.StewardLaneState()
+        assert store.active_reservation_runs(OWNER) == (paid.run_id,)
+        with store.transaction() as db:
+            assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+    assert store.settle(money(paid.run_id)).disposition is AccountingDisposition.AVAILABLE
+    source = store.steward_admission(WorkflowAttemptIdentity(paid.workflow, paid.run_id, "leg:triage"))
+    returned = cc.StewardFailed(source, cc.StewardFailureKind.INFRASTRUCTURE)
+    assert store.record_steward_outcome(returned)
+    assert not store.record_steward_outcome(returned)
+    assert store.reclaim_dead_leases(OWNER, lambda pid, start: False) == ()
+    reopened = SQLiteControlStore(store.path, now=lambda: NOW)
+    reopened.initialize()
+    state = reopened.read_steward(key).component.state
+    assert state.triage.infra_failures == 1 and state.triage.stalls == 0
+    assert state.groom == cc.StewardLaneState()
+    with reopened.transaction() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+
+
+def test_late_steward_return_cannot_change_new_human_episode(tmp_path):
+    store, paid = running_steward(tmp_path)
+    key = paid.workflow.fence.key
+    assert store.reclaim_dead_leases(OWNER, lambda pid, start: False) == (paid.run_id,)
+    assert store.settle(money(paid.run_id)).disposition is AccountingDisposition.AVAILABLE
+    source = store.steward_admission(WorkflowAttemptIdentity(paid.workflow, paid.run_id, "leg:triage"))
+    selection = store.read_steward(key)
+    purchase = cc.StewardPurchase(cc.ContinuationCapture(selection.binding, selection.revision, "leg:new"),
+        cc.StewardLane.TRIAGE, (NOW + timedelta(minutes=1)).isoformat(), 3, infra_ceiling=2)
+    fresh = replace(request("new-human"), workflow=selection.binding, owner_id=OWNER, kind="TRIAGE",
+        dispatch_id=json.dumps({"repository":"o/r", "role":"steward", "issue":7, "number":7,
+                               "kind":"TRIAGE", "leg_id":"leg:new"}))
+    assert store.reserve_steward(fresh, purchase).admitted
+    before = store.read_steward(key)
+    assert before.component.state.triage.infra_failures == 0
+    assert not store.record_steward_outcome(cc.StewardFailed(source, cc.StewardFailureKind.PAID))
+    assert store.read_steward(key) == before
+    assert store.pending_commands() == ()
+
+
+@pytest.mark.parametrize("runtime_first", [False, True])
+def test_captured_steward_death_survives_restart_and_reclaim(tmp_path, runtime_first):
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.adapters.workflow_codec import decode_workflow
+    store, paid = running_steward(tmp_path)
+    writer = WorkflowWriter("o/r", "steward", OWNER)
+    key = paid.workflow.fence.key
+    before = store.read_steward(key)
+    if runtime_first:
+        assert not store.record_steward_recovery(paid.run_id, cc.StewardFailureKind.DETERMINISTIC, writer)
+        assert store.read_steward(key) == before
+        selected = store.read_steward(key)
+        blocked = cc.StewardPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:blocked"),
+            cc.StewardLane.TRIAGE, NOW.isoformat(), 3, infra_ceiling=2)
+        with pytest.raises(ValueError, match="held, pending"):
+            cc.consume_steward(selected, blocked, selected.revision.version + 1)
+        with store.transaction() as db:
+            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return'").fetchone()
+            assert decode_workflow(row[0], tuple)[1].kind is cc.StewardFailureKind.DETERMINISTIC
+    reopened = SQLiteControlStore(store.path, now=lambda: NOW)
+    reopened.initialize()
+    bind_events(reopened)
+    assert reopened.reclaim_dead_leases(OWNER, lambda pid, start: False) == (paid.run_id,)
+    if not runtime_first:
+        assert reopened.record_steward_recovery(paid.run_id, cc.StewardFailureKind.DETERMINISTIC, writer)
+    state = reopened.read_steward(key)
+    # A legacy capture without a policy conservatively contributes one death.
+    assert state.component.state.triage.infra_failures == 1
+    assert state.component.state.triage.stalls == 0 and state.component.state.groom == before.component.state.groom
+    assert not reopened.record_steward_recovery(paid.run_id, cc.StewardFailureKind.DETERMINISTIC, writer)
+    assert reopened.read_steward(key) == state
+    assert reopened.active_reservation_runs(OWNER) == (paid.run_id,)
+    with reopened.transaction() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+
+
+def test_caught_steward_reclaim_failure_rolls_back_lease_run_episode_and_receipt(tmp_path, monkeypatch):
+    import sqlite3
+    store, paid = running_steward(tmp_path)
+    before = store.read_steward(paid.workflow.fence.key)
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER refuse_steward_event BEFORE INSERT ON event_outbox "
+                   "BEGIN SELECT RAISE(ABORT,'refuse steward outcome'); END")
+        original = tuple(db.iterdump())
+        @contextmanager
+        def borrowed():
+            yield db
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "transaction", borrowed)
+            with pytest.raises(sqlite3.IntegrityError, match="refuse steward outcome"):
+                store.reclaim_dead_leases(OWNER, lambda pid, start: False)
+        assert tuple(db.iterdump()) == original
+        db.execute("DROP TRIGGER refuse_steward_event")
+    assert store.read_steward(paid.workflow.fence.key) == before
+    assert store.leases(OWNER)[0].run_id == paid.run_id
+    assert store.reclaim_dead_leases(OWNER, lambda pid, start: False) == (paid.run_id,)
+    assert store.read_steward(paid.workflow.fence.key).component.state.triage.infra_failures == 1
+    assert store.active_reservation_runs(OWNER) == (paid.run_id,)
+
+
+def test_administrative_spend_release_cannot_claim_never_launched_steward_work(tmp_path):
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    store, paid = running_steward(tmp_path)
+    assert store.record_reservation_retained(paid.run_id, "unknown launched spend")
+    assert store.release_retained(paid.run_id, "operator grace expired", NOW + timedelta(days=1)).disposition is AccountingDisposition.AVAILABLE
+    before = store.read_steward(paid.workflow.fence.key)
+    with store.transaction() as db:
+        original = tuple(db.iterdump())
+    with pytest.raises(WorkflowAuthorityError, match="proven never-launched"):
+        store.record_steward_recovery(paid.run_id, cc.StewardFailureKind.RECLAIMED,
+                                     WorkflowWriter("o/r", "steward", OWNER))
+    assert store.read_steward(paid.workflow.fence.key) == before
+    with store.transaction() as db:
+        assert tuple(db.iterdump()) == original
+
 def test_retired_owner_cannot_cancel_adopted_current_run(tmp_path):
     store,paid=running_steward(tmp_path)
     store.adopt_legacy_owner('o/r','steward',SUCCESSOR,prior_owner_ids=(OWNER,))

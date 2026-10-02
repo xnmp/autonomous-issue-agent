@@ -563,3 +563,19 @@ def test_literal_accepted_pre_f7_capture_preserves_wire_and_absent_policy():
         replace(old, fix_infra_ceiling=-1)
     with pytest.raises(ValueError):
         replace(old, fix_infra_ceiling=True)
+
+
+def test_literal_accepted_steward_purchase_preserves_wire_and_captured_policy():
+    from pathlib import Path
+    from issue_agent.domain import continuation_components as cc
+    literal = json.loads((Path(__file__).parents[1] / "fixtures/phase4-pre-t3-steward-purchase.json").read_text())
+    old = decode_workflow(literal["wire"], cc.StewardPurchase)
+    assert old.infra_ceiling is None
+    assert encode_workflow(old) == literal["wire"] and repr(old) == literal["repr"]
+    disabled = replace(old, infra_ceiling=0)
+    assert encode_workflow(disabled) != literal["wire"]
+    assert decode_workflow(encode_workflow(disabled), cc.StewardPurchase).infra_ceiling == 0
+    assert repr(disabled) == literal["repr"]
+    for malformed in (-1, True, 10**100, "3"):
+        with pytest.raises(ValueError):
+            replace(old, infra_ceiling=malformed)

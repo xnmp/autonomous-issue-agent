@@ -61,13 +61,13 @@ def test_queued_verdict_keeps_baseline_and_stalls_until_delivery():
     assert delivered.groom == state.groom
 
 
-@pytest.mark.parametrize("kind,stalls", [(cc.StewardFailureKind.PAID, 2), (cc.StewardFailureKind.INFRASTRUCTURE, 1)])
-def test_classified_failure_charges_only_a_paid_attempt(kind, stalls):
+@pytest.mark.parametrize("kind,stalls,infra", [(cc.StewardFailureKind.PAID, 2, 4), (cc.StewardFailureKind.INFRASTRUCTURE, 1, 5)])
+def test_classified_failure_charges_only_a_paid_attempt(kind, stalls, infra):
     selection, source = admitted(cc.StewardLaneState(stalls=1, infra_failures=4))
     state = cc.steward_return_state(selection, cc.StewardFailed(source, kind))
     assert state is not None
     assert state.triage.stalls == stalls
-    assert state.triage.infra_failures == 4 and state.triage.baseline_at == ""
+    assert state.triage.infra_failures == infra and state.triage.baseline_at == ""
     applied = cc.SelectedSteward(selection.revision, replace(selection.component, state=state,
         watermarks=replace(selection.component.watermarks, last_applied=source.admission.admission_version)))
     assert cc.steward_return_state(applied, cc.StewardFailed(source, kind)) is None

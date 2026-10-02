@@ -3667,6 +3667,7 @@ def build_steward_daemon(
         deployment_owner_id=owner_id,
         config_version=cfg.config_version,
         steward_error_ceiling=cfg.steward_error_ceiling,
+        steward_infra_ceiling=steward_runtime.max_infra_deaths,
         **_spend_cfg(cfg, "steward"),
     )
     control = _control_store(cfg, cfg.steward_state_dir, journal)
@@ -3725,15 +3726,10 @@ def build_steward_daemon(
     )
     executor.bind_dispatch(dispatch_runtime)
 
-    # Same ceiling shape as the reviewer's (review P0R-3), for the same reason:
-    # the steward's "already handled" markers — `triage-N.at` and the jira phase
-    # — are written ONLY on success, so a session that dies leaves the issue in
-    # the candidate set and the next poll buys it again. Unlike the other two
-    # roles the steward escalates NOTHING: an untriaged issue is not work anyone
-    # promised to finish, and moving it to needs-human-review would be the
-    # steward inventing lifecycle state for an issue it never triaged. It stops
-    # spending and says so, once per change in the suppressed set (not once per
-    # poll — a line repeated 4,300 times a day is a line nobody reads).
+    # Lane infrastructure ceilings stop spending without inventing lifecycle
+    # state for an issue the steward never triaged. Suppression is logged only
+    # when the selected set changes. Jira retains its original legacy gate as
+    # an explicit exclusion from the triage/groom authority cutover.
     max_deaths = steward_runtime.max_infra_deaths
     suppressed_last: set[int] = set()
     report_recurrences = _recurrence_reporter(
@@ -3781,31 +3777,24 @@ def build_steward_daemon(
                       for number, selected in triage_state.items()}
         groom_content = {number: selected.component.state.groom_content.successful if isinstance(selected, cc.SelectedSteward) else ""
                          for number, selected in triage_state.items()}
-        infra = {i.number: _control_value(errors, i.number, store.get_infra_deaths, 0) for i in world.issues}
         for target, reason in errors.items():
             steward_log(f"issue #{target} held: {reason}")
         world = replace(world, issues=tuple(i for i in world.issues if i.number not in errors))
         state = TriageState(seen_at=seen)
         updated_at = {i.number: i.updated_at for i in world.issues}
         signatures = {i.number: grooming_content(i) for i in world.issues}
-        deaths = control.abandoned_dispatch_counts(owner_id)
-
-        def exhausted(n: int) -> bool:
-            spent = infra.get(n, 0) + deaths.get(n, 0)
-            return retry_breaker(spent, max_deaths).tripped
-
         actions = [
             RunAgent(AgentKind.TRIAGE, n)
             for n in triage_candidates(world, tcfg_dom, state)
-            if not exhausted(n) and cc.triage_admissible(triage_state[n],
-                updated_at[n], cfg.steward_error_ceiling)
+            if cc.triage_admissible(triage_state[n],
+                updated_at[n], cfg.steward_error_ceiling, infra_ceiling=max_deaths)
         ]
         actions.extend(
             adr_steward_actions(world.prs, adrs, steward_runtime.bot)
         )
         groom_world = replace(world, issues=tuple(i for i in world.issues
-            if not exhausted(i.number) and cc.groom_admissible(triage_state[i.number], updated_at[i.number],
-                signatures[i.number], cfg.steward_error_ceiling)))
+            if cc.groom_admissible(triage_state[i.number], updated_at[i.number],
+                signatures[i.number], cfg.steward_error_ceiling, infra_ceiling=max_deaths)))
         actions.extend(
             RunAgent(AgentKind.GROOM, n)
             for n in grooming_candidates(
@@ -3816,20 +3805,32 @@ def build_steward_daemon(
             )
         )
         if jira_on:
+            jira_errors: dict[int, str] = {}
+            jira_deaths = control.abandoned_dispatch_counts(owner_id)
             for i in world.issues:
                 target = jira_phase(i.labels)
-                if target is not None and not exhausted(i.number) and jira_sync_needed(
+                jira_infra = _control_value(jira_errors, i.number, store.get_infra_deaths, 0)
+                jira_held = i.number in jira_errors or retry_breaker(
+                    jira_infra + jira_deaths.get(i.number, 0), max_deaths).tripped
+                if target is not None and not jira_held and jira_sync_needed(
                     target, store.get_jira_key(i.number), store.get_jira_phase(i.number)
                 ):
                     actions.append(RunAgent(AgentKind.JIRA_SYNC, i.number))
-        suppressed = {i.number for i in world.issues if exhausted(i.number)}
+        suppressed = {i.number for i in world.issues
+            if isinstance(triage_state[i.number], cc.SelectedSteward) and max_deaths > 0
+            and (triage_state[i.number].component.state.triage.infra_failures >= max_deaths
+                 and not cc.triage_admissible(triage_state[i.number], updated_at[i.number],
+                     cfg.steward_error_ceiling, infra_ceiling=max_deaths)
+                 or triage_state[i.number].component.state.groom.infra_failures >= max_deaths
+                 and not cc.groom_admissible(triage_state[i.number], updated_at[i.number], signatures[i.number],
+                     cfg.steward_error_ceiling, infra_ceiling=max_deaths))}
         if suppressed != suppressed_last:
             if suppressed:
                 steward_log(
                     f"steward: no longer dispatching for issue(s) "
-                    f"{sorted(suppressed)} — {max_deaths} sessions died before "
-                    "returning a result. Check the runtime/daemon; clear the "
-                    "issue-N.infra-deaths marker in the steward STATE_DIR to retry."
+                    f"{sorted(suppressed)}: a selected triage/groom infrastructure "
+                    f"allowance reached {max_deaths}. Check the runtime/daemon; "
+                    "new human input starts a fresh lane episode."
                 )
             suppressed_last.clear()
             suppressed_last.update(suppressed)

@@ -185,7 +185,7 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "StewardState": {"groom_content": {"type": "GroomContent", "fields": {"attempted": "", "successful": ""}}},
     "StewardAttemptSource": {"content_signature": ""},
-    "StewardPurchase": {"content_signature": ""},
+    "StewardPurchase": {"content_signature": "", "infra_ceiling": None},
     "StewardLaneState": {"delivery_source": None, "attempted_at": ""},
     "WorkflowSnapshot": {
         "issue_recovery": {"type": "InactiveIssueRecovery", "fields": {}},
@@ -260,6 +260,7 @@ def _encode(value: object, depth: int = 0) -> object:
                         or field.name == "attempted_at" and not value.attempted_at))
                     and not (type(value) in {cc.StewardAttemptSource, cc.StewardPurchase}
                              and field.name == "content_signature" and not value.content_signature)
+                    and not (type(value) is cc.StewardPurchase and field.name == "infra_ceiling" and value.infra_ceiling is None)
                     and not (type(value) is cc.StewardState and field.name == "groom_content"
                              and value.groom_content == cc.GroomContent())
                     and (field.name not in {"expected_binding", "lineage_sha256"}
@@ -358,7 +359,7 @@ def _decode(value: object, depth: int = 0) -> object:
     field_names = _FIELD_NAMES[constructor]
     required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}
                 if tag == "StewardLaneState" else field_names - legacy.keys())
-    if tag in {"StewardLaneState", "PRRepairState", "PRRepairPurchase", "PRRepairResult", "IssueRecoveryState"} and required <= set(payload) <= field_names:
+    if tag in {"StewardLaneState", "StewardPurchase", "PRRepairState", "PRRepairPurchase", "PRRepairResult", "IssueRecoveryState"} and required <= set(payload) <= field_names:
         payload = {**legacy, **payload}
     if legacy and set(payload) == field_names - legacy.keys():
         payload = {**legacy, **payload}

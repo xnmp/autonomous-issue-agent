@@ -1,6 +1,7 @@
 """Public triage uses paid component admission and exact durable delivery."""
 
 import asyncio
+import pytest
 from dataclasses import replace
 from datetime import datetime, timedelta
 
@@ -210,9 +211,108 @@ def test_infrastructure_failure_keeps_triage_stall_allowance(tmp_path):
     inner = _Runner(replace(INFRA, cost_usd=0.01))
     workflow, control, files, key = composed(tmp_path, InMemoryGitHub((issue(),)), inner)
     asyncio.run(workflow.triage(7))
-    lane = control.read_steward(key).component.state.triage
+    state = control.read_steward(key).component.state
+    lane = state.triage
     assert lane.stalls == 0 and lane.baseline_at == ""
+    assert lane.infra_failures == 1
+    assert state.groom == cc.StewardLaneState()
     assert files.triage_at == {} and not control.pending_commands()
+    reopened = SQLiteControlStore(control.path, now=lambda: NOW)
+    reopened.initialize()
+    assert reopened.read_steward(key).component.state == state
+    with reopened.transaction() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("deterministic", [False, True])
+def test_launched_steward_exception_charges_sql_without_releasing_unknown_money(tmp_path, monkeypatch, deterministic):
+    from issue_agent.domain.contracts import RunId
+    inner = _Runner(VERDICT)
+    workflow, control, _, key = composed(tmp_path, InMemoryGitHub((issue(),)), inner)
+    workflow.cfg = replace(workflow.cfg, infra_ceiling=3)
+    run_ids = []
+    async def die(task):
+        run_id = RunId(task.env["ISSUE_AGENT_RUN_ID"])
+        run_ids.append(run_id)
+        control.register_process_lease(run_id, expected_owner_id=OWNER, pid=123, pgid=123, process_start_ticks=99)
+        raise RuntimeError("exceeded maximum buffer size" if deterministic else "transport disappeared")
+    monkeypatch.setattr(inner, "run", die)
+    with pytest.raises(RuntimeError):
+        asyncio.run(workflow.triage(7))
+    state = control.read_steward(key)
+    assert state.component.state.triage.infra_failures == (3 if deterministic else 1)
+    assert state.component.state.triage.stalls == 0 and state.component.state.groom == cc.StewardLaneState()
+    assert control.active_reservation_runs(OWNER) == tuple(run_ids)
+    assert control.pending_commands() == ()
+    assert control.abandoned_dispatch_counts(OWNER) == {}
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+        assert db.execute("SELECT state,outcome FROM runs").fetchone()[:] == ("completed", "spend_unreconciled")
+
+
+def test_never_launched_steward_exception_does_not_charge_or_strand_input(tmp_path, monkeypatch):
+    inner = _Runner(VERDICT)
+    workflow, control, _, key = composed(tmp_path, InMemoryGitHub((issue(),)), inner)
+    async def refuse(task):
+        raise RuntimeError("provider refused before spawning")
+    monkeypatch.setattr(inner, "run", refuse)
+    for _ in range(2):
+        with pytest.raises(RuntimeError):
+            asyncio.run(workflow.triage(7))
+    state = control.read_steward(key)
+    assert state.component.state.triage.infra_failures == state.component.state.triage.stalls == 0
+    assert state.component.watermarks.last_applied == state.component.watermarks.last_admitted
+    assert control.active_reservation_runs(OWNER) == () and control.pending_commands() == ()
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 2
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("groom", [False, True])
+def test_lane_infra_ceiling_and_new_human_reset_preserve_sibling(tmp_path, groom):
+    gateway = InMemoryGitHub((issue(),))
+    inner = _Runner(replace(INFRA, cost_usd=0.01))
+    workflow, control, _, key = composed(tmp_path, gateway, inner, groom=groom)
+    workflow.cfg = replace(workflow.cfg, infra_ceiling=2)
+    run = workflow.groom if groom else workflow.triage
+    for _ in range(3):
+        asyncio.run(run(7))
+    assert inner.runs == 2
+    before = control.read_steward(key).component.state
+    lane = before.groom if groom else before.triage
+    sibling = before.triage if groom else before.groom
+    assert lane.infra_failures == 2 and lane.stalls == 0
+    gateway.issues[7] = replace(gateway.get_issue(7), body="New human scope",
+        updated_at=(NOW + timedelta(minutes=1)).isoformat())
+    asyncio.run(run(7))
+    assert inner.runs == 3
+    after = control.read_steward(key).component.state
+    assert (after.groom if groom else after.triage).infra_failures == 1
+    assert (after.triage if groom else after.groom) == sibling
+
+
+@pytest.mark.parametrize("groom", [False, True])
+@pytest.mark.parametrize("remote_state", ["closed", "absent"])
+def test_terminal_issue_during_steward_return_has_no_lifecycle_mutation(tmp_path, monkeypatch, groom, remote_state):
+    gateway = InMemoryGitHub((issue(),))
+    inner = _Runner(replace(VERDICT, cost_usd=0.01))
+    workflow, control, _, key = composed(tmp_path, gateway, inner, groom=groom)
+    async def returned_after_close(task):
+        inner.runs += 1
+        if remote_state == "absent":
+            del gateway.issues[7]
+        else:
+            gateway.issues[7] = replace(gateway.get_issue(7), state="closed")
+        return replace(VERDICT, cost_usd=0.01)
+    monkeypatch.setattr(inner, "run", returned_after_close)
+    if remote_state == "absent":
+        with pytest.raises(KeyError):
+            asyncio.run((workflow.groom if groom else workflow.triage)(7))
+    else:
+        asyncio.run((workflow.groom if groom else workflow.triage)(7))
+    assert inner.runs == 1
+    assert gateway.calls == [] and control.pending_commands() == ()
+    assert (7 not in gateway.issues if remote_state == "absent" else gateway.get_issue(7).state == "closed")
 
 
 def test_first_failure_of_new_human_input_has_a_fresh_stall_allowance(tmp_path):
