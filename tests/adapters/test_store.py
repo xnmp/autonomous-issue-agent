@@ -151,12 +151,12 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
     for path in (
         s.issue_path(5, "resumes"),
         s.issue_path(5, "ci-retries"),
-        s.issue_path(5, "rebase-retries"),
+        s.issue_path(5, "infra-deaths"),
     ):
         with open(path, "w") as f:
             f.write("not-an-int")
 
-    for read in (lambda: s.get_rebase_retries(5),
+    for read in (lambda: s.get_infra_deaths(5),
                  lambda: s.bump_resumes(5)):
         with pytest.raises(ValueError, match="control unavailable"):
             read()
@@ -172,10 +172,10 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
 # collision the pid-suffixed tmp name exists to avoid.
 def test_write_leaves_no_tmp_file_after_success():
     s, root = _store()
-    s.set_rebase_retries(5, 4)
+    s.set_infra_deaths(5, 4)
 
-    assert s.get_rebase_retries(5) == 4
-    assert os.path.exists(os.path.join(root, "issue-5.rebase-retries"))
+    assert s.get_infra_deaths(5) == 4
+    assert os.path.exists(os.path.join(root, "issue-5.infra-deaths"))
     leftover = [f for f in os.listdir(root) if f.endswith(".tmp")]
     assert leftover == []
 
@@ -188,17 +188,17 @@ def test_write_survives_crash_before_replace(monkeypatch):
     # fail, so it would silently install the new (wrong-for-this-test) value
     # and this assertion would catch it.
     s, _ = _store()
-    s.set_rebase_retries(5, 4)
+    s.set_infra_deaths(5, 4)
 
     def _boom(_src, _dst):
         raise OSError("simulated crash before replace")
 
     monkeypatch.setattr(os, "replace", _boom)
     try:
-        s.set_rebase_retries(5, 9)
+        s.set_infra_deaths(5, 9)
     except OSError:
         pass
-    assert s.get_rebase_retries(5) == 4
+    assert s.get_infra_deaths(5) == 4
 
 
 def test_write_syncs_tmp_file_before_replace(monkeypatch):
@@ -215,9 +215,9 @@ def test_write_syncs_tmp_file_before_replace(monkeypatch):
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", _tracking_fsync)
-    s.set_rebase_retries(5, 4)
+    s.set_infra_deaths(5, 4)
     assert calls, "Store._write must fsync the tmp file before os.replace"
-    assert s.get_rebase_retries(5) == 4
+    assert s.get_infra_deaths(5) == 4
 
 
 def test_tmp_name_is_pid_suffixed(monkeypatch):
@@ -233,9 +233,9 @@ def test_tmp_name_is_pid_suffixed(monkeypatch):
         real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", _capture)
-    s.set_rebase_retries(5, 4)
+    s.set_infra_deaths(5, 4)
     assert str(os.getpid()) in seen["src"]
-    assert s.get_rebase_retries(5) == 4
+    assert s.get_infra_deaths(5) == 4
 
 
 
@@ -246,14 +246,14 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     s, _ = _store()
     _seed_legacy_ci_counter(s, 5, 3)
     Path(s.issue_path(5, "review-retries")).write_text("2026-01-01T00:00:00Z 2")
-    s.set_rebase_retries(5, 1)
+    Path(s.issue_path(5, "rebase-retries")).write_text("1")
     s.set_infra_deaths(5, 5)
 
     assert s.clear_retries(5) == 3  # reports what it actually retired
 
     assert _legacy_ci_counter(s, 5) == 0
     assert not Path(s.issue_path(5, "review-retries")).exists()
-    assert s.get_rebase_retries(5) == 0
+    assert not Path(s.issue_path(5, "rebase-retries")).exists()
     assert s.get_infra_deaths(5) == 5
 
 
@@ -348,14 +348,14 @@ def test_clear_issue_removes_all():
     s, _ = _store()
     s.save_session(5, "x")
     _seed_legacy_ci_counter(s, 5, 2)
-    s.set_rebase_retries(5, 1)
+    Path(s.issue_path(5, "rebase-retries")).write_text("1")
     s.set_resumed_at(5, "t")
     s.set_phase(5, "authored")
     s.bump_infra_deaths(5)
     s.clear_issue(5)
     assert not s.has_session(5)
     assert _legacy_ci_counter(s, 5) == 0
-    assert s.get_rebase_retries(5) == 0
+    assert not Path(s.issue_path(5, "rebase-retries")).exists()
     assert s.get_phase(5) == ""           # phase cleared on teardown
     assert s.get_infra_deaths(5) == 0     # review M4/D8: infra-deaths clears too
 
@@ -427,8 +427,8 @@ def test_every_issue_accessor_suffix_is_covered_by_exactly_one_cleaner():
     # review M4: a new accessor with an unlisted suffix must fail this test
     # instead of silently leaking a STATE_DIR file forever (introspects the
     # module: accessors' suffix strings vs _ISSUE_SUFFIXES).
-    # Retired triage/CI counters still need cleanup in existing state roots.
-    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage", "ci-retries", "review-retries"} == set(store_module._ISSUE_SUFFIXES)
+    # Retired counters still need cleanup in existing state roots.
+    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage", "ci-retries", "review-retries", "rebase-retries"} == set(store_module._ISSUE_SUFFIXES)
 
 
 def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
@@ -538,7 +538,7 @@ def _triage_at_has_a_cleaner() -> bool:
 
 def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
-    used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries"), ("issue_path", "review-retries")}
+    used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries"), ("issue_path", "review-retries"), ("issue_path", "rebase-retries")}
     used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
 

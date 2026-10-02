@@ -547,7 +547,7 @@ def _fix_ci_breaker() -> Scenario:
 
 
 def _rebase_breaker() -> Scenario:
-    p = pr(103, "ai-pr-open", mergeable="CONFLICTING")
+    p = pr(103, "ai-pr-open", mergeable="CONFLICTING", head_ref_oid="a" * 40)
     return Scenario(
         name="rebase-breaker",
         world=world(prs=[p]),

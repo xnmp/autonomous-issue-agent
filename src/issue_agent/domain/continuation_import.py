@@ -224,6 +224,22 @@ def ci_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRec
     return tuple(comparisons)
 
 
+def rebase_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, int, int], ...]:
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.IssueRecoveryState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.ISSUE_RECOVERY)
+        if len(found) > 1:
+            raise ValueError("eligible rebase shadow has ambiguous source ownership")
+        source = dict(found[0].fields).get("rebase-retries", LegacyAbsent()) if found else LegacyAbsent()
+        if not isinstance(source, (LegacyAbsent, LegacyPresent)):
+            raise ValueError("eligible rebase shadow has unreadable selected debt")
+        before = int(source.text.strip()) if isinstance(source, LegacyPresent) else 0
+        comparisons.append((target.key, before, target.state.rebase_failures))
+    return tuple(comparisons)
+
+
 def review_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[str, int], tuple[str, int]], ...]:
     comparisons = []
     for target in plan.targets:

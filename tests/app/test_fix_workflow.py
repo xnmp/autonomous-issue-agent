@@ -51,20 +51,6 @@ from tests.fakes.accounted_workflow import (
 )
 
 
-class RetryRecordingStore(FakeStore):
-    """The remaining rebase file authority needs an observable test counter."""
-
-    def __init__(self):
-        super().__init__()
-        self.rebase_retries: dict[int, int] = {}
-
-    def set_rebase_retries(self, i, retries):
-        self.rebase_retries[i] = retries
-
-    def get_rebase_retries(self, issue):
-        return self.rebase_retries.get(issue, 0)
-
-
 def _workflow(gw, store, runner, wt=None, *, pr_repair_authority=True, **cfg_overrides):
     cfg_kwargs = dict(
         base_branch="dev",
@@ -690,7 +676,7 @@ def test_a_merged_pr_leaves_no_history_for_the_next_one(tmp_path):
 def test_fix_ci_error_advances_the_breaker():
     # Baseline for the exemption below: a genuine failed attempt DOES count.
     gw = FakeGateway(prs={100: _ci_pr()})
-    store = RetryRecordingStore()
+    store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR))
 
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
@@ -703,7 +689,7 @@ def test_fix_ci_infra_death_does_not_advance_the_breaker():
     # work that never ran. The PR is left exactly as it was found (M22/D9: there
     # is no PR busy marker to clear).
     gw = FakeGateway(prs={100: _ci_pr()})
-    store = RetryRecordingStore()
+    store = FakeStore()
     runner = FakeRunner(
         AgentResult(is_error=True, status="timeout",
                     exit_reason=ExitReason.KILLED_EXTERNALLY)
@@ -724,26 +710,32 @@ def test_fix_ci_infra_death_does_not_advance_the_breaker():
 
 def test_rebase_error_advances_the_breaker():
     gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
-    store = RetryRecordingStore()
+    store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=True, exit_reason=ExitReason.AGENT_ERROR))
 
     asyncio.run(_workflow(gw, store, runner).rebase(100))
 
-    assert store.get_rebase_retries(5) == 1
+    assert issue_recovery_state(store).rebase_failures == 1
 
 
 def test_rebase_infra_death_does_not_advance_the_breaker():
     gw = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-token", closing_issue=5)})
-    store = RetryRecordingStore()
-    store.set_rebase_retries(5, 1)
+    store = FakeStore()
     runner = FakeRunner(
         AgentResult(is_error=True, status="timeout",
                     exit_reason=ExitReason.TRANSPORT_DEATH)
     )
 
-    asyncio.run(_workflow(gw, store, runner).rebase(100))
+    workflow = _workflow(gw, store, runner)
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    with store._workflow_db.transaction() as db:
+        current = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(5)))
+        persist_workflow_snapshot(db, dataclasses.replace(current, issue_recovery=dataclasses.replace(current.issue_recovery,
+            state=dataclasses.replace(current.issue_recovery.state, rebase_failures=1))))
+    asyncio.run(workflow.rebase(100))
 
-    assert store.get_rebase_retries(5) == 1
+    assert issue_recovery_state(store).rebase_failures == 1
 
 
 def test_fix_ci_infra_death_counts_against_the_infra_ceiling(tmp_path):
@@ -786,7 +778,7 @@ def test_rebase_infra_death_counts_against_the_infra_ceiling(tmp_path):
     asyncio.run(_workflow(gw, store, runner).rebase(100))
 
     assert store.get_infra_deaths(5) == 1
-    assert store.get_rebase_retries(5) == 0
+    assert issue_recovery_state(store).rebase_failures == 0
 
 
 def test_resolve_infra_death_counts_against_the_infra_ceiling(tmp_path):
@@ -917,7 +909,7 @@ def test_address_review_infra_death_does_not_burn_a_review_retry():
     p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     gw = FakeGateway(prs={100: p})
-    store = RetryRecordingStore()
+    store = FakeStore()
     runner = FakeRunner(
         AgentResult(is_error=True, status="timeout",
                     exit_reason=ExitReason.KILLED_EXTERNALLY, session_id="s")
@@ -2911,7 +2903,7 @@ def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_s
                reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),),
                checks=(Check("ci", "fail"),))
     gw = FakeGateway(prs={100: p})
-    store = RetryRecordingStore()
+    store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
     ensured: list[int] = []
 
@@ -2929,7 +2921,7 @@ def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_s
     with pytest.raises(WorkflowAuthorityError):
         asyncio.run(getattr(workflow, handler)(100))
     assert runner.tasks == [] and review_retry_pair(store) == ("", 0)
-    assert store.resumes.get(5, 0) == 0 and issue_recovery_state(store).ci_failures == 0 and store.rebase_retries == {}
+    assert store.resumes.get(5, 0) == 0 and issue_recovery_state(store).ci_failures == 0 and issue_recovery_state(store).rebase_failures == 0
     assert ensured == []  # not even a worktree is prepared for a deferred repair
 
 

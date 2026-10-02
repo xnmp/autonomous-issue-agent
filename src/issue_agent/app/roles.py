@@ -1858,7 +1858,7 @@ def _fix_state(
     # as count 0 (see FixState.review_retries).
     review_retries = {}
     review_errors = {}
-    rebase_retries = {k: read(k, store.get_rebase_retries, 0) for k in keys}
+    rebase_retries = {}
     resolve_workflows: dict[int, WorkflowRead] = {}
     if workflow_control is not None:
         observed_at = parse_timestamp(world.now)
@@ -1900,6 +1900,7 @@ def _fix_state(
             if not isinstance(selected, cc.SelectedIssueRecovery):
                 raise ValueError("CI issue recovery authority is inactive or migration blocked")
             ci_retries[number] = selected.component.state.ci_failures
+            rebase_retries[number] = selected.component.state.rebase_failures
             review_debt = selected.component.state.review_failures
             if review_debt.count and not review_debt.review_at:
                 review_errors[number] = "review retry debt has no verified qualifying timestamp"
@@ -2658,6 +2659,7 @@ def compose_fix_daemon(
         max_ci_retries=fix_runtime.max_ci_retries,
         infra_breaker=infra_breaker,
         max_review_retries=fix_runtime.max_review_retries,
+        max_rebase_retries=fix_runtime.max_rebase_retries,
         **_spend_cfg(cfg, "fix"),
     )
     runtime_binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](

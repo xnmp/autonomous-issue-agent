@@ -439,12 +439,6 @@ class Store:
     def mark_self_clear_ceiling_reported(self, issue: int) -> None:
         self._write(self.issue_path(issue, "self-clear-ceiling"), "1")
 
-    def get_rebase_retries(self, issue: int) -> int:
-        return self._read_int(self.issue_path(issue, "rebase-retries"))
-
-    def set_rebase_retries(self, issue: int, retries: int) -> None:
-        self._write(self.issue_path(issue, "rebase-retries"), str(retries))
-
     # ── infra-death ceiling (review C3/D2c) ──
     # NOT a retry counter: a session that dies before returning a result made no
     # attempt, so it must never march ci-/review-/rebase-/resolve-retries (that

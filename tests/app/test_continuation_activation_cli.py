@@ -680,3 +680,46 @@ def test_pre_t2_literal_plan_retains_digest_and_sql_only_retry_after_cleanup(sto
                                  "--confirm-plan-digest", report["plan_digest"])
     assert code == 0 and retry["status"] == "already_active_with_this_plan", error
     assert dump(control) == before
+
+
+def test_pre_f6_literal_rebase_plan_keeps_sql_retry_after_source_cleanup(stopped, capsys, monkeypatch):
+    from issue_agent.adapters.continuation_activation import read_import_plan
+    state, control, _ = stopped
+    saved = Path(__file__).parents[1] / "fixtures" / "workflow_fix_import_pre_f6.json"
+    report = json.loads(saved.read_text())
+    original = read_import_plan(str(saved))
+    assert original.plan_digest == report["plan_digest"]
+    with control.transaction() as db:
+        publish_continuation_import(db, original, now=datetime(2026, 10, 1, tzinfo=timezone.utc), control=control)
+        selected = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(7)))
+    assert selected.issue_recovery.state.rebase_failures == 4 and selected.issue_recovery.state.pending_rebase is None
+    (state / "issue-7.rebase-retries").write_text("malformed retained edit")
+    (state / "issue-7.rebase-retries").unlink()
+    before = dump(control)
+    monkeypatch.setattr(continuation_activation, "evaluate", lambda *args: pytest.fail("retry inspected raw source"))
+    monkeypatch.setattr(cli, "_activation_liveness", lambda *args: pytest.fail("retry inspected current work"))
+    code, retry, error = command(capsys, "fix", "activate", "--plan-file", str(saved),
+                                "--confirm-plan-digest", report["plan_digest"])
+    assert code == 0 and retry["status"] == "already_active_with_this_plan", error
+    assert dump(control) == before
+
+
+
+def test_rebase_shadow_and_copy_preserve_debt_without_raw_runtime_fallback(stopped, capsys, tmp_path):
+    state, control, _ = stopped
+    (state / "issue-7.rebase-retries").write_text("3")
+    (state / "issue-8.rebase-retries").write_text("malformed")
+    before = dump(control)
+    raw = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, report, error = command(capsys, "fix", "shadow")
+    assert code == 0, error
+    assert report["rebase_shadow"] == [{"issue": 7, "legacy": 3, "imported": 3, "agrees": True}]
+    assert [(target["number"], target["eligible"]) for target in report["targets"]] == [(7, True), (8, False)]
+    copied = tmp_path / "rebase-copy"
+    code, result, error = command(capsys, "fix", "rehearse", "--copy-to", str(copied))
+    assert code == 0 and all(result["checks"].values()), error
+    with closing(sqlite3.connect(copied / "issue-agent-control" / Path(control.path).name)) as db:
+        db.row_factory = sqlite3.Row
+        assert load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(7))).issue_recovery.state.rebase_failures == 3
+        assert isinstance(load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(8))).issue_recovery, cc.BlockedIssueRecovery)
+    assert dump(control) == before and {path.name: path.read_bytes() for path in state.iterdir()} == raw

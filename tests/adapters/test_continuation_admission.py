@@ -128,18 +128,18 @@ def test_current_duplicate_return_applies_once_and_retains_consumption(recovery)
     request = paid("first", selected)
     assert store.reserve_issue_recovery(request, selected).admitted
     admission = receipt(store, request.run_id)
-    # CI debt now requires its classified paired repair receipt. This legacy
+    # CI/review/rebase debt requires its classified paired repair receipt. This legacy
     # reply-return contract still applies unselected sibling state exactly once.
-    output = cc.IssueRecoveryState(rebase_failures=2)
+    output = cc.IssueRecoveryState(infra_failures=2)
     assert store.settle_issue_recovery(money(request.run_id), admission, output).disposition is AccountingDisposition.AVAILABLE
     current = read(store, aggregate)
-    assert current.issue_recovery.state.rebase_failures == 2
+    assert current.issue_recovery.state.infra_failures == 2
     assert current.issue_recovery.state.resumes == 1
     assert current.issue_recovery.state.consumed_reply_at == selected.reply_at
     assert store.settle_issue_recovery(money(request.run_id), admission, output).idempotent
     assert read(store, aggregate) == current
     with pytest.raises(WorkflowAuthorityError, match="immutable result"):
-        store.settle_issue_recovery(money(request.run_id), admission, replace(output, rebase_failures=0))
+        store.settle_issue_recovery(money(request.run_id), admission, replace(output, infra_failures=0))
     assert store.snapshot(request.scope).settled.micros == 1
 
 
@@ -294,7 +294,7 @@ def test_caught_return_failure_rolls_back_money_and_component_in_outer_transacti
         monkeypatch.setattr(store, "transaction", existing_transaction)
         monkeypatch.setattr(rows, "persist_workflow_snapshot", failure)
         with pytest.raises(RuntimeError, match="caught return failure"):
-            store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState(rebase_failures=1))
+            store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState(infra_failures=1))
         assert load_issue_aggregate(db, aggregate.revision.fence.key) == current
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='continuation-return'").fetchone()[0] == 0
@@ -538,9 +538,9 @@ def test_primary_hold_refuses_fresh_launch_but_preserves_exact_retry_and_actual_
                                      pid=123, pgid=123, process_start_ticks=456)
     assert store.reserve_issue_recovery(requested, selected).admitted
     assert read(store, aggregate) == held
-    assert store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState(rebase_failures=1)).disposition is AccountingDisposition.AVAILABLE
+    assert store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState(infra_failures=1)).disposition is AccountingDisposition.AVAILABLE
     completed = read(store, aggregate)
-    assert completed.gates == held.gates and completed.issue_recovery.state.rebase_failures == 1
+    assert completed.gates == held.gates and completed.issue_recovery.state.infra_failures == 1
     assert store.snapshot(requested.scope).settled.micros == 1
 
 

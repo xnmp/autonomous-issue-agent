@@ -114,6 +114,7 @@ class FixWorkflowConfig:
     log: Callable[[str], None]
     max_ci_retries: int = 3
     max_review_retries: int = 3
+    max_rebase_retries: int = 3
     # The fixer's own login. The resume path must exclude the fixer's comments
     # with the SAME filter the decide side uses (domain.fix.last_human_reply),
     # or the resumed-at dedup mark records a different comment than the decide
@@ -1967,25 +1968,45 @@ class FixWorkflow:
         p, issue = dispatch
         if issue is None:
             return
-        # Read before any repair side effect: an unavailable active-review read
-        # raises a workflow hold and defers the whole repair (ADR 0015).
         guidance = self._pr_guidance(p.number)
-        cwd = self._ensure_cwd(issue, p.head_ref_name)
+        control = self.workflow_control
+        selected = control.read_pr_repair(WorkflowKey(control.writer.repository, PullRequestRef(pr))) if control is not None else None
+        if not isinstance(selected, cc.SelectedPRRepair):
+            self.cfg.log(f"rebase #{pr}: PR repair continuity is inactive or blocked")
+            return
+        control.reconcile_pr_repair_returns()
+        selected = control.read_pr_repair(selected.binding.fence.key)
+        if not isinstance(selected, cc.SelectedPRRepair):
+            return
+        issue_selected = control.read_issue_recovery(WorkflowKey(control.writer.repository, IssueRef(issue)))
+        if not isinstance(issue_selected, cc.SelectedIssueRecovery):
+            self.cfg.log(f"rebase #{pr}: issue recovery allowance is inactive or blocked")
+            return
+        if p.state != "OPEN" or self.gateway.pr_for_issue(issue, require_unique=True) != pr:
+            self.cfg.log(f"rebase #{pr}: current issue-to-PR linkage is ambiguous or changed")
+            return
+        runtime = RuntimeName(self._resolve_runtime_name())
+        handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
+                   if selected.component.state.actual_model is None and selected.component.state.session is None else None)
+        repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff, rebase=cc.RebaseRepairInput(
+            issue_selected, PullRequestRef(pr), p.head_ref_oid, p.head_ref_name,
+            self.cfg.max_rebase_retries if self.cfg.max_rebase_retries > 0 else 2**63-1))
+        cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
         task = task_builders.build_rebase_task(
-            pr, self.cfg.base_branch, cwd, self.store.get_session(issue),
-            self._repair_fix_cfg(issue, "rebase")
+            pr, self.cfg.base_branch, cwd, repair.session.handle if repair.session is not None else "",
+            self._repair_fix_cfg(issue, "rebase", inherited_model=repair.model)
         )
+        task = dataclasses.replace(task, pr_repair_input=repair)
+        self.runner.set_context("fix", "REBASE", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged("rebase", issue, task, p, kind="REBASE", guidance=guidance)
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
-        self.store.save_session(issue, result.session_id)
         # Same rule as fix_ci: neither an infra kill nor a budget-capped
         # admission/leg is a failed rebase attempt (#155).
         if outcome.budget_exhausted(result.exit_reason):
             pass
         elif not outcome.infra_class_failure(result):
-            self.store.set_rebase_retries(issue, self.store.get_rebase_retries(issue) + 1)
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         else:  # review C3/D2c, as in fix_ci
             self._charge_infra_death(issue, "rebase", result)

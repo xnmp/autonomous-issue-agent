@@ -54,7 +54,7 @@ class AccountedFixtureWorkflow(FixWorkflow):
         inner = original.inner if isinstance(original, JournalingRuntime) else original
         maximum = self.cfg.fix.max_budget_usd
         limits = {("fix", stage): Money.from_major("USD", maximum) for stage in (
-            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "FIX_CI", "ADDRESS_REVIEW",
+            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "FIX_CI", "ADDRESS_REVIEW", "REBASE",
         )}
         limits[("fix", "ROUTE")] = Money.from_major("USD", self.cfg.fix.router_budget_usd)
         accounted = AccountingRuntime(
@@ -139,6 +139,11 @@ class AccountedFixtureWorkflow(FixWorkflow):
         issue = issue_hint or self.gateway.issue_for_pr(pr)
         with self._accounted(issue, "ADDRESS_REVIEW", None):
             await super().address_review(pr, issue_hint=issue_hint)
+
+    async def rebase(self, pr, *, issue_hint=None):
+        issue = issue_hint or self.gateway.issue_for_pr(pr)
+        with self._accounted(issue, "REBASE", None):
+            await super().rebase(pr, issue_hint=issue_hint)
 
     async def resolve(self, issue, *, binding=None):
         binding = binding or resolve_state(self.store, issue).binding

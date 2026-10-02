@@ -124,6 +124,7 @@ class IssueRecoveryState:
     infra_failures: int = 0
     self_clears: int = 0
     pending_ci: ContinuationAdmission | None = field(default=None, repr=False)
+    pending_rebase: ContinuationAdmission | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed issue reply")
@@ -135,6 +136,9 @@ class IssueRecoveryState:
         if self.pending_ci is not None and (not isinstance(self.pending_ci, ContinuationAdmission)
                 or self.pending_ci.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
             raise ValueError("pending CI requires its exact issue recovery admission")
+        if self.pending_rebase is not None and (not isinstance(self.pending_rebase, ContinuationAdmission)
+                or self.pending_rebase.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
+            raise ValueError("pending rebase requires its exact issue recovery admission")
 
 
 @dataclass(frozen=True)
@@ -343,7 +347,7 @@ class ActiveIssueRecovery:
 
     def __post_init__(self) -> None:
         _active(self.identity, WorkflowFamily.ISSUE_RECOVERY, self.state, IssueRecoveryState, self.watermarks, self.gates)
-        for pending in (self.state.pending_ci, self.state.review_failures.pending):
+        for pending in (self.state.pending_ci, self.state.review_failures.pending, self.state.pending_rebase):
             if pending is not None and (pending.attempt.binding.fence.key != self.identity.key
                     or pending.attempt.binding.authority != self.identity.authority
                     or pending.attempt.binding.episode_id != self.identity.episode_id
@@ -457,6 +461,9 @@ def validate_component_revision(component: object, revision: WorkflowRevision, f
     if isinstance(component, ActiveIssueRecovery) and component.state.review_failures.pending is not None:
         if component.state.review_failures.pending.attempt.binding.fence.generation > revision.fence.generation:
             raise ValueError("pending review cannot originate in a future target generation")
+    if isinstance(component, ActiveIssueRecovery) and component.state.pending_rebase is not None:
+        if component.state.pending_rebase.attempt.binding.fence.generation > revision.fence.generation:
+            raise ValueError("pending rebase cannot originate in a future target generation")
 
 
 @dataclass(frozen=True)
@@ -750,6 +757,69 @@ class CIEpisodeReset:
 
 
 @dataclass(frozen=True)
+class IssueRebasePurchase:
+    capture: ContinuationCapture
+    pr: PullRequestRef
+    head: str
+    branch: str
+    ceiling: int
+
+    def __post_init__(self) -> None:
+        IssueCIPurchase(self.capture, self.pr, self.head, self.ceiling)
+        validate_workflow_text(self.branch, "selected rebase branch")
+
+
+@dataclass(frozen=True)
+class RebaseRepairInput:
+    selection: SelectedIssueRecovery
+    pr: PullRequestRef
+    head: str
+    branch: str
+    ceiling: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selection, SelectedIssueRecovery):
+            raise ValueError("rebase input requires selected issue recovery")
+        IssueRebasePurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "validation"),
+                            self.pr, self.head, self.branch, self.ceiling)
+
+
+class RebaseCharge(str, Enum):
+    ATTEMPT = "attempt"
+    NOT_ATTEMPT = "not_attempt"
+    NOT_LAUNCHED = "not_launched"
+
+
+@dataclass(frozen=True)
+class RebaseRepairResult:
+    admission: ContinuationAdmission
+    charge: RebaseCharge
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.admission, ContinuationAdmission)
+                or self.admission.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or not isinstance(self.charge, RebaseCharge)):
+            raise ValueError("rebase result requires its exact issue admission and classification")
+
+
+@dataclass(frozen=True)
+class RebaseAllowanceReset:
+    binding: WorkflowBinding
+    revision: WorkflowRevision
+    pr_fence: WorkflowFence
+    branch: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.binding, WorkflowBinding)
+                or self.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or not isinstance(self.revision, WorkflowRevision) or self.revision.fence != self.binding.fence
+                or not isinstance(self.pr_fence, WorkflowFence) or not isinstance(self.pr_fence.key.target, PullRequestRef)
+                or self.pr_fence.key.repository != self.binding.fence.key.repository):
+            raise ValueError("rebase reset requires exact issue authority and selected PR fence")
+        validate_workflow_text(self.branch, "selected reset branch")
+
+
+@dataclass(frozen=True)
 class PRRepairPurchase:
     capture: ContinuationCapture
     reply_at: str = ""
@@ -805,11 +875,17 @@ class PRRepairInput:
     handoff: RepairHandoff | None = None
     ci: CIRepairInput | None = None
     review: ReviewRepairInput | None = None
+    rebase: RebaseRepairInput | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, SelectedPRRepair) or not isinstance(self.runtime, RuntimeName):
             raise ValueError("repair input requires selected authority and runtime")
         validate_workflow_text(self.branch, "current remote repair branch")
+        if self.rebase is not None and (self.ci is not None or self.review is not None
+                or not isinstance(self.rebase, RebaseRepairInput)
+                or self.rebase.pr != self.selection.binding.fence.key.target or self.rebase.branch != self.branch
+                or self.rebase.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
+            raise ValueError("rebase input differs from selected repair PR, branch or lane")
         if self.review is not None and (self.ci is not None or not isinstance(self.review, ReviewRepairInput)
                 or self.review.pr != self.selection.binding.fence.key.target
                 or self.review.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
@@ -855,6 +931,7 @@ class PRRepairResult:
     settlement: SettlementRequest
     ci: CIRepairResult | None = None
     review: ReviewRepairResult | None = None
+    rebase: RebaseRepairResult | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.admission, ContinuationAdmission)
@@ -877,6 +954,13 @@ class PRRepairResult:
         if (self.state.session is not None and self.state.session.source != self.admission
                 or self.state.actual_model is None or self.state.actual_model.source != self.admission):
             raise ValueError("repair output requires its exact admitted provenance")
+        if self.rebase is not None and (self.ci is not None or self.review is not None
+                or not isinstance(self.rebase, RebaseRepairResult)
+                or self.rebase.admission.attempt.run_id != self.admission.attempt.run_id
+                or self.rebase.admission.attempt.leg_id != self.admission.attempt.leg_id
+                or self.rebase.admission.attempt.binding.fence.key.repository != self.admission.attempt.binding.fence.key.repository
+                or self.rebase.charge is RebaseCharge.NOT_LAUNCHED):
+            raise ValueError("paid rebase result requires the same launched run and leg")
         if self.state.session is not None and (
                 self.state.session.runtime is not self.state.actual_model.runtime
                 or self.state.session.model != self.state.actual_model.model):
@@ -1109,7 +1193,26 @@ def groom_admissible(selection: StewardSelection, input_at: str, signature: str,
         return False
 
 
-ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | IssueCIPurchase | IssueReviewPurchase | PRRepairPurchase | StewardPurchase
+ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | IssueCIPurchase | IssueReviewPurchase | IssueRebasePurchase | PRRepairPurchase | StewardPurchase
+
+
+def consume_issue_rebase(selection: SelectedIssueRecovery, purchase: IssueRebasePurchase, admission: ContinuationAdmission) -> ActiveIssueRecovery:
+    if selection.binding != purchase.capture.binding or selection.revision != purchase.capture.revision:
+        raise ValueError("rebase issue capture is stale")
+    component = selection.component
+    if (admission.attempt.binding != selection.binding or admission.admission_version != selection.revision.version + 1
+            or admission.attempt.leg_id != purchase.capture.leg_id):
+        raise ValueError("rebase admission differs from selected authority")
+    pending = component.state.pending_rebase
+    if (component.gates or component.state.rebase_failures >= purchase.ceiling
+            or pending is not None and pending.attempt.binding == selection.binding):
+        raise ValueError("rebase allowance is held, pending or exhausted")
+    return replace(component, state=replace(component.state, pending_rebase=admission),
+                   watermarks=component.watermarks.admit(admission.admission_version, selection.revision.fence))
+
+
+def rebase_return_is_current(selection: SelectedIssueRecovery, admission: ContinuationAdmission) -> bool:
+    return selection.binding == admission.attempt.binding and selection.component.state.pending_rebase == admission
 
 
 def consume_issue_review(selection: SelectedIssueRecovery, purchase: IssueReviewPurchase, admission: ContinuationAdmission) -> ActiveIssueRecovery:

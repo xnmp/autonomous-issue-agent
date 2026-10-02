@@ -146,3 +146,20 @@ def test_pr_repair_ambiguous_legacy_session_is_blocked_without_new_continuity(va
     result = classify_record(record(WorkflowFamily.PR_REPAIR, session=value))
     assert isinstance(result, tuple) and result
     assert all(isinstance(item, cc.ContinuationImportBlocker) and item.source and item.reason for item in result)
+
+
+@pytest.mark.parametrize("value", ["", "-1", "1.5", "9" * 5000, str(2**63), "\ufffd"])
+def test_malformed_legacy_rebase_debt_stays_source_specifically_blocked(value):
+    result = classify_record(record(**{"rebase-retries": value}))
+    assert isinstance(result, tuple) and result
+    assert all("rebase-retries" in blocker.reason for blocker in result)
+
+
+def test_rebase_shadow_rejects_ambiguous_selected_source():
+    from issue_agent.domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget, rebase_shadow
+    original = record(**{"rebase-retries": "2"})
+    target = ContinuationImportTarget(original.key, original.family, None, "a" * 64, cc.IssueRecoveryState(rebase_failures=2))
+    plan = ContinuationImportPlan("o/r", (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR), 1, "a" * 64, "c" * 64, "d" * 64, (target,))
+    assert rebase_shadow(plan, (original,)) == ((original.key, 2, 2),)
+    with pytest.raises(ValueError, match="ambiguous source ownership"):
+        rebase_shadow(plan, (original, original))

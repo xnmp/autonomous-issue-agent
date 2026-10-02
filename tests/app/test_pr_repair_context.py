@@ -56,7 +56,7 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="continued"))
 
     dispatcher = _ci_dispatcher(gateway, store, runner, operator_guidance=guidance)
-    if kind in {AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW}:
+    if kind in {AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE}:
         runner.result = replace(runner.result, session_id="old-blocked-session")
         asyncio.run(dispatcher.fix_workflow.fix_ci(100))
         runner.tasks.clear()

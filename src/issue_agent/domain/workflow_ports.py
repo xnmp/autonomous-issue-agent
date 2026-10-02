@@ -4,7 +4,7 @@ from typing import Protocol, runtime_checkable
 from contextlib import AbstractContextManager
 
 from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
-from .continuation_components import CIEpisodeReset, IssueRecoverySelection, PRRepairSelection, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
+from .continuation_components import CIEpisodeReset, RebaseAllowanceReset, IssueRecoverySelection, PRRepairSelection, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
 from .world import IssueView
 from .agent_task import RuntimeName
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
@@ -51,6 +51,8 @@ class WorkflowControl(Protocol):
     def read_issue_recovery(self, key: WorkflowKey) -> IssueRecoverySelection: ...
 
     def reset_ci_episode(self, source: CIEpisodeReset) -> bool: ...
+
+    def reset_rebase_allowance(self, source: RebaseAllowanceReset) -> bool: ...
 
     def reconcile_pr_repair_returns(self) -> int: ...
 

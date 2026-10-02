@@ -1004,8 +1004,8 @@ def test_rebase_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.REBASE, 100)))
 
-    assert store.get_session(5) == "reb-live"
-    assert store.get_rebase_retries(5) == 1
+    assert pr_repair_state(store).session.handle == "reb-live"
+    assert issue_recovery_state(store).rebase_failures == 1
     assert not any(c[0] == "relabel" for c in gw.calls)
     assert store.get_infra_deaths(5) == 0
 

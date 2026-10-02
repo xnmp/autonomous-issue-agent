@@ -7,7 +7,6 @@ from issue_agent.adapters.store import Store
 
 @pytest.mark.parametrize("raw", ["oops", "", "-1", "1.5", "9" * 5000, "\ufffd"])
 @pytest.mark.parametrize("suffix,reader", [
-    ("rebase-retries", "get_rebase_retries"),
     ("infra-deaths", "get_infra_deaths"),
 ])
 def test_malformed_counter_never_becomes_fresh_allowance(tmp_path, raw, suffix, reader):
@@ -18,14 +17,14 @@ def test_malformed_counter_never_becomes_fresh_allowance(tmp_path, raw, suffix, 
 
 
 def test_missing_counter_is_a_new_workflow(tmp_path):
-    assert Store(str(tmp_path)).get_rebase_retries(7) == 0
+    assert Store(str(tmp_path)).get_infra_deaths(7) == 0
 
 
 def test_unreadable_counter_does_not_become_absent(tmp_path):
     store = Store(str(tmp_path))
-    (tmp_path / "issue-7.rebase-retries").mkdir()
+    (tmp_path / "issue-7.infra-deaths").mkdir()
     with pytest.raises((OSError, ValueError)):
-        store.get_rebase_retries(7)
+        store.get_infra_deaths(7)
 
 
 def test_control_delete_failure_is_reported(tmp_path):

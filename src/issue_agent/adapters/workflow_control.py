@@ -172,6 +172,10 @@ class SQLiteWorkflowControl:
         self._scope(source.binding.fence.key)
         return self._control.reset_ci_episode(source, self.writer)
 
+    def reset_rebase_allowance(self, source: cc.RebaseAllowanceReset) -> bool:
+        self._scope(source.binding.fence.key)
+        return self._control.reset_rebase_allowance(source, self.writer)
+
     def load_workflow(self, key: WorkflowKey) -> WorkflowRead:
         self._scope(key)
         try:

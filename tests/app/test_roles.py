@@ -763,6 +763,7 @@ def _rebase_pr(issue):
 
 
 def test_rebase_retries_round_trip_trips_the_breaker(tmp_path):
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
     """review C4. Write: REBASE dispatches bump rebase-retries via the REAL
     FixWorkflow.rebase. Read/decide as above, for the CONFLICTING-branch leg."""
     issue, pr = 6, 200
@@ -776,12 +777,12 @@ def test_rebase_retries_round_trip_trips_the_breaker(tmp_path):
         return WorldState(prs=(_rebase_pr(issue),))
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.REBASE, pr)))
-    assert store.get_rebase_retries(issue) == 1
+    assert store._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue))).component.state.rebase_failures == 1
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert _has_run(actions, AgentKind.REBASE)
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.REBASE, pr)))
-    assert store.get_rebase_retries(issue) == 2
+    assert store._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue))).component.state.rebase_failures == 2
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert not _has_run(actions, AgentKind.REBASE)
     assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
