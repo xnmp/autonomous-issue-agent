@@ -81,7 +81,6 @@ from ...domain.effort import (
 from ...domain.labels import Label
 from ...domain import continuation_components as cc
 from ...domain.lifecycle import AllowedEligibility, LifecycleOperation, issue_eligibility
-from ...domain.self_clear import BudgetBlock
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
 from ...domain.trust import as_untrusted, untrusted_block
@@ -350,7 +349,6 @@ class FixWorkflow:
                 raise WorkflowAuthorityError(committed.reason)
             if not committed.idempotent and committed.snapshot.binding == returned.attempt.binding:
                 pr = linkage.pr if isinstance(linkage, LinkedPrPresent) else None
-                self._record_block_state(key.target.number, Target.ISSUE, key.target.number, returned.result(), pr=pr)
                 self._journal_budget_path(key.target.number, returned.stage.value.casefold(), returned.exit_reason, pr)
             return True
         except Exception as exc:
@@ -392,42 +390,6 @@ class FixWorkflow:
         runtime = self.cfg.fixer_runtime
         return runtime.value if isinstance(runtime, RuntimeName) else runtime
 
-    def _record_block_state(
-        self,
-        issue: int,
-        target: Target,
-        number: int,
-        result,
-        *,
-        pr: int | None = None,
-        blocked_head: str = "",
-    ) -> None:
-        """Persist only typed blocker claims; never classify the prose in needs."""
-
-        if outcome.infra_class_failure(result) and not outcome.budget_exhausted(
-            result.exit_reason
-        ):
-            return
-        if outcome.budget_exhausted(result.exit_reason):
-            facts = result.admission_budget_block
-            if facts is None:
-                # A per-leg spend kill is not an admission predicate. Replaying
-                # it under the same per-leg ceiling would only repeat the kill.
-                return
-            block = BudgetBlock(
-                issue,
-                target,
-                number,
-                facts.reservation_micros,
-                facts.scope,
-                facts.cap_micros,
-                max(0, facts.cap_micros - facts.committed_micros),
-                facts.currency,
-            )
-            writer = getattr(self.store, "set_budget_block", None)
-            if writer is not None:
-                writer(block)
-            return
 
     def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None, *, remember: bool = True) -> str:
         from ...domain.workflow import CompletedRearm
@@ -900,8 +862,6 @@ class FixWorkflow:
         if changed:
             self.cfg.log(f"resolve #{issue}: requirements changed during work; requeueing for the new facts")
             actions = [Relabel(Target.ISSUE, issue, Label.AI_WORKING, Label.AI_READY)]
-        else:
-            self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
         return self._execute_resolve_actions(issue, actions, binding, current=current)
 
     def _resolve_actions(self, issue: int, result, pr: int | None):
@@ -1579,7 +1539,6 @@ class FixWorkflow:
         else:
             changed = False
             current = None
-        self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
         if outcome.infra_class_failure(result):
             self._charge_infra_death(issue, "resume", result)
         else:
@@ -1698,9 +1657,6 @@ class FixWorkflow:
             "pr-resume", issue, task, p, kind="PR_RESUME", reply=reply_comment.body,
             guidance=guidance,
         )
-        self._record_block_state(
-            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
-        )
         if outcome.infra_class_failure(result):
             self._charge_infra_death(issue, "pr-resume", result)
         else:
@@ -1784,9 +1740,6 @@ class FixWorkflow:
         self.runner.set_context("fix", "ADDRESS_REVIEW", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged(
             "address-review", issue, task, p, kind="ADDRESS_REVIEW", guidance=guidance,
-        )
-        self._record_block_state(
-            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
         out = outcome.address_review_actions(pr, result)
         self.executor.execute_all(out.actions)
@@ -1889,9 +1842,6 @@ class FixWorkflow:
             fix_cfg=self._repair_fix_cfg(issue, "fix-ci", inherited_model=repair.model)), pr_repair_input=repair)
         self.runner.set_context("fix", "FIX_CI", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged("fix-ci", issue, task, p, kind="FIX_CI", guidance=guidance)
-        self._record_block_state(
-            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
-        )
         # An externally-killed session made no attempt, so it must not march the
         # CI breaker toward needs-human-review (FAILURE-MODES #58: six SIGKILLs on
         # one PR burned the whole budget on work that never ran). Neither did a
@@ -1963,9 +1913,6 @@ class FixWorkflow:
         task = dataclasses.replace(task, pr_repair_input=repair)
         self.runner.set_context("fix", "REBASE", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged("rebase", issue, task, p, kind="REBASE", guidance=guidance)
-        self._record_block_state(
-            issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
-        )
         # Same rule as fix_ci: neither an infra kill nor a budget-capped
         # admission/leg is a failed rebase attempt (#155).
         if outcome.budget_exhausted(result.exit_reason):

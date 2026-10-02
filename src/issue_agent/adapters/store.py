@@ -32,7 +32,6 @@ from ..domain.ci_history import (
 from ..domain.world import normalize_predicted_paths
 from ..domain.actions import Target
 from ..domain.ports import WorkflowControlError
-from ..domain.self_clear import BudgetBlock
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
 # Every accessor below writes `issue-N.<suffix>` or `pr-N.<suffix>` via
@@ -333,60 +332,12 @@ class Store:
         )
         return history
 
-    def get_budget_block(self, issue: int) -> BudgetBlock | None:
-        path = self.issue_path(issue, "budget-block")
-        raw = self._read_control(path)
-        if raw is None:
-            return None
-        try:
-            value = json.loads(raw)
-            old = value.get("old_headroom_micros")
-            return BudgetBlock(
-                issue=issue,
-                target=Target[str(value["target"])],
-                number=self._integer(value["number"], path),
-                reservation_micros=self._integer(value["reservation_micros"], path),
-                scope=str(value["scope"]),
-                cap_micros=self._integer(value["cap_micros"], path),
-                old_headroom_micros=None if old is None else self._integer(old, path, signed=True),
-                currency=str(value.get("currency", "USD")),
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise WorkflowControlError(path, "malformed budget block") from exc
-
-    def set_budget_block(self, block: BudgetBlock) -> None:
-        self._write(
-            self.issue_path(block.issue, "budget-block"),
-            json.dumps(
-                {
-                    "target": block.target.name,
-                    "number": block.number,
-                    "reservation_micros": block.reservation_micros,
-                    "scope": block.scope,
-                    "cap_micros": block.cap_micros,
-                    "old_headroom_micros": block.old_headroom_micros,
-                    "currency": block.currency,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-
-    def clear_budget_block(self, issue: int) -> None:
-        self._remove(self.issue_path(issue, "budget-block"))
-
     def get_self_clear_count(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "self-clears"))
 
     def increment_self_clear_count(self, issue: int) -> int:
         count = self.get_self_clear_count(issue) + 1
         self._write(self.issue_path(issue, "self-clears"), str(count))
-        return count
-
-    def complete_budget_self_clear(self, issue: int) -> int:
-        count = self.get_self_clear_count(issue) + 1
-        self._write(self.issue_path(issue, "self-clears"), str(count))
-        self.clear_budget_block(issue)
         return count
 
     def self_clear_ceiling_reported(self, issue: int) -> bool:

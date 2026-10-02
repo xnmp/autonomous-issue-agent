@@ -229,6 +229,8 @@ class FixState:
     machine_revisions: dict[int, cc.WorkflowRevision] = field(default_factory=dict)
     machine_control_errors: Mapping[int, str] = field(default_factory=dict)
     budget_blocks: dict[int, BudgetBlock] = field(default_factory=dict)
+    budget_revisions: dict[int, cc.WorkflowRevision] = field(default_factory=dict)
+    budget_control_errors: Mapping[int, str] = field(default_factory=dict)
     budget_worlds: dict[int, BudgetWorld] = field(default_factory=dict)
     self_clear_counts: dict[int, int] = field(default_factory=dict)
     self_clear_ceiling_reported: frozenset[int] = frozenset()
@@ -1727,6 +1729,7 @@ def decide_fix(
         state.self_clear_ceiling_reported,
         cfg.ci_ignore_checks,
         machine_revisions=state.machine_revisions,
+        budget_revisions=state.budget_revisions,
     )
     actions.extend(retiring)
     retiring_issues = {
@@ -1790,7 +1793,7 @@ def decide_fix(
     issues_by_number = {issue.number: issue for issue in world.issues}
 
     def dispatchable(issue: int, paths: frozenset[str]) -> bool:
-        if issue in state.infra_control_errors or issue in state.machine_control_errors:
+        if issue in state.infra_control_errors or issue in state.machine_control_errors or issue in state.budget_control_errors:
             return False
         exclusive = not paths
         return all(
@@ -2115,6 +2118,7 @@ def decide_fix(
         if issue.number not in guarded
         and issue.number not in state.infra_control_errors
         and issue.number not in state.machine_control_errors
+        and issue.number not in state.budget_control_errors
         and isinstance(workflow := state.resolve_workflows.get(issue.number), WorkflowSnapshot)
         and not workflow.gates
     ))

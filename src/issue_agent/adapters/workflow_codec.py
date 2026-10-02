@@ -10,6 +10,7 @@ from datetime import datetime
 from enum import Enum
 import json
 from typing import TypeVar
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from ..domain import workflow as w
 from ..domain import review_workflow as rw
@@ -26,14 +27,14 @@ from ..domain import review_return as review_return
 from ..domain.agent_task import RuntimeName
 from ..domain.review import ReviewMode
 from ..domain import workflow_identity as identity
-from ..domain.contracts import WorkflowAttemptIdentity, ContinuationAdmission, Money, TokenUsage, UsageSource, PricingBasis, SettlementRequest
+from ..domain.contracts import BudgetScope, WorkflowAttemptIdentity, ContinuationAdmission, Money, TokenUsage, UsageSource, PricingBasis, SettlementRequest
 from ..domain import continuation_components as cc
 from ..domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
 from ..domain.labels import Label
 from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
-from ..domain.self_clear import MachineBlock, MachineBlocker
+from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from ..domain.actions import Target
 from ..domain.outcome import Adjudication
 from ..domain.effort import Effort
@@ -47,6 +48,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    BudgetScope, BudgetBlock, cc.RefusedBudgetBlock,
     MachineBlock, cc.RecordedMachineBlock,
     cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
     cc.IssueRebasePurchase, cc.RebaseRepairResult, cc.RebaseAllowanceReset,
@@ -202,7 +204,7 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None},
     "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False, "head": ""},
     "PRRepairResult": {"ci": None, "review": None, "rebase": None, "machine_block": None},
-    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None, "machine_block": None},
+    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None, "machine_block": None, "budget_block": None},
     "ContinuationCapture": {"fix_infra_ceiling": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
@@ -252,7 +254,7 @@ def _encode(value: object, depth: int = 0) -> object:
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None))
                     and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
-                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block"} and getattr(value, field.name) is None)
+                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block", "budget_block"} and getattr(value, field.name) is None)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
                         or field.name == "review" and value.review is None
                         or field.name == "rebase" and value.rebase is None
@@ -279,6 +281,8 @@ def _encode(value: object, depth: int = 0) -> object:
                                   and isinstance(value.steward, cc.InactiveSteward))))
             },
         }
+    if isinstance(value, ZoneInfo):
+        return {"type": "timezone", "value": value.key}
     if isinstance(value, datetime):
         if value.tzinfo is None or value.utcoffset() is None:
             raise WorkflowEncodingError("workflow timestamps require an offset")
@@ -305,6 +309,13 @@ def _decode(value: object, depth: int = 0) -> object:
     tag = value.get("type")
     if not isinstance(tag, str):
         raise WorkflowEncodingError("workflow value requires a tagged variant")
+    if tag == "timezone":
+        if set(value) != {"type", "value"} or not isinstance(value["value"], str) or not 0 < len(value["value"]) <= 256:
+            raise WorkflowEncodingError("malformed workflow timezone")
+        try:
+            return ZoneInfo(value["value"])
+        except (ValueError, ZoneInfoNotFoundError) as exc:
+            raise WorkflowEncodingError("unknown workflow timezone") from exc
     if tag == "datetime":
         if set(value) != {"type", "value"} or not isinstance(value["value"], str):
             raise WorkflowEncodingError("malformed workflow timestamp")

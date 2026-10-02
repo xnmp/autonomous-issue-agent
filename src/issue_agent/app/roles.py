@@ -1958,6 +1958,9 @@ def _fix_state(
     }
     machine_blocks = {}
     machine_revisions = {}
+    budget_blocks = {}
+    budget_revisions = {}
+    budget_errors = {}
     machine_errors = {}
     for issue in issue_keys:
         try:
@@ -1969,13 +1972,12 @@ def _fix_state(
             if selected.component.state.machine_block is not None:
                 machine_blocks[issue] = selected.component.state.machine_block
                 machine_revisions[issue] = selected.revision
+            if selected.component.state.budget_block is not None:
+                budget_blocks[issue] = selected.component.state.budget_block
+                budget_revisions[issue] = selected.revision
         except (ValueError, sqlite3.Error) as exc:
             machine_errors[issue] = str(exc)
-    budget_blocks = {
-        issue: block
-        for issue in issue_keys
-        if (block := read(issue, store.get_budget_block, None)) is not None
-    }
+            budget_errors[issue] = str(exc)
     self_clear_counts = {
         issue: read(issue, store.get_self_clear_count, 0) for issue in issue_keys
     }
@@ -2000,6 +2002,8 @@ def _fix_state(
         machine_revisions=machine_revisions,
         machine_control_errors=machine_errors,
         budget_blocks=budget_blocks,
+        budget_revisions=budget_revisions,
+        budget_control_errors=budget_errors,
         self_clear_counts=self_clear_counts,
         self_clear_ceiling_reported=self_clear_ceiling_reported,
     )
@@ -2722,6 +2726,17 @@ def compose_fix_daemon(
             raise ValueError("machine discard lacks its selected SQL revision")
         control.retire_machine_block(action.revision)
 
+    def retire_budget(action):
+        if action.revision is None:
+            raise ValueError("budget retirement lacks its selected SQL revision")
+        control.retire_budget_block(action.revision, reservation_micros=action.reservation_micros)
+        return store.increment_self_clear_count(action.issue)
+
+    def discard_budget(action):
+        if action.revision is None:
+            raise ValueError("budget discard lacks its selected SQL revision")
+        control.retire_budget_block(action.revision)
+
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=log,
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
@@ -2731,10 +2746,10 @@ def compose_fix_daemon(
         clear_issue_state=cleanup_fix_state,
         reset_ci_retries=reset_ci_episode,
         retire_machine_block=retire_machine,
-        retire_budget_block=store.complete_budget_self_clear,
+        retire_budget_block=retire_budget,
         mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,
         discard_machine_block=discard_machine,
-        discard_budget_block=store.clear_budget_block,
+        discard_budget_block=discard_budget,
         journal=journal, alert_cmd=cfg.alert_cmd,
         effect_executor=effect_executor.actions,
     )

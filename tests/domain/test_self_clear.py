@@ -46,6 +46,29 @@ def _decide(world, *, machine=None, budget=None, budgets=None, count=0):
     )
 
 
+def test_budget_recovery_does_not_release_uncleared_machine_on_same_pr():
+    budget = BudgetBlock(7, Target.PR, 100, 2_000_000, "issue:7", 5_000_000, 100_000)
+    pr = _pr(head="different-head")
+    world = WorldState(prs=(pr,))
+    assert _decide(world, machine=_machine(), budget=budget,
+        budgets=BudgetWorld((BudgetLimitObservation("issue:7", "available", 0, 5_000_000),), True)) == []
+
+
+def test_sibling_external_discards_are_selected_one_per_snapshot():
+    from dataclasses import replace
+    budget = BudgetBlock(7, Target.PR, 100, 2_000_000, "issue:7", 5_000_000, 100_000)
+    world = WorldState(prs=(replace(_pr(), labels=frozenset({Label.AI_PR_OPEN})),))
+    assert _decide(world, machine=_machine(), budget=budget) == [DiscardSelfClearMarker(7, "machine")]
+    assert _decide(world, budget=budget) == [DiscardSelfClearMarker(7, "budget")]
+
+
+def test_sibling_ceiling_reports_are_selected_once_per_snapshot():
+    budget = BudgetBlock(7, Target.PR, 100, 2_000_000, "issue:7", 5_000_000, 100_000)
+    actions = _decide(WorldState(prs=(_pr(),)), machine=_machine(), budget=budget,
+        budgets=BudgetWorld((BudgetLimitObservation("issue:7", "available", 0, 5_000_000),), True), count=3)
+    assert actions == [ReportSelfClearCeiling(7, Target.PR, 100, "publication", 3)]
+
+
 def test_publication_block_retires_only_on_the_recorded_open_pr_head():
     actions = _decide(WorldState(prs=(_pr(),)), machine=_machine())
 

@@ -10,7 +10,7 @@ import re
 from . import continuation_components as cc
 from .refs import issue_from_branch
 from .actions import Target
-from .self_clear import MachineBlock, MachineBlocker
+from .self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable
 from .workflow_identity import (
     WorkflowFamily, WorkflowKey, WorkflowRevision, canonical_workflow_repository,
@@ -33,6 +33,8 @@ def digest(value: object) -> str:
 
 
 def _plan_state_identity(state: ImportedState | None) -> object:
+    if isinstance(state, cc.IssueRecoveryState) and state.budget_block is not None:
+        return (repr(state), repr(state.machine_block), repr(state.budget_block))
     if isinstance(state, cc.IssueRecoveryState) and state.machine_block is not None:
         return (repr(state), repr(state.machine_block))
     if isinstance(state, cc.IssueRecoveryState) and not state.review_failures.review_at and state.review_failures.pr is None and state.review_failures.pending is None:
@@ -136,6 +138,20 @@ def _machine_block(record: LegacyContinuationRecord, text: str) -> MachineBlock:
                         value["pr"], MachineBlocker(value["blocker"]), value["blocked_head"])
 
 
+def _budget_block(record: LegacyContinuationRecord, text: str) -> BudgetBlock:
+    if record.family is not WorkflowFamily.ISSUE_RECOVERY or len(text) > 4096:
+        raise ValueError("budget hold requires bounded issue evidence")
+    value = json.loads(text)
+    if not isinstance(value, dict) or set(value) != {"target", "number", "reservation_micros", "scope", "cap_micros", "old_headroom_micros", "currency"}:
+        raise ValueError("budget hold requires its exact fixed fields")
+    block = BudgetBlock(record.key.target.number, Target[value["target"]], value["number"],
+                        value["reservation_micros"], value["scope"], value["cap_micros"],
+                        value["old_headroom_micros"], value["currency"])
+    if block.scope not in {"repository", "global", f"issue:{block.issue}"}:
+        raise ValueError("budget hold has an unsupported or mismatched cap scope")
+    return block
+
+
 def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[cc.ContinuationImportBlocker, ...]:
     """Only direct typed facts are imported; unsupported provenance stays held."""
     values: dict[str, str] = {}
@@ -161,7 +177,12 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                     _machine_block(record, text)
                 except (ValueError, TypeError, KeyError) as exc:
                     reason = str(exc)
-            elif name in {"session", "model", "budget-block", "self-clear-ceiling", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
+            elif name == "budget-block":
+                try:
+                    _budget_block(record, text)
+                except (ValueError, TypeError, KeyError) as exc:
+                    reason = str(exc)
+            elif name in {"session", "model", "self-clear-ceiling", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
             elif name == "review-retries":
                 at, separator, number = text.rpartition(" ")
@@ -195,7 +216,8 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
             return cc.IssueRecoveryState(values.get("resumed-at", ""), count("resumes"), values.get("branch", ""),
                                          count("ci-retries"), cc.ReviewRetryState(review_at, int(review_count)), count("rebase-retries"),
                                          count("infra-deaths"), count("self-clears"),
-                                         machine_block=_machine_block(record, values["machine-block"]) if "machine-block" in values else None)
+                                         machine_block=_machine_block(record, values["machine-block"]) if "machine-block" in values else None,
+                                         budget_block=_budget_block(record, values["budget-block"]) if "budget-block" in values else None)
         if record.family is WorkflowFamily.PR_REPAIR:
             return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
                                     infra_failures=count("infra-deaths"))
@@ -332,4 +354,23 @@ def machine_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuati
             raise ValueError("eligible machine shadow has unreadable selected evidence")
         before = _machine_block(found[0], source.text) if isinstance(source, LegacyPresent) else None
         comparisons.append((target.key, fact(before), fact(target.state.machine_block)))
+    return tuple(comparisons)
+
+
+def budget_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple | None, tuple | None], ...]:
+    def fact(block: BudgetBlock | None) -> tuple | None:
+        return ((block.issue, block.target.name, block.number, block.reservation_micros, block.scope,
+                 block.cap_micros, block.old_headroom_micros, block.currency) if block is not None else None)
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.IssueRecoveryState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.ISSUE_RECOVERY)
+        if len(found) > 1:
+            raise ValueError("eligible budget shadow has ambiguous source ownership")
+        source = dict(found[0].fields).get("budget-block", LegacyAbsent()) if found else LegacyAbsent()
+        if not isinstance(source, (LegacyAbsent, LegacyPresent)):
+            raise ValueError("eligible budget shadow has unreadable selected evidence")
+        before = _budget_block(found[0], source.text) if isinstance(source, LegacyPresent) else None
+        comparisons.append((target.key, fact(before), fact(target.state.budget_block)))
     return tuple(comparisons)

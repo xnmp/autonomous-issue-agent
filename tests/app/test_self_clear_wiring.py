@@ -41,15 +41,97 @@ def _executor(gateway, store, journal):
         store._workflow_db.retire_machine_block(action.revision, blocker=action.blocker,
                                                 blocked_head=action.blocked_head)
         return store.increment_self_clear_count(action.issue)
+    def retire_budget(action):
+        store._workflow_db.retire_budget_block(action.revision, reservation_micros=action.reservation_micros)
+        return store.increment_self_clear_count(action.issue)
     return ImmediateExecutor(
         gateway,
         journal=journal,
         retire_machine_block=retire,
-        retire_budget_block=store.complete_budget_self_clear,
+        retire_budget_block=retire_budget,
         mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,
         discard_machine_block=lambda action: store._workflow_db.retire_machine_block(action.revision),
-        discard_budget_block=store.clear_budget_block,
+        discard_budget_block=lambda action: store._workflow_db.retire_budget_block(action.revision),
     )
+
+
+@pytest.mark.parametrize("initial_count", [0, 2])
+@pytest.mark.parametrize("same_target", [False, True])
+@pytest.mark.parametrize("budget_available", [False, True])
+def test_sibling_recovery_uses_a_fresh_revision_and_shared_count_before_second_relabel(tmp_path, initial_count, same_target, budget_available):
+    import asyncio
+    from issue_agent.domain.outcome import AgentResult
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from tests.app.test_pr_repair_workflow import active_ci_workflow
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    workflow, store, _, _ = active_ci_workflow(AgentResult(
+        is_error=False, status="blocked", structured={"blocker": "publication"}, cost_usd=.01), Store(str(tmp_path)))
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="published-head")
+    asyncio.run(workflow.fix_ci(100))
+    seed_imported_budget_hold(store._workflow_db, BudgetBlock(5, Target.PR if same_target else Target.ISSUE,
+        100 if same_target else 5, 2_000_000, "issue:5", 5_000_000, 100_000))
+    for _ in range(initial_count):
+        store.increment_self_clear_count(5)
+    pr = PRView(100, head_ref_oid="published-head", labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}), closing_issue=5)
+    if same_target:
+        pr = replace(pr, labels=pr.labels | {Label.NEEDS_BUDGET_REVIEW})
+    issue = IssueView(5, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
+    gateway = InMemoryGitHub(prs={100: pr}, issues=(issue,))
+    journal = _Journal()
+    executor = _executor(gateway, store, journal)
+    key = WorkflowKey("o/r", IssueRef(5))
+    def decide():
+        selected = store._workflow_db.read_issue_recovery(key)
+        state = selected.component.state
+        return self_clear_actions(
+            WorldState(prs=(gateway.prs[100],), issues=(gateway.issues[5],)),
+            {5: state.machine_block} if state.machine_block is not None else {},
+            {5: state.budget_block} if state.budget_block is not None else {},
+            {5: BudgetWorld((BudgetLimitObservation("issue:5", "available" if budget_available else "unavailable", 0, 5_000_000),), True)},
+            {5: store.get_self_clear_count(5)}, frozenset(),
+            machine_revisions={5: selected.revision}, budget_revisions={5: selected.revision})
+    assert executor.execute_all(decide())
+    assert store.get_self_clear_count(5) == initial_count + 1
+    after = store._workflow_db.read_issue_recovery(key).component.state
+    assert after.machine_block is None and after.budget_block is not None
+    assert gateway.issues[5].labels == issue.labels
+    if same_target and not budget_available:
+        from issue_agent.app.roles import _fix_state
+        from issue_agent.domain.fix import FixConfig, decide_fix
+        from issue_agent.domain.actions import RunAgent
+        from issue_agent.domain.world import Check
+        paid_pr = replace(gateway.prs[100], author="fix-bot", head_ref_name="fix/5-test",
+                          checks=(Check("unit", bucket="fail"),))
+        paid_world = WorldState(prs=(paid_pr,), issues=(replace(issue, labels=frozenset({Label.AI_PR_OPEN})),))
+        state = _fix_state(store, paid_world, workflow_control=workflow.workflow_control)
+        cfg = FixConfig(fix_bot="fix-bot", ci_free_rerun=False)
+        actions = decide_fix(paid_world, cfg, state, fixer_busy=False)
+        assert not any(isinstance(action, RunAgent) for action in actions)
+        permitted = replace(paid_pr, labels=frozenset({Label.AI_PR_OPEN}))
+        permitted_world = replace(paid_world, prs=(permitted,))
+        permitted_state = replace(state, budget_blocks={}, budget_revisions={})
+        permitted_actions = decide_fix(permitted_world, cfg, permitted_state, fixer_busy=False)
+        assert any(isinstance(action, RunAgent) for action in permitted_actions), (
+            state.control_errors, state.machine_control_errors, state.budget_control_errors,
+            state.infra_control_errors, permitted_actions,
+        )
+    assert executor.execute_all(decide())
+    after = store._workflow_db.read_issue_recovery(key).component.state
+    if not budget_available:
+        assert after.budget_block is not None and store.get_self_clear_count(5) == initial_count + 1
+        assert gateway.issues[5].labels == issue.labels
+        if same_target:
+            assert Label.NEEDS_BUDGET_REVIEW in gateway.prs[100].labels
+    elif initial_count == 0:
+        assert after.budget_block is None and store.get_self_clear_count(5) == 2
+        if same_target:
+            assert gateway.prs[100].labels == frozenset({Label.AI_PR_OPEN})
+        else:
+            assert gateway.issues[5].labels == frozenset({Label.AI_READY})
+    else:
+        assert after.budget_block is not None and store.get_self_clear_count(5) == 3
+        assert gateway.issues[5].labels == issue.labels
+        assert store.self_clear_ceiling_reported(5)
 
 
 def test_machine_retirement_is_journalled_after_label_is_observed_gone(tmp_path):
@@ -103,7 +185,13 @@ def test_budget_retirement_removes_both_labels_and_journals_headroom(tmp_path):
         BudgetLimitObservation("issue:7", "available", 3_000_000, 5_000_000),
     ), True)
     store = Store(str(tmp_path))
-    store.set_budget_block(block)
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    object.__setattr__(store, "_workflow_db", control)
+    seed_imported_budget_hold(control, block)
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
     journal = _Journal()
     class RevisionBumpingGateway(InMemoryGitHub):
         def relabel(self, kind, number, remove, add):
@@ -115,7 +203,8 @@ def test_budget_retirement_removes_both_labels_and_journals_headroom(tmp_path):
 
     gateway = RevisionBumpingGateway(issues=(issue,))
     actions = self_clear_actions(
-        WorldState(issues=(issue,)), {}, {7: block}, {7: budget}, {7: 0}, frozenset()
+        WorldState(issues=(issue,)), {}, {7: block}, {7: budget}, {7: 0}, frozenset(),
+        budget_revisions={7: selected.revision}
     )
 
     assert len(actions) == 2
@@ -131,6 +220,7 @@ def test_budget_retirement_removes_both_labels_and_journals_headroom(tmp_path):
     assert gateway.has_label("issue", 7, "ai-ready")
     assert not gateway.has_label("issue", 7, "ai-blocked")
     assert not gateway.has_label("issue", 7, "needs-budget-review")
+    assert control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7))).component.state.budget_block is None
     assert [
         event.payload
         for event in journal.events
@@ -195,14 +285,6 @@ def test_harness_marker_observes_a_half_cleared_budget_transition():
     assert worlds[7].complete is True
 
 
-def test_malformed_store_markers_fail_closed(tmp_path):
-    store = Store(str(tmp_path))
-    store._write(store.issue_path(7, "budget-block"), '{"reservation_micros":-1}')
-
-    with pytest.raises(ValueError, match="control unavailable"):
-        store.get_budget_block(7)
-
-
 def test_ceiling_event_is_persisted_once(tmp_path):
     block = MachineBlock(
         7, Target.PR, 100, 100, MachineBlocker.PUBLICATION, "head"
@@ -214,7 +296,7 @@ def test_ceiling_event_is_persisted_once(tmp_path):
         InMemoryGitHub(prs={100: pr}),
         journal=journal,
         retire_machine_block=lambda action: store.increment_self_clear_count(action.issue),
-        retire_budget_block=store.complete_budget_self_clear,
+        retire_budget_block=lambda action: store.increment_self_clear_count(action.issue),
         mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,
     )
     action = self_clear_actions(

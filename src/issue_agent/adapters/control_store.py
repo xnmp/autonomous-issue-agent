@@ -4929,6 +4929,60 @@ class SQLiteControlStore:
                 Money.zero(request.scope.currency), request.quote.maximum_charge,
                 request.cap, f"deployment effect authority unavailable: {exc}")
 
+    def record_fix_budget_refusal(self, request: ReservationRequest) -> cc.RefusedBudgetBlock | None:
+        """Recheck the final cap trip after reconciliation without buying work."""
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        from ..domain.actions import Target
+        from ..domain.workflow_identity import PullRequestRef
+        purchases = tuple(item for item in request.continuations
+                          if item.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY)
+        if len(purchases) != 1 or request.workflow is None or deployment_role(request.workload_repository, request.owner_id) != "fix":
+            raise WorkflowAuthorityError("fix budget refusal requires its selected issue and primary context")
+        capture = purchases[0].capture
+        key = capture.binding.fence.key
+        fingerprint = hashlib.sha256((_review_request_fingerprint(request) + encode_workflow(request.continuations)).encode()).hexdigest()
+        receipt_key = self._continuation_receipt_key(request.run_id, WorkflowFamily.ISSUE_RECOVERY)
+        self.integrity_check()
+        with self.transaction() as db, self.mutation_savepoint(db):
+            self._assert_owner_active(db, request.owner_id)
+            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-budget-refusal' AND scope=? AND key=?",
+                               (key.repository, receipt_key)).fetchone()
+            if prior is not None:
+                block = decode_workflow(prior[0], cc.RefusedBudgetBlock)
+                if (block.capture != capture or block.run_id != str(request.run_id)
+                        or block.reservation_id != str(request.reservation_id) or block.request_fingerprint != fingerprint):
+                    raise WorkflowAuthorityError("fix budget refusal conflicts with its original request")
+                return block
+            if db.execute("SELECT 1 FROM runs WHERE run_id=?", (str(request.run_id),)).fetchone():
+                raise WorkflowAuthorityError("fix budget refusal already has a paid admission")
+            self._validate_workflow_reservation(db, request)
+            self._prepare_continuation_admissions(db, request)
+            aggregate = load_issue_aggregate(db, key)
+            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+            if not isinstance(selected, cc.SelectedIssueRecovery) or selected.binding != capture.binding or selected.revision != capture.revision:
+                raise WorkflowAuthorityError("fix budget refusal issue selection is stale or inactive")
+            for limit in (BudgetLimit(request.scope, request.cap), *request.additional_limits):
+                settled, reserved = self._balance(db, limit.scope)
+                committed = settled + reserved
+                if committed + request.quote.maximum_charge.micros <= limit.cap.micros:
+                    continue
+                target = request.workflow.fence.key.target
+                block = cc.RefusedBudgetBlock(issue=key.target.number,
+                    target=Target.PR if isinstance(target, PullRequestRef) else Target.ISSUE,
+                    number=target.number, reservation_micros=request.quote.maximum_charge.micros,
+                    scope=limit.scope.dimension, cap_micros=limit.cap.micros,
+                    old_headroom_micros=max(0, limit.cap.micros-committed), currency=limit.scope.currency,
+                    capture=capture, run_id=str(request.run_id), reservation_id=str(request.reservation_id),
+                    config_version=request.config_version, budget_scope=limit.scope,
+                    request_fingerprint=fingerprint, refused_at=self._now(), committed_micros=committed)
+                persist_workflow_snapshot(db, replace(aggregate,
+                    revision=replace(aggregate.revision, version=aggregate.revision.version+1),
+                    issue_recovery=replace(selected.component, state=replace(selected.component.state, budget_block=block))))
+                db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('fix-budget-refusal',?,?,?,?)",
+                           (key.repository, receipt_key, _stamp(block.refused_at), encode_workflow(block)))
+                return block
+            return None
+
     def record_review_admission_refusal(
         self, request: ReservationRequest,
     ) -> ReviewChildAdmissionRefusal | None:
@@ -5430,6 +5484,7 @@ class SQLiteControlStore:
             if isinstance(selection, cc.SelectedIssueRecovery):
                 self._require_fix_infra_projection(db, selection)
                 self._require_machine_projection(db, selection)
+                self._require_budget_projection(db, selection)
             if (not isinstance(selection, (cc.SelectedIssueRecovery, cc.SelectedPRRepair, cc.SelectedSteward))
                     or getattr(aggregate, "gates", ()) or selection.component.gates
                     or not (selection.binding == admission.attempt.binding and admission.admission_version <= selection.revision.version
@@ -5583,6 +5638,7 @@ class SQLiteControlStore:
                     self._require_issue_reply_projection(db, key, selection.component.state.consumed_reply_at)
                     self._require_fix_infra_projection(db, selection)
                     self._require_machine_projection(db, selection)
+                    self._require_budget_projection(db, selection)
                     if isinstance(purchase, cc.IssueInfraPurchase):
                         if selection.binding != capture.binding or selection.component.gates:
                             raise ValueError("fix infrastructure capture is stale or held")
@@ -6317,6 +6373,7 @@ class SQLiteControlStore:
             if isinstance(selected, cc.SelectedIssueRecovery):
                 self._require_fix_infra_projection(db, selected)
                 self._require_machine_projection(db, selected)
+                self._require_budget_projection(db, selected)
             if isinstance(selected, cc.SelectedIssueRecovery) and selected.component.state.pending_ci is not None:
                 pending = selected.component.state.pending_ci
                 purchase, _ = self._continuation_return_admission(db, pending, WorkflowFamily.ISSUE_RECOVERY)
@@ -6871,6 +6928,45 @@ class SQLiteControlStore:
                     or target.state.machine_block != block):
                 raise WorkflowAuthorityError("imported machine hold lacks its exact original decision")
 
+    def _require_budget_projection(self, db, selected: cc.SelectedIssueRecovery) -> None:
+        block = selected.component.state.budget_block
+        if block is None:
+            return
+        key = selected.binding.fence.key
+        if isinstance(block, cc.RefusedBudgetBlock):
+            if (block.capture.revision.fence.generation > selected.revision.fence.generation
+                    or block.capture.revision.fence == selected.revision.fence
+                    and block.capture.revision.version >= selected.revision.version):
+                raise WorkflowAuthorityError("budget hold comes from a future issue selection")
+            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='fix-budget-refusal' AND scope=? AND key=?",
+                (key.repository, self._continuation_receipt_key(RunId(block.run_id), WorkflowFamily.ISSUE_RECOVERY))).fetchone()
+            if row is None or decode_workflow(row[0], cc.RefusedBudgetBlock) != block:
+                raise WorkflowAuthorityError("budget hold lacks its exact final refusal receipt")
+        else:
+            from ..domain.continuation_import import ContinuationImportTarget
+            row = db.execute("SELECT decision_json FROM workflow_activation_imports WHERE repository=? AND family=? AND epoch=? AND target_kind=? AND target_number=?",
+                (key.repository, WorkflowFamily.ISSUE_RECOVERY.value, selected.binding.authority.epoch, *workflow_scope(key)[1:])).fetchone()
+            target = decode_workflow(row[0], ContinuationImportTarget) if row is not None else None
+            if (target is None or target.key != key or not isinstance(target.state, cc.IssueRecoveryState)
+                    or target.state.budget_block != block):
+                raise WorkflowAuthorityError("imported budget hold lacks its exact original decision")
+
+    def retire_budget_block(self, revision: WorkflowRevision, *, reservation_micros: int | None = None) -> int:
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        with self.transaction() as db, self.mutation_savepoint(db):
+            aggregate = load_issue_aggregate(db, revision.fence.key)
+            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+            if not isinstance(selected, cc.SelectedIssueRecovery) or selected.revision != revision:
+                raise WorkflowAuthorityError("budget retirement selection is stale or inactive")
+            self._require_budget_projection(db, selected)
+            block = selected.component.state.budget_block
+            if block is None or reservation_micros is not None and block.reservation_micros != reservation_micros:
+                raise WorkflowAuthorityError("budget retirement differs from its selected reservation")
+            persist_workflow_snapshot(db, replace(aggregate,
+                revision=replace(revision, version=revision.version+1),
+                issue_recovery=replace(selected.component, state=replace(selected.component.state, budget_block=None))))
+            return selected.component.state.self_clears
+
     def retire_machine_block(self, revision: WorkflowRevision, *, blocker: str | None = None,
                              blocked_head: str | None = None) -> int:
         from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
@@ -7140,7 +7236,8 @@ class SQLiteControlStore:
                                       ci_failures=component.state.ci_failures, pending_ci=component.state.pending_ci,
                                       infra_failures=component.state.infra_failures, infra_episode=component.state.infra_episode,
                                       review_failures=component.state.review_failures, rebase_failures=component.state.rebase_failures,
-                                      pending_rebase=component.state.pending_rebase, machine_block=component.state.machine_block)
+                                      pending_rebase=component.state.pending_rebase, machine_block=component.state.machine_block,
+                                      budget_block=component.state.budget_block)
                     after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
                 elif isinstance(selection, cc.SelectedPRRepair):
                     if not isinstance(aggregate, ReviewWorkflowSnapshot):

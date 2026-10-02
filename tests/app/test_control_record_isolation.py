@@ -124,10 +124,15 @@ def test_corrupt_current_review_allowance_holds_only_affected_pr(rig):
     '{"target":"ISSUE","number":1,"reservation_micros":true,"scope":"issue","cap_micros":100}',
 ])
 def test_structured_control_corruption_does_not_starve_peer(tmp_path, raw):
-    (tmp_path / "issue-1.budget-block").write_text(raw)
+    from issue_agent.domain.self_clear import BudgetBlock
+    from issue_agent.domain.actions import Target
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
     world = WorldState(issues=tuple(IssueView(n, labels=frozenset({Label.AI_READY}), updated_at="r")
                                   for n in (1, 2)))
-    _, workflows = workflow_control(tmp_path)
+    control, workflows = workflow_control(tmp_path)
+    seed_imported_budget_hold(control, BudgetBlock(1, Target.ISSUE, 1, 2_000_000, "issue:1", 5_000_000, 250_000, "USD"))
+    with control.transaction() as db:
+        db.execute("UPDATE workflow_activation_imports SET decision_json=? WHERE target_number=1 AND family='issue_recovery'", (raw,))
     actions = decide_fix(world, FixConfig(fix_bot="fix-bot"),
                          _fix_state(Store(str(tmp_path)), world, workflow_control=workflows), fixer_busy=False)
     assert [a.number for a in actions if isinstance(a, RunAgent)] == [2]

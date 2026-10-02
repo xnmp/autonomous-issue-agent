@@ -15,6 +15,7 @@ from .actions import (
     Target,
 )
 from .ci import ci_state
+from .contracts import Money
 from .labels import Label
 from .world import CIState, WorldState
 from .workflow_identity import WorkflowRevision, validate_workflow_integer, validate_workflow_text
@@ -60,16 +61,18 @@ class BudgetBlock:
     currency: str = "USD"
 
     def __post_init__(self) -> None:
-        if min(self.issue, self.number) <= 0:
-            raise ValueError("budget block identifiers must be positive")
-        if self.reservation_micros < 0:
-            raise ValueError("budget reservation cannot be negative")
-        if not self.scope:
-            raise ValueError("budget block requires its admission scope")
-        if self.cap_micros < 0:
-            raise ValueError("budget cap cannot be negative")
-        if self.old_headroom_micros is not None and self.old_headroom_micros < 0:
-            raise ValueError("budget headroom cannot be negative")
+        for value in (self.issue, self.number):
+            validate_workflow_integer(value, "budget block target", minimum=1)
+        for value in (self.reservation_micros, self.cap_micros):
+            validate_workflow_integer(value, "budget block money")
+        if self.old_headroom_micros is not None:
+            validate_workflow_integer(self.old_headroom_micros, "budget block headroom")
+        validate_workflow_text(self.scope, "budget block scope", limit=512)
+        if not isinstance(self.target, Target) or self.target is Target.ISSUE and self.number != self.issue:
+            raise ValueError("budget block mutation must name its selected target")
+        if not isinstance(self.currency, str):
+            raise ValueError("budget block requires a typed currency")
+        Money(self.currency, 0)
 
 
 @dataclass(frozen=True)
@@ -148,6 +151,7 @@ def self_clear_actions(
     ignored_checks: tuple[str, ...] = (),
     ceiling: int = SELF_CLEAR_CEILING,
     machine_revisions: dict[int, WorkflowRevision] | None = None,
+    budget_revisions: dict[int, WorkflowRevision] | None = None,
 ) -> list[Action]:
     """Return only clears proven by the current snapshot; absence never clears."""
 
@@ -189,9 +193,21 @@ def self_clear_actions(
             ),
         ])
 
+    # Both causes share one component revision and allowance. A second mutation
+    # needs a fresh snapshot of the first retirement's revision and count.
+    machine_selected = {action.issue for action in actions if isinstance(action, (
+        FinalizeMachineBlockRetirement, DiscardSelfClearMarker, ReportSelfClearCeiling,
+    ))}
     issues = {candidate.number: candidate for candidate in world.issues}
     prs = {candidate.number: candidate for candidate in world.prs}
     for issue, block in budget_blocks.items():
+        if issue in machine_selected:
+            continue
+        sibling = machine_blocks.get(issue)
+        if sibling is not None and sibling.target is block.target and sibling.number == block.number:
+            # ai-blocked is shared remote projection. Budget recovery cannot
+            # remove an unresolved machine cause on the same target.
+            continue
         observed = (
             issues.get(block.number)
             if block.target is Target.ISSUE
@@ -202,7 +218,7 @@ def self_clear_actions(
         blocked = observed.has(Label.AI_BLOCKED)
         budget_label = observed.has(Label.NEEDS_BUDGET_REVIEW)
         if not blocked and not budget_label:
-            actions.append(DiscardSelfClearMarker(issue, "budget"))
+            actions.append(DiscardSelfClearMarker(issue, "budget", (budget_revisions or {}).get(issue)))
             continue
         clearable, tightest, new_headroom = _budget_clearable(
             budget_worlds.get(issue, BudgetWorld()), block.reservation_micros
@@ -246,5 +262,6 @@ def self_clear_actions(
             block.reservation_micros,
             tightest.cap_micros if tightest is not None else None,
             tightest.currency if tightest is not None else block.currency,
+            (budget_revisions or {}).get(issue),
         ))
     return actions

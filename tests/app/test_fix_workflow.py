@@ -2279,7 +2279,20 @@ def test_fix_ci_persists_structured_publication_block_for_reconciliation(tmp_pat
     assert marker.blocked_head == "blocked-head"
 
 
-def test_fix_ci_persists_harness_budget_facts_for_re_evaluation(tmp_path):
+def test_fix_ci_persists_harness_budget_facts_for_re_evaluation(tmp_path, monkeypatch):
+    from issue_agent.domain.contracts import ReservationId
+    from tests.fakes import accounted_workflow
+    original = accounted_workflow.AccountingRuntime
+    def limited(*args, **kwargs):
+        runtime = dataclasses.replace(original(*args, **kwargs), issue_cap=Money("USD", 5_000_000))
+        def admit(request):
+            overhang = dataclasses.replace(request, run_id=RunId("overhang"), reservation_id=ReservationId("overhang"),
+                kind="overhang", owner_id="o/r:fix:overhang", dispatch_id="overhang", workflow=None, continuations=(),
+                quote=dataclasses.replace(request.quote, maximum_charge=Money("USD", 4_750_000)))
+            assert runtime.store.reserve(overhang).admitted
+            return runtime.store.reserve(request)
+        return dataclasses.replace(runtime, admit=admit)
+    monkeypatch.setattr(accounted_workflow, "AccountingRuntime", limited)
     pr = PRView(
         100,
         head_ref_name="fix/5-token",
@@ -2288,33 +2301,23 @@ def test_fix_ci_persists_harness_budget_facts_for_re_evaluation(tmp_path):
         checks=(Check("unit", bucket="fail"),),
     )
     store = Store(str(tmp_path))
-    result = AgentResult(
-        is_error=True,
-        status="error_max_budget_usd",
-        exit_reason=ExitReason.BUDGET_EXHAUSTED,
-        structured={
-            "budget_block": {
-                "scope": "issue:5",
-                "reservation_micros": 2_000_000,
-                "old_headroom_micros": 250_000,
-                "currency": "USD",
-            }
-        },
-        admission_budget_block=AdmissionBudgetBlock(
-            "issue:5", 2_000_000, 5_000_000, 4_750_000, "USD"
-        ),
-    )
+    runner = FakeRunner(AgentResult(is_error=False, status="pushed", cost_usd=.01))
 
     asyncio.run(
-        _workflow(FakeGateway(prs={100: pr}), store, FakeRunner(result)).fix_ci(100)
+        _workflow(FakeGateway(prs={100: pr}), store, runner,
+                  fix=FixTaskConfig("o/r", agent_md="AM", model="m", max_budget_usd=2)).fix_ci(100)
     )
 
-    assert store.get_budget_block(5) == BudgetBlock(
-        5, Target.PR, 100, 2_000_000, "issue:5", 5_000_000, 250_000, "USD"
-    )
+    block = store._workflow_db.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state.budget_block
+    assert isinstance(block, cc.RefusedBudgetBlock)
+    assert (block.issue, block.target, block.number, block.reservation_micros, block.scope,
+            block.cap_micros, block.old_headroom_micros, block.currency) == (
+            5, Target.PR, 100, 2_000_000, "issue:5", 5_000_000, 250_000, "USD")
+    assert runner.tasks == []
 
 
-def test_in_run_budget_kill_does_not_create_a_re_evaluable_marker(tmp_path):
+@pytest.mark.parametrize("forged_facts", [None, AdmissionBudgetBlock("issue:5", 2_000_000, 5_000_000, 4_750_000, "USD")])
+def test_in_run_budget_kill_does_not_create_a_re_evaluable_marker(tmp_path, forged_facts):
     pr = PRView(
         100,
         head_ref_name="fix/5-token",
@@ -2327,6 +2330,7 @@ def test_in_run_budget_kill_does_not_create_a_re_evaluable_marker(tmp_path):
         is_error=True,
         status="error_max_budget_usd",
         exit_reason=ExitReason.BUDGET_EXHAUSTED,
+        admission_budget_block=forged_facts,
         # Even a forged agent payload is not admission authority.
         structured={
             "budget_block": {
@@ -2341,7 +2345,7 @@ def test_in_run_budget_kill_does_not_create_a_re_evaluable_marker(tmp_path):
         _workflow(FakeGateway(prs={100: pr}), store, FakeRunner(result)).fix_ci(100)
     )
 
-    assert store.get_budget_block(5) is None
+    assert store._workflow_db.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state.budget_block is None
 
 
 @pytest.mark.parametrize("missing", ["binding", "control", "row", "activation", "stale"])

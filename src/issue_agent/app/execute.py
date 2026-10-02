@@ -350,10 +350,10 @@ class Executor:
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         reset_ci_retries: Callable[[ResetCiRetries], None] | None = None,
         retire_machine_block: Callable[[FinalizeMachineBlockRetirement], int] | None = None,
-        retire_budget_block: Callable[[int], int] | None = None,
+        retire_budget_block: Callable[[FinalizeBudgetBlockRetirement], int] | None = None,
         mark_self_clear_ceiling: Callable[[int], None] | None = None,
         discard_machine_block: Callable[[DiscardSelfClearMarker], None] | None = None,
-        discard_budget_block: Callable[[int], None] | None = None,
+        discard_budget_block: Callable[[DiscardSelfClearMarker], None] | None = None,
         journal=None,
         alert_cmd: str = "",
         retry_delays: tuple[float, ...] = _DEFAULT_RETRY_DELAYS,
@@ -790,7 +790,7 @@ class Executor:
                 raise LifecycleWriteUnverified(
                     f"{kind} #{action.number} still has {', '.join(remaining)}"
                 )
-            count = self._retire_budget_block(action.issue)
+            count = self._retire_budget_block(action)
             if self._journal is not None:
                 self._journal.emit(TelemetryEvent(
                     BudgetBlockRetired(
@@ -820,7 +820,7 @@ class Executor:
             if action.marker == "machine":
                 self._discard_machine_block(action)
             elif action.marker == "budget":
-                self._discard_budget_block(action.issue)
+                self._discard_budget_block(action)
             else:
                 raise ValueError(f"unknown self-clear marker {action.marker!r}")
         elif isinstance(action, RunAgent):

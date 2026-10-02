@@ -181,3 +181,33 @@ def test_machine_hold_import_preserves_fixed_cause_head_and_target():
 def test_machine_import_refuses_incomplete_or_unbounded_selected_evidence(payload):
     result = classify_record(record(**{"machine-block": payload}))
     assert isinstance(result, tuple) and all("machine-block" in blocker.reason for blocker in result)
+
+
+def test_budget_hold_import_preserves_fixed_reservation_scope_and_currency():
+    import json
+    from issue_agent.domain.actions import Target
+    from issue_agent.domain.self_clear import BudgetBlock
+    payload = json.dumps(dict(target="ISSUE", number=7, reservation_micros=2_000_000,
+        scope="issue:7", cap_micros=5_000_000, old_headroom_micros=250_000, currency="USD"))
+    state = classify_record(record(**{"budget-block": payload}))
+    assert isinstance(state, cc.IssueRecoveryState)
+    assert state.budget_block == BudgetBlock(7, Target.ISSUE, 7, 2_000_000, "issue:7", 5_000_000, 250_000, "USD")
+
+
+@pytest.mark.parametrize("field,value", [("scope", ""), ("scope", "mystery"), ("scope", "issue:99"),
+    ("scope", "x" * 513), ("cap_micros", -1), ("cap_micros", True), ("cap_micros", 2**63),
+    ("reservation_micros", None), ("currency", ""), ("currency", "usd"), ("currency", None),
+    ("number", 8), ("old_headroom_micros", -1)])
+def test_budget_import_refuses_only_selected_malformed_evidence(field, value):
+    import json
+    payload = dict(target="ISSUE", number=7, reservation_micros=2_000_000,
+        scope="issue:7", cap_micros=5_000_000, old_headroom_micros=250_000, currency="USD")
+    payload[field] = value
+    result = classify_record(record(**{"budget-block": json.dumps(payload)}))
+    assert isinstance(result, tuple) and all("budget-block" in blocker.reason for blocker in result)
+
+
+@pytest.mark.parametrize("payload", ["{}", "null", '{"target":"ISSUE"}', "x" * 4097])
+def test_budget_import_requires_bounded_complete_evidence(payload):
+    result = classify_record(record(**{"budget-block": payload}))
+    assert isinstance(result, tuple) and all("budget-block" in blocker.reason for blocker in result)

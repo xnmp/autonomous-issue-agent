@@ -172,6 +172,7 @@ def test_composed_admission_refusal_prevents_provider_even_after_budget_reclaim(
     assert runtime.calls == 0
     assert len(attempts) == (2 if reclaim else 1)
     assert reconciler.calls == int(reclaim)
+    assert store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1))).component.state.budget_block is None
     if reclaim:
         assert attempts[0] == attempts[1]
     with store.transaction() as db:
@@ -1451,3 +1452,139 @@ def test_concurrent_review_validators_share_context_without_false_dedup(
     assert runtime.calls == 2
     assert [result.status for result in results] == ["ok", "ok"]
     assert store.active_reservation_runs() == ()
+
+
+def test_final_fix_cap_refusal_has_exact_receipt_without_paid_run(tmp_path):
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
+    wrapper, store = _wrapper(tmp_path, runtime, cap=0)
+    requests = []
+    def admit(request):
+        requests.append(request)
+        return store.reserve(request)
+    wrapper = dataclasses.replace(wrapper, admit=admit)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    key = WorkflowKey("o/r", IssueRef(1))
+    selected = store.read_issue_recovery(key)
+    block = selected.component.state.budget_block
+    assert isinstance(block, cc.RefusedBudgetBlock), (result.summary, len(requests))
+    assert block.budget_scope == requests[0].scope and block.config_version == "cfg"
+    assert store.record_fix_budget_refusal(requests[0]) == block
+    assert store.read_issue_recovery(key) == selected
+    with pytest.raises(ValueError, match="original request"):
+        store.record_fix_budget_refusal(dataclasses.replace(requests[0], config_version="new-config"))
+    assert store.read_issue_recovery(key) == selected
+    assert runtime.calls == 0
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+
+
+def test_reconciled_provisional_fix_refusal_does_not_persist_budget_hold(tmp_path):
+    from issue_agent.domain.contracts import ReservationId, SettlementRequest, PricingBasis
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
+    wrapper, store = _wrapper(tmp_path, runtime, cap=5_000_000)
+    attempts = []
+    def admit(request):
+        if not attempts:
+            overhang = dataclasses.replace(request, run_id=RunId("overhang"), reservation_id=ReservationId("overhang"),
+                kind="overhang", owner_id="o/r:fix:overhang", dispatch_id="overhang", workflow=None, continuations=(),
+                quote=dataclasses.replace(request.quote, maximum_charge=Money("USD", 4_000_000)))
+            assert store.reserve(overhang).admitted
+        attempts.append(request)
+        return store.reserve(request)
+    class Reconciler:
+        def reconcile_stale_reservations(self):
+            store.settle(SettlementRequest(RunId("overhang"), Money("USD", 0), PricingBasis.PROVIDER_REPORTED,
+                                          "overhang-zero", None, None, None))
+            return 1
+    wrapper = dataclasses.replace(wrapper, admit=admit, reservation_reconciler=Reconciler())
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert not result.is_error and runtime.calls == 1 and len(attempts) == 2, (result.summary, len(attempts))
+    assert store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1))).component.state.budget_block is None
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='fix-budget-refusal'").fetchone()[0] == 0
+        assert db.execute("SELECT sum(amount_micros) FROM charges").fetchone()[0] == 10000
+
+
+def test_old_fix_refusal_replay_cannot_replace_new_config_hold(tmp_path):
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
+    wrapper, store = _wrapper(tmp_path, runtime, cap=0)
+    requests = []
+    def admit(request):
+        requests.append(request)
+        return store.reserve(request)
+    wrapper = dataclasses.replace(wrapper, admit=admit)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    asyncio.run(wrapper.run(RuntimePlan("old", model="gpt-test", max_budget_usd=2)))
+    old_request = requests[-1]
+    newer = dataclasses.replace(wrapper, repository_cap=Money("USD", 1_000_000), config_version="new-config")
+    newer.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    asyncio.run(newer.run(RuntimePlan("new", model="gpt-test", max_budget_usd=2)))
+    key = WorkflowKey("o/r", IssueRef(1))
+    selected = store.read_issue_recovery(key)
+    assert selected.component.state.budget_block.cap_micros == 1_000_000
+    assert selected.component.state.budget_block.config_version == "new-config"
+    store.record_fix_budget_refusal(old_request)
+    assert store.read_issue_recovery(key) == selected
+    from issue_agent.domain.contracts import ReservationId
+    with pytest.raises(ValueError, match="stale"):
+        store.record_fix_budget_refusal(dataclasses.replace(old_request,
+            run_id=RunId("late-old-selection"), reservation_id=ReservationId("late-old-selection")))
+    assert store.read_issue_recovery(key) == selected
+    assert runtime.calls == 0
+
+
+@pytest.mark.parametrize("cap_kind", ["repository", "global", "issue"])
+def test_final_fix_refusal_records_exact_applicable_scope(tmp_path, cap_kind):
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
+    wrapper, store = _wrapper(tmp_path, runtime)
+    wrapper = dataclasses.replace(wrapper, repository_cap=Money("USD", 0) if cap_kind == "repository" else None,
+        global_cap=Money("USD", 0) if cap_kind == "global" else None,
+        issue_cap=Money("USD", 0) if cap_kind == "issue" else None)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    block = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1))).component.state.budget_block
+    assert isinstance(block, cc.RefusedBudgetBlock)
+    assert block.scope == ("issue:1" if cap_kind == "issue" else cap_kind)
+    assert block.budget_scope.repository == ("*" if cap_kind == "global" else "o/r")
+    assert block.budget_scope.period_id == ("lifetime:1" if cap_kind == "issue" else block.refused_at.date().isoformat())
+    assert runtime.calls == 0
+
+
+def test_fix_refusal_receipt_failure_rolls_back_even_when_caught_by_outer_transaction(tmp_path):
+    import sqlite3
+    from contextlib import contextmanager
+    from unittest.mock import patch
+    runtime = Runtime(AgentResult(False, status="ok", cost_usd=.01))
+    wrapper, store = _wrapper(tmp_path, runtime, cap=0)
+    requests = []
+    def admit(request):
+        requests.append(request)
+        return store.reserve(request)
+    wrapper = dataclasses.replace(wrapper, admit=admit)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    key = WorkflowKey("o/r", IssueRef(1))
+    original = store.read_issue_recovery(key)
+    with store.transaction() as db:
+        db.execute("CREATE TRIGGER reject_fix_refusal BEFORE INSERT ON dedupe_keys "
+                   "WHEN NEW.namespace='fix-budget-refusal' BEGIN SELECT RAISE(ABORT, 'receipt rejected'); END")
+    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert result.is_error and runtime.calls == 0
+    assert store.read_issue_recovery(key) == original
+    with store.transaction() as db:
+        @contextmanager
+        def enclosing_transaction():
+            yield db
+        with patch.object(store, "transaction", enclosing_transaction):
+            with pytest.raises(sqlite3.IntegrityError, match="receipt rejected"):
+                store.record_fix_budget_refusal(requests[0])
+            assert store.read_issue_recovery(key) == original
+    assert store.read_issue_recovery(key) == original
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='fix-budget-refusal'").fetchone()[0] == 0

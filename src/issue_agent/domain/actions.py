@@ -367,6 +367,7 @@ class FinalizeBudgetBlockRetirement:
     reservation_micros: int
     cap_micros: int | None
     currency: str
+    revision: WorkflowRevision | None = None
 
 
 @dataclass(frozen=True)

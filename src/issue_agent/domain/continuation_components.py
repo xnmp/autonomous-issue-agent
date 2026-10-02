@@ -6,12 +6,13 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 from .agent_task import RuntimeName
 from .refs import issue_from_branch
-from .contracts import ContinuationAdmission, SettlementRequest, WorkflowAttemptIdentity
+from .contracts import BudgetScope, ContinuationAdmission, SettlementRequest, WorkflowAttemptIdentity
 from .eligibility import IssueCompletionGuard, LifecycleOperation
-from .self_clear import MachineBlock
+from .self_clear import BudgetBlock, MachineBlock
 from .workflow_identity import (
     MAX_WORKFLOW_GATES, ContinuationComponentIdentity, FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
@@ -173,6 +174,40 @@ class RecordedMachineBlock(MachineBlock):
             raise ValueError("machine block requires its exact admitted issue source")
 
 
+@dataclass(frozen=True, kw_only=True)
+class RefusedBudgetBlock(BudgetBlock):
+    capture: ContinuationCapture
+    run_id: str
+    reservation_id: str
+    config_version: str
+    budget_scope: BudgetScope
+    request_fingerprint: str
+    refused_at: datetime
+    committed_micros: int
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (not isinstance(self.capture, ContinuationCapture)
+                or self.capture.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or self.capture.binding.fence.key.target.number != self.issue
+                or not isinstance(self.budget_scope, BudgetScope)
+                or not isinstance(self.budget_scope.period_timezone, ZoneInfo)
+                or self.budget_scope.dimension != self.scope or self.budget_scope.currency != self.currency):
+            raise ValueError("budget refusal requires its exact issue capture and applicable scope")
+        if not ((self.budget_scope.repository == self.capture.binding.fence.key.repository
+                 and self.scope in {"repository", f"issue:{self.issue}"})
+                or self.budget_scope.repository == "*" and self.scope == "global"):
+            raise ValueError("budget refusal has an unsupported or mismatched cap scope")
+        for name in ("run_id", "reservation_id", "config_version", "request_fingerprint"):
+            validate_workflow_identifier(getattr(self, name), "budget refusal " + name)
+        validate_workflow_integer(self.committed_micros, "budget refusal committed money")
+        if (self.committed_micros + self.reservation_micros <= self.cap_micros
+                or self.old_headroom_micros != max(0, self.cap_micros-self.committed_micros)):
+            raise ValueError("budget refusal requires its actual exhausted balance")
+        if not isinstance(self.refused_at, datetime) or self.refused_at.tzinfo is None or self.refused_at.utcoffset() is None:
+            raise ValueError("budget refusal requires its observed aware time")
+
+
 @dataclass(frozen=True)
 class IssueRecoveryState:
     consumed_reply_at: str = ""
@@ -187,6 +222,7 @@ class IssueRecoveryState:
     pending_rebase: ContinuationAdmission | None = field(default=None, repr=False)
     infra_episode: FixInfraEpisode | None = field(default=None, repr=False)
     machine_block: MachineBlock | None = field(default=None, repr=False)
+    budget_block: BudgetBlock | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed issue reply")
@@ -205,6 +241,8 @@ class IssueRecoveryState:
             raise ValueError("fix infrastructure state requires one typed episode")
         if self.machine_block is not None and not isinstance(self.machine_block, MachineBlock):
             raise ValueError("machine hold requires its fixed typed cause and head")
+        if self.budget_block is not None and not isinstance(self.budget_block, BudgetBlock):
+            raise ValueError("budget hold requires its fixed typed reservation evidence")
 
 
 @dataclass(frozen=True)
@@ -450,6 +488,15 @@ class ActiveIssueRecovery:
                 if (binding.fence.key != self.identity.key or binding.authority != self.identity.authority
                         or binding.episode_id != self.identity.episode_id):
                     raise ValueError("machine hold differs from its issue component")
+        budget = self.state.budget_block
+        if budget is not None:
+            if budget.issue != self.identity.key.target.number:
+                raise ValueError("budget hold belongs to another issue")
+            if isinstance(budget, RefusedBudgetBlock):
+                binding = budget.capture.binding
+                if (binding.fence.key != self.identity.key or binding.authority != self.identity.authority
+                        or binding.episode_id != self.identity.episode_id):
+                    raise ValueError("budget hold differs from its issue component")
 
 
 @dataclass(frozen=True)

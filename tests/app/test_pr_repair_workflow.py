@@ -105,9 +105,10 @@ def test_machine_block_return_survives_sql_reopen_and_exact_result_retry(tmp_pat
     from issue_agent.domain.actions import Target
     files = Store(str(tmp_path / "state"))
     budget = BudgetBlock(5, Target.PR, 100, 10000, "issue", 100000)
-    files.set_budget_block(budget)
     workflow, files, inner, _ = active_ci_workflow(AgentResult(
         is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01), files)
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    seed_imported_budget_hold(files._workflow_db, budget)
     workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
     asyncio.run(workflow.fix_ci(100))
     reopened = SQLiteControlStore(files._workflow_db.path)
@@ -115,7 +116,7 @@ def test_machine_block_return_survives_sql_reopen_and_exact_result_retry(tmp_pat
     block = reopened.read_issue_recovery(key).component.state.machine_block
     assert block is not None and block.blocker is MachineBlocker.CHECKS
     assert block.blocked_head == "a" * 40 and block.pr == 100
-    assert files.get_budget_block(5) == budget
+    assert reopened.read_issue_recovery(key).component.state.budget_block == budget
     with reopened.transaction() as db:
         returned = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
     reopened.settle_pr_repair_result(returned, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"))
@@ -1973,9 +1974,10 @@ def test_machine_retirement_is_selected_and_preserves_budget_hold(tmp_path):
     from issue_agent.domain.actions import Target
     files = Store(str(tmp_path / "state"))
     budget = BudgetBlock(5, Target.PR, 100, 10000, "issue", 100000)
-    files.set_budget_block(budget)
     workflow, files, _, _ = active_ci_workflow(AgentResult(
         is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01), files)
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    seed_imported_budget_hold(files._workflow_db, budget)
     workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
     asyncio.run(workflow.fix_ci(100))
     control = files._workflow_db
@@ -1986,7 +1988,7 @@ def test_machine_retirement_is_selected_and_preserves_budget_hold(tmp_path):
     assert control.read_issue_recovery(key) == selected
     control.retire_machine_block(selected.revision, blocker="checks", blocked_head="a" * 40)
     assert control.read_issue_recovery(key).component.state.machine_block is None
-    assert files.get_budget_block(5) == budget
+    assert control.read_issue_recovery(key).component.state.budget_block == budget
     with pytest.raises(ValueError, match="stale"):
         control.retire_machine_block(selected.revision, blocker="checks", blocked_head="a" * 40)
     assert files.get_self_clear_count(5) == 0
@@ -2021,3 +2023,30 @@ def test_stale_pr_machine_return_settles_without_installing_old_head(monkeypatch
     assert control.read_issue_recovery(issue_key) == newer
     with control.transaction() as db:
         assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
+
+
+def test_actual_final_budget_refusal_persists_sql_hold_without_paid_debit(monkeypatch, tmp_path):
+    from issue_agent.adapters.store import Store
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.domain.contracts import Money
+    from tests.fakes import accounted_workflow
+    original = accounted_workflow.AccountingRuntime
+    def limited(*args, **kwargs):
+        return replace(original(*args, **kwargs), issue_cap=Money("USD", 0))
+    monkeypatch.setattr(accounted_workflow, "AccountingRuntime", limited)
+    files = Store(str(tmp_path / "state"))
+    workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01), files)
+    before = files._workflow_db.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    asyncio.run(workflow.fix_ci(100))
+    reopened = SQLiteControlStore(files._workflow_db.path)
+    state = reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state
+    block = getattr(state, "budget_block", None)
+    assert block is not None
+    assert block.scope == "issue:5" and block.cap_micros == 0 and block.reservation_micros > 0
+    assert state.ci_failures == before.component.state.ci_failures
+    assert state.consumed_reply_at == before.component.state.consumed_reply_at
+    assert inner.tasks == []
+    with reopened.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0

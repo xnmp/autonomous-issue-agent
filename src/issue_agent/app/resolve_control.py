@@ -46,7 +46,7 @@ def compose_resolve_rearm(
             holds += ("infrastructure failure ceiling",)
         if selected.component.state.machine_block is not None:
             holds += ("machine blocker",)
-        if store.get_budget_block(issue) is not None:
+        if selected.component.state.budget_block is not None:
             holds += ("budget blocker",)
         return holds
 
