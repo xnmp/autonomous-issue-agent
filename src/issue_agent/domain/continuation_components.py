@@ -223,12 +223,15 @@ class IssueRecoveryState:
     infra_episode: FixInfraEpisode | None = field(default=None, repr=False)
     machine_block: MachineBlock | None = field(default=None, repr=False)
     budget_block: BudgetBlock | None = field(default=None, repr=False)
+    self_clear_ceiling_reported: bool = field(default=False, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed issue reply")
         validate_workflow_text(self.remembered_branch, "remembered issue branch", empty=True)
         for name in ("resumes", "ci_failures", "rebase_failures", "infra_failures", "self_clears"):
             validate_workflow_integer(getattr(self, name), name)
+        if type(self.self_clear_ceiling_reported) is not bool or self.self_clear_ceiling_reported and self.self_clears < 3:
+            raise ValueError("reported self-clear ceiling requires the shared exhausted allowance")
         if not isinstance(self.review_failures, ReviewRetryState):
             raise ValueError("review retry allowance requires one typed timestamp/count state")
         if self.pending_ci is not None and (not isinstance(self.pending_ci, ContinuationAdmission)

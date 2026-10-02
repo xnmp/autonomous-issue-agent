@@ -79,6 +79,9 @@ from ..domain.events import (
     ActionFailed,
     AdmissionReconciled,
     BudgetVarianceDetected,
+    BlockRetired,
+    BudgetBlockRetired,
+    SelfClearCeilingReached,
     ControlTransitionCommitted,
     Correlation,
     EscalationRaised,
@@ -6967,6 +6970,87 @@ class SQLiteControlStore:
                 issue_recovery=replace(selected.component, state=replace(selected.component.state, budget_block=None))))
             return selected.component.state.self_clears
 
+    def validate_self_clear_projection(self, projection) -> None:
+        with self.transaction() as db:
+            self._selected_self_clear_projection(db, projection)
+
+    def mark_self_clear_ceiling(self, action) -> bool:
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        from ..domain.actions import ReportSelfClearCeiling
+        from ..domain.self_clear import SELF_CLEAR_CEILING
+        if not isinstance(action, ReportSelfClearCeiling) or action.revision is None or action.ceiling != SELF_CLEAR_CEILING:
+            raise WorkflowAuthorityError("self-clear ceiling report requires selected fixed policy evidence")
+        with self.transaction() as db, self.mutation_savepoint(db):
+            aggregate = load_issue_aggregate(db, action.revision.fence.key)
+            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+            if not isinstance(selected, cc.SelectedIssueRecovery):
+                raise WorkflowAuthorityError("self-clear report authority is inactive")
+            state = selected.component.state
+            if state.self_clear_ceiling_reported:
+                return False
+            if selected.revision != action.revision or state.self_clears < SELF_CLEAR_CEILING:
+                raise WorkflowAuthorityError("self-clear report revision/count is stale")
+            block = state.budget_block if action.blocker == "budget" else state.machine_block
+            if block is None or block.target is not action.target or block.number != action.number:
+                raise WorkflowAuthorityError("self-clear report no longer matches its selected cause")
+            if action.blocker == "budget":
+                self._require_budget_projection(db, selected)
+            else:
+                self._require_machine_projection(db, selected)
+                if block.blocker.value != action.blocker:
+                    raise WorkflowAuthorityError("self-clear report machine cause changed")
+            persist_workflow_snapshot(db, replace(aggregate,
+                revision=replace(aggregate.revision, version=aggregate.revision.version+1),
+                issue_recovery=replace(selected.component, state=replace(state, self_clear_ceiling_reported=True))))
+            self._event(db, SelfClearCeilingReached(action.blocker, action.target.name.lower(), action.number,
+                action.ceiling), correlation=Correlation(issue=action.issue,
+                    pr=action.number if action.target.name == "PR" else None))
+            return True
+
+    def _selected_self_clear_projection(self, db, projection):
+        from ..domain.self_clear import MachineClearProjection, BudgetClearProjection, SELF_CLEAR_CEILING
+        from .workflow_rows import load_issue_aggregate
+        if not isinstance(projection, (MachineClearProjection, BudgetClearProjection)):
+            raise WorkflowAuthorityError("self-clear requires fixed typed selected evidence")
+        aggregate = load_issue_aggregate(db, projection.revision.fence.key)
+        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+        if not isinstance(selected, cc.SelectedIssueRecovery) or selected.revision != projection.revision:
+            raise WorkflowAuthorityError("self-clear selection is stale or inactive")
+        if selected.component.state.self_clears >= SELF_CLEAR_CEILING:
+            raise WorkflowAuthorityError("self-clear shared ceiling is exhausted")
+        if isinstance(projection, MachineClearProjection):
+            self._require_machine_projection(db, selected)
+            held = selected.component.state.machine_block
+        else:
+            self._require_budget_projection(db, selected)
+            held = selected.component.state.budget_block
+        if held != projection.block:
+            raise WorkflowAuthorityError("self-clear differs from its selected cause")
+        return aggregate, selected
+
+    def _complete_self_clear_projection(self, db, command, receipt) -> None:
+        from .workflow_codec import decode_self_clear_projection
+        from .workflow_rows import persist_workflow_snapshot
+        from ..domain.self_clear import MachineClearProjection, _budget_clearable
+        projection = decode_self_clear_projection(command.payload["self_clear"])
+        aggregate, selected = self._selected_self_clear_projection(db, projection)
+        if isinstance(projection, MachineClearProjection) and receipt.remote_revision != projection.observed_head:
+            raise WorkflowAuthorityError("machine clear effect lacks exact verified head")
+        state = replace(selected.component.state, self_clears=selected.component.state.self_clears+1,
+            **({"machine_block": None} if isinstance(projection, MachineClearProjection) else {"budget_block": None}))
+        persist_workflow_snapshot(db, replace(aggregate,
+            revision=replace(aggregate.revision, version=aggregate.revision.version+1),
+            issue_recovery=replace(selected.component, state=state)))
+        if isinstance(projection, MachineClearProjection):
+            event = BlockRetired(projection.block.blocker.value, projection.block.blocked_head,
+                                 projection.observed_head, state.self_clears)
+        else:
+            _, tightest, headroom = _budget_clearable(projection.budget, projection.block.reservation_micros)
+            event = BudgetBlockRetired(tightest.scope, projection.block.old_headroom_micros, headroom,
+                projection.block.reservation_micros, tightest.cap_micros, tightest.currency, state.self_clears)
+        self._event(db, event, correlation=Correlation(issue=projection.block.issue,
+            pr=projection.block.number if command.target.startswith("pr:") else None))
+
     def retire_machine_block(self, revision: WorkflowRevision, *, blocker: str | None = None,
                              blocked_head: str | None = None) -> int:
         from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
@@ -7237,7 +7321,8 @@ class SQLiteControlStore:
                                       infra_failures=component.state.infra_failures, infra_episode=component.state.infra_episode,
                                       review_failures=component.state.review_failures, rebase_failures=component.state.rebase_failures,
                                       pending_rebase=component.state.pending_rebase, machine_block=component.state.machine_block,
-                                      budget_block=component.state.budget_block)
+                                      budget_block=component.state.budget_block, self_clears=component.state.self_clears,
+                                      self_clear_ceiling_reported=component.state.self_clear_ceiling_reported)
                     after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
                 elif isinstance(selection, cc.SelectedPRRepair):
                     if not isinstance(aggregate, ReviewWorkflowSnapshot):
@@ -8444,6 +8529,22 @@ class SQLiteControlStore:
         registering_steward_verdict: bool = False,
         allow_blocked_submission_retry: bool = False,
     ) -> None:
+        if "self_clear" in command.payload:
+            from .effects import action_from_command
+            from ..domain.actions import Relabel
+            action = action_from_command(command)
+            if not isinstance(action, Relabel) or action.self_clear is None or command.workflow is not None:
+                raise WorkflowAuthorityError("self-clear requires its fixed relabel command")
+            if (command.repository != action.self_clear.revision.fence.key.repository
+                    or deployment_role(command.repository, command.executor_identity) != "fix"
+                    or command.target != f"{action.target.name.lower()}:{action.number}"):
+                raise WorkflowAuthorityError("self-clear command differs from its selected deployment")
+            self._assert_owner_active(db, command.executor_identity)
+            if db.execute("SELECT 1 FROM effect_receipts WHERE command_id=? AND status='succeeded'",
+                          (str(command.command_id),)).fetchone() is not None:
+                return
+            self._selected_self_clear_projection(db, action.self_clear)
+            return
         if registering_steward_verdict or "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
             self._validate_steward_command(db, command, registering=registering_steward_verdict)
             return
@@ -9991,7 +10092,7 @@ class SQLiteControlStore:
             if state not in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
                 raise ControlStoreError("command is not awaiting reconciliation")
             command = _command_from_row(row)
-            if command.workflow is not None or "steward_guard" in command.payload:
+            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow reconciliation receipt requires the current command owner")
@@ -10039,7 +10140,7 @@ class SQLiteControlStore:
             if row["state"] != EffectStatus.RETRYABLE_FAILURE.value:
                 return False
             command = _command_from_row(row)
-            if command.workflow is not None or "steward_guard" in command.payload:
+            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow exhaustion receipt requires the current command owner")
@@ -10075,12 +10176,23 @@ class SQLiteControlStore:
     def _insert_effect(
         self, db: sqlite3.Connection, receipt: EffectReceipt, digest: str
     ) -> None:
+        with self.mutation_savepoint(db):
+            self._insert_effect_mutation(db, receipt, digest)
+
+    def _insert_effect_mutation(
+        self, db: sqlite3.Connection, receipt: EffectReceipt, digest: str
+    ) -> None:
         command_row = db.execute(
             "SELECT * FROM lifecycle_commands WHERE command_id=?", (str(receipt.command_id),),
         ).fetchone()
         if command_row is None:
             raise ControlStoreError(f"receipt {receipt.command_id} has no lifecycle command")
         command = _command_from_row(command_row)
+        if "self_clear" in command.payload:
+            if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
+                raise WorkflowAuthorityError("self-clear receipt requires its captured attempt owner")
+            if receipt.status is EffectStatus.SUCCEEDED:
+                self._complete_self_clear_projection(db, command, receipt)
         if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
             self._validate_steward_command(db, command, settling=True, refusing=receipt.status is EffectStatus.PERMANENT_FAILURE)
             if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:

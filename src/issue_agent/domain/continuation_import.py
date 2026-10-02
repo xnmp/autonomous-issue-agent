@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import hashlib
 import json
 import re
@@ -33,6 +33,8 @@ def digest(value: object) -> str:
 
 
 def _plan_state_identity(state: ImportedState | None) -> object:
+    if isinstance(state, cc.IssueRecoveryState) and state.self_clear_ceiling_reported:
+        return (_plan_state_identity(replace(state, self_clear_ceiling_reported=False)), "self-clear-ceiling-reported")
     if isinstance(state, cc.IssueRecoveryState) and state.budget_block is not None:
         return (repr(state), repr(state.machine_block), repr(state.budget_block))
     if isinstance(state, cc.IssueRecoveryState) and state.machine_block is not None:
@@ -182,7 +184,10 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                     _budget_block(record, text)
                 except (ValueError, TypeError, KeyError) as exc:
                     reason = str(exc)
-            elif name in {"session", "model", "self-clear-ceiling", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
+            elif name == "self-clear-ceiling":
+                if text != "1":
+                    reason = "malformed shared self-clear ceiling report marker"
+            elif name in {"session", "model", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
             elif name == "review-retries":
                 at, separator, number = text.rpartition(" ")
@@ -217,7 +222,8 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                                          count("ci-retries"), cc.ReviewRetryState(review_at, int(review_count)), count("rebase-retries"),
                                          count("infra-deaths"), count("self-clears"),
                                          machine_block=_machine_block(record, values["machine-block"]) if "machine-block" in values else None,
-                                         budget_block=_budget_block(record, values["budget-block"]) if "budget-block" in values else None)
+                                         budget_block=_budget_block(record, values["budget-block"]) if "budget-block" in values else None,
+                                         self_clear_ceiling_reported="self-clear-ceiling" in values)
         if record.family is WorkflowFamily.PR_REPAIR:
             return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
                                     infra_failures=count("infra-deaths"))
@@ -373,4 +379,22 @@ def budget_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuatio
             raise ValueError("eligible budget shadow has unreadable selected evidence")
         before = _budget_block(found[0], source.text) if isinstance(source, LegacyPresent) else None
         comparisons.append((target.key, fact(before), fact(target.state.budget_block)))
+    return tuple(comparisons)
+
+
+def self_clear_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[int, bool], tuple[int, bool]], ...]:
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.IssueRecoveryState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.ISSUE_RECOVERY)
+        if len(found) > 1:
+            raise ValueError("eligible self-clear shadow has ambiguous source ownership")
+        fields = dict(found[0].fields) if found else {}
+        count = fields.get("self-clears", LegacyAbsent())
+        report = fields.get("self-clear-ceiling", LegacyAbsent())
+        if not isinstance(count, (LegacyAbsent, LegacyPresent)) or not isinstance(report, (LegacyAbsent, LegacyPresent)):
+            raise ValueError("eligible self-clear shadow has unreadable selected allowance")
+        before = (int(count.text.strip()) if isinstance(count, LegacyPresent) else 0, isinstance(report, LegacyPresent))
+        comparisons.append((target.key, before, (target.state.self_clears, target.state.self_clear_ceiling_reported)))
     return tuple(comparisons)

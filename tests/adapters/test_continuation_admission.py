@@ -128,9 +128,12 @@ def test_current_duplicate_return_applies_once_and_retains_consumption(recovery)
     request = paid("first", selected)
     assert store.reserve_issue_recovery(request, selected).admitted
     admission = receipt(store, request.run_id)
-    # Classified repair/infra debt has separate ownership. The legacy reply
-    # return still applies unselected sibling state exactly once.
-    output = cc.IssueRecoveryState(self_clears=2)
+    # Recovery effects own the shared count; a later paid reply cannot reset it.
+    before = read(store, aggregate)
+    with store.transaction() as db:
+        persist_workflow_snapshot(db, replace(before, revision=replace(before.revision, version=before.revision.version + 1), issue_recovery=replace(
+            before.issue_recovery, state=replace(before.issue_recovery.state, self_clears=2))))
+    output = cc.IssueRecoveryState()
     assert store.settle_issue_recovery(money(request.run_id), admission, output).disposition is AccountingDisposition.AVAILABLE
     current = read(store, aggregate)
     assert current.issue_recovery.state.self_clears == 2
@@ -139,7 +142,7 @@ def test_current_duplicate_return_applies_once_and_retains_consumption(recovery)
     assert store.settle_issue_recovery(money(request.run_id), admission, output).idempotent
     assert read(store, aggregate) == current
     with pytest.raises(WorkflowAuthorityError, match="immutable result"):
-        store.settle_issue_recovery(money(request.run_id), admission, replace(output, self_clears=0))
+        store.settle_issue_recovery(money(request.run_id), admission, replace(output, self_clears=1))
     assert store.snapshot(request.scope).settled.micros == 1
 
 
@@ -527,18 +530,20 @@ def test_primary_hold_refuses_fresh_launch_but_preserves_exact_retry_and_actual_
     admitted = receipt(store, requested.run_id)
     current = read(store, aggregate)
     assert isinstance(current, WorkflowSnapshot)
+    assert isinstance(current.issue_recovery, cc.ActiveIssueRecovery)
     gate = OpenGate("primary:uncertainty", current.revision.fence.generation,
                     RemoteOutcomeUncertain("command:pending", NOW, 0, "missing reply"),
                     NoAuthorizedRemediation("reconcile"))
     with store.transaction() as db:
-        held = replace(current, revision=replace(current.revision, version=current.revision.version + 1), gates=(gate,))
+        held = replace(current, revision=replace(current.revision, version=current.revision.version + 1), gates=(gate,),
+                       issue_recovery=replace(current.issue_recovery, state=replace(current.issue_recovery.state, self_clears=1)))
         persist_workflow_snapshot(db, held)
     with pytest.raises(WorkflowAuthorityError, match="stale or held"):
         store.register_process_lease(requested.run_id, expected_owner_id=requested.owner_id,
                                      pid=123, pgid=123, process_start_ticks=456)
     assert store.reserve_issue_recovery(requested, selected).admitted
     assert read(store, aggregate) == held
-    assert store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState(self_clears=1)).disposition is AccountingDisposition.AVAILABLE
+    assert store.settle_issue_recovery(money(requested.run_id), admitted, cc.IssueRecoveryState()).disposition is AccountingDisposition.AVAILABLE
     completed = read(store, aggregate)
     assert completed.gates == held.gates and completed.issue_recovery.state.self_clears == 1
     assert store.snapshot(requested.scope).settled.micros == 1

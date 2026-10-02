@@ -332,20 +332,6 @@ class Store:
         )
         return history
 
-    def get_self_clear_count(self, issue: int) -> int:
-        return self._read_int(self.issue_path(issue, "self-clears"))
-
-    def increment_self_clear_count(self, issue: int) -> int:
-        count = self.get_self_clear_count(issue) + 1
-        self._write(self.issue_path(issue, "self-clears"), str(count))
-        return count
-
-    def self_clear_ceiling_reported(self, issue: int) -> bool:
-        return bool(self._read(self.issue_path(issue, "self-clear-ceiling")))
-
-    def mark_self_clear_ceiling_reported(self, issue: int) -> None:
-        self._write(self.issue_path(issue, "self-clear-ceiling"), "1")
-
     # ── infra-death ceiling (review C3/D2c) ──
     # NOT a retry counter: a session that dies before returning a result made no
     # attempt, so it must never march ci-/review-/rebase-/resolve-retries (that

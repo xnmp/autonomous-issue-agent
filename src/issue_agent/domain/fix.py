@@ -1735,6 +1735,8 @@ def decide_fix(
     retiring_issues = {
         action.issue for action in retiring if hasattr(action, "issue")
     }
+    retiring_issues.update(action.self_clear.block.issue for action in retiring
+        if isinstance(action, Relabel) and action.self_clear is not None)
     retiring_prs = {
         action.number
         for action in retiring

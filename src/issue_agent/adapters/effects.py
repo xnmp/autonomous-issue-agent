@@ -33,6 +33,7 @@ from ..domain.lifecycle import (
 from ..domain.repository import canonical_repository
 from ..domain.workflow_identity import WorkflowBinding, WorkflowFamily
 from ..domain import continuation_components as cc
+from ..domain.self_clear import MachineClearProjection, BudgetClearProjection, machine_clear_evidence
 from ..domain.workflow import (
     ActiveReconciliation, ReconciliationOnly, RetiredUncertainCommand,
     RetryBegan, RetryDeclined,
@@ -64,7 +65,7 @@ from .review_effects import (
     is_review_family, read_pull_request, review_family_op,
 )
 from .review_linkage import ReviewLinkedIssueUnavailable, review_linked_issue_holds
-from .workflow_codec import decode_workflow, encode_workflow
+from .workflow_codec import decode_workflow, encode_workflow, decode_self_clear_projection
 from .workflow_rows import WorkflowAuthorityError
 
 _TARGET = {Target.ISSUE: "issue", Target.PR: "pr"}
@@ -1278,6 +1279,9 @@ class GitHubEffectExecutor:
         command: LifecycleCommand | None = None,
     ):
         """Apply one effect, re-validating its completion facts between writes."""
+        if isinstance(action, Relabel) and action.self_clear is not None:
+            if not self._self_clear_evidence(action):
+                raise StaleExpectedRevision("self-clear head/check/source evidence changed before projection")
         selected_guard = None
         if command is not None and ("steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:")):
             current = self._steward_completion_view(command)
@@ -1424,6 +1428,10 @@ class GitHubEffectExecutor:
         self, action: Action, command: LifecycleCommand | None = None
     ) -> bool | None:
         if isinstance(action, Relabel):
+            if action.self_clear is not None:
+                receipt = self.store.effect_receipt(command.command_id) if command is not None else None
+                if not self._self_clear_evidence(action, settled=receipt is not None and receipt.status is EffectStatus.SUCCEEDED):
+                    return False
             if _is_compound_relabel(action):
                 self._validate_completion(action, partial=True, steward_guard=
                     decode_workflow(command.payload["steward_guard"], cc.StewardCommandGuard)
@@ -1770,7 +1778,32 @@ class GitHubEffectExecutor:
                 )
         return self._revision_matches(command)
 
+    def _self_clear_evidence(self, action: Relabel, *, originating: bool = False, settled: bool = False) -> bool:
+        projection = action.self_clear
+        assert projection is not None
+        if not settled:
+            try:
+                self.store.validate_self_clear_projection(projection)
+            except WorkflowAuthorityError:
+                return False
+        if action.target is Target.PR:
+            current = self.gateway.get_pr(action.number)
+            if isinstance(projection, MachineClearProjection) and not machine_clear_evidence(
+                current, projection.block, projection.ignored_checks):
+                return False
+        else:
+            current = self.gateway.get_issue(action.number)
+        if originating and not any(label in current.labels for label in action.removed_labels):
+            return False
+        if current.state not in {"OPEN", "open"} or current.has(Label.NEEDS_HUMAN_REVIEW):
+            return False
+        return True
+
     def _revision_matches(self, command: LifecycleCommand) -> bool:
+        if "self_clear" in command.payload:
+            action = action_from_command(command)
+            assert isinstance(action, Relabel)
+            return self._self_clear_evidence(action, originating=True)
         if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
             return self._steward_completion_view(command) is not None
         if command.kind is CommandKind.RELABEL:
@@ -1847,6 +1880,10 @@ class GitHubEffectExecutor:
                            and (comment.author, comment.body, comment.created_at) not in previous)
 
     def _steward_success(self, command: LifecycleCommand) -> EffectOutcome[bool]:
+        if "self_clear" in command.payload:
+            projection = decode_self_clear_projection(command.payload["self_clear"])
+            return EffectOutcome(True, EffectStatus.SUCCEEDED,
+                remote_revision=projection.observed_head if isinstance(projection, MachineClearProjection) else None)
         if "steward_guard" not in command.payload:
             return EffectOutcome(True, EffectStatus.SUCCEEDED)
         action = action_from_command(command)
@@ -1933,6 +1970,10 @@ def command_for_action(
     action_payload = _jsonable(action)
     action_payload.pop("workflow", None)
     if isinstance(action, Relabel):
+        if action.self_clear is None:
+            action_payload.pop("self_clear", None)
+        else:
+            action_payload["self_clear"] = encode_workflow(action.self_clear)
         # These optional fields extend the existing relabel command. Omitting
         # empty defaults preserves the digest of commands minted before the
         # compound projection capability existed.
@@ -2009,6 +2050,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
             adds=adds,
             comment=comment,
             hold_guard=_hold_guard_from_payload(payload.get("hold_guard")),
+            self_clear=decode_self_clear_projection(payload["self_clear"]) if "self_clear" in payload else None,
         )
     if command.kind is CommandKind.POST_COMMENT:
         return PostComment(

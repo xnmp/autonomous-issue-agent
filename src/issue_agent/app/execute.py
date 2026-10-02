@@ -351,7 +351,7 @@ class Executor:
         reset_ci_retries: Callable[[ResetCiRetries], None] | None = None,
         retire_machine_block: Callable[[FinalizeMachineBlockRetirement], int] | None = None,
         retire_budget_block: Callable[[FinalizeBudgetBlockRetirement], int] | None = None,
-        mark_self_clear_ceiling: Callable[[int], None] | None = None,
+        mark_self_clear_ceiling: Callable[[ReportSelfClearCeiling], bool] | None = None,
         discard_machine_block: Callable[[DiscardSelfClearMarker], None] | None = None,
         discard_budget_block: Callable[[DiscardSelfClearMarker], None] | None = None,
         journal=None,
@@ -805,17 +805,7 @@ class Executor:
                     _action_correlation(action),
                 ))
         elif isinstance(action, ReportSelfClearCeiling):
-            self._mark_self_clear_ceiling(action.issue)
-            if self._journal is not None:
-                self._journal.emit(TelemetryEvent(
-                    SelfClearCeilingReached(
-                        action.blocker,
-                        _KIND[action.target],
-                        action.number,
-                        action.ceiling,
-                    ),
-                    _action_correlation(action),
-                ))
+            self._mark_self_clear_ceiling(action)
         elif isinstance(action, DiscardSelfClearMarker):
             if action.marker == "machine":
                 self._discard_machine_block(action)

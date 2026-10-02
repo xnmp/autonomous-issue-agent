@@ -1962,6 +1962,8 @@ def _fix_state(
     budget_revisions = {}
     budget_errors = {}
     machine_errors = {}
+    self_clear_counts = {}
+    ceiling_reported = set()
     for issue in issue_keys:
         try:
             if workflow_control is None:
@@ -1969,6 +1971,9 @@ def _fix_state(
             selected = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(issue)))
             if not isinstance(selected, cc.SelectedIssueRecovery):
                 raise ValueError("machine hold authority is inactive or migration blocked")
+            self_clear_counts[issue] = selected.component.state.self_clears
+            if selected.component.state.self_clear_ceiling_reported:
+                ceiling_reported.add(issue)
             if selected.component.state.machine_block is not None:
                 machine_blocks[issue] = selected.component.state.machine_block
                 machine_revisions[issue] = selected.revision
@@ -1978,12 +1983,7 @@ def _fix_state(
         except (ValueError, sqlite3.Error) as exc:
             machine_errors[issue] = str(exc)
             budget_errors[issue] = str(exc)
-    self_clear_counts = {
-        issue: read(issue, store.get_self_clear_count, 0) for issue in issue_keys
-    }
-    self_clear_ceiling_reported = frozenset(
-        issue for issue in issue_keys if read(issue, store.self_clear_ceiling_reported, False)
-    )
+    self_clear_ceiling_reported = frozenset(ceiling_reported)
     return FixState(
         control_errors=errors,
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
@@ -2714,23 +2714,10 @@ def compose_fix_daemon(
         if workflow_control.reset_ci_episode(source):
             store.clear_ci_history(action.issue)
 
-    def retire_machine(action):
-        if action.revision is None:
-            raise ValueError("machine retirement lacks its selected SQL revision")
-        control.retire_machine_block(action.revision, blocker=action.blocker,
-            blocked_head=action.blocked_head)
-        return store.increment_self_clear_count(action.issue)
-
     def discard_machine(action):
         if action.revision is None:
             raise ValueError("machine discard lacks its selected SQL revision")
         control.retire_machine_block(action.revision)
-
-    def retire_budget(action):
-        if action.revision is None:
-            raise ValueError("budget retirement lacks its selected SQL revision")
-        control.retire_budget_block(action.revision, reservation_micros=action.reservation_micros)
-        return store.increment_self_clear_count(action.issue)
 
     def discard_budget(action):
         if action.revision is None:
@@ -2745,9 +2732,7 @@ def compose_fix_daemon(
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=cleanup_fix_state,
         reset_ci_retries=reset_ci_episode,
-        retire_machine_block=retire_machine,
-        retire_budget_block=retire_budget,
-        mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,
+        mark_self_clear_ceiling=control.mark_self_clear_ceiling,
         discard_machine_block=discard_machine,
         discard_budget_block=discard_budget,
         journal=journal, alert_cmd=cfg.alert_cmd,

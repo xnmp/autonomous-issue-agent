@@ -426,7 +426,7 @@ def test_every_issue_accessor_suffix_is_covered_by_exactly_one_cleaner():
     # instead of silently leaking a STATE_DIR file forever (introspects the
     # module: accessors' suffix strings vs _ISSUE_SUFFIXES).
     # Retired counters still need cleanup in existing state roots.
-    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage", "ci-retries", "review-retries", "rebase-retries", "machine-block", "budget-block"} == set(store_module._ISSUE_SUFFIXES)
+    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage", "ci-retries", "review-retries", "rebase-retries", "machine-block", "budget-block", "self-clears", "self-clear-ceiling"} == set(store_module._ISSUE_SUFFIXES)
 
 
 def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
@@ -537,7 +537,7 @@ def _triage_at_has_a_cleaner() -> bool:
 
 def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
-    used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries"), ("issue_path", "review-retries"), ("issue_path", "rebase-retries"), ("issue_path", "machine-block"), ("issue_path", "budget-block")}
+    used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries"), ("issue_path", "review-retries"), ("issue_path", "rebase-retries"), ("issue_path", "machine-block"), ("issue_path", "budget-block"), ("issue_path", "self-clears"), ("issue_path", "self-clear-ceiling")}
     used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
     used.add(("pr_path", "resumed-at"))
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param

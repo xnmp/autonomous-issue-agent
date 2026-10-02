@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 
 from .actions import (
     Action,
@@ -17,8 +18,8 @@ from .actions import (
 from .ci import ci_state
 from .contracts import Money
 from .labels import Label
-from .world import CIState, WorldState
-from .workflow_identity import WorkflowRevision, validate_workflow_integer, validate_workflow_text
+from .world import CIState, WorldState, PRView
+from .workflow_identity import IssueRef, WorkflowRevision, validate_workflow_integer, validate_workflow_text
 
 SELF_CLEAR_CEILING = 3
 
@@ -84,8 +85,11 @@ class BudgetLimitObservation:
     currency: str = "USD"
 
     def __post_init__(self) -> None:
-        if self.committed_micros < 0 or self.cap_micros < 0:
-            raise ValueError("budget observations cannot be negative")
+        validate_workflow_integer(self.committed_micros, "budget observation committed amount")
+        validate_workflow_integer(self.cap_micros, "budget observation cap")
+        validate_workflow_text(self.scope, "budget observation scope", limit=512)
+        validate_workflow_text(self.disposition, "budget observation disposition", limit=64)
+        Money(self.currency, 0)
 
 
 @dataclass(frozen=True)
@@ -95,9 +99,56 @@ class BudgetWorld:
     limits: tuple[BudgetLimitObservation, ...] = ()
     complete: bool = False
 
+    def __post_init__(self) -> None:
+        if (type(self.complete) is not bool or not isinstance(self.limits, tuple)
+                or any(not isinstance(limit, BudgetLimitObservation) for limit in self.limits)):
+            raise ValueError("budget world requires typed limits and completeness")
+
+
+@dataclass(frozen=True)
+class MachineClearProjection:
+    revision: WorkflowRevision
+    block: MachineBlock
+    observed_head: str
+    ignored_checks: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.revision, WorkflowRevision) or not isinstance(self.block, MachineBlock):
+            raise ValueError("machine clear requires selected typed recovery evidence")
+        if (not isinstance(self.revision.fence.key.target, IssueRef)
+                or self.revision.fence.key.target.number != self.block.issue or self.observed_head != self.block.blocked_head):
+            raise ValueError("machine clear evidence does not match its issue/head")
+        validate_workflow_text(self.ignored_checks, "machine clear ignored check policy", empty=True)
+        try:
+            re.compile(self.ignored_checks)
+        except re.error as exc:
+            raise ValueError("machine clear ignored check policy is malformed") from exc
+
+
+@dataclass(frozen=True)
+class BudgetClearProjection:
+    revision: WorkflowRevision
+    block: BudgetBlock
+    budget: BudgetWorld
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.revision, WorkflowRevision) or not isinstance(self.block, BudgetBlock):
+            raise ValueError("budget clear requires selected typed recovery evidence")
+        if not isinstance(self.revision.fence.key.target, IssueRef) or self.revision.fence.key.target.number != self.block.issue:
+            raise ValueError("budget clear evidence does not match its issue")
+        if not isinstance(self.budget, BudgetWorld) or not _budget_clearable(self.budget, self.block.reservation_micros)[0]:
+            raise ValueError("budget clear lacks complete fitting captured limits")
+
+
+def machine_clear_evidence(pr: PRView, block: MachineBlock, ignored_checks: str) -> bool:
+    if pr.state != "OPEN" or not pr.head_ref_oid or pr.head_ref_oid != block.blocked_head:
+        return False
+    return block.blocker is MachineBlocker.PUBLICATION or ci_state(
+        pr.checks, ignored_checks, known=pr.checks_known) is CIState.OK
+
 
 def _machine_clearable(
-    world: WorldState, block: MachineBlock, ignored_checks: tuple[str, ...]
+    world: WorldState, block: MachineBlock, ignored_checks: str
 ) -> tuple[bool, str]:
     pr = next(
         (
@@ -109,17 +160,7 @@ def _machine_clearable(
     )
     if pr is None or not pr.has(Label.AI_BLOCKED) or not pr.head_ref_oid:
         return False, ""
-    if pr.head_ref_oid != block.blocked_head:
-        return False, ""
-    if block.blocker is MachineBlocker.PUBLICATION:
-        # The agent-written blocker only selects this predicate. Authorization
-        # comes from observing the exact head that the recorded leg could not
-        # publish, not from trusting the classification itself.
-        return True, pr.head_ref_oid
-    return (
-        ci_state(pr.checks, ignored_checks, known=pr.checks_known) is CIState.OK,
-        pr.head_ref_oid,
-    )
+    return machine_clear_evidence(pr, block, ignored_checks), pr.head_ref_oid
 
 
 def _budget_clearable(
@@ -148,7 +189,7 @@ def self_clear_actions(
     budget_worlds: dict[int, BudgetWorld],
     clear_counts: dict[int, int],
     ceiling_reported: frozenset[int],
-    ignored_checks: tuple[str, ...] = (),
+    ignored_checks: str = "",
     ceiling: int = SELF_CLEAR_CEILING,
     machine_revisions: dict[int, WorkflowRevision] | None = None,
     budget_revisions: dict[int, WorkflowRevision] | None = None,
@@ -171,18 +212,22 @@ def self_clear_actions(
         if count >= ceiling:
             if issue not in ceiling_reported:
                 actions.append(ReportSelfClearCeiling(
-                    issue, block.target, block.number, block.blocker.value, ceiling
+                    issue, block.target, block.number, block.blocker.value, ceiling,
+                    (machine_revisions or {}).get(issue),
                 ))
             continue
-        actions.extend([
-            Relabel(
+        selected_revision = (machine_revisions or {}).get(issue)
+        actions.append(Relabel(
                 block.target,
                 block.number,
                 Label.AI_BLOCKED,
                 Label.AI_PR_OPEN,
                 observed_head,
-            ),
-            FinalizeMachineBlockRetirement(
+                self_clear=MachineClearProjection(selected_revision, block, observed_head, ignored_checks)
+                if selected_revision is not None else None,
+            ))
+        if selected_revision is None:
+            actions.append(FinalizeMachineBlockRetirement(
                 issue,
                 block.target,
                 block.number,
@@ -190,14 +235,15 @@ def self_clear_actions(
                 block.blocked_head,
                 observed_head,
                 (machine_revisions or {}).get(issue),
-            ),
-        ])
+            ))
 
     # Both causes share one component revision and allowance. A second mutation
     # needs a fresh snapshot of the first retirement's revision and count.
     machine_selected = {action.issue for action in actions if isinstance(action, (
         FinalizeMachineBlockRetirement, DiscardSelfClearMarker, ReportSelfClearCeiling,
     ))}
+    machine_selected.update(action.self_clear.block.issue for action in actions
+        if isinstance(action, Relabel) and action.self_clear is not None)
     issues = {candidate.number: candidate for candidate in world.issues}
     prs = {candidate.number: candidate for candidate in world.prs}
     for issue, block in budget_blocks.items():
@@ -229,7 +275,8 @@ def self_clear_actions(
         if count >= ceiling:
             if issue not in ceiling_reported:
                 actions.append(ReportSelfClearCeiling(
-                    issue, block.target, block.number, "budget", ceiling
+                    issue, block.target, block.number, "budget", ceiling,
+                    (budget_revisions or {}).get(issue),
                 ))
             continue
         revision = observed.updated_at if block.target is Target.ISSUE else None
@@ -244,6 +291,7 @@ def self_clear_actions(
             )
             if present
         )
+        selected_revision = (budget_revisions or {}).get(issue)
         actions.append(Relabel(
             block.target,
             block.number,
@@ -251,8 +299,10 @@ def self_clear_actions(
             resume_label,
             revision,
             removes=removes,
+            self_clear=BudgetClearProjection(selected_revision, block, budget_worlds[issue]) if selected_revision is not None else None,
         ))
-        actions.append(FinalizeBudgetBlockRetirement(
+        if selected_revision is None:
+            actions.append(FinalizeBudgetBlockRetirement(
             issue,
             block.target,
             block.number,
@@ -263,5 +313,5 @@ def self_clear_actions(
             tightest.cap_micros if tightest is not None else None,
             tightest.currency if tightest is not None else block.currency,
             (budget_revisions or {}).get(issue),
-        ))
+            ))
     return actions

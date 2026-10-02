@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.control_store import SQLiteControlStore, RetiredOwnerError
 from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.effects import GitHubEffectExecutor
@@ -177,6 +177,111 @@ def seed(root: Path, *labels: str) -> None:
     control.initialize()
     from tests.fakes.workflow_authority import with_issue_recovery
     install_workflow(control, with_issue_recovery(resolve_snapshot(7)))
+
+
+@pytest.mark.parametrize("adopted_owner", [False, True])
+def test_machine_recovery_remote_success_crash_reconciles_one_shared_sql_clear(tmp_path, adopted_owner):
+    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from tests.fakes.accounted_workflow import seed_imported_machine_hold
+    seed(tmp_path, "ai-pr-open")
+    remote = PersistentGitHub(tmp_path / "github.db")
+    remote.seed_pr(pr(70, "ai-pr-open", "ai-blocked", closing_issue=7, head_ref_oid="same-head"))
+    first = compose(tmp_path, fault=fail_at("relabel_pr_applied"))
+    seed_imported_machine_hold(first.control, MachineBlock(7, Target.PR, 70, 70, MachineBlocker.PUBLICATION, "same-head"))
+    with pytest.raises(Crash):
+        first.daemon.tick()
+    restarted = compose(tmp_path)
+    if adopted_owner:
+        restarted.control.adopt_legacy_owner("o/r", "fix", "o/r:fix:successor", prior_owner_ids=("o/r:fix",))
+        with pytest.raises(RetiredOwnerError):
+            first.effects.drain_pending_commands()
+        assert restarted.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7))).component.state.self_clears == 0
+        successor = GitHubEffectExecutor(remote, restarted.control, repository="o/r", identity="o/r:fix:successor")
+        assert successor.drain_pending_commands() == 1
+        assert successor.drain_pending_commands() == 0
+    else:
+        for _ in range(3):
+            restarted.daemon.tick()
+    selected = restarted.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    assert selected.component.state.machine_block is None
+    assert selected.component.state.self_clears == 1
+    assert restarted.remote.get_pr(70).labels == frozenset({Label.AI_PR_OPEN})
+    assert first.provider.tasks == restarted.provider.tasks == []
+    assert not (tmp_path / "fix" / "issue-7.self-clears").exists()
+
+
+@pytest.mark.parametrize("changed_head", [False, True])
+@pytest.mark.parametrize("adopted_owner", [False, True])
+def test_machine_recovery_partial_projection_does_not_charge_until_exact_head_completion(tmp_path, changed_head, adopted_owner, monkeypatch):
+    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from tests.fakes.accounted_workflow import seed_imported_machine_hold
+    seed(tmp_path, "ai-pr-open")
+    remote = PersistentGitHub(tmp_path / "github.db")
+    remote.seed_pr(pr(70, "ai-blocked", closing_issue=7, head_ref_oid="same-head"))
+    first = compose(tmp_path)
+    write = first.remote.relabel
+    def partially_apply(kind, number, remove, add):
+        write(kind, number, None, add)
+        raise Crash("lost after adding resume label, before blocked removal")
+    monkeypatch.setattr(first.remote, "relabel", partially_apply)
+    seed_imported_machine_hold(first.control, MachineBlock(7, Target.PR, 70, 70, MachineBlocker.PUBLICATION, "same-head"))
+    with pytest.raises(Crash):
+        first.daemon.tick()
+    assert remote.get_pr(70).labels == frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED})
+    selected = first.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    assert selected.component.state.machine_block is not None and selected.component.state.self_clears == 0
+    if changed_head:
+        remote.external_pr_change(70, head_ref_oid="newer-head")
+    restarted = compose(tmp_path)
+    if adopted_owner:
+        restarted.control.adopt_legacy_owner("o/r", "fix", "o/r:fix:successor", prior_owner_ids=("o/r:fix",))
+        with pytest.raises(RetiredOwnerError):
+            first.effects.drain_pending_commands()
+        successor = GitHubEffectExecutor(remote, restarted.control, repository="o/r", identity="o/r:fix:successor")
+        for _ in range(3):
+            successor.drain_pending_commands()
+    else:
+        for _ in range(3):
+            restarted.daemon.tick()
+    state = restarted.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7))).component.state
+    if changed_head:
+        assert state.machine_block is not None and state.self_clears == 0
+        assert restarted.remote.get_pr(70).has(Label.AI_BLOCKED)
+    else:
+        assert state.machine_block is None and state.self_clears == 1
+        assert restarted.remote.get_pr(70).labels == frozenset({Label.AI_PR_OPEN})
+    assert first.provider.tasks == restarted.provider.tasks == []
+
+
+@pytest.mark.parametrize("changed", ["head", "checks", "checks-unavailable"])
+def test_machine_recovery_rechecks_exact_head_and_checks_before_remote_mutation(tmp_path, changed):
+    from dataclasses import asdict
+    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
+    from issue_agent.domain.world import Check
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from tests.fakes.accounted_workflow import seed_imported_machine_hold
+    seed(tmp_path, "ai-pr-open")
+    remote = PersistentGitHub(tmp_path / "github.db")
+    remote.seed_pr(pr(70, "ai-pr-open", "ai-blocked", closing_issue=7, head_ref_oid="same-head",
+                      checks=(Check("unit", bucket="pass"),)))
+    client = compose(tmp_path)
+    seed_imported_machine_hold(client.control, MachineBlock(7, Target.PR, 70, 70, MachineBlocker.CHECKS, "same-head"))
+    actions = client.daemon.decide(remote.build_world())
+    assert len(actions) == 1 and isinstance(actions[0], Relabel)
+    if changed == "head":
+        remote.external_pr_change(70, head_ref_oid="newer-head")
+    elif changed == "checks":
+        remote.external_pr_change(70, checks=[asdict(Check("unit", bucket="pending"))])
+    else:
+        remote.external_pr_change(70, checks_known=False)
+    assert not client.daemon.executor.execute_all(actions)
+    state = client.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7))).component.state
+    assert state.machine_block is not None and state.self_clears == 0
+    assert remote.get_pr(70).has(Label.AI_BLOCKED)
+    assert not any(call[0] == "relabel_pr" for call in remote.calls)
+    assert client.provider.tasks == []
 
 
 def fail_at(point: str):

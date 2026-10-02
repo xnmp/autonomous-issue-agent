@@ -1991,7 +1991,7 @@ def test_machine_retirement_is_selected_and_preserves_budget_hold(tmp_path):
     assert control.read_issue_recovery(key).component.state.budget_block == budget
     with pytest.raises(ValueError, match="stale"):
         control.retire_machine_block(selected.revision, blocker="checks", blocked_head="a" * 40)
-    assert files.get_self_clear_count(5) == 0
+    assert control.read_issue_recovery(key).component.state.self_clears == 0
 
 
 def test_stale_pr_machine_return_settles_without_installing_old_head(monkeypatch):

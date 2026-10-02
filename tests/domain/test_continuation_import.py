@@ -211,3 +211,19 @@ def test_budget_import_refuses_only_selected_malformed_evidence(field, value):
 def test_budget_import_requires_bounded_complete_evidence(payload):
     result = classify_record(record(**{"budget-block": payload}))
     assert isinstance(result, tuple) and all("budget-block" in blocker.reason for blocker in result)
+
+
+@pytest.mark.parametrize("count,reported", [(0, False), (2, False), (3, True), (9, True)])
+def test_shared_self_clear_import_preserves_count_and_ceiling_report(count, reported):
+    fields = {"self-clears": str(count)}
+    if reported:
+        fields["self-clear-ceiling"] = "1"
+    state = classify_record(record(**fields))
+    assert isinstance(state, cc.IssueRecoveryState)
+    assert (state.self_clears, state.self_clear_ceiling_reported) == (count, reported)
+
+
+@pytest.mark.parametrize("count,marker", [(2, "1"), (3, ""), (3, "0"), (3, "true"), (3, "2")])
+def test_shared_self_clear_import_refuses_malformed_or_contradictory_report(count, marker):
+    state = classify_record(record(**{"self-clears": str(count), "self-clear-ceiling": marker}))
+    assert isinstance(state, tuple) and state

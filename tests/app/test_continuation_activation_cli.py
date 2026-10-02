@@ -838,3 +838,25 @@ def test_budget_shadow_and_copy_preserve_selected_cap_facts_and_refuse_only_bad_
     assert isinstance(blocked.issue_recovery, cc.BlockedIssueRecovery)
     assert dump(control) == original_sql
     assert {path.name: path.read_bytes() for path in state.iterdir()} == original_files
+
+
+def test_self_clear_shadow_and_copy_preserve_one_exhausted_shared_allowance(stopped, capsys, tmp_path):
+    state, control, _ = stopped
+    (state / "issue-7.self-clears").write_text("3")
+    (state / "issue-7.self-clear-ceiling").write_text("1")
+    (state / "issue-8.self-clear-ceiling").write_text("1")
+    original_sql = dump(control)
+    original_files = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, report, error = command(capsys, "fix", "shadow")
+    assert code == 0, error
+    assert report["self_clear_shadow"] == [{"issue": 7, "legacy": [3, True], "imported": [3, True], "agrees": True}]
+    assert [(target["number"], target["eligible"]) for target in report["targets"]] == [(7, True), (8, False)]
+    copied = tmp_path / "self-clear-copy"
+    code, result, error = command(capsys, "fix", "rehearse", "--copy-to", str(copied))
+    assert code == 0 and all(result["checks"].values()), error
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    reopened = SQLiteControlStore(str(copied / "issue-agent-control" / Path(control.path).name))
+    selected = reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    assert (selected.component.state.self_clears, selected.component.state.self_clear_ceiling_reported) == (3, True)
+    assert dump(control) == original_sql
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == original_files

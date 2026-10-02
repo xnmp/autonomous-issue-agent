@@ -69,6 +69,17 @@ def test_sibling_ceiling_reports_are_selected_once_per_snapshot():
     assert actions == [ReportSelfClearCeiling(7, Target.PR, 100, "publication", 3)]
 
 
+@pytest.mark.parametrize("field,value", [
+    ("committed_micros", True), ("committed_micros", None), ("cap_micros", 2**63),
+    ("cap_micros", True), ("scope", ""), ("disposition", None), ("currency", "usd"),
+])
+def test_budget_observation_boundary_refuses_untrusted_projection_amounts(field, value):
+    facts = dict(scope="issue:7", disposition="available", committed_micros=0, cap_micros=5_000_000, currency="USD")
+    facts[field] = value
+    with pytest.raises(ValueError):
+        BudgetLimitObservation(**facts)
+
+
 def test_publication_block_retires_only_on_the_recorded_open_pr_head():
     actions = _decide(WorldState(prs=(_pr(),)), machine=_machine())
 

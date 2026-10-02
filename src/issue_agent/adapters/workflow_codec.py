@@ -34,7 +34,7 @@ from ..domain.labels import Label
 from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
-from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
+from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker, MachineClearProjection, BudgetClearProjection, BudgetWorld, BudgetLimitObservation
 from ..domain.actions import Target
 from ..domain.outcome import Adjudication
 from ..domain.effort import Effort
@@ -47,7 +47,17 @@ MAX_WORKFLOW_PAYLOAD_BYTES = 262144
 MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
+
+def decode_self_clear_projection(payload: object) -> MachineClearProjection | BudgetClearProjection:
+    if not isinstance(payload, str):
+        raise ValueError("self-clear projection requires a bounded encoded value")
+    value = decode_workflow(payload, object)
+    if not isinstance(value, (MachineClearProjection, BudgetClearProjection)):
+        raise ValueError("self-clear command requires its fixed recovery projection")
+    return value
+
 _VALUES = (
+    MachineClearProjection, BudgetClearProjection, BudgetWorld, BudgetLimitObservation,
     BudgetScope, BudgetBlock, cc.RefusedBudgetBlock,
     MachineBlock, cc.RecordedMachineBlock,
     cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
@@ -204,7 +214,7 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None},
     "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False, "head": ""},
     "PRRepairResult": {"ci": None, "review": None, "rebase": None, "machine_block": None},
-    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None, "machine_block": None, "budget_block": None},
+    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None, "machine_block": None, "budget_block": None, "self_clear_ceiling_reported": False},
     "ContinuationCapture": {"fix_infra_ceiling": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
@@ -255,6 +265,7 @@ def _encode(value: object, depth: int = 0) -> object:
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None))
                     and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
                     and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block", "budget_block"} and getattr(value, field.name) is None)
+                    and not (type(value) is cc.IssueRecoveryState and field.name == "self_clear_ceiling_reported" and not value.self_clear_ceiling_reported)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
                         or field.name == "review" and value.review is None
                         or field.name == "rebase" and value.rebase is None
