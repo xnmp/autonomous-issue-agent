@@ -138,6 +138,12 @@ make test-governor
 `make test` must be green before any commit. The daemons hot-reload from this
 checkout between ticks, so commit only coherent tested states.
 
+`make test` creates private scratch storage and removes it on exit. It prefers
+a writable `XDG_RUNTIME_DIR`, then `/tmp`; an explicit `TMPDIR` overrides that
+choice. Leave `TMPDIR` unset for routine runs so a prior disk-backed workaround
+does not slow every SQLite test. The focused Python targets retain pytest
+scratch for debugging.
+
 Before a PR, include required evidence and run an unbiased adversarial review of
 the complete diff in a subagent.
 

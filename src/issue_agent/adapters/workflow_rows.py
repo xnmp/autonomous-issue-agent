@@ -1449,12 +1449,16 @@ def _check_current_execution(
             or (latest["sequence"] if latest is not None else 0) != execution.last_sequence):
         raise WorkflowAuthorityError("current execution allocation disagrees with its indexed high water")
     read_current_review_pending(db, execution)
-    references = {
-        sequence: _read_current_round_outcome(db, episode, sequence)
+    # Baseline and current state usually name the same round. Validate each
+    # selected source once within this read, including carried display sources.
+    sequences = {
+        sequence
         for state in (execution.baseline.state, execution.state)
-        for sequence in {state.session_sequence, state.display_sequence, state.productive_sequence}
-        if sequence > 0 and sequence != execution.generation_start_sequence
+        for sequence in (state.display_sequence, state.productive_sequence,
+                         state.session_sequence if state.session_sequence > execution.generation_start_sequence else 0)
+        if sequence > 0
     }
+    references = {sequence: _read_current_round_outcome(db, episode, sequence) for sequence in sequences}
     if any(not same_execution_episode(execution.binding, outcome.round.binding)
            or outcome.round.binding.rejection.fence.generation > generation
            for outcome in references.values()):
@@ -1475,11 +1479,11 @@ def _check_current_execution(
                             or isinstance(update, ClearReviewSession) and isinstance(state.session, NoReviewSession))):
                 raise WorkflowAuthorityError("current session lacks its exact productive source")
         if state.display_sequence > 0:
-            outcome = references.get(state.display_sequence) or _read_current_round_outcome(db, episode, state.display_sequence)
+            outcome = references[state.display_sequence]
             if not isinstance(outcome.display, SetDisplayedRound) or outcome.display.number != state.displayed_round:
                 raise WorkflowAuthorityError("current displayed round lacks its exact outcome source")
         if state.productive_sequence > 0:
-            outcome = references.get(state.productive_sequence) or _read_current_round_outcome(db, episode, state.productive_sequence)
+            outcome = references[state.productive_sequence]
             if not isinstance(outcome.disposition, (PaidReviewProgress, CopiedReviewProgress)):
                 raise WorkflowAuthorityError("current productive watermark lacks its exact outcome source")
 

@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from enum import Enum
+import re
 from typing import Literal
 
 from .repository import canonical_repository, repository_validation_error
@@ -11,6 +12,7 @@ from .repository import canonical_repository, repository_validation_error
 MAX_REARM_COMMANDS = 64   # durable obligations of one transition or re-arm
 MAX_WORKFLOW_GATES = 64
 MAX_DETAIL_CHARS = 16384
+_IDENTIFIER_CONTROL = re.compile(r"[\x00-\x1f]")
 
 
 def validate_workflow_integer(value: int, name: str, *, minimum: int = 0) -> None:
@@ -23,7 +25,7 @@ def validate_workflow_identifier(value: str, name: str) -> None:
         not isinstance(value, str)
         or not value.strip()
         or len(value) > 512
-        or any(ord(character) < 32 for character in value)
+        or _IDENTIFIER_CONTROL.search(value) is not None
     ):
         raise ValueError(f"{name} must be a nonempty bounded identifier")
 

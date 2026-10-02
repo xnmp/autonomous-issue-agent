@@ -8,14 +8,17 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from zoneinfo import ZoneInfo
+
+import pytest
 
 from issue_agent.adapters.child_env import CHILD_ENV_MANIFEST
 from issue_agent.adapters.control_store import (
     ReservationRequest,
     SQLiteControlStore,
 )
-from issue_agent.adapters.process_supervisor import ProcessSupervisor
+from issue_agent.adapters.process_supervisor import ProcessIdentity, ProcessSupervisor
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -30,6 +33,43 @@ def _wait_dead(process: subprocess.Popen[bytes]) -> None:
     while process.poll() is None and time.monotonic() < deadline:
         time.sleep(0.02)
     assert process.poll() is not None
+
+
+@pytest.mark.parametrize("state", ["R", "S", "Z", "X"])
+def test_selected_process_identity_needs_no_host_census(monkeypatch, state):
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(Path, "is_dir", lambda path: path == Path("/proc") or original_is_dir(path))
+    fields = [state, "1", "123", *("0" for _ in range(16)), "9876"]
+
+    def read_stat(path, **kwargs):
+        assert path == Path("/proc/123/stat")
+        return f"123 (command with ) and ( spaces) {' '.join(fields)}"
+
+    def unavailable_census(path):
+        raise PermissionError("other processes are not observable")
+
+    monkeypatch.setattr(Path, "read_text", read_stat)
+    monkeypatch.setattr(Path, "iterdir", unavailable_census)
+    live = state not in {"Z", "X"}
+    assert ProcessSupervisor.process_identity(123) == (ProcessIdentity(123, 9876) if live else None)
+    assert ProcessSupervisor.matches_identity(123, 9876) is live
+    assert not ProcessSupervisor.matches_identity(123, 9877)
+
+
+@pytest.mark.parametrize("raw", [None, "malformed", "123 (short) R", "456 (replaced) R 1 123 " + "0 " * 16 + "9876"])
+def test_selected_process_identity_refuses_absent_or_malformed_stat(monkeypatch, raw):
+    original_is_dir = Path.is_dir
+    monkeypatch.setattr(Path, "is_dir", lambda path: path == Path("/proc") or original_is_dir(path))
+
+    def read_stat(path, **kwargs):
+        assert path == Path("/proc/123/stat")
+        if raw is None:
+            raise FileNotFoundError(path)
+        return raw
+
+    monkeypatch.setattr(Path, "read_text", read_stat)
+    assert ProcessSupervisor.process_identity(123) is None
+    assert not ProcessSupervisor.matches_identity(123, 9876)
 
 
 def _reserve_paid_run(

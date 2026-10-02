@@ -993,6 +993,77 @@ def test_a_permanently_partial_read_never_holds_a_later_rearm(rig):
     assert isinstance(rig.reconcile().snapshot.intent, CompletedReviewRearm)
 
 
+def cancelled_rearm_with_settled_command(rig):
+    pending = rig.pending()
+    command = rig.commands(CommandKind.DISMISS_REVIEW)[0]
+    stopped = rig.control().cancel_rearm(CancelRearm(
+        "cancel:1", pending.revision, "request:1", "stop", expected_binding=pending.binding,
+    ), ACTOR)
+    assert isinstance(stopped, WorkflowCommitted)
+    assert isinstance(rig.store.command_reconciliation(command), RetiredSettledCommand)
+    return stopped.snapshot, command
+
+
+@pytest.mark.parametrize("column", ["payload_json", "workflow_binding_json"])
+def test_generation_advance_does_not_rebuild_fully_settled_command_history(rig, column):
+    stopped, command = cancelled_rearm_with_settled_command(rig)
+    retired = rig.store.command_reconciliation(command)
+    with rig.store.transaction() as db:
+        db.execute(f"UPDATE lifecycle_commands SET {column}=? WHERE command_id=?",
+                   ("unreadable historical payload", str(command)))
+    continued = rig.control().continue_rearm(ContinueGrantedRearm(
+        "request:2", stopped.revision, "request:1", expected_binding=stopped.binding,
+    ), ACTOR)
+    assert isinstance(continued, WorkflowCommitted)
+    assert continued.snapshot.revision.fence.generation == stopped.revision.fence.generation + 1
+    assert rig.store.command_reconciliation(command) == retired
+    assert rig.receipt(command) is None
+
+
+@pytest.mark.parametrize("raw", [
+    "not JSON",
+    '{"format":1,"value":{"type":"RetiredSettledCommand","fields":{}}}',
+])
+def test_generation_advance_refuses_malformed_retirement_without_committing(rig, raw):
+    stopped, command = cancelled_rearm_with_settled_command(rig)
+    with rig.store.transaction() as db:
+        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                   (raw, str(command)))
+    commands = rig.commands()
+    with pytest.raises(ValueError):
+        rig.control().continue_rearm(ContinueGrantedRearm(
+            "request:2", stopped.revision, "request:1", expected_binding=stopped.binding,
+        ), ACTOR)
+    assert rig.workflow() == stopped
+    assert rig.commands() == commands
+
+
+@pytest.mark.parametrize("corrupt_binding", [False, True])
+def test_retired_command_with_scheduled_cleanup_still_requires_its_binding(rig, corrupt_binding):
+    from issue_agent.domain.workflow import ActiveReconciliation
+
+    stopped, command = cancelled_rearm_with_settled_command(rig)
+    schedule = ActiveReconciliation(NOW, NOW, 0)
+    with rig.store.transaction() as db:
+        db.execute("UPDATE lifecycle_commands SET prewrite_read_json=? WHERE command_id=?",
+                   (encode_workflow(schedule), str(command)))
+        if corrupt_binding:
+            db.execute("UPDATE lifecycle_commands SET workflow_binding_json=? WHERE command_id=?",
+                       ("unreadable binding", str(command)))
+    request = ContinueGrantedRearm(
+        "request:2", stopped.revision, "request:1", expected_binding=stopped.binding,
+    )
+    if corrupt_binding:
+        with pytest.raises(ValueError):
+            rig.control().continue_rearm(request, ACTOR)
+        assert rig.workflow() == stopped
+        assert rig.store.prewrite_read(command) == schedule
+    else:
+        assert isinstance(rig.control().continue_rearm(request, ACTOR), WorkflowCommitted)
+        assert rig.store.prewrite_read(command) is None
+        assert isinstance(rig.store.command_reconciliation(command), RetiredSettledCommand)
+
+
 def test_a_generation_advance_retires_older_commands_and_ends_their_schedules(rig):
     """A standalone old-generation command can never begin: the advance retires it (typed, journaled)."""
     rig.activate()

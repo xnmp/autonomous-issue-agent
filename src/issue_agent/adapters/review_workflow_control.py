@@ -94,7 +94,7 @@ from .review_dispatch_holds import (
     SETTLED_SUBMISSION_NAMESPACE as _SETTLED_SUBMISSION_NAMESPACE,
     review_release_projection, review_submission_settled, unresolved_review_submissions,
 )
-from .workflow_codec import decode_workflow, encode_workflow
+from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_commit import (
     insert_pending_rearm, intent_state, owns_command, persist_retry_authorization, record_commit,
     retire_rearm_obligation,
@@ -1461,10 +1461,28 @@ class SQLiteReviewWorkflowControl:
         payload = json.dumps({"reason": "generation advanced", "from_generation": prior.revision.fence.generation,
                               "to_generation": after.revision.fence.generation}, sort_keys=True)
         recorded = False
-        for row in db.execute(
-            "SELECT * FROM lifecycle_commands WHERE repository=? AND target=? AND workflow_binding_json IS NOT NULL",
+        for candidate in db.execute(
+            "SELECT command_id,state,prewrite_read_json,workflow_reconciliation_json "
+            "FROM lifecycle_commands WHERE repository=? AND target=? AND workflow_binding_json IS NOT NULL",
             (key.repository, f"pr:{key.target.number}"),
         ).fetchall():
+            if (candidate["prewrite_read_json"] is None
+                    and candidate["state"] not in ("succeeded", "permanent_failure")
+                    and candidate["workflow_reconciliation_json"] is not None):
+                try:
+                    reconciliation = self._control._command_reconciliation(candidate)
+                except WorkflowEncodingError:
+                    # Preserve the binding checks and error ordering below.
+                    pass
+                else:
+                    if isinstance(reconciliation, RetiredSettledCommand):
+                        # Fully settled history with no scheduled cleanup cannot
+                        # authorize an action; its old payload is not current authority.
+                        continue
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?",
+                             (candidate["command_id"],)).fetchone()
+            if row is None:
+                raise WorkflowAuthorityError("selected generation command disappeared")
             command = _command_from_row(row)
             binding = command.workflow
             assert binding is not None

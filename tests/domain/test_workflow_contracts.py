@@ -34,6 +34,17 @@ def test_episode_rejects_identifier_that_cannot_be_carried_to_admission(control)
         ResolveEpisode(f"episode{control}7")
 
 
+@pytest.mark.parametrize("identifier", ["x" * 512, "épisode", "episode\x7f", "episode\u2028next"])
+def test_episode_preserves_bounded_unicode_identifiers(identifier):
+    assert ResolveEpisode(identifier).episode_id == identifier
+
+
+@pytest.mark.parametrize("identifier", ["", " \u2003 ", "x" * 513])
+def test_episode_refuses_empty_or_oversized_identifiers(identifier):
+    with pytest.raises(ValueError):
+        ResolveEpisode(identifier)
+
+
 def test_episode_allows_multiline_operator_guidance_and_error_details():
     state = replace(snapshot(), episode=ResolveEpisode("episode", 1, "one\ntwo", "three\nfour"))
     assert state.binding.episode_id == "episode"

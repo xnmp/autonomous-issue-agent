@@ -668,7 +668,24 @@ class ProcessSupervisor:
             return None, ()
 
     @staticmethod
-    def _process_table() -> dict[int, tuple[ProcessIdentity, int, int]]:
+    def _proc_entry(path: Path) -> tuple[ProcessIdentity, int, int] | None:
+        try:
+            raw = path.read_text(encoding="utf-8")
+            pid_text, separator, tail = raw.partition("(")
+            if not separator:
+                return None
+            _command, separator, fields_text = tail.rpartition(")")
+            if not separator:
+                return None
+            fields = fields_text.split()
+            if fields[0] in {"Z", "X"}:
+                return None
+            return ProcessIdentity(int(pid_text), int(fields[19])), int(fields[1]), int(fields[2])
+        except (OSError, ValueError, IndexError, UnicodeError):
+            return None
+
+    @classmethod
+    def _process_table(cls) -> dict[int, tuple[ProcessIdentity, int, int]]:
         """Return live process identity, parent pid, and process-group id."""
 
         table: dict[int, tuple[ProcessIdentity, int, int]] = {}
@@ -677,28 +694,9 @@ class ProcessSupervisor:
             for path in proc.iterdir():
                 if not path.name.isdigit():
                     continue
-                try:
-                    raw = (path / "stat").read_text(encoding="utf-8")
-                    pid_text, separator, tail = raw.partition("(")
-                    if not separator:
-                        continue
-                    _command, separator, fields_text = tail.rpartition(")")
-                    if not separator:
-                        continue
-                    fields = fields_text.split()
-                    if fields[0] in {"Z", "X"}:
-                        continue
-                    pid = int(pid_text)
-                    ppid = int(fields[1])
-                    pgid = int(fields[2])
-                    start_ticks = int(fields[19])
-                    table[pid] = (
-                        ProcessIdentity(pid, start_ticks),
-                        ppid,
-                        pgid,
-                    )
-                except (OSError, ValueError, IndexError):
-                    continue
+                entry = cls._proc_entry(path / "stat")
+                if entry is not None:
+                    table[entry[0].pid] = entry
             return table
         try:
             completed = subprocess.run(
@@ -729,13 +727,17 @@ class ProcessSupervisor:
 
     @classmethod
     def _identity_for_pid(cls, pid: int) -> ProcessIdentity | None:
+        if type(pid) is not int or pid <= 0:
+            return None
+        if Path("/proc").is_dir():
+            current = cls._proc_entry(Path(f"/proc/{pid}/stat"))
+            return current[0] if current is not None and current[0].pid == pid else None
         current = cls._process_table().get(pid)
         return current[0] if current is not None else None
 
     @classmethod
     def _same_process(cls, identity: ProcessIdentity) -> bool:
-        current = cls._process_table().get(identity.pid)
-        return current is not None and current[0].start_ticks == identity.start_ticks
+        return cls._identity_for_pid(identity.pid) == identity
 
     @classmethod
     def _group_identities(cls, pgid: int) -> tuple[ProcessIdentity, ...]:

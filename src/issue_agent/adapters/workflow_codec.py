@@ -158,6 +158,14 @@ _TAGS = {value.__name__: value for value in (*_VALUES, *_ENUMS)}
 if len(_TAGS) != len(_VALUES) + len(_ENUMS):
     raise RuntimeError("workflow codec tags must name exactly one registered variant")
 
+# The closed constructors do not change between payloads. Cache their schema,
+# never decoded authority values or validation results.
+_VALUE_FIELDS = {value: fields(value) for value in _VALUES}
+_FIELD_NAMES = {value: frozenset(field.name for field in schema) for value, schema in _VALUE_FIELDS.items()}
+_ENUM_TYPES = frozenset(_ENUMS)
+_EVOLVED_TAGS = {"WorkflowSnapshotV2": "WorkflowSnapshot", "ReviewWorkflowSnapshotV3": "ReviewWorkflowSnapshot",
+                 "ReviewFamilyEpisodesV2": "ReviewFamilyEpisodes"}
+
 _CURRENT_REVIEW_SNAPSHOT_TAG = "ReviewWorkflowSnapshotV2"
 _LEGACY_REVIEW_SNAPSHOT_FIELDS = frozenset({"revision", "authority", "episode", "gates", "intent"})
 _CURRENT_ACTIVATED_EXECUTION_TAG = "ActivatedReviewExecutionV2"
@@ -209,9 +217,9 @@ class WorkflowEncodingError(ValueError):
 def _encode(value: object, depth: int = 0) -> object:
     if depth > MAX_WORKFLOW_PAYLOAD_DEPTH:
         raise WorkflowEncodingError("workflow payload nesting is excessive")
-    if type(value) in _ENUMS:
+    if type(value) in _ENUM_TYPES:
         return {"type": type(value).__name__, "value": value.value}
-    if type(value) in _VALUES and is_dataclass(value):
+    if type(value) in _VALUE_FIELDS and is_dataclass(value):
         return {
             "type": ("ReviewWorkflowSnapshotV3" if type(value) is rw.ReviewWorkflowSnapshot and not isinstance(value.pr_repair, cc.InactivePRRepair)
                      else _CURRENT_REVIEW_SNAPSHOT_TAG if type(value) is rw.ReviewWorkflowSnapshot
@@ -224,7 +232,7 @@ def _encode(value: object, depth: int = 0) -> object:
                      else type(value).__name__),
             "fields": {
                 field.name: _encode(getattr(value, field.name), depth + 1)
-                for field in fields(value)
+                for field in _VALUE_FIELDS[type(value)]
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None))
@@ -308,11 +316,9 @@ def _decode(value: object, depth: int = 0) -> object:
             raise WorkflowEncodingError("wrong fields for legacy execution checkpoint")
         decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
         return rx.ReviewExecutionCheckpoint(**decoded, boundary_cursor=None)
-    evolved = {"WorkflowSnapshotV2": "WorkflowSnapshot", "ReviewWorkflowSnapshotV3": "ReviewWorkflowSnapshot",
-               "ReviewFamilyEpisodesV2": "ReviewFamilyEpisodes"}
-    strict_evolution = tag in evolved
+    strict_evolution = tag in _EVOLVED_TAGS
     if strict_evolution:
-        tag = evolved[tag]
+        tag = _EVOLVED_TAGS[tag]
     elif tag == _CURRENT_REVIEW_SNAPSHOT_TAG:
         tag = "ReviewWorkflowSnapshot"
     if tag == _CURRENT_ACTIVATED_EXECUTION_TAG:
@@ -332,13 +338,14 @@ def _decode(value: object, depth: int = 0) -> object:
     if set(value) != {"type", "fields"} or not isinstance(payload, dict):
         raise WorkflowEncodingError("malformed workflow fields")
     legacy: dict[str, object] = {} if strict_evolution else _LEGACY_FIELDS.get(tag, {})
+    field_names = _FIELD_NAMES[constructor]
     required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}
-                if tag == "StewardLaneState" else {field.name for field in fields(constructor)} - legacy.keys())
-    if tag in {"StewardLaneState", "PRRepairState", "PRRepairPurchase"} and required <= set(payload) <= {field.name for field in fields(constructor)}:
+                if tag == "StewardLaneState" else field_names - legacy.keys())
+    if tag in {"StewardLaneState", "PRRepairState", "PRRepairPurchase"} and required <= set(payload) <= field_names:
         payload = {**legacy, **payload}
-    if legacy and set(payload) == {field.name for field in fields(constructor)} - legacy.keys():
+    if legacy and set(payload) == field_names - legacy.keys():
         payload = {**legacy, **payload}
-    if set(payload) != {field.name for field in fields(constructor)}:
+    if set(payload) != field_names:
         raise WorkflowEncodingError(f"wrong fields for workflow variant: {tag}")
     return constructor(**{key: _decode(item, depth + 1) for key, item in payload.items()})
 
