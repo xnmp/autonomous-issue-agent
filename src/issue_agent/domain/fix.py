@@ -198,6 +198,7 @@ class FixState:
     # workflow (on a RETURNED infra-death result) — the two are mutually
     # exclusive, so a single death counts once.
     infra_deaths: dict[int, int] = field(default_factory=dict)
+    infra_control_errors: Mapping[int, str] = field(default_factory=dict)
     # PR number → the head SHA whose ONE free CI re-run has been spent (#38).
     # Keyed on the SHA, not a boolean, so a push resets the allowance for free:
     # a new head is a genuinely new failure and deserves its own flake test,
@@ -1786,6 +1787,8 @@ def decide_fix(
     issues_by_number = {issue.number: issue for issue in world.issues}
 
     def dispatchable(issue: int, paths: frozenset[str]) -> bool:
+        if issue in state.infra_control_errors:
+            return False
         exclusive = not paths
         return all(
             active.issue != issue
@@ -2107,6 +2110,7 @@ def decide_fix(
     ready_world = replace(world, prs=observed_prs, issues=tuple(
         issue for issue in world.issues
         if issue.number not in guarded
+        and issue.number not in state.infra_control_errors
         and isinstance(workflow := state.resolve_workflows.get(issue.number), WorkflowSnapshot)
         and not workflow.gates
     ))

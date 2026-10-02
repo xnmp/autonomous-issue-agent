@@ -126,7 +126,7 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
             keys = {key for key in keys if isinstance(key.target, IssueRef) or WorkflowFamily.PR_REPAIR in scope.families}
             if len(keys) > MAX_IMPORT_TARGETS:
                 raise ResolveActivationRefused("continuation target inventory exceeds its bound")
-            kinds = ("TRIAGE", "GROOM") if scope.families == (WorkflowFamily.STEWARD,) else ("RESOLVE", "RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE")
+            kinds = ("TRIAGE", "GROOM") if scope.families == (WorkflowFamily.STEWARD,) else ("ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE")
             unbound = db.execute("SELECT rowid,typeof(owner_id),length(CAST(owner_id AS BLOB)) FROM runs WHERE workflow_episode_key IS NULL LIMIT ?", (MAX_IMPORT_TARGETS + 1,)).fetchall()
             if len(unbound) > MAX_IMPORT_TARGETS:
                 raise ResolveActivationRefused("unassigned run identity sources exceed the stopped import bound")

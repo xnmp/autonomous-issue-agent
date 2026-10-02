@@ -29,7 +29,7 @@ from issue_agent.domain.world import IssueView
 from issue_agent.domain.workflow import OpenGate, ResolveCeiling
 
 from tests.domain.builders import issue as build_issue, world
-from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, resolve_state, seed_resolve
+from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, issue_recovery_state, resolve_state, seed_resolve
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees
 
@@ -103,7 +103,7 @@ def decide_from(store):
     """Use the SQL-owned episode and separate infrastructure counter."""
     state = FixState(
         resolve_workflows={ISSUE: resolve_state(store, ISSUE)},
-        infra_deaths={ISSUE: store.get_infra_deaths(ISSUE)},
+        infra_deaths={ISSUE: issue_recovery_state(store, ISSUE).infra_failures},
     )
     return decide_fix(
         world(issues=[build_issue(ISSUE, "ai-ready")]), CFG, state, fixer_busy=False
@@ -149,7 +149,7 @@ def test_stillborn_legs_take_the_infra_ceiling_instead():
 
     run_resolves(store, stillborn(), 3)
 
-    assert store.get_infra_deaths(ISSUE) == 3
+    assert issue_recovery_state(store, ISSUE).infra_failures == 3
 
 
 def test_a_runtime_broken_past_the_infra_ceiling_escalates_as_infra():
@@ -183,10 +183,8 @@ def test_stillborn_legs_are_journalled_with_the_ceiling_they_advanced():
     assert all(e.correlation.issue == ISSUE for e in journal.events)
 
 
-def test_a_counter_we_cannot_persist_does_not_replace_the_death_it_reports():
-    """A store failure here used to escape the workflow, where the dispatcher
-    re-catches it and reports a SECOND infra death for the same leg. The leg's
-    own follow-up actions must still be applied."""
+def test_retired_file_counter_failure_does_not_replace_sql_death_or_followups():
+    """Retired file writes cannot replace the fault or charge its SQL episode twice."""
 
     class UnwritableStore(FakeStore):
         def bump_infra_deaths(self, key):
@@ -204,7 +202,7 @@ def test_a_counter_we_cannot_persist_does_not_replace_the_death_it_reports():
         ).resolve(ISSUE)
     )
 
-    assert any("infra death not persisted" in m for m in logged)
+    assert issue_recovery_state(store, ISSUE).infra_failures == 1
     assert resolve_state(store, ISSUE).episode.failures == 0
     assert ("relabel", "issue", ISSUE, "ai-working", "ai-ready") in gateway.calls
 
@@ -249,7 +247,7 @@ def test_a_leg_that_ran_decays_the_infra_deaths_that_preceded_it():
     run_resolves(store, stillborn(), 3)
     run_resolves(store, ran_and_failed(), 1)
 
-    assert store.get_infra_deaths(ISSUE) == 0
+    assert issue_recovery_state(store, ISSUE).infra_failures == 0
     assert resolve_state(store, ISSUE).episode.failures == 1
     session = resolve_state(store, ISSUE).episode.continuation.session
     assert session is not None and session.session_id == "sess-abc"
@@ -266,7 +264,7 @@ def test_wall_timeout_is_a_quality_strike_not_an_infra_failure():
     ), 3)
 
     assert resolve_state(store, ISSUE).episode.failures == 3
-    assert store.get_infra_deaths(ISSUE) == 0
+    assert issue_recovery_state(store, ISSUE).infra_failures == 0
 
 
 def test_budget_exhausted_outcome_touches_neither_counter():
@@ -281,7 +279,7 @@ def test_budget_exhausted_outcome_touches_neither_counter():
     ), 3)
 
     assert resolve_state(store, ISSUE).episode.failures == 0
-    assert store.get_infra_deaths(ISSUE) == 0
+    assert issue_recovery_state(store, ISSUE).infra_failures == 0
 
 
 def test_admission_refusal_subtypes_are_infra_not_strikes():
@@ -297,7 +295,7 @@ def test_admission_refusal_subtypes_are_infra_not_strikes():
     ), 3)
 
     assert resolve_state(store, ISSUE).episode.failures == 0
-    assert store.get_infra_deaths(ISSUE) == 3
+    assert issue_recovery_state(store, ISSUE).infra_failures == 3
 
 
 # ── router evidence (#16) ────────────────────────────────────────────────────

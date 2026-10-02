@@ -1208,9 +1208,26 @@ def activation_cli(bare, monkeypatch, capsys):
     monkeypatch.setattr(cli, "REPOS_DIR", str(bare.root / "config" / "repos"))
     monkeypatch.setattr(cli, "_launcher_pids", lambda name: [])
     monkeypatch.setattr(cli, "_role_pids", lambda name: {})
+    # These stopped activation sources exercise resolve/fix authority. Stall
+    # telemetry has its separate F12 parser and explicit refusal case below.
+    from issue_agent.app import roles
+    monkeypatch.setattr(roles, "_stall_reporter", lambda *_args: lambda _world: None)
 
-    def run(*argv):
-        args = cli.build_parser().parse_args(["resolve-activation", *argv, "--name", "demo"])
+    from issue_agent.app import continuation_activation
+    original_scope = continuation_activation.activation_scope
+
+    class EmptyRemote:
+        def _gh_json(self, args):
+            return [[]]
+
+    def stopped_scope(*args, **kwargs):
+        from dataclasses import replace
+        return replace(original_scope(*args, **kwargs), gateway=EmptyRemote())
+
+    monkeypatch.setattr(continuation_activation, "activation_scope", stopped_scope)
+
+    def run(*argv, family="resolve"):
+        args = cli.build_parser().parse_args([family + "-activation", *argv, "--name", "demo"])
         code = args.func(args)
         out = capsys.readouterr()
         return code, (json.loads(out.out) if out.out.strip() else None), out.err
@@ -1234,6 +1251,19 @@ def _held_for_migration(composition) -> None:
     assert composition.charges() == []
 
 
+def _activate_fix_continuations(bare, activation_cli):
+    import json
+
+    _held_for_migration(compose(bare))
+    code, reviewed, err = activation_cli("shadow", family="fix")
+    assert code == 0 and all(target["eligible"] for target in reviewed["targets"]), (err, reviewed["targets"])
+    plan_file = bare.root / "fix-continuation-plan.json"
+    plan_file.write_text(json.dumps(reviewed))
+    code, result, err = activation_cli("activate", "--plan-file", str(plan_file),
+        "--confirm-plan-digest", reviewed["plan_digest"], family="fix")
+    assert code == 0 and result["status"] == "activated", err
+
+
 def test_activation_import_then_daemon_ticks_under_the_active_family(bare, activation_cli):
     from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
 
@@ -1243,6 +1273,7 @@ def test_activation_import_then_daemon_ticks_under_the_active_family(bare, activ
     assert code == 0 and reviewed["status"] == "ready", err
     code, result, err = activation_cli("activate", "--confirm-plan-digest", reviewed["plan"]["plan_digest"])
     assert code == 0 and result["status"] == "activated", err
+    _activate_fix_continuations(bare, activation_cli)
 
     client = compose(bare)
     client.boot()
@@ -1305,6 +1336,7 @@ def test_rollback_after_remote_write_preserves_authority_and_never_replays_old_f
     _, reviewed, _ = activation_cli("shadow")
     digest = reviewed["plan"]["plan_digest"]
     assert activation_cli("activate", "--confirm-plan-digest", digest)[0] == 0
+    _activate_fix_continuations(bare, activation_cli)
     client = compose(bare)
     client.boot()
     client.tick()  # the healthy peer's paid leg: a charge and remote writes
@@ -1331,3 +1363,19 @@ def test_rollback_after_remote_write_preserves_authority_and_never_replays_old_f
     assert not ceiling_gates(restarted.state(1))
     progress(restarted, 2)
     assert restarted.remote.calls.count(["relabel", 1, NHR, READY]) == 1
+
+
+def test_fix_activation_refuses_unsupported_stall_source_without_paid_work(bare, activation_cli):
+    _legacy_deployment(bare)
+    code, reviewed, err = activation_cli("shadow")
+    assert code == 0, err
+    assert activation_cli("activate", "--confirm-plan-digest", reviewed["plan"]["plan_digest"])[0] == 0
+    marker = bare.root / "fix-state" / "issue-2.stall-sig"
+    marker.write_text("unsupported retained stall source")
+    before = _dump(bare)
+    code, blocked, err = activation_cli("shadow", family="fix")
+    assert code == 0, err
+    peer = next(target for target in blocked["targets"] if target["number"] == 2)
+    assert not peer["eligible"] and any("stall-sig" in reason for reason in peer["blockers"])
+    assert _dump(bare) == before and marker.read_text() == "unsupported retained stall source"
+    _held_for_migration(compose(bare))

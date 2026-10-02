@@ -431,6 +431,7 @@ def _with_accounting(
         require_dispatch_claim=True,
         reservation_reconciler=reconciler,
         max_contract_rounds=cfg.max_contract_rounds,
+        fix_infra_ceiling=cfg.max_infra_deaths,
         admit=admit,
     )
 
@@ -1829,7 +1830,6 @@ def _fix_state(
     store: Store,
     world,
     inflight: tuple[InFlightFix, ...] = (),
-    process_deaths: Mapping[int, int] | None = None,
     test_exemptions: dict[int, "ExemptionFacts"] | None = None,
     *,
     workflow_control: WorkflowControl | None = None,
@@ -1924,38 +1924,18 @@ def _fix_state(
                     ci_resets[pr.number] = cc.CIEpisodeReset(selected.binding, selected.revision, repair.revision.fence, pr.head_ref_oid)
         except (ValueError, sqlite3.Error) as exc:
             errors[number] = str(exc)
-    # Infra deaths (review C3) span BOTH key spaces: the issue legs (resolve /
-    # resume) escalate on the issue number, the PR legs on breaker_key(pr) —
-    # and the dispatcher writes under whichever one the dying leg used. Read the
-    # union, or a leg escalates on a counter nobody reads.
-    #
-    # The file-backed workflow counter sees deaths the process survived.
-    # SIGKILL/OOM/restart deaths come from reclaimed control-store runs through
-    # ``process_deaths``. Telemetry is never queried to reconstruct authority.
-    #
-    # A PR's entry SUMS both key spaces (review P1R-1, matching `_review_unproductive_rounds`).
-    # When the dispatcher's pre-handler `issue_for_pr` lookup fails — and the
-    # network flakiness that drops a session is exactly the flakiness that fails
-    # that lookup — the death lands under `-pr` while the decide side asks for
-    # `breaker_key(pr)`, splitting one loop across two counters so the ceiling
-    # never trips. Summing folds the orphaned half back into the key the domain
-    # actually reads. `alt` is skipped when it IS the breaker key (an issueless
-    # PR, where breaker_key already == -pr), so nothing is counted twice.
-    deaths = dict(process_deaths or {})
-
-    def _infra_for_pr(p) -> int:
-        k = breaker_key(p)
-        alt = -p.number
-        total = read(k, store.get_infra_deaths, 0) + deaths.get(k, 0)
-        if alt != k:
-            total += read(alt, store.get_infra_deaths, 0, error_key=k) + deaths.get(alt, 0)
-        return total
-
-    infra_deaths = {breaker_key(p): _infra_for_pr(p) for p in world.prs}
-    for i in world.issues:
-        infra_deaths.setdefault(
-            i.number, read(i.number, store.get_infra_deaths, 0) + deaths.get(i.number, 0)
-        )
+    infra_deaths = {}
+    infra_errors = {}
+    for number in {issue.number for issue in world.issues} | pr_issues:
+        try:
+            if workflow_control is None:
+                raise ValueError("fix infrastructure episode authority is unavailable")
+            selected_infra = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
+            if not isinstance(selected_infra, cc.SelectedIssueRecovery):
+                raise ValueError("fix infrastructure episode is inactive or migration blocked")
+            infra_deaths[number] = selected_infra.component.state.infra_failures
+        except (ValueError, sqlite3.Error) as exc:
+            infra_errors[number] = str(exc)
     # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
@@ -2000,7 +1980,7 @@ def _fix_state(
         ci_retries=ci_retries, ci_resets=ci_resets, review_retries=review_retries,
         review_control_errors=review_errors,
         rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
-        infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
+        infra_deaths=infra_deaths, infra_control_errors=infra_errors, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
         update_branch_head=update_branch_head,
         ci_pending_escalated=ci_pending_escalated,
@@ -2873,7 +2853,6 @@ def compose_fix_daemon(
             store,
             world,
             inflight,
-            control.abandoned_dispatch_counts(owner_id),
             _collect_test_exemptions(
                 gateway, world, fix_cfg, fix_cfg.review_bot, log
             ),
@@ -2883,6 +2862,8 @@ def compose_fix_daemon(
             log(f"workflow {target} held: {reason}")
         for target, reason in state.review_control_errors.items():
             log(f"address-review {target} held: {reason}")
+        for target, reason in state.infra_control_errors.items():
+            log(f"fix infrastructure {target} held: {reason}")
         for target, reason in state.pr_reply_control_errors.items():
             log(f"PR reply {target} held: {reason}")
         migration_required = sorted(

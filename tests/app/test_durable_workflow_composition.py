@@ -50,7 +50,7 @@ from issue_agent.domain.resolve_split import ContractRevision, ContractResetResu
 from issue_agent.domain.workflow_identity import WorkflowBinding, WorkflowWriter
 from tests.domain.builders import issue, pr
 from tests.fakes.persistent_github import PersistentGitHub
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 
 class Crash(BaseException):
@@ -252,7 +252,7 @@ def test_corrupt_paid_return_holds_only_its_issue_while_restart_advances_a_healt
     with first.control.transaction() as db:
         db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='workflow-return'")
     first.remote.seed(issue(8, "ai-ready", updated_at="2026-09-14T00:00:00Z"))
-    install_workflow(first.control, resolve_snapshot(8))
+    install_workflow(first.control, with_issue_recovery(resolve_snapshot(8)))
 
     restarted = compose(tmp_path)
     monkeypatch.setattr(restarted.control, "_now", lambda: datetime.now(timezone.utc) + timedelta(minutes=2))

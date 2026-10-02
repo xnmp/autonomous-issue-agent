@@ -6,6 +6,9 @@ shrinking into a router without losing behavior coverage.
 
 from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
 
+from tests.fakes.accounted_workflow import seed_infra_outcome
+from issue_agent.domain import continuation_components as cc
+
 import asyncio
 import dataclasses
 from pathlib import Path
@@ -446,7 +449,9 @@ def test_resolve_session_handoff_dispatches_and_runs_pr_reply_without_legacy_res
     assert pr_repair_state(store).session.handle == "repair-transcript"
     assert pr_repair_state(store).actual_model.model == "m"
     assert store.get_session(5) == "" and store.get_model(5) == ""
-    assert _resolve_snapshot(store) == before
+    after = _resolve_snapshot(store)
+    assert (after.episode, after.gates, after.intent, after.binding) == (before.episode, before.gates, before.intent, before.binding)
+    assert dataclasses.replace(after.issue_recovery.state, infra_episode=before.issue_recovery.state.infra_episode) == before.issue_recovery.state
     assert Label.AI_BLOCKED not in gw.prs[100].labels
     assert pr_repair_state(store).consumed_reply_at == "2026-09-14T00:01:00Z"
 
@@ -755,7 +760,7 @@ def test_fix_ci_infra_death_counts_against_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
-    assert store.get_infra_deaths(5) == 1
+    assert issue_recovery_state(store).infra_failures == 1
     assert issue_recovery_state(store).ci_failures == 0  # still not an attempt
 
 
@@ -769,7 +774,7 @@ def test_fix_ci_error_does_not_touch_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
-    assert store.get_infra_deaths(5) == 0
+    assert issue_recovery_state(store).infra_failures == 0
     assert issue_recovery_state(store).ci_failures == 1
 
 
@@ -781,7 +786,7 @@ def test_rebase_infra_death_counts_against_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner).rebase(100))
 
-    assert store.get_infra_deaths(5) == 1
+    assert issue_recovery_state(store).infra_failures == 1
     assert issue_recovery_state(store).rebase_failures == 0
 
 
@@ -795,7 +800,7 @@ def test_resolve_infra_death_counts_against_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner).resolve(5))
 
-    assert store.get_infra_deaths(5) == 1
+    assert issue_recovery_state(store).infra_failures == 1
     assert _resolve_snapshot(store).episode.failures == 0
 
 
@@ -819,11 +824,11 @@ def test_a_returned_result_resets_the_infra_ceiling(tmp_path):
 
     asyncio.run(wf.fix_ci(100))
     asyncio.run(wf.fix_ci(100))
-    assert store.get_infra_deaths(5) == 2, "anti-vacuity: the deaths were counted"
+    assert issue_recovery_state(store).infra_failures == 2, "anti-vacuity: the deaths were counted"
 
     asyncio.run(wf.fix_ci(100))
 
-    assert store.get_infra_deaths(5) == 0
+    assert issue_recovery_state(store).infra_failures == 0
 
 
 def test_an_errored_result_also_resets_it(tmp_path):
@@ -839,7 +844,7 @@ def test_an_errored_result_also_resets_it(tmp_path):
     asyncio.run(wf.fix_ci(100))
     asyncio.run(wf.fix_ci(100))
 
-    assert store.get_infra_deaths(5) == 0
+    assert issue_recovery_state(store).infra_failures == 0
     assert issue_recovery_state(store).ci_failures == 1
 
 
@@ -854,7 +859,7 @@ def test_deaths_that_never_return_still_reach_the_ceiling(tmp_path):
     for _ in range(5):
         asyncio.run(wf.fix_ci(100))
 
-    assert store.get_infra_deaths(5) == 5
+    assert issue_recovery_state(store).infra_failures == 5
 
 
 def test_consecutive_resolve_deaths_still_reach_the_ceiling(tmp_path):
@@ -870,7 +875,7 @@ def test_consecutive_resolve_deaths_still_reach_the_ceiling(tmp_path):
     for _ in range(5):
         asyncio.run(wf.resolve(5))
 
-    assert store.get_infra_deaths(5) == 5
+    assert issue_recovery_state(store).infra_failures == 5
     assert _resolve_snapshot(store).episode.failures == 0, "a death is never an attempt"
 
 
@@ -884,11 +889,11 @@ def test_the_resolve_leg_decays_it_too(tmp_path):
     wf = _workflow(gw, store, seq)
 
     asyncio.run(wf.resolve(5))
-    assert store.get_infra_deaths(5) == 1
+    assert issue_recovery_state(store).infra_failures == 1
 
     asyncio.run(wf.resolve(5))
 
-    assert store.get_infra_deaths(5) == 0
+    assert issue_recovery_state(store).infra_failures == 0
     assert _resolve_snapshot(store).episode.failures == 1  # the honest failure is bounded elsewhere
 
 
@@ -900,13 +905,14 @@ def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
     store = Store(state_dir=str(tmp_path))
     ok = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
 
-    store.bump_infra_deaths(5)
-    asyncio.run(_workflow(gw, store, ok).rebase(100))
-    assert store.get_infra_deaths(5) == 0
+    wf = _workflow(gw, store, ok)
+    seed_infra_outcome(store._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
+    asyncio.run(wf.rebase(100))
+    assert issue_recovery_state(store).infra_failures == 0
 
-    store.bump_infra_deaths(5)
-    asyncio.run(_workflow(gw, store, ok).address_review(100))
-    assert store.get_infra_deaths(5) == 0
+    seed_infra_outcome(store._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
+    asyncio.run(wf.address_review(100))
+    assert issue_recovery_state(store).infra_failures == 0
 
 
 def test_address_review_infra_death_does_not_burn_a_review_retry():
@@ -1287,7 +1293,7 @@ def test_address_review_infra_death_counts_against_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner).address_review(100))
 
-    assert store.get_infra_deaths(5) == 1
+    assert issue_recovery_state(store).infra_failures == 1
     assert review_retry_pair(store)[1] == 0  # still not an attempt
 
 
@@ -1301,7 +1307,7 @@ def test_address_review_error_does_not_touch_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner).address_review(100))
 
-    assert store.get_infra_deaths(5) == 0
+    assert issue_recovery_state(store).infra_failures == 0
     assert review_retry_pair(store) == ("2026-01-01T00:00:09Z", 1)
 
 
@@ -1322,7 +1328,7 @@ def test_resume_infra_death_counts_against_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
 
-    assert store.get_infra_deaths(5) == 1
+    assert issue_recovery_state(store).infra_failures == 1
     assert _resolve_snapshot(store).episode.failures == 0  # no attempt was made
 
 
@@ -1336,44 +1342,30 @@ def test_resume_error_does_not_touch_the_infra_ceiling(tmp_path):
 
     asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume(5))
 
-    assert store.get_infra_deaths(5) == 0
+    assert issue_recovery_state(store).infra_failures == 0
     assert ("relabel", "issue", 5, "ai-working", "ai-blocked") in gw.calls
 
 
 # ── decay must clear the whole key set the read unions (verification sweep) ────
-def test_a_clean_pr_leg_clears_a_death_stranded_under_the_orphan_key(tmp_path):
-    """The composition gap between P1R-1 (read unions {breaker_key, -pr}) and
-    P1R-3 (decay cleared ONE key): a transient `issue_for_pr` failure that
-    coincides with a session death records under `-pr`, and the next clean run
-    only cleared the resolved key — so the phantom death read as real forever
-    and walked a healthy PR toward needs-human-review. `cleanup_pr` never
-    reached it either: it clears whichever key is current at cleanup time."""
-    store = Store(str(tmp_path))
-    store.bump_infra_deaths(-100)  # death recorded while the lookup was down
-    store.bump_infra_deaths(5)     # and one under the resolved issue
-
-    gw = FakeGateway(prs={100: _review_pr()})
-    runner = FakeRunner(_PUSHED)
-
-    asyncio.run(_workflow(gw, store, runner).address_review(100))
-
-    assert store.get_infra_deaths(5) == 0
-    assert store.get_infra_deaths(-100) == 0, "the orphaned half must clear too"
-
-
-def test_an_infra_death_still_leaves_both_halves_standing(tmp_path):
-    """Anti-vacuity twin: decay must not fire on the very deaths the ceiling
-    counts, in either half."""
+def test_clean_linked_pr_return_resets_issue_episode_without_reinterpreting_orphan_file(tmp_path):
     store = Store(str(tmp_path))
     store.bump_infra_deaths(-100)
-
     gw = FakeGateway(prs={100: _review_pr()})
-    runner = FakeRunner(_death())
+    workflow = _workflow(gw, store, FakeRunner(_PUSHED))
+    seed_infra_outcome(store._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
+    assert issue_recovery_state(store).infra_failures == 1
+    asyncio.run(workflow.address_review(100))
+    assert issue_recovery_state(store).infra_failures == 0
+    assert store.get_infra_deaths(-100) == 1, "unassigned historical files remain stopped-import evidence"
 
-    asyncio.run(_workflow(gw, store, runner).address_review(100))
 
-    assert store.get_infra_deaths(-100) == 1, "a death must not clear itself"
-    assert store.get_infra_deaths(5) == 1, "and the leg's own death is counted"
+def test_linked_pr_infra_return_counts_issue_once_without_mutating_orphan_file(tmp_path):
+    store = Store(str(tmp_path))
+    store.bump_infra_deaths(-100)
+    gw = FakeGateway(prs={100: _review_pr()})
+    asyncio.run(_workflow(gw, store, FakeRunner(_death())).address_review(100))
+    assert store.get_infra_deaths(-100) == 1
+    assert issue_recovery_state(store).infra_failures == 1
 
 
 # ── difficulty routing (#8 / P4.1) ────────────────────────────────────────────

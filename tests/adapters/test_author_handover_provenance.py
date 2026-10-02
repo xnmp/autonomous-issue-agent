@@ -28,7 +28,7 @@ from issue_agent.domain.workflow import (
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from tests.domain.builders import issue
 from tests.fakes.legacy_journal import Journal
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 
 @pytest.mark.parametrize("authoritative_change", ["prompt", "system_instruction", "schema"])
@@ -38,7 +38,7 @@ def test_author_checkpoint_fingerprints_authoritative_inputs_not_delivered_hando
 ):
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
-    snapshot = resolve_snapshot(1)
+    snapshot = with_issue_recovery(resolve_snapshot(1))
     install_workflow(control, snapshot)
     owner = "o/r:fix:test"
     worktree = tmp_path / "worktree"

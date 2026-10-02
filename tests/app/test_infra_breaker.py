@@ -35,7 +35,7 @@ from issue_agent.domain.world import IssueView, WorldState
 
 from test_dispatch import FakeGateway, FakeRunner, FakeStore, FakeWorktrees
 from tests.fakes.in_memory_github import InMemoryGitHub as LoopGateway
-from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, resolve_state
+from tests.fakes.accounted_workflow import AccountedFixtureWorkflow, attach_workflow_authority, issue_recovery_state, resolve_state
 from tests.fakes.workflow_authority import resolve_snapshot
 
 
@@ -239,7 +239,7 @@ def test_one_issue_dying_repeatedly_never_trips_the_breaker():
     assert not subject.tripped
     assert subject.gate_reason() is None
     # …and the per-issue ceiling did its own counting, unchanged.
-    assert store.get_infra_deaths(130) == DEFAULT_BREAKER_DEATHS * 3
+    assert issue_recovery_state(store, 130).infra_failures == DEFAULT_BREAKER_DEATHS * 3
     assert resolve_state(store, 130).episode.failures == 0
 
 
@@ -261,7 +261,7 @@ def test_wall_timeouts_never_count_toward_the_breaker():
 
     assert not subject.tripped
     assert all(resolve_state(store, issue).episode.failures == 1 for issue, store in stores.items())
-    assert all(store.get_infra_deaths(issue) == 0 for issue, store in stores.items())
+    assert all(issue_recovery_state(store, issue).infra_failures == 0 for issue, store in stores.items())
 
 
 def test_ordinary_agent_failures_never_count_toward_the_breaker():
@@ -271,7 +271,7 @@ def test_ordinary_agent_failures_never_count_toward_the_breaker():
 
     assert not subject.tripped
     assert all(resolve_state(store, issue).episode.failures == 1 for issue, store in stores.items())
-    assert all(store.get_infra_deaths(issue) == 0 for issue, store in stores.items())
+    assert all(issue_recovery_state(store, issue).infra_failures == 0 for issue, store in stores.items())
 
 
 # ── window ───────────────────────────────────────────────────────────────────
@@ -397,7 +397,7 @@ def test_a_disabled_breaker_is_absent_and_the_workflow_still_counts():
     for issue in STORM:
         run_resolve(issue, stillborn(), None, store=store)
 
-    assert store.get_infra_deaths(STORM[0]) == 1
+    assert issue_recovery_state(store, STORM[0]).infra_failures == 1
 
 
 def test_a_broken_breaker_never_fails_the_leg():
@@ -413,4 +413,4 @@ def test_a_broken_breaker_never_fails_the_leg():
 
     store = run_resolve(130, stillborn(), Exploding())
 
-    assert store.get_infra_deaths(130) == 1
+    assert issue_recovery_state(store, 130).infra_failures == 1

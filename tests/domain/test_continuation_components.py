@@ -38,6 +38,51 @@ def admission(selection, version, run="run:secondary"):
     return ContinuationAdmission(WorkflowAttemptIdentity(selection.binding, RunId(run), "leg:secondary"), version)
 
 
+def test_fix_infra_ordering_preserves_newer_episode_and_every_sibling_field():
+    from issue_agent.domain import continuation_components as cc
+    key = WorkflowKey("o/r", IssueRef(5))
+    component = ActiveIssueRecovery(identity(key, WorkflowFamily.ISSUE_RECOVERY),
+        IssueRecoveryState(resumes=2, remembered_branch="fix/5-x", ci_failures=3, rebase_failures=4, self_clears=1),
+        gates=(hold(),))
+    selected = SelectedIssueRecovery(WorkflowRevision(WorkflowFence(key, 0), 10), component)
+    old = admission(selected, 1, "old")
+    normal = admission(selected, 2, "normal-error")
+    newer = admission(selected, 3, "newer-death")
+    after, counted = cc.apply_fix_infra(selected, old, cc.FixInfraOutcome.RECLAIMED)
+    assert after is not None and after.state.infra_failures == 1
+    selected = replace(selected, component=after)
+    retry, receipt = cc.apply_fix_infra(selected, old, cc.FixInfraOutcome.RETURNED_INFRA, counted)
+    assert retry is None and receipt.failures == 1
+    reset, _ = cc.apply_fix_infra(selected, normal, cc.FixInfraOutcome.RETURNED_NORMAL)
+    assert reset is not None and reset.state.infra_failures == 0
+    selected = replace(selected, component=reset)
+    late, _ = cc.apply_fix_infra(selected, old, cc.FixInfraOutcome.RETURNED_INFRA)
+    assert late is None
+    newer_state, _ = cc.apply_fix_infra(selected, newer, cc.FixInfraOutcome.RECLAIMED)
+    assert newer_state is not None and newer_state.state.infra_failures == 1
+    selected = replace(selected, component=newer_state)
+    late_normal, _ = cc.apply_fix_infra(selected, normal, cc.FixInfraOutcome.RETURNED_NORMAL)
+    assert late_normal is None
+    assert replace(newer_state.state, infra_failures=0, infra_episode=None) == component.state
+    assert newer_state.gates == component.gates and newer_state.watermarks == component.watermarks
+
+
+def test_fix_infra_reclaimed_normal_return_resets_once_and_refuses_conflicting_reply():
+    from issue_agent.domain import continuation_components as cc
+    key = WorkflowKey("o/r", IssueRef(5))
+    selected = SelectedIssueRecovery(WorkflowRevision(WorkflowFence(key, 0), 1),
+        ActiveIssueRecovery(identity(key, WorkflowFamily.ISSUE_RECOVERY), IssueRecoveryState()))
+    source = admission(selected, 1)
+    after, receipt = cc.apply_fix_infra(selected, source, cc.FixInfraOutcome.RECLAIMED)
+    assert after is not None
+    selected = replace(selected, component=after)
+    reset, normal = cc.apply_fix_infra(selected, source, cc.FixInfraOutcome.RETURNED_NORMAL, receipt)
+    assert reset is not None and reset.state.infra_failures == 0
+    assert cc.apply_fix_infra(replace(selected, component=reset), source, cc.FixInfraOutcome.RECLAIMED, normal) == (None, normal)
+    with pytest.raises(ValueError):
+        cc.apply_fix_infra(selected, source, cc.FixInfraOutcome.RETURNED_INFRA, normal)
+
+
 @pytest.mark.parametrize("mode", ["issue", "episode", "epoch", "future_version", "future_generation"])
 def test_pending_review_requires_exact_possible_component_provenance(mode):
     from issue_agent.domain.continuation_components import ReviewRetryState

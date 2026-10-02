@@ -150,6 +150,9 @@ class _RaisingRunner:
 
     async def run(self, task):
         self.tasks.append(task)
+        control = SQLiteControlStore(task.env["ISSUE_AGENT_CONTROL_DB"])
+        control.register_process_lease(RunId(task.env["ISSUE_AGENT_RUN_ID"]),
+            expected_owner_id=task.env["ISSUE_AGENT_OWNER_ID"], pid=123, pgid=123, process_start_ticks=99)
         raise RuntimeError("stream closed before any result")
 
 

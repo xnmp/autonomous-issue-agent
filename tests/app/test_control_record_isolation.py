@@ -15,7 +15,7 @@ from issue_agent.domain.actions import AgentKind
 from issue_agent.domain.world import IssueView, PRView, WorldState
 from issue_agent.domain.workflow import WorkflowAbsent, WorkflowMigrationRequired, WorkflowSnapshot, WorkflowUnavailable
 from issue_agent.domain.workflow_identity import WorkflowWriter
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 import pytest
 
 
@@ -23,7 +23,7 @@ def workflow_control(tmp_path, numbers=(1, 2)):
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
     for number in numbers:
-        install_workflow(control, resolve_snapshot(number))
+        install_workflow(control, with_issue_recovery(resolve_snapshot(number)))
     return control, SQLiteWorkflowControl(
         control, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"), resolve_ceiling=3,
     )

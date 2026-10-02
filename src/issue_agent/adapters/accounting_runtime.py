@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import uuid
 import contextvars
+import asyncio
 import hashlib
 import json
 from collections.abc import Callable
@@ -43,7 +44,7 @@ from ..domain.outcome import (
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
 from ..domain.refs import is_governed_branch
-from ..domain.workflow_identity import WorkflowBinding, WorkflowWriter
+from ..domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowWriter
 from ..domain.workflow import ResolveSession, ResolveStage
 from ..domain.resolve_return import ReturnedResolve
 from ..domain.resolve_split import (
@@ -143,6 +144,7 @@ class AccountingRuntime(AgentRuntime):
     require_dispatch_claim: bool = False
     reservation_reconciler: StaleReservationReconciler | None = None
     max_contract_rounds: int | None = None
+    fix_infra_ceiling: int = 5
     admit: Callable[[ReservationRequest], ReservationResult] | None = None
     _context: contextvars.ContextVar[
         tuple[int | None, str, int, int | None, WorkflowBinding | None, ReviewChildIdentity | None]
@@ -428,6 +430,14 @@ class AccountingRuntime(AgentRuntime):
                     return _return_refused("rebase allowance belongs to another linked issue")
                 capture = cc.ContinuationCapture(rebase.selection.binding, rebase.selection.revision, _leg_id or str(run_id))
                 continuations += (cc.IssueRebasePurchase(capture, rebase.pr, rebase.head, rebase.branch, rebase.ceiling),)
+        if (self.role == "fix" and issue is not None
+                and kind in {"ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"}
+                and not any(p.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY for p in continuations)):
+            selected_infra = self.store.read_issue_recovery(WorkflowKey(self.repository, IssueRef(issue)))
+            if not isinstance(selected_infra, cc.SelectedIssueRecovery):
+                return _return_refused("fix infrastructure episode requires migrated issue recovery authority")
+            continuations += (cc.IssueInfraPurchase(cc.ContinuationCapture(
+                selected_infra.binding, selected_infra.revision, _leg_id or str(run_id))),)
         publication = _fix_publication_context(self.role, task.cwd)
         if (
             self.role == "fix"
@@ -485,6 +495,10 @@ class AccountingRuntime(AgentRuntime):
             separators=(",", ":"),
         )
         reserved_model = task.model or "<runtime-default>"
+        if self.role == "fix":
+            continuations = tuple(replace(purchase, capture=replace(purchase.capture, fix_infra_ceiling=self.fix_infra_ceiling))
+                if purchase.capture.binding.authority.family is WorkflowFamily.ISSUE_RECOVERY else purchase
+                for purchase in continuations)
         request = ReservationRequest(
             ReservationId(uuid.uuid4().hex),
             run_id,
@@ -651,9 +665,25 @@ class AccountingRuntime(AgentRuntime):
         )
         try:
             result = await self.inner.run(runtime_task)
-        except BaseException:
+        except BaseException as exc:
             self._recover_or_release(run_id)
+            if self.role == "fix" and not isinstance(exc, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+                from ..domain.outcome import deterministic_death
+                deterministic = deterministic_death(f"{type(exc).__name__}: {exc}",
+                    str(getattr(exc, "harness_last_trace", "") or ""))
+                try:
+                    self.store.record_fix_infra_return(run_id,
+                        cc.FixInfraOutcome.DETERMINISTIC_DEATH if deterministic is not None else cc.FixInfraOutcome.RECLAIMED,
+                        WorkflowWriter(self.repository, "fix", self.owner_id or f"{self.repository}:fix"))
+                except Exception:
+                    # Preserve the provider failure; existing dead-run recovery
+                    # still owns the retained reservation and exact episode.
+                    pass
             raise
+        if self.role == "fix":
+            self.store.record_fix_infra_return(run_id,
+                cc.FixInfraOutcome.RETURNED_INFRA if infra_class_failure(result) else cc.FixInfraOutcome.RETURNED_NORMAL,
+                WorkflowWriter(self.repository, "fix", self.owner_id or f"{self.repository}:fix"))
         result = replace(
             result,
             workflow_attempt=(

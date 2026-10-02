@@ -20,7 +20,7 @@ from issue_agent.domain.resolve_split import ContractRevision, ContractResetComp
 from issue_agent.domain.workflow import NoLinkedPr, ObservedIssue, WorkflowSnapshot
 from issue_agent.domain.workflow_identity import WorkflowWriter
 from tests.domain.builders import issue
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 
 class Provider:
@@ -37,7 +37,7 @@ class Provider:
 def split_runtime(tmp_path, monkeypatch):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
-    state = resolve_snapshot(7)
+    state = with_issue_recovery(resolve_snapshot(7))
     install_workflow(store, state)
     monkeypatch.setattr(accounting_runtime, "_fix_publication_context", lambda role, cwd:
         accounting_runtime._FixPublicationContext(str(Path(cwd).resolve()), "fix/7-contract", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin"))

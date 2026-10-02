@@ -17,6 +17,7 @@ from issue_agent.adapters.control_store import AccountingDisposition, Lease, Res
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
+from issue_agent.domain import continuation_components as cc
 from issue_agent.domain.agent_task import run_input_fingerprint
 from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
 from issue_agent.domain.workflow_identity import (
@@ -42,7 +43,7 @@ from issue_agent.domain.pricing import (
     UnknownModelPolicy,
 )
 from tests.fakes.legacy_journal import Journal
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 
 def _policy(maximum=2_000_000):
@@ -99,6 +100,7 @@ def _wrapper(
 ):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -113,7 +115,7 @@ def _wrapper(
         _rates(),
         spend_evidence_dir=evidence_dir,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
     return (
         wrapper,
         store,
@@ -164,7 +166,7 @@ def test_composed_admission_refusal_prevents_provider_even_after_budget_reclaim(
 
     reconciler = Reconciler()
     wrapper = dataclasses.replace(wrapper, admit=admit, reservation_reconciler=reconciler)
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
     result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
     assert result.is_error
     assert runtime.calls == 0
@@ -195,7 +197,10 @@ def test_provider_cannot_mint_workflow_result_authority(tmp_path) -> None:
     result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
     assert result.status == "ok"
-    assert result.workflow_attempt is None
+    assert result.workflow_attempt is not None
+    assert result.workflow_attempt.binding == resolve_snapshot().binding
+    assert result.workflow_attempt != forged
+    assert wrapper.inner.calls == 1
 
 
 def test_captured_binding_is_persisted_and_mints_actual_attempt_identity(tmp_path) -> None:
@@ -204,7 +209,6 @@ def test_captured_binding_is_persisted_and_mints_actual_attempt_identity(tmp_pat
     wrapper, store = _wrapper(
         tmp_path, Runtime(AgentResult(False, status="ok", cost_usd=1, workflow_attempt=forged)),
     )
-    install_workflow(store, state)
     wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
     wrapper.set_run_identity("harness-run", "harness-leg")
 
@@ -223,7 +227,6 @@ def test_oversized_recovery_inputs_are_refused_before_paid_admission(tmp_path, b
     state = resolve_snapshot()
     provider = Runtime(AgentResult(False, status="done", cost_usd=1))
     wrapper, store = _wrapper(tmp_path, provider)
-    install_workflow(store, state)
     wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=state.binding)
     # Include enough ASCII metadata to exceed the selected input envelope too.
     inputs = ResolveInputs("t" * 40000, body, "author")
@@ -263,7 +266,6 @@ def test_author_runtime_persists_fingerprint_of_supplied_inputs_before_provider_
 
     wrapper, store = _wrapper(tmp_path, InspectingRuntime())
     wrapper = dataclasses.replace(wrapper, budget_policy=BudgetPolicy({("fix", "AUTHOR"): Money("USD", 2_000_000)}))
-    install_workflow(store, state)
     wrapper.set_context("fix", "AUTHOR", 1, 1, workflow=state.binding)
     wrapper.set_run_identity("author-run", "author-leg")
     result = asyncio.run(wrapper.run(task))
@@ -279,7 +281,6 @@ def test_activated_resolve_rejects_missing_or_stale_authority_before_provider(tm
     state = resolve_snapshot()
     runtime = Runtime(AgentResult(False, status="ok", cost_usd=1))
     wrapper, store = _wrapper(tmp_path, runtime)
-    install_workflow(store, state)
     binding = state.binding
     if invalid == "missing":
         binding = None
@@ -372,6 +373,7 @@ def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -385,7 +387,7 @@ def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
         _policy(),
         _rates(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
 
     result = asyncio.run(
         wrapper.run(
@@ -418,7 +420,7 @@ def test_production_runtime_binds_paid_run_to_dispatch_claim(tmp_path) -> None:
         owner_id="o/r:fix:deployment",
         require_dispatch_claim=True,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
     assert store.claim_dispatch(
         "o/r",
         "fix",
@@ -450,7 +452,7 @@ def test_production_runtime_releases_admission_when_claim_is_missing(
         owner_id="o/r:fix:deployment",
         require_dispatch_claim=True,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
 
     result = asyncio.run(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
@@ -480,7 +482,7 @@ def test_paid_run_carries_portable_ancestor_authority_bundle(
     )
     wrapper, _ = _wrapper(tmp_path, runtime)
     wrapper = dataclasses.replace(wrapper, github_host="github.example")
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
     monkeypatch.setattr(
         accounting_runtime,
         "_fix_publication_context",
@@ -952,6 +954,7 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -964,7 +967,7 @@ def test_disabled_caps_still_reserve_and_settle_subscription_run(tmp_path) -> No
         "claude",
         _policy(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
 
     result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
 
@@ -990,6 +993,7 @@ def test_disabled_caps_still_price_observed_subscription_stream_usage(
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -1003,7 +1007,7 @@ def test_disabled_caps_still_price_observed_subscription_stream_usage(
         _policy(),
         _rates(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
 
     result = asyncio.run(
         wrapper.run(
@@ -1031,6 +1035,7 @@ def test_disabled_caps_honor_explicit_unpriced_codex_opt_out(
     )
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -1044,7 +1049,7 @@ def test_disabled_caps_honor_explicit_unpriced_codex_opt_out(
         _policy(),
         None,
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
 
     result = asyncio.run(
         wrapper.run(RuntimePlan("work", max_budget_usd=2))
@@ -1080,6 +1085,7 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
     runtime = SubscriptionRuntime()
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
+    install_workflow(store, with_issue_recovery(resolve_snapshot()))
     wrapper = AccountingRuntime(
         runtime,
         store,
@@ -1093,7 +1099,7 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
         _policy(),
         _rates(),
     )
-    wrapper.set_context("fix", "RESOLVE", 1, 1)
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
 
     first = asyncio.run(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
@@ -1209,6 +1215,11 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
         "runtime_exception_before_launch",
     )
 
+    selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
+    assert isinstance(selected, cc.SelectedIssueRecovery)
+    assert selected.component.state.infra_failures == 0
+    assert selected.component.state.infra_episode is None
+
 
 def test_result_normalization_failure_retains_reservation_fail_closed(
     tmp_path,
@@ -1274,6 +1285,11 @@ def test_non_codex_runtime_exception_releases_after_completed_teardown(
         "released",
         "runtime_exception_before_launch",
     )
+
+    selected = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(1)))
+    assert isinstance(selected, cc.SelectedIssueRecovery)
+    assert selected.component.state.infra_failures == 0
+    assert selected.component.state.infra_episode is None
 
 
 def test_runtime_exception_after_child_registration_retains_reservation(

@@ -52,6 +52,7 @@ _VALUES = (
     ContinuationImportPlan, ContinuationImportTarget,
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState, cc.PRBlankReplySource,
+    cc.FixInfraEpisode, cc.FixInfraReceipt, cc.IssueInfraPurchase,
     cc.StewardLaneState, cc.StewardState, cc.StewardAttemptSource, cc.StewardCommandGuard,
     cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.GroomContent, cc.GroomNoFinding, cc.ContinuationImportBlocker,
     cc.InactiveIssueRecovery, cc.InactivePRRepair, cc.InactiveSteward,
@@ -146,7 +147,7 @@ _VALUES = (
 _ENUMS = (
     UsageSource, PricingBasis,
     LifecycleOperation,
-    cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.StewardLane, cc.StewardFailureKind,
+    cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.StewardLane, cc.StewardFailureKind, cc.FixInfraOutcome,
     migration.ReviewImportBlockerKind,
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
@@ -197,7 +198,8 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None},
     "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False},
     "PRRepairResult": {"ci": None, "review": None, "rebase": None},
-    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None},
+    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None},
+    "ContinuationCapture": {"fix_infra_ceiling": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
     "ResolveAttemptResult": {"split": None},
@@ -245,7 +247,8 @@ def _encode(value: object, depth: int = 0) -> object:
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None))
-                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase"} and getattr(value, field.name) is None)
+                    and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
+                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode"} and getattr(value, field.name) is None)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
                         or field.name == "review" and value.review is None
                         or field.name == "rebase" and value.rebase is None))

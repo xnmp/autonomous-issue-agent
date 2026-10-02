@@ -61,7 +61,7 @@ from issue_agent.domain.workflow_policy import reconcile_resolve_ceiling
 from issue_agent.domain.world import IssueView
 from tests.adapters.test_episode_workspace import REMOTE_URL, MappedRemoteGit
 from tests.fakes.persistent_github import PersistentGitHub
-from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
 
 ISSUE = 1
 REPO = "o/r"
@@ -275,7 +275,7 @@ def isolate_authority(deployment: Deployment, monkeypatch=None) -> None:
 
 
 def exhausted_snapshot(ceiling: int, number: int = ISSUE) -> WorkflowSnapshot:
-    state = replace(resolve_snapshot(number), episode=ResolveEpisode(f"exhausted-{number}", ceiling))
+    state = replace(with_issue_recovery(resolve_snapshot(number)), episode=ResolveEpisode(f"exhausted-{number}", ceiling))
     return reconcile_resolve_ceiling(state, ceiling=ceiling, evidence_ids=(f"prior-attempts-{number}",)).snapshot
 
 
@@ -301,7 +301,7 @@ def seed_episode(deployment: Deployment, failures: int, *labels: str, number: in
         number, title=TITLE, body=BODY, updated_at="2026-09-14T00:00:00Z",
         labels=frozenset(Label(label) for label in labels), comments=tuple(comments),
     ))
-    state = replace(resolve_snapshot(number), episode=ResolveEpisode(f"episode-{number}", failures))
+    state = replace(with_issue_recovery(resolve_snapshot(number)), episode=ResolveEpisode(f"episode-{number}", failures))
     install_workflow(deployment.control(), state)
     return state
 

@@ -62,6 +62,7 @@ class AccountedFixtureWorkflow(FixWorkflow):
             BudgetPolicy(limits), RateTable("fixture", "1", "USD", {}, UnknownModelPolicy.USE_FALLBACK,
                                             ModelRates(1, 1, 1, 1)),
             owner_id="o/r:fix:fixture", max_contract_rounds=self.cfg.max_contract_rounds,
+            fix_infra_ceiling=getattr(self, "_fixture_infra_ceiling", 5),
         )
         journalled = original if isinstance(original, JournalingRuntime) else JournalingRuntime(
             accounted, Journal(str(Path(self.store._workflow_dir.name) / "events.jsonl")), repo="o/r", role="fix",
@@ -243,3 +244,29 @@ def attach_workflow_authority(
     if pr_repair:
         install_pr_repair_authority(gw, store)
     return store._workflow_authority
+
+
+def seed_infra_outcome(control, issue, outcome, *, owner_id="o/r:fix:fixture", reclaim=False):
+    """Seed a fixed issue episode through actual admission, classification and money."""
+    import uuid
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.adapters.control_store import SettlementRequest
+    from issue_agent.domain.contracts import PricingBasis
+    from tests.adapters.test_workflow_admission import request
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue)))
+    assert isinstance(selected, cc.SelectedIssueRecovery)
+    name = "infra-fixture:" + uuid.uuid4().hex
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate
+    with control.transaction() as db:
+        principal = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue))).binding
+    captured = cc.IssueInfraPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:" + name, 5))
+    paid = dataclasses.replace(request(name, binding=principal), owner_id=owner_id, continuations=(captured,))
+    assert control.reserve(paid).admitted
+    if reclaim:
+        control.register_process_lease(paid.run_id, expected_owner_id=owner_id, pid=123, pgid=123, process_start_ticks=99)
+        assert control.reclaim_dead_leases(owner_id, lambda *_: False) == (paid.run_id,)
+    else:
+        control.record_fix_infra_return(paid.run_id, outcome, WorkflowWriter("o/r", "fix", owner_id))
+    assert control.settle(SettlementRequest(paid.run_id, Money("USD", 0), PricingBasis.PROVIDER_REPORTED,
+        "infra-fixture:" + str(paid.run_id), None, None, None)).disposition.value == "available"
+    return paid.run_id

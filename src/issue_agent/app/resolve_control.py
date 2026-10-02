@@ -13,6 +13,7 @@ from ..adapters.store import Store
 from ..adapters.worktree import Worktrees
 from ..adapters.workflow_control import SQLiteWorkflowControl
 from ..domain.fix import breaker_tripped
+from ..domain.continuation_components import SelectedIssueRecovery
 from ..domain.deployment import canonical_deployment_name
 from ..domain.labels import Label
 from ..domain.ports import FixWorktreePort, WorkflowGitHubReads
@@ -37,9 +38,10 @@ def compose_resolve_rearm(
         issue = observed.key.target.number
         holds = tuple(label.value for label in (Label.AI_BLOCKED, Label.AI_PARKED, Label.NEEDS_BUDGET_REVIEW)
                       if label in observed.issue.labels)
-        # These families have not migrated. Read exactly the scheduler's
-        # remaining authority; failure is unavailable, never permission to clear.
-        deaths = store.get_infra_deaths(issue) + control.abandoned_dispatch_counts(owner).get(issue, 0)
+        selected = control.read_issue_recovery(observed.key)
+        if not isinstance(selected, SelectedIssueRecovery):
+            raise ValueError("fix infrastructure episode is inactive or migration blocked")
+        deaths = selected.component.state.infra_failures
         if breaker_tripped(deaths, cfg.max_infra_deaths):
             holds += ("infrastructure failure ceiling",)
         if store.get_machine_block(issue) is not None:

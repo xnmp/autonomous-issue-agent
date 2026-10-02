@@ -3371,3 +3371,12 @@ def test_a_grant_minted_under_a_different_key_never_merges():
             key="a-key-the-harness-does-not-hold",
         ),))
     assert should_automerge(_approved_green_pr(), forged, EXEMPT_CFG) is False
+
+
+def test_missing_infra_authority_holds_ready_target_without_starving_peer():
+    observed = world(issues=[issue(1, "ai-ready", "P1"), issue(2, "ai-ready", "P2")])
+    state = FixState(infra_control_errors={1: "issue recovery migration required"})
+    actions = decide_fix(observed, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
+    paid = [action for action in actions if isinstance(action, RunAgent)]
+    assert [action.number for action in paid] == [2]
+    assert not any(isinstance(action, (Relabel, PostComment, CloseIssue)) and action.number == 1 for action in actions)

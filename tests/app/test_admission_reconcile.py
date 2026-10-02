@@ -54,6 +54,8 @@ from issue_agent.domain.pricing import (
     UnknownModelPolicy,
 )
 
+from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
+
 REPOSITORY = "o/r"
 ISSUE = 34
 OWNER = "o/r:fix"
@@ -173,6 +175,7 @@ def _store(tmp_path, stamped_at: datetime):
         str(tmp_path / "control.db"), now=lambda: stamped_at
     )
     store.initialize()
+    install_workflow(store, with_issue_recovery(resolve_snapshot(ISSUE)))
     published: list[EventEnvelope] = []
     producer = Producer("deployment", REPOSITORY, "fix", 123, "boot")
     sequence = [0]
@@ -296,7 +299,7 @@ def _admission(store, runtime, cap: Money, reconciler):
         owner_id=OWNER,
         reservation_reconciler=late,
     )
-    wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE)
+    wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE, workflow=resolve_snapshot(ISSUE).binding)
     return wrapper
 
 
@@ -550,7 +553,7 @@ def test_the_journalled_scope_names_the_cap_that_actually_tripped(tmp_path):
         owner_id=OWNER,
         reservation_reconciler=late,
     )
-    wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE)
+    wrapper.set_context("fix", "RESOLVE", ISSUE, ISSUE, workflow=resolve_snapshot(ISSUE).binding)
 
     result = _resolve(wrapper)
 

@@ -539,7 +539,7 @@ class AgentDispatcher:
             )
             bound_review = (self.cfg.role == "review" and action.workflow is not None
                             and action.kind in {AgentKind.REVIEW, AgentKind.RE_REVIEW})
-            if not bound_review:
+            if not bound_review and self.cfg.role != "fix":
                 try:
                     if det is not None and self.cfg.max_infra_deaths > 0:
                         charged = max(

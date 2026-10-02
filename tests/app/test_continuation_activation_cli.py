@@ -748,3 +748,38 @@ def test_rebase_shadow_and_copy_preserve_debt_without_raw_runtime_fallback(stopp
         assert load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(7))).issue_recovery.state.rebase_failures == 3
         assert isinstance(load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(8))).issue_recovery, cc.BlockedIssueRecovery)
     assert dump(control) == before and {path.name: path.read_bytes() for path in state.iterdir()} == raw
+
+
+@pytest.mark.parametrize("kind", ["ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"])
+def test_stopped_fix_import_blocks_attributed_pre_f7_paid_history(stopped, capsys, kind):
+    from issue_agent.domain.contracts import RunId
+    from issue_agent.adapters.control_store import workflow_episode_key
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from tests.fakes.workflow_authority import resolve_snapshot
+    state, control, _ = stopped
+    base = resolve_snapshot(7)
+    install_workflow(control, base)
+    (state / "issue-7.infra-deaths").write_text("0")
+    control.start_run(RunId("legacy-paid"), json.dumps({"repository":"o/r", "role":"fix", "issue":7}),
+        kind, "o/r:fix", "legacy", state="abandoned")
+    with control.transaction() as db:
+        db.execute("UPDATE runs SET workflow_binding_json=?,workflow_episode_key=? WHERE run_id='legacy-paid'",
+            (encode_workflow(base.binding), workflow_episode_key(base.binding)))
+    before = dump(control)
+    code, result, error = command(capsys, "fix", "inventory")
+    assert code == 0, error
+    target = next(t for t in result["targets"] if t["family"] == "issue_recovery" and t["number"] == 7)
+    assert not target["eligible"]
+    assert any("prior paid recovery history" in reason for reason in target["blockers"])
+    assert dump(control) == before
+
+
+def test_stopped_fix_import_refuses_unassigned_pre_f7_death_without_zero_inference(stopped, capsys):
+    from issue_agent.domain.contracts import RunId
+    state, control, _ = stopped
+    (state / "issue-7.infra-deaths").write_text("0")
+    control.start_run(RunId("unassigned-death"), "{", "PR_RESUME", "o/r:fix", "legacy", state="abandoned")
+    before = dump(control)
+    code, result, error = command(capsys, "fix", "inventory")
+    assert code != 0 and result is None and "unassigned prior" in error
+    assert dump(control) == before
