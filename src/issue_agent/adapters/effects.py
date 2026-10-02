@@ -33,7 +33,7 @@ from ..domain.lifecycle import (
 from ..domain.repository import canonical_repository
 from ..domain.workflow_identity import WorkflowBinding, WorkflowFamily
 from ..domain import continuation_components as cc
-from ..domain.self_clear import MachineClearProjection, BudgetClearProjection, machine_clear_evidence
+from ..domain.self_clear import MachineClearProjection, BudgetClearProjection, machine_clear_evidence, budget_recovery_limits
 from ..domain.workflow import (
     ActiveReconciliation, ReconciliationOnly, RetiredUncertainCommand,
     RetryBegan, RetryDeclined,
@@ -41,6 +41,7 @@ from ..domain.workflow import (
 from ..domain.workflow_reconciliation import reconciliation_due, reexecution_exhausted
 from ..domain.workflow_retry import RetryAbsenceRead
 from ..domain.contracts import (
+    Money,
     CommandId,
     CommandKind,
     EffectStatus,
@@ -331,6 +332,9 @@ class GitHubEffectExecutor:
         repository: str,
         identity: str,
         config_version: str = "",
+        repository_cap: Money | None = None,
+        global_cap: Money | None = None,
+        issue_cap: Money | None = None,
         retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
         journal: EventSink | None = None,
         alert_cmd: str = "",
@@ -343,6 +347,9 @@ class GitHubEffectExecutor:
         self.repository = canonical_repository(repository)
         self.identity = identity
         self.config_version = config_version
+        self.repository_cap = repository_cap
+        self.global_cap = global_cap
+        self.issue_cap = issue_cap
         self.retry_ceiling = retry_ceiling
         self.journal = journal
         self.alert_cmd = alert_cmd
@@ -585,7 +592,12 @@ class GitHubEffectExecutor:
                 action = replace(action, completion_guard=completion_guard(current, operation))
         if pending is None:
             command = self._command(action)
-            pending = self.effects.enqueue(command)
+            latest = self.store.latest_command(command.idempotency_key) if (
+                isinstance(action, Relabel) and action.self_clear is not None
+            ) else None
+            pending = (latest if latest is not None and latest.command.payload == command.payload
+                       else self.effects.enqueue(command))
+            command = pending.command
         else:
             command = pending.command
             action = action_from_command(command)
@@ -602,14 +614,23 @@ class GitHubEffectExecutor:
         if self._retire_if_exhausted(pending):
             return False
         if pending.state == EffectStatus.PERMANENT_FAILURE.value:
-            return False
+            receipt = self.store.effect_receipt(command.command_id)
+            if (isinstance(action, Relabel) and action.self_clear is not None and receipt is not None
+                    and receipt.error == "selected recovery evidence refused before dispatch"
+                    and self._self_clear_evidence(action, originating=True)):
+                pending = self.effects.enqueue_occurrence(command)
+                command = pending.command
+            else:
+                return False
         if pending.state == "pending" and not self._revision_matches(command):
             self.effects.execute(
                 command,
                 lambda: EffectOutcome(
                     False,
                     EffectStatus.PERMANENT_FAILURE,
-                    error="expected revision no longer matches remote target",
+                    error=("selected recovery evidence refused before dispatch"
+                           if isinstance(action, Relabel) and action.self_clear is not None
+                           else "expected revision no longer matches remote target"),
                 ),
             )
             raise StaleExpectedRevision(
@@ -641,6 +662,9 @@ class GitHubEffectExecutor:
             self.effects.retry_reconciled(command)
         else:
             reconciled = self._reconcile(action, command)
+            if (reconciled is None and pending.state != "pending"
+                    and isinstance(action, Relabel) and action.self_clear is not None):
+                raise UnknownEffectOutcome("selected recovery projection cannot yet verify current evidence")
             if reconciled is True:
                 # A deployment cutover or target revision change can produce a
                 # new command identity for an effect that already landed.
@@ -651,7 +675,7 @@ class GitHubEffectExecutor:
         if (
             pending.state != "pending"
             and not repairing_partial_close
-            and not self._revision_matches(command)
+            and not self._revision_matches(command, self_clear_reconciliation=True)
         ):
             self.effects.execute(
                 command,
@@ -672,7 +696,7 @@ class GitHubEffectExecutor:
 
         def apply_and_verify() -> EffectOutcome[bool]:
             before_comments = tuple((c.author, c.body, c.created_at) for c in self.gateway.get_issue(action.number).comments) if selected_body else ()
-            applied = self._apply(action, command)
+            applied = self._apply(action, command, self_clear_reconciliation=pending.state != "pending")
             if isinstance(action, (CancelWorkflowRuns, RerunFailedChecks)):
                 # These effects' postcondition is that GitHub ACCEPTED the
                 # request for runs still belonging to the observed head — which
@@ -1277,10 +1301,11 @@ class GitHubEffectExecutor:
         self,
         action: Action,
         command: LifecycleCommand | None = None,
+        *, self_clear_reconciliation: bool = False,
     ):
         """Apply one effect, re-validating its completion facts between writes."""
         if isinstance(action, Relabel) and action.self_clear is not None:
-            if not self._self_clear_evidence(action):
+            if not self._self_clear_evidence(action, reconciling=self_clear_reconciliation):
                 raise StaleExpectedRevision("self-clear head/check/source evidence changed before projection")
         selected_guard = None
         if command is not None and ("steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:")):
@@ -1326,6 +1351,9 @@ class GitHubEffectExecutor:
                 action.add.value if action.add else None,
             )
             for label in removals[1:]:
+                if action.self_clear is not None and not self._self_clear_evidence(
+                        action, reconciling=self_clear_reconciliation):
+                    raise UnknownEffectOutcome("selected recovery evidence changed during partial label projection")
                 self._validate_completion(action, partial=True, steward_guard=selected_guard)
                 self.gateway.relabel(
                     _TARGET[action.target], action.number, label.value, None
@@ -1430,8 +1458,10 @@ class GitHubEffectExecutor:
         if isinstance(action, Relabel):
             if action.self_clear is not None:
                 receipt = self.store.effect_receipt(command.command_id) if command is not None else None
-                if not self._self_clear_evidence(action, settled=receipt is not None and receipt.status is EffectStatus.SUCCEEDED):
-                    return False
+                if not self._self_clear_evidence(action, reconciling=True, settled=receipt is not None and receipt.status is EffectStatus.SUCCEEDED):
+                    # A changed recovery proof cannot establish that a lost
+                    # remote mutation was absent or an external clearing.
+                    return None
             if _is_compound_relabel(action):
                 self._validate_completion(action, partial=True, steward_guard=
                     decode_workflow(command.payload["steward_guard"], cc.StewardCommandGuard)
@@ -1778,12 +1808,22 @@ class GitHubEffectExecutor:
                 )
         return self._revision_matches(command)
 
-    def _self_clear_evidence(self, action: Relabel, *, originating: bool = False, settled: bool = False) -> bool:
+    def _budget_clear_observation(self, projection, *, require_captured: bool = False):
+        if not self.config_version:
+            raise WorkflowAuthorityError("budget recovery has no current policy")
+        limits = budget_recovery_limits(self.repository, projection.block.issue, self.store.now(),
+            self.repository_cap, self.global_cap, self.issue_cap)
+        return self.store.observe_budget_clear_accounting(projection, limits, self.config_version,
+            require_captured=require_captured)
+
+    def _self_clear_evidence(self, action: Relabel, *, originating: bool = False, settled: bool = False, reconciling: bool = False) -> bool:
         projection = action.self_clear
         assert projection is not None
         if not settled:
             try:
-                self.store.validate_self_clear_projection(projection)
+                self.store.validate_self_clear_projection(projection, allow_adoption=reconciling)
+                if isinstance(projection, BudgetClearProjection):
+                    self._budget_clear_observation(projection, require_captured=not reconciling)
             except WorkflowAuthorityError:
                 return False
         if action.target is Target.PR:
@@ -1799,11 +1839,11 @@ class GitHubEffectExecutor:
             return False
         return True
 
-    def _revision_matches(self, command: LifecycleCommand) -> bool:
+    def _revision_matches(self, command: LifecycleCommand, *, self_clear_reconciliation: bool = False) -> bool:
         if "self_clear" in command.payload:
             action = action_from_command(command)
             assert isinstance(action, Relabel)
-            return self._self_clear_evidence(action, originating=True)
+            return self._self_clear_evidence(action, originating=True, reconciling=self_clear_reconciliation)
         if "steward_guard" in command.payload or command.idempotency_key.startswith("steward-verdict:"):
             return self._steward_completion_view(command) is not None
         if command.kind is CommandKind.RELABEL:
@@ -1882,8 +1922,10 @@ class GitHubEffectExecutor:
     def _steward_success(self, command: LifecycleCommand) -> EffectOutcome[bool]:
         if "self_clear" in command.payload:
             projection = decode_self_clear_projection(command.payload["self_clear"])
-            return EffectOutcome(True, EffectStatus.SUCCEEDED,
-                remote_revision=projection.observed_head if isinstance(projection, MachineClearProjection) else None)
+            proof = self.store.current_self_clear_projection(projection)
+            if isinstance(proof, BudgetClearProjection):
+                proof = replace(proof, budget=self._budget_clear_observation(projection))
+            return EffectOutcome(True, EffectStatus.SUCCEEDED, remote_revision=encode_workflow(proof))
         if "steward_guard" not in command.payload:
             return EffectOutcome(True, EffectStatus.SUCCEEDED)
         action = action_from_command(command)
@@ -1967,7 +2009,8 @@ def command_for_action(
         raise ValueError("command cannot replace an action's captured workflow binding")
     workflow = captured if captured is not None else workflow
     kind, target = _command_identity(action)
-    action_payload = _jsonable(action)
+    action_payload = ({field.name: _jsonable(getattr(action, field.name)) for field in fields(action)
+                       if field.name != "self_clear"} if isinstance(action, Relabel) else _jsonable(action))
     action_payload.pop("workflow", None)
     if isinstance(action, Relabel):
         if action.self_clear is None:

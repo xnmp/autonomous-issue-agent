@@ -1,5 +1,6 @@
 from dataclasses import replace
 from types import SimpleNamespace
+import json
 import pytest
 
 from issue_agent.adapters.control_store import AccountingDisposition
@@ -37,7 +38,7 @@ class _Journal:
         self.events.append(event)
 
 
-def _executor(gateway, store, journal):
+def _executor(gateway, store, journal, *, issue_cap=Money("USD", 5_000_000), repository_cap=None, global_cap=None, config_version="config", retry_ceiling=3):
     from issue_agent.adapters.effects import GitHubEffectExecutor
     from issue_agent.adapters.event_log import EventLog
     from issue_agent.domain.events import Producer
@@ -47,7 +48,9 @@ def _executor(gateway, store, journal):
         gateway,
         journal=journal,
         retry_delays=(),
-        effect_executor=GitHubEffectExecutor(gateway, store._workflow_db, repository="o/r", identity="o/r:fix"),
+        effect_executor=GitHubEffectExecutor(gateway, store._workflow_db, repository="o/r", identity="o/r:fix",
+            config_version=config_version, issue_cap=issue_cap, repository_cap=repository_cap, global_cap=global_cap,
+            retry_ceiling=retry_ceiling),
         mark_self_clear_ceiling=store._workflow_db.mark_self_clear_ceiling,
         discard_machine_block=lambda action: store._workflow_db.retire_machine_block(action.revision),
         discard_budget_block=lambda action: store._workflow_db.retire_budget_block(action.revision),
@@ -58,12 +61,289 @@ def _recovery_state(store, issue):
     return store._workflow_db.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue))).component.state
 
 
+def _observed_budget(store, world, block):
+    cfg = SimpleNamespace(repo="o/r", config_version="config", issue_spend_cap_usd=5.0,
+                          daily_spend_cap_usd=0.0, global_daily_spend_cap_usd=0.0)
+    return _budget_self_clear_worlds(store._workflow_db, cfg, world, {block.issue: block})[1][block.issue]
+
+
 def _seed_clear_count(store, issue, count):
     from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
     with store._workflow_db.transaction() as db:
         current = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue)))
         persist_workflow_snapshot(db, replace(current, issue_recovery=replace(current.issue_recovery,
             state=replace(current.issue_recovery.state, self_clears=count))))
+
+
+@pytest.mark.parametrize("cause", ["machine", "budget"])
+def test_lost_recovery_reply_adopts_same_source_after_actual_paid_return_once(tmp_path, cause, monkeypatch):
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.app.test_durable_workflow_composition import Crash
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold, seed_imported_machine_hold
+    from tests.adapters.test_continuation_admission import purchase, paid, receipt, money
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    store = Store(str(tmp_path))
+    object.__setattr__(store, "_workflow_db", control)
+    machine = MachineBlock(7, Target.PR, 100, 100, MachineBlocker.PUBLICATION, "same-head")
+    budget = BudgetBlock(7, Target.ISSUE, 7, 2_000_000, "issue:7", 5_000_000)
+    seed_imported_machine_hold(control, machine)
+    seed_imported_budget_hold(control, budget)
+    key = WorkflowKey("o/r", IssueRef(7))
+    with control.transaction() as db:
+        aggregate = load_issue_aggregate(db, key)
+    purchased = replace(purchase(aggregate), branch="fix/7-reply")
+    requested = replace(paid("actual-return", purchased), dispatch_id=json.dumps({"repository": "o/r", "role": "fix",
+        "issue": 7, "leg_id": purchased.capture.leg_id}))
+    assert control.reserve_issue_recovery(requested, purchased).admitted
+    admission = receipt(control, requested.run_id)
+    selected = control.read_issue_recovery(key)
+    issue = IssueView(7, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
+    pr = PRView(100, head_ref_oid="same-head", labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}))
+    world = WorldState(issues=(issue,), prs=(pr,))
+    actions = self_clear_actions(world, {7: machine} if cause == "machine" else {},
+        {7: budget} if cause == "budget" else {},
+        {7: _observed_budget(store, world, budget)}, {}, frozenset(),
+        machine_revisions={7: selected.revision}, budget_revisions={7: selected.revision},
+        self_clear_bindings={7: selected.binding})
+    assert len(actions) == 1
+    gateway = InMemoryGitHub(issues=(issue,), prs={100: pr})
+    write = gateway.relabel
+    def lost_reply(kind, number, remove, add):
+        write(kind, number, remove, add)
+        if remove == Label.AI_BLOCKED.value:
+            raise Crash("lost recovery reply before current continuation returned")
+    monkeypatch.setattr(gateway, "relabel", lost_reply)
+    executor = _executor(gateway, store, _Journal(), retry_ceiling=1)
+    with pytest.raises(Crash):
+        executor.execute(actions[0])
+    monkeypatch.setattr(gateway, "relabel", write)
+    assert control.settle_issue_recovery(money(requested.run_id), admission, cc.IssueRecoveryState()).disposition is AccountingDisposition.AVAILABLE
+    current = control.read_issue_recovery(key)
+    assert current.revision.version > selected.revision.version
+    assert current.component.state.machine_block == machine and current.component.state.budget_block == budget
+    discards = self_clear_actions(WorldState(issues=(gateway.issues[7],), prs=(gateway.prs[100],)),
+        {7: machine} if cause == "machine" else {}, {7: budget} if cause == "budget" else {}, {}, {}, frozenset(),
+        machine_revisions={7: current.revision}, budget_revisions={7: current.revision})
+    assert len(discards) == 1 and not executor.execute_all(discards)
+    assert executor.execute_all(actions)
+    assert executor.execute_all(actions)
+    after = _recovery_state(store, 7)
+    assert after.self_clears == 1 and after.resumes == 1 and after.consumed_reply_at == purchased.reply_at
+    assert (after.machine_block is None) == (cause == "machine")
+    assert (after.budget_block is None) == (cause == "budget")
+    assert control.snapshot(requested.scope).settled == Money("USD", 1)
+
+
+def test_remote_recovery_refusal_keeps_existing_ceiling_after_permission_heals(tmp_path):
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    store = Store(str(tmp_path))
+    object.__setattr__(store, "_workflow_db", control)
+    block = BudgetBlock(7, Target.ISSUE, 7, 2_000_000, "issue:7", 5_000_000)
+    seed_imported_budget_hold(control, block)
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    issue = IssueView(7, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
+    world = WorldState(issues=(issue,))
+    actions = self_clear_actions(world, {}, {7: block}, {7: _observed_budget(store, world, block)}, {}, frozenset(),
+        budget_revisions={7: selected.revision}, self_clear_bindings={7: selected.binding})
+    assert len(actions) == 1
+    gateway = InMemoryGitHub(issues=(issue,))
+    write = gateway.relabel
+    gateway.relabel = lambda *args: None
+    executor = _executor(gateway, store, _Journal())
+    for _ in range(8):
+        assert not executor.execute_all(actions)
+    gateway.relabel = write
+    assert not _executor(gateway, store, _Journal()).execute_all(actions)
+    assert gateway.issues[7].labels == issue.labels
+    assert _recovery_state(store, 7).budget_block == block
+    assert _recovery_state(store, 7).self_clears == 0
+
+
+def test_lost_budget_reply_uses_current_daily_period_after_restart(tmp_path, monkeypatch):
+    from datetime import timedelta
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.app.test_durable_workflow_composition import Crash
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    from issue_agent.domain.self_clear import BudgetClearProjection, budget_recovery_limits
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    store = Store(str(tmp_path))
+    object.__setattr__(store, "_workflow_db", control)
+    block = BudgetBlock(7, Target.ISSUE, 7, 2_000_000, "repository", 5_000_000)
+    seed_imported_budget_hold(control, block)
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    original = control.now()
+    cap = Money("USD", 5_000_000)
+    limits = budget_recovery_limits("o/r", 7, original, cap, None, None)
+    provisional = BudgetClearProjection(selected.revision, block, BudgetWorld(tuple(
+        BudgetLimitObservation(scope.dimension, "available", 0, maximum.micros, scope.currency, scope)
+        for scope, maximum in limits), True, "config"), selected.binding)
+    observed = control.observe_budget_clear_accounting(provisional,
+        limits, "config")
+    issue = IssueView(7, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
+    actions = self_clear_actions(WorldState(issues=(issue,)), {}, {7: block}, {7: observed}, {}, frozenset(),
+        budget_revisions={7: selected.revision}, self_clear_bindings={7: selected.binding})
+    assert len(actions) == 1
+    gateway = InMemoryGitHub(issues=(issue,))
+    write = gateway.relabel
+    def lose_reply(*args):
+        write(*args)
+        if args[2] == Label.AI_BLOCKED.value:
+            raise Crash("remote success before midnight reply lost")
+    gateway.relabel = lose_reply
+    with pytest.raises(Crash):
+        _executor(gateway, store, _Journal(), issue_cap=None, repository_cap=cap).execute_all(actions)
+    gateway.relabel = write
+    monkeypatch.setattr(control, "_now", lambda: original + timedelta(days=1))
+    restarted = _executor(gateway, store, _Journal(), issue_cap=None, repository_cap=cap)
+    assert restarted.execute_all(actions)
+    assert restarted.execute_all(actions)
+    assert gateway.issues[7].labels == frozenset({Label.AI_READY})
+    assert _recovery_state(store, 7).budget_block is None
+    assert _recovery_state(store, 7).self_clears == 1
+
+
+@pytest.mark.parametrize("target", [Target.ISSUE, Target.PR])
+@pytest.mark.parametrize("changed", ["cap", "config", "currency", "disabled", "human", "unavailable"])
+def test_changed_budget_evidence_refuses_remote_mutation_and_restored_policy_progresses(tmp_path, target, changed):
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    store = Store(str(tmp_path))
+    object.__setattr__(store, "_workflow_db", control)
+    block = BudgetBlock(7, target, 7 if target is Target.ISSUE else 100, 2_000_000, "issue:7", 5_000_000)
+    seed_imported_budget_hold(control, block)
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    issue = IssueView(7, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
+    pr = PRView(100, head_ref_oid="budget-head", labels=issue.labels, closing_issue=7)
+    world = WorldState(issues=(issue,), prs=(pr,))
+    actions = self_clear_actions(world, {}, {7: block}, {7: _observed_budget(store, world, block)}, {}, frozenset(),
+        budget_revisions={7: selected.revision}, self_clear_bindings={7: selected.binding})
+    assert len(actions) == 1
+    gateway = InMemoryGitHub(issues=(issue,), prs={100: pr})
+    kwargs = {}
+    if changed == "cap":
+        kwargs["issue_cap"] = Money("USD", 1_000_000)
+    elif changed == "config":
+        kwargs["config_version"] = "different-config"
+    elif changed == "currency":
+        kwargs["issue_cap"] = Money("EUR", 5_000_000)
+    elif changed == "disabled":
+        kwargs["issue_cap"] = None
+    elif changed == "human":
+        views = gateway.issues if target is Target.ISSUE else gateway.prs
+        views[block.number] = replace(views[block.number], labels=views[block.number].labels | {Label.NEEDS_HUMAN_REVIEW})
+    else:
+        with control.transaction() as db:
+            db.execute("ALTER TABLE charges RENAME TO unavailable_charges")
+    assert not _executor(gateway, store, _Journal(), **kwargs).execute_all(actions)
+    assert _recovery_state(store, 7).budget_block == block and _recovery_state(store, 7).self_clears == 0
+    assert (gateway.issues[7] if target is Target.ISSUE else gateway.prs[100]).has(Label.AI_BLOCKED)
+    if changed == "unavailable":
+        with control.transaction() as db:
+            db.execute("ALTER TABLE unavailable_charges RENAME TO charges")
+    elif changed == "human":
+        gateway.issues[7] = issue
+        gateway.prs[100] = pr
+    restored = _executor(gateway, store, _Journal())
+    assert restored.execute_all(actions)
+    assert restored.execute_all(actions)
+    assert _recovery_state(store, 7).budget_block is None and _recovery_state(store, 7).self_clears == 1
+    assert (gateway.issues[7] if target is Target.ISSUE else gateway.prs[100]).labels == frozenset({
+        Label.AI_READY if target is Target.ISSUE else Label.AI_PR_OPEN})
+
+
+@pytest.mark.parametrize("remote_stage", ["none", "partial", "full"])
+@pytest.mark.parametrize("changed_accounting", [False, True])
+@pytest.mark.parametrize("dimension", ["issue:7", "repository", "global"])
+def test_budget_recovery_rechecks_committed_reservations_before_remote_release(tmp_path, remote_stage, changed_accounting, dimension, monkeypatch):
+    from datetime import datetime, timezone
+    from zoneinfo import ZoneInfo
+    from issue_agent.adapters.control_store import ReservationRequest
+    from issue_agent.domain.contracts import BudgetScope, PriceQuote, ReservationId, RunId
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+    control, _ = workflow_control(tmp_path, numbers=(7,))
+    store = Store(str(tmp_path))
+    object.__setattr__(store, "_workflow_db", control)
+    block = BudgetBlock(7, Target.ISSUE, 7, 2_000_000, "issue:7", 5_000_000)
+    seed_imported_budget_hold(control, block)
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    issue = IssueView(7, labels=frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}))
+    world = WorldState(issues=(issue,))
+    cfg = SimpleNamespace(repo="o/r", config_version="config", issue_spend_cap_usd=5.0,
+                          daily_spend_cap_usd=5.0, global_daily_spend_cap_usd=5.0)
+    blocks, budgets = _budget_self_clear_worlds(control, cfg, world, {7: block})
+    actions = self_clear_actions(world, {}, blocks, budgets, {}, frozenset(),
+                                 budget_revisions={7: selected.revision})
+    assert len(actions) == 1
+    gateway = InMemoryGitHub(issues=(issue,))
+    caps = dict(issue_cap=Money("USD", 5_000_000), repository_cap=Money("USD", 5_000_000), global_cap=Money("USD", 5_000_000))
+    executor = _executor(gateway, store, _Journal(), **caps)
+    if remote_stage != "none":
+        from tests.app.test_durable_workflow_composition import Crash
+        write = gateway.relabel
+        def lost_reply(kind, number, remove, add):
+            write(kind, number, remove, add)
+            if remove == (Label.AI_BLOCKED.value if remote_stage == "full" else Label.NEEDS_BUDGET_REVIEW.value):
+                raise Crash("remote budget labels applied before lost reply")
+        monkeypatch.setattr(gateway, "relabel", lost_reply)
+        with pytest.raises(Crash):
+            executor.execute(actions[0])
+        monkeypatch.setattr(gateway, "relabel", write)
+        assert gateway.issues[7].labels == (frozenset({Label.AI_READY}) if remote_stage == "full"
+                                         else frozenset({Label.AI_READY, Label.AI_BLOCKED}))
+        assert _recovery_state(store, 7).budget_block == block
+    now = datetime.now(timezone.utc)
+    scope = next(item.budget_scope for item in budgets[7].limits if item.scope == dimension)
+    assert scope is not None
+    reservation = ReservationRequest(ReservationId("competing-reservation"), RunId("competing-run"),
+        "competing-dispatch", scope, PriceQuote("model", "card", "1", now, Money("USD", 4_000_000)),
+        Money("USD", 5_000_000), "config", "o/r", owner_id="o/r:fix:fixture")
+    if changed_accounting:
+        assert control.reserve(reservation).admitted
+        assert control.snapshot(scope).committed == Money("USD", 4_000_000)
+    restarted = _executor(gateway, store, _Journal(), **caps)
+    if not changed_accounting:
+        assert restarted.execute_all(actions)
+        assert restarted.execute_all(actions)
+        assert gateway.issues[7].labels == frozenset({Label.AI_READY})
+        assert _recovery_state(store, 7).budget_block is None
+        assert _recovery_state(store, 7).self_clears == 1
+        return
+    assert not restarted.execute_all(actions)
+    if remote_stage == "full":
+        discards = self_clear_actions(WorldState(issues=(gateway.issues[7],)), {}, blocks, {}, {}, frozenset(),
+                                     budget_revisions={7: selected.revision})
+        assert len(discards) == 1
+        with control.transaction() as db:
+            plan = db.execute("EXPLAIN QUERY PLAN SELECT payload_json FROM lifecycle_commands INDEXED BY lifecycle_self_clear_pending "
+                "WHERE repository=? AND target=? AND state IN ('pending','executing','retryable_failure','unknown_outcome') "
+                "AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text' LIMIT 65", ("o/r", "issue:7")).fetchall()
+        assert any("SEARCH lifecycle_commands USING INDEX lifecycle_self_clear_pending" in row[3] for row in plan)
+        assert all("SCAN" not in row[3] for row in plan)
+        assert not restarted.execute_all(discards)
+    elif remote_stage == "none":
+        assert gateway.issues[7].labels == issue.labels
+    assert _recovery_state(store, 7).budget_block == block
+    assert _recovery_state(store, 7).self_clears == 0
+    from issue_agent.adapters.control_store import SettlementRequest
+    from issue_agent.domain.contracts import PricingBasis
+    assert control.settle(SettlementRequest(RunId("competing-run"), Money("USD", 1_000_000),
+        PricingBasis.PROVIDER_REPORTED, "competing-reported-cost", None, None, None)).disposition is AccountingDisposition.AVAILABLE
+    assert control.snapshot(scope).committed == Money("USD", 1_000_000)
+    if remote_stage == "none":
+        fresh_blocks, fresh_budgets = _budget_self_clear_worlds(control, cfg, world, {7: block})
+        actions = self_clear_actions(world, {}, fresh_blocks, fresh_budgets, {}, frozenset(),
+                                     budget_revisions={7: selected.revision})
+    assert restarted.execute_all(actions)
+    assert restarted.execute_all(actions)
+    assert gateway.issues[7].labels == frozenset({Label.AI_READY})
+    assert _recovery_state(store, 7).budget_block is None
+    assert _recovery_state(store, 7).self_clears == 1
 
 
 def test_alternating_machine_budget_recoveries_and_restart_consume_one_sql_ceiling(tmp_path):
@@ -91,7 +371,7 @@ def test_alternating_machine_budget_recoveries_and_restart_consume_one_sql_ceili
         actions = self_clear_actions(WorldState(prs=(gateway.prs[100],), issues=(gateway.issues[5],)),
             {5: state.machine_block} if state.machine_block is not None else {},
             {5: state.budget_block} if state.budget_block is not None else {},
-            {5: BudgetWorld((BudgetLimitObservation("issue:5", "available", 0, 5_000_000),), True)},
+            {5: _observed_budget(store, WorldState(issues=(gateway.issues[5],)), state.budget_block)} if state.budget_block is not None else {},
             {5: state.self_clears}, frozenset({5}) if state.self_clear_ceiling_reported else frozenset(),
             machine_revisions={5: selected.revision}, budget_revisions={5: selected.revision})
         # Recreate the executor before each cause, then redeliver exact work.
@@ -218,11 +498,18 @@ def test_sibling_recovery_uses_a_fresh_revision_and_shared_count_before_second_r
     def decide():
         selected = store._workflow_db.read_issue_recovery(key)
         state = selected.component.state
+        world = WorldState(prs=(gateway.prs[100],), issues=(gateway.issues[5],))
+        budgets = {}
+        if state.budget_block is not None:
+            budget = _observed_budget(store, world, state.budget_block)
+            if not budget_available:
+                budget = replace(budget, complete=False)
+            budgets[5] = budget
         return self_clear_actions(
-            WorldState(prs=(gateway.prs[100],), issues=(gateway.issues[5],)),
+            world,
             {5: state.machine_block} if state.machine_block is not None else {},
             {5: state.budget_block} if state.budget_block is not None else {},
-            {5: BudgetWorld((BudgetLimitObservation("issue:5", "available" if budget_available else "unavailable", 0, 5_000_000),), True)},
+            budgets,
             {5: _recovery_state(store, 5).self_clears}, frozenset(),
             machine_revisions={5: selected.revision}, budget_revisions={5: selected.revision})
     assert executor.execute_all(decide())
@@ -316,9 +603,6 @@ def test_budget_retirement_removes_both_labels_and_journals_headroom(tmp_path):
     block = BudgetBlock(
         7, Target.ISSUE, 7, 2_000_000, "issue:7", 5_000_000, 100_000
     )
-    budget = BudgetWorld((
-        BudgetLimitObservation("issue:7", "available", 3_000_000, 5_000_000),
-    ), True)
     store = Store(str(tmp_path))
     from tests.app.test_control_record_isolation import workflow_control
     from tests.fakes.accounted_workflow import seed_imported_budget_hold
@@ -327,6 +611,17 @@ def test_budget_retirement_removes_both_labels_and_journals_headroom(tmp_path):
     object.__setattr__(store, "_workflow_db", control)
     seed_imported_budget_hold(control, block)
     selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    from issue_agent.adapters.control_store import ReservationRequest
+    from issue_agent.domain.contracts import PriceQuote, ReservationId, RunId
+    budget = _observed_budget(store, WorldState(issues=(issue,)), block)
+    scope = budget.limits[0].budget_scope
+    assert scope is not None
+    reserved = ReservationRequest(ReservationId("existing-reservation"), RunId("existing-run"), "existing-dispatch",
+        scope, PriceQuote("model", "card", "1", control.now(), Money("USD", 3_000_000)),
+        Money("USD", 5_000_000), "config", "o/r", owner_id="o/r:fix:fixture")
+    assert control.reserve(reserved).admitted
+    budget = _observed_budget(store, WorldState(issues=(issue,)), block)
+    assert budget.limits[0].committed_micros == 3_000_000
     journal = _Journal()
     class RevisionBumpingGateway(InMemoryGitHub):
         def relabel(self, kind, number, remove, add):
@@ -375,6 +670,7 @@ def test_labels_without_harness_marker_do_not_synthesize_budget_authority():
 
     cfg = SimpleNamespace(
         repo="o/r",
+        config_version="config",
         fix_budget_usd=2.0,
         issue_spend_cap_usd=5.0,
         daily_spend_cap_usd=0.0,
@@ -402,6 +698,7 @@ def test_harness_marker_observes_a_half_cleared_budget_transition():
 
     cfg = SimpleNamespace(
         repo="o/r",
+        config_version="config",
         fix_budget_usd=2.0,
         issue_spend_cap_usd=5.0,
         daily_spend_cap_usd=0.0,

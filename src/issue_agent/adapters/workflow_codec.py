@@ -199,6 +199,10 @@ _LEGACY_EXECUTION_CHECKPOINT_FIELDS = frozenset({"through_sequence", "state", "p
 # Explicit evolution of already-persisted variants. Never infer defaults from
 # dataclass declarations: new authority fields require a deliberate read rule.
 _LEGACY_FIELDS: dict[str, dict[str, object]] = {
+    "BudgetWorld": {"config_version": ""},
+    "MachineClearProjection": {"binding": None},
+    "BudgetClearProjection": {"binding": None},
+    "BudgetLimitObservation": {"budget_scope": None},
     "StewardState": {"groom_content": {"type": "GroomContent", "fields": {"attempted": "", "successful": ""}}},
     "StewardAttemptSource": {"content_signature": ""},
     "StewardPurchase": {"content_signature": "", "infra_ceiling": None},
@@ -266,6 +270,9 @@ def _encode(value: object, depth: int = 0) -> object:
                     and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
                     and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block", "budget_block"} and getattr(value, field.name) is None)
                     and not (type(value) is cc.IssueRecoveryState and field.name == "self_clear_ceiling_reported" and not value.self_clear_ceiling_reported)
+                    and not (type(value) is BudgetWorld and field.name == "config_version" and not value.config_version)
+                    and not (type(value) is BudgetLimitObservation and field.name == "budget_scope" and value.budget_scope is None)
+                    and not (type(value) in {MachineClearProjection, BudgetClearProjection} and field.name == "binding" and value.binding is None)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
                         or field.name == "review" and value.review is None
                         or field.name == "rebase" and value.rebase is None

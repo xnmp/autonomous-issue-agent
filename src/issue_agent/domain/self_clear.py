@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from enum import Enum
 import re
+from zoneinfo import ZoneInfo
 
 from .actions import (
     Action,
@@ -16,10 +18,10 @@ from .actions import (
     Target,
 )
 from .ci import ci_state
-from .contracts import Money
+from .contracts import Money, BudgetScope, daily_budget_scope
 from .labels import Label
 from .world import CIState, WorldState, PRView
-from .workflow_identity import IssueRef, WorkflowRevision, validate_workflow_integer, validate_workflow_text
+from .workflow_identity import IssueRef, WorkflowRevision, WorkflowBinding, WorkflowFamily, validate_workflow_integer, validate_workflow_text
 
 SELF_CLEAR_CEILING = 3
 
@@ -83,6 +85,7 @@ class BudgetLimitObservation:
     committed_micros: int
     cap_micros: int
     currency: str = "USD"
+    budget_scope: BudgetScope | None = None
 
     def __post_init__(self) -> None:
         validate_workflow_integer(self.committed_micros, "budget observation committed amount")
@@ -90,6 +93,9 @@ class BudgetLimitObservation:
         validate_workflow_text(self.scope, "budget observation scope", limit=512)
         validate_workflow_text(self.disposition, "budget observation disposition", limit=64)
         Money(self.currency, 0)
+        if self.budget_scope is not None and (not isinstance(self.budget_scope, BudgetScope)
+                or self.budget_scope.dimension != self.scope or self.budget_scope.currency != self.currency):
+            raise ValueError("budget observation requires its exact accounting scope")
 
 
 @dataclass(frozen=True)
@@ -98,11 +104,26 @@ class BudgetWorld:
 
     limits: tuple[BudgetLimitObservation, ...] = ()
     complete: bool = False
+    config_version: str = ""
 
     def __post_init__(self) -> None:
         if (type(self.complete) is not bool or not isinstance(self.limits, tuple)
                 or any(not isinstance(limit, BudgetLimitObservation) for limit in self.limits)):
             raise ValueError("budget world requires typed limits and completeness")
+        validate_workflow_text(self.config_version, "budget world config", limit=512, empty=True)
+
+
+def budget_recovery_limits(repository: str, issue: int, now: datetime,
+        repository_cap: Money | None, global_cap: Money | None,
+        issue_cap: Money | None) -> tuple[tuple[BudgetScope, Money], ...]:
+    limits = []
+    for repo, dimension, cap in ((repository, "repository", repository_cap), ("*", "global", global_cap)):
+        if cap is not None:
+            limits.append((daily_budget_scope(repo, dimension, cap.currency, now, ZoneInfo("UTC")), cap))
+    if issue_cap is not None:
+        limits.append((BudgetScope(repository, f"issue:{issue}", issue_cap.currency, f"lifetime:{issue}",
+            datetime(1970, 1, 1, tzinfo=timezone.utc), datetime.max.replace(tzinfo=timezone.utc), ZoneInfo("UTC")), issue_cap))
+    return tuple(limits)
 
 
 @dataclass(frozen=True)
@@ -111,8 +132,10 @@ class MachineClearProjection:
     block: MachineBlock
     observed_head: str
     ignored_checks: str = ""
+    binding: WorkflowBinding | None = None
 
     def __post_init__(self) -> None:
+        _validate_clear_binding(self.revision, self.binding)
         if not isinstance(self.revision, WorkflowRevision) or not isinstance(self.block, MachineBlock):
             raise ValueError("machine clear requires selected typed recovery evidence")
         if (not isinstance(self.revision.fence.key.target, IssueRef)
@@ -130,14 +153,22 @@ class BudgetClearProjection:
     revision: WorkflowRevision
     block: BudgetBlock
     budget: BudgetWorld
+    binding: WorkflowBinding | None = None
 
     def __post_init__(self) -> None:
+        _validate_clear_binding(self.revision, self.binding)
         if not isinstance(self.revision, WorkflowRevision) or not isinstance(self.block, BudgetBlock):
             raise ValueError("budget clear requires selected typed recovery evidence")
         if not isinstance(self.revision.fence.key.target, IssueRef) or self.revision.fence.key.target.number != self.block.issue:
             raise ValueError("budget clear evidence does not match its issue")
         if not isinstance(self.budget, BudgetWorld) or not _budget_clearable(self.budget, self.block.reservation_micros)[0]:
             raise ValueError("budget clear lacks complete fitting captured limits")
+
+
+def _validate_clear_binding(revision, binding) -> None:
+    if binding is not None and (not isinstance(binding, WorkflowBinding) or not isinstance(revision, WorkflowRevision)
+            or binding.fence != revision.fence or binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
+        raise ValueError("recovery projection binding must name its selected issue family and generation")
 
 
 def machine_clear_evidence(pr: PRView, block: MachineBlock, ignored_checks: str) -> bool:
@@ -193,6 +224,7 @@ def self_clear_actions(
     ceiling: int = SELF_CLEAR_CEILING,
     machine_revisions: dict[int, WorkflowRevision] | None = None,
     budget_revisions: dict[int, WorkflowRevision] | None = None,
+    self_clear_bindings: dict[int, WorkflowBinding] | None = None,
 ) -> list[Action]:
     """Return only clears proven by the current snapshot; absence never clears."""
 
@@ -223,7 +255,8 @@ def self_clear_actions(
                 Label.AI_BLOCKED,
                 Label.AI_PR_OPEN,
                 observed_head,
-                self_clear=MachineClearProjection(selected_revision, block, observed_head, ignored_checks)
+                self_clear=MachineClearProjection(selected_revision, block, observed_head, ignored_checks,
+                    (self_clear_bindings or {}).get(issue))
                 if selected_revision is not None else None,
             ))
         if selected_revision is None:
@@ -299,7 +332,8 @@ def self_clear_actions(
             resume_label,
             revision,
             removes=removes,
-            self_clear=BudgetClearProjection(selected_revision, block, budget_worlds[issue]) if selected_revision is not None else None,
+            self_clear=BudgetClearProjection(selected_revision, block, budget_worlds[issue],
+                (self_clear_bindings or {}).get(issue)) if selected_revision is not None else None,
         ))
         if selected_revision is None:
             actions.append(FinalizeBudgetBlockRetirement(

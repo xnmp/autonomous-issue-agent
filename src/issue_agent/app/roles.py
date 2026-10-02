@@ -138,6 +138,7 @@ from ..domain.self_clear import (
     BudgetBlock,
     BudgetLimitObservation,
     BudgetWorld,
+    budget_recovery_limits,
 )
 from ..domain.pricing import (
     BudgetPolicy,
@@ -542,6 +543,9 @@ def _effects(
     identity: str,
     config_version: str,
     base_branch: str,
+    repository_cap: Money | None = None,
+    global_cap: Money | None = None,
+    issue_cap: Money | None = None,
     retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
     journal: TypedJournal | None = None,
     alert_cmd: str = "",
@@ -553,6 +557,9 @@ def _effects(
         repository=repository,
         identity=identity,
         config_version=config_version,
+        repository_cap=repository_cap,
+        global_cap=global_cap,
+        issue_cap=issue_cap,
         retry_ceiling=retry_ceiling,
         journal=journal,
         alert_cmd=alert_cmd,
@@ -1963,6 +1970,7 @@ def _fix_state(
     budget_errors = {}
     machine_errors = {}
     self_clear_counts = {}
+    self_clear_bindings = {}
     ceiling_reported = set()
     for issue in issue_keys:
         try:
@@ -1972,6 +1980,7 @@ def _fix_state(
             if not isinstance(selected, cc.SelectedIssueRecovery):
                 raise ValueError("machine hold authority is inactive or migration blocked")
             self_clear_counts[issue] = selected.component.state.self_clears
+            self_clear_bindings[issue] = selected.binding
             if selected.component.state.self_clear_ceiling_reported:
                 ceiling_reported.add(issue)
             if selected.component.state.machine_block is not None:
@@ -2005,6 +2014,7 @@ def _fix_state(
         budget_revisions=budget_revisions,
         budget_control_errors=budget_errors,
         self_clear_counts=self_clear_counts,
+        self_clear_bindings=self_clear_bindings,
         self_clear_ceiling_reported=self_clear_ceiling_reported,
     )
 
@@ -2038,40 +2048,12 @@ def _budget_self_clear_worlds(
 
     blocks = dict(stored)
     now = datetime.now(timezone.utc)
-    day_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
     worlds: dict[int, BudgetWorld] = {}
     for issue, (target, number) in targets.items():
-        scopes: list[tuple[BudgetScope, float]] = []
-        if cfg.issue_spend_cap_usd > 0:
-            scopes.append((
-                BudgetScope(
-                    cfg.repo,
-                    f"issue:{issue}",
-                    "USD",
-                    f"lifetime:{issue}",
-                    datetime(1970, 1, 1, tzinfo=timezone.utc),
-                    datetime.max.replace(tzinfo=timezone.utc),
-                    ZoneInfo("UTC"),
-                ),
-                cfg.issue_spend_cap_usd,
-            ))
-        for repository, dimension, cap in (
-            (cfg.repo, "repository", cfg.daily_spend_cap_usd),
-            ("*", "global", cfg.global_daily_spend_cap_usd),
-        ):
-            if cap > 0:
-                scopes.append((
-                    BudgetScope(
-                        repository,
-                        dimension,
-                        "USD",
-                        day_start.date().isoformat(),
-                        day_start,
-                        day_start + timedelta(days=1),
-                        ZoneInfo("UTC"),
-                    ),
-                    cap,
-                ))
+        def cap(value: float) -> Money | None:
+            return Money.from_major("USD", value) if value > 0 else None
+        scopes = budget_recovery_limits(cfg.repo, issue, now,
+            cap(cfg.daily_spend_cap_usd), cap(cfg.global_daily_spend_cap_usd), cap(cfg.issue_spend_cap_usd))
         observations: list[BudgetLimitObservation] = []
         complete = True
         for scope, cap in scopes:
@@ -2082,10 +2064,11 @@ def _budget_self_clear_worlds(
                 scope.dimension,
                 disposition,
                 snapshot.committed.micros,
-                Money.from_major("USD", cap).micros,
-                "USD",
+                cap.micros,
+                scope.currency,
+                scope,
             ))
-        worlds[issue] = BudgetWorld(tuple(observations), complete)
+        worlds[issue] = BudgetWorld(tuple(observations), complete, cfg.config_version)
     return blocks, worlds
 
 
@@ -2685,6 +2668,9 @@ def compose_fix_daemon(
         identity=owner_id,
         config_version=cfg.config_version,
         base_branch=cfg.base_branch,
+        repository_cap=Money.from_major("USD", cfg.daily_spend_cap_usd) if cfg.daily_spend_cap_usd > 0 else None,
+        global_cap=Money.from_major("USD", cfg.global_daily_spend_cap_usd) if cfg.global_daily_spend_cap_usd > 0 else None,
+        issue_cap=Money.from_major("USD", cfg.issue_spend_cap_usd) if cfg.issue_spend_cap_usd > 0 else None,
         retry_ceiling=cfg.effect_retry_ceiling,
         journal=journal,
         alert_cmd=cfg.alert_cmd,

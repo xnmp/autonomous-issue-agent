@@ -233,6 +233,7 @@ class FixState:
     budget_control_errors: Mapping[int, str] = field(default_factory=dict)
     budget_worlds: dict[int, BudgetWorld] = field(default_factory=dict)
     self_clear_counts: dict[int, int] = field(default_factory=dict)
+    self_clear_bindings: dict[int, cc.WorkflowBinding] = field(default_factory=dict)
     self_clear_ceiling_reported: frozenset[int] = frozenset()
     # A bad per-target record must not mint a default allowance or hide peers.
     control_errors: Mapping[int, str] = field(default_factory=dict)
@@ -1730,6 +1731,7 @@ def decide_fix(
         cfg.ci_ignore_checks,
         machine_revisions=state.machine_revisions,
         budget_revisions=state.budget_revisions,
+        self_clear_bindings=state.self_clear_bindings,
     )
     actions.extend(retiring)
     retiring_issues = {

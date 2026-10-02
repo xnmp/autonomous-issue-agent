@@ -656,7 +656,7 @@ def test_fix_presence_index_migrates_malformed_sources_atomically_and_fences_old
     legacy = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     with monkeypatch.context() as patch:
         patch.setattr(module, "SCHEMA_VERSION", 36)
-        patch.setattr(module, "_SCHEMA_MIGRATIONS", module._SCHEMA_MIGRATIONS[:-1])
+        patch.setattr(module, "_SCHEMA_MIGRATIONS", tuple(m for m in module._SCHEMA_MIGRATIONS if m.version <= 36))
         legacy.initialize()
         for index, dispatch in enumerate(("{", "[]", "null", '"text"',
                 json.dumps({"repository":"o/r", "role":"fix", "issue":True}),
@@ -680,7 +680,7 @@ def test_fix_presence_index_migrates_malformed_sources_atomically_and_fences_old
         assert db.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
         after = tuple(db.iterdump())
     literal = json.loads((Path(__file__).parents[1] / "fixtures/phase4-pre-f7-capture.json").read_text())
-    assert hashlib.sha256("".join(m.source for m in module._SCHEMA_MIGRATIONS[:-1]).encode()).hexdigest() == literal["pre37_sql_hash"]
+    assert hashlib.sha256("".join(m.source for m in module._SCHEMA_MIGRATIONS if m.version <= 36).encode()).hexdigest() == literal["pre37_sql_hash"]
     with monkeypatch.context() as patch:
         patch.setattr(module, "SCHEMA_VERSION", 36)
         with pytest.raises(module.IncompatibleSchema, match="newer"):
