@@ -12,7 +12,7 @@ from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.world import Check, PRView
+from issue_agent.domain.world import Check, PRView, Review
 from issue_agent.domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey
 from tests.app.test_dispatch import FakeGateway, FakeRunner, FakeStore
 from tests.app.test_fix_workflow import _workflow
@@ -28,6 +28,25 @@ def test_fix_ci_without_active_pr_component_refuses_without_purchase():
     workflow = _workflow(gateway, files, inner, pr_repair_authority=False)
     install_workflow(files._workflow_db, held(key=WorkflowKey("o/r", PullRequestRef(100))))
     asyncio.run(workflow.fix_ci(100))
+    assert inner.tasks == []
+    assert files.sessions == {} and files.branches == {}
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+
+
+def test_address_review_without_active_pr_component_refuses_without_purchase():
+    gateway = FakeGateway(prs={100: PRView(
+        100, head_ref_name="fix/5-remote", closing_issue=5, head_ref_oid="a" * 40,
+        reviews=(Review("CHANGES_REQUESTED", "reviewer", "2026-10-02T00:00:01Z", body="fix it"),),
+    )})
+    inner = FakeRunner(AgentResult(is_error=False, status="pushed", cost_usd=.01, session_id="unselected"))
+    files = FakeStore()
+    workflow = _workflow(gateway, files, inner, pr_repair_authority=False)
+    install_workflow(files._workflow_db, held(key=WorkflowKey("o/r", PullRequestRef(100))))
+
+    asyncio.run(workflow.address_review(100))
+
     assert inner.tasks == []
     assert files.sessions == {} and files.branches == {}
     with files._workflow_db.transaction() as db:
@@ -59,6 +78,257 @@ def issue_ci_state(files, issue=5):
     with files._workflow_db.transaction() as db:
         aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue)))
         return cc.select_issue_recovery(aggregate).component.state
+
+
+def test_review_repair_charges_same_timestamp_until_ceiling_then_newer_review_only_resets():
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", cost_usd=.01, session_id="review-continuation"))
+    workflow.cfg = replace(workflow.cfg, max_review_retries=2)
+    first = "2026-10-02T00:00:01Z"
+    second = "2026-10-02T00:00:02Z"
+    gateway = workflow.gateway
+    gateway.prs[100] = replace(gateway.prs[100], head_ref_oid="a"*40,
+        reviews=(Review("CHANGES_REQUESTED", "reviewer", first, body="fix it"),))
+    asyncio.run(workflow.address_review(100))
+    assert len(inner.tasks) == 1
+    assert (issue_ci_state(files).review_failures.review_at, issue_ci_state(files).review_failures.count) == (first, 1)
+    assert issue_ci_state(files).review_failures.pending is None
+    asyncio.run(workflow.address_review(100))
+    assert issue_ci_state(files).review_failures.count == 2
+    asyncio.run(workflow.address_review(100))
+    assert len(inner.tasks) == 2
+    gateway.prs[100] = replace(gateway.prs[100], head_ref_oid="b"*40)
+    asyncio.run(workflow.address_review(100))
+    assert len(inner.tasks) == 2
+    gateway.prs[100] = replace(gateway.prs[100], reviews=(Review("CHANGES_REQUESTED", "reviewer", second),))
+    asyncio.run(workflow.address_review(100))
+    assert len(inner.tasks) == 3
+    assert (issue_ci_state(files).review_failures.review_at, issue_ci_state(files).review_failures.count) == (second, 1)
+    gateway.prs[100] = replace(gateway.prs[100], reviews=(Review("CHANGES_REQUESTED", "reviewer", first),))
+    asyncio.run(workflow.address_review(100))
+    assert len(inner.tasks) == 3
+    assert (issue_ci_state(files).review_failures.review_at, issue_ci_state(files).review_failures.count) == (second, 1)
+    assert files.sessions == {} and files.branches == {}
+
+
+def review_workflow(result):
+    workflow, files, inner, key = active_ci_workflow(result)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a"*40,
+        reviews=(Review("CHANGES_REQUESTED", "reviewer", "2026-10-02T00:00:01Z", body="fix it"),))
+    return workflow, files, inner, key
+
+
+def test_review_repair_preserves_primary_review_and_sibling_issue_allowances():
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    with files._workflow_db.transaction() as db:
+        before = load_review_workflow_row(db, key)
+    issue_before = issue_ci_state(files)
+    asyncio.run(workflow.address_review(100))
+    with files._workflow_db.transaction() as db:
+        after = load_review_workflow_row(db, key)
+    assert (after.episode, after.execution, after.intent, after.gates) == (before.episode, before.execution, before.intent, before.gates)
+    issue_after = issue_ci_state(files)
+    assert replace(issue_after, review_failures=issue_before.review_failures) == issue_before
+
+
+def test_unknown_legacy_review_episode_refuses_without_purchasing_or_resetting():
+    from tests.fakes.accounted_workflow import seed_review_retry
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    seed_review_retry(files, "", 3)
+    before = issue_ci_state(files)
+    asyncio.run(workflow.address_review(100))
+    assert inner.tasks == [] and issue_ci_state(files) == before
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+
+
+def test_disabled_review_ceiling_preserves_existing_unbounded_policy():
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    workflow.cfg = replace(workflow.cfg, max_review_retries=0)
+    for _ in range(4):
+        asyncio.run(workflow.address_review(100))
+    assert len(inner.tasks) == 4 and issue_ci_state(files).review_failures.count == 4
+
+
+def test_review_budget_refusal_preserves_timestamp_continuation_and_fork_inputs(monkeypatch):
+    from issue_agent.domain.contracts import Money
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    before_issue = issue_ci_state(files)
+    before_pr = files._workflow_authority.read_pr_repair(key)
+    reserve = files._workflow_db.reserve
+    monkeypatch.setattr(files._workflow_db, "reserve", lambda request: reserve(replace(request, cap=Money("USD", 0))))
+    asyncio.run(workflow.address_review(100))
+    assert inner.tasks == [] and issue_ci_state(files) == before_issue
+    assert files._workflow_authority.read_pr_repair(key) == before_pr
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("namespace", ["continuation-admission", "continuation-return"])
+def test_review_exact_retry_refuses_missing_selected_issue_receipt(namespace):
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    asyncio.run(workflow.address_review(100))
+    store = files._workflow_db
+    with store.transaction() as db:
+        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0]
+        returned = decode_workflow(raw, cc.PRRepairResult)
+        db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND key=?", (namespace,
+            store._continuation_receipt_key(returned.admission.attempt.run_id, returned.review.admission.attempt.binding.authority.family)))
+    with pytest.raises(WorkflowAuthorityError, match="selected|admission"):
+        store.settle_pr_repair_result(returned, files._workflow_authority.writer)
+    assert issue_ci_state(files).review_failures.count == 1
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
+
+
+def test_review_proven_unlaunched_release_keeps_debt_and_continuation_unspent(monkeypatch):
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01, session_id="eventual"))
+    run = inner.run
+    async def failed_spawn(task):
+        raise FileNotFoundError("provider executable missing")
+    with monkeypatch.context() as patch:
+        patch.setattr(inner, "run", failed_spawn)
+        with pytest.raises(FileNotFoundError, match="provider executable"):
+            asyncio.run(workflow.address_review(100))
+    debt = issue_ci_state(files).review_failures
+    assert debt.count == 0 and debt.pending is None
+    assert files._workflow_authority.read_pr_repair(key).component.state.session is None
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0] == 0
+    asyncio.run(workflow.address_review(100))
+    assert issue_ci_state(files).review_failures.count == 1
+    assert files._workflow_authority.read_pr_repair(key).component.state.session.handle == "eventual"
+
+
+def interrupted_review(monkeypatch):
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False,
+        status="pushed", session_id="durable-review", cost_usd=.01))
+    with monkeypatch.context() as patch:
+        patch.setattr(files._workflow_db, "settle_pr_repair", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")))
+        with pytest.raises(RuntimeError, match="interrupted"):
+            asyncio.run(workflow.address_review(100))
+    return workflow, files, inner, key
+
+
+@pytest.mark.parametrize("reason,status,count", [("killed_externally", "timeout", 0), ("budget_exhausted", "", 0),
+                                                  ("ok", "blocked", 0), ("ok", "pushed", 1)])
+def test_review_return_preserves_attempt_classification(reason, status, count):
+    from issue_agent.domain.outcome import ExitReason
+    workflow, files, inner, key = review_workflow(AgentResult(
+        is_error=reason != "ok", exit_reason=ExitReason(reason), status=status, cost_usd=.01))
+    asyncio.run(workflow.address_review(100))
+    assert issue_ci_state(files).review_failures.count == count
+    assert issue_ci_state(files).review_failures.pending is None
+
+
+def test_review_restart_recovers_durable_output_once_and_preserves_sibling_reply(monkeypatch):
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from tests.adapters.test_workflow_admission import request
+    workflow, files, inner, key = interrupted_review(monkeypatch)
+    selected = files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    pending = selected.component.state.review_failures.pending
+    purchase = cc.IssueRecoveryPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:newer-reply"),
+        "2026-10-02T10:00:00+00:00", "fix/5-newer", 20)
+    requested = replace(request("newer-review-reply", binding=selected.binding), owner_id=files._workflow_authority.writer.owner_id)
+    assert files._workflow_db.reserve_issue_recovery(requested, purchase).admitted
+    restarted = SQLiteControlStore(files._workflow_db.path)
+    restarted.initialize()
+    recovered = SQLiteWorkflowControl(restarted, files._workflow_authority.writer, resolve_ceiling=20)
+    assert recovered.reconcile_pr_repair_returns() == 1
+    state = recovered.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state
+    assert state.review_failures.count == 1 and state.review_failures.pending is None
+    assert state.remembered_branch == "fix/5-newer" and state.consumed_reply_at == purchase.reply_at
+    assert recovered.read_pr_repair(key).component.state.session.handle == "durable-review"
+    assert recovered.reconcile_pr_repair_returns() == 0
+    assert recovered.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state == state
+    with restarted.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
+
+
+def test_review_stale_issue_result_settles_money_without_erasing_new_episode(monkeypatch):
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowRevision
+    workflow, files, inner, key = interrupted_review(monkeypatch)
+    issue_key = WorkflowKey("o/r", IssueRef(5))
+    with files._workflow_db.transaction() as db:
+        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0]
+        returned = decode_workflow(raw, cc.PRRepairResult)
+        current = load_issue_aggregate(db, issue_key)
+        changed = replace(current, revision=WorkflowRevision(replace(current.revision.fence, generation=current.revision.fence.generation+1), current.revision.version+1))
+        persist_workflow_snapshot(db, changed)
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    assert issue_ci_state(files).review_failures.count == 0
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], reviews=(Review("CHANGES_REQUESTED", "reviewer", "2026-10-02T00:00:02Z"),))
+    asyncio.run(workflow.address_review(100))
+    state = issue_ci_state(files)
+    assert (state.review_failures.review_at, state.review_failures.count) == ("2026-10-02T00:00:02Z", 1)
+    assert files._workflow_db.settle_pr_repair_result(returned, files._workflow_authority.writer).idempotent
+    assert issue_ci_state(files) == state
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
+
+
+def test_review_relinking_and_ambiguous_current_prs_refuse_without_purchase():
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    asyncio.run(workflow.address_review(100))
+    workflow.gateway.prs[101] = replace(workflow.gateway.prs[100], number=101,
+        reviews=(Review("CHANGES_REQUESTED", "reviewer", "2026-10-02T00:00:02Z"),))
+    install_pr_repair_authority(workflow.gateway, files)
+    with pytest.raises(ValueError, match="ambiguous"):
+        asyncio.run(workflow.address_review(101))
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], state="CLOSED")
+    asyncio.run(workflow.address_review(101))
+    assert len(inner.tasks) == 1
+    assert issue_ci_state(files).review_failures.count == 1
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 1
+
+
+def test_review_distinct_reviewer_filter_does_not_rekey_to_own_or_nonqualifying_review():
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    workflow.cfg = replace(workflow.cfg, fix_bot="fixer")
+    first = workflow.gateway.prs[100].reviews[0]
+    own = Review("CHANGES_REQUESTED", workflow.cfg.fix_bot, "2026-10-02T00:00:02Z")
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], reviews=(first, own))
+    asyncio.run(workflow.address_review(100))
+    assert issue_ci_state(files).review_failures.review_at == first.submitted_at
+    approved = Review("APPROVED", "reviewer", "2026-10-02T00:00:03Z")
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], reviews=(first, own, approved))
+    asyncio.run(workflow.address_review(100))
+    assert len(inner.tasks) == 1 and issue_ci_state(files).review_failures.count == 1
+
+
+@pytest.mark.parametrize("mutation", ["drop_issue", "drop_all", "kind", "issue_float", "pr_float"])
+def test_review_common_admission_refuses_missing_purchase_or_changed_actual_context(monkeypatch, mutation):
+    import json
+    workflow, files, inner, key = review_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    original = files._workflow_db.reserve
+    requests = []
+    def capture(request):
+        requests.append(request)
+        from issue_agent.adapters.control_store import ReservationResult, AccountingDisposition
+        return ReservationResult(AccountingDisposition.UNAVAILABLE, None, request.cap, request.cap, request.cap, "captured before admission")
+    with monkeypatch.context() as patch:
+        patch.setattr(files._workflow_db, "reserve", capture)
+        asyncio.run(workflow.address_review(100))
+    request = requests[0]
+    if mutation == "drop_all":
+        request = replace(request, continuations=(), workflow=None)
+    elif mutation == "drop_issue":
+        request = replace(request, continuations=tuple(p for p in request.continuations if isinstance(p, cc.PRRepairPurchase)))
+    else:
+        dispatch = json.loads(request.dispatch_id)
+        dispatch.update({"kind": "FIX_CI"} if mutation == "kind" else {"issue": 5.0} if mutation == "issue_float" else {"number": 100.0})
+        request = replace(request, dispatch_id=json.dumps(dispatch))
+    assert not original(request).admitted
+    assert inner.tasks == []
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
 
 
 def test_ci_attempt_counts_in_issue_authority_and_ceiling_prevents_purchase():
@@ -100,7 +370,7 @@ def test_ci_green_reset_is_exact_and_preserves_sibling_allowances():
     issue_key = WorkflowKey("o/r", IssueRef(5))
     with files._workflow_db.transaction() as db:
         current = load_issue_aggregate(db, issue_key)
-        siblings = replace(current.issue_recovery.state, resumes=2, review_failures=3, rebase_failures=4,
+        siblings = replace(current.issue_recovery.state, resumes=2, review_failures=cc.ReviewRetryState(count=3), rebase_failures=4,
                            infra_failures=5, self_clears=6)
         persist_workflow_snapshot(db, replace(current, issue_recovery=replace(current.issue_recovery, state=siblings)))
     asyncio.run(workflow.fix_ci(100))
@@ -551,11 +821,19 @@ def test_never_launched_claim_refusal_does_not_strand_component(monkeypatch):
     asyncio.run(workflow.fix_ci(100))
     assert len(inner.tasks) == 1
 
-def test_caught_paid_settlement_failure_rolls_back_money_and_continuity(monkeypatch):
+@pytest.mark.parametrize("lane", ["ci", "review"])
+def test_caught_paid_settlement_failure_rolls_back_money_and_continuity(monkeypatch, lane):
     import issue_agent.adapters.workflow_rows as rows
-    _,files,_,key,returned=captured_interrupted_ci_result(monkeypatch)
+    if lane == "ci":
+        _,files,_,key,returned=captured_interrupted_ci_result(monkeypatch)
+    else:
+        _,files,_,key=interrupted_review(monkeypatch)
+        with files._workflow_db.transaction() as db:
+            raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0]
+        returned = decode_workflow(raw, cc.PRRepairResult)
     store=files._workflow_db
     before=files._workflow_authority.read_pr_repair(key)
+    before_issue = issue_ci_state(files)
     original=rows.persist_workflow_snapshot
     def fail(db,state):
         original(db,state)
@@ -571,6 +849,7 @@ def test_caught_paid_settlement_failure_rolls_back_money_and_continuity(monkeypa
         db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('scratch','o/r','outer','0','{}')")
     monkeypatch.undo()
     assert files._workflow_authority.read_pr_repair(key) == before
+    assert issue_ci_state(files) == before_issue
     with store.transaction() as db:
         assert db.execute('SELECT count(*) FROM charges').fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='continuation-return'").fetchone()[0] == 0

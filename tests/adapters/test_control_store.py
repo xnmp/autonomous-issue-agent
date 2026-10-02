@@ -2872,6 +2872,35 @@ def test_a_claim_with_an_unreadable_row_is_skipped(tmp_path) -> None:
     assert store.active_dispatch_claims("o/r", "fix") == ()
 
 
+def _selected_review_claim_request(store, request):
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import WorkflowFamily, WorkflowKey, IssueRef, PullRequestRef
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
+    from tests.fakes.review_workflow import held
+    from tests.adapters.test_continuation_admission import active, install_secondary
+
+    issue = with_issue_recovery(resolve_snapshot(42))
+    install_workflow(store, issue)
+    primary = dataclasses.replace(held(key=WorkflowKey("o/r", PullRequestRef(7))), gates=())
+    component = active(primary.revision.fence.key, WorkflowFamily.PR_REPAIR)
+    primary = dataclasses.replace(primary, pr_repair=component)
+    install_workflow(store, primary)
+    install_secondary(store, primary, component)
+    selected_issue = cc.select_issue_recovery(issue)
+    selected_pr = cc.select_pr_repair(primary)
+    leg = "leg:bound-review"
+    head, review_at = "a" * 40, "2026-10-02T00:00:01Z"
+    return dataclasses.replace(request, workflow=selected_pr.binding, continuations=(
+        cc.PRRepairPurchase(cc.ContinuationCapture(selected_pr.binding, selected_pr.revision, leg),
+            allowance=cc.RepairAllowance.REVIEW, ceiling=3, branch="fix/42-claim", advance_resume=True),
+        cc.IssueReviewPurchase(cc.ContinuationCapture(selected_issue.binding, selected_issue.revision, leg),
+            PullRequestRef(7), head, review_at, 3)),
+        dispatch_id=json.dumps({"repository": "o/r", "role": "fix", "kind": "ADDRESS_REVIEW",
+            "number": 7, "issue": 42, "runtime": "claude", "leg_id": leg,
+            "review_input": encode_workflow((head, review_at))}))
+
+
 def test_a_claim_stays_active_and_keyed_the_same_once_a_run_binds(tmp_path) -> None:
     """A claim is taken at decision time and bound to a run later. Keying the
     observation on the run id changed it mid-hold, which double-journalled one
@@ -2886,6 +2915,7 @@ def test_a_claim_stays_active_and_keyed_the_same_once_a_run_binds(tmp_path) -> N
         owner_id=owner,
         kind="ADDRESS_REVIEW",
     )
+    request = _selected_review_claim_request(store, request)
     assert store.claim_dispatch(
         "o/r", "fix", 42, "ADDRESS_REVIEW", owner, frozenset({"a.py"})
     )
@@ -2915,6 +2945,7 @@ def test_a_dead_owner_with_a_live_bound_run_is_still_an_active_claim(
         owner_id=owner,
         kind="ADDRESS_REVIEW",
     )
+    request = _selected_review_claim_request(store, request)
     assert store.claim_dispatch(
         "o/r", "fix", 42, "ADDRESS_REVIEW", owner, frozenset({"a.py"})
     )

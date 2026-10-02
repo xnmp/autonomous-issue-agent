@@ -119,6 +119,7 @@ class DispatchConfig:
     # for every hand-built DispatchConfig.
     max_infra_deaths: int = 0
     max_ci_retries: int = 3
+    max_review_retries: int = 3
     # ADR 0012: consecutive verdict-less paid steward legs allowed per issue
     # version before the steward stops re-buying and escalates.
     steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
@@ -149,6 +150,7 @@ class DispatchConfig:
             infra_breaker=self.infra_breaker,
             operator_guidance=self.operator_guidance,
             max_ci_retries=self.max_ci_retries,
+            max_review_retries=self.max_review_retries,
         )
 
     def review_workflow_config(self) -> ReviewWorkflowConfig:

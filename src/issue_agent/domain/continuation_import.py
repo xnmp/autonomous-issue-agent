@@ -31,6 +31,8 @@ def digest(value: object) -> str:
 
 
 def _plan_state_identity(state: ImportedState | None) -> object:
+    if isinstance(state, cc.IssueRecoveryState) and not state.review_failures.review_at and state.review_failures.pr is None and state.review_failures.pending is None:
+        return repr(state).replace(f"review_failures={state.review_failures!r}", f"review_failures={state.review_failures.count}", 1)
     if isinstance(state, cc.StewardState) and state.groom_content != cc.GroomContent():
         return (repr(state), repr(state.groom_content))
     if isinstance(state, cc.PRRepairState) and (state.resumes or state.actual_model is not None):
@@ -142,7 +144,17 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                     reason = "empty present continuation field"
             elif name in {"session", "model", "machine-block", "budget-block", "self-clear-ceiling", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
-            elif name in {"resumes", "ci-retries", "review-retries", "rebase-retries", "infra-deaths", "self-clears", "steward-stalls-triage", "steward-stalls-groom"}:
+            elif name == "review-retries":
+                at, separator, number = text.rpartition(" ")
+                try:
+                    if not separator or not re.fullmatch(r"0|[1-9][0-9]{0,18}", number):
+                        raise ValueError("requires qualifying review timestamp and bounded count")
+                    cc.ReviewRetryState(at, int(number))
+                    if not at:
+                        raise ValueError("qualifying review timestamp is absent")
+                except ValueError as exc:
+                    reason = str(exc)
+            elif name in {"resumes", "ci-retries", "rebase-retries", "infra-deaths", "self-clears", "steward-stalls-triage", "steward-stalls-groom"}:
                 if not re.fullmatch(r"0|[1-9][0-9]{0,18}", text) or int(text) > 2**63 - 1:
                     reason = "malformed nonnegative bounded counter"
             elif not text:
@@ -160,8 +172,9 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
         if record.family is WorkflowFamily.ISSUE_RECOVERY:
             if values.get("branch") and issue_from_branch(values["branch"]) != record.key.target.number:
                 raise ValueError("remembered issue branch lacks matching target ownership")
+            review_at, _, review_count = values.get("review-retries", " 0").rpartition(" ")
             return cc.IssueRecoveryState(values.get("resumed-at", ""), count("resumes"), values.get("branch", ""),
-                                         count("ci-retries"), count("review-retries"), count("rebase-retries"),
+                                         count("ci-retries"), cc.ReviewRetryState(review_at, int(review_count)), count("rebase-retries"),
                                          count("infra-deaths"), count("self-clears"))
         if record.family is WorkflowFamily.PR_REPAIR:
             return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
@@ -208,6 +221,24 @@ def ci_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRec
             raise ValueError("eligible CI shadow has unreadable selected debt")
         before = int(source.text.strip()) if isinstance(source, LegacyPresent) else 0
         comparisons.append((target.key, before, target.state.ci_failures))
+    return tuple(comparisons)
+
+
+def review_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[str, int], tuple[str, int]], ...]:
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.IssueRecoveryState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.ISSUE_RECOVERY)
+        if len(found) > 1:
+            raise ValueError("eligible review shadow has ambiguous source ownership")
+        source = dict(found[0].fields).get("review-retries", LegacyAbsent()) if found else LegacyAbsent()
+        if not isinstance(source, (LegacyAbsent, LegacyPresent)):
+            raise ValueError("eligible review shadow has unreadable selected debt")
+        at, _, count = source.text.strip().rpartition(" ") if isinstance(source, LegacyPresent) else ("", "", "0")
+        before = (at, int(count))
+        after = (target.state.review_failures.review_at, target.state.review_failures.count)
+        comparisons.append((target.key, before, after))
     return tuple(comparisons)
 
 

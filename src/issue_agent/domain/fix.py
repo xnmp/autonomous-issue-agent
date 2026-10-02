@@ -186,6 +186,7 @@ class FixState:
     # reset the counter every round, so the breaker could never trip and a downed
     # review daemon meant an infinite full-session-cost loop.
     review_retries: dict[int, tuple[str, int]] = field(default_factory=dict)
+    review_control_errors: Mapping[int, str] = field(default_factory=dict)
     rebase_retries: dict[int, int] = field(default_factory=dict)
     # Missing/unavailable authority never means a fresh allowance. Resolve's
     # gates, failure count and continuation are one SQLite-owned episode.
@@ -1979,6 +1980,8 @@ def decide_fix(
                 # counter is keyed to the review's submitted_at — a stored count
                 # from an OLDER review reads as 0 (superseded = reset), and
                 # nothing else resets it (see FixState.review_retries).
+                if bkey in state.review_control_errors:
+                    continue
                 if infra_ceiling_hit(state, cfg, bkey):
                     actions.extend(_escalate_pr(
                         pr.number, infra_escalation_reason(cfg.max_infra_deaths)))

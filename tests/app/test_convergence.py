@@ -228,11 +228,12 @@ class _SimGateway:
         view = self.get_issue(number) if kind == "issue" else self.get_pr(number)
         return Label(label) in view.labels
 
-    def pr_for_issue(self, issue_number: int) -> int | None:
-        for p in self.world.prs:
-            if p.state == "OPEN" and _issue_for(p) == issue_number:
-                return p.number
-        return None
+    def pr_for_issue(self, issue_number: int, *, require_unique: bool = False) -> int | None:
+        selected = [p.number for p in self.world.prs
+                    if p.state == "OPEN" and _issue_for(p) == issue_number]
+        if not selected or require_unique and len(selected) != 1:
+            return None
+        return selected[0]
 
     def issue_for_pr(self, pr_number: int) -> int | None:
         return _issue_for(self.get_pr(pr_number))

@@ -96,12 +96,30 @@ class RepairModel:
 
 
 @dataclass(frozen=True)
+class ReviewRetryState:
+    review_at: str = ""
+    count: int = 0
+    pr: PullRequestRef | None = None
+    pending: ContinuationAdmission | None = None
+
+    def __post_init__(self) -> None:
+        _timestamp(self.review_at, "qualifying review timestamp")
+        validate_workflow_integer(self.count, "review retry count")
+        if self.pr is not None and not isinstance(self.pr, PullRequestRef):
+            raise ValueError("review retry requires typed PR linkage")
+        if self.pending is not None and (not self.review_at or self.pr is None
+                or not isinstance(self.pending, ContinuationAdmission)
+                or self.pending.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
+            raise ValueError("pending review requires its selected issue admission and episode")
+
+
+@dataclass(frozen=True)
 class IssueRecoveryState:
     consumed_reply_at: str = ""
     resumes: int = 0
     remembered_branch: str = ""
     ci_failures: int = 0
-    review_failures: int = 0
+    review_failures: ReviewRetryState = field(default_factory=ReviewRetryState)
     rebase_failures: int = 0
     infra_failures: int = 0
     self_clears: int = 0
@@ -110,8 +128,10 @@ class IssueRecoveryState:
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed issue reply")
         validate_workflow_text(self.remembered_branch, "remembered issue branch", empty=True)
-        for name in ("resumes", "ci_failures", "review_failures", "rebase_failures", "infra_failures", "self_clears"):
+        for name in ("resumes", "ci_failures", "rebase_failures", "infra_failures", "self_clears"):
             validate_workflow_integer(getattr(self, name), name)
+        if not isinstance(self.review_failures, ReviewRetryState):
+            raise ValueError("review retry allowance requires one typed timestamp/count state")
         if self.pending_ci is not None and (not isinstance(self.pending_ci, ContinuationAdmission)
                 or self.pending_ci.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
             raise ValueError("pending CI requires its exact issue recovery admission")
@@ -323,12 +343,12 @@ class ActiveIssueRecovery:
 
     def __post_init__(self) -> None:
         _active(self.identity, WorkflowFamily.ISSUE_RECOVERY, self.state, IssueRecoveryState, self.watermarks, self.gates)
-        pending = self.state.pending_ci
-        if pending is not None and (pending.attempt.binding.fence.key != self.identity.key
-                or pending.attempt.binding.authority != self.identity.authority
-                or pending.attempt.binding.episode_id != self.identity.episode_id
-                or pending.admission_version > self.watermarks.last_admitted):
-            raise ValueError("pending CI differs from admitted issue component provenance")
+        for pending in (self.state.pending_ci, self.state.review_failures.pending):
+            if pending is not None and (pending.attempt.binding.fence.key != self.identity.key
+                    or pending.attempt.binding.authority != self.identity.authority
+                    or pending.attempt.binding.episode_id != self.identity.episode_id
+                    or pending.admission_version > self.watermarks.last_admitted):
+                raise ValueError("pending repair differs from admitted issue component provenance")
 
 
 @dataclass(frozen=True)
@@ -434,6 +454,9 @@ def validate_component_revision(component: object, revision: WorkflowRevision, f
     if isinstance(component, ActiveIssueRecovery) and component.state.pending_ci is not None:
         if component.state.pending_ci.attempt.binding.fence.generation > revision.fence.generation:
             raise ValueError("pending CI cannot originate in a future target generation")
+    if isinstance(component, ActiveIssueRecovery) and component.state.review_failures.pending is not None:
+        if component.state.review_failures.pending.attempt.binding.fence.generation > revision.fence.generation:
+            raise ValueError("pending review cannot originate in a future target generation")
 
 
 @dataclass(frozen=True)
@@ -662,6 +685,54 @@ class CIRepairResult:
 
 
 @dataclass(frozen=True)
+class IssueReviewPurchase:
+    capture: ContinuationCapture
+    pr: PullRequestRef
+    head: str
+    review_at: str
+    ceiling: int
+
+    def __post_init__(self) -> None:
+        IssueCIPurchase(self.capture, self.pr, self.head, self.ceiling)
+        _timestamp(self.review_at, "selected qualifying review")
+        if not self.review_at:
+            raise ValueError("review repair requires a qualifying review timestamp")
+
+
+@dataclass(frozen=True)
+class ReviewRepairInput:
+    selection: SelectedIssueRecovery
+    pr: PullRequestRef
+    head: str
+    review_at: str
+    ceiling: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selection, SelectedIssueRecovery):
+            raise ValueError("review input requires selected issue recovery")
+        IssueReviewPurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "validation"),
+                            self.pr, self.head, self.review_at, self.ceiling)
+
+
+class ReviewCharge(str, Enum):
+    ATTEMPT = "attempt"
+    NOT_ATTEMPT = "not_attempt"
+    NOT_LAUNCHED = "not_launched"
+
+
+@dataclass(frozen=True)
+class ReviewRepairResult:
+    admission: ContinuationAdmission
+    charge: ReviewCharge
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.admission, ContinuationAdmission)
+                or self.admission.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or not isinstance(self.charge, ReviewCharge)):
+            raise ValueError("review result requires its exact issue admission and classification")
+
+
+@dataclass(frozen=True)
 class CIEpisodeReset:
     binding: WorkflowBinding
     revision: WorkflowRevision
@@ -686,6 +757,7 @@ class PRRepairPurchase:
     ceiling: int = 1
     branch: str = ""
     handoff: RepairHandoff | None = None
+    advance_resume: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, ContinuationCapture) or self.capture.binding.authority.family is not WorkflowFamily.PR_REPAIR:
@@ -698,6 +770,8 @@ class PRRepairPurchase:
         if not isinstance(self.allowance, RepairAllowance):
             raise ValueError("PR repair purchase requires a fixed allowance")
         validate_workflow_integer(self.ceiling, "repair allowance ceiling", minimum=1)
+        if type(self.advance_resume) is not bool:
+            raise ValueError("repair resume purchase requires an exact boolean")
 
 
 @dataclass(frozen=True)
@@ -730,11 +804,16 @@ class PRRepairInput:
     runtime: RuntimeName
     handoff: RepairHandoff | None = None
     ci: CIRepairInput | None = None
+    review: ReviewRepairInput | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, SelectedPRRepair) or not isinstance(self.runtime, RuntimeName):
             raise ValueError("repair input requires selected authority and runtime")
         validate_workflow_text(self.branch, "current remote repair branch")
+        if self.review is not None and (self.ci is not None or not isinstance(self.review, ReviewRepairInput)
+                or self.review.pr != self.selection.binding.fence.key.target
+                or self.review.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
+            raise ValueError("review input differs from selected repair PR/repository or lane")
         if self.ci is not None and (not isinstance(self.ci, CIRepairInput)
                 or self.ci.pr != self.selection.binding.fence.key.target
                 or self.ci.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
@@ -775,6 +854,7 @@ class PRRepairResult:
     state: PRRepairState
     settlement: SettlementRequest
     ci: CIRepairResult | None = None
+    review: ReviewRepairResult | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.admission, ContinuationAdmission)
@@ -788,6 +868,12 @@ class PRRepairResult:
                 or self.ci.admission.attempt.binding.fence.key.repository != self.admission.attempt.binding.fence.key.repository
                 or self.ci.charge is CICharge.NOT_LAUNCHED):
             raise ValueError("paid CI result requires the same launched run and leg")
+        if self.review is not None and (self.ci is not None or not isinstance(self.review, ReviewRepairResult)
+                or self.review.admission.attempt.run_id != self.admission.attempt.run_id
+                or self.review.admission.attempt.leg_id != self.admission.attempt.leg_id
+                or self.review.admission.attempt.binding.fence.key.repository != self.admission.attempt.binding.fence.key.repository
+                or self.review.charge is ReviewCharge.NOT_LAUNCHED):
+            raise ValueError("paid review result requires the same launched run and leg")
         if (self.state.session is not None and self.state.session.source != self.admission
                 or self.state.actual_model is None or self.state.actual_model.source != self.admission):
             raise ValueError("repair output requires its exact admitted provenance")
@@ -1023,7 +1109,31 @@ def groom_admissible(selection: StewardSelection, input_at: str, signature: str,
         return False
 
 
-ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | IssueCIPurchase | PRRepairPurchase | StewardPurchase
+ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | IssueCIPurchase | IssueReviewPurchase | PRRepairPurchase | StewardPurchase
+
+
+def consume_issue_review(selection: SelectedIssueRecovery, purchase: IssueReviewPurchase, admission: ContinuationAdmission) -> ActiveIssueRecovery:
+    if selection.binding != purchase.capture.binding or selection.revision != purchase.capture.revision:
+        raise ValueError("review issue capture is stale")
+    component = selection.component
+    debt = component.state.review_failures
+    if (admission.attempt.binding != selection.binding or admission.admission_version != selection.revision.version + 1
+            or admission.attempt.leg_id != purchase.capture.leg_id):
+        raise ValueError("review admission differs from its selected authority")
+    newer = reply_advances(purchase.review_at, debt.review_at)
+    if (component.gates or debt.count and not debt.review_at
+            or debt.pr is not None and debt.pr != purchase.pr
+            or debt.pending is not None and debt.pending.attempt.binding == selection.binding
+            or debt.review_at and purchase.review_at != debt.review_at and not newer
+            or not newer and debt.count >= purchase.ceiling):
+        raise ValueError("review allowance is held, pending, exhausted, relinked or older")
+    debt = ReviewRetryState(purchase.review_at, 0 if newer else debt.count, purchase.pr, admission)
+    return replace(component, state=replace(component.state, review_failures=debt),
+                   watermarks=component.watermarks.admit(admission.admission_version, selection.revision.fence))
+
+
+def review_return_is_current(selection: SelectedIssueRecovery, admission: ContinuationAdmission) -> bool:
+    return selection.binding == admission.attempt.binding and selection.component.state.review_failures.pending == admission
 
 
 def consume_issue_ci(selection: SelectedIssueRecovery, purchase: IssueCIPurchase, admission: ContinuationAdmission) -> ActiveIssueRecovery:
@@ -1078,6 +1188,8 @@ def consume_pr_repair(selection: SelectedPRRepair, purchase: PRRepairPurchase, v
     state = replace(component.state, consumed_reply_at=purchase.reply_at) if purchase.reply_at else component.state
     if purchase.handoff is not None:
         state = replace(state, resumes=max(state.resumes, purchase.handoff.resumes))
+    if purchase.advance_resume:
+        state = replace(state, resumes=state.resumes + 1)
     return replace(component, state=state, watermarks=component.watermarks.admit(version, selection.revision.fence))
 
 

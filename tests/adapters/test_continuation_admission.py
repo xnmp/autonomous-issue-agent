@@ -542,3 +542,16 @@ def test_primary_hold_refuses_fresh_launch_but_preserves_exact_retry_and_actual_
     completed = read(store, aggregate)
     assert completed.gates == held.gates and completed.issue_recovery.state.rebase_failures == 1
     assert store.snapshot(requested.scope).settled.micros == 1
+
+
+def test_empty_review_value_roundtrips_as_typed_root_but_old_issue_field_keeps_scalar_bytes():
+    import json
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.adapters.workflow_codec import decode_workflow, encode_workflow
+    state = cc.ReviewRetryState()
+    assert decode_workflow(encode_workflow(state), cc.ReviewRetryState) == state
+    # Literal accepted pre-F5 issue field, including debt without an episode.
+    old = '{"format":1,"value":{"type":"IssueRecoveryState","fields":{"consumed_reply_at":"","resumes":0,"remembered_branch":"","ci_failures":0,"review_failures":3,"rebase_failures":0,"infra_failures":0,"self_clears":0}}}'
+    decoded = decode_workflow(old, cc.IssueRecoveryState)
+    assert decoded.review_failures == cc.ReviewRetryState(count=3)
+    assert encode_workflow(decoded) == json.dumps(json.loads(old), sort_keys=True, separators=(",", ":"))

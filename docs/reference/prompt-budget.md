@@ -19,3 +19,6 @@ historical detail moved to `docs/reference/`.
 Re-measured 2026-08-05 after the ADR 0012 provenance/liveness rule and the
 explicit typed-variant rule were added; the diet's guardrail (routing,
 direction, non-negotiables only) still holds.
+
+Re-measured 2026-10-02 after the private test scratch instructions: 6,716
+UTF-8 bytes and 885 whitespace-delimited words.

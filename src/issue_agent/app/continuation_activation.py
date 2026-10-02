@@ -25,7 +25,7 @@ from ..adapters.workflow_rows import load_issue_aggregate, load_review_workflow_
 from ..domain import continuation_components as cc
 from ..domain.continuation_import import (
     ISSUE_FIELDS, PR_FIELDS, STEWARD_FIELDS, MAX_IMPORT_TARGETS,
-    ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, classify_record, digest, ci_shadow, issue_reply_shadow, triage_shadow, groom_shadow,
+    ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, classify_record, digest, ci_shadow, review_shadow, issue_reply_shadow, triage_shadow, groom_shadow,
 )
 from ..domain.refs import issue_from_branch
 from ..domain.resolve_activation import LegacyAbsent
@@ -155,6 +155,13 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
                     selected = found[0] if found else LegacyContinuationRecord(key, family, "steward" if family is WorkflowFamily.STEWARD else "fix", tuple((name, LegacyAbsent()) for name in names))
                     value = classify_record(selected)
                     blockers = list(value) if isinstance(value, tuple) else []
+                    if isinstance(value, cc.IssueRecoveryState) and value.review_failures.review_at:
+                        prs = mapped_issues.get(key.target.number, [])
+                        if len(prs) != 1:
+                            blockers.append(cc.ContinuationImportBlocker("review-linkage:" + selected.source_digest,
+                                "review-retries: requires one verified current linked PR"))
+                        else:
+                            value = replace(value, review_failures=replace(value.review_failures, pr=PullRequestRef(prs[0])))
                     if len(found) > 1 or found and selected.root not in (("steward",) if family is WorkflowFamily.STEWARD else ("fix",)) and not selected.root.startswith("extra:"):
                         blockers.append(cc.ContinuationImportBlocker("roots:" + selected.source_digest, "duplicate or conflicting source owner"))
                     if key in linkage_blocks:
@@ -193,6 +200,8 @@ def inspect(scope: ContinuationActivationScope, *, shadow: bool) -> dict[str, ob
                                         for key, before, after in issue_reply_shadow(plan, records)]
         result["ci_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
                               for key, before, after in ci_shadow(plan, records)]
+        result["review_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
+                                  for key, before, after in review_shadow(plan, records)]
         result["triage_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
                                    for key, before, after in triage_shadow(plan, records)]
         result["groom_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}

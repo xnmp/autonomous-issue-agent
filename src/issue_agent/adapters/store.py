@@ -487,27 +487,8 @@ class Store:
         only form that cannot leave a torn one behind."""
         self._remove(self.issue_path(key, "infra-deaths"))
 
-    def get_review_retry(self, issue: int) -> tuple[str, int]:
-        """(review_at, count). Bash stored "<at> <n>" in issue-N.review-retries."""
-        path = self.issue_path(issue, "review-retries")
-        raw = self._read_control(path)
-        if raw is None:
-            return "", 0
-        at, _, n = raw.rpartition(" ")
-        if at and parse_timestamp(at) is None:
-            raise WorkflowControlError(path, "malformed review episode timestamp")
-        return at, self._counter(n, path)
 
-    def set_review_retry(
-        self, issue: int, at: str, retries: int
-    ) -> None:
-        self._write(
-            self.issue_path(issue, "review-retries"),
-            f"{at} {retries}",
-        )
 
-    def clear_review_retry(self, issue: int) -> None:
-        self._remove(self.issue_path(issue, "review-retries"))
 
     def clear_retries(self, key: int) -> int:
         """Operator unblock: give the lifecycle its per-attempt budget back.

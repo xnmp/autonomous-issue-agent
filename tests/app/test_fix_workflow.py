@@ -4,6 +4,8 @@ These cover the extracted fix-side workflow directly so AgentDispatcher can keep
 shrinking into a router without losing behavior coverage.
 """
 
+from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
+
 import asyncio
 import dataclasses
 from pathlib import Path
@@ -519,20 +521,20 @@ def test_address_review_attempt_rekeys_counter_to_current_review():
     # against an OLDER review restarts at 1 for the new one, and a successful
     # push still counts (no clear-on-success — V2/#64).
     p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
-               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     gw = FakeGateway(prs={100: p})
     store = FakeStore()
-    store.set_review_retry(5, "t1", 3)  # stale: keyed to a superseded review
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
+    workflow = _workflow(gw, store, runner)
+    seed_review_retry(store, "2026-01-01T00:00:01Z", 3)
+    asyncio.run(workflow.address_review(100))
 
-    asyncio.run(_workflow(gw, store, runner).address_review(100))
-
-    assert store.get_review_retry(5) == ("t9", 1)
+    assert review_retry_pair(store) == ("2026-01-01T00:00:09Z", 1)
 
 
 def test_address_review_blocked_does_not_bump_counter():
     p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
-               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     gw = FakeGateway(prs={100: p})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False, status="blocked",
@@ -540,7 +542,7 @@ def test_address_review_blocked_does_not_bump_counter():
 
     asyncio.run(_workflow(gw, store, runner).address_review(100))
 
-    assert store.get_review_retry(5) == ("", 0)
+    assert review_retry_pair(store)[1] == 0
 
 
 # ── infra death must not advance a breaker (FAILURE-MODES #58) ───────────────
@@ -897,7 +899,7 @@ def test_the_resolve_leg_decays_it_too(tmp_path):
 def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
     gw = FakeGateway(prs={100: PRView(
         100, head_ref_name="fix/5-x", closing_issue=5,
-        reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),),
+        reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),),
     )})
     store = Store(state_dir=str(tmp_path))
     ok = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
@@ -913,18 +915,19 @@ def test_the_rebase_and_address_review_legs_decay_it_too(tmp_path):
 
 def test_address_review_infra_death_does_not_burn_a_review_retry():
     p = PRView(100, head_ref_name="fix/5-x", closing_issue=5,
-               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     gw = FakeGateway(prs={100: p})
     store = RetryRecordingStore()
-    store.set_review_retry(5, "t9", 2)
     runner = FakeRunner(
         AgentResult(is_error=True, status="timeout",
                     exit_reason=ExitReason.KILLED_EXTERNALLY, session_id="s")
     )
 
-    asyncio.run(_workflow(gw, store, runner).address_review(100))
+    workflow = _workflow(gw, store, runner)
+    seed_review_retry(store, "2026-01-01T00:00:09Z", 2)
+    asyncio.run(workflow.address_review(100))
 
-    assert store.get_review_retry(5) == ("t9", 2)
+    assert review_retry_pair(store) == ("2026-01-01T00:00:09Z", 2)
 
 
 def test_split_majority_case_author_then_implement_opens_pr():
@@ -1289,7 +1292,7 @@ def test_address_review_infra_death_counts_against_the_infra_ceiling(tmp_path):
     asyncio.run(_workflow(gw, store, runner).address_review(100))
 
     assert store.get_infra_deaths(5) == 1
-    assert store.get_review_retry(5) == ("", 0)  # still not an attempt
+    assert review_retry_pair(store)[1] == 0  # still not an attempt
 
 
 def test_address_review_error_does_not_touch_the_infra_ceiling(tmp_path):
@@ -1303,7 +1306,7 @@ def test_address_review_error_does_not_touch_the_infra_ceiling(tmp_path):
     asyncio.run(_workflow(gw, store, runner).address_review(100))
 
     assert store.get_infra_deaths(5) == 0
-    assert store.get_review_retry(5) == ("2026-01-01T00:00:09Z", 1)
+    assert review_retry_pair(store) == ("2026-01-01T00:00:09Z", 1)
 
 
 def _resume_issue():
@@ -1817,7 +1820,7 @@ def test_a_store_that_cannot_answer_still_dispatches():
     An unreadable counter must cost a mis-tiering, not the pipeline."""
 
     class BrokenStore(FakeStore):
-        def get_review_retry(self, i):
+        def get_ci_history(self, i):
             raise OSError("state dir vanished")
 
     gw = FakeGateway(
@@ -1839,7 +1842,7 @@ def test_a_store_that_cannot_answer_still_dispatches():
 def _pr_with_rounds(n, extra=()):
     """A PR the reviewer has requested changes on `n` times."""
     reviews = tuple(
-        Review("CHANGES_REQUESTED", "rev-bot", f"t{i}", body="fix it")
+        Review("CHANGES_REQUESTED", "rev-bot", f"2026-01-01T00:00:{i:02d}Z", body="fix it")
         for i in range(1, n + 1)
     ) + tuple(extra)
     return PRView(100, head_ref_name="fix/5-x", closing_issue=5, reviews=reviews)
@@ -1887,7 +1890,8 @@ def test_review_rounds_climb_with_the_reviewer_not_with_retries_at_one_review():
 def test_an_approve_resets_the_round_count():
     """Prior dissatisfaction that was SATISFIED is not evidence — the same rule
     the reviewer's own escalation ceiling applies."""
-    pr = _pr_with_rounds(3, extra=(Review("APPROVED", "rev-bot", "t9", body=""),))
+    pr = _pr_with_rounds(3, extra=(Review("APPROVED", "rev-bot", "2026-01-01T00:00:09Z", body=""),
+        Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:10Z", body="one new request")))
     gw = FakeGateway(prs={100: pr}, issues={5: IssueView(5)})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
 
@@ -1988,6 +1992,11 @@ def test_hard_history_on_an_unpinned_repair_preserves_its_stored_model_and_journ
     store = FakeStore()
     store.models[5] = "gpt-5.6-terra"
     _seed_resolve(store, 5, failures=2)
+    # Continuation comes from a verified paid repair return, replacing the
+    # retired issue model file as this fixture's authority.
+    setup = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="previous-repair", model="gpt-5.6-terra"))
+    asyncio.run(_workflow(gw, store, setup, fixer_runtime="codex",
+        fix=FixTaskConfig("o/r", agent_md="AM", model="gpt-5.6-terra")).fix_ci(100))
     journal = RecordingJournal()
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
 
@@ -2899,7 +2908,7 @@ def _review_guidance_control(tmp_path, guidance):
 @pytest.mark.parametrize("handler", ["address_review", "fix_ci", "rebase"])
 def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_side_effects(handler):
     p = PRView(100, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
-               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),),
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),),
                checks=(Check("ci", "fail"),))
     gw = FakeGateway(prs={100: p})
     store = RetryRecordingStore()
@@ -2919,7 +2928,7 @@ def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_s
     workflow = _workflow(gw, store, runner, wt=worktrees, operator_guidance=unreadable)
     with pytest.raises(WorkflowAuthorityError):
         asyncio.run(getattr(workflow, handler)(100))
-    assert runner.tasks == [] and store.get_review_retry(5) == ("", 0)
+    assert runner.tasks == [] and review_retry_pair(store) == ("", 0)
     assert store.resumes.get(5, 0) == 0 and issue_recovery_state(store).ci_failures == 0 and store.rebase_retries == {}
     assert ensured == []  # not even a worktree is prepared for a deferred repair
 
@@ -2932,7 +2941,7 @@ def test_the_repair_reads_the_committed_review_episode_guidance(tmp_path):
     assert reader(pr) == "Scope: the parser only"
     assert reader(pr + 1) == ""  # active but never observed: no legacy fallback
     p = PRView(pr, head_ref_name="fix/5-x", closing_issue=5, head_ref_oid="h",
-               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "t9", body="fix it"),))
+               reviews=(Review("CHANGES_REQUESTED", "rev-bot", "2026-01-01T00:00:09Z", body="fix it"),))
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s"))
     asyncio.run(_workflow(FakeGateway(prs={pr: p}), FakeStore(), runner, operator_guidance=reader).address_review(pr))
     assert "Scope: the parser only" in runner.tasks[0].intent.prompt

@@ -29,6 +29,22 @@ def test_direct_issue_debt_and_consumed_reply_are_preserved():
     assert (value.consumed_reply_at, value.resumes, value.ci_failures, value.infra_failures) == ("2026-10-01T00:00:00Z", 2, 3, 4)
 
 
+def test_review_timestamp_and_count_are_imported_together():
+    value = classify_record(record(**{"review-retries": "2026-10-01T00:00:00Z 3"}))
+    assert isinstance(value, cc.IssueRecoveryState)
+    assert value.review_failures == cc.ReviewRetryState("2026-10-01T00:00:00Z", 3)
+
+
+@pytest.mark.parametrize("value", ["", "3", "garbage 3", "2026-10-01 3", "2026-10-01T00:00:00Z -1",
+                                  "2026-10-01T00:00:00Z 1.5", "2026-10-01T00:00:00Z " + str(2**63)])
+def test_unknown_or_malformed_review_episode_stays_source_specifically_blocked(value):
+    result = classify_record(record(**{"review-retries": value}))
+    assert isinstance(result, tuple) and result
+    assert all("review-retries" in blocker.reason for blocker in result)
+
+
+
+
 @pytest.mark.parametrize("value", ["", "-1", "1.5", "1" * 1000, str(2**63)])
 def test_malformed_legacy_ci_debt_is_source_specifically_blocked(value):
     result = classify_record(record(**{"ci-retries": value}))

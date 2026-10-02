@@ -1050,14 +1050,25 @@ def test_the_composed_fix_role_defers_a_repair_on_unreadable_review_guidance_the
     progress_until(client, lambda c: len(c.provider.tasks) == 3)
     assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"  # the fixer now owes an address-review
     from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    from tests.adapters.test_continuation_admission import active, install_secondary
     from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
     control = SQLiteControlStore(client.review.control.path)
     control.initialize()
     install_workflow(control, with_issue_recovery(resolve_snapshot(1)))
+    with control.transaction() as db:
+        primary = load_review_workflow_row(db, KEY)
+    assert primary is not None
+    component = active(KEY, WorkflowFamily.PR_REPAIR)
+    install_secondary(control, replace(primary, pr_repair=component), component)
     with sqlite3.connect(client.review.control.path) as db:
         committed = db.execute("SELECT episode_json FROM workflows WHERE target_number=?", (PR,)).fetchone()[0]
+        before_money = db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0]
+        before_issue = db.execute("SELECT * FROM workflows WHERE target_kind='issue' AND target_number=1").fetchone()
         db.execute("UPDATE workflows SET episode_json='corrupt' WHERE target_number=?", (PR,))
     cfg = deployment.config()
+    client.remote.link_pr(1, PR)
     provider = ScriptedProvider([AgentResult(is_error=True, cost_usd=0.1, session_id="fix-1")])
     log: list[str] = []
     fix = roles.compose_fix_daemon(cfg, client.remote, Store(cfg.state_dir), Worktrees(str(deployment.target)),
@@ -1074,9 +1085,11 @@ def test_the_composed_fix_role_defers_a_repair_on_unreadable_review_guidance_the
     assert not (deployment.target / ".claude" / "worktrees" / "issue-1").exists()
     assert Store(cfg.state_dir).get_infra_deaths(1) == 0
     with sqlite3.connect(client.review.control.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == before_money
+        assert db.execute("SELECT * FROM workflows WHERE target_kind='issue' AND target_number=1").fetchone() == before_issue
         db.execute("UPDATE workflows SET episode_json=? WHERE target_number=?", (committed, PR))
     fix_tick()
-    assert len(provider.tasks) == 1 and "Only judge the parser change." in provider.tasks[0].intent.prompt
+    assert len(provider.tasks) == 1 and "Only judge the parser change." in provider.tasks[0].intent.prompt, log
 
 
 # -- increment 6 re-review: escalation holds are fenced by hold facts, re-planned, signalled once ----

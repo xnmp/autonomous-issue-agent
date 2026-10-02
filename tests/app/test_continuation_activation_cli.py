@@ -64,6 +64,49 @@ def test_ci_shadow_and_copied_activation_preserve_debt_and_unknown_hold(stopped,
     assert {path.name: path.read_bytes() for path in state.iterdir()} == original_files
 
 
+@pytest.mark.parametrize("numbers", [(9,), (9, 10), ()])
+def test_review_shadow_retains_episode_and_requires_unique_current_linkage(stopped, capsys, tmp_path, monkeypatch, numbers):
+    from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState
+    from issue_agent.domain.world import PRView
+    state, control, _ = stopped
+    (state / "issue-7.review-retries").write_text("2026-10-01T00:00:00Z 2")
+    for number in numbers:
+        primary = held(key=WorkflowKey("o/r", PullRequestRef(number)))
+        from issue_agent.domain.workflow import OpenGate
+        gate = primary.gates[0]
+        assert isinstance(gate, OpenGate)
+        primary = replace(primary, gates=(replace(gate, gate_id=f"gate:review:{number}"),))
+        install_workflow(control, primary)
+    class LinkedRemote:
+        def _gh_json(self, args):
+            return [[{"number": number, "state": "open"} for number in numbers]]
+    original = continuation_activation.activation_scope
+    monkeypatch.setattr(continuation_activation, "activation_scope", lambda *args, **kwargs: replace(original(*args, **kwargs), gateway=LinkedRemote()))
+    def read(gateway, key, now, **kwargs):
+        view = PRView(key.target.number, f"fix/7-pr-{key.target.number}", "a"*40, closing_issue=7)
+        return ObservedPullRequest(key, "a"*40, PullRequestState.OPEN, frozenset(), CompleteReviews(()), now), view
+    monkeypatch.setattr(continuation_activation, "read_pull_request", read)
+    before = dump(control)
+    source = (state / "issue-7.review-retries").read_bytes()
+    code, report, error = command(capsys, "fix", "shadow")
+    assert code == 0, error
+    target = next(t for t in report["targets"] if t["family"] == "issue_recovery")
+    assert target["eligible"] == (len(numbers) == 1)
+    if len(numbers) == 1:
+        assert report["review_shadow"] == [{"issue": 7, "legacy": ["2026-10-01T00:00:00Z", 2], "imported": ["2026-10-01T00:00:00Z", 2], "agrees": True}]
+        copied = tmp_path / "review-copy"
+        code, result, error = command(capsys, "fix", "rehearse", "--copy-to", str(copied))
+        assert code == 0 and all(result["checks"].values()), error
+        with closing(sqlite3.connect(copied / "issue-agent-control" / Path(control.path).name)) as db:
+            db.row_factory = sqlite3.Row
+            imported = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(7)))
+        assert imported.issue_recovery.state.review_failures == cc.ReviewRetryState("2026-10-01T00:00:00Z", 2, PullRequestRef(9))
+    else:
+        assert target["blockers"] and report["review_shadow"] == []
+    assert dump(control) == before
+    assert (state / "issue-7.review-retries").read_bytes() == source
+
+
 def test_pre_f4_literal_ci_plan_keeps_sql_retry_after_source_cleanup(stopped, capsys, monkeypatch):
     from issue_agent.adapters.continuation_activation import read_import_plan
     state, control, _ = stopped

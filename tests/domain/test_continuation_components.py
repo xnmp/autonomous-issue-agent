@@ -38,6 +38,32 @@ def admission(selection, version, run="run:secondary"):
     return ContinuationAdmission(WorkflowAttemptIdentity(selection.binding, RunId(run), "leg:secondary"), version)
 
 
+@pytest.mark.parametrize("mode", ["issue", "episode", "epoch", "future_version", "future_generation"])
+def test_pending_review_requires_exact_possible_component_provenance(mode):
+    from issue_agent.domain.continuation_components import ReviewRetryState
+    key = WorkflowKey("o/r", IssueRef(5))
+    component = ActiveIssueRecovery(identity(key, WorkflowFamily.ISSUE_RECOVERY), IssueRecoveryState())
+    fence = WorkflowFence(key, 0)
+    binding = component.identity.bind(fence)
+    version = 1
+    if mode == "issue":
+        binding = replace(binding, fence=WorkflowFence(WorkflowKey("o/r", IssueRef(6)), 0))
+    elif mode == "episode":
+        binding = replace(binding, episode_id="other-episode")
+    elif mode == "epoch":
+        binding = replace(binding, authority=replace(binding.authority, epoch=3))
+    elif mode == "future_version":
+        version = 2
+    else:
+        binding = replace(binding, fence=WorkflowFence(key, 1))
+    pending = ContinuationAdmission(WorkflowAttemptIdentity(binding, RunId("pending-review"), "leg"), version)
+    debt = ReviewRetryState("2026-10-02T00:00:01Z", 0, PullRequestRef(100), pending)
+    with pytest.raises(ValueError):
+        component = replace(component, state=replace(component.state, review_failures=debt),
+            watermarks=ContinuationWatermarks(1, 0, fence))
+        SelectedIssueRecovery(WorkflowRevision(fence, 1), component)
+
+
 def test_resolve_generation_advance_preserves_both_secondary_states_and_fences_old_returns():
     state = exhausted()
     key = state.revision.fence.key

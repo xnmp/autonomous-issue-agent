@@ -42,10 +42,6 @@ def test_corrupt_consumed_reply_cannot_become_a_new_reply(tmp_path, raw):
         Store(str(tmp_path)).get_resumed_at(7)
 
 
-def test_corrupt_review_episode_cannot_reset_its_allowance(tmp_path):
-    (tmp_path / "issue-7.review-retries").write_text("garbage 3")
-    with pytest.raises(ValueError, match="timestamp"):
-        Store(str(tmp_path)).get_review_retry(7)
 
 
 def test_oversized_control_record_is_rejected(tmp_path):

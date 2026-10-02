@@ -4,6 +4,8 @@ Drives each handler and asserts the resulting gateway writes + persisted state,
 proving the dispatcher routes inputs→task→run→follow-up correctly. The DECISIONS
 are tested in tests/domain; here we verify the wiring."""
 
+from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
+
 import asyncio
 import hashlib
 from dataclasses import replace
@@ -121,11 +123,7 @@ class FakeStore:
     def get_pr_resumed_at(self, pr):
         return self.pr_resumed_at.get(pr, "")
 
-    def get_review_retry(self, i):
-        return getattr(self, "review_retries", {}).get(i, ("", 0))
 
-    def set_review_retry(self, i, at, n):
-        self.__dict__.setdefault("review_retries", {})[i] = (at, n)
 
     def set_triage_at(self, i, at):
         self.triage_at[i] = at
@@ -1026,9 +1024,9 @@ def test_address_review_mid_dispatch_failure_still_applies_the_rest_of_the_tail(
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, 100)))
 
-    assert store.get_session(5) == "ar-live"
+    assert pr_repair_state(store).session.handle == "ar-live"
     assert ("relabel", "pr", 100, None, "ai-blocked") in gw.calls
-    assert store.get_review_retry(5) == ("", 0)
+    assert review_retry_pair(store)[1] == 0
     assert store.get_infra_deaths(5) == 0
 
 
@@ -1045,8 +1043,8 @@ def test_address_review_success_counts_the_retry_and_touches_no_label(tmp_path):
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, 100)))
 
-    assert store.get_session(5) == "ar-live"
-    assert store.get_review_retry(5) == ("2026-01-01T00:00:01Z", 1)
+    assert pr_repair_state(store).session.handle == "ar-live"
+    assert review_retry_pair(store) == ("2026-01-01T00:00:01Z", 1)
     assert not any(c[0] == "relabel" for c in gw.calls)  # no gh write at all, not a failed one
     assert store.get_infra_deaths(5) == 0
 

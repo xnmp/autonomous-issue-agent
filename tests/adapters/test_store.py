@@ -152,13 +152,11 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
         s.issue_path(5, "resumes"),
         s.issue_path(5, "ci-retries"),
         s.issue_path(5, "rebase-retries"),
-        s.issue_path(5, "review-retries"),
     ):
         with open(path, "w") as f:
             f.write("not-an-int")
 
     for read in (lambda: s.get_rebase_retries(5),
-                 lambda: s.get_review_retry(5),
                  lambda: s.bump_resumes(5)):
         with pytest.raises(ValueError, match="control unavailable"):
             read()
@@ -240,13 +238,6 @@ def test_tmp_name_is_pid_suffixed(monkeypatch):
     assert s.get_rebase_retries(5) == 4
 
 
-def test_review_retry_pair():
-    s, _ = _store()
-    assert s.get_review_retry(5) == ("", 0)
-    s.set_review_retry(5, "2026-01-01T00:00:00Z", 2)
-    assert s.get_review_retry(5) == ("2026-01-01T00:00:00Z", 2)
-    s.clear_review_retry(5)
-    assert s.get_review_retry(5) == ("", 0)
 
 
 def test_clear_retries_hands_back_only_the_per_attempt_budgets():
@@ -254,14 +245,14 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     deliberately not the two that bound unwinnable work."""
     s, _ = _store()
     _seed_legacy_ci_counter(s, 5, 3)
-    s.set_review_retry(5, "2026-01-01T00:00:00Z", 2)
+    Path(s.issue_path(5, "review-retries")).write_text("2026-01-01T00:00:00Z 2")
     s.set_rebase_retries(5, 1)
     s.set_infra_deaths(5, 5)
 
     assert s.clear_retries(5) == 3  # reports what it actually retired
 
     assert _legacy_ci_counter(s, 5) == 0
-    assert s.get_review_retry(5) == ("", 0)
+    assert not Path(s.issue_path(5, "review-retries")).exists()
     assert s.get_rebase_retries(5) == 0
     assert s.get_infra_deaths(5) == 5
 
@@ -437,7 +428,7 @@ def test_every_issue_accessor_suffix_is_covered_by_exactly_one_cleaner():
     # instead of silently leaking a STATE_DIR file forever (introspects the
     # module: accessors' suffix strings vs _ISSUE_SUFFIXES).
     # Retired triage/CI counters still need cleanup in existing state roots.
-    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage", "ci-retries"} == set(store_module._ISSUE_SUFFIXES)
+    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage", "ci-retries", "review-retries"} == set(store_module._ISSUE_SUFFIXES)
 
 
 def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
@@ -547,7 +538,7 @@ def _triage_at_has_a_cleaner() -> bool:
 
 def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
-    used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries")}
+    used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries"), ("issue_path", "review-retries")}
     used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
 

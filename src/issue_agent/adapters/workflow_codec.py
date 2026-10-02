@@ -45,6 +45,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
     cc.IssueCIPurchase, cc.CIRepairResult, cc.CIEpisodeReset,
     IssueCompletionGuard, Money, TokenUsage, SettlementRequest, cc.RepairModel, cc.PRRepairResult, cc.PRRepairNotLaunched, cc.RepairHandoff,
     ContinuationImportPlan, ContinuationImportTarget,
@@ -144,7 +145,7 @@ _VALUES = (
 _ENUMS = (
     UsageSource, PricingBasis,
     LifecycleOperation,
-    cc.RepairAllowance, cc.CICharge, cc.StewardLane, cc.StewardFailureKind,
+    cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.StewardLane, cc.StewardFailureKind,
     migration.ReviewImportBlockerKind,
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
@@ -193,8 +194,8 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
     "PRRepairState": {"resumes": 0, "actual_model": None},
-    "PRRepairPurchase": {"branch": "", "handoff": None},
-    "PRRepairResult": {"ci": None},
+    "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False},
+    "PRRepairResult": {"ci": None, "review": None},
     "IssueRecoveryState": {"pending_ci": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
@@ -234,15 +235,21 @@ def _encode(value: object, depth: int = 0) -> object:
                      else _CURRENT_EXECUTION_CHECKPOINT_TAG if type(value) is rx.ReviewExecutionCheckpoint
                      else type(value).__name__),
             "fields": {
-                field.name: _encode(getattr(value, field.name), depth + 1)
+                # Only this historical field used a scalar wire format.
+                field.name: (value.review_failures.count if type(value) is cc.IssueRecoveryState
+                    and field.name == "review_failures" and not value.review_failures.review_at
+                    and value.review_failures.pr is None and value.review_failures.pending is None
+                    else _encode(getattr(value, field.name), depth + 1))
                 for field in _VALUE_FIELDS[type(value)]
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None))
                     and not (type(value) is cc.IssueRecoveryState and field.name == "pending_ci" and value.pending_ci is None)
-                    and not (type(value) is cc.PRRepairResult and field.name == "ci" and value.ci is None)
+                    and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
+                        or field.name == "review" and value.review is None))
                     and not (type(value) is cc.PRRepairPurchase and (field.name == "branch" and not value.branch
-                        or field.name == "handoff" and value.handoff is None))
+                        or field.name == "handoff" and value.handoff is None
+                        or field.name == "advance_resume" and not value.advance_resume))
                     and not (type(value) is cc.StewardLaneState and (
                         field.name == "delivery_source" and value.delivery_source is None
                         or field.name == "attempted_at" and not value.attempted_at))
@@ -352,7 +359,10 @@ def _decode(value: object, depth: int = 0) -> object:
         payload = {**legacy, **payload}
     if set(payload) != field_names:
         raise WorkflowEncodingError(f"wrong fields for workflow variant: {tag}")
-    return constructor(**{key: _decode(item, depth + 1) for key, item in payload.items()})
+    decoded = {key: _decode(item, depth + 1) for key, item in payload.items()}
+    if tag == "IssueRecoveryState" and type(decoded["review_failures"]) is int:
+        decoded["review_failures"] = cc.ReviewRetryState(count=decoded["review_failures"])
+    return constructor(**decoded)
 
 
 def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:

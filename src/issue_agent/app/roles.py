@@ -1856,7 +1856,8 @@ def _fix_state(
     # Full (review_at, count) tuple: the domain compares the stored timestamp
     # against the CURRENT review's submitted_at so a superseding review reads
     # as count 0 (see FixState.review_retries).
-    review_retries = {k: read(k, store.get_review_retry, ("", 0)) for k in keys}
+    review_retries = {}
+    review_errors = {}
     rebase_retries = {k: read(k, store.get_rebase_retries, 0) for k in keys}
     resolve_workflows: dict[int, WorkflowRead] = {}
     if workflow_control is not None:
@@ -1899,6 +1900,13 @@ def _fix_state(
             if not isinstance(selected, cc.SelectedIssueRecovery):
                 raise ValueError("CI issue recovery authority is inactive or migration blocked")
             ci_retries[number] = selected.component.state.ci_failures
+            review_debt = selected.component.state.review_failures
+            if review_debt.count and not review_debt.review_at:
+                review_errors[number] = "review retry debt has no verified qualifying timestamp"
+            elif review_debt.pr is not None and review_debt.pr != PullRequestRef(pr.number):
+                review_errors[number] = "review retry debt belongs to another linked PR"
+            else:
+                review_retries[number] = (review_debt.review_at, review_debt.count)
             if selected.component.state.ci_failures:
                 repair = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number)))
                 if isinstance(repair, cc.SelectedPRRepair) and pr.head_ref_oid:
@@ -1978,6 +1986,7 @@ def _fix_state(
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
         automerge_enabled=automerge,
         ci_retries=ci_retries, ci_resets=ci_resets, review_retries=review_retries,
+        review_control_errors=review_errors,
         rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
@@ -2648,6 +2657,7 @@ def compose_fix_daemon(
         max_infra_deaths=fix_runtime.max_infra_deaths,
         max_ci_retries=fix_runtime.max_ci_retries,
         infra_breaker=infra_breaker,
+        max_review_retries=fix_runtime.max_review_retries,
         **_spend_cfg(cfg, "fix"),
     )
     runtime_binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](
@@ -2858,6 +2868,8 @@ def compose_fix_daemon(
         )
         for target, reason in state.control_errors.items():
             log(f"workflow {target} held: {reason}")
+        for target, reason in state.review_control_errors.items():
+            log(f"address-review {target} held: {reason}")
         migration_required = sorted(
             target for target, workflow in state.resolve_workflows.items()
             if isinstance(workflow, WorkflowMigrationRequired)

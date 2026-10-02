@@ -54,7 +54,7 @@ class AccountedFixtureWorkflow(FixWorkflow):
         inner = original.inner if isinstance(original, JournalingRuntime) else original
         maximum = self.cfg.fix.max_budget_usd
         limits = {("fix", stage): Money.from_major("USD", maximum) for stage in (
-            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "FIX_CI",
+            "RESOLVE", "RESUME", "PR_RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "FIX_CI", "ADDRESS_REVIEW",
         )}
         limits[("fix", "ROUTE")] = Money.from_major("USD", self.cfg.fix.router_budget_usd)
         accounted = AccountingRuntime(
@@ -135,6 +135,11 @@ class AccountedFixtureWorkflow(FixWorkflow):
         with self._accounted(issue, "FIX_CI", None):
             await super().fix_ci(pr, issue_hint=issue_hint)
 
+    async def address_review(self, pr, *, issue_hint=None):
+        issue = issue_hint or self.gateway.issue_for_pr(pr)
+        with self._accounted(issue, "ADDRESS_REVIEW", None):
+            await super().address_review(pr, issue_hint=issue_hint)
+
     async def resolve(self, issue, *, binding=None):
         binding = binding or resolve_state(self.store, issue).binding
         with self._accounted(issue, "RESOLVE", binding):
@@ -176,6 +181,21 @@ def pr_repair_state(store, pr=100):
 def issue_recovery_state(store, issue=5):
     selected = store._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue)))
     return selected.component.state
+
+
+def review_retry_pair(store, issue=5):
+    debt = issue_recovery_state(store, issue).review_failures
+    return debt.review_at, debt.count
+
+
+def seed_review_retry(store, at, count, issue=5):
+    from issue_agent.domain.continuation_components import ReviewRetryState
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    with store._workflow_db.transaction() as db:
+        key = WorkflowKey("o/r", IssueRef(issue))
+        current = load_issue_aggregate(db, key)
+        state = dataclasses.replace(current.issue_recovery.state, review_failures=ReviewRetryState(at, count))
+        persist_workflow_snapshot(db, dataclasses.replace(current, issue_recovery=dataclasses.replace(current.issue_recovery, state=state)))
 
 
 def attach_workflow_authority(

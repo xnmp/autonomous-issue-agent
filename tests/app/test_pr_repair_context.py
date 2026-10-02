@@ -12,7 +12,7 @@ from issue_agent.app.planners.tasks import FixTaskConfig, build_rebase_task, wit
 from issue_agent.domain.trust import as_untrusted
 from issue_agent.domain.actions import AgentKind, RunAgent
 from issue_agent.domain.outcome import AgentResult
-from issue_agent.domain.world import Check, Comment, IssueView, PRView
+from issue_agent.domain.world import Check, Comment, IssueView, PRView, Review
 from tests.app.test_dispatch import FakeRunner, _ci_dispatcher
 from tests.fakes.in_memory_github import InMemoryGitHub
 from tests.fakes.review_workflow import held
@@ -44,6 +44,7 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
     pr = PRView(
         100, head_ref_name="fix/5-x", head_ref_oid="a" * 40, closing_issue=5,
         checks=(Check("native smoke", bucket="fail", run_id=33928243914),),
+        reviews=(Review("CHANGES_REQUESTED", "reviewer", "2026-09-14T00:00:01Z"),),
         comments=(Comment("owner", "Investigate the renderer; do not request another rerun.",
                           "2026-09-14T00:00:00Z"),),
     )
@@ -55,7 +56,7 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="continued"))
 
     dispatcher = _ci_dispatcher(gateway, store, runner, operator_guidance=guidance)
-    if kind is AgentKind.FIX_CI:
+    if kind in {AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW}:
         runner.result = replace(runner.result, session_id="old-blocked-session")
         asyncio.run(dispatcher.fix_workflow.fix_ci(100))
         runner.tasks.clear()

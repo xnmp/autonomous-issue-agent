@@ -28,6 +28,8 @@ exact result.
 
 from __future__ import annotations
 
+from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
+
 import asyncio
 import json
 import os
@@ -687,7 +689,7 @@ def test_composed_fix_daemon_resets_only_the_selected_settled_green_ci(tmp_path,
     control = dispatcher.fix_workflow.workflow_control
     sql = control._control
     base = with_issue_recovery(resolve_snapshot(5))
-    state = replace(base.issue_recovery.state, ci_failures=2, review_failures=3, rebase_failures=4, resumes=5)
+    state = replace(base.issue_recovery.state, ci_failures=2, review_failures=cc.ReviewRetryState(count=3), rebase_failures=4, resumes=5)
     issue = replace(base, issue_recovery=replace(base.issue_recovery, state=state))
     install_workflow(sql, issue)
     key = WorkflowKey("o/r", PullRequestRef(100))
@@ -810,12 +812,12 @@ def test_review_retry_round_trip_trips_the_breaker(tmp_path):
         return WorldState(prs=(_review_pr(issue),))
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, pr)))
-    assert store.get_review_retry(issue) == ("2026-01-01T00:00:01Z", 1)
+    assert review_retry_pair(store, issue) == ("2026-01-01T00:00:01Z", 1)
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert _has_run(actions, AgentKind.ADDRESS_REVIEW)
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.ADDRESS_REVIEW, pr)))
-    assert store.get_review_retry(issue) == ("2026-01-01T00:00:01Z", 2)
+    assert review_retry_pair(store, issue) == ("2026-01-01T00:00:01Z", 2)
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert not _has_run(actions, AgentKind.ADDRESS_REVIEW)
     assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions

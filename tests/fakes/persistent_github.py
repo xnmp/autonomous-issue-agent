@@ -237,7 +237,8 @@ class PersistentGitHub:
         issue = self.get_issue(number)
         return issue.state.lower() == "closed", issue.state_reason
 
-    def pr_for_issue(self, number: int) -> int | None:
+    def pr_for_issue(self, number: int, *, require_unique: bool = False) -> int | None:
+        # The link's issue primary key permits only one selected PR.
         # A failed linkage read is unavailable, never an observed absence.
         self.fault("linkage")
         with self._connect() as db:

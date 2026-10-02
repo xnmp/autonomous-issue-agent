@@ -38,6 +38,7 @@ from ..domain.outcome import (
     MAX_BUDGET_STATUS,
     budget_exhausted,
     infra_class_failure,
+    address_review_actions,
 )
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
@@ -386,22 +387,31 @@ class AccountingRuntime(AgentRuntime):
                               else cc.IssueRecoveryPurchase(capture, selected.reply_at, selected.branch, 2**63 - 1)),)
         if task.pr_repair_input is not None:
             selected = task.pr_repair_input
-            if (self.role != "fix" or kind != "FIX_CI" or workflow != selected.selection.binding
+            if (self.role != "fix" or kind not in {"FIX_CI", "ADDRESS_REVIEW"} or workflow != selected.selection.binding
                     or number != selected.selection.binding.fence.key.target.number or issue is None
-                    or selected.runtime.value != self.runtime_name or continuations):
+                    or selected.runtime.value != self.runtime_name or continuations
+                    or kind == "ADDRESS_REVIEW" and selected.review is None
+                    or kind != "ADDRESS_REVIEW" and selected.review is not None
+                    or kind != "FIX_CI" and selected.ci is not None):
                 return _return_refused("selected repair input requires its exact PR, runtime and family context")
             session = selected.session
             if (task.resume or "") != (session.handle if session is not None else ""):
                 return _return_refused("repair launch handle differs from selected continuity")
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
-            continuations = (cc.PRRepairPurchase(capture, allowance=cc.RepairAllowance.CI, ceiling=2**63-1,
-                                                 branch=selected.branch, handoff=selected.handoff),)
+            continuations = (cc.PRRepairPurchase(capture, allowance=(cc.RepairAllowance.REVIEW if selected.review is not None else cc.RepairAllowance.CI), ceiling=2**63-1,
+                                                 branch=selected.branch, handoff=selected.handoff, advance_resume=selected.review is not None),)
             if selected.ci is not None:
                 ci = selected.ci
                 if issue != ci.selection.binding.fence.key.target.number:
                     return _return_refused("CI allowance belongs to another linked issue")
                 capture = cc.ContinuationCapture(ci.selection.binding, ci.selection.revision, _leg_id or str(run_id))
                 continuations += (cc.IssueCIPurchase(capture, ci.pr, ci.head, ci.ceiling),)
+            if selected.review is not None:
+                review = selected.review
+                if issue != review.selection.binding.fence.key.target.number:
+                    return _return_refused("review allowance belongs to another linked issue")
+                capture = cc.ContinuationCapture(review.selection.binding, review.selection.revision, _leg_id or str(run_id))
+                continuations += (cc.IssueReviewPurchase(capture, review.pr, review.head, review.review_at, review.ceiling),)
         publication = _fix_publication_context(self.role, task.cwd)
         if (
             self.role == "fix"
@@ -438,6 +448,8 @@ class AccountingRuntime(AgentRuntime):
                 "number": number,
                 "issue": issue,
                 **({"ci_head": task.pr_repair_input.ci.head} if task.pr_repair_input is not None and task.pr_repair_input.ci is not None else {}),
+                **({"review_input": encode_workflow((task.pr_repair_input.review.head, task.pr_repair_input.review.review_at))}
+                   if task.pr_repair_input is not None and task.pr_repair_input.review is not None else {}),
                 "breaker_key": retry_key,
                 "claim_target": target,
                 "cwd": (
@@ -869,7 +881,10 @@ class AccountingRuntime(AgentRuntime):
                 cc.CICharge.BUDGET if budget_exhausted(result.exit_reason) else
                 cc.CICharge.INFRA if infra_class_failure(result) else cc.CICharge.ATTEMPT)
                 if repair_input.ci is not None else None)
-            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request, ci), writer)
+            review = (cc.ReviewRepairResult(self.store.review_repair_admission(attempt),
+                cc.ReviewCharge.ATTEMPT if address_review_actions(repair_input.review.pr.number, result).bump_retry else cc.ReviewCharge.NOT_ATTEMPT)
+                if repair_input.review is not None else None)
+            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request, ci, review), writer)
         elif returned_review is not None:
             settlement = self.store.settle_review_return(request, returned_review)
         elif returned is None:
