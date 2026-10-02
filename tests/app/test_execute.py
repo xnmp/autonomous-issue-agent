@@ -540,7 +540,7 @@ def test_reset_ci_retries_action_invokes_injected_callable():
     reset = []
     ex = Executor(gw, reset_ci_retries=reset.append)
     ex.execute(ResetCiRetries(9))
-    assert reset == [9]
+    assert reset == [ResetCiRetries(9)]
 
 
 def test_reset_ci_retries_is_a_no_op_when_unwired():

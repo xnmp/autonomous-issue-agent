@@ -348,7 +348,7 @@ class Executor:
         mark_branch_update: Callable[[int, str], None] | None = None,
         mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
-        reset_ci_retries: Callable[[int], None] | None = None,
+        reset_ci_retries: Callable[[ResetCiRetries], None] | None = None,
         retire_machine_block: Callable[[int], int] | None = None,
         retire_budget_block: Callable[[int], int] | None = None,
         mark_self_clear_ceiling: Callable[[int], None] | None = None,
@@ -405,7 +405,7 @@ class Executor:
         )
         # Closes a red-CI episode (ResetCiRetries): green settles → the FIX_CI
         # breaker starts the next episode from zero. Only the fix daemon wires
-        # it (Store.set_ci_retries(issue, 0)); default no-op keeps other
+        # it with the exact selected green observation; default no-op keeps other
         # roles' Executors quiet — an unwired reset costs nothing but a stale
         # count, which is exactly the pre-fix behaviour.
         self._reset_ci_retries = reset_ci_retries
@@ -761,7 +761,7 @@ class Executor:
             self._clear_issue_state(action.pr, action.issue, action.merged)
         elif isinstance(action, ResetCiRetries):
             if self._reset_ci_retries is not None:
-                self._reset_ci_retries(action.issue)
+                self._reset_ci_retries(action)
         elif isinstance(action, FinalizeMachineBlockRetirement):
             kind = _KIND[action.target]
             if self.gateway.has_label(kind, action.number, Label.AI_BLOCKED.value):

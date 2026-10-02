@@ -45,6 +45,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    cc.IssueCIPurchase, cc.CIRepairResult, cc.CIEpisodeReset,
     IssueCompletionGuard, Money, TokenUsage, SettlementRequest, cc.RepairModel, cc.PRRepairResult, cc.PRRepairNotLaunched, cc.RepairHandoff,
     ContinuationImportPlan, ContinuationImportTarget,
     ContinuationAdmission, identity.ContinuationComponentIdentity,
@@ -143,7 +144,7 @@ _VALUES = (
 _ENUMS = (
     UsageSource, PricingBasis,
     LifecycleOperation,
-    cc.RepairAllowance, cc.StewardLane, cc.StewardFailureKind,
+    cc.RepairAllowance, cc.CICharge, cc.StewardLane, cc.StewardFailureKind,
     migration.ReviewImportBlockerKind,
     ExitReason, Adjudication, Effort,
     Label, identity.WorkflowFamily, w.WorkflowMutation, w.StopReason, w.WorkflowRejection,
@@ -193,6 +194,8 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "ActiveReconciliation": {"reexecutions": 0},
     "PRRepairState": {"resumes": 0, "actual_model": None},
     "PRRepairPurchase": {"branch": "", "handoff": None},
+    "PRRepairResult": {"ci": None},
+    "IssueRecoveryState": {"pending_ci": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
     "ResolveAttemptResult": {"split": None},
@@ -236,6 +239,8 @@ def _encode(value: object, depth: int = 0) -> object:
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None))
+                    and not (type(value) is cc.IssueRecoveryState and field.name == "pending_ci" and value.pending_ci is None)
+                    and not (type(value) is cc.PRRepairResult and field.name == "ci" and value.ci is None)
                     and not (type(value) is cc.PRRepairPurchase and (field.name == "branch" and not value.branch
                         or field.name == "handoff" and value.handoff is None))
                     and not (type(value) is cc.StewardLaneState and (
@@ -341,7 +346,7 @@ def _decode(value: object, depth: int = 0) -> object:
     field_names = _FIELD_NAMES[constructor]
     required = ({"baseline_at", "stalls", "infra_failures", "pending_delivery"}
                 if tag == "StewardLaneState" else field_names - legacy.keys())
-    if tag in {"StewardLaneState", "PRRepairState", "PRRepairPurchase"} and required <= set(payload) <= field_names:
+    if tag in {"StewardLaneState", "PRRepairState", "PRRepairPurchase", "PRRepairResult", "IssueRecoveryState"} and required <= set(payload) <= field_names:
         payload = {**legacy, **payload}
     if legacy and set(payload) == field_names - legacy.keys():
         payload = {**legacy, **payload}

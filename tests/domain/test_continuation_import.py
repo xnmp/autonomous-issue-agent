@@ -29,6 +29,23 @@ def test_direct_issue_debt_and_consumed_reply_are_preserved():
     assert (value.consumed_reply_at, value.resumes, value.ci_failures, value.infra_failures) == ("2026-10-01T00:00:00Z", 2, 3, 4)
 
 
+@pytest.mark.parametrize("value", ["", "-1", "1.5", "1" * 1000, str(2**63)])
+def test_malformed_legacy_ci_debt_is_source_specifically_blocked(value):
+    result = classify_record(record(**{"ci-retries": value}))
+    assert isinstance(result, tuple) and result
+    assert all(blocker.source.startswith("legacy:") and "ci-retries" in blocker.reason for blocker in result)
+
+
+def test_pre_f4_issue_plan_digest_survives_pending_ci_evolution():
+    from issue_agent.domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget
+    # Captured using accepted 0014d93's IssueRecoveryState, before pending_ci.
+    target = ContinuationImportTarget(WorkflowKey("o/r", IssueRef(7)), WorkflowFamily.ISSUE_RECOVERY,
+        None, "a" * 64, cc.IssueRecoveryState(ci_failures=3, resumes=2))
+    plan = ContinuationImportPlan("o/r", (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR),
+        1, "a" * 64, "c" * 64, "d" * 64, (target,))
+    assert plan.plan_digest == "33e8ce0f8ae7de17109c46f1775f6ee76d993f063767a5c523b15915b78b1555"
+
+
 @pytest.mark.parametrize("field,value", [("resumes", ""), ("resumes", "-1"), ("resumes", "1.5"), ("resumes", "1" * 1000),
                                          ("resumed-at", "yesterday"), ("resumed-at", "2026-10-01"),
                                          ("session", "codex:handle"), ("model", "codex:model"), ("machine-block", "unknown")])

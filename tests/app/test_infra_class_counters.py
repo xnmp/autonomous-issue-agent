@@ -346,20 +346,18 @@ def test_initialized_episode_starts_with_no_failure_history():
     assert resolve_dispatches(actions) == [RunAgent(AgentKind.RESOLVE, ISSUE, workflow=resolve_state(store, ISSUE).binding)]
 
 
-def test_unreadable_legacy_counters_do_not_erase_sql_failure_evidence():
-    """Unavailable legacy CI evidence is optional; resolve authority is not."""
-
-    class BrokenStore(FakeStore):
-        def get_ci_retries(self, issue):
-            raise OSError("state dir is gone")
-
-    store = BrokenStore()
+def test_unavailable_ci_selection_does_not_erase_resolve_failure_evidence(monkeypatch):
+    store = FakeStore()
     seed_resolve(store, ISSUE, failures=2)
-    signals = workflow(
+    current = workflow(
         FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}),
         store,
         FakeRunner(stillborn()),
-    )._signals(ISSUE)
+    )
+    def unavailable(_key):
+        raise ValueError("CI selected source is unavailable")
+    monkeypatch.setattr(current.workflow_control, "read_issue_recovery", unavailable)
+    signals = current._signals(ISSUE)
 
     assert signals.resolve_retries == 2
     assert signals.ci_retries == 0

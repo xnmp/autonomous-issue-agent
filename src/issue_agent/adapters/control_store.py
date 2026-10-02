@@ -644,7 +644,7 @@ class ReservationRequest:
 
     def __post_init__(self) -> None:
         if (not isinstance(self.continuations, tuple) or len(self.continuations) > 3
-                or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in self.continuations)):
+                or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in self.continuations)):
             raise ValueError("reservation requires bounded fixed continuation purchases")
         if len({item.capture.binding.authority.family for item in self.continuations}) != len(self.continuations):
             raise ValueError("reservation selects each continuation family once")
@@ -5376,7 +5376,7 @@ class SQLiteControlStore:
         if run is None:
             return
         purchases = decode_workflow(run["continuations_json"], tuple)
-        if (len(purchases) > 3 or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in purchases)
+        if (len(purchases) > 3 or any(not isinstance(item, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.PRRepairPurchase, cc.StewardPurchase)) for item in purchases)
                 or len({item.capture.binding.authority.family for item in purchases}) != len(purchases)):
             raise WorkflowAuthorityError("run continuation selections are malformed")
         if run["workflow_binding_json"] is not None:
@@ -5402,7 +5402,8 @@ class SQLiteControlStore:
                          cc.select_issue_recovery(aggregate) if family is WorkflowFamily.ISSUE_RECOVERY else cc.select_steward(aggregate)) if aggregate is not None else None
             if (not isinstance(selection, (cc.SelectedIssueRecovery, cc.SelectedPRRepair, cc.SelectedSteward))
                     or getattr(aggregate, "gates", ()) or selection.component.gates
-                    or not cc.continuation_return_is_current(selection, admission)):
+                    or not (cc.ci_return_is_current(selection, admission) if isinstance(purchase, cc.IssueCIPurchase)
+                            and isinstance(selection, cc.SelectedIssueRecovery) else cc.continuation_return_is_current(selection, admission))):
                 raise WorkflowAuthorityError("continuation launch admission is stale or held")
 
     def reserve_issue_recovery(self, request: ReservationRequest, purchase: cc.IssueRecoveryPurchase | cc.IssueReplyPurchase) -> ReservationResult:
@@ -5427,6 +5428,15 @@ class SQLiteControlStore:
         for purchase in request.continuations:
             capture = purchase.capture
             key = capture.binding.fence.key
+            if isinstance(purchase, cc.IssueCIPurchase):
+                dispatch = json.loads(request.dispatch_id)
+                repairs = [item for item in request.continuations if isinstance(item, cc.PRRepairPurchase)]
+                if (request.kind != "FIX_CI" or dispatch.get("repository") != key.repository
+                        or dispatch.get("role") != "fix" or dispatch.get("issue") != key.target.number
+                        or dispatch.get("number") != purchase.pr.number or dispatch.get("ci_head") != purchase.head
+                        or dispatch.get("leg_id") != capture.leg_id or len(repairs) != 1
+                        or repairs[0].capture.binding.fence.key != WorkflowKey(key.repository, purchase.pr)):
+                    raise WorkflowAuthorityError("CI allowance differs from its exact issue/PR/head context")
             if isinstance(purchase, cc.StewardPurchase):
                 self._require_steward_dispatch(request.dispatch_id, request.kind, purchase)
             if isinstance(purchase, cc.IssueReplyPurchase) or (
@@ -5467,12 +5477,14 @@ class SQLiteControlStore:
             version = aggregate.revision.version + 1
             after = updates.get(key, aggregate)
             try:
-                if isinstance(purchase, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase)):
+                if isinstance(purchase, (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase)):
                     selection = cc.select_issue_recovery(aggregate)
                     if not isinstance(selection, cc.SelectedIssueRecovery):
                         raise ValueError("issue recovery is inactive or migration blocked")
                     self._require_issue_reply_projection(db, key, selection.component.state.consumed_reply_at)
-                    after = replace(after, issue_recovery=(cc.consume_issue_recovery(selection, purchase, version) if isinstance(purchase, cc.IssueRecoveryPurchase) else cc.consume_issue_reply(selection, purchase, version)),
+                    after = replace(after, issue_recovery=(cc.consume_issue_ci(selection, purchase, ContinuationAdmission(
+                        WorkflowAttemptIdentity(capture.binding, request.run_id, capture.leg_id), version)) if isinstance(purchase, cc.IssueCIPurchase)
+                        else cc.consume_issue_recovery(selection, purchase, version) if isinstance(purchase, cc.IssueRecoveryPurchase) else cc.consume_issue_reply(selection, purchase, version)),
                                     revision=WorkflowRevision(aggregate.revision.fence, version))
                 elif isinstance(purchase, cc.PRRepairPurchase):
                     selection = cc.select_pr_repair(aggregate)
@@ -5978,6 +5990,29 @@ class SQLiteControlStore:
         with self.transaction() as db:
             return self._pr_repair_admission(db, attempt)
 
+    def ci_repair_admission(self, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
+        with self.transaction() as db:
+            return self._ci_repair_admission(db, attempt)
+
+    def _ci_repair_admission(self, db, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
+        run = db.execute("SELECT continuations_json FROM runs WHERE run_id=?", (str(attempt.run_id),)).fetchone()
+        purchases = decode_workflow(run[0], tuple) if run is not None else ()
+        selected = [item for item in purchases if isinstance(item, cc.IssueCIPurchase)]
+        if len(selected) != 1:
+            raise WorkflowAuthorityError("CI output lacks its exact selected issue purchase")
+        purchase = selected[0]
+        key = purchase.capture.binding.fence.key
+        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND scope=? AND key=?",
+            (key.repository, self._continuation_receipt_key(attempt.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
+        if raw is None:
+            raise WorkflowAuthorityError("CI output lacks its selected issue admission receipt")
+        admission = decode_workflow(raw[0], tuple)[1]
+        expected = WorkflowAttemptIdentity(purchase.capture.binding, attempt.run_id, attempt.leg_id)
+        if not isinstance(admission, ContinuationAdmission) or admission.attempt != expected:
+            raise WorkflowAuthorityError("CI output conflicts with its selected issue attempt")
+        self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
+        return admission
+
     def _pr_repair_admission(self, db, attempt: WorkflowAttemptIdentity) -> ContinuationAdmission:
         if attempt.binding.authority.family is not WorkflowFamily.PR_REPAIR:
             raise WorkflowAuthorityError("repair lookup requires its family attempt")
@@ -6004,6 +6039,9 @@ class SQLiteControlStore:
             if run["reservation_state"] == "released":
                 raise WorkflowAuthorityError("released repair reservation cannot produce paid output")
             dispatch = json.loads(run['dispatch_id'])
+            ci_purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueCIPurchase)]
+            if bool(ci_purchases) != (returned.ci is not None) or returned.ci is not None and returned.ci.admission != self._ci_repair_admission(db, admission.attempt):
+                raise WorkflowAuthorityError("CI result differs from its selected issue admission")
             if (not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch
                     or returned.state.branch != purchase.branch
                     or dispatch.get('kind') != 'FIX_CI' or dispatch.get('number') != key.target.number
@@ -6079,6 +6117,53 @@ class SQLiteControlStore:
             if isinstance(selected, cc.SelectedPRRepair):
                 self._validate_pr_repair_sources(db, selected)
             return selected
+
+    def read_issue_recovery(self, key: WorkflowKey) -> cc.IssueRecoverySelection:
+        from .workflow_rows import load_issue_aggregate
+        with self.transaction() as db:
+            aggregate = load_issue_aggregate(db, key)
+            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else cc.InactiveIssueRecovery()
+            if isinstance(selected, cc.SelectedIssueRecovery) and selected.component.state.pending_ci is not None:
+                pending = selected.component.state.pending_ci
+                purchase, _ = self._continuation_return_admission(db, pending, WorkflowFamily.ISSUE_RECOVERY)
+                if not isinstance(purchase, cc.IssueCIPurchase) or pending.attempt.binding.fence.generation > selected.revision.fence.generation:
+                    raise WorkflowAuthorityError("pending CI lacks its selected admitted provenance")
+            return selected
+
+    def reset_ci_episode(self, source: cc.CIEpisodeReset, writer) -> bool:
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        if not isinstance(source, cc.CIEpisodeReset):
+            raise ValueError("CI reset requires its exact green observation")
+        key = source.binding.fence.key
+        encoded = encode_workflow(source)
+        receipt_key = hashlib.sha256(encoded.encode()).hexdigest()
+        with self.transaction() as db, self.mutation_savepoint(db):
+            if writer.repository != key.repository or writer.role != "fix":
+                raise WorkflowAuthorityError("CI reset belongs to another deployment")
+            self._assert_owner_active(db, writer.owner_id)
+            prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='ci-episode-reset' AND scope=? AND key=?",
+                               (key.repository, receipt_key)).fetchone()
+            if prior is not None:
+                if prior[0] != encoded:
+                    raise WorkflowAuthorityError("CI reset conflicts with its original observation")
+                return False
+            aggregate = load_issue_aggregate(db, key)
+            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+            pr = load_review_workflow_row(db, source.pr_fence.key)
+            if (not isinstance(selected, cc.SelectedIssueRecovery) or selected.binding != source.binding
+                    or aggregate.revision != source.revision or pr is None or pr.revision.fence != source.pr_fence):
+                raise WorkflowAuthorityError("CI reset observation is stale or unavailable")
+            component = selected.component
+            if component.state.pending_ci is not None and component.state.pending_ci.attempt.binding == selected.binding:
+                raise WorkflowAuthorityError("CI reset waits for the selected admitted attempt")
+            if not component.state.ci_failures:
+                raise WorkflowAuthorityError("CI reset has no spent allowance")
+            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
+                issue_recovery=replace(component, state=replace(component.state, ci_failures=0)))
+            persist_workflow_snapshot(db, after)
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('ci-episode-reset',?,?,?,?)",
+                       (key.repository, receipt_key, _stamp(self._now()), encoded))
+            return True
 
     def steward_admission(self, attempt: WorkflowAttemptIdentity) -> cc.StewardAttemptSource:
         with self.transaction() as db:
@@ -6401,7 +6486,7 @@ class SQLiteControlStore:
             raise WorkflowAuthorityError("continuation return lacks its immutable run admission")
         captured = decode_workflow(row["payload_json"], tuple)
         if (len(captured) != 2 or captured[1] != admission
-                or not isinstance(captured[0], (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.PRRepairPurchase, cc.StewardPurchase))
+                or not isinstance(captured[0], (cc.IssueRecoveryPurchase, cc.IssueReplyPurchase, cc.IssueCIPurchase, cc.PRRepairPurchase, cc.StewardPurchase))
                 or captured[0].capture.binding != admission.attempt.binding
                 or captured[0].capture.leg_id != admission.attempt.leg_id
                 or captured[0].capture.revision.version + 1 != admission.admission_version
@@ -6426,22 +6511,38 @@ class SQLiteControlStore:
         receipt_key = self._continuation_receipt_key(request.run_id, family)
         with self.transaction() as db, self.mutation_savepoint(db):
             purchase, run = self._continuation_return_admission(db, admission, family)
+            if isinstance(purchase, cc.IssueCIPurchase):
+                raise WorkflowAuthorityError("CI issue settlement requires its captured paired repair result")
+            ci = None
             if isinstance(purchase, cc.PRRepairPurchase) and purchase.branch:
                 self._require_repair_writer(db, writer, admission, run["owner_id"])
                 if state.branch != purchase.branch:
                     raise WorkflowAuthorityError("repair return changed its purchased branch")
                 raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?",
                     (key.repository, receipt_key)).fetchone()
-                if raw is None or decode_workflow(raw[0], cc.PRRepairResult) != cc.PRRepairResult(admission, state, request):
+                captured = decode_workflow(raw[0], cc.PRRepairResult) if raw is not None else None
+                if captured is None or (captured.admission, captured.state, captured.settlement) != (admission, state, request):
                     raise WorkflowAuthorityError("repair settlement conflicts with its captured result")
+                ci = captured.ci
             prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
                                (key.repository, receipt_key)).fetchone()
             encoded = encode_workflow((admission, state))
             if prior is not None and prior["payload_json"] != encoded:
                 raise WorkflowAuthorityError("continuation return conflicts with its immutable result")
+            if ci is not None:
+                selected_ci = self._ci_repair_admission(db, admission.attempt)
+                if selected_ci != ci.admission:
+                    raise WorkflowAuthorityError("CI settlement changed its selected issue source")
+                if prior is not None:
+                    paired = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                        (key.repository, self._continuation_receipt_key(request.run_id, WorkflowFamily.ISSUE_RECOVERY))).fetchone()
+                    if paired is None or paired[0] != encode_workflow((ci.admission, ci)):
+                        raise WorkflowAuthorityError("CI exact retry lost its selected applied result receipt")
             settled = self._settle(db, request)
             if settled.disposition is not AccountingDisposition.AVAILABLE or prior is not None:
                 return settled
+            if ci is not None:
+                self._apply_ci_result(db, ci)
             aggregate = load_review_workflow_row(db, key) if family is WorkflowFamily.PR_REPAIR else load_issue_aggregate(db, key)
             selection = (cc.select_pr_repair(aggregate) if family is WorkflowFamily.PR_REPAIR else
                          cc.select_issue_recovery(aggregate) if family is WorkflowFamily.ISSUE_RECOVERY else cc.select_steward(aggregate)) if aggregate is not None else None
@@ -6453,7 +6554,8 @@ class SQLiteControlStore:
                     from ..domain.workflow import IssueWorkflowShell
                     if not isinstance(aggregate, (WorkflowSnapshot, IssueWorkflowShell)):
                         raise WorkflowAuthorityError("issue return lost its issue aggregate")
-                    applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes)
+                    applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
+                                      ci_failures=component.state.ci_failures, pending_ci=component.state.pending_ci)
                     after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
                 elif isinstance(selection, cc.SelectedPRRepair):
                     if not isinstance(aggregate, ReviewWorkflowSnapshot):
@@ -6469,6 +6571,34 @@ class SQLiteControlStore:
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
                        (key.repository, receipt_key, _stamp(self._now()), encoded))
             return settled
+
+    def _apply_ci_result(self, db, returned: cc.CIRepairResult) -> None:
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        admission = returned.admission
+        purchase, _ = self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
+        if not isinstance(purchase, cc.IssueCIPurchase):
+            raise WorkflowAuthorityError("CI result selected another issue recovery operation")
+        key = admission.attempt.binding.fence.key
+        receipt_key = self._continuation_receipt_key(admission.attempt.run_id, WorkflowFamily.ISSUE_RECOVERY)
+        encoded = encode_workflow((admission, returned))
+        prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                           (key.repository, receipt_key)).fetchone()
+        if prior is not None:
+            if prior[0] != encoded:
+                raise WorkflowAuthorityError("CI return conflicts with its immutable result")
+            return
+        aggregate = load_issue_aggregate(db, key)
+        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+        if isinstance(selected, cc.SelectedIssueRecovery) and cc.ci_return_is_current(selected, admission):
+            component = selected.component
+            state = replace(component.state, pending_ci=None,
+                ci_failures=component.state.ci_failures + (1 if returned.charge is cc.CICharge.ATTEMPT else 0))
+            after = replace(aggregate, revision=WorkflowRevision(aggregate.revision.fence, aggregate.revision.version+1),
+                issue_recovery=replace(component, state=state, watermarks=replace(component.watermarks,
+                    last_applied=max(component.watermarks.last_applied, admission.admission_version))))
+            persist_workflow_snapshot(db, after)
+        db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
+                   (key.repository, receipt_key, _stamp(self._now()), encoded))
 
     def record_review_runtime_preflight_stop(
         self, run_id: RunId, expected_owner_id: str, result: ReviewReturnedEnvelope,
@@ -7328,6 +7458,10 @@ class SQLiteControlStore:
         from .workflow_rows import persist_workflow_snapshot
         run = db.execute("SELECT continuations_json FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
         for purchase in decode_workflow(run[0], tuple):
+            if isinstance(purchase, cc.IssueCIPurchase):
+                admission = self._ci_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
+                self._apply_ci_result(db, cc.CIRepairResult(admission, cc.CICharge.NOT_LAUNCHED))
+                continue
             if not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch:
                 continue
             admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))

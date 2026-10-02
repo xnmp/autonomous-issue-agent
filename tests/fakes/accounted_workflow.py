@@ -173,6 +173,11 @@ def pr_repair_state(store, pr=100):
     return store._workflow_authority.read_pr_repair(WorkflowKey("o/r", PullRequestRef(pr))).component.state
 
 
+def issue_recovery_state(store, issue=5):
+    selected = store._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue)))
+    return selected.component.state
+
+
 def attach_workflow_authority(
     gw, store, *, resolve_ceiling=20, max_contract_rounds=2, pr_repair=False
 ):
@@ -191,7 +196,9 @@ def attach_workflow_authority(
         object.__setattr__(store, "_workflow_db", SQLiteControlStore(str(Path(store._workflow_dir.name) / "control.sqlite")))
         store._workflow_db.initialize()
         seeded = getattr(store, "_workflow_seed", None)
+        from issue_agent.domain.refs import issue_from_branch
         numbers = set(gw.issues) | {p.closing_issue for p in gw.prs.values() if p.closing_issue}
+        numbers |= {number for p in gw.prs.values() if (number := issue_from_branch(p.head_ref_name)) is not None}
         numbers.add(5)
         for number in numbers:
             primary = seeded if seeded is not None and seeded.revision.fence.key.target.number == number else resolve_snapshot(number)

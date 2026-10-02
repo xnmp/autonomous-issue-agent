@@ -491,6 +491,7 @@ from test_dispatch import (
 )
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 from tests.fakes.accounted_dispatch import with_resolve_authority
+from tests.fakes.accounted_workflow import issue_recovery_state
 from tests.fakes.accounted_workflow import attach_workflow_authority, resolve_state
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
@@ -502,7 +503,7 @@ def _fix_state(store, world, *args, **kwargs):
     workflows = attach_workflow_authority(FakeGateway(
         issues={i.number: i for i in world.issues},
         prs={p.number: p for p in world.prs},
-    ), store, resolve_ceiling=3)
+    ), store, resolve_ceiling=3, pr_repair=True)
     return read_fix_state(store, world, *args, workflow_control=workflows, **kwargs)
 
 
@@ -660,15 +661,95 @@ def test_ci_retries_round_trip_trips_the_breaker(tmp_path):
         return WorldState(prs=(_ci_pr(issue),))
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, pr)))
-    assert store.get_ci_retries(issue) == 1
+    assert issue_recovery_state(store, issue).ci_failures == 1
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert _has_run(actions, AgentKind.FIX_CI)
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, pr)))
-    assert store.get_ci_retries(issue) == 2
+    assert issue_recovery_state(store, issue).ci_failures == 2
     actions = decide_fix(world(), cfg, _fix_state(store, world()), fixer_busy=False)
     assert not _has_run(actions, AgentKind.FIX_CI)
     assert Relabel(Target.PR, pr, Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW) in actions
+
+
+@pytest.mark.parametrize("change", ["none", "head", "linkage", "checks", "unknown-checks", "merged", "replacement", "ambiguous"])
+def test_composed_fix_daemon_resets_only_the_selected_settled_green_ci(tmp_path, change):
+    from issue_agent.domain.ci_history import CiAttempt
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.actions import ResetCiRetries
+    from issue_agent.domain.workflow_identity import WorkflowFamily, WorkflowKey, IssueRef, PullRequestRef
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate
+    from tests.fakes.workflow_authority import with_issue_recovery
+    from tests.fakes.review_workflow import held
+    from tests.adapters.test_continuation_admission import active, install_secondary
+    daemon = _codex_daemon(tmp_path)
+    dispatcher = daemon.executor._run_agent._dispatch.__self__
+    control = dispatcher.fix_workflow.workflow_control
+    sql = control._control
+    base = with_issue_recovery(resolve_snapshot(5))
+    state = replace(base.issue_recovery.state, ci_failures=2, review_failures=3, rebase_failures=4, resumes=5)
+    issue = replace(base, issue_recovery=replace(base.issue_recovery, state=state))
+    install_workflow(sql, issue)
+    key = WorkflowKey("o/r", PullRequestRef(100))
+    pr_base = replace(held(key=key), gates=())
+    install_workflow(sql, pr_base)
+    component = active(key, WorkflowFamily.PR_REPAIR)
+    install_secondary(sql, replace(pr_base, pr_repair=component), component)
+    observed = replace(_ci_pr(5), head_ref_oid="a" * 40, checks=(Check("unit", bucket="pass"),))
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    source = cc.CIEpisodeReset(selected.binding, selected.revision, pr_base.revision.fence, observed.head_ref_oid)
+    if change == "head":
+        observed = replace(observed, head_ref_oid="b" * 40)
+    elif change == "linkage":
+        observed = replace(observed, closing_issue=6, head_ref_name="fix/6-other")
+    elif change == "checks":
+        observed = replace(observed, checks=(Check("unit", bucket="fail"),))
+    elif change == "unknown-checks":
+        observed = replace(observed, checks_known=False)
+    elif change in {"merged", "replacement"}:
+        observed = replace(observed, state="MERGED", checks=(Check("unit", bucket="fail"),))
+    if change in {"replacement", "ambiguous"}:
+        dispatcher.gw.prs[101] = replace(_ci_pr(5), number=101, head_ref_oid="b" * 40)
+    dispatcher.gw.prs[100] = observed
+    dispatcher.store.append_ci_attempt(5, CiAttempt("old-head", ("unit",)))
+    from pathlib import Path
+    Path(dispatcher.store.issue_path(5, "ci-retries")).write_text("-999")
+    assert control.read_issue_recovery(selected.binding.fence.key).component.state.ci_failures == 2
+    if change == "merged":
+        from issue_agent.domain.actions import ClearIssueState
+        world = WorldState(prs=(observed,), issues=(IssueView(5, labels=frozenset({Label.AI_PR_OPEN})),))
+        state_view = read_fix_state(dispatcher.store, world, workflow_control=control)
+        planned = decide_fix(world, _cfg(), state_view, fixer_busy=True)
+        resets = [action for action in planned if isinstance(action, ResetCiRetries)]
+        assert resets == [ResetCiRetries(5, source)]
+        daemon.executor.execute(resets[0])
+        daemon.executor.execute(ClearIssueState(100, 5, True))
+    elif change == "none":
+        daemon.executor.execute(ResetCiRetries(5, source))
+    else:
+        with pytest.raises(ValueError, match="settled green PR/head linkage|ambiguous"):
+            daemon.executor.execute(ResetCiRetries(5, source))
+    with sql.transaction() as db:
+        after = load_issue_aggregate(db, selected.binding.fence.key)
+        assert after.episode == issue.episode
+    assert after.issue_recovery.state == (replace(state, ci_failures=0) if change in {"none", "merged"} else state)
+    assert bool(dispatcher.store.get_ci_history(5)) is (change not in {"none", "merged"})
+    if change == "merged":
+        from issue_agent.adapters.workflow_rows import persist_workflow_snapshot
+        from issue_agent.domain.workflow_identity import WorkflowRevision
+        new_debt = replace(after.issue_recovery.state, ci_failures=1)
+        with sql.transaction() as db:
+            persist_workflow_snapshot(db, replace(after,
+                revision=WorkflowRevision(after.revision.fence, after.revision.version+1),
+                issue_recovery=replace(after.issue_recovery, state=new_debt)))
+        dispatcher.store.append_ci_attempt(5, CiAttempt("new-head", ("unit",)))
+        daemon.executor.execute(ResetCiRetries(5, source))
+        assert control.read_issue_recovery(selected.binding.fence.key).component.state == new_debt
+        assert len(dispatcher.store.get_ci_history(5)) == 1
+        dispatcher.gw.prs[101] = replace(_ci_pr(5), number=101, head_ref_oid="b" * 40)
+        with pytest.raises(ValueError, match="settled green PR/head linkage"):
+            daemon.executor.execute(ResetCiRetries(5, source))
+        assert control.read_issue_recovery(selected.binding.fence.key).component.state == new_debt
 
 
 # ── rebase-retries (PR-keyed via closing_issue) ────────────────────────────────
@@ -830,12 +911,12 @@ def test_breaker_key_agrees_with_gateway_issue_for_pr_when_branch_numbered_no_cl
 
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, pr_no)))
 
-    # The workflow write (FixWorkflow.fix_ci → store.set_ci_retries(issue, …),
-    # where `issue` comes from gateway.issue_for_pr) must land under the SAME
+    # The SQL workflow charge, where `issue` comes from gateway.issue_for_pr,
+    # must land under the SAME
     # key `_fix_state` reads via the domain's breaker_key.
     state = _fix_state(store, WorldState(prs=(pr,)))
     assert state.ci_retries[breaker_key(pr)] == 1
-    assert store.get_ci_retries(issue) == 1  # explicit: the real issue number, not -401
+    assert issue_recovery_state(store, issue).ci_failures == 1  # explicit: the real issue number, not -401
 
 
 # ══════════════════════════════════════════════════════════════════════════════

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import sqlite3
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -111,6 +112,7 @@ class FixWorkflowConfig:
     fix_mcp_config: str
     harness_root: str
     log: Callable[[str], None]
+    max_ci_retries: int = 3
     # The fixer's own login. The resume path must exclude the fixer's comments
     # with the SAME filter the decide side uses (domain.fix.last_human_reply),
     # or the resumed-at dedup mark records a different comment than the decide
@@ -630,14 +632,20 @@ class FixWorkflow:
                     self.cfg.log(f"issue #{issue}: no available resolve escalation evidence")
             except Exception as exc:  # noqa: BLE001 — advisory only; selected admission validates authority separately
                 self.cfg.log(f"issue #{issue}: resolve escalation evidence unavailable ({exc})")
+        ci_retries = 0
+        if self.workflow_control is not None:
+            try:
+                recovery = self.workflow_control.read_issue_recovery(WorkflowKey(self.workflow_control.writer.repository, IssueRef(issue)))
+                if isinstance(recovery, cc.SelectedIssueRecovery):
+                    ci_retries = recovery.component.state.ci_failures
+            except (ValueError, sqlite3.Error) as exc:
+                self.cfg.log(f"issue #{issue}: CI escalation evidence unavailable ({exc})")
         return EscalationSignals(
             recurrence=bool(
                 self._try(lambda: iss is not None and iss.has(Label.RECURRENCE), False)
             ),
             resolve_retries=resolve_retries,
-            ci_retries=int(
-                self._try(lambda: self.store.get_ci_retries(issue), 0) or 0
-            ),
+            ci_retries=ci_retries,
             review_rounds=max(0, int(review_rounds or 0)),
         )
 
@@ -1881,10 +1889,15 @@ class FixWorkflow:
         selected = control.read_pr_repair(selected.binding.fence.key)
         if not isinstance(selected, cc.SelectedPRRepair):
             return
+        issue_selected = control.read_issue_recovery(WorkflowKey(control.writer.repository, IssueRef(issue)))
+        if not isinstance(issue_selected, cc.SelectedIssueRecovery):
+            self.cfg.log(f"fix-ci #{pr}: issue recovery allowance is inactive or blocked")
+            return
         runtime = RuntimeName(self._resolve_runtime_name())
         handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
-        repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff)
+        repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff,
+            cc.CIRepairInput(issue_selected, PullRequestRef(pr), p.head_ref_oid, self.cfg.max_ci_retries))
         guidance = self._pr_guidance(p.number)
         cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
         attempt = make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"])
@@ -1917,7 +1930,6 @@ class FixWorkflow:
         if capped:
             pass
         elif not outcome.infra_class_failure(result):
-            self.store.set_ci_retries(issue, self.store.get_ci_retries(issue) + 1)
             self._decay_infra_deaths(issue, result, alt_key=-pr)
         else:
             # Separate, higher ceiling for the deaths themselves (review C3/D2c)

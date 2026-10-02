@@ -1778,6 +1778,32 @@ def test_pr_for_issue_no_warning_below_limit(capsys):
     assert capsys.readouterr().err == ""
 
 
+def test_ci_reset_linkage_selects_closing_refs_and_refuses_ambiguity():
+    prs = [{"number": 100, "headRefName": "unrelated", "closingIssuesReferences": [{"number": 5}]}]
+    gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": prs}))
+    assert gw.pr_for_issue(5, require_unique=True) == 100
+    assert gw.pr_for_issue(5) is None
+    prs.append({"number": 101, "headRefName": "fix/5-current", "closingIssuesReferences": []})
+    gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": prs}))
+    with pytest.raises(ValueError, match="ambiguous"):
+        gw.pr_for_issue(5, require_unique=True)
+    assert gw.pr_for_issue(5) == 101
+
+
+@pytest.mark.parametrize("prs", [
+    None,
+    [{"number": 100, "headRefName": "fix/5-work"}],
+    [{"number": 100, "headRefName": "fix/5-work", "closingIssuesReferences": [None]}],
+    *[[{"number": invalid, "headRefName": "other", "closingIssuesReferences": []}] for invalid in (True, 0, -1, 2**63)],
+    *[[{"number": 100, "headRefName": "other", "closingIssuesReferences": [{"number": invalid}]}] for invalid in (True, -1, 2**63)],
+    [{"number": n, "headRefName": f"fix/{n}-work", "closingIssuesReferences": []} for n in range(_LIST_LIMIT)],
+])
+def test_ci_reset_linkage_refuses_incomplete_observations(prs):
+    gw = GitHubGateway("o/r", runner=FakeRunner({"pr list": prs}))
+    with pytest.raises(ValueError, match="CI reset|linkage is unavailable"):
+        gw.pr_for_issue(5, require_unique=True)
+
+
 def test_pr_discovery_uses_the_shared_branch_issue_policy():
     from issue_agent.domain.refs import BRANCH_PREFIXES
 

@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
+from .continuation_components import CIEpisodeReset
 from enum import Enum
 
 from .actions import (
@@ -177,6 +178,7 @@ class FixState:
     # unbounded fix-CI / address-review loop burns budget forever, so at the cap
     # we escalate to a human instead of re-dispatching. Default 0 (no attempts).
     ci_retries: dict[int, int] = field(default_factory=dict)
+    ci_resets: Mapping[int, CIEpisodeReset] = field(default_factory=dict)
     # review_retries values are (review_submitted_at, count): the counter is
     # KEYED to the specific CHANGES_REQUESTED review it accumulated against. A
     # NEW review (different submitted_at) reads as count 0 — supersession is the
@@ -1694,6 +1696,7 @@ def decide_fix(
     lease, including PR legs mapped back to their linked issue.
     """
     actions: list[Action] = []
+    observed_prs = world.prs
     if state.control_errors:
         world = replace(
             world,
@@ -1887,7 +1890,7 @@ def decide_fix(
                     held_ci == CIState.OK
                     and state.ci_retries.get(breaker_key(pr), 0) > 0
                 ):
-                    actions.append(ResetCiRetries(held_issue))
+                    actions.append(ResetCiRetries(held_issue, state.ci_resets.get(pr.number)))
             continue
         lifecycle = pr_lifecycle(pr)
         if lifecycle.is_blocked:
@@ -2010,7 +2013,7 @@ def decide_fix(
             # is the same episode idea). OK only — NONE means "no checks
             # reported", which is absence of a verdict, not a green one.
             if current_ci == CIState.OK and state.ci_retries.get(bkey, 0) > 0:
-                actions.append(ResetCiRetries(issue_n))
+                actions.append(ResetCiRetries(issue_n, state.ci_resets.get(pr.number)))
             if current_ci == CIState.FAILURE:
                 paths = pr.changed_files | issue_paths(issue_n)
                 if not dispatchable(issue_n, paths):
@@ -2093,7 +2096,7 @@ def decide_fix(
 
     # Filter before selecting so held high-priority work cannot starve an
     # unrelated available episode. Labels cannot grant or reset SQL authority.
-    ready_world = replace(world, issues=tuple(
+    ready_world = replace(world, prs=observed_prs, issues=tuple(
         issue for issue in world.issues
         if issue.number not in guarded
         and isinstance(workflow := state.resolve_workflows.get(issue.number), WorkflowSnapshot)
@@ -2190,6 +2193,10 @@ def decide_fix(
                 # issue or lose a terminal relabel after this poll publishes it.
                 continue
             observed = _observed_issue(world, issue_n)
+            if (pr.state == "MERGED" and issue_n is not None
+                    and _issue_carries_ai_pr_open(issue_world, issue_n)
+                    and state.ci_retries.get(issue_n, 0) > 0):
+                actions.append(ResetCiRetries(issue_n, state.ci_resets.get(pr.number)))
             actions.extend(cleanup_actions(
                 pr, issue_n, cfg,
                 issue_observed_pr_open=_issue_carries_ai_pr_open(issue_world, issue_n),

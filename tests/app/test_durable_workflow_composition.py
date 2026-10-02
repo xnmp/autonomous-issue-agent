@@ -175,7 +175,8 @@ def seed(root: Path, *labels: str) -> None:
     PersistentGitHub(root / "github.db").seed(issue(7, *labels, updated_at="2026-09-14T00:00:00Z"))
     control = SQLiteControlStore(str(root / "control.db"))
     control.initialize()
-    install_workflow(control, resolve_snapshot(7))
+    from tests.fakes.workflow_authority import with_issue_recovery
+    install_workflow(control, with_issue_recovery(resolve_snapshot(7)))
 
 
 def fail_at(point: str):

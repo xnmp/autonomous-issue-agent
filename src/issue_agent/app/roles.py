@@ -80,7 +80,8 @@ from ..domain.review_dispatch_record import (
     AdmissionInFlight, AdmissionOutcome, AdmissionWithheld, WithheldReason,
 )
 from ..domain.labels import Label
-from ..domain.ci import parse_timestamp
+from ..domain.ci import CIState, ci_state, parse_timestamp
+from ..domain import continuation_components as cc
 from ..domain.workflow import (
     ObservedIssue, WorkflowAbsent, WorkflowMigrationRequired, WorkflowRead, WorkflowSnapshot, WorkflowUnavailable,
 )
@@ -127,7 +128,7 @@ from ..domain.triage import (
     triage_candidates,
 )
 from ..domain.jira import jira_phase, jira_sync_needed
-from ..domain.actions import AgentKind, Relabel, RunAgent, Target
+from ..domain.actions import AgentKind, Relabel, ResetCiRetries, RunAgent, Target
 from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.outcome import AgentResult
@@ -1850,7 +1851,8 @@ def _fix_state(
     # closing-ref). Must match the workflow's increment key exactly, else the
     # breaker reads 0 forever and the retry loop never escalates (was PR #112).
     keys = {breaker_key(p) for p in world.prs}
-    ci_retries = {k: read(k, store.get_ci_retries, 0) for k in keys}
+    ci_retries: dict[int, int] = {}
+    ci_resets: dict[int, cc.CIEpisodeReset] = {}
     # Full (review_at, count) tuple: the domain compares the stored timestamp
     # against the CURRENT review's submitted_at so a superseding review reads
     # as count 0 (see FixState.review_retries).
@@ -1888,6 +1890,21 @@ def _fix_state(
         and workflow.episode.continuation.session is not None
         and workflow.episode.continuation.session.runtime == store.runtime
     )
+    for pr in world.prs:
+        number = breaker_key(pr)
+        try:
+            if workflow_control is None or number <= 0:
+                raise ValueError("CI issue recovery authority is unavailable")
+            selected = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
+            if not isinstance(selected, cc.SelectedIssueRecovery):
+                raise ValueError("CI issue recovery authority is inactive or migration blocked")
+            ci_retries[number] = selected.component.state.ci_failures
+            if selected.component.state.ci_failures:
+                repair = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number)))
+                if isinstance(repair, cc.SelectedPRRepair) and pr.head_ref_oid:
+                    ci_resets[pr.number] = cc.CIEpisodeReset(selected.binding, selected.revision, repair.revision.fence, pr.head_ref_oid)
+        except (ValueError, sqlite3.Error) as exc:
+            errors[number] = str(exc)
     # Infra deaths (review C3) span BOTH key spaces: the issue legs (resolve /
     # resume) escalate on the issue number, the PR legs on breaker_key(pr) —
     # and the dispatcher writes under whichever one the dying leg used. Read the
@@ -1960,7 +1977,7 @@ def _fix_state(
         control_errors=errors,
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
         automerge_enabled=automerge,
-        ci_retries=ci_retries, review_retries=review_retries,
+        ci_retries=ci_retries, ci_resets=ci_resets, review_retries=review_retries,
         rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
         infra_deaths=infra_deaths, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
@@ -2629,6 +2646,7 @@ def compose_fix_daemon(
         # The same ceiling `fix_cfg` escalates on, so a deterministic death can
         # saturate the counter rather than pay for cap-1 identical retries (#13).
         max_infra_deaths=fix_runtime.max_infra_deaths,
+        max_ci_retries=fix_runtime.max_ci_retries,
         infra_breaker=infra_breaker,
         **_spend_cfg(cfg, "fix"),
     )
@@ -2663,6 +2681,20 @@ def compose_fix_daemon(
             workflow_control.cleanup_pr_repair(WorkflowKey(cfg.repo, PullRequestRef(pr)), merged)
         store.cleanup_pr(pr, issue, merged)
 
+    def reset_ci_episode(action: ResetCiRetries) -> None:
+        source = action.source
+        if source is None:
+            raise ValueError("CI reset lacks its selected green observation")
+        pr = gateway.get_pr(source.pr_fence.key.target.number)
+        current_pr = gateway.pr_for_issue(action.issue, require_unique=True)
+        if (breaker_key(pr) != action.issue or pr.head_ref_oid != source.head
+                or pr.state not in {"OPEN", "MERGED"}
+                or (pr.state != "MERGED" and ci_state(pr.checks, fix_cfg.ci_ignore_checks, known=pr.checks_known) is not CIState.OK)
+                or current_pr != (pr.number if pr.state == "OPEN" else None)):
+            raise ValueError("CI reset no longer matches settled green PR/head linkage")
+        if workflow_control.reset_ci_episode(source):
+            store.clear_ci_history(action.issue)
+
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=log,
         mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
@@ -2670,7 +2702,7 @@ def compose_fix_daemon(
         mark_branch_update=store.set_update_branch_head,
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=cleanup_fix_state,
-        reset_ci_retries=store.reset_ci_episode,
+        reset_ci_retries=reset_ci_episode,
         retire_machine_block=store.complete_machine_self_clear,
         retire_budget_block=store.complete_budget_self_clear,
         mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,

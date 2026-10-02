@@ -373,10 +373,13 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
         scenario.seed(store)
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
-    for item in scenario.world.issues:
-        snapshot = with_issue_recovery(resolve_snapshot(item.number))
+    issue_numbers = {item.number for item in scenario.world.issues} | {
+        number for item in scenario.world.prs if (number := _issue_for(item)) is not None
+    }
+    for number in issue_numbers:
+        snapshot = with_issue_recovery(resolve_snapshot(number))
         if scenario.resolve_session:
-            source = WorkflowAttemptIdentity(snapshot.binding, RunId(f"prior:{item.number}"), "prior-leg")
+            source = WorkflowAttemptIdentity(snapshot.binding, RunId(f"prior:{number}"), "prior-leg")
             snapshot = replace(
                 snapshot, revision=replace(snapshot.revision, version=1),
                 episode=replace(snapshot.episode, continuation=FreshResolve(
@@ -532,7 +535,7 @@ def _address_review_superseded() -> Scenario:
 
 
 def _fix_ci_breaker() -> Scenario:
-    p = pr(102, "ai-pr-open", checks=(Check("unit", "COMPLETED", "fail"),))
+    p = pr(102, "ai-pr-open", head_ref_oid="a" * 40, checks=(Check("unit", "COMPLETED", "fail"),))
     return Scenario(
         name="fix-ci-breaker",
         world=world(prs=[p]),

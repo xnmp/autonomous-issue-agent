@@ -115,8 +115,8 @@ class SQLiteWorkflowControl:
         self._control._assert_owner_active(db, self.writer.owner_id)
         if load_family_authority(db, WorkflowFamily.RESOLVE, key.repository) is None:
             return None
-        state = load_resolve_workflow_row(db, key)
-        if state is None:
+        state = load_issue_aggregate(db, key)
+        if not isinstance(state, WorkflowSnapshot):
             return None
         session = state.episode.continuation.session
         if session is None or session.runtime != runtime.value:
@@ -163,6 +163,14 @@ class SQLiteWorkflowControl:
     def read_pr_repair(self, key: WorkflowKey) -> cc.PRRepairSelection:
         self._pr_repair_scope(key)
         return self._control.read_pr_repair(key)
+
+    def read_issue_recovery(self, key: WorkflowKey) -> cc.IssueRecoverySelection:
+        self._scope(key)
+        return self._control.read_issue_recovery(key)
+
+    def reset_ci_episode(self, source: cc.CIEpisodeReset) -> bool:
+        self._scope(source.binding.fence.key)
+        return self._control.reset_ci_episode(source, self.writer)
 
     def load_workflow(self, key: WorkflowKey) -> WorkflowRead:
         self._scope(key)

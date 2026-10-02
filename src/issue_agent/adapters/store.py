@@ -310,23 +310,8 @@ class Store:
         return n
 
     # ── retry counters ──
-    def get_ci_retries(self, issue: int) -> int:
-        return self._read_int(self.issue_path(issue, "ci-retries"))
-
-    def set_ci_retries(self, issue: int, retries: int) -> None:
-        self._write(self.issue_path(issue, "ci-retries"), str(retries))
-
-    def reset_ci_episode(self, issue: int) -> None:
-        """Close a red-CI episode (the `ResetCiRetries` action): checks settled
-        GREEN, so the breaker AND the attempt history it annotates both start
-        the next episode from zero.
-
-        The two must move together. A later unrelated red episode (base drift,
-        a new review round's push) inheriting the old attempt list would tell
-        its first repair leg that the check "keeps failing" across attempts that
-        a green run has already resolved — the same lifetime-vs-episode bug
-        `ResetCiRetries` exists to fix, one layer up in the prompt."""
-        self.set_ci_retries(issue, 0)
+    def clear_ci_history(self, issue: int) -> None:
+        """Discard advisory context only after SQL closes the selected CI episode."""
         self._remove(self.issue_path(issue, "ci-history"))
 
     # ── CI attempt history (tauri PR #620) ──────────────────────────────────

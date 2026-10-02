@@ -105,12 +105,16 @@ class IssueRecoveryState:
     rebase_failures: int = 0
     infra_failures: int = 0
     self_clears: int = 0
+    pending_ci: ContinuationAdmission | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed issue reply")
         validate_workflow_text(self.remembered_branch, "remembered issue branch", empty=True)
         for name in ("resumes", "ci_failures", "review_failures", "rebase_failures", "infra_failures", "self_clears"):
             validate_workflow_integer(getattr(self, name), name)
+        if self.pending_ci is not None and (not isinstance(self.pending_ci, ContinuationAdmission)
+                or self.pending_ci.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY):
+            raise ValueError("pending CI requires its exact issue recovery admission")
 
 
 @dataclass(frozen=True)
@@ -319,6 +323,12 @@ class ActiveIssueRecovery:
 
     def __post_init__(self) -> None:
         _active(self.identity, WorkflowFamily.ISSUE_RECOVERY, self.state, IssueRecoveryState, self.watermarks, self.gates)
+        pending = self.state.pending_ci
+        if pending is not None and (pending.attempt.binding.fence.key != self.identity.key
+                or pending.attempt.binding.authority != self.identity.authority
+                or pending.attempt.binding.episode_id != self.identity.episode_id
+                or pending.admission_version > self.watermarks.last_admitted):
+            raise ValueError("pending CI differs from admitted issue component provenance")
 
 
 @dataclass(frozen=True)
@@ -421,6 +431,9 @@ def validate_component_revision(component: object, revision: WorkflowRevision, f
         for selected in (component.state.session, component.state.actual_model):
             if selected is not None and selected.source.attempt.binding.fence.generation > revision.fence.generation:
                 raise ValueError("repair continuity cannot originate in a future target generation")
+    if isinstance(component, ActiveIssueRecovery) and component.state.pending_ci is not None:
+        if component.state.pending_ci.attempt.binding.fence.generation > revision.fence.generation:
+            raise ValueError("pending CI cannot originate in a future target generation")
 
 
 @dataclass(frozen=True)
@@ -600,6 +613,72 @@ class IssueReplyPurchase:
 
 
 @dataclass(frozen=True)
+class IssueCIPurchase:
+    capture: ContinuationCapture
+    pr: PullRequestRef
+    head: str
+    ceiling: int
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.capture, ContinuationCapture)
+                or self.capture.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or not isinstance(self.pr, PullRequestRef)):
+            raise ValueError("CI purchase requires selected issue recovery and linked PR")
+        validate_workflow_text(self.head, "observed CI head")
+        validate_workflow_integer(self.ceiling, "CI allowance ceiling", minimum=1)
+
+
+@dataclass(frozen=True)
+class CIRepairInput:
+    selection: SelectedIssueRecovery
+    pr: PullRequestRef
+    head: str
+    ceiling: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.selection, SelectedIssueRecovery):
+            raise ValueError("CI input requires selected issue recovery")
+        IssueCIPurchase(ContinuationCapture(self.selection.binding, self.selection.revision, "validation"),
+                        self.pr, self.head, self.ceiling)
+
+
+class CICharge(str, Enum):
+    ATTEMPT = "attempt"
+    BUDGET = "budget"
+    INFRA = "infra"
+    NOT_LAUNCHED = "not_launched"
+
+
+@dataclass(frozen=True)
+class CIRepairResult:
+    admission: ContinuationAdmission
+    charge: CICharge
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.admission, ContinuationAdmission)
+                or self.admission.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or not isinstance(self.charge, CICharge)):
+            raise ValueError("CI result requires its exact issue admission and classification")
+
+
+@dataclass(frozen=True)
+class CIEpisodeReset:
+    binding: WorkflowBinding
+    revision: WorkflowRevision
+    pr_fence: WorkflowFence
+    head: str
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.binding, WorkflowBinding)
+                or self.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or not isinstance(self.revision, WorkflowRevision) or self.revision.fence != self.binding.fence
+                or not isinstance(self.pr_fence, WorkflowFence) or not isinstance(self.pr_fence.key.target, PullRequestRef)
+                or self.pr_fence.key.repository != self.binding.fence.key.repository):
+            raise ValueError("CI reset requires exact issue authority and observed PR fence")
+        validate_workflow_text(self.head, "settled green CI head")
+
+
+@dataclass(frozen=True)
 class PRRepairPurchase:
     capture: ContinuationCapture
     reply_at: str = ""
@@ -650,11 +729,16 @@ class PRRepairInput:
     branch: str
     runtime: RuntimeName
     handoff: RepairHandoff | None = None
+    ci: CIRepairInput | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, SelectedPRRepair) or not isinstance(self.runtime, RuntimeName):
             raise ValueError("repair input requires selected authority and runtime")
         validate_workflow_text(self.branch, "current remote repair branch")
+        if self.ci is not None and (not isinstance(self.ci, CIRepairInput)
+                or self.ci.pr != self.selection.binding.fence.key.target
+                or self.ci.selection.binding.fence.key.repository != self.selection.binding.fence.key.repository):
+            raise ValueError("CI input differs from selected repair PR/repository")
         if self.handoff is not None and (not isinstance(self.handoff, RepairHandoff) or self.handoff.branch != self.branch
                 or self.handoff.runtime is not self.runtime or self.handoff.pr != self.selection.binding.fence.key.target):
             raise ValueError("repair handoff differs from selected branch/runtime")
@@ -690,6 +774,7 @@ class PRRepairResult:
     admission: ContinuationAdmission
     state: PRRepairState
     settlement: SettlementRequest
+    ci: CIRepairResult | None = None
 
     def __post_init__(self) -> None:
         if (not isinstance(self.admission, ContinuationAdmission)
@@ -697,6 +782,12 @@ class PRRepairResult:
                 or not isinstance(self.state, PRRepairState) or not isinstance(self.settlement, SettlementRequest)
                 or self.settlement.run_id != self.admission.attempt.run_id):
             raise ValueError("repair result requires its exact paid admission and settlement")
+        if self.ci is not None and (not isinstance(self.ci, CIRepairResult)
+                or self.ci.admission.attempt.run_id != self.admission.attempt.run_id
+                or self.ci.admission.attempt.leg_id != self.admission.attempt.leg_id
+                or self.ci.admission.attempt.binding.fence.key.repository != self.admission.attempt.binding.fence.key.repository
+                or self.ci.charge is CICharge.NOT_LAUNCHED):
+            raise ValueError("paid CI result requires the same launched run and leg")
         if (self.state.session is not None and self.state.session.source != self.admission
                 or self.state.actual_model is None or self.state.actual_model.source != self.admission):
             raise ValueError("repair output requires its exact admitted provenance")
@@ -932,7 +1023,26 @@ def groom_admissible(selection: StewardSelection, input_at: str, signature: str,
         return False
 
 
-ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | PRRepairPurchase | StewardPurchase
+ContinuationPurchase = IssueRecoveryPurchase | IssueReplyPurchase | IssueCIPurchase | PRRepairPurchase | StewardPurchase
+
+
+def consume_issue_ci(selection: SelectedIssueRecovery, purchase: IssueCIPurchase, admission: ContinuationAdmission) -> ActiveIssueRecovery:
+    if selection.binding != purchase.capture.binding or selection.revision != purchase.capture.revision:
+        raise ValueError("CI issue capture is stale")
+    component = selection.component
+    if (admission.attempt.binding != selection.binding or admission.admission_version != selection.revision.version + 1
+            or admission.attempt.leg_id != purchase.capture.leg_id):
+        raise ValueError("CI admission differs from its selected authority")
+    pending = component.state.pending_ci
+    if (component.gates or component.state.ci_failures >= purchase.ceiling
+            or pending is not None and pending.attempt.binding == selection.binding):
+        raise ValueError("CI issue allowance is held, pending or exhausted")
+    return replace(component, state=replace(component.state, pending_ci=admission),
+                   watermarks=component.watermarks.admit(admission.admission_version, selection.revision.fence))
+
+
+def ci_return_is_current(selection: SelectedIssueRecovery, admission: ContinuationAdmission) -> bool:
+    return selection.binding == admission.attempt.binding and selection.component.state.pending_ci == admission
 
 
 def consume_issue_reply(selection: SelectedIssueRecovery, purchase: IssueReplyPurchase, version: int) -> ActiveIssueRecovery:

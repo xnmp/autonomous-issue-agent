@@ -1881,16 +1881,43 @@ class GitHubGateway:
             now=build_time(),
         )
 
-    def pr_for_issue(self, issue: int) -> int | None:
+    def pr_for_issue(self, issue: int, *, require_unique: bool = False) -> int | None:
         """Open PR whose head branch identifies this issue under domain policy.
         Port of agent/lib.sh:pr_for_issue (closing-ref graph is default-branch only)."""
         data = self._gh_json(
             ["pr", "list", "--repo", self.repo, "--state", "open",
-             "--json", "number,headRefName", "--limit", str(_LIST_LIMIT)]
-        ) or []
+             "--json", "number,headRefName,closingIssuesReferences" if require_unique else "number,headRefName",
+             "--limit", str(_LIST_LIMIT)]
+        )
+        if not require_unique:
+            data = data or []
+        if not isinstance(data, list):
+            raise ValueError("open PR linkage is unavailable")
         _warn_if_list_truncated("gh pr list --state open (pr_for_issue)", len(data))
         from ..domain.refs import issue_from_branch
 
+        if require_unique:
+            from ..domain.workflow_identity import validate_workflow_integer, validate_workflow_text
+            if len(data) >= _LIST_LIMIT:
+                raise ValueError("CI reset requires complete open PR linkage")
+            matches: set[int] = set()
+            for p in data:
+                if (not isinstance(p, dict) or not isinstance(p.get("number"), int)
+                        or not isinstance(p.get("headRefName"), str)
+                        or not isinstance(p.get("closingIssuesReferences"), list)):
+                    raise ValueError("CI reset open PR linkage is malformed")
+                validate_workflow_integer(p["number"], "CI reset pull request number", minimum=1)
+                validate_workflow_text(p["headRefName"], "CI reset branch")
+                refs = p["closingIssuesReferences"]
+                if any(not isinstance(ref, dict) or not isinstance(ref.get("number"), int) for ref in refs):
+                    raise ValueError("CI reset open PR linkage is malformed")
+                for ref in refs:
+                    validate_workflow_integer(ref["number"], "CI reset closing issue number", minimum=1)
+                if issue_from_branch(p["headRefName"]) == issue or any(ref["number"] == issue for ref in refs):
+                    matches.add(p["number"])
+            if len(matches) > 1:
+                raise ValueError("CI reset open PR linkage is ambiguous")
+            return next(iter(matches), None)
         for p in data:
             if issue_from_branch(p.get("headRefName", "")) == issue:
                 return int(p["number"])

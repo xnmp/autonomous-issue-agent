@@ -54,6 +54,85 @@ def active_ci_workflow(result):
     return workflow, files, inner, key
 
 
+def issue_ci_state(files, issue=5):
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate
+    with files._workflow_db.transaction() as db:
+        aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue)))
+        return cc.select_issue_recovery(aggregate).component.state
+
+
+def test_ci_attempt_counts_in_issue_authority_and_ceiling_prevents_purchase():
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", cost_usd=.01))
+    workflow.cfg = replace(workflow.cfg, max_ci_retries=2)
+    asyncio.run(workflow.fix_ci(100))
+    asyncio.run(workflow.fix_ci(100))
+    assert issue_ci_state(files).ci_failures == 2
+    asyncio.run(workflow.fix_ci(100))
+    assert len(inner.tasks) == 2
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 2
+
+
+def test_ci_attempt_moves_issue_authority_before_returning_to_workflow():
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    assert issue_ci_state(files).ci_failures == 1
+
+
+@pytest.mark.parametrize("reason,count", [
+    ("budget_exhausted", 0), ("transport_death", 0), ("agent_error", 1),
+])
+def test_ci_return_classification_preserves_existing_policy(reason, count):
+    from issue_agent.domain.outcome import ExitReason
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=True, exit_reason=ExitReason(reason), cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    state = issue_ci_state(files)
+    assert state.ci_failures == count and state.pending_ci is None
+    assert len(inner.tasks) == 1
+
+
+def test_ci_green_reset_is_exact_and_preserves_sibling_allowances():
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    workflow, files, inner, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    issue_key = WorkflowKey("o/r", IssueRef(5))
+    with files._workflow_db.transaction() as db:
+        current = load_issue_aggregate(db, issue_key)
+        siblings = replace(current.issue_recovery.state, resumes=2, review_failures=3, rebase_failures=4,
+                           infra_failures=5, self_clears=6)
+        persist_workflow_snapshot(db, replace(current, issue_recovery=replace(current.issue_recovery, state=siblings)))
+    asyncio.run(workflow.fix_ci(100))
+    control = files._workflow_authority
+    selected = control.read_issue_recovery(issue_key)
+    before_primary = control.load_workflow(issue_key).episode
+    source = cc.CIEpisodeReset(selected.binding, selected.revision, control.read_pr_repair(key).revision.fence, "a" * 40)
+    assert control.reset_ci_episode(source)
+    assert issue_ci_state(files) == siblings
+    assert control.load_workflow(issue_key).episode == before_primary
+    asyncio.run(workflow.fix_ci(100))
+    after = issue_ci_state(files)
+    assert after.ci_failures == 1
+    assert not control.reset_ci_episode(source)
+    assert issue_ci_state(files) == after
+
+
+@pytest.mark.parametrize("namespace", ["continuation-admission", "continuation-return"])
+def test_ci_exact_retry_refuses_missing_selected_issue_receipt(namespace):
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    workflow, files, inner, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    store = files._workflow_db
+    with store.transaction() as db:
+        returned = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
+        db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND key=?", (namespace,
+            store._continuation_receipt_key(returned.settlement.run_id, WorkflowFamily.ISSUE_RECOVERY)))
+    with pytest.raises(WorkflowAuthorityError, match="CI output lacks|CI exact retry lost"):
+        store.settle_pr_repair_result(returned, files._workflow_authority.writer)
+    assert issue_ci_state(files).ci_failures == 1
+
+
 def test_fix_ci_commits_remote_branch_and_session_with_money():
     workflow, files, inner, key = active_ci_workflow(AgentResult(
         is_error=False, status="pushed", session_id="first-session", cost_usd=.01, model="actual-ci"))
@@ -293,6 +372,117 @@ def captured_interrupted_ci_result(monkeypatch):
     with files._workflow_db.transaction() as db:
         raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0]
     return workflow,files,inner,key,decode_workflow(raw,cc.PRRepairResult)
+
+
+def test_generic_issue_settlement_cannot_bypass_captured_ci_classification(monkeypatch):
+    _, files, _, _, returned = captured_interrupted_ci_result(monkeypatch)
+    with pytest.raises(WorkflowAuthorityError, match="captured paired repair result"):
+        files._workflow_db.settle_issue_recovery(returned.settlement, returned.ci.admission, cc.IssueRecoveryState())
+    assert issue_ci_state(files).ci_failures == 0
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    assert issue_ci_state(files).ci_failures == 1
+
+
+def test_newer_issue_reply_cannot_erase_pending_ci_outcome(monkeypatch):
+    from tests.adapters.test_workflow_admission import request
+    _, files, _, _, returned = captured_interrupted_ci_result(monkeypatch)
+    selected = files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    purchase = cc.IssueRecoveryPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "leg:newer-reply"),
+        "2026-10-02T10:00:00+00:00", "fix/5-newer", 20)
+    requested = replace(request("newer-reply", binding=selected.binding), owner_id=files._workflow_authority.writer.owner_id)
+    assert files._workflow_db.reserve_issue_recovery(requested, purchase).admitted
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    state = issue_ci_state(files)
+    assert state.ci_failures == 1 and state.resumes == 1 and state.pending_ci is None
+    assert state.remembered_branch == "fix/5-newer" and state.consumed_reply_at == purchase.reply_at
+    assert files._workflow_db.settle_pr_repair_result(returned, files._workflow_authority.writer).idempotent
+    assert issue_ci_state(files) == state
+
+
+def test_old_issue_generation_ci_result_settles_without_changing_current_debt(monkeypatch):
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowRevision
+    workflow, files, inner, key, returned = captured_interrupted_ci_result(monkeypatch)
+    issue_key = WorkflowKey("o/r", IssueRef(5))
+    with files._workflow_db.transaction() as db:
+        current = load_issue_aggregate(db, issue_key)
+        changed = replace(current, revision=WorkflowRevision(replace(current.revision.fence, generation=current.revision.fence.generation+1), current.revision.version+1))
+        persist_workflow_snapshot(db, changed)
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    assert issue_ci_state(files).ci_failures == 0
+    asyncio.run(workflow.fix_ci(100))
+    after = issue_ci_state(files)
+    assert after.ci_failures == 1 and after.pending_ci is None
+    assert files._workflow_db.settle_pr_repair_result(returned, files._workflow_authority.writer).idempotent
+    assert issue_ci_state(files) == after
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
+
+
+def test_ci_reset_caught_receipt_failure_rolls_back_the_grant(monkeypatch):
+    workflow, files, _, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    control, store = files._workflow_authority, files._workflow_db
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    source = cc.CIEpisodeReset(selected.binding, selected.revision, control.read_pr_repair(key).revision.fence, "a" * 40)
+    with store.transaction() as db:
+        before = tuple(db.iterdump())
+        db.execute("CREATE TRIGGER fail_reset BEFORE INSERT ON dedupe_keys WHEN NEW.namespace='ci-episode-reset' BEGIN SELECT RAISE(ABORT,'reset receipt failure'); END")
+        @contextmanager
+        def borrowed():
+            yield db
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "transaction", borrowed)
+            with pytest.raises(Exception, match="reset receipt failure"):
+                control.reset_ci_episode(source)
+        db.execute("DROP TRIGGER fail_reset")
+        assert tuple(db.iterdump()) == before
+    assert issue_ci_state(files).ci_failures == 1
+
+
+def test_pending_ci_serializes_two_prs_for_the_same_issue(monkeypatch):
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    workflow, files, inner, key, returned = captured_interrupted_ci_result(monkeypatch)
+    workflow.gateway.prs[101] = replace(workflow.gateway.prs[100], number=101)
+    install_pr_repair_authority(workflow.gateway, files)
+    with monkeypatch.context() as patch:
+        patch.setattr(files._workflow_authority, "reconcile_pr_repair_returns", lambda: 0)
+        asyncio.run(workflow.fix_ci(101))
+    assert len(inner.tasks) == 1
+    assert issue_ci_state(files).pending_ci == returned.ci.admission
+    control = files._workflow_authority
+    selected = control.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    source = cc.CIEpisodeReset(selected.binding, selected.revision, control.read_pr_repair(key).revision.fence, "a" * 40)
+    before = issue_ci_state(files)
+    with pytest.raises(ValueError, match="selected admitted attempt"):
+        control.reset_ci_episode(source)
+    assert issue_ci_state(files) == before
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 1
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    asyncio.run(workflow.fix_ci(101))
+    assert len(inner.tasks) == 2 and issue_ci_state(files).ci_failures == 2
+
+
+def test_ci_pure_consumption_refuses_another_leg():
+    from issue_agent.domain.contracts import ContinuationAdmission, RunId, WorkflowAttemptIdentity
+    workflow, files, _, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed"))
+    selected = files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    purchase = cc.IssueCIPurchase(cc.ContinuationCapture(selected.binding, selected.revision, "captured-leg"),
+                                PullRequestRef(100), "a" * 40, 3)
+    wrong = ContinuationAdmission(WorkflowAttemptIdentity(selected.binding, RunId("captured-run"), "other-leg"),
+                                  selected.revision.version + 1)
+    with pytest.raises(ValueError, match="differs from its selected authority"):
+        cc.consume_issue_ci(selected, purchase, wrong)
+
+
+def test_ci_paired_result_refuses_another_repository(monkeypatch):
+    _, _, _, _, returned = captured_interrupted_ci_result(monkeypatch)
+    attempt = returned.ci.admission.attempt
+    foreign = replace(attempt.binding, fence=replace(attempt.binding.fence, key=WorkflowKey("other/repo", IssueRef(5))))
+    ci = replace(returned.ci, admission=replace(returned.ci.admission, attempt=replace(attempt, binding=foreign)))
+    with pytest.raises(ValueError, match="same launched run and leg"):
+        replace(returned, ci=ci)
 
 def test_adopted_pending_result_is_recovered(monkeypatch):
     _,files,_,key,returned = captured_interrupted_ci_result(monkeypatch)

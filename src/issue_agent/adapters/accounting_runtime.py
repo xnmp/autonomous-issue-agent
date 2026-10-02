@@ -396,6 +396,12 @@ class AccountingRuntime(AgentRuntime):
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
             continuations = (cc.PRRepairPurchase(capture, allowance=cc.RepairAllowance.CI, ceiling=2**63-1,
                                                  branch=selected.branch, handoff=selected.handoff),)
+            if selected.ci is not None:
+                ci = selected.ci
+                if issue != ci.selection.binding.fence.key.target.number:
+                    return _return_refused("CI allowance belongs to another linked issue")
+                capture = cc.ContinuationCapture(ci.selection.binding, ci.selection.revision, _leg_id or str(run_id))
+                continuations += (cc.IssueCIPurchase(capture, ci.pr, ci.head, ci.ceiling),)
         publication = _fix_publication_context(self.role, task.cwd)
         if (
             self.role == "fix"
@@ -431,6 +437,7 @@ class AccountingRuntime(AgentRuntime):
                 "split_fingerprint": hashlib.sha256(encode_workflow(task.split_input).encode()).hexdigest() if task.split_input is not None else None,
                 "number": number,
                 "issue": issue,
+                **({"ci_head": task.pr_repair_input.ci.head} if task.pr_repair_input is not None and task.pr_repair_input.ci is not None else {}),
                 "breaker_key": retry_key,
                 "claim_target": target,
                 "cwd": (
@@ -858,7 +865,11 @@ class AccountingRuntime(AgentRuntime):
             state = replace(repair_input.selection.component.state, branch=repair_input.branch,
                             session=session, actual_model=actual_model)
             writer = WorkflowWriter(self.repository, self.role, self.owner_id or f"{self.repository}:{self.role}")
-            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request), writer)
+            ci = (cc.CIRepairResult(self.store.ci_repair_admission(attempt),
+                cc.CICharge.BUDGET if budget_exhausted(result.exit_reason) else
+                cc.CICharge.INFRA if infra_class_failure(result) else cc.CICharge.ATTEMPT)
+                if repair_input.ci is not None else None)
+            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request, ci), writer)
         elif returned_review is not None:
             settlement = self.store.settle_review_return(request, returned_review)
         elif returned is None:

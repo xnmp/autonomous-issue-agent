@@ -22,6 +22,7 @@ from typing import Union
 from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from .labels import Label
 from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding
+from .continuation_components import CIEpisodeReset
 
 
 class Target(Enum):
@@ -330,6 +331,12 @@ class ResetCiRetries:
     submitted_at episode key)."""
 
     issue: int
+    source: CIEpisodeReset | None = None
+
+    def __post_init__(self) -> None:
+        if self.source is not None and (not isinstance(self.source, CIEpisodeReset)
+                or self.source.binding.fence.key.target != IssueRef(self.issue)):
+            raise ValueError("CI reset action belongs to another issue")
 
 
 @dataclass(frozen=True)

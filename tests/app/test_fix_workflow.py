@@ -41,6 +41,7 @@ from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, Workflow
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot
 
 
+from tests.fakes.accounted_workflow import issue_recovery_state
 from tests.fakes.accounted_workflow import (
     AccountedFixtureWorkflow, attach_workflow_authority,
     pr_repair_state,
@@ -49,20 +50,11 @@ from tests.fakes.accounted_workflow import (
 
 
 class RetryRecordingStore(FakeStore):
-    """FakeStore swallows the CI counter (set_ci_retries is a no-op) and has no
-    rebase counter at all, so the breaker-advance decision is unobservable through
-    it. Record both here — these tests are about WHETHER a counter moves."""
+    """The remaining rebase file authority needs an observable test counter."""
 
     def __init__(self):
         super().__init__()
-        self.ci_retries: dict[int, int] = {}
         self.rebase_retries: dict[int, int] = {}
-
-    def set_ci_retries(self, i, n):
-        self.ci_retries[i] = n
-
-    def get_ci_retries(self, i):
-        return self.ci_retries.get(i, 0)
 
     def set_rebase_retries(self, i, retries):
         self.rebase_retries[i] = retries
@@ -701,7 +693,7 @@ def test_fix_ci_error_advances_the_breaker():
 
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
-    assert store.get_ci_retries(5) == 1
+    assert issue_recovery_state(store).ci_failures == 1
 
 
 def test_fix_ci_infra_death_does_not_advance_the_breaker():
@@ -710,15 +702,21 @@ def test_fix_ci_infra_death_does_not_advance_the_breaker():
     # is no PR busy marker to clear).
     gw = FakeGateway(prs={100: _ci_pr()})
     store = RetryRecordingStore()
-    store.set_ci_retries(5, 2)
     runner = FakeRunner(
         AgentResult(is_error=True, status="timeout",
                     exit_reason=ExitReason.KILLED_EXTERNALLY)
     )
 
-    asyncio.run(_workflow(gw, store, runner).fix_ci(100))
+    workflow = _workflow(gw, store, runner)
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    with store._workflow_db.transaction() as db:
+        current = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(5)))
+        persist_workflow_snapshot(db, dataclasses.replace(current, issue_recovery=dataclasses.replace(current.issue_recovery,
+            state=dataclasses.replace(current.issue_recovery.state, ci_failures=2))))
+    asyncio.run(workflow.fix_ci(100))
 
-    assert store.get_ci_retries(5) == 2
+    assert issue_recovery_state(store).ci_failures == 2
     assert not any(c[0] == "relabel" for c in gw.calls)  # M22/D9: no PR label writes
 
 
@@ -760,7 +758,7 @@ def test_fix_ci_infra_death_counts_against_the_infra_ceiling(tmp_path):
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
     assert store.get_infra_deaths(5) == 1
-    assert store.get_ci_retries(5) == 0  # still not an attempt
+    assert issue_recovery_state(store).ci_failures == 0  # still not an attempt
 
 
 def test_fix_ci_error_does_not_touch_the_infra_ceiling(tmp_path):
@@ -774,7 +772,7 @@ def test_fix_ci_error_does_not_touch_the_infra_ceiling(tmp_path):
     asyncio.run(_workflow(gw, store, runner).fix_ci(100))
 
     assert store.get_infra_deaths(5) == 0
-    assert store.get_ci_retries(5) == 1
+    assert issue_recovery_state(store).ci_failures == 1
 
 
 def test_rebase_infra_death_counts_against_the_infra_ceiling(tmp_path):
@@ -844,7 +842,7 @@ def test_an_errored_result_also_resets_it(tmp_path):
     asyncio.run(wf.fix_ci(100))
 
     assert store.get_infra_deaths(5) == 0
-    assert store.get_ci_retries(5) == 1
+    assert issue_recovery_state(store).ci_failures == 1
 
 
 def test_deaths_that_never_return_still_reach_the_ceiling(tmp_path):
@@ -2681,13 +2679,18 @@ def test_selected_runtime_enum_is_normalized_in_durable_session_provenance():
 
 @pytest.mark.parametrize("resolve_activated", [True, False])
 def test_pr_only_repair_does_not_require_a_selected_resolve_authority_row(resolve_activated):
+    from issue_agent.domain.workflow import IssueWorkflowShell
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
     gateway = FakeGateway(prs={100: _ci_pr_at("a" * 40, "unit")})
     store = FakeStore()
     runner = _pushed_runner()
     workflow = _workflow(gateway, store, runner)
     with store._workflow_db.transaction() as db:
-        db.execute("DELETE FROM workflow_components WHERE target_kind='issue'")
-        db.execute("DELETE FROM workflows WHERE target_kind='issue'")
+        current = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(5)))
+        db.execute("DELETE FROM workflow_components WHERE target_kind='issue' AND family='resolve'")
+        shell = IssueWorkflowShell(current.revision, current.issue_recovery, current.steward)
+        persist_workflow_snapshot(db, shell)
         if not resolve_activated:
             db.execute("DELETE FROM workflow_authority_epochs WHERE family='resolve'")
     asyncio.run(workflow.fix_ci(100))
@@ -2917,7 +2920,7 @@ def test_an_unavailable_active_review_guidance_read_defers_every_repair_before_s
     with pytest.raises(WorkflowAuthorityError):
         asyncio.run(getattr(workflow, handler)(100))
     assert runner.tasks == [] and store.get_review_retry(5) == ("", 0)
-    assert store.resumes.get(5, 0) == 0 and store.ci_retries == {} and store.rebase_retries == {}
+    assert store.resumes.get(5, 0) == 0 and issue_recovery_state(store).ci_failures == 0 and store.rebase_retries == {}
     assert ensured == []  # not even a worktree is prepared for a deferred repair
 
 

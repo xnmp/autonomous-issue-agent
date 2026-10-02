@@ -195,6 +195,22 @@ def issue_reply_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContin
     return tuple(comparisons)
 
 
+def ci_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, int, int], ...]:
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.IssueRecoveryState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.ISSUE_RECOVERY)
+        if len(found) > 1:
+            raise ValueError("eligible CI shadow has ambiguous source ownership")
+        source = dict(found[0].fields).get("ci-retries", LegacyAbsent()) if found else LegacyAbsent()
+        if not isinstance(source, (LegacyAbsent, LegacyPresent)):
+            raise ValueError("eligible CI shadow has unreadable selected debt")
+        before = int(source.text.strip()) if isinstance(source, LegacyPresent) else 0
+        comparisons.append((target.key, before, target.state.ci_failures))
+    return tuple(comparisons)
+
+
 def triage_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple[str, int], tuple[str, int]], ...]:
     comparisons = []
     for target in plan.targets:

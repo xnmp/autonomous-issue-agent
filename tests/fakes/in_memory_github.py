@@ -65,8 +65,14 @@ class InMemoryGitHub:
             base_ref_oid=pr.base_ref_oid or "base-sha",
         )
 
-    def pr_for_issue(self, issue: int) -> int | None:
+    def pr_for_issue(self, issue: int, *, require_unique: bool = False) -> int | None:
         self._maybe_fail("pr_for_issue")
+        if require_unique:
+            from issue_agent.domain.world import issue_for_pr
+            matches = {pr.number for pr in self.prs.values() if pr.state == "OPEN" and issue_for_pr(pr) == issue}
+            if len(matches) > 1:
+                raise ValueError("CI reset open PR linkage is ambiguous")
+            return next(iter(matches), None)
         return self._pr_for_issue.get(issue)
 
     def issue_for_pr(self, pr: int) -> int | None:

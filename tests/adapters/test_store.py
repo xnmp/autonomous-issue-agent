@@ -15,6 +15,15 @@ from issue_agent.domain.triage import grooming_candidates, grooming_content
 from issue_agent.domain.world import IssueView, WorldState
 
 
+def _seed_legacy_ci_counter(store, issue, count):
+    Path(store.issue_path(issue, "ci-retries")).write_text(str(count))
+
+
+def _legacy_ci_counter(store, issue):
+    path = Path(store.issue_path(issue, "ci-retries"))
+    return int(path.read_text()) if path.exists() else 0
+
+
 def _store():
     d = tempfile.mkdtemp()
     return Store(state_dir=d), d
@@ -49,13 +58,6 @@ def test_resumed_at_and_resumes_counter():
     assert s.get_pr_resumed_at(100) == "2026-01-01T00:00:03Z"
     assert s.bump_resumes(5) == 1
     assert s.bump_resumes(5) == 2
-
-
-def test_ci_retries():
-    s, _ = _store()
-    assert s.get_ci_retries(5) == 0
-    s.set_ci_retries(5, 3)
-    assert s.get_ci_retries(5) == 3
 
 
 # ── CI attempt history (tauri PR #620) ──────────────────────────────────────
@@ -109,7 +111,7 @@ def test_appending_over_a_corrupt_ci_history_starts_a_fresh_record():
 
 def test_an_operator_retry_unblock_also_forgets_the_attempt_history():
     s, _ = _store()
-    s.set_ci_retries(5, 3)
+    _seed_legacy_ci_counter(s, 5, 3)
     s.append_ci_attempt(5, CiAttempt("abc", ("unit",)))
 
     assert s.clear_retries(5) == 1  # counters retired — history is not one
@@ -117,16 +119,14 @@ def test_an_operator_retry_unblock_also_forgets_the_attempt_history():
     assert s.get_ci_history(5) == ()
 
 
-def test_green_ci_closes_the_episode_for_the_counter_and_the_history_together():
-    # ResetCiRetries' episode rule, extended to the history: a later unrelated
-    # red episode must not read attempts a green run already resolved.
+def test_advisory_ci_history_clear_does_not_mutate_retained_legacy_counter():
     s, _ = _store()
-    s.set_ci_retries(5, 2)
+    _seed_legacy_ci_counter(s, 5, 2)
     s.append_ci_attempt(5, CiAttempt("abc", ("unit",)))
 
-    s.reset_ci_episode(5)
+    s.clear_ci_history(5)
 
-    assert s.get_ci_retries(5) == 0
+    assert _legacy_ci_counter(s, 5) == 2
     assert s.get_ci_history(5) == ()
 
 
@@ -157,7 +157,7 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
         with open(path, "w") as f:
             f.write("not-an-int")
 
-    for read in (lambda: s.get_ci_retries(5), lambda: s.get_rebase_retries(5),
+    for read in (lambda: s.get_rebase_retries(5),
                  lambda: s.get_review_retry(5),
                  lambda: s.bump_resumes(5)):
         with pytest.raises(ValueError, match="control unavailable"):
@@ -174,10 +174,10 @@ def test_malformed_numeric_state_blocks_reads_and_increments():
 # collision the pid-suffixed tmp name exists to avoid.
 def test_write_leaves_no_tmp_file_after_success():
     s, root = _store()
-    s.set_ci_retries(5, 4)
+    s.set_rebase_retries(5, 4)
 
-    assert s.get_ci_retries(5) == 4
-    assert os.path.exists(os.path.join(root, "issue-5.ci-retries"))
+    assert s.get_rebase_retries(5) == 4
+    assert os.path.exists(os.path.join(root, "issue-5.rebase-retries"))
     leftover = [f for f in os.listdir(root) if f.endswith(".tmp")]
     assert leftover == []
 
@@ -190,17 +190,17 @@ def test_write_survives_crash_before_replace(monkeypatch):
     # fail, so it would silently install the new (wrong-for-this-test) value
     # and this assertion would catch it.
     s, _ = _store()
-    s.set_ci_retries(5, 4)
+    s.set_rebase_retries(5, 4)
 
     def _boom(_src, _dst):
         raise OSError("simulated crash before replace")
 
     monkeypatch.setattr(os, "replace", _boom)
     try:
-        s.set_ci_retries(5, 9)
+        s.set_rebase_retries(5, 9)
     except OSError:
         pass
-    assert s.get_ci_retries(5) == 4
+    assert s.get_rebase_retries(5) == 4
 
 
 def test_write_syncs_tmp_file_before_replace(monkeypatch):
@@ -217,9 +217,9 @@ def test_write_syncs_tmp_file_before_replace(monkeypatch):
         return real_fsync(fd)
 
     monkeypatch.setattr(os, "fsync", _tracking_fsync)
-    s.set_ci_retries(5, 4)
+    s.set_rebase_retries(5, 4)
     assert calls, "Store._write must fsync the tmp file before os.replace"
-    assert s.get_ci_retries(5) == 4
+    assert s.get_rebase_retries(5) == 4
 
 
 def test_tmp_name_is_pid_suffixed(monkeypatch):
@@ -235,9 +235,9 @@ def test_tmp_name_is_pid_suffixed(monkeypatch):
         real_replace(src, dst)
 
     monkeypatch.setattr(os, "replace", _capture)
-    s.set_ci_retries(5, 4)
+    s.set_rebase_retries(5, 4)
     assert str(os.getpid()) in seen["src"]
-    assert s.get_ci_retries(5) == 4
+    assert s.get_rebase_retries(5) == 4
 
 
 def test_review_retry_pair():
@@ -253,14 +253,14 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     """An operator unblock resets the retry ceilings a wedge consumed — and
     deliberately not the two that bound unwinnable work."""
     s, _ = _store()
-    s.set_ci_retries(5, 3)
+    _seed_legacy_ci_counter(s, 5, 3)
     s.set_review_retry(5, "2026-01-01T00:00:00Z", 2)
     s.set_rebase_retries(5, 1)
     s.set_infra_deaths(5, 5)
 
     assert s.clear_retries(5) == 3  # reports what it actually retired
 
-    assert s.get_ci_retries(5) == 0
+    assert _legacy_ci_counter(s, 5) == 0
     assert s.get_review_retry(5) == ("", 0)
     assert s.get_rebase_retries(5) == 0
     assert s.get_infra_deaths(5) == 5
@@ -269,7 +269,7 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
 def test_clear_retries_on_an_untouched_key_is_a_no_op_not_an_error():
     s, _ = _store()
     assert s.clear_retries(-112) == 0  # the negated-PR breaker key namespace
-    assert s.get_ci_retries(-112) == 0
+    assert _legacy_ci_counter(s, -112) == 0
 
 
 def test_automerge_marker():
@@ -356,14 +356,14 @@ def test_jira_key_and_phase_roundtrip_and_cleared():
 def test_clear_issue_removes_all():
     s, _ = _store()
     s.save_session(5, "x")
-    s.set_ci_retries(5, 2)
+    _seed_legacy_ci_counter(s, 5, 2)
     s.set_rebase_retries(5, 1)
     s.set_resumed_at(5, "t")
     s.set_phase(5, "authored")
     s.bump_infra_deaths(5)
     s.clear_issue(5)
     assert not s.has_session(5)
-    assert s.get_ci_retries(5) == 0
+    assert _legacy_ci_counter(s, 5) == 0
     assert s.get_rebase_retries(5) == 0
     assert s.get_phase(5) == ""           # phase cleared on teardown
     assert s.get_infra_deaths(5) == 0     # review M4/D8: infra-deaths clears too
@@ -436,8 +436,8 @@ def test_every_issue_accessor_suffix_is_covered_by_exactly_one_cleaner():
     # review M4: a new accessor with an unlisted suffix must fail this test
     # instead of silently leaking a STATE_DIR file forever (introspects the
     # module: accessors' suffix strings vs _ISSUE_SUFFIXES).
-    # The retired triage counter still needs cleanup in existing state roots.
-    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage"} == set(store_module._ISSUE_SUFFIXES)
+    # Retired triage/CI counters still need cleanup in existing state roots.
+    assert _accessor_suffixes("issue_path") | {"steward-stalls-triage", "ci-retries"} == set(store_module._ISSUE_SUFFIXES)
 
 
 def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
@@ -547,7 +547,7 @@ def _triage_at_has_a_cleaner() -> bool:
 
 def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
-    used.add(("issue_path", "steward-stalls-triage"))
+    used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries")}
     used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
 

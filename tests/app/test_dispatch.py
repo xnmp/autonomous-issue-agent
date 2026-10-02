@@ -38,6 +38,7 @@ from issue_agent.domain.labels import Label
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
 from tests.fakes.review_authority import with_review_authority, review_state
 from tests.fakes.accounted_dispatch import with_resolve_authority
+from tests.fakes.accounted_workflow import issue_recovery_state
 from tests.fakes.accounted_workflow import resolve_state, pr_repair_state
 from tests.fakes.accounted_workflow import attach_workflow_authority
 
@@ -128,12 +129,6 @@ class FakeStore:
 
     def set_triage_at(self, i, at):
         self.triage_at[i] = at
-
-    def set_ci_retries(self, i, n):
-        pass
-
-    def get_ci_retries(self, i):
-        return 0
 
     def get_phase(self, i):
         return self.phases.get(i, "")
@@ -995,7 +990,7 @@ def test_fix_ci_mid_dispatch_failure_keeps_the_retry_counted(tmp_path):
     asyncio.run(d.dispatch(RunAgent(AgentKind.FIX_CI, 100)))  # completes: the bad action is isolated, not raised
 
     assert pr_repair_state(store).session.handle == "c-live"
-    assert store.get_ci_retries(5) == 1                   # the attempt DID count
+    assert issue_recovery_state(store).ci_failures == 1                   # the attempt DID count
     assert not any(c[0] == "relabel" for c in gw.calls)    # the ai-blocked write never landed
     assert store.get_infra_deaths(5) == 0                  # isolated at the action level, not the session level
 

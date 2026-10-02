@@ -1049,6 +1049,11 @@ def test_the_composed_fix_role_defers_a_repair_on_unreadable_review_guidance_the
     client.request("request:scope", guidance=SetGuidance("Only judge the parser change."))
     progress_until(client, lambda c: len(c.provider.tasks) == 3)
     assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"  # the fixer now owes an address-review
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
+    control = SQLiteControlStore(client.review.control.path)
+    control.initialize()
+    install_workflow(control, with_issue_recovery(resolve_snapshot(1)))
     with sqlite3.connect(client.review.control.path) as db:
         committed = db.execute("SELECT episode_json FROM workflows WHERE target_number=?", (PR,)).fetchone()[0]
         db.execute("UPDATE workflows SET episode_json='corrupt' WHERE target_number=?", (PR,))

@@ -25,7 +25,7 @@ from ..adapters.workflow_rows import load_issue_aggregate, load_review_workflow_
 from ..domain import continuation_components as cc
 from ..domain.continuation_import import (
     ISSUE_FIELDS, PR_FIELDS, STEWARD_FIELDS, MAX_IMPORT_TARGETS,
-    ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, classify_record, digest, issue_reply_shadow, triage_shadow, groom_shadow,
+    ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, classify_record, digest, ci_shadow, issue_reply_shadow, triage_shadow, groom_shadow,
 )
 from ..domain.refs import issue_from_branch
 from ..domain.resolve_activation import LegacyAbsent
@@ -191,6 +191,8 @@ def inspect(scope: ContinuationActivationScope, *, shadow: bool) -> dict[str, ob
     if shadow:
         result["issue_reply_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
                                         for key, before, after in issue_reply_shadow(plan, records)]
+        result["ci_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
+                              for key, before, after in ci_shadow(plan, records)]
         result["triage_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
                                    for key, before, after in triage_shadow(plan, records)]
         result["groom_shadow"] = [{"issue": key.target.number, "legacy": before, "imported": after, "agrees": before == after}
