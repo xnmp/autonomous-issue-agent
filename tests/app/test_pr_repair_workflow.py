@@ -98,6 +98,389 @@ def issue_ci_state(files, issue=5):
         return cc.select_issue_recovery(aggregate).component.state
 
 
+def pr_reply_workflow(*, establish_session=True, body="Use A."):
+    from issue_agent.domain.world import Comment, IssueView
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", cost_usd=.01, session_id="selected-pr-session"))
+    workflow.gateway.issues[5] = IssueView(5, title="Choose an option")
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
+    if establish_session:
+        asyncio.run(workflow.fix_ci(100))
+        # Retained files are deliberately present; the selected SQL receipt owns continuity.
+        files.save_session(5, "selected-pr-session")
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], comments=(
+        Comment("alice", body, "2026-10-02T00:00:01Z"),))
+    return workflow, files, inner, key
+
+
+def test_duplicate_pr_reply_purchases_one_resume_and_keeps_issue_marker_independent():
+    workflow, files, inner, key = pr_reply_workflow()
+    before_issue = issue_ci_state(files)
+    asyncio.run(workflow.resume_pr(100))
+    asyncio.run(workflow.resume_pr(100))
+    assert len(inner.tasks) == 2  # One initial CI leg and one reply-driven resume.
+    assert issue_ci_state(files) == before_issue
+    state = files._workflow_authority.read_pr_repair(key).component.state
+    assert state.consumed_reply_at == "2026-10-02T00:00:01Z" and state.resumes == 1
+    assert files.pr_resumed_at == {}
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 2
+        assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
+
+
+def test_nonblank_pr_reply_without_compatible_session_stays_unconsumed():
+    workflow, files, inner, key = pr_reply_workflow(establish_session=False)
+    before = files._workflow_authority.read_pr_repair(key)
+    asyncio.run(workflow.resume_pr(100))
+    assert inner.tasks == [] and files._workflow_authority.read_pr_repair(key) == before
+    assert files.pr_resumed_at == {}
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 0
+
+
+def test_blank_pr_reply_consumes_once_without_session_money_or_issue_reblock():
+    workflow, files, inner, key = pr_reply_workflow(establish_session=False, body=" \n ")
+    before_issue = issue_ci_state(files)
+    asyncio.run(workflow.resume_pr(100))
+    selected = files._workflow_authority.read_pr_repair(key)
+    assert selected.component.state.consumed_reply_at == "2026-10-02T00:00:01Z"
+    asyncio.run(workflow.resume_pr(100))
+    assert files._workflow_authority.read_pr_repair(key) == selected
+    assert issue_ci_state(files) == before_issue and inner.tasks == [] and workflow.gateway.calls == []
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM budget_reservations").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM lifecycle_commands").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("blank", [False, True])
+def test_reordered_pr_reply_cannot_overwrite_newer_consumption(blank):
+    from issue_agent.domain.world import Comment
+    workflow, files, inner, key = pr_reply_workflow()
+    asyncio.run(workflow.resume_pr(100))
+    latest = files._workflow_authority.read_pr_repair(key)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], comments=(
+        Comment("alice", " " if blank else "older", "2026-10-01T00:00:01Z"),))
+    asyncio.run(workflow.resume_pr(100))
+    assert files._workflow_authority.read_pr_repair(key) == latest and len(inner.tasks) == 2
+
+
+@pytest.mark.parametrize("changed", ["closed", "branch", "runtime"])
+def test_changed_pr_or_incompatible_session_defers_unconsumed(changed):
+    workflow, files, inner, key = pr_reply_workflow()
+    before = files._workflow_authority.read_pr_repair(key)
+    if changed == "closed":
+        workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], state="CLOSED")
+    elif changed == "branch":
+        workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_name="fix/5-new")
+    else:
+        workflow.cfg = replace(workflow.cfg, fixer_runtime="codex")
+    asyncio.run(workflow.resume_pr(100))
+    assert files._workflow_authority.read_pr_repair(key) == before and len(inner.tasks) == 1
+
+
+def test_pr_reply_budget_refusal_preserves_session_marker_and_allowance(monkeypatch):
+    from issue_agent.adapters.control_store import AccountingDisposition, ReservationResult
+    from issue_agent.domain.contracts import Money
+    workflow, files, inner, key = pr_reply_workflow()
+    before = files._workflow_authority.read_pr_repair(key)
+    monkeypatch.setattr(files._workflow_db, "reserve", lambda request: ReservationResult(
+        AccountingDisposition.EXHAUSTED, None, Money("USD", 0), request.quote.maximum_charge, Money("USD", 0), "cap"))
+    asyncio.run(workflow.resume_pr(100))
+    assert files._workflow_authority.read_pr_repair(key) == before and len(inner.tasks) == 1
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_pr_reply_missing_selected_session_receipt_refuses_before_money():
+    workflow, files, inner, key = pr_reply_workflow()
+    with files._workflow_db.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='continuation-return'")
+    with pytest.raises(WorkflowAuthorityError, match="output receipt"):
+        asyncio.run(workflow.resume_pr(100))
+    assert len(inner.tasks) == 1
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_same_head_relink_keeps_pr_consumption_and_does_not_grant_issue_allowance():
+    from issue_agent.domain.world import Comment, IssueView
+    from tests.fakes.workflow_authority import resolve_snapshot, with_issue_recovery
+    workflow, files, inner, key = pr_reply_workflow()
+    asyncio.run(workflow.resume_pr(100))
+    install_workflow(files._workflow_db, with_issue_recovery(resolve_snapshot(6)))
+    before_issue = issue_ci_state(files, 6)
+    workflow.gateway.issues[6] = IssueView(6)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], closing_issue=6)
+    asyncio.run(workflow.resume_pr(100))
+    assert len(inner.tasks) == 2 and issue_ci_state(files, 6) == before_issue
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], comments=(
+        Comment("alice", "new", "2026-10-02T00:00:02Z"),))
+    asyncio.run(workflow.resume_pr(100))
+    assert len(inner.tasks) == 3 and issue_ci_state(files, 6) == before_issue
+    assert files._workflow_authority.read_pr_repair(key).component.state.resumes == 2
+
+
+def test_pr_reply_fresh_process_recovers_captured_return_once(monkeypatch):
+    import json
+    import subprocess
+    import sys
+    workflow, files, inner, key = pr_reply_workflow()
+    with monkeypatch.context() as patch:
+        patch.setattr(files._workflow_db, "settle_pr_repair", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("lost after capture")))
+        with pytest.raises(RuntimeError, match="lost after capture"):
+            asyncio.run(workflow.resume_pr(100))
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+    with files._workflow_db.transaction() as db:
+        current = load_review_workflow_row(db, key)
+        assert current is not None
+        retained = replace(current, gates=held(key=key).gates)
+        persist_workflow_snapshot(db, retained)
+    sibling = (retained.episode, retained.execution, retained.gates, retained.authority)
+    child = subprocess.run([sys.executable, "-c", '''
+import json,sys
+from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+from issue_agent.domain.workflow_identity import WorkflowWriter
+store=SQLiteControlStore(sys.argv[1]);store.initialize()
+control=SQLiteWorkflowControl(store,WorkflowWriter("o/r","fix","o/r:fix:fixture"),resolve_ceiling=0)
+print(json.dumps([control.reconcile_pr_repair_returns(),control.reconcile_pr_repair_returns()]))
+''', files._workflow_db.path], check=False, capture_output=True, text=True, timeout=30)
+    assert child.returncode == 0, child.stderr
+    assert json.loads(child.stdout) == [1, 0]
+    asyncio.run(workflow.resume_pr(100))
+    assert len(inner.tasks) == 2
+    state = files._workflow_authority.read_pr_repair(key).component.state
+    assert state.resumes == 1 and state.branch == "fix/5-remote" and state.session.handle == "selected-pr-session"
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
+        after = load_review_workflow_row(db, key)
+        assert after is not None
+    assert (after.episode, after.execution, after.gates, after.authority) == sibling
+
+
+def test_blank_pr_publication_caught_write_failure_rolls_back_selected_source(monkeypatch):
+    import issue_agent.adapters.workflow_rows as rows
+    workflow, files, _, key = pr_reply_workflow(body=" ")
+    store = files._workflow_db
+    selected = files._workflow_authority.read_pr_repair(key)
+    original = rows.persist_workflow_snapshot
+    def fail(db, state):
+        original(db, state)
+        raise RuntimeError("after blank component write")
+    with store.transaction() as db:
+        @contextmanager
+        def borrowed():
+            yield db
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "transaction", borrowed)
+            patch.setattr(rows, "persist_workflow_snapshot", fail)
+            with pytest.raises(RuntimeError, match="blank component"):
+                files._workflow_authority.consume_blank_pr_reply(selected.binding, "2026-10-02T00:00:01Z", " ")
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('scratch','o/r','outer','0','{}')")
+    assert files._workflow_authority.read_pr_repair(key) == selected
+    with store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='pr-reply-noop'").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='scratch'").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("corruption", ["missing", "malformed", "wrong_binding"])
+def test_selected_blank_receipt_corruption_refuses_new_paid_reply(corruption):
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.domain.world import Comment
+    workflow, files, inner, key = pr_reply_workflow(body=" ")
+    asyncio.run(workflow.resume_pr(100))
+    with files._workflow_db.transaction() as db:
+        if corruption == "missing":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace='pr-reply-noop'")
+        elif corruption == "malformed":
+            db.execute("UPDATE dedupe_keys SET payload_json='{}' WHERE namespace='pr-reply-noop'")
+        else:
+            receipt = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-reply-noop'").fetchone()[0], tuple)
+            wrong = replace(receipt[0], fence=replace(receipt[0].fence, key=WorkflowKey("o/r", PullRequestRef(101))))
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='pr-reply-noop'", (encode_workflow((wrong, *receipt[1:])),))
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], comments=(Comment("alice", "newer", "2026-10-02T00:00:02Z"),))
+    with pytest.raises(ValueError):
+        asyncio.run(workflow.resume_pr(100))
+    assert len(inner.tasks) == 1
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 1
+
+
+def test_reopened_blank_source_allows_new_paid_reply_and_clears_only_its_reference():
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.domain.world import Comment
+    workflow, files, inner, key = pr_reply_workflow(body=" ")
+    asyncio.run(workflow.resume_pr(100))
+    reopened = SQLiteControlStore(files._workflow_db.path)
+    reopened.initialize()
+    control = SQLiteWorkflowControl(reopened, files._workflow_authority.writer, resolve_ceiling=0)
+    selected = control.read_pr_repair(key)
+    assert not control.consume_blank_pr_reply(selected.binding, "2026-10-02T00:00:01Z", " ")
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], comments=(Comment("alice", "newer", "2026-10-02T00:00:02Z"),))
+    asyncio.run(workflow.resume_pr(100))
+    current = control.read_pr_repair(key).component.state
+    assert current.blank_reply is None and current.resumes == 1 and len(inner.tasks) == 2
+    assert current.consumed_reply_at == "2026-10-02T00:00:02Z"
+
+
+def interrupted_linked_reply(monkeypatch):
+    from tests.app.test_issue_reply_admission import setup_reply
+    from tests.fakes.accounted_workflow import attach_workflow_authority
+    workflow, gateway, files, inner = setup_reply()
+    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
+    gateway._pr_for_issue[5] = 100
+    attach_workflow_authority(gateway, files, pr_repair=True)
+    inner.result = AgentResult(is_error=False, status="pushed", cost_usd=.01, session_id="linked-return")
+    with monkeypatch.context() as patch:
+        patch.setattr(files._workflow_db, "settle_pr_repair", lambda *a, **kw: (_ for _ in ()).throw(RuntimeError("lost after capture")))
+        with pytest.raises(RuntimeError, match="lost after capture"):
+            asyncio.run(workflow.resume(5))
+    with files._workflow_db.transaction() as db:
+        returned = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
+    return workflow, files, inner, WorkflowKey("o/r", PullRequestRef(100)), returned
+
+
+def test_generic_linked_issue_settlement_caught_refusal_keeps_real_recovery_usable(monkeypatch):
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    workflow, files, inner, key, returned = interrupted_linked_reply(monkeypatch)
+    store = files._workflow_db
+    before = store.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    before_pr = store.read_pr_repair(key)
+    with store.transaction() as db:
+        admission = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-admission' AND key=?",
+            (store._continuation_receipt_key(returned.admission.attempt.run_id, WorkflowFamily.ISSUE_RECOVERY),)).fetchone()[0], tuple)[1]
+        @contextmanager
+        def borrowed():
+            yield db
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "transaction", borrowed)
+            with pytest.raises(WorkflowAuthorityError, match="paired repair result"):
+                store.settle_issue_recovery(returned.settlement, admission, before.component.state)
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('scratch','o/r','outer','0','{}')")
+    assert store.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))) == before and store.read_pr_repair(key) == before_pr
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    asyncio.run(workflow.resume(5))
+    assert len(inner.tasks) == 1 and files._workflow_authority.read_pr_repair(key).component.state.session.handle == "linked-return"
+
+
+@pytest.mark.parametrize("namespace", ["continuation-admission", "continuation-return"])
+def test_linked_pr_exact_retry_requires_selected_issue_receipt(monkeypatch, namespace):
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    _, files, _, _, returned = interrupted_linked_reply(monkeypatch)
+    store = files._workflow_db
+    store.settle_pr_repair_result(returned, files._workflow_authority.writer)
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND key=?", (namespace,
+            store._continuation_receipt_key(returned.admission.attempt.run_id, WorkflowFamily.ISSUE_RECOVERY)))
+    with pytest.raises(WorkflowAuthorityError, match="admission|receipt"):
+        store.settle_pr_repair_result(returned, files._workflow_authority.writer)
+    with store.transaction() as db:
+        assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
+
+
+def test_issue_and_pr_with_same_number_consume_their_own_threads():
+    from issue_agent.domain.world import Comment, IssueView
+    from tests.fakes.workflow_authority import resolve_snapshot, with_issue_recovery
+    workflow, files, inner, key = pr_reply_workflow()
+    install_workflow(files._workflow_db, with_issue_recovery(resolve_snapshot(100)))
+    workflow.gateway.issues[100] = IssueView(100, title="separate", comments=(
+        Comment("alice", "issue answer", "2026-10-02T00:00:01Z"),))
+    asyncio.run(workflow.resume(100))
+    assert issue_ci_state(files, 100).consumed_reply_at == "2026-10-02T00:00:01Z"
+    assert files._workflow_authority.read_pr_repair(key).component.state.consumed_reply_at == ""
+    asyncio.run(workflow.resume_pr(100))
+    assert files._workflow_authority.read_pr_repair(key).component.state.consumed_reply_at == "2026-10-02T00:00:01Z"
+    assert issue_ci_state(files, 100).resumes == 1 and issue_ci_state(files).consumed_reply_at == ""
+    assert len(inner.tasks) == 3
+
+
+def test_linked_reply_proven_unlaunched_release_finishes_both_without_paid_session(monkeypatch):
+    from issue_agent.domain.world import Comment
+    from tests.app.test_issue_reply_admission import setup_reply
+    from tests.fakes.accounted_workflow import attach_workflow_authority
+    workflow, gateway, files, inner = setup_reply()
+    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
+    gateway._pr_for_issue[5] = 100
+    attach_workflow_authority(gateway, files, pr_repair=True)
+    async def failed_spawn(task):
+        raise FileNotFoundError("provider executable missing")
+    with monkeypatch.context() as patch:
+        patch.setattr(inner, "run", failed_spawn)
+        with pytest.raises(FileNotFoundError):
+            asyncio.run(workflow.resume(5))
+    assert files._workflow_authority.read_pr_repair(WorkflowKey("o/r", PullRequestRef(100))).component.state.session is None
+    assert issue_ci_state(files).resumes == 0
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='continuation-return'").fetchone()[0] == 2
+    gateway.issues[5] = replace(gateway.issues[5], comments=(Comment("alice", "newer", "2026-10-02T00:00:00Z"),))
+    inner.result = AgentResult(is_error=False, status="pushed", cost_usd=.01, session_id="new")
+    asyncio.run(workflow.resume(5))
+    assert len(inner.tasks) == 1 and issue_ci_state(files).resumes == 0
+
+
+@pytest.mark.parametrize("entrypoint", ["register_process_lease", "register_lease"])
+def test_selected_blank_source_corruption_after_reservation_refuses_launch(monkeypatch, entrypoint):
+    from datetime import datetime, timezone
+    from issue_agent.adapters.control_store import Lease
+    from tests.app.test_issue_reply_admission import setup_reply
+    from tests.fakes.accounted_workflow import attach_workflow_authority
+    workflow, gateway, files, inner = setup_reply()
+    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="a" * 40, closing_issue=5)
+    gateway._pr_for_issue[5] = 100
+    attach_workflow_authority(gateway, files, pr_repair=True)
+    store = files._workflow_db
+    selected = files._workflow_authority.read_pr_repair(WorkflowKey("o/r", PullRequestRef(100)))
+    files._workflow_authority.consume_blank_pr_reply(selected.binding, "2026-10-01T00:00:00Z", " ")
+    captured = []
+    original = store.reserve
+    def interrupted(request):
+        reserved = original(request)
+        assert reserved.reservation_id is not None
+        captured.append(request)
+        raise RuntimeError("lost after reservation")
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "reserve", interrupted)
+        with pytest.raises(RuntimeError, match="lost after reservation"):
+            asyncio.run(workflow.resume(5))
+    request = captured[0]
+    with store.transaction() as db:
+        db.execute("DELETE FROM dedupe_keys WHERE namespace='pr-reply-noop'")
+    with pytest.raises(WorkflowAuthorityError, match="blank PR reply"):
+        if entrypoint == "register_process_lease":
+            store.register_process_lease(request.run_id, expected_owner_id=request.owner_id,
+                                         pid=123, pgid=123, process_start_ticks=456)
+        else:
+            now = datetime.now(timezone.utc)
+            store.register_lease(Lease(run_id=request.run_id, dispatch_id=request.dispatch_id, owner_id=request.owner_id,
+                                      pid=123, pgid=123, started_at=now, process_start_ticks=456))
+    assert inner.tasks == []
+    with store.transaction() as db:
+        assert db.execute("SELECT COUNT(*) FROM leases").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+
+
+def test_linked_stale_return_settles_money_without_new_generation_overwrite(monkeypatch):
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, load_review_workflow_row, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowRevision
+    workflow, files, inner, key, returned = interrupted_linked_reply(monkeypatch)
+    with files._workflow_db.transaction() as db:
+        for selected_key in (WorkflowKey("o/r", IssueRef(5)), key):
+            current = load_review_workflow_row(db, selected_key) if selected_key == key else load_issue_aggregate(db, selected_key)
+            persist_workflow_snapshot(db, replace(current, revision=WorkflowRevision(
+                replace(current.revision.fence, generation=current.revision.fence.generation+1), current.revision.version+1)))
+    before_issue = issue_ci_state(files)
+    before_pr = files._workflow_authority.read_pr_repair(key)
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    assert issue_ci_state(files) == before_issue and files._workflow_authority.read_pr_repair(key) == before_pr
+    files._workflow_db.settle_pr_repair_result(returned, files._workflow_authority.writer)
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
+
+
 def test_rebase_charges_sql_allowance_and_exact_retry_preserves_sibling_debt():
     from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
     workflow, files, inner, key = active_ci_workflow(AgentResult(
@@ -1179,13 +1562,15 @@ def test_never_launched_claim_refusal_does_not_strand_component(monkeypatch):
     asyncio.run(workflow.fix_ci(100))
     assert len(inner.tasks) == 1
 
-@pytest.mark.parametrize("lane", ["ci", "review", "rebase"])
+@pytest.mark.parametrize("lane", ["ci", "review", "rebase", "linked_reply"])
 def test_caught_paid_settlement_failure_rolls_back_money_and_continuity(monkeypatch, lane):
     import issue_agent.adapters.workflow_rows as rows
     if lane == "ci":
         _,files,_,key,returned=captured_interrupted_ci_result(monkeypatch)
     elif lane == "rebase":
         _, files, _, key, returned = interrupted_rebase(monkeypatch)
+    elif lane == "linked_reply":
+        _, files, _, key, returned = interrupted_linked_reply(monkeypatch)
     else:
         _,files,_,key=interrupted_review(monkeypatch)
         with files._workflow_db.transaction() as db:

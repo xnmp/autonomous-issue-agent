@@ -145,6 +145,12 @@ class AccountedFixtureWorkflow(FixWorkflow):
         with self._accounted(issue, "REBASE", None):
             await super().rebase(pr, issue_hint=issue_hint)
 
+    async def resume_pr(self, pr, *, issue_hint=None):
+        issue = issue_hint or self.gateway.issue_for_pr(pr)
+        with self._accounted(issue, "PR_RESUME", None):
+            self.runner.set_context("fix", "PR_RESUME", pr, issue, workflow=None)
+            await super().resume_pr(pr, issue_hint=issue_hint)
+
     async def resolve(self, issue, *, binding=None):
         binding = binding or resolve_state(self.store, issue).binding
         with self._accounted(issue, "RESOLVE", binding):

@@ -764,8 +764,8 @@ def test_blocked_pr_review_prompt_ignores_comments_before_the_prompt():
     blocked = pr(
         100, "ai-pr-open", "ai-blocked", closing_issue=7,
         comments=(
-            Comment("alice", "Earlier feedback", "t1"),
-            Comment("fix-bot", review_prompt, "t2"),
+            Comment("alice", "Earlier feedback", "2026-10-01T00:00:01Z"),
+            Comment("fix-bot", review_prompt, "2026-10-01T00:00:02Z"),
         ),
     )
     state = FixState(sessions=frozenset({7}))
@@ -774,13 +774,45 @@ def test_blocked_pr_review_prompt_ignores_comments_before_the_prompt():
     assert _run_agents(decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)) == []
 
 
+@pytest.mark.parametrize("blank", [False, True])
+def test_unavailable_pr_reply_authority_refuses_only_the_selected_reply(blank):
+    comments = (Comment("alice", " " if blank else "Use A.", "2026-10-01T00:00:02Z"),)
+    blocked = pr(100, "ai-pr-open", "ai-blocked", closing_issue=7, comments=comments)
+    sibling = pr(101, "ai-pr-open", "ai-blocked", closing_issue=8, comments=comments)
+    state = FixState(sessions=frozenset({7, 8}), pr_reply_control_errors={100: "missing selected receipt"})
+    observed = world(prs=[blocked, sibling])
+
+    assert prs_needing_resume(observed, state, CFG) == [(101, 8, "2026-10-01T00:00:02Z")]
+    runs = _run_agents(decide_fix(observed, CFG, state, fixer_busy=False))
+    assert RunAgent(AgentKind.PR_RESUME, 100) not in runs
+    assert RunAgent(AgentKind.PR_RESUME, 101) in runs
+
+
+@pytest.mark.parametrize("operation", ["cleanup", "review", "ci", "reset", "rebase"])
+def test_pr_reply_read_refusal_preserves_other_action_outcomes(operation):
+    observed, state, expected = {
+        "cleanup": (pr(100, "ai-pr-open", state="MERGED", closing_issue=9), FixState(), ClearIssueState(100, 9, True)),
+        "review": (pr(100, "ai-pr-open", reviews=(Review("CHANGES_REQUESTED", "review-bot", "2026-10-01T00:00:01Z"),)), FixState(), RunAgent(AgentKind.ADDRESS_REVIEW, 100)),
+        "ci": (pr(100, "ai-pr-open", checks=(Check("unit", bucket="fail"),)), FixState(), RunAgent(AgentKind.FIX_CI, 100)),
+        "reset": (pr(100, "ai-pr-open", closing_issue=9, checks=(Check("unit", bucket="pass"),)), FixState(ci_retries={9: 2}), ResetCiRetries(9)),
+        "rebase": (pr(100, "ai-pr-open", mergeable="CONFLICTING"), FixState(), RunAgent(AgentKind.REBASE, 100)),
+    }[operation]
+    current = world(prs=[observed], issues=[issue(9, "ai-pr-open")])
+    baseline = decide_fix(current, CFG, state, fixer_busy=False)
+    held = decide_fix(current, CFG,
+        replace(state, pr_reply_control_errors={100: "unavailable reply source"}), fixer_busy=False)
+
+    assert expected in baseline
+    assert held == baseline
+
+
 def test_blocked_pr_reply_already_resumed_does_not_dispatch_again():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     blocked = pr(
         100, "ai-pr-open", "ai-blocked", closing_issue=7,
-        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+        comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")),
     )
-    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "t2"})
+    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "2026-10-01T00:00:02Z"})
 
     assert prs_needing_resume(world(prs=[blocked]), state, CFG) == []
     assert _run_agents(decide_fix(world(prs=[blocked]), CFG, state, fixer_busy=False)) == []
@@ -808,18 +840,32 @@ def test_blocked_pr_reply_from_operator_who_is_fix_bot_dispatches_resume():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     blocked = pr(
         100, "ai-pr-open", "ai-blocked", closing_issue=7,
-        comments=(Comment("fix-bot", prompt, "t1"), Comment("fix-bot", "Use A.", "t2")),
+        comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("fix-bot", "Use A.", "2026-10-01T00:00:02Z")),
     )
     state = FixState(sessions=frozenset({7}))
 
-    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "t2")]
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == [(100, 7, "2026-10-01T00:00:02Z")]
+
+
+@pytest.mark.parametrize("blank", [False, True])
+def test_older_pr_reply_does_not_dispatch_after_newer_consumption(blank):
+    blocked = pr(100, "ai-pr-open", "ai-blocked", closing_issue=7,
+                 comments=(Comment("alice", " " if blank else "old", "2026-10-01T00:00:01Z"),))
+    state = FixState(sessions=frozenset({7}), pr_resumed_at={100: "2026-10-01T00:00:02Z"})
+    assert prs_needing_resume(world(prs=[blocked]), state, CFG) == []
+
+
+def test_blank_pr_reply_dispatches_without_saved_session_for_unpaid_consumption():
+    blocked = pr(100, "ai-pr-open", "ai-blocked", closing_issue=7,
+                 comments=(Comment("alice", " ", "2026-10-01T00:00:01Z"),))
+    assert prs_needing_resume(world(prs=[blocked]), FixState(), CFG) == [(100, 7, "2026-10-01T00:00:01Z")]
 
 
 def test_pr_resume_infra_ceiling_replaces_the_blocked_label():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     blocked = pr(
         100, "ai-pr-open", "ai-blocked", closing_issue=7,
-        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+        comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")),
     )
     state = FixState(sessions=frozenset({7}), infra_deaths={7: 5})
 
@@ -832,7 +878,7 @@ def test_needs_human_review_pr_reply_never_reopens_the_escalation():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
     escalated = pr(
         100, "ai-pr-open", "needs-human-review", closing_issue=7,
-        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+        comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")),
     )
     state = FixState(sessions=frozenset({7}))
 

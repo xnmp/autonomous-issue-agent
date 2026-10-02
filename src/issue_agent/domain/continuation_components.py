@@ -142,6 +142,19 @@ class IssueRecoveryState:
 
 
 @dataclass(frozen=True)
+class PRBlankReplySource:
+    binding: WorkflowBinding
+    reply_at: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, WorkflowBinding) or self.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("blank PR reply source requires its exact PR repair binding")
+        _timestamp(self.reply_at, "blank PR reply source")
+        if not self.reply_at:
+            raise ValueError("blank PR reply source requires its selected timestamp")
+
+
+@dataclass(frozen=True)
 class PRRepairState:
     consumed_reply_at: str = ""
     branch: str = ""
@@ -153,6 +166,7 @@ class PRRepairState:
     self_clears: int = 0
     resumes: int = field(default=0, repr=False)
     actual_model: RepairModel | None = field(default=None, repr=False)
+    blank_reply: PRBlankReplySource | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed PR reply")
@@ -162,6 +176,9 @@ class PRRepairState:
         validate_workflow_integer(self.resumes, "repair resumes")
         if self.actual_model is not None and not isinstance(self.actual_model, RepairModel):
             raise ValueError("actual repair model requires typed provenance")
+        if self.blank_reply is not None and (not isinstance(self.blank_reply, PRBlankReplySource)
+                or self.blank_reply.reply_at != self.consumed_reply_at):
+            raise ValueError("blank PR source must name the selected consumed reply")
         for name in ("ci_failures", "review_failures", "rebase_failures", "infra_failures", "self_clears"):
             validate_workflow_integer(getattr(self, name), name)
 
@@ -171,7 +188,7 @@ def retire_pr_repair_continuity(state: PRRepairState, merged: bool) -> PRRepairS
         raise ValueError("repair retirement requires typed continuity and terminal outcome")
     # A closed-unmerged requeue clears only resume-blocking state. Remembered
     # branch/model, fork count and existing failure debt retain their old meaning.
-    return PRRepairState() if merged else replace(state, session=None, consumed_reply_at="")
+    return PRRepairState() if merged else replace(state, session=None, consumed_reply_at="", blank_reply=None)
 
 
 class StewardLane(str, Enum):
@@ -380,6 +397,10 @@ class ActivePRRepair:
 
     def __post_init__(self) -> None:
         _active(self.identity, WorkflowFamily.PR_REPAIR, self.state, PRRepairState, self.watermarks, self.gates)
+        blank = self.state.blank_reply
+        if blank is not None and (blank.binding.fence.key != self.identity.key
+                or blank.binding.authority != self.identity.authority or blank.binding.episode_id != self.identity.episode_id):
+            raise ValueError("blank PR receipt belongs to another component")
         for selected in (self.state.session, self.state.actual_model):
             if selected is None:
                 continue
@@ -452,6 +473,8 @@ def validate_component_revision(component: object, revision: WorkflowRevision, f
                for gate in component.gates):
             raise ValueError("component hold cannot originate in a future target generation")
     if isinstance(component, ActivePRRepair):
+        if component.state.blank_reply is not None and component.state.blank_reply.binding.fence.generation > revision.fence.generation:
+            raise ValueError("blank PR reply cannot originate in a future target generation")
         for selected in (component.state.session, component.state.actual_model):
             if selected is not None and selected.source.attempt.binding.fence.generation > revision.fence.generation:
                 raise ValueError("repair continuity cannot originate in a future target generation")
@@ -868,6 +891,18 @@ class RepairHandoff:
 
 
 @dataclass(frozen=True)
+class PRReplyInput:
+    reply_at: str
+    body: str
+
+    def __post_init__(self) -> None:
+        _timestamp(self.reply_at, "selected PR reply")
+        validate_workflow_text(self.body, "selected PR reply body", limit=65536)
+        if not self.reply_at or not self.body.strip():
+            raise ValueError("paid PR reply requires its exact timestamp and nonblank content")
+
+
+@dataclass(frozen=True)
 class PRRepairInput:
     selection: SelectedPRRepair
     branch: str
@@ -876,11 +911,16 @@ class PRRepairInput:
     ci: CIRepairInput | None = None
     review: ReviewRepairInput | None = None
     rebase: RebaseRepairInput | None = None
+    reply: PRReplyInput | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, SelectedPRRepair) or not isinstance(self.runtime, RuntimeName):
             raise ValueError("repair input requires selected authority and runtime")
         validate_workflow_text(self.branch, "current remote repair branch")
+        if self.reply is not None and (self.ci is not None or self.review is not None or self.rebase is not None
+                or not isinstance(self.reply, PRReplyInput)
+                or not reply_advances(self.reply.reply_at, self.selection.component.state.consumed_reply_at)):
+            raise ValueError("PR reply is consumed, stale or mixed with another repair lane")
         if self.rebase is not None and (self.ci is not None or self.review is not None
                 or not isinstance(self.rebase, RebaseRepairInput)
                 or self.rebase.pr != self.selection.binding.fence.key.target or self.rebase.branch != self.branch
@@ -1288,7 +1328,7 @@ def consume_pr_repair(selection: SelectedPRRepair, purchase: PRRepairPurchase, v
             or getattr(component.state, purchase.allowance.value) >= purchase.ceiling
             or purchase.reply_at and not reply_advances(purchase.reply_at, component.state.consumed_reply_at)):
         raise ValueError("PR repair purchase is held, consumed or exhausted")
-    state = replace(component.state, consumed_reply_at=purchase.reply_at) if purchase.reply_at else component.state
+    state = replace(component.state, consumed_reply_at=purchase.reply_at, blank_reply=None) if purchase.reply_at else component.state
     if purchase.handoff is not None:
         state = replace(state, resumes=max(state.resumes, purchase.handoff.resumes))
     if purchase.advance_resume:

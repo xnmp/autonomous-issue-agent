@@ -166,6 +166,7 @@ class FixState:
     # must not share the issue marker: one issue can have a different issue
     # thread and PR thread, whose timestamps are unrelated.
     pr_resumed_at: dict[int, str] = field(default_factory=dict)
+    pr_reply_control_errors: Mapping[int, str] = field(default_factory=dict)
     automerge_enabled: frozenset[int] = frozenset()  # PRs already auto-merge-enabled (marker)
     # PR → the #124 test-immutability-exemption facts the app layer observed:
     # declared test files (from the change's tracked declaration), REVIEW_BOT-
@@ -642,14 +643,18 @@ def prs_needing_resume(
         # `needs-human-review` is also lifecycle-blocked, but it is terminal:
         # an operator reply must never silently reopen an escalation that
         # deliberately removed `ai-blocked` at the retry/infra ceiling.
-        if not pr.has(Label.AI_BLOCKED):
+        if not pr.has(Label.AI_BLOCKED) or pr.number in state.pr_reply_control_errors:
             continue
         issue = _issue_for_pr(pr)
-        if issue is None or issue not in state.sessions:
+        reply = last_human_reply(pr, cfg.fix_bot)
+        if issue is None or reply is None or reply.body.strip() and issue not in state.sessions:
             continue
-        last_at = _last_human_reply_at(pr, cfg.fix_bot)
-        if last_at is not None and last_at != state.pr_resumed_at.get(pr.number, ""):
-            out.append((pr.number, issue, last_at))
+        try:
+            advances = cc.reply_advances(reply.created_at, state.pr_resumed_at.get(pr.number, ""))
+        except ValueError:
+            continue
+        if advances:
+            out.append((pr.number, issue, reply.created_at))
     return out
 
 

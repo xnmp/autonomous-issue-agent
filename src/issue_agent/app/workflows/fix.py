@@ -1562,16 +1562,39 @@ class FixWorkflow:
         if self.cfg.author_tests_split and state is not None:
             await self.resolve_split(issue, human_reply=reply, binding=binding)
             return
-        branch = self.gateway.get_pr(pr_existing).head_ref_name if pr_existing else self._resume_branch(issue, iss.title, state)
-        cwd = self._ensure_cwd(issue, branch, state)
-        fork = selected.component.state.resumes + 1 >= self.cfg.fork_threshold if state is not None else self.store.bump_resumes(issue) >= self.cfg.fork_threshold
+        repair = None
+        if pr_existing is not None:
+            current_pr = self.gateway.get_pr(pr_existing)
+            if current_pr.state != "OPEN" or fix_domain.breaker_key(current_pr) != issue:
+                return
+            control = self.workflow_control
+            assert control is not None
+            repair_selected = control.read_pr_repair(WorkflowKey(control.writer.repository, PullRequestRef(pr_existing)))
+            if not isinstance(repair_selected, cc.SelectedPRRepair):
+                self.cfg.log(f"PR #{pr_existing}: linked reply deferred; repair continuity is inactive or blocked")
+                return
+            control.reconcile_pr_repair_returns()
+            repair_selected = control.read_pr_repair(repair_selected.binding.fence.key)
+            if not isinstance(repair_selected, cc.SelectedPRRepair):
+                return
+            branch = current_pr.head_ref_name
+            runtime = RuntimeName(self._resolve_runtime_name())
+            handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr_existing), branch, runtime)
+                       if repair_selected.component.state.actual_model is None and repair_selected.component.state.session is None else None)
+            repair = cc.PRRepairInput(repair_selected, branch, runtime, handoff)
+            fork = max(repair_selected.component.state.resumes, handoff.resumes if handoff is not None else 0) + 1 >= self.cfg.fork_threshold
+        else:
+            branch = self._resume_branch(issue, iss.title, state)
+            fork = selected.component.state.resumes + 1 >= self.cfg.fork_threshold
+        cwd = self._ensure_cwd(issue, branch, state, remember=state is not None)
         if state is not None:
             session = state.episode.continuation.session
             session_id = session.session_id if session is not None else ""
             fix_cfg = self._resolve_resume_cfg(issue, state, iss)
         else:
-            session_id = self.store.get_session(issue)
-            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss)
+            assert repair is not None
+            session_id = repair.session.handle if repair.session is not None else ""
+            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss, inherited_model=repair.model)
         task = (
             task_builders.build_resume_task(as_untrusted(reply), cwd, session_id, fix_cfg, fork=fork)
             if session_id else task_builders.build_fresh_reply_task(
@@ -1586,7 +1609,10 @@ class FixWorkflow:
             task = dataclasses.replace(task, issue_reply=cc.IssueReplyInput(selected, reply_comment.created_at, reply, branch))
         else:
             assert pr_existing is not None
-            task = dataclasses.replace(task, issue_reply=cc.LinkedPRIssueReplyInput(selected, reply_comment.created_at, reply, PullRequestRef(pr_existing)))
+            assert repair is not None
+            task = dataclasses.replace(task, issue_reply=cc.LinkedPRIssueReplyInput(selected, reply_comment.created_at, reply, PullRequestRef(pr_existing)),
+                                       pr_repair_input=repair)
+            self.runner.set_context("fix", "PR_RESUME", pr_existing, issue, workflow=repair.selection.binding)
         result = await self._run_logged("resume", issue, task, kind="RESUME" if state is not None else "PR_RESUME")
         if state is not None:
             assert binding is not None
@@ -1617,7 +1643,6 @@ class FixWorkflow:
             ):
                 return
         else:
-            self.store.save_session(issue, "" if result.status == "blocked" else result.session_id)
             changed = False
             current = None
         self._record_block_state(issue, Target.ISSUE, issue, result, pr=pr)
@@ -1684,40 +1709,46 @@ class FixWorkflow:
     async def resume_pr(
         self, pr: int, *, issue_hint: int | None = None
     ) -> None:
-        """Resume a PR-stage block using the linked issue's saved transcript."""
+        """Resume the selected PR reply with its compatible SQL transcript."""
         dispatch = self._dispatch_pr(pr, issue_hint)
         if dispatch is None:
             return
         p, issue = dispatch
-        if issue is None:
+        if issue is None or p.state != "OPEN":
             return
         # Read before any repair side effect: an unavailable active-review read
         # raises a workflow hold and defers the whole repair (ADR 0015).
         guidance = self._pr_guidance(p.number)
+        control = self.workflow_control
+        selected = control.read_pr_repair(WorkflowKey(control.writer.repository, PullRequestRef(pr))) if control is not None else None
+        if not isinstance(selected, cc.SelectedPRRepair):
+            self.cfg.log(f"PR #{pr}: reply deferred; PR repair continuity is inactive or blocked")
+            return
+        control.reconcile_pr_repair_returns()
+        selected = control.read_pr_repair(selected.binding.fence.key)
+        if not isinstance(selected, cc.SelectedPRRepair):
+            return
         reply_comment = fix_domain.last_human_reply(p, self.cfg.fix_bot)
         if reply_comment is None or not reply_comment.body.strip():
             if reply_comment is not None:
-                self.store.set_pr_resumed_at(pr, reply_comment.created_at)
+                control.consume_blank_pr_reply(selected.binding, reply_comment.created_at, reply_comment.body)
+            return
+        if not cc.reply_advances(reply_comment.created_at, selected.component.state.consumed_reply_at):
+            return
+        runtime = RuntimeName(self._resolve_runtime_name())
+        handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
+                   if selected.component.state.actual_model is None and selected.component.state.session is None else None)
+        repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff,
+                                  reply=cc.PRReplyInput(reply_comment.created_at, reply_comment.body))
+        if repair.session is None:
+            self.cfg.log(f"PR #{pr}: reply deferred; no compatible session is available")
             return
         iss = self.gateway.get_issue(issue)
-        session_id = self.store.get_session(issue)
+        session_id = repair.session.handle
         leg = "fix-ci" if any(check.bucket == "fail" and not check.advisory for check in p.checks) else "resume"
-        if session_id:
-            fix_cfg = self._repair_fix_cfg(issue, leg, iss=iss)
-        else:
-            handed_off = self._resolve_handoff_session(issue)
-            if handed_off is None or self.cfg.fix is None:
-                self.cfg.log(f"PR #{pr}: reply deferred; no compatible session is available")
-                return
-            session_id = handed_off.session_id
-            fix_cfg = self._escalated(dataclasses.replace(
-                self.cfg.fix, model=None if handed_off.model == "<runtime-default>" else handed_off.model,
-            ), issue, leg, iss=iss)
-        # Persist only after a usable transcript is selected, but before paid
-        # work: neither missing handoff nor an incompatible runtime consumes it.
-        self.store.set_pr_resumed_at(pr, reply_comment.created_at)
-        cwd = self._ensure_cwd(issue, p.head_ref_name)
-        fork = self.store.bump_resumes(issue) >= self.cfg.fork_threshold
+        fix_cfg = self._repair_fix_cfg(issue, leg, iss=iss, inherited_model=repair.model)
+        cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
+        fork = max(selected.component.state.resumes, handoff.resumes if handoff is not None else 0) + 1 >= self.cfg.fork_threshold
         if any(check.bucket == "fail" and not check.advisory for check in p.checks):
             task = self._ci_task(p, issue, cwd, fork=fork, session_id=session_id, fix_cfg=fix_cfg)
         else:
@@ -1727,6 +1758,8 @@ class FixWorkflow:
                 session_id,
                 fix_cfg, fork=fork,
             )
+        task = dataclasses.replace(task, pr_repair_input=repair)
+        self.runner.set_context("fix", "PR_RESUME", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged(
             "pr-resume", issue, task, p, kind="PR_RESUME", reply=reply_comment.body,
             guidance=guidance,
@@ -1734,9 +1767,6 @@ class FixWorkflow:
         self._record_block_state(
             issue, Target.PR, pr, result, pr=pr, blocked_head=p.head_ref_oid
         )
-        self.store.save_session(issue, result.session_id)
-        if result.session_id:
-            self.store.save_model(issue, task.model or "<runtime-default>")
         if outcome.infra_class_failure(result):
             self._charge_infra_death(issue, "pr-resume", result)
         else:

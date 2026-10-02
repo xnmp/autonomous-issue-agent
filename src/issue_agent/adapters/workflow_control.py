@@ -176,6 +176,42 @@ class SQLiteWorkflowControl:
         self._scope(source.binding.fence.key)
         return self._control.reset_rebase_allowance(source, self.writer)
 
+    def consume_blank_pr_reply(self, binding: WorkflowBinding, reply_at: str, body: str) -> bool:
+        from .workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+        if (not isinstance(binding, WorkflowBinding) or binding.authority.family is not WorkflowFamily.PR_REPAIR
+                or not cc.reply_advances(reply_at, "") or not isinstance(body, str)
+                or len(body.encode()) > 65536 or body.strip() or self.writer.role != "fix"):
+            raise WorkflowAuthorityError("unpaid PR reply requires its exact authority, timestamp and blank content")
+        self._pr_repair_scope(binding.fence.key)
+        receipt_key = hashlib.sha256(encode_workflow((binding.fence.key, reply_at)).encode()).hexdigest()
+        request = encode_workflow((binding, reply_at, body))
+        with self._control.transaction() as db, self._control.mutation_savepoint(db):
+            self._control._assert_owner_active(db, self.writer.owner_id)
+            receipt = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-reply-noop' AND scope=? AND key=?",
+                                 (self.writer.repository, receipt_key)).fetchone()
+            if receipt is not None:
+                if receipt[0] != request:
+                    raise WorkflowAuthorityError("blank PR reply conflicts with its original consumption")
+                return False
+            aggregate = load_review_workflow_row(db, binding.fence.key)
+            selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+            if not isinstance(selected, cc.SelectedPRRepair) or selected.binding != binding:
+                raise WorkflowAuthorityError("blank PR reply requires current PR repair authority")
+            assert aggregate is not None
+            self._control._validate_pr_repair_sources(db, selected)
+            marker = selected.component.state.consumed_reply_at
+            if marker == reply_at:
+                raise WorkflowAuthorityError("blank PR reply lost its exact consumption receipt")
+            if not cc.reply_advances(reply_at, marker):
+                return False
+            component = replace(selected.component, state=replace(selected.component.state, consumed_reply_at=reply_at,
+                                                                   blank_reply=cc.PRBlankReplySource(binding, reply_at)))
+            persist_workflow_snapshot(db, replace(aggregate, pr_repair=component,
+                revision=replace(aggregate.revision, version=aggregate.revision.version+1)))
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('pr-reply-noop',?,?,?,?)",
+                       (self.writer.repository, receipt_key, self._control._now().isoformat(), request))
+            return True
+
     def load_workflow(self, key: WorkflowKey) -> WorkflowRead:
         self._scope(key)
         try:

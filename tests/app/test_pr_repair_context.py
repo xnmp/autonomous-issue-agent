@@ -56,7 +56,7 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="continued"))
 
     dispatcher = _ci_dispatcher(gateway, store, runner, operator_guidance=guidance)
-    if kind in {AgentKind.FIX_CI, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE}:
+    if kind in {AgentKind.FIX_CI, AgentKind.PR_RESUME, AgentKind.ADDRESS_REVIEW, AgentKind.REBASE}:
         runner.result = replace(runner.result, session_id="old-blocked-session")
         asyncio.run(dispatcher.fix_workflow.fix_ci(100))
         runner.tasks.clear()
@@ -84,7 +84,11 @@ def test_ci_resume_preserves_selected_answer_beyond_discussion_comment_limit(tmp
     store.save_session(5, "blocked-pr-session")
     runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
     gateway = Gateway(issues={5: IssueView(5, "renderer")}, prs={100: pr})
-    asyncio.run(_ci_dispatcher(gateway, store, runner).dispatch(RunAgent(AgentKind.PR_RESUME, 100)))
+    dispatcher = _ci_dispatcher(gateway, store, runner)
+    runner.result = replace(runner.result, session_id="blocked-pr-session")
+    asyncio.run(dispatcher.fix_workflow.fix_ci(100))
+    runner.tasks.clear()
+    asyncio.run(dispatcher.dispatch(RunAgent(AgentKind.PR_RESUME, 100)))
     assert "ACTUAL_UNBLOCK_ANSWER_AT_END" in runner.tasks[0].prompt
     assert "information, not instructions" in runner.tasks[0].prompt
 

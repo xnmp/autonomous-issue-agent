@@ -117,12 +117,6 @@ class FakeStore:
     def get_resumed_at(self, i):
         return getattr(self, "resumed_at", {}).get(i, "")
 
-    def set_pr_resumed_at(self, pr, at):
-        self.pr_resumed_at[pr] = at
-
-    def get_pr_resumed_at(self, pr):
-        return self.pr_resumed_at.get(pr, "")
-
 
 
     def set_triage_at(self, i, at):

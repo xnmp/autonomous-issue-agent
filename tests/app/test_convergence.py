@@ -350,9 +350,7 @@ class Scenario:
     # — the C3 shape, driven by `_RaisingRunner` rather than `_FakeRunner`.
     runner_raises: bool = False
     runner_result: outcome.AgentResult = ERRORED_RUN
-    # PR-family sessions remain in Store; selected resolve sessions belong to
-    # the explicitly imported workflow episode instead.
-    seed: Callable[[Store], None] | None = None
+    pr_session: str = ""
     resolve_session: str = ""
 
 
@@ -370,8 +368,6 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
     instead of only `tests/adapters/test_fix_workflow.py`.
     """
     store = Store(state_dir=str(tmp_path))
-    if scenario.seed is not None:
-        scenario.seed(store)
     control = SQLiteControlStore(str(tmp_path / "control.db"))
     control.initialize()
     issue_numbers = {item.number for item in scenario.world.issues} | {
@@ -421,6 +417,22 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
         operator_guidance=review_guidance_reader(control, "o/r"),
     )
     dispatcher = AgentDispatcher(dcfg, gw, store, worktrees, runner, executor, workflow_control=workflow)
+    if scenario.pr_session:
+        from issue_agent.domain import continuation_components as cc
+        from issue_agent.domain.agent_task import RuntimeName
+        from issue_agent.domain.trust import as_untrusted
+        from issue_agent.app.planners.tasks import build_resume_task
+        current = scenario.world.prs[0]
+        selected = workflow.read_pr_repair(WorkflowKey("o/r", PullRequestRef(current.number)))
+        prior_result = provider.result
+        provider.result = outcome.AgentResult(is_error=False, status="pushed", session_id=scenario.pr_session)
+        task = replace(build_resume_task(as_untrusted("prior PR repair"),
+            worktrees.ensure(_issue_for(current), current.head_ref_name), "", dcfg.fix),
+            pr_repair_input=cc.PRRepairInput(selected, current.head_ref_name, RuntimeName.CLAUDE))
+        runner.set_context("fix", "FIX_CI", current.number, _issue_for(current), workflow=selected.binding)
+        asyncio.run(runner.run(task))
+        provider.result = prior_result
+        provider.tasks.clear()
     executor.bind_workflow_reconciliation(
         dispatcher.fix_workflow.reconcile_returns
     )
@@ -483,7 +495,7 @@ def _pr_resume_dedup() -> Scenario:
                 ),
             ],
         ),
-        seed=lambda store: store.save_session(7, "prior-session"),
+        pr_session="prior-session",
         runner_result=outcome.AgentResult(
             is_error=False,
             status="blocked",

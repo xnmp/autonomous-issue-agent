@@ -389,20 +389,22 @@ def test_productive_resume_keeps_its_session():
 
 def test_pr_resume_uses_pr_reply_and_linked_issue_session_once():
     prompt = "**Agent needs input:** choose A or B\n\n_Reply to unblock._"
-    iss = IssueView(5, title="t", body="b")
+    iss = IssueView(5, title="Token", body="b")
     p = PRView(
         100, head_ref_name="fix/5-token", closing_issue=5,
-        comments=(Comment("fix-bot", prompt, "t1"), Comment("alice", "Use A.", "t2")),
+        comments=(Comment("fix-bot", prompt, "2026-10-01T00:00:01Z"), Comment("alice", "Use A.", "2026-10-01T00:00:02Z")),
     )
-    gw = FakeGateway(issues={5: iss}, prs={100: p})
+    gw = FakeGateway(issues={5: iss}, prs={100: p}, pr_for_issue={5: 100})
     store = FakeStore()
-    store.save_session(5, "prior-session")
-    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="s5"))
+    runner = SeqRunner([AgentResult(is_error=False, status="pushed", session_id="prior-session"),
+                        AgentResult(is_error=False, status="pushed", session_id="s5")])
+    workflow = _workflow(gw, store, runner, fix_bot="fix-bot")
+    asyncio.run(workflow.resolve(5))
+    gw.prs[100] = dataclasses.replace(gw.prs[100], labels=frozenset({Label.AI_BLOCKED, Label.AI_PR_OPEN}))
+    asyncio.run(workflow.resume_pr(100))
 
-    asyncio.run(_workflow(gw, store, runner, fix_bot="fix-bot").resume_pr(100))
-
-    assert store.get_pr_resumed_at(100) == "t2"
-    assert "Use A." in runner.tasks[0].prompt
+    assert pr_repair_state(store).consumed_reply_at == "2026-10-01T00:00:02Z"
+    assert "Use A." in runner.tasks[1].prompt
     assert ("relabel", "pr", 100, "ai-blocked", "ai-pr-open") in gw.calls
 
 
@@ -412,7 +414,7 @@ def test_resolve_session_handoff_dispatches_and_runs_pr_reply_without_legacy_res
     from issue_agent.domain.fix import FixConfig, prs_needing_resume
 
     issue = IssueView(5, title="Add token", body="body")
-    pr = PRView(100, author="fix-bot", head_ref_name="fix/5-token", closing_issue=5)
+    pr = PRView(100, author="fix-bot", head_ref_name="fix/5-add-token", closing_issue=5)
     gw = FakeGateway(issues={5: issue}, prs={100: pr}, pr_for_issue={5: 100})
     store = Store(str(tmp_path), runtime="claude")
     runner = SeqRunner([
@@ -435,40 +437,42 @@ def test_resolve_session_handoff_dispatches_and_runs_pr_reply_without_legacy_res
     assert prs_needing_resume(world, state, FixConfig(fix_bot="fix-bot")) == [(100, 5, "2026-09-14T00:01:00Z")]
 
     workflow.cfg = dataclasses.replace(workflow.cfg, fix=FixTaskConfig("o/r", model=None))
-    with workflow._accounted(5, "PR_RESUME", None):
-        workflow.runner.set_context("fix", "PR_RESUME", 100, 5, workflow=None)
-        asyncio.run(workflow.resume_pr(100))
+    asyncio.run(workflow.resume_pr(100))
 
     assert len(runner.tasks) == 2
     assert runner.tasks[1].resume == "resolve-transcript"
     assert runner.tasks[1].model == "m"
     assert "Use A." in runner.tasks[1].prompt
-    assert store.get_session(5) == "repair-transcript"
-    assert store.get_model(5) == "m"
+    assert pr_repair_state(store).session.handle == "repair-transcript"
+    assert pr_repair_state(store).actual_model.model == "m"
+    assert store.get_session(5) == "" and store.get_model(5) == ""
     assert _resolve_snapshot(store) == before
     assert Label.AI_BLOCKED not in gw.prs[100].labels
-    assert store.get_pr_resumed_at(100) == "2026-09-14T00:01:00Z"
+    assert pr_repair_state(store).consumed_reply_at == "2026-09-14T00:01:00Z"
 
 
 @pytest.mark.parametrize("legacy", [False, True])
-def test_pr_resume_prefers_legacy_session_and_otherwise_preserves_sql_default_model(tmp_path, legacy):
+def test_pr_resume_ignores_retired_file_session_and_preserves_sql_default_model(tmp_path, legacy):
     store = Store(str(tmp_path), runtime="claude")
-    _seed_resolve(store, 5, session_id="resolve-transcript", model="<runtime-default>")
     store.save_model(5, "stale-model")
     if legacy:
-        store.save_session(5, "repair-transcript")
-    gw = FakeGateway(issues={5: IssueView(5)}, prs={100: PRView(
-        100, closing_issue=5, head_ref_name="fix/5-token",
-        comments=(Comment("alice", "Use A.", "t2"),))})
-    runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="new-repair"))
+        store.save_session(5, "retired-transcript")
+    gw = FakeGateway(issues={5: IssueView(5, title="Token")}, prs={100: PRView(
+        100, closing_issue=5, head_ref_name="fix/5-token", head_ref_oid="a" * 40,
+        comments=(Comment("alice", "Use A.", "2026-10-01T00:00:02Z"),))}, pr_for_issue={5: 100})
+    runner = SeqRunner([AgentResult(is_error=False, status="pushed", session_id="repair-transcript"),
+                        AgentResult(is_error=False, status="pushed", session_id="new-repair"),
+                        AgentResult(is_error=False, status="pushed", session_id="new-repair")])
     workflow = _workflow(gw, store, runner, fix=FixTaskConfig("o/r", model=None))
+    asyncio.run(workflow.fix_ci(100))
     asyncio.run(workflow.resume_pr(100))
-    assert runner.tasks[0].resume == ("repair-transcript" if legacy else "resolve-transcript")
-    assert runner.tasks[0].model == ("stale-model" if legacy else None)
-    assert store.get_model(5) == ("stale-model" if legacy else "<runtime-default>")
+    assert runner.tasks[1].resume == "repair-transcript"
+    assert runner.tasks[1].model is None
+    assert store.get_model(5) == "stale-model"
+    gw.prs[100] = dataclasses.replace(gw.prs[100], comments=(Comment("alice", "Use B.", "2026-10-01T00:00:03Z"),))
     asyncio.run(workflow.resume_pr(100))
-    assert runner.tasks[1].resume == "new-repair"
-    assert runner.tasks[1].model == ("stale-model" if legacy else None)
+    assert runner.tasks[2].resume == "new-repair"
+    assert runner.tasks[2].model is None
 
 
 @pytest.mark.parametrize("runtime", [None, "codex"])
@@ -478,11 +482,11 @@ def test_pr_reply_without_compatible_handoff_does_not_consume_reply_or_run(runti
         _seed_resolve(store, 5, session_id="foreign-session", runtime=runtime)
     gw = FakeGateway(issues={5: IssueView(5)}, prs={100: PRView(
         100, closing_issue=5, head_ref_name="fix/5-token",
-        comments=(Comment("alice", "Use A.", "t2"),))})
+        comments=(Comment("alice", "Use A.", "2026-10-01T00:00:02Z"),))})
     runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
     asyncio.run(_workflow(gw, store, runner).resume_pr(100))
     assert runner.tasks == []
-    assert store.get_pr_resumed_at(100) == ""
+    assert pr_repair_state(store).consumed_reply_at == ""
 
 
 def test_resume_without_human_reply_does_not_run():

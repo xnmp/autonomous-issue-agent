@@ -285,3 +285,24 @@ def test_repair_retirement_preserves_requeue_debt_but_retires_merged_state():
     assert (requeued.resumes, requeued.ci_failures, requeued.infra_failures, requeued.branch) == (4, 3, 2, "fix/7-ci")
     merged = cc.retire_pr_repair_continuity(state, True)
     assert (merged.resumes, merged.ci_failures, merged.infra_failures, merged.branch) == (0, 0, 0, "")
+
+
+def test_blank_reply_source_cannot_originate_in_future_current_generation():
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import WorkflowBinding
+    base = gated()
+    assert isinstance(base, ReviewWorkflowSnapshot)
+    component = identity(base.revision.fence.key, WorkflowFamily.PR_REPAIR)
+    binding = WorkflowBinding(replace(base.revision.fence, generation=base.revision.fence.generation+1),
+                              component.authority, component.episode_id)
+    state = cc.PRRepairState(consumed_reply_at=NOW.isoformat(), blank_reply=cc.PRBlankReplySource(binding, NOW.isoformat()))
+    with pytest.raises(ValueError, match="future"):
+        replace(base, pr_repair=cc.ActivePRRepair(component, state))
+
+
+@pytest.mark.parametrize("timestamp,body", [(None, "x"), ("", "x"), ("yesterday", "x"),
+    ("2026-10-01", "x"), (NOW.isoformat(), " "), (NOW.isoformat(), None), (NOW.isoformat(), "x" * 65537)])
+def test_paid_pr_reply_requires_bounded_nonblank_body_and_aware_timestamp(timestamp, body):
+    from issue_agent.domain import continuation_components as cc
+    with pytest.raises(ValueError):
+        cc.PRReplyInput(timestamp, body)

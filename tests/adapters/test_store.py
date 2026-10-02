@@ -54,8 +54,6 @@ def test_resumed_at_and_resumes_counter():
     s, _ = _store()
     s.set_resumed_at(5, "2026-01-01T00:00:02Z")
     assert s.get_resumed_at(5) == "2026-01-01T00:00:02Z"
-    s.set_pr_resumed_at(100, "2026-01-01T00:00:03Z")
-    assert s.get_pr_resumed_at(100) == "2026-01-01T00:00:03Z"
     assert s.bump_resumes(5) == 1
     assert s.bump_resumes(5) == 2
 
@@ -435,7 +433,8 @@ def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
     # Same check for the PR namespace — this is what catches the `automerge`
     # drift: automerge_enabled/mark_automerge use pr_path, so `automerge` must
     # be in _PR_SUFFIXES (it used to sit, unused, in the issue tuple instead).
-    assert _accessor_suffixes("pr_path") == set(store_module._PR_SUFFIXES)
+    # F2 retired the runtime accessor; historical files still need cleanup.
+    assert _accessor_suffixes("pr_path") | {"resumed-at"} == set(store_module._PR_SUFFIXES)
 
 
 # ── merged/closed-unmerged cleanup orchestration (review M4/D8) ────────────
@@ -540,6 +539,7 @@ def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
     used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries"), ("issue_path", "review-retries"), ("issue_path", "rebase-retries")}
     used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
+    used.add(("pr_path", "resumed-at"))
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
 
     cleared = {("issue_path", s) for s in store_module._ISSUE_SUFFIXES}

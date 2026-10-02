@@ -705,6 +705,31 @@ def test_pre_f6_literal_rebase_plan_keeps_sql_retry_after_source_cleanup(stopped
 
 
 
+def test_pre_f2_literal_pr_plan_keeps_wire_and_sql_retry_after_raw_cleanup(stopped, capsys, monkeypatch):
+    from issue_agent.adapters.continuation_activation import read_import_plan
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    state, control, _ = stopped
+    saved = Path(__file__).parents[1] / "fixtures" / "workflow_fix_import_pre_f2.json"
+    report = json.loads(saved.read_text())
+    original = read_import_plan(str(saved))
+    assert original.plan_digest == report["plan_digest"]
+    assert encode_workflow(original) == report["original_plan"]
+    install_workflow(control, held(key=WorkflowKey("o/r", PullRequestRef(100))))
+    with control.transaction() as db:
+        publish_continuation_import(db, original, now=datetime(2026, 10, 2, tzinfo=timezone.utc), control=control)
+        selected = load_review_workflow_row(db, WorkflowKey("o/r", PullRequestRef(100)))
+    assert selected.pr_repair.state.consumed_reply_at == "2026-10-01T00:00:00Z" and selected.pr_repair.state.blank_reply is None
+    (state / "pr-100.resumed-at").write_text("malformed retained edit")
+    (state / "pr-100.resumed-at").unlink()
+    before = dump(control)
+    monkeypatch.setattr(continuation_activation, "evaluate", lambda *a: pytest.fail("retry inspected raw source"))
+    monkeypatch.setattr(cli, "_activation_liveness", lambda *a: pytest.fail("retry inspected current work"))
+    code, retry, error = command(capsys, "fix", "activate", "--plan-file", str(saved),
+                                "--confirm-plan-digest", report["plan_digest"])
+    assert code == 0 and retry["status"] == "already_active_with_this_plan", error
+    assert dump(control) == before
+
+
 def test_rebase_shadow_and_copy_preserve_debt_without_raw_runtime_fallback(stopped, capsys, tmp_path):
     state, control, _ = stopped
     (state / "issue-7.rebase-retries").write_text("3")

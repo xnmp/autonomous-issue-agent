@@ -94,6 +94,8 @@ def test_linked_pr_issue_reply_consumes_timestamp_without_no_pr_count_or_branch(
     workflow, gateway, store, runner = setup_reply()
     gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="head", closing_issue=5)
     gateway._pr_for_issue[5] = 100
+    from tests.fakes.accounted_workflow import attach_workflow_authority
+    attach_workflow_authority(gateway, store, pr_repair=True)
     before = resolve_state(store)
     asyncio.run(workflow.resume(5))
     after = resolve_state(store)
@@ -105,8 +107,9 @@ def test_linked_pr_issue_reply_consumes_timestamp_without_no_pr_count_or_branch(
     assert len(runner.tasks) == 1 and store.get_resumed_at(5) == ""
     with store._workflow_db._connect() as db:
         row = db.execute("SELECT workflow_binding_json,continuations_json FROM runs").fetchone()
-        assert row[0] is None
-        assert isinstance(decode_workflow(row[1], tuple)[0], cc.IssueReplyPurchase)
+        from issue_agent.domain.workflow_identity import WorkflowBinding
+        assert decode_workflow(row[0], WorkflowBinding).authority.family.value == "pr_repair"
+        assert tuple(type(purchase) for purchase in decode_workflow(row[1], tuple)) == (cc.PRRepairPurchase, cc.IssueReplyPurchase)
 
 
 def test_linked_pr_budget_refusal_leaves_issue_reply_available(monkeypatch):
@@ -114,6 +117,8 @@ def test_linked_pr_budget_refusal_leaves_issue_reply_available(monkeypatch):
     workflow, gateway, store, runner = setup_reply()
     gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="head", closing_issue=5)
     gateway._pr_for_issue[5] = 100
+    from tests.fakes.accounted_workflow import attach_workflow_authority
+    attach_workflow_authority(gateway, store, pr_repair=True)
     before = resolve_state(store).issue_recovery.state
     monkeypatch.setattr(store._workflow_db, "reserve", lambda request: ReservationResult(AccountingDisposition.EXHAUSTED, None, Money("USD", 0), Money("USD", 1), Money("USD", 0), "test cap"))
     asyncio.run(workflow.resume(5))

@@ -378,7 +378,10 @@ class AccountingRuntime(AgentRuntime):
         if task.issue_reply is not None:
             selected = task.issue_reply
             if isinstance(selected, cc.LinkedPRIssueReplyInput):
-                if self.role != "fix" or kind != "PR_RESUME" or workflow is not None or number != selected.pr.number or issue != selected.selection.binding.fence.key.target.number:
+                if (self.role != "fix" or kind != "PR_RESUME" or number != selected.pr.number
+                        or issue != selected.selection.binding.fence.key.target.number
+                        or task.pr_repair_input is None or workflow != task.pr_repair_input.selection.binding
+                        or workflow.fence.key.target != selected.pr):
                     return _return_refused("linked PR issue reply requires its exact issue/PR context")
             elif self.role != "fix" or kind not in {"RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"} or workflow is None or workflow.fence != selected.selection.revision.fence:
                 return _return_refused("selected issue reply requires its captured resolve context")
@@ -387,21 +390,26 @@ class AccountingRuntime(AgentRuntime):
                               else cc.IssueRecoveryPurchase(capture, selected.reply_at, selected.branch, 2**63 - 1)),)
         if task.pr_repair_input is not None:
             selected = task.pr_repair_input
-            if (self.role != "fix" or kind not in {"FIX_CI", "ADDRESS_REVIEW", "REBASE"} or workflow != selected.selection.binding
+            linked_reply = isinstance(task.issue_reply, cc.LinkedPRIssueReplyInput)
+            if (self.role != "fix" or kind not in {"FIX_CI", "ADDRESS_REVIEW", "REBASE", "PR_RESUME"} or workflow != selected.selection.binding
                     or number != selected.selection.binding.fence.key.target.number or issue is None
-                    or selected.runtime.value != self.runtime_name or continuations
+                    or selected.runtime.value != self.runtime_name or continuations and not linked_reply
                     or kind == "ADDRESS_REVIEW" and selected.review is None
                     or kind != "ADDRESS_REVIEW" and selected.review is not None
                     or kind == "REBASE" and selected.rebase is None
                     or kind != "REBASE" and selected.rebase is not None
+                    or kind == "PR_RESUME" and (selected.reply is None and not linked_reply
+                                                or selected.reply is not None and linked_reply)
+                    or kind != "PR_RESUME" and selected.reply is not None
                     or kind != "FIX_CI" and selected.ci is not None):
                 return _return_refused("selected repair input requires its exact PR, runtime and family context")
             session = selected.session
             if (task.resume or "") != (session.handle if session is not None else ""):
                 return _return_refused("repair launch handle differs from selected continuity")
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
-            continuations = (cc.PRRepairPurchase(capture, allowance=(cc.RepairAllowance.REVIEW if selected.review is not None else cc.RepairAllowance.REBASE if selected.rebase is not None else cc.RepairAllowance.CI), ceiling=2**63-1,
-                                                 branch=selected.branch, handoff=selected.handoff, advance_resume=selected.review is not None),)
+            continuations = (cc.PRRepairPurchase(capture, reply_at=selected.reply.reply_at if selected.reply is not None else "",
+                                                 allowance=(cc.RepairAllowance.INFRA if kind == "PR_RESUME" else cc.RepairAllowance.REVIEW if selected.review is not None else cc.RepairAllowance.REBASE if selected.rebase is not None else cc.RepairAllowance.CI), ceiling=2**63-1,
+                                                 branch=selected.branch, handoff=selected.handoff, advance_resume=selected.review is not None or kind == "PR_RESUME"),) + continuations
             if selected.ci is not None:
                 ci = selected.ci
                 if issue != ci.selection.binding.fence.key.target.number:
@@ -460,6 +468,8 @@ class AccountingRuntime(AgentRuntime):
                    if task.pr_repair_input is not None and task.pr_repair_input.review is not None else {}),
                 **({"rebase_input": encode_workflow((task.pr_repair_input.rebase.head, task.pr_repair_input.rebase.branch))}
                    if task.pr_repair_input is not None and task.pr_repair_input.rebase is not None else {}),
+                **({"pr_reply": encode_workflow((task.pr_repair_input.reply.reply_at, task.pr_repair_input.reply.body))}
+                   if task.pr_repair_input is not None and task.pr_repair_input.reply is not None else {}),
                 "breaker_key": retry_key,
                 "claim_target": target,
                 "cwd": (

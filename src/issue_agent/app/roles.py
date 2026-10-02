@@ -1840,11 +1840,11 @@ def _fix_state(
     def read(key, reader, default, *, error_key=None):
         return _control_value(errors, key, reader, default, error_key=error_key)
 
-    # Only the unselected PR family may consult legacy session files.
     pr_issues = {breaker_key(p) for p in world.prs if breaker_key(p) > 0}
-    sessions = frozenset(n for n in pr_issues if read(n, store.has_session, False))
+    sessions = frozenset()
     resumed = {}
-    pr_resumed = {p.number: read(p.number, store.get_pr_resumed_at, "", error_key=breaker_key(p)) for p in world.prs}
+    pr_resumed = {}
+    pr_reply_errors = {}
     automerge = frozenset(p.number for p in world.prs if read(p.number, store.automerge_enabled, False, error_key=breaker_key(p)))
     # Retry counters are keyed by breaker_key(pr): the linked issue number, or the
     # NEGATED PR number when a PR has no resolvable issue (Jira-keyed branch, no
@@ -1893,6 +1893,16 @@ def _fix_state(
     )
     for pr in world.prs:
         number = breaker_key(pr)
+        try:
+            repair = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number))) if workflow_control is not None else None
+            if not isinstance(repair, cc.SelectedPRRepair):
+                raise ValueError("PR repair continuity is inactive or migration blocked")
+            pr_resumed[pr.number] = repair.component.state.consumed_reply_at
+            current_session = repair.component.state.session
+            if current_session is not None and current_session.runtime.value == store.runtime and repair.component.state.branch == pr.head_ref_name:
+                sessions = sessions | {number}
+        except (ValueError, sqlite3.Error) as exc:
+            pr_reply_errors[pr.number] = str(exc)
         try:
             if workflow_control is None or number <= 0:
                 raise ValueError("CI issue recovery authority is unavailable")
@@ -1985,6 +1995,7 @@ def _fix_state(
     return FixState(
         control_errors=errors,
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
+        pr_reply_control_errors=pr_reply_errors,
         automerge_enabled=automerge,
         ci_retries=ci_retries, ci_resets=ci_resets, review_retries=review_retries,
         review_control_errors=review_errors,
@@ -2872,6 +2883,8 @@ def compose_fix_daemon(
             log(f"workflow {target} held: {reason}")
         for target, reason in state.review_control_errors.items():
             log(f"address-review {target} held: {reason}")
+        for target, reason in state.pr_reply_control_errors.items():
+            log(f"PR reply {target} held: {reason}")
         migration_required = sorted(
             target for target, workflow in state.resolve_workflows.items()
             if isinstance(workflow, WorkflowMigrationRequired)
