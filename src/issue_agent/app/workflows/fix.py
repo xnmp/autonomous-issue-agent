@@ -81,7 +81,7 @@ from ...domain.effort import (
 from ...domain.labels import Label
 from ...domain import continuation_components as cc
 from ...domain.lifecycle import AllowedEligibility, LifecycleOperation, issue_eligibility
-from ...domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
+from ...domain.self_clear import BudgetBlock
 from ...domain.refs import slugify
 from ...domain.review import count_outstanding_change_requests
 from ...domain.trust import as_untrusted, untrusted_block
@@ -392,12 +392,6 @@ class FixWorkflow:
         runtime = self.cfg.fixer_runtime
         return runtime.value if isinstance(runtime, RuntimeName) else runtime
 
-    def _clear_block_markers(self, issue: int) -> None:
-        for name in ("clear_machine_block", "clear_budget_block"):
-            writer = getattr(self.store, name, None)
-            if writer is not None:
-                writer(issue)
-
     def _record_block_state(
         self,
         issue: int,
@@ -420,7 +414,6 @@ class FixWorkflow:
                 # A per-leg spend kill is not an admission predicate. Replaying
                 # it under the same per-leg ceiling would only repeat the kill.
                 return
-            self._clear_block_markers(issue)
             block = BudgetBlock(
                 issue,
                 target,
@@ -435,18 +428,6 @@ class FixWorkflow:
             if writer is not None:
                 writer(block)
             return
-        self._clear_block_markers(issue)
-        if result.status != "blocked" or pr is None or not blocked_head:
-            return
-        try:
-            blocker = MachineBlocker(result.field("blocker"))
-        except ValueError:
-            return
-        writer = getattr(self.store, "set_machine_block", None)
-        if writer is not None:
-            writer(MachineBlock(
-                issue, target, number, pr, blocker, blocked_head
-            ))
 
     def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None, *, remember: bool = True) -> str:
         from ...domain.workflow import CompletedRearm
@@ -1534,7 +1515,7 @@ class FixWorkflow:
             runtime = RuntimeName(self._resolve_runtime_name())
             handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr_existing), branch, runtime)
                        if repair_selected.component.state.actual_model is None and repair_selected.component.state.session is None else None)
-            repair = cc.PRRepairInput(repair_selected, branch, runtime, handoff)
+            repair = cc.PRRepairInput(repair_selected, branch, runtime, handoff, head=current_pr.head_ref_oid)
             fork = max(repair_selected.component.state.resumes, handoff.resumes if handoff is not None else 0) + 1 >= self.cfg.fork_threshold
         else:
             branch = self._resume_branch(issue, iss.title, state)
@@ -1692,7 +1673,7 @@ class FixWorkflow:
         handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff,
-                                  reply=cc.PRReplyInput(reply_comment.created_at, reply_comment.body))
+                                  reply=cc.PRReplyInput(reply_comment.created_at, reply_comment.body), head=p.head_ref_oid)
         if repair.session is None:
             self.cfg.log(f"PR #{pr}: reply deferred; no compatible session is available")
             return
@@ -1777,7 +1758,7 @@ class FixWorkflow:
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff, review=cc.ReviewRepairInput(
             issue_selected, PullRequestRef(pr), p.head_ref_oid, review_at,
-            self.cfg.max_review_retries if self.cfg.max_review_retries > 0 else 2**63-1))
+            self.cfg.max_review_retries if self.cfg.max_review_retries > 0 else 2**63-1), head=p.head_ref_oid)
         cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
         review_body = self.latest_review_body(p)
         # The file:line asks reviewers actually make live in the INLINE comments,
@@ -1899,7 +1880,7 @@ class FixWorkflow:
         handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff,
-            cc.CIRepairInput(issue_selected, PullRequestRef(pr), p.head_ref_oid, self.cfg.max_ci_retries))
+            cc.CIRepairInput(issue_selected, PullRequestRef(pr), p.head_ref_oid, self.cfg.max_ci_retries), head=p.head_ref_oid)
         guidance = self._pr_guidance(p.number)
         cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
         attempt = make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"])
@@ -1973,7 +1954,7 @@ class FixWorkflow:
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff, rebase=cc.RebaseRepairInput(
             issue_selected, PullRequestRef(pr), p.head_ref_oid, p.head_ref_name,
-            self.cfg.max_rebase_retries if self.cfg.max_rebase_retries > 0 else 2**63-1))
+            self.cfg.max_rebase_retries if self.cfg.max_rebase_retries > 0 else 2**63-1), head=p.head_ref_oid)
         cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
         task = task_builders.build_rebase_task(
             pr, self.cfg.base_branch, cwd, repair.session.handle if repair.session is not None else "",

@@ -2272,7 +2272,8 @@ def test_fix_ci_persists_structured_publication_block_for_reconciliation(tmp_pat
         _workflow(FakeGateway(prs={100: pr}), store, FakeRunner(result)).fix_ci(100)
     )
 
-    marker = store.get_machine_block(5)
+    from tests.fakes.accounted_workflow import issue_recovery_state
+    marker = issue_recovery_state(store).machine_block
     assert marker is not None
     assert marker.blocker.value == "publication"
     assert marker.blocked_head == "blocked-head"

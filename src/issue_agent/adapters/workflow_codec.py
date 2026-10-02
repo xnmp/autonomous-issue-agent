@@ -33,6 +33,8 @@ from ..domain.labels import Label
 from ..domain.eligibility import IssueCompletionGuard, LifecycleOperation
 from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
+from ..domain.self_clear import MachineBlock, MachineBlocker
+from ..domain.actions import Target
 from ..domain.outcome import Adjudication
 from ..domain.effort import Effort
 from ..domain import resolve_split as split
@@ -45,6 +47,7 @@ MAX_WORKFLOW_PAYLOAD_DEPTH = 24
 T = TypeVar("T")
 
 _VALUES = (
+    MachineBlock, cc.RecordedMachineBlock,
     cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
     cc.IssueRebasePurchase, cc.RebaseRepairResult, cc.RebaseAllowanceReset,
     cc.IssueCIPurchase, cc.CIRepairResult, cc.CIEpisodeReset,
@@ -145,6 +148,7 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
+    MachineBlocker, Target,
     UsageSource, PricingBasis,
     LifecycleOperation,
     cc.RepairAllowance, cc.CICharge, cc.ReviewCharge, cc.RebaseCharge, cc.StewardLane, cc.StewardFailureKind, cc.FixInfraOutcome,
@@ -196,9 +200,9 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
     "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None},
-    "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False},
-    "PRRepairResult": {"ci": None, "review": None, "rebase": None},
-    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None},
+    "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False, "head": ""},
+    "PRRepairResult": {"ci": None, "review": None, "rebase": None, "machine_block": None},
+    "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None, "machine_block": None},
     "ContinuationCapture": {"fix_infra_ceiling": None},
     "AuthoredResolve": {"split": None, "split_applied_admission_version": 0},
     "ResolveAdmission": {"split_fingerprint": None, "workspace_handoff_id": None},
@@ -248,13 +252,15 @@ def _encode(value: object, depth: int = 0) -> object:
                 # commands retain their required binding; legacy audits omit it.
                 if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None))
                     and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
-                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode"} and getattr(value, field.name) is None)
+                    and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block"} and getattr(value, field.name) is None)
                     and not (type(value) is cc.PRRepairResult and (field.name == "ci" and value.ci is None
                         or field.name == "review" and value.review is None
-                        or field.name == "rebase" and value.rebase is None))
+                        or field.name == "rebase" and value.rebase is None
+                        or field.name == "machine_block" and value.machine_block is None))
                     and not (type(value) is cc.PRRepairPurchase and (field.name == "branch" and not value.branch
                         or field.name == "handoff" and value.handoff is None
-                        or field.name == "advance_resume" and not value.advance_resume))
+                        or field.name == "advance_resume" and not value.advance_resume
+                        or field.name == "head" and not value.head))
                     and not (type(value) is cc.StewardLaneState and (
                         field.name == "delivery_source" and value.delivery_source is None
                         or field.name == "attempted_at" and not value.attempted_at))

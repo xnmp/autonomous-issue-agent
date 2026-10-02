@@ -32,7 +32,7 @@ from ..domain.ci_history import (
 from ..domain.world import normalize_predicted_paths
 from ..domain.actions import Target
 from ..domain.ports import WorkflowControlError
-from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker
+from ..domain.self_clear import BudgetBlock
 
 # ── suffix universe (review M4/D8) ──────────────────────────────────────────
 # Every accessor below writes `issue-N.<suffix>` or `pr-N.<suffix>` via
@@ -333,43 +333,6 @@ class Store:
         )
         return history
 
-    def get_machine_block(self, issue: int) -> MachineBlock | None:
-        path = self.issue_path(issue, "machine-block")
-        raw = self._read_control(path)
-        if raw is None:
-            return None
-        try:
-            value = json.loads(raw)
-            return MachineBlock(
-                issue=issue,
-                target=Target[str(value["target"])],
-                number=self._integer(value["number"], path),
-                pr=self._integer(value["pr"], path),
-                blocker=MachineBlocker(str(value["blocker"])),
-                blocked_head=str(value["blocked_head"]),
-            )
-        except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-            raise WorkflowControlError(path, "malformed machine block") from exc
-
-    def set_machine_block(self, block: MachineBlock) -> None:
-        self._write(
-            self.issue_path(block.issue, "machine-block"),
-            json.dumps(
-                {
-                    "target": block.target.name,
-                    "number": block.number,
-                    "pr": block.pr,
-                    "blocker": block.blocker.value,
-                    "blocked_head": block.blocked_head,
-                },
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        )
-
-    def clear_machine_block(self, issue: int) -> None:
-        self._remove(self.issue_path(issue, "machine-block"))
-
     def get_budget_block(self, issue: int) -> BudgetBlock | None:
         path = self.issue_path(issue, "budget-block")
         raw = self._read_control(path)
@@ -415,10 +378,9 @@ class Store:
     def get_self_clear_count(self, issue: int) -> int:
         return self._read_int(self.issue_path(issue, "self-clears"))
 
-    def complete_machine_self_clear(self, issue: int) -> int:
+    def increment_self_clear_count(self, issue: int) -> int:
         count = self.get_self_clear_count(issue) + 1
         self._write(self.issue_path(issue, "self-clears"), str(count))
-        self.clear_machine_block(issue)
         return count
 
     def complete_budget_self_clear(self, issue: int) -> int:

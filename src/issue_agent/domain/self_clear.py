@@ -17,6 +17,7 @@ from .actions import (
 from .ci import ci_state
 from .labels import Label
 from .world import CIState, WorldState
+from .workflow_identity import WorkflowRevision, validate_workflow_integer, validate_workflow_text
 
 SELF_CLEAR_CEILING = 3
 
@@ -36,14 +37,15 @@ class MachineBlock:
     blocked_head: str
 
     def __post_init__(self) -> None:
-        if min(self.issue, self.number, self.pr) <= 0:
-            raise ValueError("machine block identifiers must be positive")
+        for value in (self.issue, self.number, self.pr):
+            validate_workflow_integer(value, "machine block target", minimum=1)
+        if self.number != self.pr:
+            raise ValueError("machine block mutation must name its selected PR")
         if self.target is not Target.PR:
             raise ValueError("machine-checkable fixer blocks currently target PRs")
         if not isinstance(self.blocker, MachineBlocker):
             raise ValueError("machine block requires a recognized blocker selector")
-        if not self.blocked_head:
-            raise ValueError("machine block requires the observed blocked head")
+        validate_workflow_text(self.blocked_head, "machine blocked head", limit=256)
 
 
 @dataclass(frozen=True)
@@ -145,6 +147,7 @@ def self_clear_actions(
     ceiling_reported: frozenset[int],
     ignored_checks: tuple[str, ...] = (),
     ceiling: int = SELF_CLEAR_CEILING,
+    machine_revisions: dict[int, WorkflowRevision] | None = None,
 ) -> list[Action]:
     """Return only clears proven by the current snapshot; absence never clears."""
 
@@ -155,7 +158,7 @@ def self_clear_actions(
             None,
         )
         if observed_target is not None and not observed_target.has(Label.AI_BLOCKED):
-            actions.append(DiscardSelfClearMarker(issue, "machine"))
+            actions.append(DiscardSelfClearMarker(issue, "machine", (machine_revisions or {}).get(issue)))
             continue
         clearable, observed_head = _machine_clearable(world, block, ignored_checks)
         if not clearable:
@@ -182,6 +185,7 @@ def self_clear_actions(
                 block.blocker.value,
                 block.blocked_head,
                 observed_head,
+                (machine_revisions or {}).get(issue),
             ),
         ])
 

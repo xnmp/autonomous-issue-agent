@@ -17,12 +17,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Union
+from typing import TYPE_CHECKING, Union
 
 from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from .labels import Label
-from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding
-from .continuation_components import CIEpisodeReset
+from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding, WorkflowRevision
+if TYPE_CHECKING:
+    from .continuation_components import CIEpisodeReset
 
 
 class Target(Enum):
@@ -334,6 +335,7 @@ class ResetCiRetries:
     source: CIEpisodeReset | None = None
 
     def __post_init__(self) -> None:
+        from .continuation_components import CIEpisodeReset
         if self.source is not None and (not isinstance(self.source, CIEpisodeReset)
                 or self.source.binding.fence.key.target != IssueRef(self.issue)):
             raise ValueError("CI reset action belongs to another issue")
@@ -349,6 +351,7 @@ class FinalizeMachineBlockRetirement:
     blocker: str
     blocked_head: str
     observed_head: str
+    revision: WorkflowRevision | None = None
 
 
 @dataclass(frozen=True)
@@ -383,6 +386,7 @@ class DiscardSelfClearMarker:
 
     issue: int
     marker: str
+    revision: WorkflowRevision | None = None
 
 
 @dataclass(frozen=True)

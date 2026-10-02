@@ -11,6 +11,7 @@ from .agent_task import RuntimeName
 from .refs import issue_from_branch
 from .contracts import ContinuationAdmission, SettlementRequest, WorkflowAttemptIdentity
 from .eligibility import IssueCompletionGuard, LifecycleOperation
+from .self_clear import MachineBlock
 from .workflow_identity import (
     MAX_WORKFLOW_GATES, ContinuationComponentIdentity, FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, WorkflowFence,
     validate_workflow_identifier, validate_workflow_integer, validate_workflow_text,
@@ -161,6 +162,18 @@ class FixInfraReceipt:
 
 
 @dataclass(frozen=True)
+class RecordedMachineBlock(MachineBlock):
+    source: ContinuationAdmission
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        if (not isinstance(self.source, ContinuationAdmission)
+                or self.source.attempt.binding.authority.family is not WorkflowFamily.ISSUE_RECOVERY
+                or self.source.attempt.binding.fence.key.target.number != self.issue):
+            raise ValueError("machine block requires its exact admitted issue source")
+
+
+@dataclass(frozen=True)
 class IssueRecoveryState:
     consumed_reply_at: str = ""
     resumes: int = 0
@@ -173,6 +186,7 @@ class IssueRecoveryState:
     pending_ci: ContinuationAdmission | None = field(default=None, repr=False)
     pending_rebase: ContinuationAdmission | None = field(default=None, repr=False)
     infra_episode: FixInfraEpisode | None = field(default=None, repr=False)
+    machine_block: MachineBlock | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed issue reply")
@@ -189,6 +203,8 @@ class IssueRecoveryState:
             raise ValueError("pending rebase requires its exact issue recovery admission")
         if self.infra_episode is not None and not isinstance(self.infra_episode, FixInfraEpisode):
             raise ValueError("fix infrastructure state requires one typed episode")
+        if self.machine_block is not None and not isinstance(self.machine_block, MachineBlock):
+            raise ValueError("machine hold requires its fixed typed cause and head")
 
 
 @dataclass(frozen=True)
@@ -425,6 +441,15 @@ class ActiveIssueRecovery:
             if (binding.fence.key != self.identity.key or binding.authority != self.identity.authority
                     or binding.episode_id != self.identity.episode_id):
                 raise ValueError("fix infrastructure episode differs from its issue component")
+        block = self.state.machine_block
+        if block is not None:
+            if block.issue != self.identity.key.target.number:
+                raise ValueError("machine hold belongs to another issue")
+            if isinstance(block, RecordedMachineBlock):
+                binding = block.source.attempt.binding
+                if (binding.fence.key != self.identity.key or binding.authority != self.identity.authority
+                        or binding.episode_id != self.identity.episode_id):
+                    raise ValueError("machine hold differs from its issue component")
 
 
 @dataclass(frozen=True)
@@ -925,11 +950,13 @@ class PRRepairPurchase:
     branch: str = ""
     handoff: RepairHandoff | None = None
     advance_resume: bool = False
+    head: str = field(default="", repr=False)
 
     def __post_init__(self) -> None:
         if not isinstance(self.capture, ContinuationCapture) or self.capture.binding.authority.family is not WorkflowFamily.PR_REPAIR:
             raise ValueError("PR repair purchase requires its family capture")
         validate_workflow_text(self.branch, "purchased repair branch", empty=True)
+        validate_workflow_text(self.head, "purchased repair head", limit=256, empty=True)
         if self.handoff is not None and (not isinstance(self.handoff, RepairHandoff) or self.handoff.branch != self.branch
                 or self.handoff.pr != self.capture.binding.fence.key.target):
             raise ValueError("purchased repair handoff differs from its PR/branch")
@@ -986,11 +1013,13 @@ class PRRepairInput:
     review: ReviewRepairInput | None = None
     rebase: RebaseRepairInput | None = None
     reply: PRReplyInput | None = None
+    head: str = ""
 
     def __post_init__(self) -> None:
         if not isinstance(self.selection, SelectedPRRepair) or not isinstance(self.runtime, RuntimeName):
             raise ValueError("repair input requires selected authority and runtime")
         validate_workflow_text(self.branch, "current remote repair branch")
+        validate_workflow_text(self.head, "current remote repair head", limit=256, empty=True)
         if self.reply is not None and (self.ci is not None or self.review is not None or self.rebase is not None
                 or not isinstance(self.reply, PRReplyInput)
                 or not reply_advances(self.reply.reply_at, self.selection.component.state.consumed_reply_at)):
@@ -1046,6 +1075,7 @@ class PRRepairResult:
     ci: CIRepairResult | None = None
     review: ReviewRepairResult | None = None
     rebase: RebaseRepairResult | None = None
+    machine_block: RecordedMachineBlock | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         if (not isinstance(self.admission, ContinuationAdmission)
@@ -1079,6 +1109,11 @@ class PRRepairResult:
                 self.state.session.runtime is not self.state.actual_model.runtime
                 or self.state.session.model != self.state.actual_model.model):
             raise ValueError("repair handle must come from the actual returned runtime and model")
+        if self.machine_block is not None and (not isinstance(self.machine_block, RecordedMachineBlock)
+                or self.machine_block.source.attempt.run_id != self.admission.attempt.run_id
+                or self.machine_block.source.attempt.leg_id != self.admission.attempt.leg_id
+                or self.machine_block.pr != self.admission.attempt.binding.fence.key.target.number):
+            raise ValueError("machine cause must come from the same paid issue/PR run")
 
 
 @dataclass(frozen=True)

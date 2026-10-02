@@ -349,10 +349,10 @@ class Executor:
         mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         reset_ci_retries: Callable[[ResetCiRetries], None] | None = None,
-        retire_machine_block: Callable[[int], int] | None = None,
+        retire_machine_block: Callable[[FinalizeMachineBlockRetirement], int] | None = None,
         retire_budget_block: Callable[[int], int] | None = None,
         mark_self_clear_ceiling: Callable[[int], None] | None = None,
-        discard_machine_block: Callable[[int], None] | None = None,
+        discard_machine_block: Callable[[DiscardSelfClearMarker], None] | None = None,
         discard_budget_block: Callable[[int], None] | None = None,
         journal=None,
         alert_cmd: str = "",
@@ -768,7 +768,7 @@ class Executor:
                 raise LifecycleWriteUnverified(
                     f"{kind} #{action.number} is still ai-blocked"
                 )
-            count = self._retire_machine_block(action.issue)
+            count = self._retire_machine_block(action)
             if self._journal is not None:
                 self._journal.emit(TelemetryEvent(
                     BlockRetired(
@@ -818,7 +818,7 @@ class Executor:
                 ))
         elif isinstance(action, DiscardSelfClearMarker):
             if action.marker == "machine":
-                self._discard_machine_block(action.issue)
+                self._discard_machine_block(action)
             elif action.marker == "budget":
                 self._discard_budget_block(action.issue)
             else:

@@ -247,7 +247,8 @@ def test_composed_holds_preserve_labels_machine_budget_and_sql_infra_episode(dep
     assert "infrastructure failure ceiling" not in workflow.external_holds(issue)
     control = deployment[2]
     seed_infra_outcome(control, 1, cc.FixInfraOutcome.RECLAIMED, owner_id=workflow.control.writer.owner_id, reclaim=True)
-    store.set_machine_block(MachineBlock(1, Target.PR, 11, 11, MachineBlocker.CHECKS, "head"))
+    from tests.fakes.accounted_workflow import seed_imported_machine_hold
+    seed_imported_machine_hold(control, MachineBlock(1, Target.PR, 11, 11, MachineBlocker.CHECKS, "head"))
     store.set_budget_block(BudgetBlock(1, Target.ISSUE, 1, 10, "daily", 5))
     assert set(workflow.external_holds(observed)) == {label.value for label in labels} | {
         "infrastructure failure ceiling", "machine blocker", "budget blocker",
@@ -256,7 +257,7 @@ def test_composed_holds_preserve_labels_machine_budget_and_sql_infra_episode(dep
     assert workflow.external_holds(unrelated) == ()
 
 
-@pytest.mark.parametrize("reader", ["read_issue_recovery", "get_machine_block", "get_budget_block"])
+@pytest.mark.parametrize("reader", ["read_issue_recovery", "get_budget_block"])
 def test_unavailable_hold_reader_is_not_treated_as_clear(deployment, monkeypatch, reader):
     workflow, cfg, store, issue = _compose(deployment)
     def unavailable(*args, **kwargs):

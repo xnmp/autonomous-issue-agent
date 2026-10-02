@@ -5429,6 +5429,7 @@ class SQLiteControlStore:
                 self._validate_pr_repair_sources(db, selection)
             if isinstance(selection, cc.SelectedIssueRecovery):
                 self._require_fix_infra_projection(db, selection)
+                self._require_machine_projection(db, selection)
             if (not isinstance(selection, (cc.SelectedIssueRecovery, cc.SelectedPRRepair, cc.SelectedSteward))
                     or getattr(aggregate, "gates", ()) or selection.component.gates
                     or not (selection.binding == admission.attempt.binding and admission.admission_version <= selection.revision.version
@@ -5581,6 +5582,7 @@ class SQLiteControlStore:
                         raise ValueError("issue recovery is inactive or migration blocked")
                     self._require_issue_reply_projection(db, key, selection.component.state.consumed_reply_at)
                     self._require_fix_infra_projection(db, selection)
+                    self._require_machine_projection(db, selection)
                     if isinstance(purchase, cc.IssueInfraPurchase):
                         if selection.binding != capture.binding or selection.component.gates:
                             raise ValueError("fix infrastructure capture is stale or held")
@@ -6223,6 +6225,7 @@ class SQLiteControlStore:
                     or dispatch.get('kind') != ('PR_RESUME' if purchase.reply_at or linked_reply is not None else 'REBASE' if returned.rebase is not None else 'ADDRESS_REVIEW' if returned.review is not None else 'FIX_CI') or dispatch.get('number') != key.target.number
                     or dispatch.get('runtime') != returned.state.actual_model.runtime.value):
                 raise WorkflowAuthorityError("repair output changed its admitted branch, lane or runtime")
+            self._validate_machine_result(db, purchase, returned)
             prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?",
                 (key.repository, receipt_key)).fetchone()
             if prior is not None:
@@ -6313,6 +6316,7 @@ class SQLiteControlStore:
             selected = cc.select_issue_recovery(aggregate) if aggregate is not None else cc.InactiveIssueRecovery()
             if isinstance(selected, cc.SelectedIssueRecovery):
                 self._require_fix_infra_projection(db, selected)
+                self._require_machine_projection(db, selected)
             if isinstance(selected, cc.SelectedIssueRecovery) and selected.component.state.pending_ci is not None:
                 pending = selected.component.state.pending_ci
                 purchase, _ = self._continuation_return_admission(db, pending, WorkflowFamily.ISSUE_RECOVERY)
@@ -6842,6 +6846,50 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("continuation return conflicts with its actual run binding")
         return captured[0], row
 
+    def _require_machine_projection(self, db, selected: cc.SelectedIssueRecovery) -> None:
+        block = selected.component.state.machine_block
+        if block is None:
+            return
+        key = selected.binding.fence.key
+        if isinstance(block, cc.RecordedMachineBlock):
+            if block.source.attempt.binding.fence.generation > selected.revision.fence.generation:
+                raise WorkflowAuthorityError("machine hold comes from a future issue generation")
+            captured = self._fix_infra_admission(db, block.source.attempt.run_id)
+            row = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?",
+                (key.repository, self._continuation_receipt_key(block.source.attempt.run_id, WorkflowFamily.PR_REPAIR))).fetchone()
+            returned = decode_workflow(row[0], cc.PRRepairResult) if row is not None else None
+            if captured is None or captured[0] != block.source or returned is None or returned.machine_block != block:
+                raise WorkflowAuthorityError("machine hold lacks its exact captured return receipt")
+            purchase, _ = self._continuation_return_admission(db, returned.admission, WorkflowFamily.PR_REPAIR)
+            self._validate_machine_result(db, purchase, returned)
+        else:
+            from ..domain.continuation_import import ContinuationImportTarget
+            row = db.execute("SELECT decision_json FROM workflow_activation_imports WHERE repository=? AND family=? AND epoch=? AND target_kind=? AND target_number=?",
+                (key.repository, WorkflowFamily.ISSUE_RECOVERY.value, selected.binding.authority.epoch, *workflow_scope(key)[1:])).fetchone()
+            target = decode_workflow(row[0], ContinuationImportTarget) if row is not None else None
+            if (target is None or target.key != key or not isinstance(target.state, cc.IssueRecoveryState)
+                    or target.state.machine_block != block):
+                raise WorkflowAuthorityError("imported machine hold lacks its exact original decision")
+
+    def retire_machine_block(self, revision: WorkflowRevision, *, blocker: str | None = None,
+                             blocked_head: str | None = None) -> int:
+        from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+        with self.transaction() as db, self.mutation_savepoint(db):
+            aggregate = load_issue_aggregate(db, revision.fence.key)
+            selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+            if not isinstance(selected, cc.SelectedIssueRecovery) or selected.revision != revision:
+                raise WorkflowAuthorityError("machine retirement selection is stale or inactive")
+            self._require_machine_projection(db, selected)
+            block = selected.component.state.machine_block
+            if block is None or (blocker is not None and block.blocker.value != blocker
+                                 or blocked_head is not None and block.blocked_head != blocked_head):
+                raise WorkflowAuthorityError("machine retirement differs from its selected cause/head")
+            state = replace(selected.component.state, machine_block=None)
+            persist_workflow_snapshot(db, replace(aggregate,
+                revision=replace(revision, version=revision.version+1),
+                issue_recovery=replace(selected.component, state=state)))
+            return state.self_clears
+
     def _require_fix_infra_projection(self, db, selected: cc.SelectedIssueRecovery) -> None:
         episode = selected.component.state.infra_episode
         if episode is None:
@@ -6913,6 +6961,13 @@ class SQLiteControlStore:
     def record_fix_infra_return(self, run_id: RunId, outcome: cc.FixInfraOutcome, writer) -> None:
         with self.transaction() as db, self.mutation_savepoint(db):
             self._record_fix_infra(db, run_id, outcome, writer)
+
+    def fix_issue_admission(self, run_id: RunId) -> ContinuationAdmission:
+        with self.transaction() as db:
+            captured = self._fix_infra_admission(db, run_id)
+            if captured is None:
+                raise WorkflowAuthorityError("machine return lacks its captured issue admission")
+            return captured[0]
 
     def _record_fix_infra(self, db, run_id: RunId, outcome: cc.FixInfraOutcome, writer, *, captured=None) -> None:
         from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot
@@ -7007,6 +7062,7 @@ class SQLiteControlStore:
             review = None
             rebase = None
             linked_reply = None
+            captured = None
             if isinstance(purchase, cc.PRRepairPurchase) and purchase.branch:
                 self._require_repair_writer(db, writer, admission, run["owner_id"])
                 if state.branch != purchase.branch:
@@ -7017,6 +7073,7 @@ class SQLiteControlStore:
                 if captured is None or (captured.admission, captured.state, captured.settlement) != (admission, state, request):
                     raise WorkflowAuthorityError("repair settlement conflicts with its captured result")
                 ci = captured.ci
+                self._validate_machine_result(db, purchase, captured)
                 review = captured.review
                 rebase = captured.rebase
                 linked_reply = self._linked_issue_reply_admission(db, admission.attempt, run)
@@ -7058,6 +7115,8 @@ class SQLiteControlStore:
             settled = self._settle(db, request)
             if settled.disposition is not AccountingDisposition.AVAILABLE or prior is not None:
                 return settled
+            if family is WorkflowFamily.PR_REPAIR and captured is not None and captured.machine_block is not None:
+                self._apply_machine_result(db, captured)
             if ci is not None:
                 self._apply_ci_result(db, ci)
             if review is not None:
@@ -7081,7 +7140,7 @@ class SQLiteControlStore:
                                       ci_failures=component.state.ci_failures, pending_ci=component.state.pending_ci,
                                       infra_failures=component.state.infra_failures, infra_episode=component.state.infra_episode,
                                       review_failures=component.state.review_failures, rebase_failures=component.state.rebase_failures,
-                                      pending_rebase=component.state.pending_rebase)
+                                      pending_rebase=component.state.pending_rebase, machine_block=component.state.machine_block)
                     after = replace(aggregate, revision=revision, issue_recovery=replace(component, state=applied, watermarks=watermarks))
                 elif isinstance(selection, cc.SelectedPRRepair):
                     if not isinstance(aggregate, ReviewWorkflowSnapshot):
@@ -7098,6 +7157,40 @@ class SQLiteControlStore:
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
                        (key.repository, receipt_key, _stamp(self._now()), encoded))
             return settled
+
+    def _validate_machine_result(self, db, purchase: cc.PRRepairPurchase, returned: cc.PRRepairResult) -> None:
+        block = returned.machine_block
+        if block is None:
+            return
+        captured = self._fix_infra_admission(db, returned.admission.attempt.run_id)
+        if (captured is None or captured[0] != block.source or block.blocked_head != purchase.head
+                or block.pr != purchase.capture.binding.fence.key.target.number):
+            raise WorkflowAuthorityError("machine result differs from its captured issue/PR/head")
+
+    def _apply_machine_result(self, db, returned: cc.PRRepairResult) -> None:
+        from .workflow_rows import load_issue_aggregate, load_review_workflow_row, persist_workflow_snapshot
+        block = returned.machine_block
+        if block is None:
+            return
+        repair = load_review_workflow_row(db, returned.admission.attempt.binding.fence.key)
+        selected_repair = cc.select_pr_repair(repair) if repair is not None else None
+        if not isinstance(selected_repair, cc.SelectedPRRepair) or not cc.continuation_return_is_current(selected_repair, returned.admission):
+            return
+        source = block.source
+        key = source.attempt.binding.fence.key
+        purchase, _ = self._continuation_return_admission(db, source, WorkflowFamily.ISSUE_RECOVERY)
+        aggregate = load_issue_aggregate(db, key)
+        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else None
+        if not isinstance(selected, cc.SelectedIssueRecovery):
+            return
+        current = (selected.binding == source.attempt.binding
+            and selected.component.state.infra_episode is not None
+            and selected.component.state.infra_episode.source == source
+            if isinstance(purchase, cc.IssueInfraPurchase) else cc.continuation_return_is_current(selected, source))
+        if current:
+            persist_workflow_snapshot(db, replace(aggregate,
+                revision=replace(aggregate.revision, version=aggregate.revision.version+1),
+                issue_recovery=replace(selected.component, state=replace(selected.component.state, machine_block=block))))
 
     def _apply_rebase_result(self, db, returned: cc.RebaseRepairResult) -> None:
         from .workflow_rows import load_issue_aggregate, persist_workflow_snapshot

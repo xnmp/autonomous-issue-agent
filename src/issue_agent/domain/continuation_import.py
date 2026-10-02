@@ -9,6 +9,8 @@ import re
 
 from . import continuation_components as cc
 from .refs import issue_from_branch
+from .actions import Target
+from .self_clear import MachineBlock, MachineBlocker
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable
 from .workflow_identity import (
     WorkflowFamily, WorkflowKey, WorkflowRevision, canonical_workflow_repository,
@@ -31,6 +33,8 @@ def digest(value: object) -> str:
 
 
 def _plan_state_identity(state: ImportedState | None) -> object:
+    if isinstance(state, cc.IssueRecoveryState) and state.machine_block is not None:
+        return (repr(state), repr(state.machine_block))
     if isinstance(state, cc.IssueRecoveryState) and not state.review_failures.review_at and state.review_failures.pr is None and state.review_failures.pending is None:
         return repr(state).replace(f"review_failures={state.review_failures!r}", f"review_failures={state.review_failures.count}", 1)
     if isinstance(state, cc.StewardState) and state.groom_content != cc.GroomContent():
@@ -122,6 +126,16 @@ class ContinuationImportPlan:
                               t.authority_digest, _plan_state_identity(t.state), tuple((b.source, b.reason) for b in t.blockers)) for t in self.targets)))
 
 
+def _machine_block(record: LegacyContinuationRecord, text: str) -> MachineBlock:
+    if record.family is not WorkflowFamily.ISSUE_RECOVERY or len(text) > 4096:
+        raise ValueError("machine hold requires bounded issue evidence")
+    value = json.loads(text)
+    if not isinstance(value, dict) or set(value) != {"target", "number", "pr", "blocker", "blocked_head"}:
+        raise ValueError("machine hold requires its exact fixed fields")
+    return MachineBlock(record.key.target.number, Target[value["target"]], value["number"],
+                        value["pr"], MachineBlocker(value["blocker"]), value["blocked_head"])
+
+
 def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[cc.ContinuationImportBlocker, ...]:
     """Only direct typed facts are imported; unsupported provenance stays held."""
     values: dict[str, str] = {}
@@ -142,7 +156,12 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                     reason = str(exc)
                 if not text:
                     reason = "empty present continuation field"
-            elif name in {"session", "model", "machine-block", "budget-block", "self-clear-ceiling", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
+            elif name == "machine-block":
+                try:
+                    _machine_block(record, text)
+                except (ValueError, TypeError, KeyError) as exc:
+                    reason = str(exc)
+            elif name in {"session", "model", "budget-block", "self-clear-ceiling", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
             elif name == "review-retries":
                 at, separator, number = text.rpartition(" ")
@@ -175,7 +194,8 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
             review_at, _, review_count = values.get("review-retries", " 0").rpartition(" ")
             return cc.IssueRecoveryState(values.get("resumed-at", ""), count("resumes"), values.get("branch", ""),
                                          count("ci-retries"), cc.ReviewRetryState(review_at, int(review_count)), count("rebase-retries"),
-                                         count("infra-deaths"), count("self-clears"))
+                                         count("infra-deaths"), count("self-clears"),
+                                         machine_block=_machine_block(record, values["machine-block"]) if "machine-block" in values else None)
         if record.family is WorkflowFamily.PR_REPAIR:
             return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
                                     infra_failures=count("infra-deaths"))
@@ -293,4 +313,23 @@ def groom_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuation
         before = (baseline, signature, int(stalls or "0"))
         after = (target.state.groom.baseline_at, target.state.groom_content.successful, target.state.groom.stalls)
         comparisons.append((target.key, before, after))
+    return tuple(comparisons)
+
+
+def machine_shadow(plan: ContinuationImportPlan, records: tuple[LegacyContinuationRecord, ...]) -> tuple[tuple[WorkflowKey, tuple | None, tuple | None], ...]:
+    def fact(block: MachineBlock | None) -> tuple | None:
+        return ((block.issue, block.target.name, block.number, block.pr, block.blocker.value, block.blocked_head)
+                if block is not None else None)
+    comparisons = []
+    for target in plan.targets:
+        if not isinstance(target.state, cc.IssueRecoveryState):
+            continue
+        found = tuple(record for record in records if record.key == target.key and record.family is WorkflowFamily.ISSUE_RECOVERY)
+        if len(found) > 1:
+            raise ValueError("eligible machine shadow has ambiguous source ownership")
+        source = dict(found[0].fields).get("machine-block", LegacyAbsent()) if found else LegacyAbsent()
+        if not isinstance(source, (LegacyAbsent, LegacyPresent)):
+            raise ValueError("eligible machine shadow has unreadable selected evidence")
+        before = _machine_block(found[0], source.text) if isinstance(source, LegacyPresent) else None
+        comparisons.append((target.key, fact(before), fact(target.state.machine_block)))
     return tuple(comparisons)

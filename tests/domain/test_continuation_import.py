@@ -163,3 +163,21 @@ def test_rebase_shadow_rejects_ambiguous_selected_source():
     assert rebase_shadow(plan, (original,)) == ((original.key, 2, 2),)
     with pytest.raises(ValueError, match="ambiguous source ownership"):
         rebase_shadow(plan, (original, original))
+
+
+def test_machine_hold_import_preserves_fixed_cause_head_and_target():
+    import json
+    from issue_agent.domain.actions import Target
+    from issue_agent.domain.self_clear import MachineBlock, MachineBlocker
+    payload = json.dumps(dict(target="PR", number=11, pr=11, blocker="checks", blocked_head="head"))
+    state = classify_record(record(**{"machine-block": payload}))
+    assert isinstance(state, cc.IssueRecoveryState)
+    assert state.machine_block == MachineBlock(7, Target.PR, 11, 11, MachineBlocker.CHECKS, "head")
+
+
+@pytest.mark.parametrize("payload", ["{}", "null", '{"target":"PR"}', "x" * 4097,
+    '{"target":"PR","number":11,"pr":12,"blocker":"checks","blocked_head":"head"}',
+    '{"target":"PR","number":true,"pr":true,"blocker":"checks","blocked_head":"head"}'])
+def test_machine_import_refuses_incomplete_or_unbounded_selected_evidence(payload):
+    result = classify_record(record(**{"machine-block": payload}))
+    assert isinstance(result, tuple) and all("machine-block" in blocker.reason for blocker in result)

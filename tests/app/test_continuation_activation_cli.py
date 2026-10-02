@@ -783,3 +783,30 @@ def test_stopped_fix_import_refuses_unassigned_pre_f7_death_without_zero_inferen
     code, result, error = command(capsys, "fix", "inventory")
     assert code != 0 and result is None and "unassigned prior" in error
     assert dump(control) == before
+
+
+def test_machine_shadow_and_copy_preserve_selected_hold_and_refuse_only_bad_target(stopped, capsys, tmp_path):
+    state, control, _ = stopped
+    payload = dict(target="PR", number=11, pr=11, blocker="checks", blocked_head="head")
+    (state / "issue-7.machine-block").write_text(json.dumps(payload))
+    (state / "issue-8.machine-block").write_text('{"target":"PR"}')
+    original_sql = dump(control)
+    original_files = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, report, error = command(capsys, "fix", "shadow")
+    assert code == 0, error
+    fact = [7, "PR", 11, 11, "checks", "head"]
+    assert report["machine_shadow"] == [{"issue": 7, "legacy": fact, "imported": fact, "agrees": True}]
+    assert [(target["number"], target["eligible"]) for target in report["targets"]] == [(7, True), (8, False)]
+    copied = tmp_path / "machine-copy"
+    code, result, error = command(capsys, "fix", "rehearse", "--copy-to", str(copied))
+    assert code == 0 and all(result["checks"].values()), error
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    reopened = SQLiteControlStore(str(copied / "issue-agent-control" / Path(control.path).name))
+    selected = reopened.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    assert selected.component.state.machine_block.blocked_head == "head"
+    assert selected.component.state.machine_block.pr == 11
+    with reopened.transaction() as db:
+        blocked = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(8)))
+    assert isinstance(blocked.issue_recovery, cc.BlockedIssueRecovery)
+    assert dump(control) == original_sql
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == original_files

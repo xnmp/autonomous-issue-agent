@@ -72,7 +72,7 @@ def test_rebase_without_active_pr_component_refuses_without_purchase(tmp_path):
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
 
 
-def active_ci_workflow(result):
+def active_ci_workflow(result, files=None):
     from dataclasses import replace
     from issue_agent.domain import continuation_components as cc
     from issue_agent.domain.workflow_identity import WorkflowFamily
@@ -81,7 +81,7 @@ def active_ci_workflow(result):
     gateway = FakeGateway(prs={100: PRView(100, head_ref_name="fix/5-remote", closing_issue=5,
         checks=(Check("tests", "fail"),))})
     inner = FakeRunner(result)
-    files = FakeStore()
+    files = files if files is not None else FakeStore()
     workflow = _workflow(gateway, files, inner, pr_repair_authority=False)
     key = WorkflowKey("o/r", PullRequestRef(100))
     base = replace(held(key=key), gates=())
@@ -96,6 +96,33 @@ def issue_ci_state(files, issue=5):
     with files._workflow_db.transaction() as db:
         aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(issue)))
         return cc.select_issue_recovery(aggregate).component.state
+
+
+def test_machine_block_return_survives_sql_reopen_and_exact_result_retry(tmp_path):
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    from issue_agent.adapters.store import Store
+    from issue_agent.domain.self_clear import MachineBlocker, BudgetBlock
+    from issue_agent.domain.actions import Target
+    files = Store(str(tmp_path / "state"))
+    budget = BudgetBlock(5, Target.PR, 100, 10000, "issue", 100000)
+    files.set_budget_block(budget)
+    workflow, files, inner, _ = active_ci_workflow(AgentResult(
+        is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01), files)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
+    asyncio.run(workflow.fix_ci(100))
+    reopened = SQLiteControlStore(files._workflow_db.path)
+    key = WorkflowKey("o/r", IssueRef(5))
+    block = reopened.read_issue_recovery(key).component.state.machine_block
+    assert block is not None and block.blocker is MachineBlocker.CHECKS
+    assert block.blocked_head == "a" * 40 and block.pr == 100
+    assert files.get_budget_block(5) == budget
+    with reopened.transaction() as db:
+        returned = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
+    reopened.settle_pr_repair_result(returned, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"))
+    assert reopened.read_issue_recovery(key).component.state.machine_block == block
+    assert len(inner.tasks) == 1
+    with reopened.transaction() as db:
+        assert db.execute("SELECT COUNT(*), SUM(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
 
 
 def test_fix_infra_return_and_exact_recovery_count_one_issue_death():
@@ -1937,3 +1964,60 @@ def test_actual_normal_return_resets_episode_without_releasing_unreadable_spend(
         assert db.execute("SELECT COUNT(*) FROM charges WHERE amount_micros>0").fetchone()[0] == 0
         assert db.execute("SELECT COUNT(*) FROM budget_reservations WHERE state='active'").fetchone()[0] == 1
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0] == 0
+
+
+def test_machine_retirement_is_selected_and_preserves_budget_hold(tmp_path):
+    import pytest
+    from issue_agent.adapters.store import Store
+    from issue_agent.domain.self_clear import BudgetBlock
+    from issue_agent.domain.actions import Target
+    files = Store(str(tmp_path / "state"))
+    budget = BudgetBlock(5, Target.PR, 100, 10000, "issue", 100000)
+    files.set_budget_block(budget)
+    workflow, files, _, _ = active_ci_workflow(AgentResult(
+        is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01), files)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
+    asyncio.run(workflow.fix_ci(100))
+    control = files._workflow_db
+    key = WorkflowKey("o/r", IssueRef(5))
+    selected = control.read_issue_recovery(key)
+    with pytest.raises(ValueError, match="cause/head"):
+        control.retire_machine_block(selected.revision, blocker="publication", blocked_head="a" * 40)
+    assert control.read_issue_recovery(key) == selected
+    control.retire_machine_block(selected.revision, blocker="checks", blocked_head="a" * 40)
+    assert control.read_issue_recovery(key).component.state.machine_block is None
+    assert files.get_budget_block(5) == budget
+    with pytest.raises(ValueError, match="stale"):
+        control.retire_machine_block(selected.revision, blocker="checks", blocked_head="a" * 40)
+    assert files.get_self_clear_count(5) == 0
+
+
+def test_stale_pr_machine_return_settles_without_installing_old_head(monkeypatch):
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowRevision
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="blocked", structured={"blocker": "checks"}, cost_usd=.01))
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="old-head")
+    control = files._workflow_db
+    settle = control.settle_pr_repair
+    monkeypatch.setattr(control, "settle_pr_repair", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("interrupted")))
+    with pytest.raises(RuntimeError, match="interrupted"):
+        asyncio.run(workflow.fix_ci(100))
+    with control.transaction() as db:
+        current = load_review_workflow_row(db, key)
+        persist_workflow_snapshot(db, replace(current, revision=WorkflowRevision(
+            replace(current.revision.fence, generation=1), current.revision.version + 1)))
+    monkeypatch.setattr(control, "settle_pr_repair", settle)
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    issue_key = WorkflowKey("o/r", IssueRef(5))
+    assert control.read_issue_recovery(issue_key).component.state.machine_block is None
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="new-head")
+    inner.result = replace(inner.result, structured={"blocker": "publication"})
+    asyncio.run(workflow.fix_ci(100))
+    newer = control.read_issue_recovery(issue_key)
+    assert newer.component.state.machine_block.blocked_head == "new-head"
+    assert newer.component.state.machine_block.blocker.value == "publication"
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 0
+    assert control.read_issue_recovery(issue_key) == newer
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (2, 20000)

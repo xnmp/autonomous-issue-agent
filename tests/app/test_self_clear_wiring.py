@@ -37,40 +37,52 @@ class _Journal:
 
 
 def _executor(gateway, store, journal):
+    def retire(action):
+        store._workflow_db.retire_machine_block(action.revision, blocker=action.blocker,
+                                                blocked_head=action.blocked_head)
+        return store.increment_self_clear_count(action.issue)
     return ImmediateExecutor(
         gateway,
         journal=journal,
-        retire_machine_block=store.complete_machine_self_clear,
+        retire_machine_block=retire,
         retire_budget_block=store.complete_budget_self_clear,
         mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,
-        discard_machine_block=store.clear_machine_block,
+        discard_machine_block=lambda action: store._workflow_db.retire_machine_block(action.revision),
         discard_budget_block=store.clear_budget_block,
     )
 
 
 def test_machine_retirement_is_journalled_after_label_is_observed_gone(tmp_path):
+    import asyncio
+    from issue_agent.domain.outcome import AgentResult
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    from tests.app.test_pr_repair_workflow import active_ci_workflow
     pr = PRView(
         100,
         head_ref_oid="published-head",
         labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
-        closing_issue=7,
-    )
-    block = MachineBlock(
-        7, Target.PR, 100, 100, MachineBlocker.PUBLICATION, "published-head"
+        closing_issue=5,
     )
     store = Store(str(tmp_path))
-    store.set_machine_block(block)
+    workflow, store, _, _ = active_ci_workflow(AgentResult(
+        is_error=False, status="blocked", structured={"blocker": "publication"}, cost_usd=.01), store)
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="published-head")
+    asyncio.run(workflow.fix_ci(100))
+    selected = store._workflow_db.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    block = selected.component.state.machine_block
+    assert block is not None
     journal = _Journal()
     gateway = InMemoryGitHub(prs={100: pr})
     actions = self_clear_actions(
-        WorldState(prs=(pr,)), {7: block}, {}, {}, {7: 0}, frozenset()
+        WorldState(prs=(pr,)), {5: block}, {}, {}, {5: 0}, frozenset(),
+        machine_revisions={5: selected.revision}
     )
 
     assert _executor(gateway, store, journal).execute_all(actions)
 
     assert not gateway.has_label("pr", 100, "ai-blocked")
-    assert store.get_machine_block(7) is None
-    assert store.get_self_clear_count(7) == 1
+    assert store._workflow_db.read_issue_recovery(WorkflowKey("o/r", IssueRef(5))).component.state.machine_block is None
+    assert store.get_self_clear_count(5) == 1
     assert [
         event.payload
         for event in journal.events
@@ -185,11 +197,8 @@ def test_harness_marker_observes_a_half_cleared_budget_transition():
 
 def test_malformed_store_markers_fail_closed(tmp_path):
     store = Store(str(tmp_path))
-    store._write(store.issue_path(7, "machine-block"), "{not-json")
     store._write(store.issue_path(7, "budget-block"), '{"reservation_micros":-1}')
 
-    with pytest.raises(ValueError, match="control unavailable"):
-        store.get_machine_block(7)
     with pytest.raises(ValueError, match="control unavailable"):
         store.get_budget_block(7)
 
@@ -204,7 +213,7 @@ def test_ceiling_event_is_persisted_once(tmp_path):
     executor = Executor(
         InMemoryGitHub(prs={100: pr}),
         journal=journal,
-        retire_machine_block=store.complete_machine_self_clear,
+        retire_machine_block=lambda action: store.increment_self_clear_count(action.issue),
         retire_budget_block=store.complete_budget_self_clear,
         mark_self_clear_ceiling=store.mark_self_clear_ceiling_reported,
     )

@@ -20,6 +20,8 @@ from zoneinfo import ZoneInfo
 
 from .runtime_plan import AgentRuntime, RuntimePlan
 from ..domain import continuation_components as cc
+from ..domain.self_clear import MachineBlocker
+from ..domain.actions import Target
 from ..domain.contracts import (
     BudgetScope,
     Money,
@@ -411,7 +413,7 @@ class AccountingRuntime(AgentRuntime):
             capture = cc.ContinuationCapture(selected.selection.binding, selected.selection.revision, _leg_id or str(run_id))
             continuations = (cc.PRRepairPurchase(capture, reply_at=selected.reply.reply_at if selected.reply is not None else "",
                                                  allowance=(cc.RepairAllowance.INFRA if kind == "PR_RESUME" else cc.RepairAllowance.REVIEW if selected.review is not None else cc.RepairAllowance.REBASE if selected.rebase is not None else cc.RepairAllowance.CI), ceiling=2**63-1,
-                                                 branch=selected.branch, handoff=selected.handoff, advance_resume=selected.review is not None or kind == "PR_RESUME"),) + continuations
+                                                 branch=selected.branch, handoff=selected.handoff, advance_resume=selected.review is not None or kind == "PR_RESUME", head=selected.head),) + continuations
             if selected.ci is not None:
                 ci = selected.ci
                 if issue != ci.selection.binding.fence.key.target.number:
@@ -948,7 +950,19 @@ class AccountingRuntime(AgentRuntime):
             rebase = (cc.RebaseRepairResult(self.store.rebase_repair_admission(attempt),
                 cc.RebaseCharge.NOT_ATTEMPT if budget_exhausted(result.exit_reason) or infra_class_failure(result) else cc.RebaseCharge.ATTEMPT)
                 if repair_input.rebase is not None else None)
-            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request, ci, review, rebase), writer)
+            machine_block = None
+            if (result.status == "blocked" and repair_input.head
+                    and not infra_class_failure(result) and not budget_exhausted(result.exit_reason)):
+                try:
+                    blocker = MachineBlocker(result.field("blocker"))
+                except ValueError:
+                    pass
+                else:
+                    source = self.store.fix_issue_admission(run_id)
+                    machine_block = cc.RecordedMachineBlock(source.attempt.binding.fence.key.target.number,
+                        Target.PR, attempt.binding.fence.key.target.number, attempt.binding.fence.key.target.number,
+                        blocker, repair_input.head, source)
+            settlement = self.store.settle_pr_repair_result(cc.PRRepairResult(admission, state, request, ci, review, rebase, machine_block), writer)
         elif returned_review is not None:
             settlement = self.store.settle_review_return(request, returned_review)
         elif returned is None:

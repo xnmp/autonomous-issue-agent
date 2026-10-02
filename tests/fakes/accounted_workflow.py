@@ -270,3 +270,23 @@ def seed_infra_outcome(control, issue, outcome, *, owner_id="o/r:fix:fixture", r
     assert control.settle(SettlementRequest(paid.run_id, Money("USD", 0), PricingBasis.PROVIDER_REPORTED,
         "infra-fixture:" + str(paid.run_id), None, None, None)).disposition.value == "available"
     return paid.run_id
+
+
+def seed_imported_machine_hold(control, block):
+    """Install stopped-import evidence alongside its selected component state."""
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.continuation_import import ContinuationImportTarget
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    key = WorkflowKey("o/r", IssueRef(block.issue))
+    with control.transaction() as db:
+        current = load_issue_aggregate(db, key)
+        state = dataclasses.replace(current.issue_recovery.state, machine_block=block)
+        target = ContinuationImportTarget(key, WorkflowFamily.ISSUE_RECOVERY, current.revision,
+                                          "a" * 64, state)
+        db.execute("INSERT OR REPLACE INTO workflow_activation_imports VALUES (?,?,?,?,?,?,?)",
+                   (key.repository, WorkflowFamily.ISSUE_RECOVERY.value,
+                    current.issue_recovery.identity.authority.epoch, "issue", block.issue,
+                    target.source_digest, encode_workflow(target)))
+        persist_workflow_snapshot(db, dataclasses.replace(current,
+            issue_recovery=dataclasses.replace(current.issue_recovery, state=state)))
