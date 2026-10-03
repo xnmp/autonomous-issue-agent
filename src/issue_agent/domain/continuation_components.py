@@ -10,7 +10,7 @@ from zoneinfo import ZoneInfo
 
 from .agent_task import RuntimeName
 from .refs import issue_from_branch
-from .contracts import BudgetScope, ContinuationAdmission, SettlementRequest, WorkflowAttemptIdentity
+from .contracts import BudgetScope, CommandId, EffectReceipt, EffectStatus, ContinuationAdmission, SettlementRequest, WorkflowAttemptIdentity
 from .eligibility import IssueCompletionGuard, LifecycleOperation
 from .self_clear import BudgetBlock, MachineBlock
 from .workflow_identity import (
@@ -262,6 +262,62 @@ class PRBlankReplySource:
 
 
 @dataclass(frozen=True)
+class CIRemediationCapture:
+    binding: WorkflowBinding
+    head: str
+    run_ids: tuple[int, ...]
+    decided_at: str = ""
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, WorkflowBinding) or self.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("CI remediation requires its selected PR repair binding")
+        validate_workflow_identifier(self.head, "CI remediation head")
+        if (not isinstance(self.run_ids, tuple) or not self.run_ids or len(self.run_ids) > 64
+                or any(type(run) is not int or run <= 0 or run > 2**63-1 for run in self.run_ids)
+                or tuple(sorted(set(self.run_ids))) != self.run_ids):
+            raise ValueError("CI remediation requires bounded exact ordered workflow runs")
+        _timestamp(self.decided_at, "CI cancellation decision")
+
+
+@dataclass(frozen=True)
+class OwedCIRemediation:
+    command_id: CommandId
+    capture: CIRemediationCapture
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "CI remediation command identity")
+        if not isinstance(self.capture, CIRemediationCapture):
+            raise ValueError("owed CI remediation requires its exact command and capture")
+
+
+@dataclass(frozen=True)
+class SettledCIRemediation:
+    owed: OwedCIRemediation
+    receipt: EffectReceipt
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.owed, OwedCIRemediation) or not isinstance(self.receipt, EffectReceipt)
+                or self.receipt.command_id != self.owed.command_id
+                or self.receipt.status not in {EffectStatus.SUCCEEDED, EffectStatus.PERMANENT_FAILURE}):
+            raise ValueError("settled CI remediation requires its exact verified terminal receipt")
+
+
+@dataclass(frozen=True)
+class ImportedCIRemediation:
+    head: str
+    decided_at: str
+    import_identity: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.head, "imported CI remediation head")
+        _timestamp(self.decided_at, "imported CI cancellation decision")
+        validate_workflow_identifier(self.import_identity, "CI remediation import identity")
+
+
+CIRemediation = OwedCIRemediation | SettledCIRemediation | ImportedCIRemediation
+
+
+@dataclass(frozen=True)
 class PRRepairState:
     consumed_reply_at: str = ""
     branch: str = ""
@@ -274,6 +330,8 @@ class PRRepairState:
     resumes: int = field(default=0, repr=False)
     actual_model: RepairModel | None = field(default=None, repr=False)
     blank_reply: PRBlankReplySource | None = field(default=None, repr=False)
+    ci_rerun: CIRemediation | None = field(default=None, repr=False)
+    ci_cancel: CIRemediation | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed PR reply")
@@ -281,6 +339,9 @@ class PRRepairState:
         if self.session is not None and not isinstance(self.session, RepairSession):
             raise ValueError("PR repair continuity requires a typed session")
         validate_workflow_integer(self.resumes, "repair resumes")
+        for remediation in (self.ci_rerun, self.ci_cancel):
+            if remediation is not None and not isinstance(remediation, (OwedCIRemediation, SettledCIRemediation, ImportedCIRemediation)):
+                raise ValueError("CI remediation requires fixed typed provenance")
         if self.actual_model is not None and not isinstance(self.actual_model, RepairModel):
             raise ValueError("actual repair model requires typed provenance")
         if self.blank_reply is not None and (not isinstance(self.blank_reply, PRBlankReplySource)

@@ -43,7 +43,7 @@ from ..domain.contracts import (
     TokenUsage,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import FamilyAuthority, IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
+from ..domain.workflow_identity import FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
 from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, CommandRetryApplicability,
     ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryAlreadyConsumed,
@@ -5580,6 +5580,7 @@ class SQLiteControlStore:
                         or dispatch.get("role") != "fix" or dispatch.get("issue") != key.target.number
                         or dispatch.get("number") != purchase.pr.number or dispatch.get("ci_head") != purchase.head
                         or dispatch.get("leg_id") != capture.leg_id or len(repairs) != 1
+                        or repairs[0].head != purchase.head
                         or repairs[0].capture.binding.fence.key != WorkflowKey(key.repository, purchase.pr)):
                     raise WorkflowAuthorityError("CI allowance differs from its exact issue/PR/head context")
             if isinstance(purchase, cc.IssueReviewPurchase):
@@ -5661,6 +5662,12 @@ class SQLiteControlStore:
                         else cc.consume_issue_recovery(selection, purchase, version) if isinstance(purchase, cc.IssueRecoveryPurchase) else cc.consume_issue_reply(selection, purchase, version)),
                                         revision=WorkflowRevision(aggregate.revision.fence, version))
                 elif isinstance(purchase, cc.PRRepairPurchase):
+                    if request.kind == "FIX_CI":
+                        current_repair = cc.select_pr_repair(aggregate)
+                        if isinstance(current_repair, cc.SelectedPRRepair) and any(
+                            isinstance(remedy, cc.OwedCIRemediation) and remedy.capture.head == purchase.head
+                            for remedy in (current_repair.component.state.ci_rerun, current_repair.component.state.ci_cancel)):
+                            raise ValueError("paid CI repair cannot bypass an owed exact-head remediation")
                     selection = cc.select_pr_repair(aggregate)
                     if not isinstance(selection, cc.SelectedPRRepair):
                         raise ValueError("PR repair is inactive or migration blocked")
@@ -6336,6 +6343,7 @@ class SQLiteControlStore:
 
     def _validate_pr_repair_sources(self, db, selected: cc.SelectedPRRepair) -> None:
         state = selected.component.state
+        self._require_ci_remediation_projection(db, selected)
         blank = state.blank_reply
         if blank is not None:
             receipt_key = hashlib.sha256(encode_workflow((selected.binding.fence.key, blank.reply_at)).encode()).hexdigest()
@@ -6363,6 +6371,41 @@ class SQLiteControlStore:
                 proofs[source] = payload[1]
             if getattr(proofs[source], field) != reference:
                 raise WorkflowAuthorityError("selected repair continuity lost its exact applied output receipt")
+
+    def _require_ci_remediation_projection(self, db, selected: cc.SelectedPRRepair) -> None:
+        from ..domain.continuation_import import ContinuationImportTarget
+        key = selected.binding.fence.key
+        for field, kind in (("ci_rerun", CommandKind.RERUN_CHECKS), ("ci_cancel", CommandKind.CANCEL_CHECKS)):
+            remedy = getattr(selected.component.state, field)
+            if remedy is None:
+                continue
+            if isinstance(remedy, cc.ImportedCIRemediation):
+                row = db.execute("SELECT decision_json FROM workflow_activation_imports WHERE repository=? AND family=? "
+                    "AND epoch=? AND target_kind=? AND target_number=?", (key.repository, WorkflowFamily.PR_REPAIR.value,
+                    selected.binding.authority.epoch, *workflow_scope(key)[1:])).fetchone()
+                imported = decode_workflow(row[0], ContinuationImportTarget) if row is not None else None
+                if imported is None or not isinstance(imported.state, cc.PRRepairState) or getattr(imported.state, field) != remedy:
+                    raise WorkflowAuthorityError("imported CI remediation lost its exact original decision")
+                continue
+            owed = remedy if isinstance(remedy, cc.OwedCIRemediation) else remedy.owed
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
+            command = _command_from_row(row) if row is not None else None
+            if (command is None or command.kind is not kind or command.repository != key.repository
+                    or command.target != f"pr:{key.target.number}"
+                    or decode_workflow(command.payload.get("ci_remediation"), cc.CIRemediationCapture) != owed.capture
+                    or owed.capture.binding.fence.key != key or owed.capture.binding.authority != selected.binding.authority
+                    or owed.capture.binding.episode_id != selected.binding.episode_id
+                    or owed.capture.binding.fence.generation > selected.binding.fence.generation):
+                raise WorkflowAuthorityError("CI remediation lost its exact selected command")
+            if isinstance(remedy, cc.SettledCIRemediation):
+                proof = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(owed.command_id),)).fetchone()
+                actual = EffectReceipt(CommandId(proof["command_id"]), proof["executor_identity"], _parse_stamp(proof["started_at"]),
+                    _parse_stamp(proof["completed_at"]), EffectStatus(proof["status"]), proof["remote_object_id"],
+                    proof["remote_revision"], proof["error"]) if proof is not None else None
+                if actual != remedy.receipt or row["state"] != remedy.receipt.status.value:
+                    raise WorkflowAuthorityError("settled CI remediation lost its exact terminal receipt")
+            elif row["state"] not in {"pending", "executing", "unknown_outcome", "retryable_failure"}:
+                raise WorkflowAuthorityError("owed CI remediation contradicts its durable command state")
 
     def read_pr_repair(self, key: WorkflowKey) -> cc.PRRepairSelection:
         from .workflow_rows import load_review_workflow_row
@@ -7416,7 +7459,8 @@ class SQLiteControlStore:
                     if not isinstance(aggregate, ReviewWorkflowSnapshot):
                         raise WorkflowAuthorityError("repair return lost its PR aggregate")
                     applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
-                                      blank_reply=component.state.blank_reply)
+                                      blank_reply=component.state.blank_reply,
+                                      ci_rerun=component.state.ci_rerun, ci_cancel=component.state.ci_cancel)
                     after = replace(aggregate, revision=revision, pr_repair=replace(component, state=applied, watermarks=watermarks))
                 else:
                     from ..domain.workflow import IssueWorkflowShell
@@ -8529,7 +8573,7 @@ class SQLiteControlStore:
         return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
     def enqueue_command(self, command: LifecycleCommand) -> PendingCommand:
-        with self.transaction() as db:
+        with self.transaction() as db, self.mutation_savepoint(db):
             return self._enqueue_command(db, command)
 
     def _enqueue_command(
@@ -8595,6 +8639,8 @@ class SQLiteControlStore:
                 _encoded_command_binding(command),
             ),
         )
+        if "ci_remediation" in command.payload:
+            self._record_ci_remediation(db, command)
         self._transition(
             db,
             "lifecycle_command",
@@ -8611,12 +8657,95 @@ class SQLiteControlStore:
         )
         return PendingCommand(command, "pending", 0)
 
+    def _selected_ci_remediation(self, db, command):
+        from .workflow_rows import load_review_workflow_row
+        capture = decode_workflow(command.payload["ci_remediation"], cc.CIRemediationCapture)
+        if (command.kind not in {CommandKind.RERUN_CHECKS, CommandKind.CANCEL_CHECKS}
+                or command.workflow is not None or command.repository != capture.binding.fence.key.repository
+                or command.target != f"pr:{capture.binding.fence.key.target.number}"
+                or deployment_role(command.repository, command.executor_identity) != "fix"
+                or command.expected_revision != capture.head or command.payload.get("head") != capture.head
+                or command.payload.get("run_ids") != list(capture.run_ids)
+                or command.kind is CommandKind.CANCEL_CHECKS and command.payload.get("decided_at", "") != capture.decided_at):
+            raise WorkflowAuthorityError("CI remediation command differs from its exact captured PR/head/runs")
+        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
+        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+        if not isinstance(selected, cc.SelectedPRRepair) or selected.binding != capture.binding:
+            raise WorkflowAuthorityError("CI remediation PR repair binding is no longer current")
+        return aggregate, selected, capture
+
+    def _record_ci_remediation(self, db, command) -> None:
+        from .workflow_rows import persist_workflow_snapshot
+        aggregate, selected, capture = self._selected_ci_remediation(db, command)
+        field = "ci_rerun" if command.kind is CommandKind.RERUN_CHECKS else "ci_cancel"
+        before = getattr(selected.component.state, field)
+        prior_capture = (before.capture if isinstance(before, cc.OwedCIRemediation)
+                         else before.owed.capture if isinstance(before, cc.SettledCIRemediation) else before)
+        if prior_capture is not None and prior_capture.head == capture.head:
+            raise WorkflowAuthorityError("this head already owns its one CI remediation command")
+        state = replace(selected.component.state, **{field: cc.OwedCIRemediation(command.command_id, capture)})
+        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
+            pr_repair=replace(selected.component, state=state)))
+
+    def validate_ci_remediation(self, command) -> None:
+        with self.transaction() as db:
+            _, selected, capture = self._selected_ci_remediation(db, command)
+            field = "ci_rerun" if command.kind is CommandKind.RERUN_CHECKS else "ci_cancel"
+            if getattr(selected.component.state, field) != cc.OwedCIRemediation(command.command_id, capture):
+                raise WorkflowAuthorityError("CI remediation is not its current owed command")
+
+    def current_ci_remediation_command(self, repository, pr, kind, head, run_ids) -> PendingCommand | None:
+        from .workflow_rows import load_review_workflow_row
+        with self.transaction() as db:
+            aggregate = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
+            selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+            if not isinstance(selected, cc.SelectedPRRepair):
+                raise WorkflowAuthorityError("CI remediation PR repair authority is unavailable")
+            self._require_ci_remediation_projection(db, selected)
+            field = "ci_rerun" if kind is CommandKind.RERUN_CHECKS else "ci_cancel"
+            remedy = getattr(selected.component.state, field)
+            if remedy is None or isinstance(remedy, cc.ImportedCIRemediation):
+                return None
+            owed = remedy if isinstance(remedy, cc.OwedCIRemediation) else remedy.owed
+            if owed.capture.head != head:
+                return None
+            if owed.capture.run_ids != run_ids:
+                raise WorkflowAuthorityError("this head's CI remediation belongs to another exact run set")
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
+            return PendingCommand(_command_from_row(row), row["state"], row["attempts"], row["refusals"])
+
+    def _settle_ci_remediation(self, db, command, receipt) -> None:
+        from .workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+        if receipt.status not in {EffectStatus.SUCCEEDED, EffectStatus.PERMANENT_FAILURE}:
+            return
+        capture = decode_workflow(command.payload["ci_remediation"], cc.CIRemediationCapture)
+        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
+        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+        if (not isinstance(selected, cc.SelectedPRRepair)
+                or selected.binding.authority != capture.binding.authority
+                or selected.binding.episode_id != capture.binding.episode_id
+                or selected.binding.fence.key != capture.binding.fence.key
+                or selected.binding.fence.generation < capture.binding.fence.generation):
+            return
+        field = "ci_rerun" if command.kind is CommandKind.RERUN_CHECKS else "ci_cancel"
+        owed = getattr(selected.component.state, field)
+        if not isinstance(owed, cc.OwedCIRemediation) or owed != cc.OwedCIRemediation(command.command_id, capture):
+            return
+        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
+            pr_repair=replace(selected.component, state=replace(selected.component.state,
+                **{field: cc.SettledCIRemediation(owed, replace(receipt,
+                    started_at=_parse_stamp(_stamp(receipt.started_at)),
+                    completed_at=_parse_stamp(_stamp(receipt.completed_at))))}))))
+
     def _validate_workflow_command(
         self, db: sqlite3.Connection, command: LifecycleCommand, *,
         registering_review_submission: bool = False,
         registering_steward_verdict: bool = False,
         allow_blocked_submission_retry: bool = False,
     ) -> None:
+        if "ci_remediation" in command.payload:
+            self._selected_ci_remediation(db, command)
+            return
         if "self_clear" in command.payload:
             from .effects import action_from_command
             from ..domain.actions import Relabel
@@ -10183,7 +10312,7 @@ class SQLiteControlStore:
             if state not in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
                 raise ControlStoreError("command is not awaiting reconciliation")
             command = _command_from_row(row)
-            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload:
+            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload or "ci_remediation" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow reconciliation receipt requires the current command owner")
@@ -10231,7 +10360,7 @@ class SQLiteControlStore:
             if row["state"] != EffectStatus.RETRYABLE_FAILURE.value:
                 return False
             command = _command_from_row(row)
-            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload:
+            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload or "ci_remediation" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow exhaustion receipt requires the current command owner")
@@ -10279,6 +10408,10 @@ class SQLiteControlStore:
         if command_row is None:
             raise ControlStoreError(f"receipt {receipt.command_id} has no lifecycle command")
         command = _command_from_row(command_row)
+        if "ci_remediation" in command.payload:
+            if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
+                raise WorkflowAuthorityError("CI remediation receipt requires its captured attempt owner")
+            self._settle_ci_remediation(db, command, receipt)
         if "self_clear" in command.payload:
             if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
                 raise WorkflowAuthorityError("self-clear receipt requires its captured attempt owner")

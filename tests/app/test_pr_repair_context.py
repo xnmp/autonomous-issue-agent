@@ -51,7 +51,8 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
     gateway = Gateway(issues={5: IssueView(5, "renderer")}, prs={100: pr})
     store = Store(str(tmp_path))
     store.save_session(5, "old-blocked-session")
-    store.set_ci_rerun_head(100, pr.head_ref_oid)
+    from tests.fakes.accounted_workflow import seed_verified_ci_rerun
+    seed_verified_ci_rerun(store, 100, pr.head_ref_oid)
     guidance = guidance_reader(tmp_path, "Preserve regression assertions; diagnose persistent failure.")
     runner = FakeRunner(AgentResult(is_error=False, status="pushed", session_id="continued"))
 

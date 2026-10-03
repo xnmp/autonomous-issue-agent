@@ -38,6 +38,30 @@ def admission(selection, version, run="run:secondary"):
     return ContinuationAdmission(WorkflowAttemptIdentity(selection.binding, RunId(run), "leg:secondary"), version)
 
 
+@pytest.mark.parametrize("runs", [None, (), (True,), (0,), (-1,), (1.5,), (2**63,), (2, 1), (1, 1), tuple(range(1, 66))])
+def test_ci_capture_refuses_absent_malformed_or_unbounded_run_identity(runs):
+    from issue_agent.domain import continuation_components as cc
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    binding = identity(key, WorkflowFamily.PR_REPAIR).bind(WorkflowFence(key, 0))
+    with pytest.raises(ValueError, match="workflow runs"):
+        cc.CIRemediationCapture(binding, "head-1", runs)
+
+
+def test_ci_settlement_requires_same_command_and_verified_terminal_outcome():
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.contracts import EffectReceipt, EffectStatus
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    binding = identity(key, WorkflowFamily.PR_REPAIR).bind(WorkflowFence(key, 0))
+    owed = cc.OwedCIRemediation(CommandId("ci:1"), cc.CIRemediationCapture(binding, "head-1", (42,)))
+    receipt = EffectReceipt(CommandId("ci:1"), "o/r:fix", NOW, NOW, EffectStatus.SUCCEEDED)
+    assert cc.SettledCIRemediation(owed, receipt).owed == owed
+    for invalid in (replace(receipt, command_id=CommandId("ci:other")),
+                    replace(receipt, status=EffectStatus.UNKNOWN_OUTCOME, error="unreadable"),
+                    replace(receipt, status=EffectStatus.RETRYABLE_FAILURE, error="refused")):
+        with pytest.raises(ValueError, match="terminal receipt"):
+            cc.SettledCIRemediation(owed, invalid)
+
+
 def test_fix_infra_ordering_preserves_newer_episode_and_every_sibling_field():
     from issue_agent.domain import continuation_components as cc
     key = WorkflowKey("o/r", IssueRef(5))

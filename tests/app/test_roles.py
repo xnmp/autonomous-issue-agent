@@ -2944,11 +2944,95 @@ def test_fix_state_reads_the_ci_rerun_marker_the_executor_wrote(tmp_path):
     store = Store(str(tmp_path / "state"))
     world = _rerun_world(bucket="fail")
     assert _fix_state(store, world).ci_rerun_head[144] == ""   # fresh PR: unspent
-    store.set_ci_rerun_head(144, "sha-1")
+    from tests.fakes.accounted_workflow import seed_verified_ci_rerun
+    seed_verified_ci_rerun(store, 144, "sha-1")
     assert _fix_state(store, world).ci_rerun_head[144] == "sha-1"
     # ...and that is exactly what stops a second free re-run on the same head.
     actions = decide_fix(world, _GUARD_CFG, _fix_state(store, world), fixer_busy=False)
     assert RunAgent(AgentKind.FIX_CI, 144) in actions
+
+
+@pytest.mark.parametrize("legacy_hint", [False, True])
+def test_unknown_actual_ci_rerun_blocks_paid_repair_after_restart(tmp_path, legacy_hint):
+    from types import SimpleNamespace
+    from pathlib import Path
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    from tests.adapters.test_effects import Gateway
+    from issue_agent.adapters.effects import GitHubEffectExecutor
+    from issue_agent.domain.actions import RerunFailedChecks
+    from tests.app.test_durable_workflow_composition import Crash
+    control, authority = workflow_control(tmp_path, numbers=(9,))
+    store = Store(str(tmp_path / "state"))
+    object.__setattr__(store, "_workflow_db", control)
+    object.__setattr__(store, "_workflow_authority", authority)
+    gateway = Gateway()
+    gateway.head = "sha-1"
+    world = _rerun_world(bucket="fail")
+    world = replace(world, prs=(replace(world.prs[0], checks=(Check("unit", bucket="fail", run_id=42),)),))
+    install_pr_repair_authority(SimpleNamespace(prs={144: world.prs[0]}), store)
+    baseline = decide_fix(world, _GUARD_CFG, _fix_state(store, world), fixer_busy=False)
+    assert RerunFailedChecks(144, "sha-1", (42,)) in baseline
+    def lose_reply(*args):
+        gateway.calls.append(("rerun", "sha-1", (42,)))
+        raise Crash("rerun success reply is unavailable")
+    gateway.rerun_failed_checks = lose_reply
+    if legacy_hint:
+        Path(store.pr_path(144, "ci-rerun-head")).parent.mkdir(parents=True, exist_ok=True)
+        Path(store.pr_path(144, "ci-rerun-head")).write_text("sha-1")
+    effect = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
+    with pytest.raises(Crash):
+        effect.execute(RerunFailedChecks(144, "sha-1", (42,)))
+    restarted = _fix_state(store, world)
+    actions = decide_fix(world, _GUARD_CFG, restarted, fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 144) not in actions
+    assert RerunFailedChecks(144, "sha-1", (42,)) not in actions
+    gateway.advance_run_attempts()
+    restarted_effect = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
+    assert restarted_effect.execute(RerunFailedChecks(144, "sha-1", (42,)))
+    assert restarted_effect.execute(RerunFailedChecks(144, "sha-1", (42,)))
+    assert gateway.calls == [("rerun", "sha-1", (42,))]
+    fresh = _fix_state(store, world)
+    assert RunAgent(AgentKind.FIX_CI, 144) in decide_fix(world, _GUARD_CFG, fresh, fixer_busy=False)
+    next_world = replace(world, prs=(replace(world.prs[0], head_ref_oid="sha-2", checks=(Check("unit", bucket="fail", run_id=43),)),))
+    assert RerunFailedChecks(144, "sha-2", (43,)) in decide_fix(next_world, _GUARD_CFG,
+        _fix_state(store, next_world), fixer_busy=False)
+
+
+def test_actual_ci_cancel_restart_wait_then_rerun_preserves_existing_progression(tmp_path):
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    from tests.adapters.test_effects import Gateway
+    from issue_agent.adapters.effects import GitHubEffectExecutor
+    from issue_agent.domain.actions import CancelWorkflowRuns, RerunFailedChecks
+    from types import SimpleNamespace
+    control, authority = workflow_control(tmp_path, numbers=(9,))
+    store = Store(str(tmp_path / "state"))
+    object.__setattr__(store, "_workflow_db", control)
+    object.__setattr__(store, "_workflow_authority", authority)
+    world = _wedged_run_world()
+    install_pr_repair_authority(SimpleNamespace(prs={144: world.prs[0]}), store)
+    gateway = Gateway()
+    gateway.head = world.prs[0].head_ref_oid
+    planned = decide_fix(world, _STALL_CFG, _fix_state(store, world), fixer_busy=False)
+    cancels = [action for action in planned if isinstance(action, CancelWorkflowRuns)]
+    assert len(cancels) == 1
+    assert cancels[0].run_ids == (4242,)
+    effect = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
+    assert effect.execute(cancels[0])
+    waiting = decide_fix(world, _STALL_CFG, _fix_state(store, world), fixer_busy=False)
+    assert not any(isinstance(action, (CancelWorkflowRuns, RerunFailedChecks, RunAgent)) for action in waiting)
+    failed = replace(world, prs=(replace(world.prs[0], checks=(Check("unit", bucket="fail", run_id=4242),)),))
+    gateway.run_states[4242] = "completed"
+    reruns = [action for action in decide_fix(failed, _STALL_CFG, _fix_state(store, failed), fixer_busy=False)
+              if isinstance(action, RerunFailedChecks)]
+    assert reruns == [RerunFailedChecks(144, gateway.head, (4242,))]
+    restarted = GitHubEffectExecutor(gateway, control, repository="o/r", identity="o/r:fix:fixture")
+    assert restarted.execute(reruns[0])
+    assert restarted.execute(reruns[0])
+    final = decide_fix(failed, _STALL_CFG, _fix_state(store, failed), fixer_busy=False)
+    assert RunAgent(AgentKind.FIX_CI, 144) in final
+    assert gateway.calls == [("cancel", gateway.head, (4242,)), ("rerun", gateway.head, (4242,))]
 
 
 # ── ADR 0014 exemption-fact collection (which PRs cost a gh call) ────────────

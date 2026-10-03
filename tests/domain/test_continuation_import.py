@@ -29,6 +29,28 @@ def test_direct_issue_debt_and_consumed_reply_are_preserved():
     assert (value.consumed_reply_at, value.resumes, value.ci_failures, value.infra_failures) == ("2026-10-01T00:00:00Z", 2, 3, 4)
 
 
+def test_imported_ci_hints_preserve_exact_bounded_source_without_success_receipts():
+    value = classify_record(record(WorkflowFamily.PR_REPAIR, **{
+        "ci-rerun-head": "head-1", "ci-cancel-head": "head-1@2026-10-01T00:00:00Z"}))
+    assert isinstance(value, cc.PRRepairState)
+    assert isinstance(value.ci_rerun, cc.ImportedCIRemediation)
+    assert isinstance(value.ci_cancel, cc.ImportedCIRemediation)
+    assert (value.ci_rerun.head, value.ci_cancel.head, value.ci_cancel.decided_at) == (
+        "head-1", "head-1", "2026-10-01T00:00:00Z")
+    assert value.ci_rerun.import_identity != value.ci_cancel.import_identity
+    different = classify_record(record(WorkflowFamily.PR_REPAIR, **{"ci-rerun-head": "head-2"}))
+    assert different.ci_rerun.import_identity != value.ci_rerun.import_identity
+
+
+@pytest.mark.parametrize("name,text", [("ci-rerun-head", ""), ("ci-rerun-head", "x" * 1000),
+    ("ci-cancel-head", "@2026-10-01T00:00:00Z"), ("ci-cancel-head", "head@garbage"),
+    ("ci-cancel-head", "head@2026-10-01T00:00:00Z@other")])
+def test_malformed_ci_hints_refuse_only_the_selected_import_source(name, text):
+    result = classify_record(record(WorkflowFamily.PR_REPAIR, **{name: text}))
+    assert isinstance(result, tuple) and result
+    assert all(name in blocker.reason for blocker in result)
+
+
 def test_review_timestamp_and_count_are_imported_together():
     value = classify_record(record(**{"review-retries": "2026-10-01T00:00:00Z 3"}))
     assert isinstance(value, cc.IssueRecoveryState)

@@ -2025,6 +2025,37 @@ def test_stale_pr_machine_return_settles_without_installing_old_head(monkeypatch
         assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
 
 
+@pytest.mark.parametrize("changed_head", [None, "", "another-head"])
+def test_actual_ci_purchase_cannot_bypass_owed_remediation_with_paired_head(monkeypatch, changed_head):
+    from issue_agent.adapters.effects import GitHubEffectExecutor
+    from issue_agent.adapters.control_store import ReservationResult, AccountingDisposition
+    from tests.adapters.test_effects import Gateway
+    from issue_agent.domain.actions import RerunFailedChecks
+    from issue_agent.domain import continuation_components as cc
+    workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="head-1")
+    store = files._workflow_db
+    effects = GitHubEffectExecutor(Gateway(), store, repository="o/r", identity="o/r:fix")
+    store.enqueue_command(effects._command(RerunFailedChecks(100, "head-1", (42,))))
+    requests = []
+    original = store.reserve
+    def capture(request):
+        requests.append(request)
+        return ReservationResult(AccountingDisposition.UNAVAILABLE, None, request.cap, request.cap, request.cap, "capture")
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "reserve", capture)
+        asyncio.run(workflow.fix_ci(100))
+    (requested,) = requests
+    if changed_head is not None:
+        requested = replace(requested, continuations=tuple(replace(item, head=changed_head)
+            if isinstance(item, cc.PRRepairPurchase) else item for item in requested.continuations))
+    assert original(requested).disposition is AccountingDisposition.UNAVAILABLE
+    assert inner.tasks == []
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
+        assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
+
+
 def test_actual_final_budget_refusal_persists_sql_hold_without_paid_debit(monkeypatch, tmp_path):
     from issue_agent.adapters.store import Store
     from issue_agent.adapters.control_store import SQLiteControlStore

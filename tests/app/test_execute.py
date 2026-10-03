@@ -92,7 +92,6 @@ def test_ci_pending_escalation_marks_head_after_verified_write():
 
     ex.execute(EscalateCiPending(100, "sha-1", "stalled"))
 
-    assert marked == [(100, "sha-1")]
     assert [call[0] for call in gw.calls] == ["comment"]
 
 
@@ -327,22 +326,18 @@ def test_relabel_is_advisory_when_only_an_additional_label_is_advisory() -> None
     assert _is_advisory_relabel(_compound_relabel())
 
 
-def test_rerun_marks_the_head_before_asking_github():
-    # Ordering is the whole safety property: marker THEN gh. The reverse loses
-    # the record if the process dies in between, and a free re-run with no
-    # record is an unbounded loop (no retry counter counts a non-agent action).
+def test_rerun_executes_the_exact_requested_runs():
     gw = FakeGateway()
     marked = []
-    ex = Executor(gw, mark_ci_rerun=lambda pr, head: marked.append((pr, head)))
+    ex = Executor(gw, )
     ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
-    assert marked == [(100, "sha-1")]
     assert gw.calls == [("rerun", "sha-1", (4242,))]
 
 
 def test_rerun_journals_the_run_it_triggered():
     gw = FakeGateway()
     j = _Journal()
-    ex = Executor(gw, mark_ci_rerun=lambda pr, head: None, journal=j)
+    ex = Executor(gw,  journal=j)
     ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
     kind, fields = next(e for e in j.events if e[0] == "ci_rerun")
     assert (fields["pr"], fields["head"], fields["run_id"], fields["ok"]) == (
@@ -357,10 +352,9 @@ def test_rejected_exact_rerun_still_keeps_the_marker_and_says_so():
     gw.rerun_run_id = None
     marked, logged = [], []
     j = _Journal()
-    ex = Executor(gw, mark_ci_rerun=lambda pr, head: marked.append((pr, head)),
+    ex = Executor(gw,
                   journal=j, log=logged.append)
     ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
-    assert marked == [(100, "sha-1")]
     assert any("not executable" in line for line in logged)
     assert next(f for e, f in j.events if e == "ci_rerun")["ok"] is False
 
@@ -372,24 +366,20 @@ def _wedged_gateway(status="in_progress"):
     return gw
 
 
-def test_cancel_marks_the_head_before_asking_github():
-    # Same ordering property as the re-run marker: marker THEN gh. Reversed, a
-    # death in between leaves a cancel nothing recorded, and the next poll
-    # cancels again, forever.
+def test_cancel_executes_the_exact_requested_runs():
     gw = _wedged_gateway()
     marked = []
-    ex = Executor(gw, mark_ci_cancel=lambda pr, head: marked.append((pr, head)))
+    ex = Executor(gw, )
 
     ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
 
-    assert marked == [(100, "sha-1")]
     assert gw.calls == [("cancel", "sha-1", (4242,))]
 
 
 def test_cancel_journals_the_runs_it_took_down():
     gw = _wedged_gateway()
     j = _Journal()
-    ex = Executor(gw, mark_ci_cancel=lambda pr, head: None, journal=j)
+    ex = Executor(gw,  journal=j)
 
     ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
 
@@ -406,27 +396,23 @@ def test_a_refused_cancel_is_logged_and_journalled_not_silent():
     gw = FakeGateway()
     marked, logged = [], []
     j = _Journal()
-    ex = Executor(gw, mark_ci_cancel=lambda pr, head: marked.append((pr, head)),
+    ex = Executor(gw,
                   journal=j, log=logged.append)
 
     ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
 
-    assert marked == [(100, "sha-1")]
     assert any("not cancellable" in line for line in logged)
     assert next(f for e, f in j.events if e == "ci_cancel")["ok"] is False
 
 
-def test_cancel_without_a_marker_writer_does_not_touch_github():
-    # An Executor with no marker writer cannot bound the loop, so it must not
-    # start one — the stalled-CI escalation stands instead.
+def test_cancel_needs_no_file_marker_callback():
     gw = _wedged_gateway()
     logged = []
     ex = Executor(gw, log=logged.append)
 
     ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
 
-    assert gw.calls == []
-    assert any("no marker writer" in line for line in logged)
+    assert gw.calls == [("cancel", "sha-1", (4242,))]
 
 
 def test_a_bool_effect_receipt_never_crashes_the_run_id_journal():
@@ -434,8 +420,8 @@ def test_a_bool_effect_receipt_never_crashes_the_run_id_journal():
     # field may not take a remote mutation down with it.
     gw = _wedged_gateway()
     j = _Journal()
-    ex = Executor(gw, mark_ci_cancel=lambda pr, head: None,
-                  mark_ci_rerun=lambda pr, head: None, journal=j,
+    ex = Executor(gw,
+                   journal=j,
                   effect_executor=_BoolReceiptExecutor(gw))
 
     ex.execute(CancelWorkflowRuns(100, "sha-1", (4242,)))
@@ -465,15 +451,12 @@ class _BoolReceiptExecutor:
         return True
 
 
-def test_rerun_without_a_marker_writer_does_not_touch_github():
-    # The review/steward Executors wire no marker writer. Running the re-run
-    # there would be unrecordable — i.e. unbounded — so it is skipped instead.
+def test_rerun_needs_no_file_marker_callback():
     gw = FakeGateway()
     logged = []
     ex = Executor(gw, log=logged.append)
     ex.execute(RerunFailedChecks(100, "sha-1", (4242,)))
-    assert gw.calls == []
-    assert any("no marker writer" in line for line in logged)
+    assert gw.calls == [("rerun", "sha-1", (4242,))]
 
 
 def test_remove_worktree_delegated():

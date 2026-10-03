@@ -190,6 +190,19 @@ def pr_repair_state(store, pr=100):
     return store._workflow_authority.read_pr_repair(WorkflowKey("o/r", PullRequestRef(pr))).component.state
 
 
+def seed_verified_ci_rerun(store, pr, head):
+    from types import SimpleNamespace
+    from tests.adapters.test_effects import Gateway
+    from issue_agent.adapters.effects import GitHubEffectExecutor
+    from issue_agent.domain.actions import RerunFailedChecks
+    from issue_agent.domain.world import PRView
+    attach_workflow_authority(SimpleNamespace(issues={}, prs={pr: PRView(pr, head_ref_oid=head)}), store, pr_repair=True)
+    gateway = Gateway()
+    gateway.head = head
+    assert GitHubEffectExecutor(gateway, store._workflow_db, repository="o/r", identity="o/r:fix:fixture").execute(
+        RerunFailedChecks(pr, head, (42,)))
+
+
 def issue_recovery_state(store, issue=5):
     selected = store._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(issue)))
     return selected.component.state

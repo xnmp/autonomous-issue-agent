@@ -20,7 +20,7 @@ from .workflow_identity import (
 ISSUE_FIELDS = ("resumed-at", "resumes", "ci-retries", "review-retries", "rebase-retries",
                 "infra-deaths", "self-clears", "branch", "session", "model", "machine-block",
                 "budget-block", "self-clear-ceiling", "ci-history", "stall-sig")
-PR_FIELDS = ("resumed-at", "session", "model", "branch", "infra-deaths", "stall-sig")
+PR_FIELDS = ("resumed-at", "session", "model", "branch", "infra-deaths", "stall-sig", "ci-rerun-head", "ci-cancel-head")
 STEWARD_FIELDS = ("triage-at", "groom-at", "groom-content", "steward-stalls-triage",
                   "steward-stalls-groom", "infra-deaths")
 IMPORT_FAMILIES = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD)
@@ -33,6 +33,8 @@ def digest(value: object) -> str:
 
 
 def _plan_state_identity(state: ImportedState | None) -> object:
+    if isinstance(state, cc.PRRepairState) and (state.ci_rerun is not None or state.ci_cancel is not None):
+        return (_plan_state_identity(replace(state, ci_rerun=None, ci_cancel=None)), repr(state.ci_rerun), repr(state.ci_cancel))
     if isinstance(state, cc.IssueRecoveryState) and state.self_clear_ceiling_reported:
         return (_plan_state_identity(replace(state, self_clear_ceiling_reported=False)), "self-clear-ceiling-reported")
     if isinstance(state, cc.IssueRecoveryState) and state.budget_block is not None:
@@ -69,7 +71,8 @@ class LegacyContinuationRecord:
         return digest((self.root, self.family.value, self.key.target.number,
                        tuple((name, type(value).__name__, value.digest if isinstance(value, LegacyPresent)
                               else None if isinstance(value, LegacyAbsent) else value.reason)
-                             for name, value in self.fields)))
+                             for name, value in self.fields
+                             if name not in {"ci-rerun-head", "ci-cancel-head"} or not isinstance(value, LegacyAbsent))))
 
 
 ImportedState = cc.IssueRecoveryState | cc.PRRepairState | cc.StewardState
@@ -187,6 +190,12 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
             elif name == "self-clear-ceiling":
                 if text != "1":
                     reason = "malformed shared self-clear ceiling report marker"
+            elif name in {"ci-rerun-head", "ci-cancel-head"}:
+                try:
+                    head, separator, at = text.partition("@") if name == "ci-cancel-head" else (text, "", "")
+                    cc.ImportedCIRemediation(head, at if separator else "", "legacy:" + digest((record.root, name, source.digest)))
+                except (ValueError, TypeError) as exc:
+                    reason = str(exc)
             elif name in {"session", "model", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
             elif name == "review-retries":
@@ -225,8 +234,16 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                                          budget_block=_budget_block(record, values["budget-block"]) if "budget-block" in values else None,
                                          self_clear_ceiling_reported="self-clear-ceiling" in values)
         if record.family is WorkflowFamily.PR_REPAIR:
+            def imported(name):
+                text = values.get(name)
+                if text is None:
+                    return None
+                head, separator, at = text.partition("@") if name == "ci-cancel-head" else (text, "", "")
+                source = dict(record.fields)[name]
+                assert isinstance(source, LegacyPresent)
+                return cc.ImportedCIRemediation(head, at if separator else "", "legacy:" + digest((record.root, name, source.digest)))
             return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
-                                    infra_failures=count("infra-deaths"))
+                                    infra_failures=count("infra-deaths"), ci_rerun=imported("ci-rerun-head"), ci_cancel=imported("ci-cancel-head"))
         return cc.StewardState(cc.StewardLaneState(values.get("triage-at", ""), count("steward-stalls-triage"), count("infra-deaths")),
                               cc.StewardLaneState(values.get("groom-at", ""), count("steward-stalls-groom"), count("infra-deaths")),
                               cc.GroomContent(values.get("groom-content", ""), values.get("groom-content", "")))

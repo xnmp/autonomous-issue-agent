@@ -1766,9 +1766,18 @@ class FixWorkflow:
         return self.cfg.operator_guidance(pr)
 
     async def _run_pr_logged(self, label, issue, task, p: PRView, *, kind, guidance: str, reply=None):
+        if self.workflow_control is None:
+            raise WorkflowAuthorityError("CI remediation repair context authority is unavailable")
+        selected = self.workflow_control.read_pr_repair(WorkflowKey(self.workflow_control.writer.repository, PullRequestRef(p.number)))
+        if not isinstance(selected, cc.SelectedPRRepair):
+            raise WorkflowAuthorityError("CI remediation repair context authority is inactive")
+        remedy = selected.component.state.ci_rerun
+        rerun_head = (remedy.capture.head if isinstance(remedy, cc.OwedCIRemediation)
+                      else remedy.owed.capture.head if isinstance(remedy, cc.SettledCIRemediation)
+                      else remedy.head if isinstance(remedy, cc.ImportedCIRemediation) else "")
         current = task_builders.with_pr_repair_context(
             task, p,
-            rerun_head=self.store.get_ci_rerun_head(p.number),
+            rerun_head=rerun_head,
             operator_guidance=guidance,
             discussion=as_untrusted(format_pr_discussion(p.comments)),
             human_reply=as_untrusted(reply) if reply is not None else None,

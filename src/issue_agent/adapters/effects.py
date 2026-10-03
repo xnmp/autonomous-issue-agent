@@ -33,6 +33,7 @@ from ..domain.lifecycle import (
 from ..domain.repository import canonical_repository
 from ..domain.workflow_identity import WorkflowBinding, WorkflowFamily
 from ..domain import continuation_components as cc
+from ..domain.workflow_identity import WorkflowKey, PullRequestRef
 from ..domain.self_clear import MachineClearProjection, BudgetClearProjection, machine_clear_evidence, budget_recovery_limits
 from ..domain.workflow import (
     ActiveReconciliation, ReconciliationOnly, RetiredUncertainCommand,
@@ -386,7 +387,10 @@ class GitHubEffectExecutor:
         )
 
     def execute(self, action: Action):
-        pending = self._pending_for_action(action)
+        pending = (self.store.current_ci_remediation_command(self.repository, action.pr,
+            CommandKind.RERUN_CHECKS if isinstance(action, RerunFailedChecks) else CommandKind.CANCEL_CHECKS,
+            action.head, action.run_ids) if isinstance(action, (RerunFailedChecks, CancelWorkflowRuns))
+            else self._pending_for_action(action))
         if pending is not None and _unresolved_workflow_command(pending):
             return self._reconcile_scheduled(pending, raise_unresolved=True)
         return self._execute(action, pending)
@@ -602,6 +606,8 @@ class GitHubEffectExecutor:
             command = pending.command
             action = action_from_command(command)
         if pending.state == EffectStatus.SUCCEEDED.value:
+            if "ci_remediation" in command.payload:
+                return True
             current = self._reconcile(action, command)
             if current is True:
                 return True
@@ -1719,6 +1725,13 @@ class GitHubEffectExecutor:
             extra["prior_run_states"] = dict(
                 (str(run_id), status) for run_id, status in states.items()
             )
+        if isinstance(action, (RerunFailedChecks, CancelWorkflowRuns)):
+            selected = self.store.read_pr_repair(WorkflowKey(self.repository, PullRequestRef(action.pr)))
+            if not isinstance(selected, cc.SelectedPRRepair):
+                raise WorkflowAuthorityError("CI remediation PR repair authority is unavailable")
+            capture = cc.CIRemediationCapture(selected.binding, action.head, action.run_ids,
+                action.decided_at if isinstance(action, CancelWorkflowRuns) else "")
+            extra["ci_remediation"] = encode_workflow(capture)
         return command_for_action(
             action,
             self.config_version,
@@ -1840,6 +1853,11 @@ class GitHubEffectExecutor:
         return True
 
     def _revision_matches(self, command: LifecycleCommand, *, self_clear_reconciliation: bool = False) -> bool:
+        if "ci_remediation" in command.payload:
+            try:
+                self.store.validate_ci_remediation(command)
+            except WorkflowAuthorityError:
+                return False
         if "self_clear" in command.payload:
             action = action_from_command(command)
             assert isinstance(action, Relabel)

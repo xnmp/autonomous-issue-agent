@@ -173,10 +173,17 @@ class Gateway:
         return (pr, event, body, head) in self.reviews
 
 
-def _executor(tmp_path):
+def _executor(tmp_path, *, ci=False):
     store = SQLiteControlStore(str(tmp_path / "control.db"))
     store.initialize()
     gateway = Gateway()
+    if ci:
+        from issue_agent.adapters.store import Store
+        from issue_agent.domain.world import PRView
+        from tests.fakes.accounted_workflow import install_pr_repair_authority
+        legacy = Store(str(tmp_path / "state"))
+        object.__setattr__(legacy, "_workflow_db", store)
+        install_pr_repair_authority(SimpleNamespace(prs={7: PRView(7, head_ref_oid="head-1")}), legacy)
     return (
         GitHubEffectExecutor(
             gateway,
@@ -677,7 +684,7 @@ def test_command_identity_canonicalizes_repository_case_aliases() -> None:
 
 
 def test_expected_revision_blocks_stale_effect(tmp_path) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     gateway.head = "new-head"
 
     with pytest.raises(StaleExpectedRevision):
@@ -812,8 +819,150 @@ def test_ambiguous_branch_update_uses_original_revision_to_reconcile(
     assert store.pending_commands() == ()
 
 
+@pytest.mark.parametrize("cancel", [False, True])
+def test_late_ci_receipt_cannot_replace_new_head_and_changed_run_set_cannot_replay(tmp_path, cancel):
+    from issue_agent.adapters.durable_effects import EffectOutcome
+    from issue_agent.domain.contracts import EffectStatus
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    make = CancelWorkflowRuns if cancel else RerunFailedChecks
+    name = "cancel_workflow_runs" if cancel else "rerun_failed_checks"
+    field = "ci_cancel" if cancel else "ci_rerun"
+    original = getattr(gateway, name)
+    def lost(*args):
+        accepted = original(*args)
+        assert accepted is not None
+        raise RuntimeError("original accepted CI reply lost")
+    setattr(gateway, name, lost)
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(make(7, "head-1", (42,)))
+    (old,) = store.pending_commands()
+    setattr(gateway, name, original)
+    with pytest.raises(ValueError, match="another exact run set"):
+        executor.execute(make(7, "head-1", (43,)))
+    gateway.head = "head-2"
+    assert executor.execute(make(7, "head-2", (43,)))
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    current = store.read_pr_repair(key).component.state
+    assert isinstance(getattr(current, field), cc.SettledCIRemediation)
+    assert getattr(current, field).owed.capture.head == "head-2"
+    assert executor.effects.resolve_unknown(old.command, EffectOutcome(True, EffectStatus.SUCCEEDED))
+    assert store.read_pr_repair(key).component.state == current
+    assert gateway.calls == [("cancel" if cancel else "rerun", "head-1", (42,)),
+                             ("cancel" if cancel else "rerun", "head-2", (43,))]
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_ci_lost_success_adopts_authorized_owner_and_refuses_retired_owner(tmp_path, cancel):
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    action = CancelWorkflowRuns(7, "head-1", (42,)) if cancel else RerunFailedChecks(7, "head-1", (42,))
+    field = "ci_cancel" if cancel else "ci_rerun"
+    name = "cancel_workflow_runs" if cancel else "rerun_failed_checks"
+    original = getattr(gateway, name)
+    def lost(*args):
+        original(*args)
+        raise RuntimeError("accepted CI effect reply lost")
+    setattr(gateway, name, lost)
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(action)
+    setattr(gateway, name, original)
+    if cancel:
+        gateway.run_states[42] = "completed"
+    else:
+        gateway.advance_run_attempts()
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    owed = getattr(store.read_pr_repair(key).component.state, field)
+    assert isinstance(owed, cc.OwedCIRemediation)
+    store.adopt_legacy_owner("o/r", "fix", "o/r:fix:successor", prior_owner_ids=("o/r:fix",))
+    with pytest.raises(RetiredOwnerError):
+        executor.execute(action)
+    assert getattr(store.read_pr_repair(key).component.state, field) == owed
+    successor = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix:successor")
+    assert successor.drain_pending_commands() == 1
+    assert successor.execute(action)
+    after = getattr(store.read_pr_repair(key).component.state, field)
+    assert isinstance(after, cc.SettledCIRemediation) and after.owed == owed
+    assert after.receipt.executor_identity == "o/r:fix:successor"
+    assert len(gateway.calls) == 1
+
+
+@pytest.mark.parametrize("settling", [False, True])
+def test_caught_ci_projection_failure_rolls_back_command_or_receipt_with_state(tmp_path, monkeypatch, settling):
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    from issue_agent.domain.contracts import EffectReceipt, EffectStatus
+    from datetime import datetime, timezone
+    executor, _, store = _executor(tmp_path, ci=True)
+    command = executor._command(RerunFailedChecks(7, "head-1", (42,)))
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    if settling:
+        store.enqueue_command(command)
+        store.begin_command(command.command_id)
+    before = store.read_pr_repair(key)
+    name = "_settle_ci_remediation" if settling else "_record_ci_remediation"
+    original = getattr(store, name)
+    def fail_after_projection(*args):
+        original(*args)
+        raise ValueError("caught CI projection failure")
+    monkeypatch.setattr(store, name, fail_after_projection)
+    with store.transaction() as db:
+        with pytest.raises(ValueError, match="caught CI projection"):
+            if settling:
+                now = datetime.now(timezone.utc)
+                receipt = EffectReceipt(command.command_id, "o/r:fix", now, now, EffectStatus.SUCCEEDED)
+                store._insert_effect(db, receipt, "injected-receipt")
+            else:
+                with store.mutation_savepoint(db):
+                    store._enqueue_command(db, command)
+    assert store.read_pr_repair(key) == before
+    assert store.effect_receipt(command.command_id) is None
+    pending = store.pending_commands()
+    assert len(pending) == int(settling)
+    if settling:
+        assert pending[0].command.command_id == command.command_id and pending[0].state == "executing"
+
+
+def test_actual_review_rearm_preserves_original_ci_obligation_and_receipts_it_once(tmp_path):
+    from tests.adapters.test_review_workflow_control import Rig, PR_KEY
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    from issue_agent.adapters.store import Store
+    from issue_agent.domain.world import PRView
+    from issue_agent.domain import continuation_components as cc
+    rig = Rig(tmp_path)
+    rig.gated()
+    legacy = Store(str(tmp_path / "state"))
+    object.__setattr__(legacy, "_workflow_db", rig.store)
+    install_pr_repair_authority(SimpleNamespace(prs={9: PRView(9, head_ref_oid="head-1")}), legacy)
+    gateway = Gateway()
+    executor = GitHubEffectExecutor(gateway, rig.store, repository="o/r", identity="o/r:fix")
+    original = gateway.rerun_failed_checks
+    def lost(*args):
+        original(*args)
+        raise RuntimeError("accepted rerun reply lost before review rearm")
+    gateway.rerun_failed_checks = lost
+    action = RerunFailedChecks(9, "head-1", (42,))
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(action)
+    before = rig.store.read_pr_repair(PR_KEY)
+    assert isinstance(before.component.state.ci_rerun, cc.OwedCIRemediation)
+    _, accepted = rig.request()
+    assert accepted.snapshot.revision.fence.generation == before.revision.fence.generation+1
+    assert accepted.snapshot.pr_repair == before.component
+    gateway.rerun_failed_checks = original
+    gateway.advance_run_attempts()
+    assert executor.drain_pending_commands() == 1
+    settled = rig.store.read_pr_repair(PR_KEY).component.state.ci_rerun
+    assert isinstance(settled, cc.SettledCIRemediation)
+    assert settled.owed == before.component.state.ci_rerun
+    assert settled.owed.capture.binding.fence == before.revision.fence
+    assert executor.execute(action)
+    assert gateway.calls == [("rerun", "head-1", (42,))]
+
+
 def test_ambiguous_check_rerun_is_reconciled_by_attempt_number(tmp_path) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     action = RerunFailedChecks(7, "head-1", (42,))
     original = gateway.rerun_failed_checks
 
@@ -837,7 +986,7 @@ def test_ambiguous_check_rerun_is_reconciled_by_attempt_number(tmp_path) -> None
 def test_partially_applied_multi_run_rerun_is_never_blindly_retried(
     tmp_path,
 ) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     action = RerunFailedChecks(7, "head-1", (42, 43))
     advanced = False
 
@@ -870,7 +1019,7 @@ def test_accepted_check_rerun_succeeds_before_the_attempt_counter_moves(
 ) -> None:
     """#177: GitHub queues the re-run and bumps `run_attempt` seconds later.
     Acceptance is the postcondition; convergence is observed from the world."""
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
 
     assert executor.execute(RerunFailedChecks(7, "head-1", (42,))) is True
 
@@ -882,7 +1031,7 @@ def test_accepted_check_rerun_succeeds_before_the_attempt_counter_moves(
 def test_refused_check_rerun_is_terminal_for_this_head(tmp_path) -> None:
     """The free re-run's one attempt per head is spent by the request itself,
     so a refusal must not be redriven next tick (ADR 0012 ceiling)."""
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     action = RerunFailedChecks(7, "head-1", (42,))
     original = gateway.rerun_failed_checks
     gateway.rerun_failed_checks = (
@@ -900,7 +1049,7 @@ def test_refused_check_rerun_is_terminal_for_this_head(tmp_path) -> None:
 def test_an_unreadable_run_observation_mints_no_rerun_command(tmp_path) -> None:
     """Fail closed: with no observation at all there is nothing to verify
     against, so no command exists for a later tick to redrive."""
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     gateway.workflow_run_attempts = lambda _head, _run_ids: None
 
     with pytest.raises(UnknownEffectOutcome):
@@ -923,7 +1072,7 @@ def test_a_malformed_run_observation_refuses_the_rerun_without_a_loop(
     """#177: a baseline that cannot be parsed cannot become parseable, so the
     re-run is refused terminally instead of parking in `unknown_outcome` and
     re-raising on every drain."""
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     gateway.workflow_run_attempts = attempts
 
     assert executor.execute(RerunFailedChecks(7, "head-1", (42,))) is False
@@ -953,7 +1102,7 @@ def test_rejected_mutation_does_not_receive_a_success_receipt(tmp_path) -> None:
 def test_revision_outage_remains_pending_instead_of_permanently_failing(
     tmp_path,
 ) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
 
     def unavailable(*_args, **_kwargs):
         raise RuntimeError("GitHub unavailable")
@@ -1247,7 +1396,7 @@ def test_a_replayed_steward_close_neither_re_comments_nor_re_closes(tmp_path) ->
 def test_cancelling_wedged_runs_is_receipted_like_any_other_remote_mutation(
     tmp_path,
 ) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
 
     assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
     assert gateway.calls == [("cancel", "head-1", (42,))]
@@ -1259,7 +1408,7 @@ def test_a_lost_cancel_reply_replays_safely_and_settles(tmp_path) -> None:
     # replay re-issues it. That is safe by construction: the gateway re-verifies
     # the head SHA and skips runs GitHub has already completed, so the repeat can
     # neither touch a newer push's run nor 409 on a finished one.
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     action = CancelWorkflowRuns(7, "head-1", (42,))
     original = gateway.cancel_workflow_runs
 
@@ -1287,7 +1436,7 @@ def test_a_lost_cancel_reply_replays_safely_and_settles(tmp_path) -> None:
 def test_a_run_github_already_completed_needs_no_cancel_at_all(tmp_path) -> None:
     # Reconcile-first: the run is already in the state the command wants, so it
     # is receipted without a POST.
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     gateway.run_states[42] = "completed"
 
     assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
@@ -1300,7 +1449,7 @@ def test_a_cancel_github_has_not_finished_yet_is_still_a_success(tmp_path) -> No
     # cancelled run down asynchronously. Verifying "the run is down" right after
     # the POST failed EVERY successful cancel — re-POSTing it to the retry
     # ceiling and raising an operator alert that pointed at token scopes.
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
 
     assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
     assert gateway.calls == [("cancel", "head-1", (42,))]
@@ -1313,7 +1462,7 @@ def test_a_cancel_github_has_not_finished_yet_is_still_a_success(tmp_path) -> No
 
 
 def test_a_run_from_a_newer_head_never_reaches_a_cancel_command(tmp_path) -> None:
-    executor, gateway, _store = _executor(tmp_path)
+    executor, gateway, _store = _executor(tmp_path, ci=True)
 
     with pytest.raises(UnknownEffectOutcome):
         executor.execute(CancelWorkflowRuns(7, "stale-head", (42,)))
@@ -1322,7 +1471,7 @@ def test_a_run_from_a_newer_head_never_reaches_a_cancel_command(tmp_path) -> Non
 
 
 def test_a_cancel_without_run_identities_is_refused(tmp_path) -> None:
-    executor, gateway, _store = _executor(tmp_path)
+    executor, gateway, _store = _executor(tmp_path, ci=True)
 
     with pytest.raises(UnknownEffectOutcome):
         executor.execute(CancelWorkflowRuns(7, "head-1", ()))

@@ -1946,10 +1946,31 @@ def _fix_state(
     # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR
     # with no resolvable issue has check runs like any other.
-    ci_rerun_head = {p.number: read(p.number, store.get_ci_rerun_head, "", error_key=breaker_key(p)) for p in world.prs}
+    ci_rerun_head = {}
+    ci_cancel_head = {}
+    ci_remediations = {}
+    ci_remediation_errors = {}
+    for pr in world.prs:
+        try:
+            if workflow_control is None:
+                raise ValueError("CI remediation PR repair authority is unavailable")
+            selected = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number)))
+            if not isinstance(selected, cc.SelectedPRRepair):
+                raise ValueError("CI remediation PR repair authority is inactive or migration blocked")
+            rerun, cancel = selected.component.state.ci_rerun, selected.component.state.ci_cancel
+            ci_remediations[pr.number] = (rerun, cancel)
+            def head_marker(item):
+                if item is None:
+                    return ""
+                capture = (item.capture if isinstance(item, cc.OwedCIRemediation)
+                           else item.owed.capture if isinstance(item, cc.SettledCIRemediation) else item)
+                return f"{capture.head}@{capture.decided_at}" if capture.decided_at else capture.head
+            ci_rerun_head[pr.number] = head_marker(rerun)
+            ci_cancel_head[pr.number] = head_marker(cancel)
+        except (ValueError, sqlite3.Error) as exc:
+            ci_remediation_errors[pr.number] = str(exc)
     # keifu PR #177: the head whose wedged runs were already sent a cancel, so
     # the deadline waits for GitHub instead of re-cancelling every poll.
-    ci_cancel_head = {p.number: read(p.number, store.get_ci_cancel_head, "", error_key=breaker_key(p)) for p in world.prs}
     update_branch_head = {
         p.number: read(p.number, store.get_update_branch_head, "", error_key=breaker_key(p)) for p in world.prs
     }
@@ -2003,6 +2024,7 @@ def _fix_state(
         rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
         infra_deaths=infra_deaths, infra_control_errors=infra_errors, ci_rerun_head=ci_rerun_head,
         ci_cancel_head=ci_cancel_head,
+        ci_remediations=ci_remediations, ci_remediation_errors=ci_remediation_errors,
         update_branch_head=update_branch_head,
         ci_pending_escalated=ci_pending_escalated,
         inflight=inflight,
@@ -2712,8 +2734,7 @@ def compose_fix_daemon(
 
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=log,
-        mark_automerge=store.mark_automerge, mark_ci_rerun=store.set_ci_rerun_head,
-        mark_ci_cancel=store.set_ci_cancel_head,
+        mark_automerge=store.mark_automerge,
         mark_branch_update=store.set_update_branch_head,
         mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=cleanup_fix_state,

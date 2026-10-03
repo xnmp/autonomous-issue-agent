@@ -216,6 +216,8 @@ class FixState:
     # cancel latch stops the harness re-cancelling every poll while GitHub takes
     # the run down, and the re-run marker is what actually spends the budget.
     ci_cancel_head: dict[int, str] = field(default_factory=dict)
+    ci_remediations: Mapping[int, tuple[cc.CIRemediation | None, cc.CIRemediation | None]] = field(default_factory=dict)
+    ci_remediation_errors: Mapping[int, str] = field(default_factory=dict)
     # Paid work currently executing in the application dispatch pool. This is
     # observation state, not persisted orchestration state: it prevents a second
     # leg for the same issue and extends the path-overlap serializer to work that
@@ -1425,6 +1427,8 @@ def ci_stall_remedies(
         if (stall.pr, stall.head) in state.ci_pending_escalated:
             continue
         pr = prs.get(stall.pr)
+        if pr is not None and pr.number in state.ci_remediation_errors:
+            continue
         issue = (_issue_for_pr(pr) or 0) if pr is not None else 0
         run_ids = stalled_run_ids(pr, cfg) if pr is not None else ()
         cancelled_head, cancelled_at = parse_cancel_marker(
@@ -1596,6 +1600,12 @@ def free_ci_rerun(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     ):
         return False
     return state.ci_rerun_head.get(pr.number, "") != pr.head_ref_oid
+
+
+def ci_remediation_owed(pr: PRView, state: FixState) -> bool:
+    return pr.number in state.ci_remediation_errors or any(
+        isinstance(item, cc.OwedCIRemediation) and item.capture.head == pr.head_ref_oid
+        for item in state.ci_remediations.get(pr.number, (None, None)))
 
 
 def ci_rerun_run_ids(pr: PRView, cfg: FixConfig) -> tuple[int, ...]:
@@ -2036,6 +2046,8 @@ def decide_fix(
             if current_ci == CIState.OK and state.ci_retries.get(bkey, 0) > 0:
                 actions.append(ResetCiRetries(issue_n, state.ci_resets.get(pr.number)))
             if current_ci == CIState.FAILURE:
+                if ci_remediation_owed(pr, state):
+                    continue
                 paths = pr.changed_files | issue_paths(issue_n)
                 if not dispatchable(issue_n, paths):
                     continue

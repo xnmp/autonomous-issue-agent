@@ -41,6 +41,53 @@ def command(capsys, family, *argv):
     return code, json.loads(output.out) if output.out.strip() else None, output.err
 
 
+def test_ci_remediation_shadow_and_copied_activation_keep_exact_imported_hints(stopped, capsys, tmp_path):
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    state, control, _ = stopped
+    install_workflow(control, held())
+    (state / "pr-9.ci-rerun-head").write_text("head-1")
+    (state / "pr-9.ci-cancel-head").write_text("head-1@2026-10-01T00:00:00Z")
+    before = dump(control)
+    files = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, report, error = command(capsys, "fix", "shadow")
+    assert code == 0, error
+    assert [(item["family"], item["number"], item["eligible"]) for item in report["targets"]] == [("pr_repair", 9, True)]
+    copy = tmp_path / "ci-remediation-copy"
+    code, result, error = command(capsys, "fix", "rehearse", "--copy-to", str(copy))
+    assert code == 0 and all(result["checks"].values()), error
+    copied = SQLiteControlStore(str(copy / "issue-agent-control" / Path(control.path).name))
+    selected = copied.read_pr_repair(WorkflowKey("o/r", PullRequestRef(9)))
+    rerun, cancel = selected.component.state.ci_rerun, selected.component.state.ci_cancel
+    assert isinstance(rerun, cc.ImportedCIRemediation) and isinstance(cancel, cc.ImportedCIRemediation)
+    assert (rerun.head, cancel.head, cancel.decided_at) == ("head-1", "head-1", "2026-10-01T00:00:00Z")
+    assert rerun.import_identity != cancel.import_identity
+    assert dump(control) == before
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == files
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("executing", [False, True])
+def test_legacy_unsettled_ci_command_refuses_hint_import_before_publication(stopped, capsys, cancel, executing):
+    from issue_agent.adapters.effects import command_for_action
+    from issue_agent.domain.actions import CancelWorkflowRuns, RerunFailedChecks
+    state, control, _ = stopped
+    install_workflow(control, held())
+    suffix = "ci-cancel-head" if cancel else "ci-rerun-head"
+    hint = "head-1@2026-10-01T00:00:00Z" if cancel else "head-1"
+    (state / ("pr-9." + suffix)).write_text(hint)
+    action = CancelWorkflowRuns(9, "head-1", (42,)) if cancel else RerunFailedChecks(9, "head-1", (42,))
+    legacy_command = command_for_action(action, repository="o/r", executor_identity="o/r:fix")
+    assert "ci_remediation" not in legacy_command.payload
+    assert control.enqueue_command(legacy_command)
+    if executing:
+        control.begin_command(legacy_command.command_id)
+    before = dump(control)
+    code, _, error = command(capsys, "fix", "shadow")
+    assert code == 2 and "pending work" in error
+    assert dump(control) == before
+    assert (state / ("pr-9." + suffix)).read_text() == hint
+
+
 def test_ci_shadow_and_copied_activation_preserve_debt_and_unknown_hold(stopped, capsys, tmp_path):
     state, control, _ = stopped
     (state / "issue-7.ci-retries").write_text("3")

@@ -343,8 +343,6 @@ class Executor:
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
-        mark_ci_rerun: Callable[[int, str], None] | None = None,
-        mark_ci_cancel: Callable[[int, str], None] | None = None,
         mark_branch_update: Callable[[int, str], None] | None = None,
         mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
@@ -373,19 +371,6 @@ class Executor:
         self._mark_automerge = mark_automerge or _missing_handler(
             "mark_automerge"
         )
-        # Persists the "this head has spent its ONE free CI re-run" marker the
-        # decide side reads (FixState.ci_rerun_head). Only the fix daemon wires
-        # it (Store.set_ci_rerun_head); a default no-op would make the re-run
-        # loop forever, which is why the arm below refuses to call gh at all
-        # when it is absent — see there.
-        self._mark_ci_rerun = mark_ci_rerun
-        # Persists "a cancel has been sent for this head's wedged runs"
-        # (FixState.ci_cancel_head). Written BEFORE the cancel call for the same
-        # reason the ci-rerun marker is: marked-but-not-cancelled costs one
-        # await-cancel wait and then the bounded escalation, whereas cancelled-
-        # but-not-marked re-cancels the run every poll forever. Unwired = the
-        # arm refuses to call gh at all, exactly like the re-run above.
-        self._mark_ci_cancel = mark_ci_cancel
         # Persists the head an advisory-UNSTABLE branch-refresh was dispatched
         # for (FixState.update_branch_head). Written BEFORE the update call,
         # same ordering rationale as the ci-rerun marker: marked-but-not-
@@ -601,33 +586,6 @@ class Executor:
 
     def _apply_once(self, action: Action) -> None:
         if self._effect_executor.handles(action):
-            if isinstance(action, RerunFailedChecks):
-                if self._mark_ci_rerun is None:
-                    self._log(
-                        f"CI re-run PR #{action.pr}: skipped (no marker writer "
-                        "wired) — the paid CI-fix leg dispatches next poll"
-                    )
-                    return
-                self._mark_ci_rerun(action.pr, action.head)
-            if isinstance(action, CancelWorkflowRuns):
-                if self._mark_ci_cancel is None:
-                    self._log(
-                        f"CI cancel PR #{action.pr}: skipped (no marker writer "
-                        "wired) - the stalled-CI escalation stands"
-                    )
-                    return
-                # `<head>@<decided_at>` — the marker dates the cancel so the
-                # await-cancel wait is bounded by time SINCE THE CANCEL. The
-                # stall clock cannot bound it: cancelling is what lets follow-on
-                # jobs start, and one fresh pending check resets that clock
-                # (adversarial review S2). An unstamped world writes the bare
-                # SHA, which the domain reads as an undated marker.
-                self._mark_ci_cancel(
-                    action.pr,
-                    f"{action.head}@{action.decided_at}"
-                    if action.decided_at
-                    else action.head,
-                )
             if isinstance(action, UpdateBranch) and self._mark_branch_update is not None:
                 self._mark_branch_update(
                     action.pr, f"{action.head}:{action.base}"

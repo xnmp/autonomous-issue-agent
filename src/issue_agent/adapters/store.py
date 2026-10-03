@@ -404,38 +404,6 @@ class Store:
         self._remove(self.issue_path(key, "ci-history"))
         return removed
 
-    # ── free CI re-run marker (#38) ──
-    # The head SHA whose ONE free `gh run rerun --failed` has been spent, so a
-    # second FAILURE on the same commit buys the paid FIX_CI leg instead of
-    # re-running forever. Keyed on the SHA rather than a bare flag: a push is a
-    # new head and gets a fresh allowance with no extra bookkeeping, and a
-    # re-armed marker can never suppress a genuinely new failure. Written by the
-    # executor BEFORE the rerun call (see the RerunFailedChecks arm) — a marker
-    # that is set-but-not-rerun costs one paid leg on the next poll, exactly what
-    # would have happened anyway, whereas rerun-but-not-marked is an unbounded
-    # loop. "" (absent) = never re-run, the sole reading a fresh PR must have.
-    def get_ci_rerun_head(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "ci-rerun-head"))
-
-    def set_ci_rerun_head(self, pr: int, sha: str) -> None:
-        if sha:
-            self._write(self.pr_path(pr, "ci-rerun-head"), sha)
-
-    # ── wedged-run cancel marker (keifu PR #177) ──
-    # The head SHA whose stuck workflow runs have already been sent a cancel, so
-    # the harness waits for GitHub to take the run down instead of re-cancelling
-    # every poll. Head-keyed and written BEFORE the cancel call for the same
-    # reasons as the re-run marker above: a push is a new head with a fresh
-    # remediation, marked-but-not-cancelled costs one bounded wait, and
-    # cancelled-but-not-marked is an unbounded cancel loop. "" (absent) = never
-    # cancelled, the sole reading a fresh PR must have.
-    def get_ci_cancel_head(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "ci-cancel-head"))
-
-    def set_ci_cancel_head(self, pr: int, sha: str) -> None:
-        if sha:
-            self._write(self.pr_path(pr, "ci-cancel-head"), sha)
-
     # PR → head a branch-refresh (advisory-UNSTABLE arm) was last dispatched
     # for. Same head-keyed shape and same write-before-execute ordering as the
     # ci-rerun marker above: refresh-but-not-marked is an unbounded push loop,
