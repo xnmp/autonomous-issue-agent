@@ -412,7 +412,7 @@ def simulate(scenario: Scenario, tmp_path, ticks: int = TICKS) -> list[Tick]:
     log: Callable[[str], None] = lambda _m: None  # noqa: E731
     executor = Executor(
         gw, remove_worktree=worktrees.remove, log=log,
-        mark_automerge=store.mark_automerge, clear_issue_state=lambda action: store.cleanup_pr(action.pr, action.issue, action.merged),
+        clear_issue_state=lambda action: store.cleanup_pr(action.pr, action.issue, action.merged),
         effect_executor=_SimEffects(gw, control),
     )
     dcfg = DispatchConfig(

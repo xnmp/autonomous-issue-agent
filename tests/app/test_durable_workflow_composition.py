@@ -196,6 +196,46 @@ def _compatible_sql_build_checkout(root: Path) -> Path:
     return checkout
 
 
+def _copied_authoritative_rows(path: Path) -> dict[str, tuple[str, ...]]:
+    with sqlite3.connect(path) as db:
+        tables = [row[0] for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%' "
+            "AND name<>'schema_migrations'")]
+        return {name: tuple(sorted(repr(row) for row in db.execute(f'SELECT * FROM "{name}"')))
+                for name in tables}
+
+
+def _stopped_copy_index_rollback(path: Path) -> None:
+    """Explicit fixture-only schema39→38 rollback; every authority row survives."""
+    from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
+    migration = next(item for item in _SCHEMA_MIGRATIONS if item.version == 39)
+    names = ("workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload")
+    before = _copied_authoritative_rows(path)
+    with sqlite3.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (39, migration.digest)
+        definitions = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='index'"))
+        statements = tuple(_sql_statements(migration.source))
+        assert len(statements) == len(names)
+        for name, statement in zip(names, statements, strict=True):
+            assert definitions[name] == statement.strip().removesuffix(";")
+        for name in names:
+            db.execute(f'DROP INDEX "{name}"')
+        assert db.execute("DELETE FROM schema_migrations WHERE version=39 AND source_digest=?", (migration.digest,)).rowcount == 1
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 38
+    assert _copied_authoritative_rows(path) == before
+
+
+def _forward_copy_indexes(path: Path, expected_rows: dict[str, tuple[str, ...]]) -> None:
+    SQLiteControlStore(str(path)).initialize()
+    assert _copied_authoritative_rows(path) == expected_rows
+    with sqlite3.connect(path) as db:
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 39
+        assert {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE name IN "
+            "('workflow_repair_owed','continuation_pr_admission_identity','reservations_active_workload')")} == {
+                "workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"}
+
+
 def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopped, capsys, tmp_path, monkeypatch):
     from issue_agent.domain.world import Check, Comment
     from dataclasses import replace
@@ -312,16 +352,25 @@ assert not any(isinstance(action, RunAgent) for action in actions)
 values = {number: control.read_issue_recovery(WorkflowKey("o/r", IssueRef(number))) for number in (7, 9)}
 print(json.dumps({str(number): encode_workflow((value.binding, value.revision, value.component)) for number, value in values.items()}))
 '''
-    later_sql = dump(blocked.control)
-    rollback = subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(repository), "python", "-c", script,
+    def read_old_build():
+        return subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(repository), "python", "-c", script,
                                str(copied_control), str(copied_state), str(checkout)], cwd=checkout,
                               env={**os.environ, "PYTHONPATH": str(checkout / "src")},
                               capture_output=True, text=True)
+    later_rows = _copied_authoritative_rows(copied_control)
+    newer_sql = dump(blocked.control)
+    refused = read_old_build()
+    assert refused.returncode != 0 and "39" in refused.stderr and "38" in refused.stderr
+    assert dump(blocked.control) == newer_sql
+    _stopped_copy_index_rollback(copied_control)
+    later_sql = dump(blocked.control)
+    rollback = read_old_build()
     assert rollback.returncode == 0, rollback.stderr
     current = {number: blocked.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(number))) for number in (7, 9)}
     assert json.loads(rollback.stdout) == {str(number): encode_workflow((value.binding, value.revision, value.component))
                                          for number, value in current.items()}
     assert dump(blocked.control) == later_sql
+    _forward_copy_indexes(copied_control, later_rows)
     assert dump(original) == before
     assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 
@@ -419,14 +468,23 @@ control.initialize()
 selected = control.read_steward(WorkflowKey("o/r", IssueRef(7)))
 print(json.dumps(encode_workflow((selected.binding, selected.revision, selected.component))))
 '''
-    later_sql = dump(current)
-    rollback = subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(Path(__file__).resolve().parents[2]),
+    def read_old_build():
+        return subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(Path(__file__).resolve().parents[2]),
                                "python", "-c", script, str(copied_control), str(checkout)], cwd=checkout,
                               env={**os.environ, "PYTHONPATH": str(checkout / "src")}, capture_output=True, text=True)
+    later_rows = _copied_authoritative_rows(copied_control)
+    newer_sql = dump(current)
+    refused = read_old_build()
+    assert refused.returncode != 0 and "39" in refused.stderr and "38" in refused.stderr
+    assert dump(current) == newer_sql
+    _stopped_copy_index_rollback(copied_control)
+    later_sql = dump(current)
+    rollback = read_old_build()
     assert rollback.returncode == 0, rollback.stderr
     selected = current.read_steward(key)
     assert json.loads(rollback.stdout) == encode_workflow((selected.binding, selected.revision, selected.component))
     assert dump(current) == later_sql
+    _forward_copy_indexes(copied_control, later_rows)
     assert dump(original) == before
     assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 
@@ -1141,7 +1199,7 @@ def test_triage_promotion_finishes_advisory_recurrence_after_own_transition(tmp_
     assert after.has(Label.RECURRENCE)
     assert any("#42" in comment.body and "PR #300" in comment.body for comment in after.comments)
     assert client.control.read_steward(resolve_snapshot(7).revision.fence.key).component.state.triage.baseline_at == after.updated_at
-    assert state.get_triage_at(7) == ""
+    assert not Path(state.state_dir, "triage-7.at").exists()
     restarted = compose(tmp_path, role="steward", decide=lambda _: [])
     restarted.daemon.tick()
     assert restarted.control.pending_commands() == ()

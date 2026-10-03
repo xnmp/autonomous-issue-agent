@@ -123,14 +123,14 @@ def test_verified_gate_never_bypasses_current_head_review_and_ci():
     assert should_automerge(pr, FixState(), _cfg()) is False
 
 
-def test_arm_on_open_still_respects_scope_marker_and_conflicts():
+def test_arm_on_open_still_respects_scope_and_conflicts():
     """Early arming relaxes ONLY the review/CI wait; every ownership and
     once-only guard keeps its teeth."""
     cfg = _cfg(arm_on_open=True)
     foreign = PRView(number=1, head_ref_name="dependabot/npm/x", reviews=(), checks=())
     assert should_automerge(foreign, FixState(), cfg) is False
     ours = PRView(number=2, head_ref_name="fix/9-t", reviews=(), checks=())
-    assert should_automerge(ours, FixState(automerge_enabled=frozenset({2})), cfg) is False
+    assert should_automerge(ours, FixState(), cfg) is False
     conflicted = PRView(number=3, head_ref_name="fix/9-t", reviews=(), checks=(),
                         mergeable="CONFLICTING")
     assert should_automerge(conflicted, FixState(), cfg) is False

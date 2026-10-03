@@ -1,13 +1,27 @@
 # Architecture implementation phases
 
-**Resumed by the user on 2026-09-25** ("resume implementing the plan and don't
+**Current execution — 2026-10-03:** phases 1–3 remain accepted. The approved
+[Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven
+outcome gates accepted locally. A2 closes the production caller/removal matrix,
+independent whole-system review, copied rollback, dashboard outcomes and final
+full gate (2026-10-03 07:08 UTC, exit 0). Phases 5 and 6 remain
+pending. No live activation, service restart, paid external experiment, push or
+remote issue closure is claimed. The sole approved Jira counter exception is
+explicit in [ADR 0016](../adr/0016-phase-4-current-state-authority.md).
+
+The checkpoint narratives below are historical evidence, not active
+implementation instructions. Recurring archive certification/censuses and
+chronology reconstruction are superseded by current SQL components and bounded
+pending sources. Missing historical chronology remains explicitly blocked.
+
+**Historical resume context — 2026-09-25** ("resume implementing the plan and don't
 stop until it's complete"). The [paused handover](2026-09-25-architecture-resume-handover.md)
 is historical input. The operator UI checkpoint below is accepted, as is the
 offline activation/import checkpoint that follows it. The **resolve slice is
 accepted** at `6905184` (absence-authorized retry `bba05c8`; composed fault-matrix
 acceptance through the production fix-daemon composition `6905184`). The
 **review-rejection slice and phase 3 are accepted** at `a7214bf`; see the
-[verification record](2026-09-27-review-slice-verification.md). Current work is
+[verification record](2026-09-27-review-slice-verification.md). At that checkpoint work was
 phase 4 under the [review execution design](2026-09-27-phase-4-review-execution-design.md).
 
 Checkpoint 138 adds atomic checkpoint publication, bounded compacted reads and
@@ -21,7 +35,8 @@ renewed origins and actual long-history acceptance remain open. The foundation
 includes fixture-selector isolation repair and the bounded import-source collector.
 The user confirmed that no additional historical source is
 available and directed ambiguous historical PRs to remain blocked. The full
-acceptance plan remains active: phase 4 is **0/7** and phases 1–3 are **3/6**.
+acceptance plan at that historical checkpoint was phase 4 **0/7** and phases
+1–3 **3/6**; the current acceptance above supersedes that count.
 See the [remaining milestones](2026-09-29-phase-4-remaining-milestones.md),
 [runtime compaction design](2026-09-30-phase-4-runtime-compaction-design.md), and
 [hook fixture incident and recovery](2026-09-30-hook-fixture-incident.md).
@@ -398,7 +413,7 @@ inventory is not permission to activate the new schema or restart deployment.
 | 1 — `phase_1_correctness` | None | Reproduce all four findings on current code; unify action-specific eligibility over terminal state and explicit holds; distinguish missing/corrupt/unreadable control records without starving healthy targets; revalidate completion and destructive effects against fresh facts. Valid self-authored updates must still complete. Establish the supported profile and incident/intervention baseline with the parent. |
 | 2 — `phase_2_composition` | Starts alongside 1; acceptance uses its fixes | Extend real daemon + durable executor + SQLite composition with a persistent GitHub double, restart and bounded fault injection. Cover remote success before receipt, duplicate delivery, partial relabel, stale completion and concurrent re-arm; prove held-state preservation, stable attempt identity, accounting conservation and visible uncertainty. |
 | 3 — `phase_3_gates` | Design may proceed alongside 1–2; implementation requires both accepted | Superseding ADR first where authority moves. Implement one complete generation-fenced gate/re-arm flow, accept it, then the second. Include operator command, continuation changes, dashboard projection, and aged-uncertain-command gates. Completion requires verified remote outcomes. Delete replaced choreography. |
-| 4 — `phase_4_continuations` | 3 accepted | Migrate remaining eligibility-bearing counters, consumed replies and continuation episodes one family at a time. Shadow comparison, scoped epochs, old-writer fencing and rollback reconciliation precede cutover. Retire replaced Store suffixes and temporary flags; never operate two authorities. |
+| 4 — `phase_4_continuations` | 3 accepted | First complete step 0.5 under ADR 0016: replace lifetime archive proof with atomic current-state authority and remove the superseded machinery. Then execute the finite issue roadmap to migrate selected eligibility-bearing counters, consumed replies and continuation episodes one family at a time. Shadow comparison, scoped epochs, old-writer fencing and rollback reconciliation precede cutover. Retire replaced Store suffixes and temporary flags; never operate two authorities. |
 | 5 — `phase_5_measurement` | 4 accepted | Implement incident/intervention records and comparable-cohort readouts, replay recorded interventions without an operator, and prepare/run authorized unattended windows. Include parked/abandoned work and operator diagnosis. Select new automation only from measured evidence; no automatic commitment to a diagnostic leg or general policy platform. Live windows remain pending while the user's deployment pause is in force. |
 | 6 — `phase_6_policy` | Findings/measurements from preceding phases | Consolidate demonstrated shell/Python gate-policy duplication behind one source while retaining parity and evidence requirements. Preserve current capability validation; do not refactor runtime registries merely because they are parallel. Address independent revision-bound test execution as a distinct verification contract, without treating model review as execution evidence. |
 
@@ -455,7 +470,7 @@ only exercised in a controlled double.
   The triage browser had returned a cache miss. A potential shared attachment
   preparation gap is recorded, not an instruction to widen child networking.
 
-## Status
+## Historical status checkpoints
 
 Phases 1 and 2 are accepted together after independent adversarial review and a
 green full `make test`: 1,115 domain, 1,201 adapter and 2,361 application tests,

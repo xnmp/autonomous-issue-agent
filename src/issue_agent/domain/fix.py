@@ -167,7 +167,6 @@ class FixState:
     # thread and PR thread, whose timestamps are unrelated.
     pr_resumed_at: dict[int, str] = field(default_factory=dict)
     pr_reply_control_errors: Mapping[int, str] = field(default_factory=dict)
-    automerge_enabled: frozenset[int] = frozenset()  # PRs already auto-merge-enabled (marker)
     # PR → the #124 test-immutability-exemption facts the app layer observed:
     # declared test files (from the change's tracked declaration), REVIEW_BOT-
     # authenticated grants, and the PR's current patch id. Absent key = nothing

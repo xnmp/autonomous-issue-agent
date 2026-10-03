@@ -343,7 +343,6 @@ class Executor:
         remove_worktree: Callable[[int], None] | None = None,
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
-        mark_automerge: Callable[[int], None] | None = None,
         clear_issue_state: Callable[[ClearIssueState], None] | None = None,
         validate_cleanup: Callable[[ClearIssueState], None] | None = None,
         reset_ci_retries: Callable[[ResetCiRetries], None] | None = None,
@@ -363,14 +362,6 @@ class Executor:
             "remove_worktree"
         )
         self._run_agent = run_agent
-        # Persist the "already armed" marker the decide side reads
-        # (FixState.automerge_enabled). Without this write the marker file was
-        # never created (T3 probe finding: store.mark_automerge had zero
-        # production call sites), so should_automerge re-armed every poll —
-        # one wasted `gh pr merge --auto` per merge-ready PR per tick.
-        self._mark_automerge = mark_automerge or _missing_handler(
-            "mark_automerge"
-        )
         # The fix role validates the complete terminal cleanup recipe before
         # remote/local effects and rechecks SQL revision at final retirement.
         self._validate_cleanup = validate_cleanup
@@ -585,12 +576,10 @@ class Executor:
                     self._escalated(action)
                 self._human_wait_transition(action)
             elif isinstance(action, EnableAutoMerge):
-                if outcome:
-                    self._mark_automerge(action.pr)
-                else:
+                if not outcome:
                     self._log(
                         f"auto-merge PR #{action.pr}: NOT armed (gh failed or "
-                        "GitHub refused); marker withheld so next poll retries"
+                        "GitHub refused); durable effect remains unconfirmed"
                     )
             elif isinstance(action, UpdateBranch):
                 # The failure must be OBSERVABLE (adversarial F2): the marker

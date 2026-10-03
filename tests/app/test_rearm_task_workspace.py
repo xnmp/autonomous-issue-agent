@@ -1,4 +1,6 @@
 """Completed rearm tasks consume their prepared workspace without recreating it."""
+from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
+
 
 import asyncio
 from dataclasses import replace
@@ -152,7 +154,7 @@ def test_completed_rearm_rejects_a_selected_branch_outside_the_handoff(
     assert worktrees.path_calls == []
     assert worktrees.ensure_calls == []
     assert runner.tasks == []
-    assert store.get_branch(5) == ""
+    assert retained_issue_file(store, 5, "branch") == ""
 
 
 def test_ordinary_resolve_still_ensures_its_worktree() -> None:

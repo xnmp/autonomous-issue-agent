@@ -3560,8 +3560,8 @@ def test_groom_dispatch_reads_sql_signature_and_preserves_triage(tmp_path, monke
     world = _triaged()
     assert decide(world) == [RunAgent(AgentKind.GROOM, 30)]
     # Retired raw sources are import evidence and cannot change runtime authority.
-    Path(store.groom_at_path(30)).write_text("unknown stopped baseline")
-    Path(store.groom_content_path(30)).write_text("unknown stopped signature")
+    Path(store.state_dir, "groom-30.at").write_text("unknown stopped baseline")
+    Path(store.state_dir, "groom-30.content").write_text("unknown stopped signature")
     with store._steward_control.transaction() as db:
         aggregate = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(30)))
         component = aggregate.steward

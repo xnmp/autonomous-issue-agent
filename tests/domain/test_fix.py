@@ -986,8 +986,8 @@ def test_no_automerge_when_ci_pending():
     assert should_automerge(p, FixState(), CFG) is False
 
 
-def test_automerge_marker_never_suppresses_remote_reconciliation():
-    st = FixState(automerge_enabled=frozenset({100}))
+def test_eligible_exact_head_remains_reconcilable():
+    st = FixState()
     assert should_automerge(_approved_green_pr(), st, CFG) is True
 
 
@@ -1256,10 +1256,8 @@ def test_behind_pr_emits_update_branch_with_automerge():
     assert UpdateBranch(100, "head-100") in actions
 
 
-def test_already_armed_behind_pr_still_updates_branch():
-    # A local marker is stale evidence: GitHub can cancel auto-merge remotely.
-    # The durable effect executor reconciles the actual remote request.
-    st = FixState(automerge_enabled=frozenset({100}))
+def test_behind_pr_reconciles_branch_before_merge():
+    st = FixState()
     actions = decide_fix(world(prs=[_approved_green_behind_pr()]), CFG, st, fixer_busy=False)
     assert EnableAutoMerge(100, "squash", "head-100") not in actions
     assert UpdateBranch(100, "head-100") in actions

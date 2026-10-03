@@ -1851,7 +1851,6 @@ def _fix_state(
     resumed = {}
     pr_resumed = {}
     pr_reply_errors = {}
-    automerge = frozenset(p.number for p in world.prs if read(p.number, store.automerge_enabled, False, error_key=breaker_key(p)))
     # Retry counters are keyed by breaker_key(pr): the linked issue number, or the
     # NEGATED PR number when a PR has no resolvable issue (Jira-keyed branch, no
     # closing-ref). Must match the workflow's increment key exactly, else the
@@ -2023,7 +2022,6 @@ def _fix_state(
         control_errors=errors,
         sessions=sessions, resumed_at=resumed, pr_resumed_at=pr_resumed,
         pr_reply_control_errors=pr_reply_errors,
-        automerge_enabled=automerge,
         ci_retries=ci_retries, ci_resets=ci_resets, review_retries=review_retries,
         review_control_errors=review_errors,
         rebase_retries=rebase_retries, resolve_workflows=resolve_workflows,
@@ -2751,7 +2749,6 @@ def compose_fix_daemon(
 
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=log,
-        mark_automerge=store.mark_automerge,
         clear_issue_state=cleanup_fix_state,
         validate_cleanup=validate_cleanup_fix_state,
         reset_ci_retries=reset_ci_episode,

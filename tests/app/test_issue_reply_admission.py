@@ -1,4 +1,6 @@
 """Issue replies buy paid work only through the selected SQL continuation."""
+from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
+
 
 import asyncio
 import pytest
@@ -33,7 +35,7 @@ def test_budget_refusal_preserves_reply_count_branch_and_legacy_inputs(monkeypat
     asyncio.run(workflow.resume(5))
     assert runner.tasks == []
     assert resolve_state(store).issue_recovery.state == before
-    assert store.get_resumed_at(5) == ""
+    assert retained_issue_file(store, 5, "resumed-at") == ""
 
 
 def test_success_consumes_exact_reply_once_and_preserves_legacy_files():
@@ -46,7 +48,7 @@ def test_success_consumes_exact_reply_once_and_preserves_legacy_files():
     assert after.issue_recovery.state.resumes == 1
     assert after.issue_recovery.state.remembered_branch == "fix/5-title"
     assert after.episode.failures == before.episode.failures
-    assert store.get_resumed_at(5) == "" and store.get_branch(5) == ""
+    assert retained_issue_file(store, 5, "resumed-at") == "" and retained_issue_file(store, 5, "branch") == ""
     asyncio.run(workflow.resume(5))
     assert len(runner.tasks) == 1
     with store._workflow_db._connect() as db:
@@ -104,7 +106,7 @@ def test_linked_pr_issue_reply_consumes_timestamp_without_no_pr_count_or_branch(
     assert after.issue_recovery.state.resumes == 0 and after.issue_recovery.state.remembered_branch == ""
     assert after.episode == before.episode
     asyncio.run(workflow.resume(5))
-    assert len(runner.tasks) == 1 and store.get_resumed_at(5) == ""
+    assert len(runner.tasks) == 1 and retained_issue_file(store, 5, "resumed-at") == ""
     with store._workflow_db._connect() as db:
         row = db.execute("SELECT workflow_binding_json,continuations_json FROM runs").fetchone()
         from issue_agent.domain.workflow_identity import WorkflowBinding
@@ -123,7 +125,7 @@ def test_linked_pr_budget_refusal_leaves_issue_reply_available(monkeypatch):
     monkeypatch.setattr(store._workflow_db, "reserve", lambda request: ReservationResult(AccountingDisposition.EXHAUSTED, None, Money("USD", 0), Money("USD", 1), Money("USD", 0), "test cap"))
     asyncio.run(workflow.resume(5))
     assert runner.tasks == [] and resolve_state(store).issue_recovery.state == before
-    assert store.get_resumed_at(5) == ""
+    assert retained_issue_file(store, 5, "resumed-at") == ""
 
 
 def test_blank_committed_projection_recovers_after_process_loss(monkeypatch):
@@ -301,7 +303,7 @@ def test_no_pr_fork_count_and_remembered_branch_advance_only_on_admission(monkey
     else:
         assert runner.tasks[0].resume == "session" and runner.tasks[0].fork_session
         assert after.resumes == 5 and after.remembered_branch == "fix/5-retained" and after.consumed_reply_at == REPLY_AT
-    assert store.get_branch(5) == "" and store.get_resumed_at(5) == ""
+    assert retained_issue_file(store, 5, "branch") == "" and retained_issue_file(store, 5, "resumed-at") == ""
 
 
 @pytest.mark.parametrize("state", ["pending", "retryable_failure", "unknown_outcome", "permanent_failure"])

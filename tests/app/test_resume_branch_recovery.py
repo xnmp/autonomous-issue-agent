@@ -1,4 +1,6 @@
 """Reply recovery must return to the branch that contains blocked work."""
+from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
+
 
 import asyncio
 import subprocess
@@ -72,7 +74,7 @@ def test_resume_recreates_removed_worktree_on_original_branch_with_blocked_commi
     assert git("branch", "--show-current", cwd=recovered_cwd) == original_branch
     assert git("rev-parse", "HEAD", cwd=recovered_cwd) == blocked_commit
     assert resolve_state(store).issue_recovery.state.remembered_branch == original_branch
-    assert store.get_branch(issue) == ""
+    assert retained_issue_file(store, issue, "branch") == ""
     assert subprocess.run(
         ["git", "show-ref", "--verify", "--quiet", "refs/heads/fix/5-issue"], cwd=repo,
     ).returncode == 1
@@ -146,7 +148,7 @@ def test_resolve_persists_branch_for_future_reply_recovery(tmp_path):
     with store._workflow_db._connect() as db:
         selected = json.loads(db.execute("SELECT dispatch_id FROM runs WHERE kind='RESOLVE'").fetchone()[0])
     assert selected["publication_branch"] == "fix/5-preserve-blocked-work"
-    assert store.get_branch(issue) == ""
+    assert retained_issue_file(store, issue, "branch") == ""
 
 
 def test_branch_for_issue_recovers_a_unique_retained_branch():

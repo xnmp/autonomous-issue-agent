@@ -29,21 +29,28 @@ def test_unreadable_counter_does_not_become_absent(tmp_path):
 
 def test_control_delete_failure_is_reported(tmp_path):
     store = Store(str(tmp_path))
-    (tmp_path / "issue-7.infra-deaths").mkdir()
+    (tmp_path / "issue-7.ci-history").mkdir()
     with pytest.raises((OSError, ValueError)):
-        store.clear_infra_deaths(7)
+        store.clear_ci_history(7)
 
 
 @pytest.mark.parametrize("raw", ["", "garbage", "not-a-timestamp"])
 def test_corrupt_consumed_reply_cannot_become_a_new_reply(tmp_path, raw):
+    from issue_agent.adapters.continuation_activation import read_continuation_roots
+    from issue_agent.domain.continuation_import import classify_record
+    from issue_agent.domain.workflow_identity import WorkflowFamily
     (tmp_path / "issue-7.resumed-at").write_text(raw)
-    with pytest.raises(ValueError, match="timestamp"):
-        Store(str(tmp_path)).get_resumed_at(7)
+    records, _ = read_continuation_roots("o/r", (("fix", str(tmp_path)),), (WorkflowFamily.ISSUE_RECOVERY,))
+    blockers = classify_record(records[0])
+    assert isinstance(blockers, tuple) and blockers
+    assert any("resumed-at" in block.reason or "timestamp" in block.reason for block in blockers)
 
 
-
-
-def test_oversized_control_record_is_rejected(tmp_path):
-    (tmp_path / "issue-7.session").write_text("x" * 65537)
-    with pytest.raises(ValueError, match="limit"):
-        Store(str(tmp_path)).get_session(7)
+def test_oversized_control_source_is_refused_by_stopped_import(tmp_path):
+    from issue_agent.adapters.continuation_activation import read_continuation_roots
+    from issue_agent.domain.resolve_activation import MAX_LEGACY_FILE_BYTES, LegacyUnreadable
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    (tmp_path / "issue-7.session").write_text("x" * (MAX_LEGACY_FILE_BYTES + 1))
+    records, _ = read_continuation_roots("o/r", (("fix", str(tmp_path)),), (WorkflowFamily.ISSUE_RECOVERY,))
+    source = dict(records[0].fields)["session"]
+    assert isinstance(source, LegacyUnreadable)

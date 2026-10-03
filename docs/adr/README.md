@@ -21,6 +21,8 @@ its load-bearing boundaries exist.
 | [0012](0012-structural-robustness-invariants.md) | Structural robustness invariants (provenance, bounded loops) |
 | [0013](0013-human-gate-ledger.md) | Human gates are a ledger, not labels plus events |
 | [0014](0014-reviewer-granted-gate-exemptions.md) | Reviewer-granted gate exemptions and the exemptable-rule boundary |
+| [0015](0015-generation-fenced-gate-rearm.md) | Accepted resolve/rejection gate and continuation authority |
+| [0016](0016-phase-4-current-state-authority.md) | Accepted Phase-4 current SQL authority and whole-system acceptance |
 
 New ADRs must name governed source files and be referenced from at least one of
 those files. Superseded decisions remain in history with an updated status and

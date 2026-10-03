@@ -50,17 +50,23 @@ job someone still has to do; the same file in `history/` is a record.
 - [2026-09-14-architecture-implementation.md](open/2026-09-14-architecture-implementation.md)
   — six-phase implementation, protected deployment pause, acceptance status,
   archived review and observational baseline.
+- [2026-09-30-phase-4-simplification-roadmap.md](open/2026-09-30-phase-4-simplification-roadmap.md)
+  — current phase-4 execution plan: mandatory step 0.5, deletion inventory,
+  fixed implementation contracts and dependency-ordered GitHub issues.
+  Supersedes conflicting next steps in the earlier phase-4 checkpoint,
+  compaction and convergence documents; all 37 issues and the seven Phase 4
+  outcome gates are accepted locally. Phases 5/6 remain pending.
 - [2026-09-27-review-slice-handover.md](open/2026-09-27-review-slice-handover.md)
   — historical stop-state handover and increment-8 brief, resumed by the user.
 - [2026-09-27-review-slice-verification.md](open/2026-09-27-review-slice-verification.md)
   — current review activation/deletion and linked-issue acceptance evidence.
 - [2026-09-27-phase-4-continuation-inventory.md](open/2026-09-27-phase-4-continuation-inventory.md)
-  — remaining authority inventory and migration constraints for phase 4.
+  — historical migration inventory; final authority follows ADR 0016 and A2.
 - [2026-09-27-phase-4-review-execution-design.md](open/2026-09-27-phase-4-review-execution-design.md)
-  — independently reviewed execution/continuation design; implementation follows
-  phase-3 acceptance, under the linked implementation conventions.
+  — original execution/continuation design. Business outcome contracts remain
+  evidence; storage/replay implementation instructions are superseded by ADR 0016.
 - [2026-09-27-phase-4-progress.md](open/2026-09-27-phase-4-progress.md)
-  — continuation checkpoint evidence, construction boundaries and remaining work.
+  — historical continuation checkpoint evidence, not the active task queue.
 - [issues/](open/issues/) — unresolved incident write-ups awaiting
   re-validation against the current tree.
 

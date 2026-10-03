@@ -391,7 +391,7 @@ class FixWorkflow:
         return runtime.value if isinstance(runtime, RuntimeName) else runtime
 
 
-    def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None, *, remember: bool = True) -> str:
+    def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None) -> str:
         from ...domain.workflow import CompletedRearm
 
         if state is not None and isinstance(state.intent, CompletedRearm):
@@ -402,8 +402,6 @@ class FixWorkflow:
             cwd = self.worktrees.episode_workspace_path(state.intent.workspace)
         else:
             cwd = self.worktrees.ensure(issue, branch)
-        if state is None and remember:
-            self.store.save_branch(issue, branch)
         if self.prepare_cwd is not None:
             self.prepare_cwd(cwd)
         self.cfg.log(f"worktree #{issue}: ready on '{branch}' → {cwd}")
@@ -703,7 +701,7 @@ class FixWorkflow:
         )
 
     def _repair_fix_cfg(
-        self, issue: int, leg: str, *, iss=None, review_rounds: int = 0, inherited_model: str | None = None
+        self, issue: int, leg: str, *, iss=None, review_rounds: int = 0, inherited_model: str = ""
     ) -> FixTaskConfig | None:
         """Effort-escalated config for a leg that resumes an existing session
         (address-review / fix-CI / rebase / resume). Its model stays attached to
@@ -719,9 +717,8 @@ class FixWorkflow:
         # live transcript. A pinned FIX_MODEL still wins; no stored marker
         # (pre-#21 sessions, unrouted resolves) keeps today's fallback.
         if not cfg.model:
-            inherited = self.store.get_model(issue) if inherited_model is None else inherited_model
-            if inherited:
-                cfg = dataclasses.replace(cfg, model=None if inherited == "<runtime-default>" else inherited)
+            if inherited_model:
+                cfg = dataclasses.replace(cfg, model=None if inherited_model == "<runtime-default>" else inherited_model)
         # Behind the kill switch: with escalation off nothing reads the labels,
         # so paying a `gh issue view` per repair leg would be pure waste.
         if iss is None and self.cfg.escalate_on_evidence:
@@ -1480,7 +1477,7 @@ class FixWorkflow:
         else:
             branch = self._resume_branch(issue, iss.title, state)
             fork = selected.component.state.resumes + 1 >= self.cfg.fork_threshold
-        cwd = self._ensure_cwd(issue, branch, state, remember=state is not None)
+        cwd = self._ensure_cwd(issue, branch, state)
         if state is not None:
             session = state.episode.continuation.session
             session_id = session.session_id if session is not None else ""
@@ -1640,7 +1637,7 @@ class FixWorkflow:
         session_id = repair.session.handle
         leg = "fix-ci" if any(check.bucket == "fail" and not check.advisory for check in p.checks) else "resume"
         fix_cfg = self._repair_fix_cfg(issue, leg, iss=iss, inherited_model=repair.model)
-        cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
         fork = max(selected.component.state.resumes, handoff.resumes if handoff is not None else 0) + 1 >= self.cfg.fork_threshold
         if any(check.bucket == "fail" and not check.advisory for check in p.checks):
             task = self._ci_task(p, issue, cwd, fork=fork, session_id=session_id, fix_cfg=fix_cfg)
@@ -1715,7 +1712,7 @@ class FixWorkflow:
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff, review=cc.ReviewRepairInput(
             issue_selected, PullRequestRef(pr), p.head_ref_oid, review_at,
             self.cfg.max_review_retries if self.cfg.max_review_retries > 0 else 2**63-1), head=p.head_ref_oid)
-        cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
         review_body = self.latest_review_body(p)
         # The file:line asks reviewers actually make live in the INLINE comments,
         # not the review body (review M13): dispatching without them rendered an
@@ -1785,7 +1782,7 @@ class FixWorkflow:
         return await self._run_logged(label, issue, current, kind=kind)
 
     def _ci_task(self, p: PRView, issue: int, cwd: str, *, fork: bool = False,
-                 session_id: str | None = None, fix_cfg: FixTaskConfig | None = None):
+                 session_id: str = "", fix_cfg: FixTaskConfig | None = None):
         pr = p.number
         failed = "\n".join(c.name for c in p.checks if c.bucket == "fail")
         failed_log = self._failed_run_log(p)
@@ -1802,7 +1799,7 @@ class FixWorkflow:
             as_untrusted(failed),
             as_untrusted(failed_log),
             cwd,
-            self.store.get_session(issue) if session_id is None else session_id,
+            session_id,
             # No `review_rounds` here (nor on `rebase`), though `p.reviews` is in
             # hand: review dissatisfaction is evidence about the RESOLUTION, and
             # a red pipeline or a conflicted branch is a different failure mode.
@@ -1844,7 +1841,7 @@ class FixWorkflow:
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff,
             cc.CIRepairInput(issue_selected, PullRequestRef(pr), p.head_ref_oid, self.cfg.max_ci_retries), head=p.head_ref_oid)
         guidance = self._pr_guidance(p.number)
-        cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
         attempt = make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"])
         task = dataclasses.replace(self._ci_task(p, issue, cwd,
             session_id=repair.session.handle if repair.session is not None else "",
@@ -1914,7 +1911,7 @@ class FixWorkflow:
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff, rebase=cc.RebaseRepairInput(
             issue_selected, PullRequestRef(pr), p.head_ref_oid, p.head_ref_name,
             self.cfg.max_rebase_retries if self.cfg.max_rebase_retries > 0 else 2**63-1), head=p.head_ref_oid)
-        cwd = self._ensure_cwd(issue, p.head_ref_name, remember=False)
+        cwd = self._ensure_cwd(issue, p.head_ref_name)
         task = task_builders.build_rebase_task(
             pr, self.cfg.base_branch, cwd, repair.session.handle if repair.session is not None else "",
             self._repair_fix_cfg(issue, "rebase", inherited_model=repair.model)

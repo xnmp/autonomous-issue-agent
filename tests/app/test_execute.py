@@ -44,7 +44,6 @@ def _exec():
         gw,
         remove_worktree=removed.append,
         run_agent=ran.append,
-        mark_automerge=lambda _pr: None,
     )
     return ex, gw, removed, ran
 
@@ -119,34 +118,8 @@ def test_enable_auto_merge():
     assert gw.calls == [("automerge", 100, "squash")]
 
 
-def test_enable_auto_merge_persists_the_armed_marker():
-    # The decide side's marker guard (FixState.automerge_enabled) only works if
-    # arming WRITES the marker — it never did (T3 probe: zero production call
-    # sites), so every merge-ready PR re-armed on every poll.
-    gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="head-100")}
-    )
-    marked = []
-    ex = Executor(gw, mark_automerge=marked.append)
-    ex.execute(EnableAutoMerge(100, "squash", "head-100"))
-    assert marked == [100]
 
 
-def test_enable_auto_merge_failure_withholds_the_marker():
-    # The inverse guard: the marker records what GITHUB did, not what we
-    # attempted. When the arm fails (observed: GraphQL "Branch does not have
-    # required protected branch rules" on an unprotected base), writing it
-    # anyway suppresses should_automerge forever on a PR that is otherwise
-    # merge-ready — #537 sat APPROVED + green + CLEAN and never merged.
-    gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="head-100")}
-    )
-    gw.automerge_ok = False
-    marked = []
-    ex = Executor(gw, mark_automerge=marked.append)
-    ex.execute(EnableAutoMerge(100, "squash", "head-100"))
-    assert gw.calls == [("automerge", 100, "squash")]
-    assert marked == []
 
 
 def test_update_branch():
@@ -686,3 +659,13 @@ def test_terminal_cleanup_preflight_keeps_remote_labels_worktree_and_sql_on_refu
     executor._validate_cleanup = lambda action: restarted.validate_pr_repair_cleanup(key, action.merged, action.source)
     assert not executor.execute_all(actions)
     assert gateway.calls == [] and gateway.labels == labels and removed == []
+
+
+def test_failed_exact_head_merge_remains_unconfirmed_without_legacy_callback():
+    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="head-100")})
+    gw.automerge_ok = False
+    logged = []
+    ex = Executor(gw, log=logged.append)
+    ex.execute(EnableAutoMerge(100, "squash", "head-100"))
+    assert gw.calls == [("automerge", 100, "squash")]
+    assert any("durable effect remains unconfirmed" in value for value in logged)

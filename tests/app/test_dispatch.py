@@ -3,6 +3,8 @@
 Drives each handler and asserts the resulting gateway writes + persisted state,
 proving the dispatcher routes inputs→task→run→follow-up correctly. The DECISIONS
 are tested in tests/domain; here we verify the wiring."""
+from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
+
 
 from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry
 
@@ -1065,6 +1067,6 @@ def test_fix_pr_kind_defers_without_dispatch_when_claim_target_carries_no_issue(
     asyncio.run(d.dispatch(action))
 
     assert runner.tasks == []
-    assert store.get_session(5) == ""
+    assert retained_issue_file(store, 5, "session") == ""
     assert store.get_infra_deaths(5) == 0
     assert gw.calls == []

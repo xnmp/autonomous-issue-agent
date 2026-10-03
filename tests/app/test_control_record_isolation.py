@@ -44,6 +44,24 @@ def test_corrupt_resolve_authority_holds_only_affected_issue(tmp_path):
     assert isinstance(state.resolve_workflows[1], WorkflowUnavailable)
 
 
+@pytest.mark.parametrize("legacy", ["unreadable", "present", "absent"])
+def test_retired_automerge_hint_cannot_suppress_sql_authorized_work(tmp_path, legacy):
+    from tests.domain.builders import issue, pr, world
+    store = Store(str(tmp_path))
+    _, workflows = workflow_control(tmp_path, numbers=(1,))
+    marker = tmp_path / "pr-9.automerge"
+    if legacy == "unreadable":
+        marker.mkdir()
+    elif legacy == "present":
+        marker.write_text("retained historical hint")
+    observed = world(issues=(issue(1, "ai-ready", updated_at="current-issue"),),
+                     prs=(pr(9, state="CLOSED", closing_issue=1),))
+    state = _fix_state(store, observed, workflow_control=workflows)
+    actions = decide_fix(observed, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
+    assert [action.number for action in actions if isinstance(action, RunAgent)] == [1]
+    assert not state.control_errors
+
+
 @pytest.mark.parametrize("table", ["workflows", "workflow_evidence"])
 def test_discovery_write_failure_rolls_back_and_does_not_starve_existing_peer(tmp_path, table):
     store = Store(str(tmp_path))

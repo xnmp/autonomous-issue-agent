@@ -1,9 +1,8 @@
 # ADR 0016 — Phase 4 current-state authority
 
-Status: Accepted implementation direction, 2026-09-30; **not implemented**.
-The user requested a substantial simplification and a finite issue roadmap.
-Step 0.5 must pass before further phase-4 feature migration. Existing runtime
-authority remains unchanged until its replacement passes the cutover tests.
+Status: Accepted implementation, 2026-10-03. Selected runtime authority and
+replacement removals passed A2 whole-system review, copied rehearsal, dashboard
+outcome checks and the final full gate. Phases 5 and 6 remain pending.
 
 Governs: src/issue_agent/domain/review_execution.py src/issue_agent/adapters/workflow_rows.py src/issue_agent/adapters/review_execution_control.py src/issue_agent/adapters/review_workflow_control.py src/issue_agent/adapters/control_store.py
 
@@ -128,6 +127,49 @@ only by a bounded, stopped, verified conversion, otherwise retained and held.
 The fact that live activation has not been reported is not proof that a state
 file is empty. Old binaries/writers remain fenced. Rollback keeps SQL authority
 and never restores file counters over newer results or charges.
+
+## Implemented continuation boundary
+
+Issue recovery, PR repair and separate TRIAGE/GROOM episodes use existing target
+aggregates, paid runs/reservations and durable commands. Reply consumption,
+allowances, infrastructure classification, source-bearing machine/budget holds,
+shared self-clear count and free remediation obligations have typed current
+identity and exact result/effect receipts. Source refusal remains specific to
+the affected action; healthy peers and unrelated cleanup continue. No generic
+workflow engine, queue, history monitor or second counter was added.
+
+PR result recovery selects the union of current issue pending admissions,
+current PR admission watermarks and active monetary obligations. Independent
+spend reconciliation can settle money before outcome classification, so money
+alone is insufficient. A public review generation release and newer REBASE may
+supersede PR continuity while an exact earlier CI classification remains owed
+by the issue component. Already-settled, fully superseded reply output needs no
+new historical completion authority. Selected malformed output remains held;
+malformed settled history cannot suppress healthy work. Recovery continues past
+refused current candidates and completes at most 32 successful outputs per pass.
+
+Schema39 adds only three fixed partial indexes on existing current workflow,
+continuation-admission and reservation tables. Copied 10/1,000/5,000-history
+query-plan measurements hold zero-selected work at 20/47/14 SQLite VM steps;
+without these indexes the same queries grow with retained history. Exact raw
+result reads use the selected run/receipt identity. This does not claim all
+writes are globally constant-time: the previously disclosed retirement-header
+scan remains distinct from ordinary current reads.
+
+CI history, predicted paths, telemetry stall signatures and Jira mirrors remain
+advisory. The obsolete automerge hint reader/callback is removed; existing
+exact-head durable merge command/readback receipts provide idempotency, including
+lost acknowledgements and restart. Jira's existing raw infrastructure counter
+and abandoned-run eligibility gate are the sole approved runtime file-counter
+exception; SQL TRIAGE/GROOM are decoupled without dual writes or a third lane.
+
+The copied rollback rehearsal explicitly proves the archived F14 binary refuses
+schema39. Only on the stopped test copy, it validates the exact migration39
+digest and three index definitions, removes those indexes and that matching
+schema metadata, then opens schema38 with the real archived F14 reader. Later
+money, holds, replies and every authoritative table row survive unchanged.
+Forward migration restores schema39 indexes without data loss. F14 does not
+directly open39; no live rollback or generic downgrade API is provided.
 
 ## Delete after replacement is accepted
 

@@ -1,4 +1,6 @@
 """PR repair uses selected SQL continuity before buying a CI leg."""
+from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
+
 
 import asyncio
 from contextlib import contextmanager
@@ -66,7 +68,7 @@ def test_rebase_without_active_pr_component_refuses_without_purchase(tmp_path):
     asyncio.run(workflow.rebase(100))
 
     assert inner.tasks == []
-    assert files.get_session(5) == "" and files.get_branch(5) == ""
+    assert retained_issue_file(files, 5, "session") == "" and retained_issue_file(files, 5, "branch") == ""
     with files._workflow_db.transaction() as db:
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
@@ -89,6 +91,60 @@ def active_ci_workflow(result, files=None):
     component = active(key, WorkflowFamily.PR_REPAIR)
     install_secondary(files._workflow_db, replace(base, pr_repair=component), component)
     return workflow, files, inner, key
+
+
+def test_settled_superseded_raw_repair_history_cannot_block_current_paid_work():
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", session_id="current", cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    with files._workflow_db.transaction() as db:
+        retired = db.execute("SELECT key FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0]
+    asyncio.run(workflow.fix_ci(100))
+    current = files._workflow_authority.read_pr_repair(key)
+    with files._workflow_db.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json='malformed retired output' "
+                   "WHERE namespace='pr-repair-result' AND key=?", (retired,))
+    assert files._workflow_authority.read_pr_repair(key) == current
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 0
+    asyncio.run(workflow.fix_ci(100))
+    assert len(inner.tasks) == 3
+    assert issue_ci_state(files).pending_ci is None
+    assert issue_ci_state(files).ci_failures == 3
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (3, 30000)
+
+
+def test_zero_owed_recovery_work_is_independent_of_retired_history(monkeypatch):
+    workflow, files, _, _ = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", session_id="current", cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    store = files._workflow_db
+    connect = store._connect
+    def recovery_steps():
+        steps = [0]
+        def counted_connect():
+            db = connect()
+            def count():
+                steps[0] += 1
+                return 0
+            db.set_progress_handler(count, 1)
+            return db
+        with monkeypatch.context() as counted:
+            counted.setattr(store, "_connect", counted_connect)
+            assert files._workflow_authority.reconcile_pr_repair_returns() == 0
+        return steps[0]
+    before = recovery_steps()
+    with store.transaction() as db:
+        raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0]
+        done = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND key LIKE '%pr_repair'").fetchone()[0]
+        # Unreferenced retired receipts cannot become a current obligation.
+        for number in range(2000):
+            for namespace, payload in (("pr-repair-result", raw), ("continuation-return", done)):
+                db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (namespace, "o/r", f"retired-{number}", "2026-10-01T00:00:00Z", payload))
+    after = recovery_steps()
+    assert after <= before + 64
+    assert issue_ci_state(files).ci_failures == 1 and issue_ci_state(files).pending_ci is None
 
 
 def issue_ci_state(files, issue=5):
@@ -295,7 +351,7 @@ def pr_reply_workflow(*, establish_session=True, body="Use A."):
     if establish_session:
         asyncio.run(workflow.fix_ci(100))
         # Retained files are deliberately present; the selected SQL receipt owns continuity.
-        files.save_session(5, "selected-pr-session")
+        seed_retained_issue_file(files, 5, "session", "selected-pr-session")
     workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], comments=(
         Comment("alice", body, "2026-10-02T00:00:01Z"),))
     return workflow, files, inner, key
@@ -1586,6 +1642,160 @@ def captured_interrupted_ci_result(monkeypatch):
     with files._workflow_db.transaction() as db:
         raw = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0]
     return workflow,files,inner,key,decode_workflow(raw,cc.PRRepairResult)
+
+
+@pytest.mark.parametrize("lane", ["ci", "review", "rebase"])
+def test_money_settled_captured_repair_still_recovers_exact_pending_classification(monkeypatch, lane):
+    if lane == "review":
+        _, files, _, key = interrupted_review(monkeypatch)
+        with files._workflow_db.transaction() as db:
+            returned = decode_workflow(db.execute("SELECT payload_json FROM dedupe_keys "
+                "WHERE namespace='pr-repair-result'").fetchone()[0], cc.PRRepairResult)
+    else:
+        _, files, _, key, returned = (captured_interrupted_ci_result(monkeypatch) if lane == "ci"
+            else interrupted_rebase(monkeypatch))
+    from issue_agent.adapters.control_store import AccountingDisposition
+    assert files._workflow_db.settle(returned.settlement).disposition is AccountingDisposition.AVAILABLE
+    pending = issue_ci_state(files)
+    assert (pending.pending_ci if lane == "ci" else pending.review_failures.pending
+            if lane == "review" else pending.pending_rebase) is not None
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 0
+    recovered = issue_ci_state(files)
+    assert (recovered.pending_ci if lane == "ci" else recovered.review_failures.pending
+            if lane == "review" else recovered.pending_rebase) is None
+    assert (recovered.ci_failures if lane == "ci" else recovered.review_failures.count
+            if lane == "review" else recovered.rebase_failures) == 1
+    assert files._workflow_authority.read_pr_repair(key).component.state.session is not None
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (1, returned.settlement.amount.micros)
+
+
+def test_public_review_release_and_newer_rebase_preserve_superseded_money_settled_ci(monkeypatch, tmp_path):
+    from tests.fakes.persistent_github import PersistentGitHub
+    from issue_agent.adapters.effects import GitHubEffectExecutor
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.labels import Label
+    from issue_agent.domain.world import IssueView
+    from issue_agent.domain.contracts import CommandId
+    from issue_agent.domain.workflow import WorkflowCommitted
+    workflow, files, inner, key = active_ci_workflow(AgentResult(
+        is_error=False, status="pushed", session_id="durable", cost_usd=.01))
+    store = files._workflow_db
+    captured = []
+    with monkeypatch.context() as pause:
+        pause.setattr(store, "capture_pr_repair_result", lambda returned, writer: captured.append(returned))
+        pause.setattr(store, "settle_pr_repair", lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("paused")))
+        with pytest.raises(RuntimeError, match="paused"):
+            asyncio.run(workflow.fix_ci(100))
+    old = captured[0]
+    from issue_agent.adapters.control_store import AccountingDisposition
+    assert store.settle(old.settlement).disposition is AccountingDisposition.AVAILABLE
+    remote = PersistentGitHub(tmp_path / "release.db")
+    remote.seed(IssueView(5, title="fixture", updated_at="2026-10-02T00:00:00Z"))
+    remote.seed_pr(PRView(100, head_ref_oid="a" * 40, head_ref_name="fix/5-remote", closing_issue=5,
+                         labels=frozenset({Label.AI_PR_OPEN})))
+    for number in range(2):
+        remote.seed_review(100, f"review-{number}", author="review-bot[bot]", commit="a" * 40,
+                           submitted_at=f"2026-09-25T11:00:0{number}+00:00")
+    writer = WorkflowWriter("o/r", "review", "o/r:review:fixture")
+    review = SQLiteReviewWorkflowControl(store, writer, gateway=remote, ceiling=3,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"))
+    effects = GitHubEffectExecutor(remote, store, repository="o/r", identity=writer.owner_id, log=lambda _: None)
+    before = review.load_workflow(key)
+    assert effects.submit_bound_review(100, "COMMENT", "ceiling", "a" * 40, workflow=before.binding,
+        reviewer="review-bot[bot]", patch_id="c" * 64, escalate_cause="ceiling")
+    with store.transaction() as db:
+        command = CommandId(db.execute("SELECT command_id FROM lifecycle_commands WHERE kind='submit_review'").fetchone()[0])
+    review.open_ceiling(command)
+    disabled = SQLiteReviewWorkflowControl(store, writer, gateway=remote, ceiling=0,
+        trigger_label=Label.AI_PR_OPEN, rule=CountingRule("review-bot[bot]"))
+    released = disabled.reconcile_ceiling(key)
+    assert isinstance(released, WorkflowCommitted)
+    assert released.snapshot.revision.fence.generation == before.revision.fence.generation + 1
+    effects.drain_pending_commands()
+    workflow.gateway._pr_for_issue[5] = 100
+    workflow.gateway.prs[100] = replace(workflow.gateway.prs[100], head_ref_oid="a" * 40)
+    reserve = store.reserve
+    def late_capture(request):
+        if request.kind == "REBASE":
+            store.capture_pr_repair_result(old, workflow.workflow_control.writer)
+        return reserve(request)
+    with monkeypatch.context() as racing:
+        racing.setattr(store, "reserve", late_capture)
+        asyncio.run(workflow.rebase(100))
+    newer = files._workflow_authority.read_pr_repair(key)
+    assert len(inner.tasks) == 2
+    assert issue_ci_state(files).pending_ci == old.ci.admission
+    assert issue_ci_state(files).ci_failures == 0 and issue_ci_state(files).rebase_failures == 1
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 1
+    assert issue_ci_state(files).pending_ci is None and issue_ci_state(files).ci_failures == 1
+    assert files._workflow_authority.read_pr_repair(key) == newer
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (2, 20000)
+
+
+def test_malformed_pending_repair_stays_held_without_suppressing_healthy_peer(monkeypatch):
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    from tests.fakes.workflow_authority import with_issue_recovery, resolve_snapshot
+    workflow, files, inner, _, returned = captured_interrupted_ci_result(monkeypatch)
+    key = files._workflow_db._continuation_receipt_key(returned.admission.attempt.run_id,
+        returned.admission.attempt.binding.authority.family)
+    held = issue_ci_state(files)
+    with files._workflow_db.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json='malformed current output' "
+                   "WHERE namespace='pr-repair-result' AND key=?", (key,))
+    assert files._workflow_authority.reconcile_pr_repair_returns() == 0
+    asyncio.run(workflow.fix_ci(100))
+    assert len(inner.tasks) == 1 and issue_ci_state(files) == held
+    install_workflow(files._workflow_db, with_issue_recovery(resolve_snapshot(6)))
+    workflow.gateway.prs[101] = replace(workflow.gateway.prs[100], number=101,
+        head_ref_name="fix/6-peer", closing_issue=6)
+    workflow.gateway._pr_for_issue[6] = 101
+    install_pr_repair_authority(workflow.gateway, files)
+    asyncio.run(workflow.fix_ci(101))
+    assert len(inner.tasks) == 2
+    assert issue_ci_state(files) == held
+    assert issue_ci_state(files, 6).pending_ci is None and issue_ci_state(files, 6).ci_failures == 1
+    with files._workflow_db.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
+        assert db.execute("SELECT count(*) FROM budget_reservations WHERE state='active'").fetchone()[0] == 1
+
+
+def test_malformed_owed_prefix_cannot_starve_healthy_return_beyond_batch_boundary(monkeypatch):
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    from tests.fakes.workflow_authority import with_issue_recovery, resolve_snapshot
+    workflow, files, inner, _, _ = captured_interrupted_ci_result(monkeypatch)
+    store = files._workflow_db
+    with store.transaction() as db:
+        db.execute("UPDATE dedupe_keys SET payload_json='malformed current output' WHERE namespace='pr-repair-result'")
+    for issue in range(6, 38):
+        pr = issue + 95
+        install_workflow(store, with_issue_recovery(resolve_snapshot(issue)))
+        workflow.gateway.prs[pr] = replace(workflow.gateway.prs[100], number=pr,
+            head_ref_name=f"fix/{issue}-peer", closing_issue=issue)
+        workflow.gateway._pr_for_issue[issue] = pr
+        install_pr_repair_authority(workflow.gateway, files)
+        with monkeypatch.context() as pause:
+            pause.setattr(store, "settle_pr_repair", lambda *args, **kwargs:
+                (_ for _ in ()).throw(RuntimeError("interrupted")))
+            with pytest.raises(RuntimeError, match="interrupted"):
+                asyncio.run(workflow.fix_ci(pr))
+        if issue < 37:
+            with store.transaction() as db:
+                db.execute("UPDATE dedupe_keys SET payload_json='malformed current output' WHERE namespace='pr-repair-result'")
+    assert len(inner.tasks) == 33
+    assert issue_ci_state(files, 37).pending_ci is not None
+    assert workflow.workflow_control.reconcile_pr_repair_returns() == 1
+    assert workflow.workflow_control.reconcile_pr_repair_returns() == 0
+    assert issue_ci_state(files, 37).pending_ci is None and issue_ci_state(files, 37).ci_failures == 1
+    for issue in range(5, 37):
+        assert issue_ci_state(files, issue).pending_ci is not None
+        assert issue_ci_state(files, issue).ci_failures == 0
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*),sum(amount_micros) FROM charges").fetchone()[:] == (1, 10000)
+        assert db.execute("SELECT count(*) FROM budget_reservations WHERE state='active'").fetchone()[0] == 32
 
 
 def test_generic_issue_settlement_cannot_bypass_captured_ci_classification(monkeypatch):

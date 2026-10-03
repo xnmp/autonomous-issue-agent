@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 39))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 40))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -121,6 +121,8 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        39: ("DROP INDEX workflow_repair_owed", "DROP INDEX continuation_pr_admission_identity",
+             "DROP INDEX reservations_active_workload"),
         38: ("DROP INDEX lifecycle_self_clear_pending",),
         37: ("DROP INDEX runs_fix_issue_dispatch",),
         36: (

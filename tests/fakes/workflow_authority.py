@@ -52,3 +52,27 @@ def install_workflow(store, snapshot):
                 (opened.gate_id, *scope, opened.opened_generation, type(opened.cause).__name__,
                  "open" if isinstance(gate, OpenGate) else "rearming", encode_workflow(gate)),
             )
+
+
+def retained_issue_file(store, issue: int, suffix: str) -> str:
+    """Observe retained fixture bytes without consulting runtime continuity."""
+    from pathlib import Path
+    if not hasattr(store, "issue_path"):
+        field = {"session": "sessions", "model": "models", "branch": "branches",
+                 "resumed-at": "resumed_at", "phase": "phases"}[suffix]
+        return getattr(store, field, {}).get(issue, "")
+    path = Path(store.issue_path(issue, suffix))
+    return path.read_text() if path.exists() else ""
+
+
+def seed_retained_issue_file(store, issue: int, suffix: str, value: str) -> None:
+    """Seed stopped-import evidence, including deliberately contradictory files."""
+    from pathlib import Path
+    if not hasattr(store, "issue_path"):
+        field = {"session": "sessions", "model": "models", "branch": "branches",
+                 "resumed-at": "resumed_at", "phase": "phases"}[suffix]
+        store.__dict__.setdefault(field, {})[issue] = value
+        return
+    path = Path(store.issue_path(issue, suffix))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(value)

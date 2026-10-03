@@ -1,4 +1,6 @@
 """A re-arm must not lose current evidence or the answer to a prior blocker."""
+from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
+
 
 import asyncio
 from dataclasses import replace
@@ -50,7 +52,7 @@ def test_every_pr_repair_carries_current_scope_discussion_and_ci_identity(tmp_pa
     )
     gateway = Gateway(issues={5: IssueView(5, "renderer")}, prs={100: pr})
     store = Store(str(tmp_path))
-    store.save_session(5, "old-blocked-session")
+    seed_retained_issue_file(store, 5, "session", "old-blocked-session")
     from tests.fakes.accounted_workflow import seed_verified_ci_rerun
     seed_verified_ci_rerun(store, 100, pr.head_ref_oid)
     guidance = guidance_reader(tmp_path, "Preserve regression assertions; diagnose persistent failure.")
@@ -82,7 +84,7 @@ def test_ci_resume_preserves_selected_answer_beyond_discussion_comment_limit(tmp
                 checks=(Check("native", bucket="fail"),),
                 comments=(Comment("owner", answer, "2026-09-14T00:00:00Z"),))
     store = Store(str(tmp_path))
-    store.save_session(5, "blocked-pr-session")
+    seed_retained_issue_file(store, 5, "session", "blocked-pr-session")
     runner = FakeRunner(AgentResult(is_error=False, status="pushed"))
     gateway = Gateway(issues={5: IssueView(5, "renderer")}, prs={100: pr})
     dispatcher = _ci_dispatcher(gateway, store, runner)

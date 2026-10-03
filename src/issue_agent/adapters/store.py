@@ -1,17 +1,8 @@
-"""ADR 0009 workflow continuity and low-authority worktree claims.
+"""Advisory files, worktree claims, and the explicitly retained Jira path.
 
-Replaces the scattered `cat`/`echo`/`rm -f "$STATE_DIR/issue-N.…"` in the bash
-with one typed surface. Two state roots:
-
-  * STATE_DIR (per-issue / per-PR daemon state): session ids, resume / ci /
-    review retry counters, the resumed-at reply mark, the automerge marker.
-    These feed FixState / ReviewState / TriageState in the domain.
-  * worktree `.harness/` (non-authoritative agent declarations): visual-ac,
-    visual-ac and test-cmd. Claims can schedule verification or select
-    a command, but never supply an authorization verdict.
-
-Path construction is pure (testable without touching disk); the read/write
-helpers are thin. Mirrors cleanup.sh's state-file set so teardown stays in sync.
+Selected lifecycle continuity, allowances, holds, and completion receipts live
+in SQLite. Historical control files are stopped-import evidence. Jira retains
+its existing infrastructure counter; its ticket mirrors remain advisory.
 """
 
 from __future__ import annotations
@@ -22,7 +13,6 @@ import subprocess
 from dataclasses import dataclass
 
 from ..domain.agent_task import RuntimeName
-from ..domain.ci import parse_timestamp
 from ..domain.ci_history import (
     CiAttempt,
     append_attempt,
@@ -35,61 +25,22 @@ from ..domain.ports import WorkflowControlError
 
 # Historical control files remain stopped-import evidence. Runtime cleanup
 # removes only the explicit advisory subsets; SQLite owns lifecycle state.
-_ISSUE_SUFFIXES = (
-    "session", "resumed-at", "resumes", "ci-retries", "ci-history",
-    "machine-block", "budget-block",
-    "self-clears", "self-clear-ceiling",
-    "rebase-retries", "infra-deaths", "review-retries", "phase", "jira",
-    "jira-phase", "model", "predicted-paths", "branch", "stall-sig",
-    "steward-stalls-triage",
-)
-_PR_SUFFIXES = (
-    "automerge", "ci-rerun-head",
-    "ci-cancel-head",
-    "update-branch-head", "ci-pending-escalated-head", "resumed-at",
-    "stall-sig",
-)
 _ISSUE_ADVISORY_SUFFIXES = ("jira", "jira-phase", "predicted-paths", "ci-history")
 _PR_ADVISORY_SUFFIXES = ("automerge",)
 
 @dataclass(frozen=True)
 class Store:
-    """STATE_DIR-rooted per-issue/PR daemon state. `state_dir` is the bash
-    STATE_DIR (fixer) or REVIEW_STATE_DIR (reviewer) or SDIR (steward)."""
+    """Filesystem advisory context and the retained Jira counter exception."""
 
     state_dir: str
-    # The agent runtime whose sessions this store may hand out. A session id is
-    # only resumable by the runtime that created it — `codex exec resume
-    # <claude-uuid>` dies in 0.3s with "no rollout found" (observed live on
-    # REBASE #541, 2026-07-27, the first dispatch after FIXER_RUNTIME flipped
-    # claude→codex). Sessions are therefore saved tagged (`<runtime>:<id>`) and
-    # a read under a DIFFERENT runtime returns "" — the leg cold-starts, which
-    # every resume-shaped leg supports. Legacy untagged files (bare uuid) read
-    # as "claude", the only runtime that existed when they were written.
+    # SQL-backed session projection still needs the configured receiving runtime.
     runtime: str | RuntimeName = RuntimeName.CLAUDE.value
-
-    def _runtime_tag(self) -> str:
-        return (
-            self.runtime.value
-            if isinstance(self.runtime, RuntimeName)
-            else self.runtime
-        )
-
     # ── pure path helpers ──
     def issue_path(self, issue: int, suffix: str) -> str:
         return os.path.join(self.state_dir, f"issue-{issue}.{suffix}")
 
     def pr_path(self, pr: int, suffix: str) -> str:
         return os.path.join(self.state_dir, f"pr-{pr}.{suffix}")
-
-    def triage_at_path(self, issue: int) -> str:
-        return os.path.join(self.state_dir, f"triage-{issue}.at")
-
-    def groom_at_path(self, issue: int) -> str:
-        return os.path.join(self.state_dir, f"groom-{issue}.at")
-
-    def groom_content_path(self, issue: int) -> str:
-        return os.path.join(self.state_dir, f"groom-{issue}.content")
 
     # ── generic thin IO ──
     # Encoding is PINNED, never the process locale: most values here are ASCII
@@ -99,19 +50,6 @@ class Store:
     # advisory reads preserve byte-damaged notes. Control records use strict
     # decoding so a damaged marker cannot grant a fresh attempt.
     def _read(self, path: str) -> str:
-        advisory = path.rsplit(".", 1)[-1] in {
-            "ci-history", "jira", "jira-phase",
-            "predicted-paths", "stall-sig",
-        }
-        if not advisory:
-            raw = self._read_control(path)
-            if raw == "" and path.rsplit(".", 1)[-1] in {
-                "session", "resumed-at", "at", "content",
-                "ci-rerun-head", "ci-cancel-head", "update-branch-head",
-                "ci-pending-escalated-head", "self-clear-ceiling",
-            }:
-                raise WorkflowControlError(path, "empty control record; repair or explicitly remove it")
-            return raw or ""
         try:
             with open(path, encoding="utf-8", errors="replace") as f:
                 return f.read().strip()
@@ -172,70 +110,6 @@ class Store:
             raise WorkflowControlError(path, "counter exceeds the supported integer range")
         return value
 
-    def _read_timestamp(self, path: str) -> str:
-        raw = self._read_control(path)
-        if raw is None:
-            return ""
-        if parse_timestamp(raw) is None:
-            raise WorkflowControlError(path, "malformed consumed-reply timestamp")
-        return raw
-
-    @staticmethod
-    def _integer(value: object, path: str, *, signed: bool = False) -> int:
-        if type(value) is not int or not (-(2**63) if signed else 0) <= value < 2**63:
-            raise WorkflowControlError(path, "malformed integer in structured control record")
-        return value
-
-    def get_branch(self, issue: int) -> str:
-        return self._read(self.issue_path(issue, "branch"))
-
-    def save_branch(self, issue: int, branch: str) -> None:
-        self._write(self.issue_path(issue, "branch"), branch)
-
-    # ── sessions (issue: resolve/resume/address-review; pr: review) ──
-    def _session_for_runtime(self, raw: str) -> str:
-        """The stored id iff the ACTIVE runtime created it, else "" (cold
-        start). Bare legacy ids are claude's."""
-        if not raw:
-            return ""
-        tag, _, sid = raw.partition(":")
-        if not sid:  # no ":" — legacy bare id, written before tagging existed
-            tag, sid = "claude", raw
-        runtime = self._runtime_tag()
-        # Older composition roots interpolated RuntimeName directly and wrote
-        # `RuntimeName.CODEX:<value>`. Accept that deployed shape while every
-        # new write uses the stable enum value (`codex:<value>`).
-        legacy_enum_tag = f"RuntimeName.{runtime.upper()}"
-        return sid if tag in {runtime, legacy_enum_tag} else ""
-
-    def get_session(self, issue: int) -> str:
-        return self._session_for_runtime(self._read(self.issue_path(issue, "session")))
-
-    def save_session(self, issue: int, session_id: str) -> None:
-        if session_id:
-            self._write(
-                self.issue_path(issue, "session"),
-                f"{self._runtime_tag()}:{session_id}",
-            )
-
-    def has_session(self, issue: int) -> bool:
-        return bool(self.get_session(issue))
-
-    # ── routed model (issue: the model the resolve family actually ran) ──
-    # Repair legs resume the resolve's session; without this marker they fell
-    # back to the configured default model (#21), silently swapping the
-    # reasoner under the routed transcript. Same runtime-tagging discipline as
-    # sessions: a model routed for one runtime must never leak into another.
-    def get_model(self, issue: int) -> str:
-        return self._session_for_runtime(self._read(self.issue_path(issue, "model")))
-
-    def save_model(self, issue: int, model: str | None) -> None:
-        if model:
-            self._write(
-                self.issue_path(issue, "model"),
-                f"{self._runtime_tag()}:{model}",
-            )
-
     # ── router path predictions ─────────────────────────────────────────────
     def get_predicted_paths(self, issue: int) -> frozenset[str]:
         """The router's last usable path prediction, or no signal on bad state."""
@@ -254,27 +128,12 @@ class Store:
         else:
             self._remove(path)
 
-    # ── resume reply mark + counter ──
-    def get_resumed_at(self, issue: int) -> str:
-        return self._read_timestamp(self.issue_path(issue, "resumed-at"))
-
-    def set_resumed_at(self, issue: int, at: str) -> None:
-        self._write(self.issue_path(issue, "resumed-at"), at)
-
-    def bump_resumes(self, issue: int) -> int:
-        path = self.issue_path(issue, "resumes")
-        n = self._read_int(path) + 1
-        self._write(path, str(n))
-        return n
-
-    # ── retry counters ──
     def clear_ci_history(self, issue: int) -> None:
         """Discard advisory context only after SQL closes the selected CI episode."""
         self._remove(self.issue_path(issue, "ci-history"))
 
     # ── CI attempt history (tauri PR #620) ──────────────────────────────────
-    # The counter above says HOW MANY repair legs ran; this says what each of
-    # them was looking at. Provenance and bounding: see domain/ci_history.py.
+    # Bounded prompt context, separate from SQL eligibility and debt.
     def get_ci_history(self, issue: int) -> tuple[CiAttempt, ...]:
         """Recorded FIX_CI attempts, oldest first — () when absent or corrupt."""
         try:
@@ -297,13 +156,9 @@ class Store:
         )
         return history
 
-    # ── infra-death ceiling (review C3/D2c) ──
-    # NOT a retry counter: a session that dies before returning a result made no
-    # attempt, so it must never march ci-/review-/rebase-/resolve-retries (that
-    # exemption is FAILURE-MODES #58). It gets its own, higher ceiling instead,
-    # because "the session keeps dying" is itself a paid loop. `key` is the same
-    # key the leg's retry counter uses: the issue number, or the NEGATED PR
-    # number for a PR with no resolvable issue (domain.fix.breaker_key).
+    # Jira retains its existing counter and ceiling policy. The stopped review
+    # activation reader also observes it once; selected fix/steward episodes
+    # neither consume nor update this counter.
     def get_infra_deaths(self, key: int) -> int:
         return self._read_int(self.issue_path(key, "infra-deaths"))
 
@@ -321,26 +176,6 @@ class Store:
         escalates on the next poll. Monotonic at the call site (max of current
         and the cap) — a saturate must never lower a tally."""
         self._write(self.issue_path(key, "infra-deaths"), str(max(0, int(count))))
-
-    def clear_infra_deaths(self, key: int) -> None:
-        """Decay: this key just produced a RETURNED result, so the transport and
-        the process are demonstrably alive (review P1R-3/P0R-3 residual).
-
-        The counter bounds CONSECUTIVE deaths — "the session keeps dying" — and
-        without a reset it is a lifetime tally instead: five unrelated deaths
-        spread over a month of otherwise healthy work eventually walk a healthy
-        issue to needs-human-review, and the cleanup path only clears it on a
-        MERGED PR, which is precisely the issue that never got there. A key that
-        never returns a result never reaches this, so the loop it was tuned for
-        still escalates.
-
-        Uses `_remove` rather than writing "0": absent and zero already read
-        identically (`_read_int` defaults to 0), and not creating a file is the
-        only form that cannot leave a torn one behind."""
-        self._remove(self.issue_path(key, "infra-deaths"))
-
-
-
 
     # ── stall watchdog markers (no-silent-forever) ──
     # (signature, since_iso) per watched target: the observable state last
@@ -374,35 +209,6 @@ class Store:
         )
         self._write(path, json.dumps({"sig": sig, "since": since}))
 
-    # ── automerge marker ──
-    def automerge_enabled(self, pr: int) -> bool:
-        return self._read_control(self.pr_path(pr, "automerge")) is not None
-
-    def mark_automerge(self, pr: int) -> None:
-        self._write(self.pr_path(pr, "automerge"), "")
-
-    # ── triage updatedAt baseline ──
-    def get_triage_at(self, issue: int) -> str:
-        """Stopped legacy-source observation; runtime continuity lives in SQLite."""
-        return self._read(self.triage_at_path(issue))
-
-    def get_groom_at(self, issue: int) -> str:
-        """Stopped legacy-source observation; runtime continuity lives in SQLite."""
-        return self._read(self.groom_at_path(issue))
-
-    def get_groom_content(self, issue: int) -> str:
-        """Stopped legacy-source observation; runtime continuity lives in SQLite."""
-        return self._read(self.groom_content_path(issue))
-
-    # ── author/implementer phase (AUTHOR_TESTS_SPLIT) ──
-    # "" (no file) = not started / single-pass; "authoring" = author leg ran and is
-    # blocked awaiting a human; "authored" = tests written, implementer leg is next.
-    def get_phase(self, issue: int) -> str:
-        return self._read(self.issue_path(issue, "phase"))
-
-    def set_phase(self, issue: int, phase: str) -> None:
-        self._write(self.issue_path(issue, "phase"), phase)
-
     # ── Jira mirror (JIRA_SYNC): the ticket key + the last phase we pushed ──
     def get_jira_key(self, issue: int) -> str:
         return self._read(self.issue_path(issue, "jira"))
@@ -417,19 +223,14 @@ class Store:
     def set_jira_phase(self, issue: int, phase: str) -> None:
         self._write(self.issue_path(issue, "jira-phase"), phase)
 
-    # ── cleanup (mirror cleanup.sh's rm -f set) ──
+    # ── advisory cleanup ──
     def _clear_issue_advisory(self, issue: int) -> None:
         """Selected SQL retirement cannot erase stopped control/import evidence."""
         for suffix in _ISSUE_ADVISORY_SUFFIXES:
             self._remove(self.issue_path(issue, suffix))
 
-    def clear_pr_state(self, pr: int) -> None:
-        """Retire current file-backed PR state, preserving stopped review evidence.
-
-        `automerge` is a PR suffix — it used to live in `clear_issue`, which
-        cleared a file nothing wrote, while the real pr-N.automerge marker was
-        cleared by neither cleaner.
-        """
+    def _clear_pr_advisory(self, pr: int) -> None:
+        """Retire the obsolete merge hint; durable commands own completion."""
         for suffix in _PR_ADVISORY_SUFFIXES:
             self._remove(self.pr_path(pr, suffix))
 
@@ -445,11 +246,10 @@ class Store:
         issue_key = issue if issue is not None else -pr  # type: ignore[operator]
         if merged:
             if pr is not None:
-                self.clear_pr_state(pr)
+                self._clear_pr_advisory(pr)
             self._clear_issue_advisory(issue_key)
         else:
             self.clear_ci_history(issue_key)
-
 
 # ── worktree .harness/ claims and local test command ──────────────────────────
 class HarnessMarkers:

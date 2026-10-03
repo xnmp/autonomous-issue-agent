@@ -1,16 +1,17 @@
 # Architecture — how the harness works now
 
-Current as of 2026-10-01. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-10-03. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
 
 The [phase-4 simplification roadmap](../open/2026-09-30-phase-4-simplification-roadmap.md)
-and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) govern review
-execution authority. The accepted simplification and review slice use current
-SQL state and a bounded unresolved suffix; archive projections, certificates
-and lifetime verification have been removed. Remaining phase-4 families are
-tracked individually in the roadmap; phase 4 is not yet accepted.
+and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) govern selected
+continuation authority. Current SQL state and a bounded unresolved suffix
+replace archive certification, lifetime verification and selected Store
+continuity writers. A2 whole-system acceptance is complete; phases 5 and 6
+remain pending. Jira's explicitly retained legacy counter path is the sole
+runtime exception; its mirror context remains advisory.
 
 Operator instructions live in [HARNESS.md](../../HARNESS.md); how to point the
 harness at a repo is in [CLAUDE.md](../../CLAUDE.md).
@@ -263,7 +264,16 @@ pending operator intent and durable effect rail. Renewal requires complete
 old-episode quiescence and carries a compact origin/session reference, preserving
 rejection allowance and unrelated holds. The dashboard projects this SQL state
 and daemon-captured facts through its existing transport; polls never grant work.
-Store's PR round/session APIs and review-only legacy reset paths are retired.
+Store continuity/session/model/reply/phase and steward baseline APIs are retired.
+Current selected issue/PR components retain exact paid admission and outcome
+sources, while free remediation holds the existing command identity until its
+exact head/run/base receipt settles. Machine and budget recoveries share one
+SQL count and retire only after verified projection. Current issue pending
+admissions recover classification even when monetary settlement and newer PR
+continuity have already committed. Schema39's fixed indexes select these owed
+sources independently of settled history. The copied rollback requires an
+explicit stopped index-only39→38 schema step before the archived F14 reader;
+later money/holds/replies survive, and forward migration restores39.
 Their raw files remain available to stopped import and cannot regain runtime
 authority after restart or rollback; the existing schema fence refuses an older
 binary before it can mutate the current database.

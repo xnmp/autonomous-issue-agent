@@ -107,7 +107,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 38
+SCHEMA_VERSION = 39
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1482,6 +1482,19 @@ _FIX_DISPATCH_REPOSITORY = "CASE WHEN json_valid(dispatch_id) THEN json_extract(
 _FIX_DISPATCH_ISSUE = "CASE WHEN json_valid(dispatch_id) THEN json_extract(dispatch_id,'$.issue') END"
 
 
+_REPAIR_BINDING = "$.value[1].fields.attempt.fields.binding"
+_REPAIR_VERSION = "$.value[1].fields.admission_version"
+_REPAIR_ADMISSION = ("namespace='continuation-admission' AND json_valid(payload_json) AND "
+    f"json_extract(payload_json,'{_REPAIR_BINDING}.fields.authority.fields.family.value')='pr_repair'")
+_REPAIR_CURRENT_OWED = """json_valid(episode_json) AND (
+    COALESCE(json_extract(episode_json,'$.value.fields.pr_repair.fields.watermarks.fields.last_admitted'),0)
+        > COALESCE(json_extract(episode_json,'$.value.fields.pr_repair.fields.watermarks.fields.last_applied'),0)
+    OR json_type(episode_json,'$.value.fields.issue_recovery.fields.state.fields.pending_ci')='object'
+    OR json_type(episode_json,'$.value.fields.issue_recovery.fields.state.fields.pending_rebase')='object'
+    OR json_type(episode_json,'$.value.fields.issue_recovery.fields.state.fields.review_failures.fields.pending')='object'
+)"""
+
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -2322,6 +2335,15 @@ WHERE {_FIX_ISSUE_DISPATCH};
 CREATE INDEX lifecycle_self_clear_pending ON lifecycle_commands(repository,target)
 WHERE state IN ('pending','executing','retryable_failure','unknown_outcome')
     AND CASE WHEN json_valid(payload_json) THEN json_type(payload_json,'$.self_clear') END='text';
+"""),
+    SchemaMigration(39, f"""
+CREATE INDEX workflow_repair_owed ON workflows(repository,target_kind,target_number)
+WHERE {_REPAIR_CURRENT_OWED};
+CREATE INDEX continuation_pr_admission_identity
+ON dedupe_keys(scope,json_extract(payload_json,'{_REPAIR_BINDING}'),json_extract(payload_json,'{_REPAIR_VERSION}'))
+WHERE {_REPAIR_ADMISSION};
+CREATE INDEX reservations_active_workload ON budget_reservations(workload_repository,run_id)
+WHERE state='active';
 """),
 )
 
@@ -6313,20 +6335,88 @@ class SQLiteControlStore:
         return self.settle_pr_repair(returned.settlement, returned.admission, returned.state, writer=writer)
 
     def reconcile_pr_repair_returns(self, writer) -> int:
+        from .workflow_rows import load_issue_aggregate, load_review_workflow_row
         with self.transaction() as db:
             self._assert_owner_active(db, writer.owner_id)
             lineage = self._owner_lineage(db, writer.repository, writer.owner_id)
             owners = ",".join("?" for _ in lineage)
-            rows = db.execute("SELECT raw.payload_json FROM dedupe_keys raw JOIN runs r "
-                "ON r.run_id=json_extract(raw.payload_json,'$.value.fields.admission.fields.attempt.fields.run_id') "
-                "LEFT JOIN dedupe_keys done ON done.namespace='continuation-return' AND done.scope=raw.scope AND done.key=raw.key "
-                f"WHERE raw.namespace='pr-repair-result' AND raw.scope=? AND r.owner_id IN ({owners}) AND done.key IS NULL "
-                "ORDER BY raw.claimed_at,raw.key LIMIT 32", (writer.repository, *lineage)).fetchall()
+            # Money may have settled independently of state classification.
+            # Current component sources retain those obligations; stale runs
+            # need recovery only while their money is still active.
+            run_ids = {row[0] for row in db.execute(
+                "SELECT b.run_id FROM budget_reservations b JOIN runs r USING(run_id) "
+                f"WHERE b.workload_repository=? AND b.state='active' AND r.owner_id IN ({owners})",
+                (writer.repository, *lineage))}
+            current = db.execute(
+                "SELECT target_kind,target_number FROM workflows WHERE repository=? AND "
+                + _REPAIR_CURRENT_OWED + " ORDER BY target_kind,target_number", (writer.repository,)).fetchall()
+            for row in current:
+                key = WorkflowKey(writer.repository, IssueRef(row["target_number"]) if row["target_kind"] == "issue"
+                                  else PullRequestRef(row["target_number"]))
+                try:
+                    if isinstance(key.target, IssueRef):
+                        aggregate = load_issue_aggregate(db, key)
+                        selected = cc.select_issue_recovery(aggregate) if aggregate is not None else cc.InactiveIssueRecovery()
+                        if isinstance(selected, cc.SelectedIssueRecovery):
+                            state = selected.component.state
+                            for admission in (state.pending_ci, state.pending_rebase, state.review_failures.pending):
+                                if admission is not None:
+                                    self._continuation_return_admission(db, admission, WorkflowFamily.ISSUE_RECOVERY)
+                                    run_ids.add(str(admission.attempt.run_id))
+                    else:
+                        aggregate = load_review_workflow_row(db, key)
+                        selected = cc.select_pr_repair(aggregate) if aggregate is not None else cc.InactivePRRepair()
+                        if not isinstance(selected, cc.SelectedPRRepair):
+                            continue
+                        marks = selected.component.watermarks
+                        if marks.last_admitted <= marks.last_applied or marks.last_admitted_fence is None:
+                            continue
+                        binding = selected.component.identity.bind(marks.last_admitted_fence)
+                        receipts = db.execute(
+                            f"SELECT payload_json FROM dedupe_keys WHERE {_REPAIR_ADMISSION} "
+                            f"AND scope=? AND json_extract(payload_json,'{_REPAIR_BINDING}')=json_extract(?,'$.value') "
+                            f"AND json_extract(payload_json,'{_REPAIR_VERSION}')=? LIMIT 2",
+                            (writer.repository, encode_workflow(binding), marks.last_admitted)).fetchall()
+                        if len(receipts) != 1:
+                            continue
+                        captured = decode_workflow(receipts[0][0], tuple)
+                        if len(captured) != 2 or not isinstance(captured[1], ContinuationAdmission):
+                            continue
+                        admission = captured[1]
+                        if admission.attempt.binding != binding or admission.admission_version != marks.last_admitted:
+                            continue
+                        self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
+                        run_ids.add(str(admission.attempt.run_id))
+                except (WorkflowAuthorityError, WorkflowEncodingError, ValueError):
+                    # Invalid selected evidence remains held; it cannot prevent
+                    # an independently authorized peer from recovering.
+                    continue
+            rows = []
+            for run_id in run_ids:
+                receipt_key = self._continuation_receipt_key(RunId(run_id), WorkflowFamily.PR_REPAIR)
+                row = db.execute(
+                    "SELECT raw.payload_json,raw.claimed_at,raw.key,r.run_id FROM dedupe_keys raw "
+                    "LEFT JOIN dedupe_keys done ON done.namespace='continuation-return' AND done.scope=raw.scope AND done.key=raw.key "
+                    "JOIN runs r ON r.run_id=? "
+                    f"WHERE raw.namespace='pr-repair-result' AND raw.scope=? AND raw.key=? AND r.owner_id IN ({owners}) AND done.key IS NULL",
+                    (run_id, writer.repository, receipt_key, *lineage)).fetchone()
+                if row is not None:
+                    rows.append(row)
         completed = 0
-        for row in rows:
-            returned = decode_workflow(row[0], cc.PRRepairResult)
-            settled = self.settle_pr_repair_result(returned, writer)
-            completed += int(settled.disposition is AccountingDisposition.AVAILABLE)
+        for row in sorted(rows, key=lambda item: (item["claimed_at"], item["key"])):
+            if completed >= 32:
+                break
+            try:
+                returned = decode_workflow(row["payload_json"], cc.PRRepairResult)
+                if (str(returned.admission.attempt.run_id) != row["run_id"]
+                        or returned.admission.attempt.binding.fence.key.repository != writer.repository
+                        or self._continuation_receipt_key(returned.admission.attempt.run_id,
+                            WorkflowFamily.PR_REPAIR) != row["key"]):
+                    continue
+                settled = self.settle_pr_repair_result(returned, writer)
+                completed += int(settled.disposition is AccountingDisposition.AVAILABLE)
+            except (WorkflowAuthorityError, WorkflowEncodingError, ValueError):
+                continue
         return completed
 
     def settle_steward(self, request: SettlementRequest, admission: ContinuationAdmission,

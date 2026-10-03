@@ -494,14 +494,13 @@ operator signal. No operator command applies. To exit:
 A refused ceiling-release relabel (`projection = ceiling_release`) exits when
 the labels are corrected by hand or a later generation supersedes it.
 
-Residual (phase 4): the review control releases only rejection-ceiling holds.
-Two external holds are never removed by a review projection (plan decision 3):
-`needs-human-review` from an ESCALATE verdict, and the unproductive-round
-breaker. Once a family is active, the legacy unblock no longer clears them
-either. A re-arm under such a hold keeps `needs-human-review` and buys no
-review; its effect text says so when the daemon's last read showed the hold,
-and acceptance's fresh read decides it otherwise. The projection obligation
-reads "add needs-human-review". The release path for these holds is phase 4.
+Review projections preserve independent holds. Rejection-ceiling release cannot
+remove an ESCALATE/human hold, renew review execution allowance or erase a fix
+infrastructure episode. Each supported named release consumes its selected SQL
+cause/revision and existing durable receipt. Legacy label-only unblock does not
+grant unsupported fix retry allowance; requests needing such a grant refuse
+before remote labels/comments. Ordinary selected state comes from SQL, with
+Jira's explicitly retained counter path as the sole runtime exception.
 
 ### Resolve family activation (offline, operator-only)
 
