@@ -359,7 +359,10 @@ class Store:
             data = json.loads(raw)
         except ValueError:
             return ("", "")
-        return (str(data.get("sig", "")), str(data.get("since", "")))
+        if not isinstance(data, dict):
+            return ("", "")
+        sig, since = data.get("sig", ""), data.get("since", "")
+        return (sig, since) if isinstance(sig, str) and isinstance(since, str) else ("", "")
 
     def set_stall_marker(
         self, kind: str, number: int, sig: str, since: str

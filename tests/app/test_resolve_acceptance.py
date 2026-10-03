@@ -1365,17 +1365,17 @@ def test_rollback_after_remote_write_preserves_authority_and_never_replays_old_f
     assert restarted.remote.calls.count(["relabel", 1, NHR, READY]) == 1
 
 
-def test_fix_activation_refuses_unsupported_stall_source_without_paid_work(bare, activation_cli):
+def test_fix_activation_refuses_unsupported_continuation_source_without_paid_work(bare, activation_cli):
     _legacy_deployment(bare)
     code, reviewed, err = activation_cli("shadow")
     assert code == 0, err
     assert activation_cli("activate", "--confirm-plan-digest", reviewed["plan"]["plan_digest"])[0] == 0
-    marker = bare.root / "fix-state" / "issue-2.stall-sig"
-    marker.write_text("unsupported retained stall source")
+    marker = bare.root / "fix-state" / "issue-2.session"
+    marker.write_text("codex:unsupported-retained-session")
     before = _dump(bare)
     code, blocked, err = activation_cli("shadow", family="fix")
     assert code == 0, err
     peer = next(target for target in blocked["targets"] if target["number"] == 2)
-    assert not peer["eligible"] and any("stall-sig" in reason for reason in peer["blockers"])
-    assert _dump(bare) == before and marker.read_text() == "unsupported retained stall source"
+    assert not peer["eligible"] and any("session" in reason for reason in peer["blockers"])
+    assert _dump(bare) == before and marker.read_text() == "codex:unsupported-retained-session"
     _held_for_migration(compose(bare))

@@ -177,6 +177,10 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
     values: dict[str, str] = {}
     blockers: list[cc.ContinuationImportBlocker] = []
     for name, source in record.fields:
+        # Prompt context and watchdog telemetry remain copied source evidence;
+        # neither can grant or refuse a paid continuation allowance.
+        if name in {"ci-history", "stall-sig"}:
+            continue
         if isinstance(source, LegacyAbsent):
             continue
         reason = source.reason if not isinstance(source, LegacyPresent) else ""
@@ -216,7 +220,7 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                     _imported_pr_recovery(record, name, text)
                 except (ValueError, TypeError) as exc:
                     reason = str(exc)
-            elif name in {"session", "model", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
+            elif name in {"session", "model"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
                 reason = "requires its fixed family provenance parser; no empty-state inference"
             elif name == "review-retries":
                 at, separator, number = text.rpartition(" ")

@@ -1,6 +1,7 @@
 """Stopped import refuses unknown facts while preserving direct typed debt."""
 
 import hashlib
+from dataclasses import replace
 
 import pytest
 
@@ -27,6 +28,16 @@ def test_direct_issue_debt_and_consumed_reply_are_preserved():
     value = classify_record(record(**{"resumed-at": "2026-10-01T00:00:00Z", "resumes": "2", "ci-retries": "3", "infra-deaths": "4"}))
     assert isinstance(value, cc.IssueRecoveryState)
     assert (value.consumed_reply_at, value.resumes, value.ci_failures, value.infra_failures) == ("2026-10-01T00:00:00Z", 2, 3, 4)
+
+
+@pytest.mark.parametrize("family", [WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR])
+@pytest.mark.parametrize("source", [LegacyPresent("a" * 64, "malformed advisory"), LegacyUnreadable("unreadable advisory")])
+def test_advisory_sources_cannot_grant_or_refuse_selected_continuity(family, source):
+    selected = record(family, **({"ci-retries": "2"} if family is WorkflowFamily.ISSUE_RECOVERY else {}))
+    selected = replace(selected, fields=tuple((name, source if name in {"ci-history", "stall-sig"} else value)
+                                             for name, value in selected.fields))
+    assert classify_record(selected) == (cc.IssueRecoveryState(ci_failures=2)
+                                        if family is WorkflowFamily.ISSUE_RECOVERY else cc.PRRepairState())
 
 
 def test_imported_ci_hints_preserve_exact_bounded_source_without_success_receipts():

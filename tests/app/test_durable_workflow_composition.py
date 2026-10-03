@@ -51,6 +51,8 @@ from issue_agent.domain.workflow_identity import WorkflowBinding, WorkflowWriter
 from tests.domain.builders import issue, pr
 from tests.fakes.persistent_github import PersistentGitHub
 from tests.fakes.workflow_authority import install_workflow, resolve_snapshot, with_issue_recovery
+from tests.app.test_continuation_activation_cli import command as continuation_command, stopped
+from tests.app.test_resolve_activation_cli import deployment, dump, run as resolve_command
 
 
 class Crash(BaseException):
@@ -130,10 +132,11 @@ UNKNOWN_READ_DELAY = timedelta(seconds=31)
 
 
 def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix", split=False,
-            later: timedelta = timedelta(0)) -> Composition:
+            later: timedelta = timedelta(0), control_path: Path | None = None,
+            state_dir: Path | None = None) -> Composition:
     """``later`` restarts the process that much after the prior one (store clock)."""
     remote = PersistentGitHub(root / "github.db", fault=fault)
-    control = SQLiteControlStore(str(root / "control.db"), now=lambda: datetime.now(timezone.utc) + later)
+    control = SQLiteControlStore(str(control_path or root / "control.db"), now=lambda: datetime.now(timezone.utc) + later)
     control.initialize()
     workflow = SQLiteWorkflowControl(
         control, WorkflowWriter("o/r", "fix", "o/r:fix"),
@@ -141,19 +144,20 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
     )
     events = EventLog(str(root / "events.jsonl"), Producer("test", "o/r", role, os.getpid(), "test-boot"))
     control.bind_event_outbox(events.prepare, events.append_committed)
-    state = Store(state_dir=str(root / role))
+    state = Store(state_dir=str(state_dir or root / role))
     messages = []
     effects = GitHubEffectExecutor(remote, control, repository="o/r", identity=f"o/r:{role}", log=messages.append)
     provider = provider or Provider()
     runtime = AccountingRuntime(
         provider, control, "o/r", "fix", Money("USD", 5_000_000), None, None,
         "test", "claude", BudgetPolicy({("fix", kind): Money("USD", 3_000_000)
-                                         for kind in ("RESOLVE", "AUTHOR", "IMPLEMENT", "ADJUDICATE")}),
+                                         for kind in ("RESOLVE", "RESUME", "FIX_CI", "AUTHOR", "IMPLEMENT", "ADJUDICATE")}),
         max_contract_rounds=2,
     )
     executor = Executor(remote, effect_executor=effects, retry_delays=(), log=messages.append, remove_worktree=lambda _: None, clear_issue_state=lambda action: state.cleanup_pr(action.pr, action.issue, action.merged))
     dispatcher = AgentDispatcher(
-        DispatchConfig(fix=FixTaskConfig("o/r", agent_md="test", model="test-model"), fix_bot="fix-bot", log=messages.append, author_tests_split=split),
+        DispatchConfig(fix=FixTaskConfig("o/r", agent_md="test", model="test-model"), fix_bot="fix-bot", log=messages.append,
+                       author_tests_split=split, operator_guidance=roles.review_guidance_reader(control, "o/r")),
         remote, state, Worktrees(root), JournalingRuntime(runtime, events, repo="o/r", role="fix", runtime="claude"), executor, workflow_control=workflow,
     )
     executor.bind_workflow_reconciliation(dispatcher.fix_workflow.reconcile_returns)
@@ -177,6 +181,254 @@ def seed(root: Path, *labels: str) -> None:
     control.initialize()
     from tests.fakes.workflow_authority import with_issue_recovery
     install_workflow(control, with_issue_recovery(resolve_snapshot(7)))
+
+
+def _compatible_sql_build_checkout(root: Path) -> Path:
+    import io
+    import subprocess
+    import tarfile
+    checkout = root / "compatible-sql-build"
+    checkout.mkdir()
+    archive = subprocess.run(["git", "archive", "f3bf33b1182dccabe9bf4b077d74f0d4af53492a", "src/issue_agent"],
+                             cwd=Path(__file__).resolve().parents[2], check=True, capture_output=True).stdout
+    with tarfile.open(fileobj=io.BytesIO(archive)) as files:
+        files.extractall(checkout, filter="data")
+    return checkout
+
+
+def test_configured_copied_cutover_dispatch_and_restart_keep_sql_authority(stopped, capsys, tmp_path, monkeypatch):
+    from issue_agent.domain.world import Check, Comment
+    from dataclasses import replace
+    from issue_agent.domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey
+    from tests.fakes.review_workflow import held
+    state, original, _ = stopped
+    for number in (7, 8, 9):
+        (state / f"issue-{number}.resolve-retries").write_text("0")
+    (state / "issue-7.resumes").write_text("1")
+    (state / "issue-7.resumed-at").write_text("2026-10-01T00:00:00Z")
+    (state / "issue-7.ci-retries").write_text("2")
+    (state / "issue-7.stall-sig").write_text('{"sig":"old-observation","since":"2026-10-01T00:00:00Z"}')
+    (state / "issue-8.resumes").write_text("unknown")
+    install_workflow(original, replace(held(key=WorkflowKey("o/r", PullRequestRef(90))), gates=()))
+    (state / "pr-90.ci-rerun-head").write_text("copy-head")
+    code, primary, error = resolve_command(capsys, "shadow")
+    assert code == 0, error
+    code, _, error = resolve_command(capsys, "activate", "--confirm-plan-digest", primary["plan"]["plan_digest"])
+    assert code == 0, error
+    (state / "issue-9.resolve-retries").unlink()
+    before = dump(original)
+    files = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, shadow, error = continuation_command(capsys, "fix", "shadow")
+    assert code == 0, error
+    assert {(target["family"], target["number"], target["eligible"]) for target in shadow["targets"]} == {
+        ("issue_recovery", 7, True), ("issue_recovery", 8, False), ("issue_recovery", 9, True), ("pr_repair", 90, True)}
+    copy = tmp_path / "configured-cutover"
+    code, rehearsal, error = continuation_command(capsys, "fix", "rehearse", "--copy-to", str(copy))
+    assert code == 0 and all(rehearsal["checks"].values()), error
+    copied_control = copy / "issue-agent-control" / Path(original.path).name
+    copied_state = next(path.parent for path in (copy / "state").glob("*/issue-7.resumes"))
+    remote = PersistentGitHub(copy / "github.db")
+    reply = "2026-10-02T00:00:00Z"
+    remote.seed(issue(7, "ai-blocked", updated_at=reply,
+                      comments=(Comment("human", "Use the local destination.", reply),)))
+    remote.seed(issue(8, "ai-ready"))
+    remote.seed(issue(10, "ai-ready"))
+    returned = False
+    def provider_returned():
+        nonlocal returned
+        returned = True
+    def crash_after_capture(point):
+        if returned and point == "read":
+            raise Crash("copied paid return before remote followup")
+    first = compose(copy, control_path=copied_control, state_dir=copied_state,
+                    fault=crash_after_capture, provider=Provider(provider_returned,
+                    AgentResult(False, status="blocked", needs="Which local directory?", session_id="copied-session", cost_usd=.25)))
+    try:
+        first.daemon.tick()
+    except Crash:
+        pass
+    else:
+        pytest.fail(repr((first.dispatched, first.log)))
+    assert len(first.provider.tasks) == 1
+    selected = first.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    assert (selected.component.state.consumed_reply_at, selected.component.state.resumes,
+            selected.component.state.ci_failures) == (reply, 2, 2)
+    restarted = compose(copy, control_path=copied_control, state_dir=copied_state)
+    assert len(restarted.workflow.pending_returns()) == 1
+    restarted.daemon.tick()
+    assert restarted.workflow.pending_returns() == ()
+    assert restarted.remote.get_issue(7).has(Label.AI_BLOCKED)
+    assert any("Which local directory?" in comment.body for comment in restarted.remote.get_issue(7).comments)
+    for number in (7, 8, 10):
+        (copied_state / f"issue-{number}.resumes").write_text("0")
+        (copied_state / f"issue-{number}.resumed-at").write_text("")
+    restarted.daemon.tick()
+    assert restarted.provider.tasks == []
+    assert restarted.remote.get_issue(8).has(Label.AI_READY)
+    assert restarted.remote.get_issue(10).has(Label.AI_READY)
+    remote.seed(issue(9, "ai-pr-open", updated_at=reply))
+    remote.seed_pr(pr(90, "ai-pr-open", head_ref_oid="copy-head", closing_issue=9,
+                      checks=(Check("tests", bucket="fail"),)))
+    monkeypatch.setattr(accounting_runtime, "_fix_publication_context", lambda _role, cwd:
+        accounting_runtime._FixPublicationContext(str(Path(cwd).resolve()), "fix/90-x", "/usr/bin/git", "/usr/bin/gh", "/usr/bin:/bin"))
+    blocked = compose(copy, control_path=copied_control, state_dir=copied_state,
+                      provider=Provider(result=AgentResult(False, status="blocked", needs="Publication denied",
+                      structured={"blocker": "publication"}, session_id="copied-ci-session", cost_usd=.25)))
+    blocked.daemon.tick()
+    assert len(blocked.provider.tasks) == 1
+    hold = blocked.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(9))).component.state.machine_block
+    assert hold is not None and hold.blocked_head == "copy-head"
+    assert blocked.remote.get_pr(90).has(Label.AI_BLOCKED)
+    with sqlite3.connect(copied_control) as db:
+        assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 2
+        assert db.execute("SELECT amount_micros FROM charges").fetchall() == [(250_000,), (250_000,)]
+    import json
+    import subprocess
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    checkout = _compatible_sql_build_checkout(tmp_path)
+    repository = Path(__file__).resolve().parents[2]
+    script = '''
+import json, pathlib, sys
+import issue_agent
+from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.store import Store
+from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+from issue_agent.adapters.workflow_codec import encode_workflow
+from issue_agent.app import roles
+from issue_agent.domain.actions import RunAgent
+from issue_agent.domain.fix import FixConfig, decide_fix
+from issue_agent.domain.labels import Label
+from issue_agent.domain.world import Comment, IssueView, WorldState
+from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey, WorkflowWriter
+assert pathlib.Path(issue_agent.__file__).is_relative_to(sys.argv[3])
+control = SQLiteControlStore(sys.argv[1])
+control.initialize()
+workflow = SQLiteWorkflowControl(control, WorkflowWriter("o/r", "fix", "o/r:fix"), resolve_ceiling=3)
+world = WorldState(issues=(IssueView(7, labels=frozenset({Label.AI_BLOCKED}),
+    comments=(Comment("human", "Use the local destination.", "2026-10-02T00:00:00Z"),)),
+    IssueView(8, labels=frozenset({Label.AI_READY})), IssueView(10, labels=frozenset({Label.AI_READY}))))
+actions = decide_fix(world, FixConfig(fix_bot="fix-bot"), roles._fix_state(Store(sys.argv[2]), world, workflow_control=workflow), fixer_busy=False)
+assert not any(isinstance(action, RunAgent) for action in actions)
+values = {number: control.read_issue_recovery(WorkflowKey("o/r", IssueRef(number))) for number in (7, 9)}
+print(json.dumps({str(number): encode_workflow((value.binding, value.revision, value.component)) for number, value in values.items()}))
+'''
+    later_sql = dump(blocked.control)
+    rollback = subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(repository), "python", "-c", script,
+                               str(copied_control), str(copied_state), str(checkout)], cwd=checkout,
+                              env={**os.environ, "PYTHONPATH": str(checkout / "src")},
+                              capture_output=True, text=True)
+    assert rollback.returncode == 0, rollback.stderr
+    current = {number: blocked.control.read_issue_recovery(WorkflowKey("o/r", IssueRef(number))) for number in (7, 9)}
+    assert json.loads(rollback.stdout) == {str(number): encode_workflow((value.binding, value.revision, value.component))
+                                         for number, value in current.items()}
+    assert dump(blocked.control) == later_sql
+    assert dump(original) == before
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == files
+
+
+@pytest.mark.parametrize("lane", ["TRIAGE", "GROOM"])
+def test_configured_copied_steward_dispatch_recovers_owed_verdict_without_repurchase(stopped, capsys, tmp_path, lane):
+    from issue_agent.app.planners.tasks import GroomTaskConfig
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
+    _, original, env = stopped
+    state = Path(env["STEWARD_STATE_DIR"])
+    state.mkdir(parents=True)
+    for name in ("triage-7.at", "groom-7.at"):
+        (state / name).write_text("2026-09-13T00:00:00Z")
+    (state / "groom-7.content").write_text("a" * 64)
+    (state / "issue-7.steward-stalls-triage").write_text("1")
+    (state / "issue-7.steward-stalls-groom").write_text("1")
+    (state / "issue-8.steward-stalls-groom").write_text("unknown")
+    before = dump(original)
+    files = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, shadow, error = continuation_command(capsys, "steward", "shadow")
+    assert code == 0, error
+    assert [(target["number"], target["eligible"]) for target in shadow["targets"]] == [(7, True), (8, False)]
+    copy = tmp_path / "configured-steward-cutover"
+    code, rehearsal, error = continuation_command(capsys, "steward", "rehearse", "--copy-to", str(copy))
+    assert code == 0 and all(rehearsal["checks"].values()), error
+    copied_control = copy / "issue-agent-control" / Path(original.path).name
+    copied_state = next(path.parent for path in (copy / "state").glob("*/triage-7.at"))
+    remote = PersistentGitHub(copy / "github.db")
+    remote.seed(issue(7, "ai-triage", updated_at="2026-09-14T00:00:00Z"))
+    remote.seed(issue(8, "ai-triage", updated_at="2026-09-14T00:00:00Z"))
+    remote.seed(issue(10, "ai-triage", updated_at="2026-09-14T00:00:00Z"))
+    remote.seed_pr(pr(300, state="MERGED", closing_issue=42, title="Original defect"))
+    verdict = {"verdict": "ready", "plain_summary": "clear", "acceptance_criteria": ["works"],
+               "creator_questions": [], "owner_questions": [], "blocked_by_issues": []}
+    provider = Provider(result=AgentResult(False, cost_usd=.01, structured=verdict if lane == "TRIAGE" else {"resolved_by": 42}))
+    kind = AgentKind.TRIAGE if lane == "TRIAGE" else AgentKind.GROOM
+    logs = []
+    def configured(provider, fault=lambda _: None, later=timedelta(0)):
+        control = SQLiteControlStore(str(copied_control), now=lambda: datetime.now(timezone.utc) + later)
+        control.initialize()
+        github = PersistentGitHub(copy / "github.db", fault=fault)
+        github.comment_author = "steward-bot"
+        events = EventLog(str(copy / "events.jsonl"), Producer("test", "o/r", "steward", os.getpid(), "copied-steward"))
+        control.bind_event_outbox(events.prepare, events.append_committed)
+        effects = GitHubEffectExecutor(github, control, repository="o/r", identity="o/r:steward", log=logs.append)
+        executor = Executor(github, effect_executor=effects, retry_delays=(), log=logs.append)
+        runtime = AccountingRuntime(provider, control, "o/r", "steward", None, None, None, "test", "claude",
+            BudgetPolicy({("steward", name): Money("USD", 750_000) for name in ("TRIAGE", "GROOM")}), owner_id="o/r:steward")
+        dispatcher = AgentDispatcher(DispatchConfig(repo="o/r", role="steward", deployment_owner_id="o/r:steward",
+            triage=TriageTaskConfig("steward-bot", triage_prompt="test"),
+            triage_cfg=TriageConfig("steward-bot", enabled=True, promote=True),
+            groom=GroomTaskConfig("steward-bot"), fix_bot="fix-bot", log=logs.append),
+            github, Store(str(copied_state)), Worktrees(copy), runtime, executor, dedupe=control)
+        executor._run_agent = lambda action: asyncio.run(dispatcher.dispatch(action))
+        daemon = Daemon("steward", github.build_world, lambda _: [RunAgent(kind, number) for number in (7, 8, 10)], executor, log=logs.append)
+        return daemon, control, github
+    first, control, _ = configured(provider, fail_at("comment_applied"))
+    with pytest.raises(Crash):
+        first.tick()
+    assert len(provider.tasks) == 1
+    key = WorkflowKey("o/r", IssueRef(7))
+    owed = control.read_steward(key).component.state
+    selected_lane = owed.triage if lane == "TRIAGE" else owed.groom
+    sibling = owed.groom if lane == "TRIAGE" else owed.triage
+    assert selected_lane.pending_delivery and selected_lane.baseline_at == "2026-09-13T00:00:00Z"
+    restarted_provider = Provider()
+    restarted, current, github = configured(restarted_provider, later=UNKNOWN_READ_DELAY)
+    restarted.tick()
+    restarted.tick()
+    delivered = current.read_steward(key).component.state
+    completed_lane = delivered.triage if lane == "TRIAGE" else delivered.groom
+    assert not completed_lane.pending_delivery and completed_lane.baseline_at == github.get_issue(7).updated_at, "\n".join(logs)
+    assert (delivered.groom if lane == "TRIAGE" else delivered.triage) == sibling
+    assert restarted_provider.tasks == []
+    assert github.get_issue(7).has(Label.AI_READY if lane == "TRIAGE" else Label.MAYBE_RESOLVED)
+    assert len(github.get_issue(7).comments) == 1
+    assert isinstance(current.read_steward(WorkflowKey("o/r", IssueRef(8))), cc.BlockedSteward)
+    with sqlite3.connect(copied_control) as db:
+        assert db.execute("SELECT kind FROM runs").fetchall() == [(lane,)]
+        assert db.execute("SELECT amount_micros FROM charges").fetchall() == [(10_000,)]
+    import json
+    import subprocess
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    checkout = _compatible_sql_build_checkout(tmp_path)
+    script = '''
+import json, pathlib, sys
+import issue_agent
+from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.workflow_codec import encode_workflow
+from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
+assert pathlib.Path(issue_agent.__file__).is_relative_to(sys.argv[2])
+control = SQLiteControlStore(sys.argv[1])
+control.initialize()
+selected = control.read_steward(WorkflowKey("o/r", IssueRef(7)))
+print(json.dumps(encode_workflow((selected.binding, selected.revision, selected.component))))
+'''
+    later_sql = dump(current)
+    rollback = subprocess.run(["uv", "run", "--offline", "--no-sync", "--project", str(Path(__file__).resolve().parents[2]),
+                               "python", "-c", script, str(copied_control), str(checkout)], cwd=checkout,
+                              env={**os.environ, "PYTHONPATH": str(checkout / "src")}, capture_output=True, text=True)
+    assert rollback.returncode == 0, rollback.stderr
+    selected = current.read_steward(key)
+    assert json.loads(rollback.stdout) == encode_workflow((selected.binding, selected.revision, selected.component))
+    assert dump(current) == later_sql
+    assert dump(original) == before
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 
 
 @pytest.mark.parametrize("adopted_owner", [False, True])

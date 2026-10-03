@@ -118,6 +118,37 @@ def test_ci_shadow_and_copied_activation_preserve_debt_and_unknown_hold(stopped,
     assert {path.name: path.read_bytes() for path in state.iterdir()} == original_files
 
 
+@pytest.mark.parametrize("advisory", ["ordinary", "malformed"])
+def test_copied_cutover_keeps_advisory_context_without_importing_authority(stopped, capsys, tmp_path, advisory):
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    state, control, _ = stopped
+    (state / "issue-7.ci-retries").write_text("2")
+    (state / "issue-8.ci-retries").write_text("unknown")
+    history = '[{"head":"head-1","failed_checks":["tests"]}]' if advisory == "ordinary" else "not-json"
+    marker = '{"sig":"observed-state","since":"2026-10-01T00:00:00Z"}' if advisory == "ordinary" else "[]"
+    for number in (7, 8):
+        (state / f"issue-{number}.ci-history").write_text(history)
+        (state / f"issue-{number}.stall-sig").write_text(marker)
+    before = dump(control)
+    originals = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, report, error = command(capsys, "fix", "shadow")
+    assert code == 0, error
+    assert [(target["number"], target["eligible"]) for target in report["targets"]] == [(7, True), (8, False)]
+    copy = tmp_path / "advisory-copy"
+    code, result, error = command(capsys, "fix", "rehearse", "--copy-to", str(copy))
+    assert code == 0 and all(result["checks"].values()), error
+    copied = SQLiteControlStore(str(copy / "issue-agent-control" / Path(control.path).name))
+    selected = copied.read_issue_recovery(WorkflowKey("o/r", IssueRef(7)))
+    blocked = copied.read_issue_recovery(WorkflowKey("o/r", IssueRef(8)))
+    assert selected.component.state.ci_failures == 2
+    assert selected.component.state.self_clears == selected.component.state.resumes == 0
+    assert isinstance(blocked, cc.BlockedIssueRecovery)
+    copied_state = next(path.parent for path in (copy / "state").glob("*/issue-7.ci-history"))
+    assert {path.name: path.read_bytes() for path in copied_state.iterdir()} == originals
+    assert dump(control) == before
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == originals
+
+
 @pytest.mark.parametrize("numbers", [(9,), (9, 10), ()])
 def test_review_shadow_retains_episode_and_requires_unique_current_linkage(stopped, capsys, tmp_path, monkeypatch, numbers):
     from issue_agent.domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState

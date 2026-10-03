@@ -89,6 +89,10 @@ class PersistentGitHub:
         with self._connect() as db:
             db.execute("INSERT INTO prs VALUES (?, ?)", (pr.number, json.dumps(body)))
 
+    def issue_for_pr(self, number: int) -> int | None:
+        from issue_agent.domain.world import issue_for_pr
+        return issue_for_pr(self.get_pr(number))
+
     def get_pr(self, number: int, *, mergeability: bool = True, checks: bool = True) -> PRView:
         self.fault("read")
         if not checks:

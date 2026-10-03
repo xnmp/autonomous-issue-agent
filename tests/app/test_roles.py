@@ -28,6 +28,7 @@ exact result.
 
 from __future__ import annotations
 
+
 from tests.fakes.accounted_workflow import review_retry_pair, seed_review_retry, seed_infra_outcome
 from issue_agent.domain import continuation_components as cc
 
@@ -136,6 +137,21 @@ from issue_agent.domain.world import (
     REVIEW_CHANGES_REQUESTED,
     WorldState,
 )
+
+
+@pytest.mark.parametrize("raw", ["[]", "null", "1", '{"sig": [], "since": {}}'])
+def test_malformed_stall_advisory_does_not_stop_observation(tmp_path, raw):
+    from pathlib import Path
+    from issue_agent.app.roles import _stall_reporter
+    from tests.domain.builders import issue, world
+    store = Store(str(tmp_path))
+    Path(store.issue_path(7, "stall-sig")).write_text(raw)
+    observed = world(issues=[issue(7, "ai-ready")], now="2026-10-01T00:00:00Z")
+    _stall_reporter(None, store, lambda _: None)(observed)
+    sig, since = store.get_stall_marker("issue", 7)
+    assert isinstance(sig, str) and sig
+    assert since == observed.now
+    assert observed.issues[0].labels == frozenset({Label.AI_READY})
 
 
 def test_runtime_wiring_registries_cover_every_supported_runtime():
