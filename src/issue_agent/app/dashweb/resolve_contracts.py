@@ -241,7 +241,40 @@ class Observation(ClosedContract):
     last_error: str
 
 
+class IssueRecoveryAvailable(ClosedContract):
+    status: Literal["available"]
+    family: Literal["issue_recovery"]
+    generation: Counter
+    version: Counter
+    resumes: Counter
+    ci_failures: Counter
+    review_failures: Counter
+    rebase_failures: Counter
+    infra_failures: Counter
+    self_clears: Counter
+    holds: list[Literal["machine", "budget", "workflow"]]
+
+
+class PRRepairAvailable(ClosedContract):
+    status: Literal["available"]
+    family: Literal["pr_repair"]
+    generation: Counter
+    version: Counter
+    resumes: Counter
+    workflow_held: bool
+    pending_effects: list[Literal["ci_rerun", "ci_cancel", "branch_refresh", "pending_ci_escalation"]]
+
+
+class RecoveryUnavailable(ClosedContract):
+    status: Literal["inactive", "migration_required", "unavailable"]
+    reason: str
+
+
+RecoveryControl = IssueRecoveryAvailable | PRRepairAvailable | RecoveryUnavailable
+
+
 class AvailableControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     status: Literal["available"]
     expected: ResolveExpected
     workflow_held: bool = Field(description="SQLite workflow holds only, not a remote readiness assertion; submission rechecks external holds.")
@@ -255,12 +288,14 @@ class AvailableControl(ClosedContract):
 
 
 class InactiveControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     status: Literal["inactive"]
     repository: str
     issue: int
 
 
 class AbsentControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     status: Literal["absent"]
     repository: str
     issue: int
@@ -268,6 +303,7 @@ class AbsentControl(ClosedContract):
 
 
 class UnavailableControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     status: Literal["unavailable"]
     reason: str
 

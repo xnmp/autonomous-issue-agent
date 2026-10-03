@@ -32,7 +32,8 @@ from ...domain.review_workflow_policy import (
 )
 from ...domain.workflow_identity import PullRequestRef, WorkflowKey
 from . import review_contracts as wire
-from .resolve_control import control_error
+from .resolve_control import control_error, recovery_control
+from .resolve_contracts import RecoveryUnavailable
 
 
 def _rearm(intent: ReviewRearmIntent | None, view: ReviewControlView) -> wire.ReviewRearm | None:
@@ -271,20 +272,25 @@ def read_review_control(
     control: SQLiteReviewWorkflowControl, pr: int, request_id: str | None = None,
 ) -> wire.ReviewControl:
     key = WorkflowKey(control.writer.repository, PullRequestRef(pr))
+    try:
+        recovery = recovery_control(control._control.read_pr_repair(key))
+    except Exception as error:
+        recovery = RecoveryUnavailable(status="unavailable", reason=control_error(error))
     result = control.review_control_view(key, request_id=request_id)
     if isinstance(result, w.WorkflowUnavailable):
-        return wire.ReviewUnavailableControl(status="unavailable", reason=result.reason)
+        return wire.ReviewUnavailableControl(status="unavailable", reason=result.reason, fix_recovery=recovery)
     if isinstance(result, MigrationRequiredReviewControl):
         return wire.ReviewMigrationRequiredControl(
             status="migration_required", repository=key.repository, pull_request=pr,
-            active_families=[family.value for family in result.active_families])
+            active_families=[family.value for family in result.active_families], fix_recovery=recovery)
     if isinstance(result, AbsentReviewControl):
         return wire.ReviewAbsentControl(status="absent", repository=key.repository, pull_request=pr,
-                                        epoch=result.authority.epoch)
+                                        epoch=result.authority.epoch, fix_recovery=recovery)
     assert isinstance(result, ReviewControlView)
     state = result.snapshot
     observation = result.observation
     return wire.ReviewAvailableControl(
+        fix_recovery=recovery,
         execution=_execution(result),
         status="available",
         expected=wire.ReviewExpected(

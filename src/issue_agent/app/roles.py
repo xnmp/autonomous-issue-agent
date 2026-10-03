@@ -1951,6 +1951,7 @@ def _fix_state(
     ci_remediation_errors = {}
     update_branch_head = {}
     pending_ci_escalations = set()
+    cleanup_sources = {}
     for pr in world.prs:
         try:
             if workflow_control is None:
@@ -1958,6 +1959,8 @@ def _fix_state(
             selected = workflow_control.read_pr_repair(WorkflowKey(workflow_control.writer.repository, PullRequestRef(pr.number)))
             if not isinstance(selected, cc.SelectedPRRepair):
                 raise ValueError("CI remediation PR repair authority is inactive or migration blocked")
+            if pr.state in {"CLOSED", "MERGED"}:
+                cleanup_sources[pr.number] = cc.PRRepairCleanup(selected.binding, selected.revision, pr.head_ref_oid, pr.state == "MERGED")
             rerun, cancel = selected.component.state.ci_rerun, selected.component.state.ci_cancel
             ci_remediations[pr.number] = (rerun, cancel)
             def head_marker(item):
@@ -2029,6 +2032,7 @@ def _fix_state(
         ci_remediations=ci_remediations, ci_remediation_errors=ci_remediation_errors,
         update_branch_head=update_branch_head,
         ci_pending_escalated=ci_pending_escalated,
+        cleanup_sources=cleanup_sources,
         inflight=inflight,
         test_exemptions=dict(test_exemptions or {}),
         machine_blocks=machine_blocks,
@@ -2705,10 +2709,21 @@ def compose_fix_daemon(
         resolve_ceiling=cfg.max_resolve_retries,
         max_contract_rounds=fix_runtime.max_contract_rounds,
     )
-    def cleanup_fix_state(pr, issue, merged):
-        if pr is not None:
-            workflow_control.cleanup_pr_repair(WorkflowKey(cfg.repo, PullRequestRef(pr)), merged)
-        store.cleanup_pr(pr, issue, merged)
+    def validate_cleanup_fix_state(action):
+        if action.pr is not None:
+            if action.source is None:
+                raise ValueError("PR cleanup requires selected SQL recovery provenance")
+            current = gateway.get_pr(action.pr)
+            if (current.state != ("MERGED" if action.merged else "CLOSED")
+                    or current.head_ref_oid != action.source.head):
+                raise ValueError("PR cleanup terminal/head observation changed")
+            workflow_control.validate_pr_repair_cleanup(WorkflowKey(cfg.repo, PullRequestRef(action.pr)), action.merged, action.source)
+
+    def cleanup_fix_state(action):
+        validate_cleanup_fix_state(action)
+        if action.pr is not None:
+            workflow_control.cleanup_pr_repair(WorkflowKey(cfg.repo, PullRequestRef(action.pr)), action.merged, action.source)
+        store.cleanup_pr(action.pr, action.issue, action.merged)
 
     def reset_ci_episode(action: ResetCiRetries) -> None:
         source = action.source
@@ -2738,6 +2753,7 @@ def compose_fix_daemon(
         gateway, remove_worktree=worktrees.remove, log=log,
         mark_automerge=store.mark_automerge,
         clear_issue_state=cleanup_fix_state,
+        validate_cleanup=validate_cleanup_fix_state,
         reset_ci_retries=reset_ci_episode,
         mark_self_clear_ceiling=control.mark_self_clear_ceiling,
         discard_machine_block=discard_machine,

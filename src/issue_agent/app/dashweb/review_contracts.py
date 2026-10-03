@@ -15,7 +15,7 @@ from ...domain.workflow_identity import (
     FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
     canonical_workflow_repository,
 )
-from .resolve_contracts import ClearGuidance, ClosedContract, Counter, Guidance, Identifier, Positive, SetGuidance
+from .resolve_contracts import ClearGuidance, ClosedContract, Counter, RecoveryControl, Guidance, Identifier, Positive, SetGuidance
 
 
 class ReviewExpected(ClosedContract):
@@ -564,6 +564,7 @@ ReviewExecution = Annotated[
 
 
 class ReviewAvailableControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     execution: ReviewExecution = Field(default_factory=ReviewExecutionInactive)
     status: Literal["available"]
     expected: ReviewExpected
@@ -579,6 +580,7 @@ class ReviewAvailableControl(ClosedContract):
 
 
 class ReviewMigrationRequiredControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     """Review dispatch and operator re-arm require explicit family activation."""
     status: Literal["migration_required"]
     repository: str
@@ -587,6 +589,7 @@ class ReviewMigrationRequiredControl(ClosedContract):
 
 
 class ReviewAbsentControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     status: Literal["absent"]
     repository: str
     pull_request: int
@@ -594,6 +597,7 @@ class ReviewAbsentControl(ClosedContract):
 
 
 class ReviewUnavailableControl(ClosedContract):
+    fix_recovery: RecoveryControl | None = None
     status: Literal["unavailable"]
     reason: str
 

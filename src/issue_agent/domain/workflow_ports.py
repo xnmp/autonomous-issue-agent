@@ -4,7 +4,7 @@ from typing import Protocol, runtime_checkable
 from contextlib import AbstractContextManager
 
 from .contracts import CommandId, LifecycleCommand, WorkflowAttemptIdentity
-from .continuation_components import CIEpisodeReset, RebaseAllowanceReset, IssueRecoverySelection, PRRepairSelection, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
+from .continuation_components import CIEpisodeReset, RebaseAllowanceReset, IssueRecoverySelection, PRRepairSelection, PRRepairCleanup, RepairHandoff, StewardSelection, StewardAttemptSource, StewardReturned
 from .world import IssueView
 from .agent_task import RuntimeName
 from .resolve_return import PendingResolveReturn, ReturnedResolve, ResolveCleanupCompleted, UnavailableResolveReturn
@@ -59,7 +59,7 @@ class WorkflowControl(Protocol):
 
     def pr_repair_handoff(self, issue: int, pr: PullRequestRef, branch: str, runtime: RuntimeName) -> RepairHandoff | None: ...
 
-    def cleanup_pr_repair(self, key: WorkflowKey, merged: bool) -> None: ...
+    def cleanup_pr_repair(self, key: WorkflowKey, merged: bool, source: PRRepairCleanup) -> None: ...
 
     def consume_blank_issue_reply(self, binding: WorkflowBinding, reply_at: str, body: str) -> bool: ...
 

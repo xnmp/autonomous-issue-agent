@@ -227,6 +227,7 @@ class FixState:
     # the label-based one-shot used by older breakers, this survives an
     # operator deliberately restoring ai-pr-open while the same check runs.
     ci_pending_escalated: frozenset[tuple[int, str]] = frozenset()
+    cleanup_sources: Mapping[int, cc.PRRepairCleanup] = field(default_factory=dict)
     machine_blocks: dict[int, MachineBlock] = field(default_factory=dict)
     machine_revisions: dict[int, cc.WorkflowRevision] = field(default_factory=dict)
     machine_control_errors: Mapping[int, str] = field(default_factory=dict)
@@ -966,19 +967,16 @@ def cleanup_actions(
     issue_observed_pr_open: bool = True,
     issue_observed_closed: bool = False,
     issue_observed_reopened: bool = False,
+    source: cc.PRRepairCleanup | None = None,
 ) -> list[Action]:
     """Merged/closed PR cleanup. Port of cleanup.sh. MERGED → issue ai-pr-open→
     ai-done (+ optional close, since GitHub only auto-closes on default-branch
     merges); CLOSED-unmerged → issue ai-pr-open→ai-ready (re-queue). Always drop
     ai-pr-open from the PR and remove the worktree.
 
-    Also emits `ClearIssueState` (review M4/D8): `clear_issue`/`clear_pr_review`
-    had zero production call sites, so a closed-unmerged requeue left
-    issue-N.session/.phase alive and the next lifecycle resumed a dead PR's
-    session with a preloaded breaker. MERGED clears everything (incl.
-    infra-deaths + the pr-N.automerge marker); CLOSED-unmerged only clears the
-    resume-blocking markers, keeping resolve-retries/infra-deaths (handover
-    §5.7's deliberate conservatism — fewer retries after a human closed the PR).
+    The executor preflights this contiguous fixed recipe before any effects.
+    ClearIssueState retires selected SQL continuity only after settled work;
+    closed-unmerged retirement preserves debt. Historical files remain evidence.
 
     `issue_observed_pr_open` gates the whole ISSUE-side arm — RemoveWorktree,
     the issue Relabel, CloseIssue, and the issue half of ClearIssueState
@@ -1042,7 +1040,7 @@ def cleanup_actions(
                 Relabel(Target.ISSUE, issue_number, Label.AI_PR_OPEN, Label.AI_READY)
             )
     actions.append(Relabel(Target.PR, pr.number, Label.AI_PR_OPEN, None))
-    actions.append(ClearIssueState(pr.number, issue_number if issue_arm else None, merged))
+    actions.append(ClearIssueState(pr.number, issue_number if issue_arm else None, merged, source))
     return actions
 
 
@@ -2237,6 +2235,7 @@ def decide_fix(
                 actions.append(ResetCiRetries(issue_n, state.ci_resets.get(pr.number)))
             actions.extend(cleanup_actions(
                 pr, issue_n, cfg,
+                source=state.cleanup_sources.get(pr.number),
                 issue_observed_pr_open=_issue_carries_ai_pr_open(issue_world, issue_n),
                 issue_observed_closed=observed is not None and observed.state != "open",
                 issue_observed_reopened=(

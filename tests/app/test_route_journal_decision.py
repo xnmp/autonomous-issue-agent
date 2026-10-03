@@ -39,7 +39,7 @@ def test_route_event_records_the_decision_not_the_probe_model(tmp_path):
         Executor(
             gateway,
             remove_worktree=worktrees.remove,
-            clear_issue_state=getattr(store, "cleanup_pr", None),
+            clear_issue_state=(lambda action: store.cleanup_pr(action.pr, action.issue, action.merged)) if hasattr(store, "cleanup_pr") else None,
         ),
         workflow_control=attach_workflow_authority(gateway, store),
     )

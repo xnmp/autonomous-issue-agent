@@ -891,6 +891,25 @@ def test_authorized_successor_receipts_original_pr_recovery_without_remote_repea
     assert gateway.calls == before
 
 
+@pytest.mark.parametrize("refresh", [False, True])
+def test_terminal_pr_cleanup_cannot_drop_unsettled_remediation_evidence(tmp_path, refresh):
+    from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef, WorkflowWriter
+    executor, _, store = _executor(tmp_path, ci=True)
+    action = UpdateBranch(7, "head-1", "base-1") if refresh else RerunFailedChecks(7, "head-1", (42,))
+    store.enqueue_command(executor._command(action))
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    before = store.read_pr_repair(key)
+    authority = SQLiteWorkflowControl(store, WorkflowWriter("o/r", "fix", "o/r:fix"), resolve_ceiling=3)
+    from issue_agent.domain import continuation_components as cc
+    source = cc.PRRepairCleanup(before.binding, before.revision, "head-1", True)
+    with pytest.raises(WorkflowAuthorityError, match="unsettled"):
+        authority.cleanup_pr_repair(key, True, source)
+    assert store.read_pr_repair(key) == before
+    assert len(store.pending_commands()) == 1
+
+
 def test_ambiguous_branch_update_uses_original_revision_to_reconcile(
     tmp_path,
 ) -> None:

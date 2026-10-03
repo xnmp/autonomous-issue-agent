@@ -112,9 +112,9 @@ def test_an_operator_retry_unblock_also_forgets_the_attempt_history():
     _seed_legacy_ci_counter(s, 5, 3)
     s.append_ci_attempt(5, CiAttempt("abc", ("unit",)))
 
-    assert s.clear_retries(5) == 1  # counters retired — history is not one
+    assert not hasattr(s, "clear_retries")
 
-    assert s.get_ci_history(5) == ()
+    assert s.get_ci_history(5) == (CiAttempt("abc", ("unit",)),)
 
 
 def test_advisory_ci_history_clear_does_not_mutate_retained_legacy_counter():
@@ -247,17 +247,17 @@ def test_clear_retries_hands_back_only_the_per_attempt_budgets():
     Path(s.issue_path(5, "rebase-retries")).write_text("1")
     s.set_infra_deaths(5, 5)
 
-    assert s.clear_retries(5) == 3  # reports what it actually retired
+    assert not hasattr(s, "clear_retries")
 
-    assert _legacy_ci_counter(s, 5) == 0
-    assert not Path(s.issue_path(5, "review-retries")).exists()
-    assert not Path(s.issue_path(5, "rebase-retries")).exists()
+    assert _legacy_ci_counter(s, 5) == 3
+    assert Path(s.issue_path(5, "review-retries")).read_text() == "2026-01-01T00:00:00Z 2"
+    assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
     assert s.get_infra_deaths(5) == 5
 
 
 def test_clear_retries_on_an_untouched_key_is_a_no_op_not_an_error():
     s, _ = _store()
-    assert s.clear_retries(-112) == 0  # the negated-PR breaker key namespace
+    assert not hasattr(s, "clear_retries")
     assert _legacy_ci_counter(s, -112) == 0
 
 
@@ -289,7 +289,7 @@ def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
     marker.parent.mkdir(parents=True, exist_ok=True)
     marker.write_text("sha-1")
     s.cleanup_pr(100, 9, merged=True)
-    assert not marker.exists()
+    assert marker.read_text() == "sha-1"
 
 
 def test_stopped_legacy_triage_baseline_remains_readable():
@@ -305,7 +305,7 @@ def test_stopped_groom_sources_survive_issue_cleanup():
                 s.issue_path(7, "steward-stalls-groom"): "3"}
     for path, value in evidence.items():
         Path(path).write_text(value)
-    s.clear_issue(7)
+    s._clear_issue_advisory(7)
     assert {path: Path(path).read_text() for path in evidence} == evidence
 
 
@@ -325,7 +325,7 @@ def test_jira_key_and_phase_roundtrip_and_cleared():
     assert s.get_jira_phase(5) == "in_progress"
     s.set_jira_key(5, "")                 # empty key is a no-op (don't clobber)
     assert s.get_jira_key(5) == "ABC-12"
-    s.clear_issue(5)
+    s._clear_issue_advisory(5)
     assert s.get_jira_key(5) == "" and s.get_jira_phase(5) == ""
 
 
@@ -337,12 +337,12 @@ def test_clear_issue_removes_all():
     s.set_resumed_at(5, "t")
     s.set_phase(5, "authored")
     s.bump_infra_deaths(5)
-    s.clear_issue(5)
-    assert not s.has_session(5)
-    assert _legacy_ci_counter(s, 5) == 0
-    assert not Path(s.issue_path(5, "rebase-retries")).exists()
-    assert s.get_phase(5) == ""           # phase cleared on teardown
-    assert s.get_infra_deaths(5) == 0     # review M4/D8: infra-deaths clears too
+    s._clear_issue_advisory(5)
+    assert s.has_session(5)
+    assert _legacy_ci_counter(s, 5) == 2
+    assert Path(s.issue_path(5, "rebase-retries")).read_text() == "1"
+    assert s.get_phase(5) == "authored"           # phase cleared on teardown
+    assert s.get_infra_deaths(5) == 1     # review M4/D8: infra-deaths clears too
 
 
 def test_set_infra_deaths_writes_the_tally_the_reader_sees():
@@ -362,7 +362,7 @@ def test_clear_issue_does_not_touch_pr_automerge_marker():
     # anything, so removing it was a no-op masquerading as cleanup).
     s, _ = _store()
     s.mark_automerge(100)
-    s.clear_issue(9)
+    s._clear_issue_advisory(9)
     assert s.automerge_enabled(100) is True
 
 
@@ -375,10 +375,10 @@ def test_cleaners_retain_retired_resolve_files_as_import_evidence():
     for path, content in ((retries, "3"), (last_error, "tests failed")):
         with open(path, "w", encoding="utf-8") as stream:
             stream.write(content)
-    s.clear_retries(5)
+    assert not hasattr(s, "clear_retries")
     s.cleanup_pr(100, 5, merged=False)
     s.cleanup_pr(100, 5, merged=True)
-    s.clear_issue(5)
+    s._clear_issue_advisory(5)
     with open(retries, encoding="utf-8") as stream:
         assert stream.read() == "3"
     with open(last_error, encoding="utf-8") as stream:
@@ -431,8 +431,8 @@ def test_cleanup_pr_merged_clears_full_issue_state_and_automerge_marker():
     s.bump_infra_deaths(9)
     s.mark_automerge(100)
     s.cleanup_pr(100, 9, merged=True)
-    assert s.get_session(9) == ""
-    assert s.get_infra_deaths(9) == 0
+    assert s.get_session(9) == "sess-1"
+    assert s.get_infra_deaths(9) == 1
     assert s.automerge_enabled(100) is False
 
 
@@ -442,13 +442,13 @@ def test_cleanup_pr_closed_unmerged_keeps_infra_deaths():
     s, _ = _store()
     s.save_session(9, "sess-1")
     s.set_phase(9, "authoring")
-    s.set_resumed_at(9, "t1")
+    s.set_resumed_at(9, "2026-09-01T00:00:00Z")
     s.bump_infra_deaths(9)
     s.mark_automerge(100)
     s.cleanup_pr(100, 9, merged=False)
-    assert s.get_session(9) == ""
-    assert s.get_phase(9) == ""
-    assert s.get_resumed_at(9) == ""
+    assert s.get_session(9) == "sess-1"
+    assert s.get_phase(9) == "authoring"
+    assert s.get_resumed_at(9) == "2026-09-01T00:00:00Z"
     # anti-vacuity twin: prove these are KEPT, not "everything got cleared"
     assert s.get_infra_deaths(9) == 1
     # closed-unmerged is silent on PR-side state (spec covers issue state only)
@@ -485,7 +485,7 @@ def test_cleanup_pr_issueless_merged_clears_the_negated_key_issue_state():
     s.bump_infra_deaths(-100)          # the negated-PR breaker key
     s.cleanup_pr(100, None, merged=True)
     assert s.automerge_enabled(100) is False       # PR-side still clears (regression guard)
-    assert s.get_infra_deaths(-100) == 0           # NEW: the negated-key namespace clears too
+    assert s.get_infra_deaths(-100) == 1           # retained legacy debt is evidence, not a runtime reset
 
 
 def test_cleanup_pr_issueless_unmerged_keeps_negated_key_infra_deaths():
@@ -529,12 +529,16 @@ def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used |= {("pr_path", s) for s in ("resumed-at", "ci-rerun-head", "ci-cancel-head", "update-branch-head", "ci-pending-escalated-head")}
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
 
-    cleared = {("issue_path", s) for s in store_module._ISSUE_SUFFIXES}
-    cleared |= {("pr_path", s) for s in store_module._PR_SUFFIXES}
+    cleared = {("issue_path", s) for s in store_module._ISSUE_ADVISORY_SUFFIXES}
+    cleared |= {("pr_path", s) for s in store_module._PR_ADVISORY_SUFFIXES}
     if _triage_at_has_a_cleaner():
         cleared.add(("triage_at_path", None))
+    retained = {("issue_path", suffix) for suffix in set(store_module._ISSUE_SUFFIXES) - set(store_module._ISSUE_ADVISORY_SUFFIXES)}
+    retained |= {("pr_path", suffix) for suffix in set(store_module._PR_SUFFIXES) - set(store_module._PR_ADVISORY_SUFFIXES)}
+    retained.add(("triage_at_path", None))
 
-    assert used == cleared
+    assert not cleared & retained
+    assert used == cleared | retained
 
 
 def test_namespace_coverage_check_is_not_vacuously_true():

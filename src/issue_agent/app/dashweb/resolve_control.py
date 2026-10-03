@@ -3,6 +3,7 @@
 import os
 
 from ...domain import workflow as w
+from ...domain import continuation_components as cc
 from ...domain.resolve_rearm import AbsentResolveControl, InactiveResolveControl, PendingRetry, ResolveControlView
 from ...domain.workflow_identity import IssueRef, WorkflowKey
 from ..workflows.resolve_rearm import ResolveRearmWorkflow
@@ -94,19 +95,46 @@ def unavailable_command(error: BaseException) -> wire.CommandResult:
                               control=wire.UnavailableControl(status="unavailable", reason="control read unavailable"))
 
 
+def recovery_control(selection: cc.IssueRecoverySelection | cc.PRRepairSelection) -> wire.RecoveryControl:
+    if isinstance(selection, (cc.InactiveIssueRecovery, cc.InactivePRRepair)):
+        return wire.RecoveryUnavailable(status="inactive", reason="Fix recovery authority is inactive.")
+    if isinstance(selection, (cc.BlockedIssueRecovery, cc.BlockedPRRepair)):
+        return wire.RecoveryUnavailable(status="migration_required", reason="Fix recovery import requires an operator decision.")
+    component = selection.component
+    state = component.state
+    if isinstance(state, cc.IssueRecoveryState):
+        return wire.IssueRecoveryAvailable(
+            status="available", family="issue_recovery", generation=selection.revision.fence.generation,
+            version=selection.revision.version, resumes=state.resumes, ci_failures=state.ci_failures,
+            review_failures=state.review_failures.count, rebase_failures=state.rebase_failures,
+            infra_failures=state.infra_failures, self_clears=state.self_clears,
+            holds=(["machine"] if state.machine_block else []) + (["budget"] if state.budget_block else [])
+                  + (["workflow"] if component.gates else []))
+    return wire.PRRepairAvailable(
+        status="available", family="pr_repair", generation=selection.revision.fence.generation,
+        version=selection.revision.version, resumes=state.resumes, workflow_held=bool(component.gates),
+        pending_effects=[name for name in ("ci_rerun", "ci_cancel", "branch_refresh", "pending_ci_escalation")
+                        if isinstance(getattr(state, name), (cc.OwedCIRemediation, cc.OwedPRRecoveryEffect))])
+
+
 def read_control(workflow: ResolveRearmWorkflow, number: int, request_id: str | None = None) -> wire.ResolveControl:
     key = WorkflowKey(workflow.control.writer.repository, IssueRef(number))
+    try:
+        recovery = recovery_control(workflow.control.read_issue_recovery(key))
+    except Exception as error:
+        recovery = wire.RecoveryUnavailable(status="unavailable", reason=control_error(error))
     result = workflow.control.resolve_control_view(key, request_id=request_id)
     if isinstance(result, w.WorkflowUnavailable):
-        return wire.UnavailableControl(status="unavailable", reason=result.reason)
+        return wire.UnavailableControl(status="unavailable", reason=result.reason, fix_recovery=recovery)
     if isinstance(result, InactiveResolveControl):
-        return wire.InactiveControl(status="inactive", repository=key.repository, issue=number)
+        return wire.InactiveControl(status="inactive", repository=key.repository, issue=number, fix_recovery=recovery)
     if isinstance(result, AbsentResolveControl):
-        return wire.AbsentControl(status="absent", repository=key.repository, issue=number, epoch=result.authority.epoch)
+        return wire.AbsentControl(status="absent", repository=key.repository, issue=number, epoch=result.authority.epoch, fix_recovery=recovery)
     assert isinstance(result, ResolveControlView)
     state = result.snapshot
     observation = result.observation
     return wire.AvailableControl(
+        fix_recovery=recovery,
         status="available",
         expected=wire.ResolveExpected(repository=key.repository, issue=number, family="resolve", epoch=state.authority.epoch,
                                       generation=state.revision.fence.generation, version=state.revision.version,

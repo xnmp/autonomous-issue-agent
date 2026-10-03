@@ -352,6 +352,8 @@ export interface components {
         AbsentControl: {
             /** Epoch */
             epoch: number;
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Issue */
             issue: number;
             /** Repository */
@@ -424,6 +426,8 @@ export interface components {
             expected: components["schemas"]["ResolveExpected"];
             /** Failures */
             failures: number;
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Gates */
             gates: components["schemas"]["Gate"][];
             /** Guidance */
@@ -697,6 +701,8 @@ export interface components {
         };
         /** InactiveControl */
         InactiveControl: {
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Issue */
             issue: number;
             /** Repository */
@@ -870,6 +876,39 @@ export interface components {
             working_s: number | null;
         } & {
             [key: string]: unknown;
+        };
+        /** IssueRecoveryAvailable */
+        IssueRecoveryAvailable: {
+            /** Ci Failures */
+            ci_failures: number;
+            /**
+             * Family
+             * @constant
+             * @enum {string}
+             */
+            family: "issue_recovery";
+            /** Generation */
+            generation: number;
+            /** Holds */
+            holds: ("machine" | "budget" | "workflow")[];
+            /** Infra Failures */
+            infra_failures: number;
+            /** Rebase Failures */
+            rebase_failures: number;
+            /** Resumes */
+            resumes: number;
+            /** Review Failures */
+            review_failures: number;
+            /** Self Clears */
+            self_clears: number;
+            /**
+             * Status
+             * @constant
+             * @enum {string}
+             */
+            status: "available";
+            /** Version */
+            version: number;
         };
         /** IssueStep */
         IssueStep: {
@@ -1114,6 +1153,31 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** PRRepairAvailable */
+        PRRepairAvailable: {
+            /**
+             * Family
+             * @constant
+             * @enum {string}
+             */
+            family: "pr_repair";
+            /** Generation */
+            generation: number;
+            /** Pending Effects */
+            pending_effects: ("ci_rerun" | "ci_cancel" | "branch_refresh" | "pending_ci_escalation")[];
+            /** Resumes */
+            resumes: number;
+            /**
+             * Status
+             * @constant
+             * @enum {string}
+             */
+            status: "available";
+            /** Version */
+            version: number;
+            /** Workflow Held */
+            workflow_held: boolean;
+        };
         /** PendingCard */
         PendingCard: {
             /** Body */
@@ -1213,6 +1277,16 @@ export interface components {
             reason: string;
             /** Stopped Request Id */
             stopped_request_id: string;
+        };
+        /** RecoveryUnavailable */
+        RecoveryUnavailable: {
+            /** Reason */
+            reason: string;
+            /**
+             * Status
+             * @enum {string}
+             */
+            status: "inactive" | "migration_required" | "unavailable";
         };
         /** RemoteUncertain */
         RemoteUncertain: {
@@ -1332,6 +1406,8 @@ export interface components {
         ReviewAbsentControl: {
             /** Epoch */
             epoch: number;
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Pull Request */
             pull_request: number;
             /** Repository */
@@ -1420,6 +1496,8 @@ export interface components {
             /** Execution */
             execution?: components["schemas"]["ReviewExecutionInactive"] | components["schemas"]["ReviewExecutionBlocked"] | components["schemas"]["ReviewExecutionCurrent"];
             expected: components["schemas"]["ReviewExpected"];
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Gates */
             gates: components["schemas"]["ReviewGate"][];
             /** Guidance */
@@ -1941,13 +2019,12 @@ export interface components {
             /** Sources */
             sources: components["schemas"]["ReviewMigrationSource"][];
         };
-        /**
-         * ReviewMigrationRequiredControl
-         * @description Review dispatch and operator re-arm require explicit family activation.
-         */
+        /** ReviewMigrationRequiredControl */
         ReviewMigrationRequiredControl: {
             /** Active Families */
             active_families: string[];
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Pull Request */
             pull_request: number;
             /** Repository */
@@ -2244,6 +2321,8 @@ export interface components {
         };
         /** ReviewUnavailableControl */
         ReviewUnavailableControl: {
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Reason */
             reason: string;
             /**
@@ -2358,6 +2437,8 @@ export interface components {
         };
         /** UnavailableControl */
         UnavailableControl: {
+            /** Fix Recovery */
+            fix_recovery?: components["schemas"]["IssueRecoveryAvailable"] | components["schemas"]["PRRepairAvailable"] | components["schemas"]["RecoveryUnavailable"] | null;
             /** Reason */
             reason: string;
             /**

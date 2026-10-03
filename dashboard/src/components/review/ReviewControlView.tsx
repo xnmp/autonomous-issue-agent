@@ -7,6 +7,7 @@ import { ReviewCommandForm } from "./ReviewCommandForm";
 import type { ReviewControlViewProps } from "./view-contract";
 import "../resolve/resolve-control.css";
 import "./review-control.css";
+import { FixRecoveryView } from "../resolve/FixRecoveryView";
 
 const STOP_REASONS: Record<string, string> = {
   target_terminal: "the pull request was closed or merged",
@@ -240,6 +241,7 @@ export function ReviewControlView(props: ReviewControlViewProps) {
           <span className="resolve-status-note"><Daemon daemon={control.daemon} /> Acceptance re-reads GitHub.</span>
         </p>}
       </div>
+      {control && <FixRecoveryView recovery={control.fix_recovery} />}
       {control?.status === "available" && <>
         {control.execution?.kind === "current" && <section aria-label="Review execution state">
           <h3>Review execution</h3>

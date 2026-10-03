@@ -22,6 +22,7 @@ import time
 from ..adapters.github import GhUnavailable
 from ..adapters.journal import alert
 from ..domain.actions import (
+    LifecycleOperation,
     Action,
     AddDependency,
     ClearIssueState,
@@ -343,7 +344,8 @@ class Executor:
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
-        clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
+        clear_issue_state: Callable[[ClearIssueState], None] | None = None,
+        validate_cleanup: Callable[[ClearIssueState], None] | None = None,
         reset_ci_retries: Callable[[ResetCiRetries], None] | None = None,
         retire_machine_block: Callable[[FinalizeMachineBlockRetirement], int] | None = None,
         retire_budget_block: Callable[[FinalizeBudgetBlockRetirement], int] | None = None,
@@ -369,10 +371,9 @@ class Executor:
         self._mark_automerge = mark_automerge or _missing_handler(
             "mark_automerge"
         )
-        # Retires STATE_DIR files on the ClearIssueState arm (review M4/D8:
-        # Store.clear_issue/clear_pr_review had zero production call sites).
-        # Default no-op keeps tests/other roles' Executors quiet — only the
-        # fix daemon wires this (Store.cleanup_pr).
+        # The fix role validates the complete terminal cleanup recipe before
+        # remote/local effects and rechecks SQL revision at final retirement.
+        self._validate_cleanup = validate_cleanup
         self._clear_issue_state = clear_issue_state or _missing_handler(
             "clear_issue_state"
         )
@@ -698,7 +699,7 @@ class Executor:
         if isinstance(action, RemoveWorktree):
             self._remove_worktree(action.issue)
         elif isinstance(action, ClearIssueState):
-            self._clear_issue_state(action.pr, action.issue, action.merged)
+            self._clear_issue_state(action)
         elif isinstance(action, ResetCiRetries):
             if self._reset_ci_retries is not None:
                 self._reset_ci_retries(action)
@@ -898,6 +899,38 @@ class Executor:
                 )
             return False
 
+    def prepare_cleanup(self, actions):
+        """Refuse only the fixed terminal-cleanup sequence before its first effect."""
+        actions = list(actions)
+        if self._validate_cleanup is None:
+            return actions
+        groups = []
+        previous = -1
+        for end, action in enumerate(actions):
+            if not isinstance(action, ClearIssueState):
+                continue
+            indices = {end}
+            if action.pr is not None:
+                index = end - 1
+                while index > previous and _belongs_to_terminal_cleanup(actions[index], action):
+                    indices.add(index)
+                    index -= 1
+                recipe = [actions[index] for index in sorted(indices) if index != end]
+                if not _valid_terminal_cleanup_recipe(recipe, action) or any(
+                        _belongs_to_terminal_cleanup(actions[index], action)
+                        for index in range(previous + 1, min(indices))):
+                    raise ValueError("terminal cleanup recipe is malformed")
+            groups.append((action, indices))
+            previous = end
+        refused: set[int] = set()
+        for action, indices in groups:
+            try:
+                self._validate_cleanup(action)
+            except Exception as error:
+                refused.update(indices)
+                self._log(f"REFUSED: {self._describe(action)} — {error}")
+        return [action for index, action in enumerate(actions) if index not in refused]
+
     def execute_all(self, actions) -> bool:
         """Apply every action, even if one raises (review S7): before this, one
         raising action propagated IMMEDIATELY out of the whole call, so sibling
@@ -921,7 +954,13 @@ class Executor:
         ClearIssueState follow-ups here — decide_fix's own RunAgent actions
         are applied one-at-a-time by Daemon.tick, which already isolates per
         action)."""
-        succeeded = True
+        original = list(actions)
+        try:
+            actions = self.prepare_cleanup(original)
+        except ValueError as error:
+            self._log(f"REFUSED: {error}")
+            return False
+        succeeded = len(actions) == len(original)
         failed_worktree_cleanup: set[int] = set()
         for action in actions:
             issue = _cleanup_dependency_issue(action)
@@ -958,3 +997,28 @@ def _cleanup_dependency_issue(action: Action) -> int | None:
     if isinstance(action, Relabel) and action.target is Target.ISSUE:
         return action.number
     return None
+
+
+def _belongs_to_terminal_cleanup(action: Action, cleanup: ClearIssueState) -> bool:
+    if isinstance(action, RemoveWorktree):
+        return cleanup.issue is not None and action.issue == cleanup.issue
+    if isinstance(action, CloseIssue):
+        return cleanup.merged and action.number == cleanup.issue and action.operation is LifecycleOperation.CLOSE_MERGED
+    if isinstance(action, Relabel) and action.remove is Label.AI_PR_OPEN:
+        return ((action.target is Target.PR and action.number == cleanup.pr and action.add is None)
+                or (action.target is Target.ISSUE and action.number == cleanup.issue
+                    and action.add is (Label.AI_DONE if cleanup.merged else Label.AI_READY)))
+    return False
+
+
+def _valid_terminal_cleanup_recipe(recipe: list[Action], cleanup: ClearIssueState) -> bool:
+    if not recipe or not isinstance(recipe[-1], Relabel) or recipe[-1].target is not Target.PR:
+        return False
+    issue_actions = recipe[:-1]
+    if cleanup.issue is None:
+        return not issue_actions
+    return (len(issue_actions) in (2, 3)
+            and isinstance(issue_actions[0], RemoveWorktree)
+            and isinstance(issue_actions[1], Relabel)
+            and issue_actions[1].target is Target.ISSUE
+            and (len(issue_actions) == 2 or cleanup.merged and isinstance(issue_actions[2], CloseIssue)))

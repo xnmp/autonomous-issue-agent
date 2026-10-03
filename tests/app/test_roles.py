@@ -726,7 +726,9 @@ def test_composed_fix_daemon_resets_only_the_selected_settled_green_ci(tmp_path,
         resets = [action for action in planned if isinstance(action, ResetCiRetries)]
         assert resets == [ResetCiRetries(5, source)]
         daemon.executor.execute(resets[0])
-        daemon.executor.execute(ClearIssueState(100, 5, True))
+        cleanup = next(action for action in planned if isinstance(action, ClearIssueState))
+        assert cleanup.source is not None
+        daemon.executor.execute(cleanup)
     elif change == "none":
         daemon.executor.execute(ResetCiRetries(5, source))
     else:

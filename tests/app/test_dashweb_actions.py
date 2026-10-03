@@ -415,7 +415,6 @@ def test_unblock_drops_the_holding_labels_and_names_the_operator_action(
     monkeypatch, tmp_path
 ):
     backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
-    (dirs["fix"] / "issue-7.ci-retries").write_text("3")
 
     assert backend.unblock("demo", 7) == (True, "ok")
 
@@ -439,7 +438,6 @@ def test_an_unblock_journals_one_event_naming_what_it_actually_reset(
     monkeypatch, tmp_path
 ):
     backend, dirs, _calls = _unblock_backend(monkeypatch, tmp_path)
-    (dirs["fix"] / "issue-7.ci-retries").write_text("3")
     (dirs["review"] / "issue-7.review-retries").write_text("at 5")
 
     backend.unblock("demo", 7)
@@ -447,7 +445,7 @@ def test_an_unblock_journals_one_event_naming_what_it_actually_reset(
     (payload,) = _journalled(dirs)
     assert payload.kind == "operator_unblock" and payload.number == 7
     assert payload.attributes["remove"] == ["needs-human-review"]
-    assert payload.attributes["retries_cleared"] == 1
+    assert payload.attributes["retries_cleared"] == 0
     assert (dirs["review"] / "issue-7.review-retries").read_text() == "at 5"
     assert payload.attributes["labels_applied"] is True
 
@@ -480,7 +478,6 @@ def test_a_counter_reset_is_journalled_even_when_github_changed_nothing(
         monkeypatch, tmp_path, issue_labels=(), pr_labels=("needs-human-review",),
         hold_role="fix",
     )
-    (dirs["fix"] / "issue-7.ci-retries").write_text("3")
 
     assert backend.unblock("demo", 7)[0] is True
 
@@ -489,7 +486,7 @@ def test_a_counter_reset_is_journalled_even_when_github_changed_nothing(
         (12, {"add": ("ai-pr-open",), "remove": ("needs-human-review",)})
     ]
     issue_event, pr_event = _journalled(dirs)
-    assert issue_event.attributes["retries_cleared"] == 1
+    assert issue_event.attributes["retries_cleared"] == 0
     assert pr_event.target == "pr"
     assert pr_event.attributes["add"] == ["ai-pr-open"]
     assert pr_event.attributes["remove"] == ["needs-human-review"]
@@ -646,7 +643,6 @@ def test_a_failed_label_edit_still_records_the_reset_it_already_made(
     backend, dirs, _calls = _unblock_backend(
         monkeypatch, tmp_path, applied=(False, "network down"),
     )
-    (dirs["fix"] / "issue-7.ci-retries").write_text("3")
 
     assert backend.unblock("demo", 7) == (False, "issue #7: network down")
 
@@ -656,7 +652,7 @@ def test_a_failed_label_edit_still_records_the_reset_it_already_made(
     assert payload.attributes["remove"] == []
     assert payload.attributes["requested_add"] == ["ai-ready"]
     assert payload.attributes["requested_remove"] == ["needs-human-review"]
-    assert payload.attributes["retries_cleared"] == 1
+    assert payload.attributes["retries_cleared"] == 0
 
 
 def test_each_target_journals_its_own_label_result(monkeypatch, tmp_path):
@@ -687,7 +683,7 @@ def test_each_target_journals_its_own_label_result(monkeypatch, tmp_path):
     assert succeeded.attributes["remove"] == ["needs-human-review"]
 
 
-def test_legacy_unblock_preserves_retired_review_allowance_evidence_and_resets_fix_retries(
+def test_legacy_unblock_refuses_unsupported_grant_and_preserves_all_evidence(
     monkeypatch, tmp_path
 ):
     backend, dirs, _calls = _unblock_backend(monkeypatch, tmp_path)
@@ -699,10 +695,12 @@ def test_legacy_unblock_preserves_retired_review_allowance_evidence_and_resets_f
     (dirs["review"] / "issue--12.infra-deaths").write_text("5")
     (dirs["fix"] / "issue-7.infra-deaths").write_text("5")
 
-    backend.unblock("demo", 7)
+    ok, detail = backend.unblock("demo", 7)
+    assert not ok and "migration required" in detail
+    assert _calls == [] and _journalled(dirs) == []
 
-    assert not (dirs["fix"] / "issue-7.ci-retries").exists()
-    assert not (dirs["fix"] / "issue-7.rebase-retries").exists()
+    assert (dirs["fix"] / "issue-7.ci-retries").read_text() == "3"
+    assert (dirs["fix"] / "issue-7.rebase-retries").read_text() == "2"
     assert (dirs["review"] / "issue-7.review-retries").read_text() == "at 5"
     assert (dirs["review"] / "issue-7.infra-deaths").read_text() == "5"
     assert (dirs["review"] / "issue--12.infra-deaths").read_text() == "5"
@@ -723,7 +721,6 @@ def test_an_unblock_that_reset_nothing_does_not_claim_it_did(monkeypatch, tmp_pa
 
 def test_unblock_on_an_issue_with_no_pr_clears_what_it_can(monkeypatch, tmp_path):
     backend, dirs, _calls = _unblock_backend(monkeypatch, tmp_path, prs=())
-    (dirs["fix"] / "issue-7.ci-retries").write_text("3")
 
     assert backend.unblock("demo", 7) == (True, "ok")
     assert not (dirs["fix"] / "issue-7.ci-retries").exists()
@@ -746,3 +743,24 @@ def test_unblock_of_an_unknown_deployment_never_reaches_github(monkeypatch, tmp_
 
 
 # ── unblock is a re-arm (keifu PR #173 / issue #25, 2026-08-02) ───────────────
+
+
+@pytest.mark.parametrize("key,suffix,payload", [(7, "ci-retries", "broken"), (-12, "rebase-retries", "2"),
+                                                 (7, "review-retries", "at 3")])
+def test_unsupported_legacy_recovery_grant_refuses_before_labels_or_comment(monkeypatch, tmp_path, key, suffix, payload):
+    backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
+    source = dirs["fix"] / f"issue-{key}.{suffix}"
+    source.write_text(payload)
+    ok, detail = backend.unblock("demo", 7)
+    assert not ok and "migration required" in detail
+    assert calls == [] and _journalled(dirs) == []
+    assert source.read_text() == payload
+
+
+def test_advisory_ci_context_alone_does_not_require_an_operator_grant(monkeypatch, tmp_path):
+    backend, dirs, calls = _unblock_backend(monkeypatch, tmp_path)
+    history = dirs["fix"] / "issue-7.ci-history"
+    history.write_text("[]")
+    assert backend.unblock("demo", 7) == (True, "ok")
+    assert calls and history.read_text() == "[]"
+    assert _journalled(dirs)[0].attributes["retries_cleared"] == 0

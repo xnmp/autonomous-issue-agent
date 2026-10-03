@@ -757,15 +757,12 @@ class Backend:
             # an ambiguous custom-trigger re-arm is safer left held than half
             # admitted to a role that cannot advance it.
             return False, f"pr #{candidate_pr}: {exc}"
-        # Counters first: a cleared counter with the labels still on holds the
-        # issue exactly as before, while the reverse order would re-admit it
-        # against a breaker that is still tripped.
+        if self._legacy_retry_grant_required(state_dirs, number, prs):
+            return False, "fix recovery migration required; retained legacy retry evidence cannot authorize a grant"
         effects = self._operator_effects(name, repo, journalled=False, control=control, state_dirs=state_dirs)
         journal = self._operator_journal(name, repo, legacy_path=journal_paths[0])
-        cleared = self._clear_retry_counters(state_dirs, number, prs)
-        # Unjournalled effects: this flow writes its own single event below,
-        # because the counter reset happened whatever GitHub then did with the
-        # labels — including the no-op path, which emits nothing of its own.
+        cleared = 0
+        # Label-only legacy effects report their own verified changes below.
         issue_applied, issue_detail = True, "ok"
         issue_actual_add: tuple[str, ...] = ()
         issue_actual_remove: tuple[str, ...] = ()
@@ -1227,30 +1224,18 @@ class Backend:
         except Exception:  # noqa: BLE001 - telemetry never fails the action
             pass
 
-    def _clear_retry_counters(self, state_dirs: tuple[str, ...], number: int, prs: tuple[int, ...]) -> int:
-        """Reset the remaining file-backed per-attempt ceilings.
-
-        Review execution and its infrastructure allowance are SQL authority;
-        the review root contains only stopped import evidence. Address-review
-        retries in the fix root remain the fix role's independent allowance.
-
-        The resolve episode is not touched: it is SQLite authority (ADR 0015),
-        renewed only by a typed re-arm after explicit family activation. The
-        retired resolve files are offline import evidence and are never reset
-        here, so an unblock cannot grant a fresh resolve allowance.
-
-        Returns how many counters were actually retired, so the journalled
-        event reports what happened rather than what was attempted.
-        """
+    def _legacy_retry_grant_required(self, state_dirs: tuple[str, ...], number: int, prs: tuple[int, ...]) -> bool:
+        """A legacy label edit cannot mint a selected recovery allowance."""
         keys = [number, *(-pr for pr in prs if pr > 0)]
-        cleared = 0
         for role, state_dir in zip(dash.ROLE_NAMES, state_dirs):
             if not state_dir or role == "review":
                 continue
             store = Store(state_dir)
             for key in keys:
-                cleared += store.clear_retries(key)
-        return cleared
+                for suffix in ("ci-retries", "review-retries", "rebase-retries"):
+                    if os.path.lexists(store.issue_path(key, suffix)):
+                        return True
+        return False
 
     def _issue_prs(self, name: str, number: int) -> list[int]:
         try:

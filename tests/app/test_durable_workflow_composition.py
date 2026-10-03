@@ -151,7 +151,7 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
                                          for kind in ("RESOLVE", "AUTHOR", "IMPLEMENT", "ADJUDICATE")}),
         max_contract_rounds=2,
     )
-    executor = Executor(remote, effect_executor=effects, retry_delays=(), log=messages.append, remove_worktree=lambda _: None, clear_issue_state=state.cleanup_pr)
+    executor = Executor(remote, effect_executor=effects, retry_delays=(), log=messages.append, remove_worktree=lambda _: None, clear_issue_state=lambda action: state.cleanup_pr(action.pr, action.issue, action.merged))
     dispatcher = AgentDispatcher(
         DispatchConfig(fix=FixTaskConfig("o/r", agent_md="test", model="test-model"), fix_bot="fix-bot", log=messages.append, author_tests_split=split),
         remote, state, Worktrees(root), JournalingRuntime(runtime, events, repo="o/r", role="fix", runtime="claude"), executor, workflow_control=workflow,

@@ -33,26 +33,8 @@ from ..domain.world import normalize_predicted_paths
 from ..domain.actions import Target
 from ..domain.ports import WorkflowControlError
 
-# ── suffix universe (review M4/D8) ──────────────────────────────────────────
-# Every accessor below writes `issue-N.<suffix>` or `pr-N.<suffix>` via
-# issue_path/pr_path. These two tuples are the SAME suffix universe the
-# accessors use — clear_issue/clear_pr_state derive from them instead of
-# hand-maintaining a parallel list, and
-# tests/adapters/test_store.py::test_every_*_accessor_suffix_is_covered_by_*
-# introspects the module source to assert every literal suffix an accessor
-# passes to issue_path/pr_path appears in exactly one of these — so a new
-# accessor with an unlisted suffix fails a test instead of silently leaking a
-# STATE_DIR file forever. Retired review session/round files remain stopped
-# import evidence; runtime cleanup cannot alter them.
-#
-# `automerge` is a PR suffix — this is the M4 fix. It used to live in the issue
-# tuple (`issue-N.automerge`), which nothing ever wrote (mark_automerge/
-# automerge_enabled always used pr_path), so clear_issue's removal was a no-op
-# and the real pr-N.automerge marker was cleared by NEITHER cleaner.
-#
-# The retired resolve files (`resolve-retries`, `last-error`) have no accessor
-# and no cleaner: resolve episodes live in SQLite (ADR 0015), and any stopped
-# file is retained as import evidence read only by adapters/resolve_activation.
+# Historical control files remain stopped-import evidence. Runtime cleanup
+# removes only the explicit advisory subsets; SQLite owns lifecycle state.
 _ISSUE_SUFFIXES = (
     "session", "resumed-at", "resumes", "ci-retries", "ci-history",
     "machine-block", "budget-block",
@@ -67,25 +49,8 @@ _PR_SUFFIXES = (
     "update-branch-head", "ci-pending-escalated-head", "resumed-at",
     "stall-sig",
 )
-
-# Closed-unmerged requeue cleanup (review M4/D8, handover §5.7): only the
-# resume-blocking markers are cleared — infra-deaths (and the SQL resolve
-# episode) are DELIBERATELY kept (fewer retries after a human closed the PR). This is a
-# strict subset of _ISSUE_SUFFIXES, not a third partition member, so it does
-# not participate in the "exactly one cleaner" coverage test above.
-#
-# `ci-history` joins them for the same reason the session does: the requeue's
-# next lifecycle opens a NEW PR, and an attempt list describing a dead PR's head
-# SHAs would tell that PR's first repair leg it is on attempt four of a loop it
-# has never been in. Unlike resolve-retries it is context, not budget, so
-# carrying it forward has no deterrent value — only a wrong diagnosis.
-_RESUME_STATE_SUFFIXES = ("session", "phase", "resumed-at", "ci-history")
-
-# Operator unblock (`clear_retries`): the per-attempt ceilings only. Also a
-# strict subset of _ISSUE_SUFFIXES — infra-deaths is deliberately absent, see
-# clear_retries.
-_RETRY_SUFFIXES = ("ci-retries", "review-retries", "rebase-retries")
-
+_ISSUE_ADVISORY_SUFFIXES = ("jira", "jira-phase", "predicted-paths", "ci-history")
+_PR_ADVISORY_SUFFIXES = ("automerge",)
 
 @dataclass(frozen=True)
 class Store:
@@ -377,33 +342,6 @@ class Store:
 
 
 
-    def clear_retries(self, key: int) -> int:
-        """Operator unblock: give the lifecycle its per-attempt budget back.
-        Returns how many counters were actually retired, so a caller can report
-        what it did rather than what it attempted.
-
-        Deliberately partial, on the same conservatism as
-        `clear_issue_resume_state` (handover §5.7): resolve-retries and
-        infra-deaths survive. A human deciding to retry does not make a
-        deterministically dying session or an unresolvable issue cheaper, and
-        those two counters are the only ceilings that bound those loops.
-
-        `key` is `domain.fix.breaker_key`'s key — the issue number, or the
-        NEGATED PR number for a PR with no resolvable issue.
-        """
-        removed = 0
-        for suffix in _RETRY_SUFFIXES:
-            path = self.issue_path(key, suffix)
-            removed += os.path.exists(path)
-            self._remove(path)
-        # The CI attempt history annotates the ci-retries counter, so it is
-        # retired with it — an operator handing back the budget is saying the
-        # previous attempts should not steer the next one either. Deliberately
-        # NOT counted in `removed`: that number reports retired ceilings, and
-        # inflating it would misreport how much budget the unblock handed back.
-        self._remove(self.issue_path(key, "ci-history"))
-        return removed
-
     # ── stall watchdog markers (no-silent-forever) ──
     # (signature, since_iso) per watched target: the observable state last
     # seen and when it first appeared. Written only when the signature
@@ -477,18 +415,10 @@ class Store:
         self._write(self.issue_path(issue, "jira-phase"), phase)
 
     # ── cleanup (mirror cleanup.sh's rm -f set) ──
-    def clear_issue(self, issue: int) -> None:
-        """Full issue-state retirement. Derives from `_ISSUE_SUFFIXES` (review
-        M4) so a suffix added anywhere above and forgotten here fails
-        test_store.py's coverage test instead of leaking a file forever.
-
-        Also retires the steward's triage baseline (`triage-N.at`, via
-        `triage_at_path`; review P1R-16) — a suffix-less namespace that
-        `_ISSUE_SUFFIXES` can't carry (triage_at_path takes no suffix
-        argument), and that consequently had NO cleaner at all before this."""
-        for suffix in _ISSUE_SUFFIXES:
+    def _clear_issue_advisory(self, issue: int) -> None:
+        """Selected SQL retirement cannot erase stopped control/import evidence."""
+        for suffix in _ISSUE_ADVISORY_SUFFIXES:
             self._remove(self.issue_path(issue, suffix))
-        self._remove(self.triage_at_path(issue))
 
     def clear_pr_state(self, pr: int) -> None:
         """Retire current file-backed PR state, preserving stopped review evidence.
@@ -497,59 +427,25 @@ class Store:
         cleared a file nothing wrote, while the real pr-N.automerge marker was
         cleared by neither cleaner.
         """
-        for suffix in _PR_SUFFIXES:
+        for suffix in _PR_ADVISORY_SUFFIXES:
             self._remove(self.pr_path(pr, suffix))
 
-    def clear_issue_resume_state(self, issue: int) -> None:
-        """Closed-unmerged requeue's conservative partial clear (review M4/D8):
-        drop only the resume-blocking markers (session/phase/resumed-at) so
-        the next lifecycle doesn't try to resume a dead PR's session — but
-        DELIBERATELY keep resolve-retries and infra-deaths (handover §5.7:
-        fewer retries after a human closed the PR is intentional, not a bug)."""
-        for suffix in _RESUME_STATE_SUFFIXES:
-            self._remove(self.issue_path(issue, suffix))
-
     def cleanup_pr(self, pr: int | None, issue: int | None, merged: bool) -> None:
-        """Single entry point the Executor's `ClearIssueState` action wiring
-        calls (review M4: `clear_issue`/`clear_pr_review` had ZERO production
-        call sites — a closed-unmerged PR requeued its issue while
-        issue-N.session/.phase survived, so the next lifecycle resumed a dead
-        PR's session with a preloaded breaker).
+        """Retire advisory files after the selected SQL cleanup.
 
-        merged=True  → retire everything: full issue state (incl.
-                       infra-deaths) AND the PR's own state (incl. the
-                       pr-N.automerge marker).
-        merged=False → closed-unmerged requeue: only the resume-blocking
-                       markers on the issue are cleared; resolve-retries/
-                       infra-deaths persist on purpose (handover §5.7). PR-side
-                       state is left alone — the PR is dead, not reused.
-
-        `issue=None` (review P1R-16): `domain.fix.breaker_key` falls back to
-        the NEGATED pr number for a PR with no resolvable issue, so counters
-        such as infra-deaths for that PR accumulate at `issue_path(-pr, …)` —
-        e.g. `issue--112.infra-deaths` — a namespace this method used to leave
-        untouched forever (it only ever cleared `pr-N.*`, and the "exactly one
-        cleaner" coverage test was blind to the gap because it introspects
-        SUFFIXES, not key namespaces: `issue-9.infra-deaths` and
-        `issue--112.infra-deaths` share the same suffix). Route the negated
-        key through the SAME clear_issue/clear_issue_resume_state helpers a
-        real issue gets, instead of a bespoke clear, so any suffix later added
-        to `_ISSUE_SUFFIXES` stays covered here automatically too.
-
-        `pr=None` (#28) is the mirror: the issue-driven cleanup arm repairs an
-        issue whose PR has vanished from the world, so there is no `pr-N.*`
-        namespace to retire — the issue's half runs alone. `issue` is then
-        necessarily set (the arm is keyed on an issue), so no `-pr` fallback key
-        is needed either."""
+        Stopped control files remain import evidence. Closed-unmerged requeue
+        changes continuity in SQL and clears only dead-PR diagnostic context. An issueless PR
+        addresses advisory issue metadata through its original negative key.
+        """
         if pr is None and issue is None:
             return  # nothing addressable — the caller has no key at all
         issue_key = issue if issue is not None else -pr  # type: ignore[operator]
         if merged:
             if pr is not None:
                 self.clear_pr_state(pr)
-            self.clear_issue(issue_key)
+            self._clear_issue_advisory(issue_key)
         else:
-            self.clear_issue_resume_state(issue_key)
+            self.clear_ci_history(issue_key)
 
 
 # ── worktree .harness/ claims and local test command ──────────────────────────

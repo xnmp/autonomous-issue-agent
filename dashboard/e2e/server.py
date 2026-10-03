@@ -418,6 +418,10 @@ class ReviewFixture:
             daemon=self._daemon(state, gates), current_intent=state.current_intent, requested_id=request_id,
             requested_intent=state.rearms.get(request_id) if request_id else None, observation=None,
             execution=self._execution(state),
+            fix_recovery=(rc.PRRepairAvailable(status="available", family="pr_repair", generation=3, version=9,
+                resumes=4, workflow_held=True, pending_effects=["ci_rerun", "branch_refresh"]) if state.pr == 199 else
+                rc.RecoveryUnavailable(status="unavailable", reason="Selected PR repair source is unreadable.")
+                if state.pr == 198 else None),
         )
 
     def _execution(self, state: _ReviewState) -> wc.ReviewExecution:
@@ -786,7 +790,10 @@ class FixtureBackend:
 
     def resolve_control(self, _name: str, number: int, request_id: str | None = None) -> rc.ResolveControl:
         if number in REVIEW_ISSUES:
-            return rc.InactiveControl(status="inactive", repository=RESOLVE_REPO, issue=number)
+            return rc.InactiveControl(status="inactive", repository=RESOLVE_REPO, issue=number,
+                fix_recovery=(rc.IssueRecoveryAvailable(status="available", family="issue_recovery", generation=2,
+                    version=8, resumes=4, ci_failures=3, review_failures=2, rebase_failures=5, infra_failures=6,
+                    self_clears=1, holds=["machine", "budget"]) if number == 99 else None))
         return self._resolve.control(number, request_id)
 
     def resolve_command(self, _name: str, number: int, body: rc.ResolveCommand) -> rc.CommandResult:

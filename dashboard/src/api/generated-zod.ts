@@ -283,6 +283,34 @@ const ResolveExpected = z.object({
   repository: z.string().min(1).max(512),
   version: z.number().int().gte(0).lte(9007199254740991),
 });
+const IssueRecoveryAvailable = z.object({
+  ci_failures: z.number().int().gte(0).lte(9007199254740991),
+  family: z.literal("issue_recovery"),
+  generation: z.number().int().gte(0).lte(9007199254740991),
+  holds: z.array(z.enum(["machine", "budget", "workflow"])),
+  infra_failures: z.number().int().gte(0).lte(9007199254740991),
+  rebase_failures: z.number().int().gte(0).lte(9007199254740991),
+  resumes: z.number().int().gte(0).lte(9007199254740991),
+  review_failures: z.number().int().gte(0).lte(9007199254740991),
+  self_clears: z.number().int().gte(0).lte(9007199254740991),
+  status: z.literal("available"),
+  version: z.number().int().gte(0).lte(9007199254740991),
+});
+const PRRepairAvailable = z.object({
+  family: z.literal("pr_repair"),
+  generation: z.number().int().gte(0).lte(9007199254740991),
+  pending_effects: z.array(
+    z.enum(["ci_rerun", "ci_cancel", "branch_refresh", "pending_ci_escalation"])
+  ),
+  resumes: z.number().int().gte(0).lte(9007199254740991),
+  status: z.literal("available"),
+  version: z.number().int().gte(0).lte(9007199254740991),
+  workflow_held: z.boolean(),
+});
+const RecoveryUnavailable = z.object({
+  reason: z.string(),
+  status: z.enum(["inactive", "migration_required", "unavailable"]),
+});
 const ResolveCeiling = z.object({
   ceiling: z.number().int(),
   episode_id: z.string(),
@@ -364,6 +392,14 @@ const AvailableControl = z.object({
   current_intent: z.union([Rearm, z.null()]),
   expected: ResolveExpected,
   failures: z.number().int(),
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   gates: z.array(Gate),
   guidance: z.string(),
   observation: z.union([Observation, z.null()]),
@@ -373,17 +409,41 @@ const AvailableControl = z.object({
   workflow_held: z.boolean(),
 });
 const InactiveControl = z.object({
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   issue: z.number().int(),
   repository: z.string(),
   status: z.literal("inactive"),
 });
 const AbsentControl = z.object({
   epoch: z.number().int(),
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   issue: z.number().int(),
   repository: z.string(),
   status: z.literal("absent"),
 });
 const UnavailableControl = z.object({
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   reason: z.string(),
   status: z.literal("unavailable"),
 });
@@ -943,6 +1003,14 @@ const ReviewAvailableControl = z.object({
     ])
     .optional(),
   expected: ReviewExpected,
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   gates: z.array(ReviewGate),
   guidance: z.string(),
   observation: z.union([ReviewObservation, z.null()]),
@@ -960,17 +1028,41 @@ const ReviewAvailableControl = z.object({
 });
 const ReviewMigrationRequiredControl = z.object({
   active_families: z.array(z.string()),
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   pull_request: z.number().int(),
   repository: z.string(),
   status: z.literal("migration_required"),
 });
 const ReviewAbsentControl = z.object({
   epoch: z.number().int(),
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   pull_request: z.number().int(),
   repository: z.string(),
   status: z.literal("absent"),
 });
 const ReviewUnavailableControl = z.object({
+  fix_recovery: z
+    .union([
+      IssueRecoveryAvailable,
+      PRRepairAvailable,
+      RecoveryUnavailable,
+      z.null(),
+    ])
+    .optional(),
   reason: z.string(),
   status: z.literal("unavailable"),
 });
@@ -1150,6 +1242,9 @@ export const schemas = {
   request_id,
   Rearm,
   ResolveExpected,
+  IssueRecoveryAvailable,
+  PRRepairAvailable,
+  RecoveryUnavailable,
   ResolveCeiling,
   RemoteUncertain,
   RetryAuthorizationRequired,

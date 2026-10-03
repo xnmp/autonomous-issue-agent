@@ -138,17 +138,36 @@ class SQLiteWorkflowControl:
         if not isinstance(state.issue_recovery, cc.ActiveIssueRecovery):
             raise WorkflowAuthorityError("repair handoff has unknown issue resume/fork history")
         return cc.RepairHandoff(session.source, session.session_id, runtime, session.model, branch, pr, state.issue_recovery.state.resumes)
-    def cleanup_pr_repair(self, key: WorkflowKey, merged: bool) -> None:
+    def _cleanup_selection(self, db, key: WorkflowKey, merged: bool, source: cc.PRRepairCleanup):
         self._pr_repair_scope(key)
+        if not isinstance(source, cc.PRRepairCleanup) or source.binding.fence.key != key or source.merged != merged:
+            raise WorkflowAuthorityError("PR cleanup requires its exact selected source")
+        self._control._assert_owner_active(db, self.writer.owner_id)
+        state = load_review_workflow_row(db, key)
+        if state is None or not isinstance(state.pr_repair, cc.ActivePRRepair):
+            raise WorkflowAuthorityError("PR cleanup is inactive or migration blocked")
+        component = state.pr_repair
+        selected = cc.select_pr_repair(state)
+        if (not isinstance(selected, cc.SelectedPRRepair)
+                or source.binding != selected.binding or source.revision != state.revision or source.merged != merged):
+            raise WorkflowAuthorityError("PR cleanup source revision is no longer current")
+        self._control._validate_pr_repair_sources(db, selected)
+        if any(isinstance(remedy, (cc.OwedCIRemediation, cc.OwedPRRecoveryEffect)) for remedy in (
+                component.state.ci_rerun, component.state.ci_cancel,
+                component.state.branch_refresh, component.state.pending_ci_escalation)):
+            raise WorkflowAuthorityError("repair cleanup retains unsettled remote remediation evidence")
+        if (component.watermarks.last_admitted > component.watermarks.last_applied
+                and component.watermarks.last_admitted_fence == state.revision.fence):
+            raise WorkflowAuthorityError("repair cleanup requires its selected paid output settled")
+        return state, component
+
+    def validate_pr_repair_cleanup(self, key: WorkflowKey, merged: bool, source: cc.PRRepairCleanup) -> None:
+        with self._control.transaction() as db:
+            self._cleanup_selection(db, key, merged, source)
+
+    def cleanup_pr_repair(self, key: WorkflowKey, merged: bool, source: cc.PRRepairCleanup) -> None:
         with self._control.transaction() as db, self._control.mutation_savepoint(db):
-            self._control._assert_owner_active(db, self.writer.owner_id)
-            state = load_review_workflow_row(db, key)
-            if state is None or not isinstance(state.pr_repair, cc.ActivePRRepair):
-                return
-            component = state.pr_repair
-            if (component.watermarks.last_admitted > component.watermarks.last_applied
-                    and component.watermarks.last_admitted_fence == state.revision.fence):
-                raise WorkflowAuthorityError("repair cleanup requires its selected paid output settled")
+            state, component = self._cleanup_selection(db, key, merged, source)
             continuity = cc.retire_pr_repair_continuity(component.state, merged)
             if continuity != component.state:
                 after = replace(state, revision=WorkflowRevision(state.revision.fence, state.revision.version + 1),

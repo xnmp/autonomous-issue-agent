@@ -213,7 +213,8 @@ def test_mixed_fix_issue_pr_publication_and_inert_sql_only_retry(stopped, capsys
     from issue_agent.adapters.store import Store
     selected = purchase(issue, reply="2026-10-02T00:00:00Z", ceiling=5)
     assert control.reserve_issue_recovery(paid("later", selected), selected).admitted
-    Store(str(state)).clear_issue(8)
+    Store(str(state))._clear_issue_advisory(8)
+    assert (state / "issue-8.session").read_text() == "codex:ambiguous"
     with control._connect() as db:
         assert isinstance(load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(8))).issue_recovery, cc.BlockedIssueRecovery)
     after = dump(control)

@@ -208,7 +208,8 @@ def test_a_rejection_only_family_with_no_observed_pull_request_is_absent(bare):
     deployment = bare
     response = http(deployment).get()
     assert response.status_code == 404
-    assert response.json() == {"status": "absent", "repository": REPO, "pull_request": PR, "epoch": 1}
+    assert response.json() == {"status": "absent", "repository": REPO, "pull_request": PR, "epoch": 1,
+                               "fix_recovery": {"status": "inactive", "reason": "Fix recovery authority is inactive."}}
 
 
 def test_an_inactive_family_offers_no_lever_and_refuses_commands(bare):
@@ -218,7 +219,8 @@ def test_an_inactive_family_offers_no_lever_and_refuses_commands(bare):
     response = api.get()
     assert response.status_code == 200
     assert response.json() == {"status": "migration_required", "repository": REPO,
-                               "pull_request": PR, "active_families": []}
+                               "pull_request": PR, "active_families": [],
+                               "fix_recovery": {"status": "unavailable", "reason": "review_rejections workflow migration is required"}}
     body = {"operation": "request_rearm", "request_id": "r", "gate_id": "g", "guidance": {"kind": "keep"},
             "expected": {"repository": REPO, "pull_request": PR, "family": "review_rejections", "epoch": 1,
                          "generation": 0, "version": 1, "episode_id": "e"}}
@@ -267,7 +269,7 @@ def test_an_unopenable_operator_is_unavailable_for_reads_and_commands(escalated)
         raise sqlite3.OperationalError("database is locked")
     api = http(deployment, factory=failing)
     read = api.get()
-    assert read.status_code == 503 and read.json() == {"status": "unavailable", "reason": "database is locked"}
+    assert read.status_code == 503 and read.json() == {"status": "unavailable", "reason": "database is locked", "fix_recovery": None}
     command = api.post(body)
     assert command.status_code == 503 and command.json()["outcome"] == "unavailable"
 

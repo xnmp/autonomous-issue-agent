@@ -39,7 +39,7 @@ def api(environment, monkeypatch, tmp_path):
     backend = Backend(harness_root=str(tmp_path), control_db_path=store.path,
                       resolve_factory=factory, now_fn=lambda: clock[0])
     monkeypatch.setattr(backend, "names", lambda: ("demo",))
-    monkeypatch.setattr(backend, "_clear_retry_counters", lambda *a: pytest.fail("typed command used legacy reset"))
+    monkeypatch.setattr(backend, "_legacy_retry_grant_required", lambda *a: pytest.fail("typed command used legacy reset"))
     monkeypatch.setattr(backend, "_operator_effects", lambda *a, **kw: pytest.fail("typed command directly executed remote effects"))
     app = server.create_app(backend=backend, harness_root=str(tmp_path), offload_backend=False)
     client = ASGITestClient(app, base_url=BASE, headers=HEADERS)
@@ -374,3 +374,56 @@ def test_dashboard_runner_refuses_nonliteral_supported_loopback_without_listener
     monkeypatch.setattr(server, "create_app", lambda *a, **kw: pytest.fail("unsafe listener constructed application"))
     with pytest.raises(ValueError, match="literal loopback"):
         server.serve(8321, host=host)
+
+
+def test_dashboard_reads_actual_paid_repair_allowance_without_remote_observation(api, monkeypatch):
+    from tests.app.test_pr_repair_workflow import active_ci_workflow
+    from issue_agent.domain.outcome import AgentResult
+    from issue_agent.domain.workflow_identity import WorkflowKey, IssueRef
+    client, app, backend, environment, body, factory_calls = api
+    workflow, files, runner, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    selected = files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    operator = replace(environment[0](), control=files._workflow_authority)
+    monkeypatch.setattr(backend, "_resolve_factory", lambda *a, **kw: operator)
+    monkeypatch.setattr(operator.gateway, "get_issue", lambda *a: pytest.fail("recovery GET observed remote state"))
+    before = authority_dump(files._workflow_db)
+    response = client.get(PATH.replace("issues/1/", "issues/5/"))
+    assert response.status_code == 200
+    recovery = response.json()["fix_recovery"]
+    assert recovery["status"] == "available" and recovery["family"] == "issue_recovery"
+    assert recovery["ci_failures"] == selected.component.state.ci_failures == 1
+    assert recovery["version"] == selected.revision.version
+    assert authority_dump(files._workflow_db) == before
+
+
+def test_inactive_primary_still_shows_independent_recovery_without_grant(api, monkeypatch, tmp_path):
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.adapters.workflow_rows import workflow_scope
+    from issue_agent.domain.workflow import IssueWorkflowShell
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    from tests.adapters.test_continuation_admission import active, install_secondary
+    from tests.fakes.workflow_authority import resolve_snapshot
+    client, app, backend, environment, body, factory_calls = api
+    isolated = SQLiteControlStore(str(tmp_path / "independent-recovery.sqlite"))
+    isolated.initialize()
+    revision = resolve_snapshot(1).revision
+    component = active(revision.fence.key, WorkflowFamily.ISSUE_RECOVERY)
+    from issue_agent.domain.continuation_components import ActiveIssueRecovery
+    assert isinstance(component, ActiveIssueRecovery)
+    component = replace(component, state=replace(component.state, ci_failures=3, resumes=2))
+    shell = IssueWorkflowShell(revision, issue_recovery=component)
+    with isolated.transaction() as db:
+        db.execute("INSERT INTO workflows VALUES (?,?,?,?,?,?)",
+                   (*workflow_scope(revision.fence.key), revision.fence.generation, revision.version, encode_workflow(shell)))
+    install_secondary(isolated, shell, component)
+    operator = replace(environment[0](), control=SQLiteWorkflowControl(isolated, environment[0]().control.writer,
+                                                                     resolve_ceiling=3))
+    monkeypatch.setattr(backend, "_resolve_factory", lambda *a, **kw: operator)
+    before = authority_dump(isolated)
+    response = client.get(PATH)
+    assert response.status_code == 200 and response.json()["status"] == "inactive"
+    assert response.json()["fix_recovery"]["ci_failures"] == 3
+    assert response.json()["fix_recovery"]["resumes"] == 2
+    assert "gates" not in response.json()
+    assert authority_dump(isolated) == before

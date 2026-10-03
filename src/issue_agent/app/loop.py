@@ -625,6 +625,13 @@ class Daemon:
             self.log(f"{self.name}: poll pass failed (continuing): {exc}")
             return []
         blocked_claims = dispatch_claims(actions) if paid_blocked else frozenset()
+        prepare_cleanup = getattr(self.executor, "prepare_cleanup", None)
+        if prepare_cleanup is not None:
+            try:
+                actions = prepare_cleanup(actions)
+            except ValueError as error:
+                self.log(f"{self.name}: cleanup recipe refused before effects: {error}")
+                return []
         ordered = order_for_execution(actions)
         taken: list[Action] = []
         completed_claims: set[Relabel] = set()

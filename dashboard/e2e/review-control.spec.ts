@@ -239,3 +239,30 @@ test.describe("review operator controls", () => {
     }
   });
 });
+
+test("existing control panel shows selected recovery debt and owed effects without reset controls", async ({ page }) => {
+  const panel = await openReview(page, 99);
+  await expect(panel.getByRole("heading", { name: "Fix recovery", exact: true })).toBeVisible();
+  await expect(panel).toContainText("PR repair · generation 3 · revision 9");
+  const debt = panel.locator(".resolve-history").filter({ has: page.getByRole("heading", { name: "Fix recovery", exact: true }) });
+  await expect(debt.locator("dd")).toHaveText(["4"]);
+  await expect(debt).toContainText("PR continuity held.");
+  await expect(debt).toContainText("Awaiting verified completion: ci rerun, branch refresh.");
+  await expect(debt.getByRole("button")).toHaveCount(0);
+  const issuePanel = page.getByRole("region", { name: /Resolve control #99/ });
+  await expect(issuePanel).toContainText("Resolve authority is inactive");
+  await expect(issuePanel.locator(".resolve-facts dd")).toHaveText(["4", "3", "2", "5", "6", "1 / 3"]);
+  await expect(issuePanel).toContainText("Recovery holds: machine, budget.");
+  for (const width of [320, 768, 1024, 1440]) {
+    await page.setViewportSize({ width, height: 900 });
+    expect(await page.evaluate(() => document.documentElement.scrollWidth <= document.documentElement.clientWidth)).toBe(true);
+  }
+  await page.screenshot({ path: test.info().outputPath("selected-recovery-debt.png"), fullPage: true });
+});
+
+test("unreadable recovery authority is visible without invented zero debt", async ({ page }) => {
+  const panel = await openReview(page, 98);
+  await expect(panel).toContainText("Selected PR repair source is unreadable. Recovery debt cannot be shown.");
+  const debt = panel.locator(".resolve-history").filter({ has: page.getByRole("heading", { name: "Fix recovery", exact: true }) });
+  await expect(debt.locator("dd")).toHaveCount(0);
+});

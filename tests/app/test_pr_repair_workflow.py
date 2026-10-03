@@ -1512,12 +1512,18 @@ def test_closed_unmerged_requeue_preserves_debt_and_terminal_merge_clears_it():
         state = replace(state, pr_repair=replace(state.pr_repair, state=replace(
             state.pr_repair.state, resumes=4, ci_failures=3, infra_failures=2)))
         persist_workflow_snapshot(db, state)
-    files._workflow_authority.cleanup_pr_repair(key, False)
+    selected = files._workflow_authority.read_pr_repair(key)
+    source = cc.PRRepairCleanup(selected.binding, selected.revision, "head-1", False)
+    files._workflow_authority.cleanup_pr_repair(key, False, source)
     retained = files._workflow_authority.read_pr_repair(key).component.state
     assert retained.session is None and retained.resumes == 4
     assert retained.branch == "fix/5-remote" and retained.actual_model.model == "m"
     assert retained.ci_failures == 3 and retained.infra_failures == 2
-    files._workflow_authority.cleanup_pr_repair(key, True)
+    with pytest.raises(WorkflowAuthorityError, match="revision"):
+        files._workflow_authority.cleanup_pr_repair(key, False, source)
+    selected = files._workflow_authority.read_pr_repair(key)
+    terminal = cc.PRRepairCleanup(selected.binding, selected.revision, "head-1", True)
+    files._workflow_authority.cleanup_pr_repair(key, True, terminal)
     retired = files._workflow_authority.read_pr_repair(key).component.state
     assert retired.session is None and retired.actual_model is None and retired.branch == ""
     assert retired.resumes == 0 and retired.ci_failures == 0 and retired.infra_failures == 0
@@ -2081,3 +2087,19 @@ def test_actual_final_budget_refusal_persists_sql_hold_without_paid_debit(monkey
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM budget_reservations").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+
+
+def test_dashboard_recovery_projection_reads_same_selected_debt_as_admission():
+    from issue_agent.app.dashweb.resolve_control import recovery_control
+    workflow, files, inner, key = active_ci_workflow(AgentResult(is_error=False, status="pushed", cost_usd=.01))
+    asyncio.run(workflow.fix_ci(100))
+    issue = files._workflow_authority.read_issue_recovery(WorkflowKey("o/r", IssueRef(5)))
+    view = recovery_control(issue).model_dump()
+    assert view["status"] == "available" and view["family"] == "issue_recovery"
+    assert view["ci_failures"] == issue.component.state.ci_failures == 1
+    assert view["version"] == issue.revision.version
+    pr = recovery_control(files._workflow_authority.read_pr_repair(key)).model_dump()
+    assert pr["family"] == "pr_repair" and "ci_failures" not in pr and "self_clears" not in pr
+    assert pr["pending_effects"] == []
+    inactive = recovery_control(cc.InactivePRRepair()).model_dump()
+    assert inactive["status"] == "inactive" and "ci_failures" not in inactive

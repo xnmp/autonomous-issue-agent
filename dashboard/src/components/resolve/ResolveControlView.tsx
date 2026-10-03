@@ -4,6 +4,7 @@ import { commandIdentity, operationLocksActions, requestIdProblem } from "./mode
 import { ResolveCommandForm } from "./ResolveCommandForm";
 import type { ResolveControlViewProps } from "./view-contract";
 import "./resolve-control.css";
+import { FixRecoveryView } from "./FixRecoveryView";
 
 function GateCause({ cause }: { cause: ResolveGate["cause"] }) {
   switch (cause.kind) {
@@ -101,6 +102,7 @@ export function ResolveControlView(props: ResolveControlViewProps) {
         <button className="btn" type="button" disabled aria-describedby={`${id}-legacy-refused`}>Review legacy unblock</button>
         <p id={`${id}-legacy-refused`} className="resolve-status-note">{props.legacyRefusal}</p>
       </div>}
+      {control && <FixRecoveryView recovery={control.fix_recovery} />}
       {control?.status === "available" && <>
         {control.gates.length > 0 && <ul className="resolve-gates">{control.gates.map((gate) => <li key={gate.gate_id}>
           <div className="resolve-gate-heading"><GateCause cause={gate.cause} /><span className="resolve-state">{gate.state}</span></div>

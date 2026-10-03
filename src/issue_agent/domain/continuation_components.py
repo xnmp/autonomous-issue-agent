@@ -446,6 +446,21 @@ def retire_pr_repair_continuity(state: PRRepairState, merged: bool) -> PRRepairS
     return PRRepairState() if merged else replace(state, session=None, consumed_reply_at="", blank_reply=None)
 
 
+@dataclass(frozen=True)
+class PRRepairCleanup:
+    binding: WorkflowBinding
+    revision: WorkflowRevision
+    head: str
+    merged: bool
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.binding, WorkflowBinding) or self.binding.authority.family is not WorkflowFamily.PR_REPAIR
+                or not isinstance(self.revision, WorkflowRevision) or self.revision.fence != self.binding.fence
+                or type(self.merged) is not bool):
+            raise ValueError("PR cleanup requires its exact selected binding/revision/disposition")
+        validate_workflow_identifier(self.head, "retired PR head")
+
+
 class StewardLane(str, Enum):
     TRIAGE = "triage"
     GROOM = "groom"

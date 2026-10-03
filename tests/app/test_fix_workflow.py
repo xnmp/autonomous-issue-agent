@@ -75,7 +75,7 @@ def _workflow(gw, store, runner, wt=None, *, pr_repair_authority=True, **cfg_ove
     executor = Executor(
         gw,
         remove_worktree=worktrees.remove,
-        clear_issue_state=getattr(store, "cleanup_pr", None),
+        clear_issue_state=(lambda action: store.cleanup_pr(action.pr, action.issue, action.merged)) if hasattr(store, "cleanup_pr") else None,
     )
     attach_workflow_authority(
         gw, store, max_contract_rounds=cfg.max_contract_rounds, pr_repair=pr_repair_authority

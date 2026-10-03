@@ -8,6 +8,23 @@
             "title": "Epoch",
             "type": "integer"
           },
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
+          },
           "issue": {
             "title": "Issue",
             "type": "integer"
@@ -200,6 +217,23 @@
           "failures": {
             "title": "Failures",
             "type": "integer"
+          },
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
           },
           "gates": {
             "items": {
@@ -1203,6 +1237,23 @@
       "InactiveControl": {
         "additionalProperties": false,
         "properties": {
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
+          },
           "issue": {
             "title": "Issue",
             "type": "integer"
@@ -1912,6 +1963,102 @@
           "events"
         ],
         "title": "IssueDetailPayload",
+        "type": "object"
+      },
+      "IssueRecoveryAvailable": {
+        "additionalProperties": false,
+        "properties": {
+          "ci_failures": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Ci Failures",
+            "type": "integer"
+          },
+          "family": {
+            "const": "issue_recovery",
+            "enum": [
+              "issue_recovery"
+            ],
+            "title": "Family",
+            "type": "string"
+          },
+          "generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "holds": {
+            "items": {
+              "enum": [
+                "machine",
+                "budget",
+                "workflow"
+              ],
+              "type": "string"
+            },
+            "title": "Holds",
+            "type": "array"
+          },
+          "infra_failures": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Infra Failures",
+            "type": "integer"
+          },
+          "rebase_failures": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Rebase Failures",
+            "type": "integer"
+          },
+          "resumes": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Resumes",
+            "type": "integer"
+          },
+          "review_failures": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Review Failures",
+            "type": "integer"
+          },
+          "self_clears": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Self Clears",
+            "type": "integer"
+          },
+          "status": {
+            "const": "available",
+            "enum": [
+              "available"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "status",
+          "family",
+          "generation",
+          "version",
+          "resumes",
+          "ci_failures",
+          "review_failures",
+          "rebase_failures",
+          "infra_failures",
+          "self_clears",
+          "holds"
+        ],
+        "title": "IssueRecoveryAvailable",
         "type": "object"
       },
       "IssueStep": {
@@ -2750,6 +2897,73 @@
         "title": "OverviewPayload",
         "type": "object"
       },
+      "PRRepairAvailable": {
+        "additionalProperties": false,
+        "properties": {
+          "family": {
+            "const": "pr_repair",
+            "enum": [
+              "pr_repair"
+            ],
+            "title": "Family",
+            "type": "string"
+          },
+          "generation": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Generation",
+            "type": "integer"
+          },
+          "pending_effects": {
+            "items": {
+              "enum": [
+                "ci_rerun",
+                "ci_cancel",
+                "branch_refresh",
+                "pending_ci_escalation"
+              ],
+              "type": "string"
+            },
+            "title": "Pending Effects",
+            "type": "array"
+          },
+          "resumes": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Resumes",
+            "type": "integer"
+          },
+          "status": {
+            "const": "available",
+            "enum": [
+              "available"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "version": {
+            "maximum": 9007199254740991.0,
+            "minimum": 0.0,
+            "title": "Version",
+            "type": "integer"
+          },
+          "workflow_held": {
+            "title": "Workflow Held",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "status",
+          "family",
+          "generation",
+          "version",
+          "resumes",
+          "workflow_held",
+          "pending_effects"
+        ],
+        "title": "PRRepairAvailable",
+        "type": "object"
+      },
       "PendingCard": {
         "additionalProperties": true,
         "properties": {
@@ -3086,6 +3300,30 @@
           "reason"
         ],
         "title": "RearmNeedsDecision",
+        "type": "object"
+      },
+      "RecoveryUnavailable": {
+        "additionalProperties": false,
+        "properties": {
+          "reason": {
+            "title": "Reason",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "inactive",
+              "migration_required",
+              "unavailable"
+            ],
+            "title": "Status",
+            "type": "string"
+          }
+        },
+        "required": [
+          "status",
+          "reason"
+        ],
+        "title": "RecoveryUnavailable",
         "type": "object"
       },
       "RemoteUncertain": {
@@ -3433,6 +3671,23 @@
             "title": "Epoch",
             "type": "integer"
           },
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
+          },
           "pull_request": {
             "title": "Pull Request",
             "type": "integer"
@@ -3716,6 +3971,23 @@
           },
           "expected": {
             "$ref": "#/components/schemas/ReviewExpected"
+          },
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
           },
           "gates": {
             "items": {
@@ -5112,7 +5384,6 @@
       },
       "ReviewMigrationRequiredControl": {
         "additionalProperties": false,
-        "description": "Review dispatch and operator re-arm require explicit family activation.",
         "properties": {
           "active_families": {
             "items": {
@@ -5120,6 +5391,23 @@
             },
             "title": "Active Families",
             "type": "array"
+          },
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
           },
           "pull_request": {
             "title": "Pull Request",
@@ -5974,6 +6262,23 @@
       "ReviewUnavailableControl": {
         "additionalProperties": false,
         "properties": {
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
+          },
           "reason": {
             "title": "Reason",
             "type": "string"
@@ -6308,6 +6613,23 @@
       "UnavailableControl": {
         "additionalProperties": false,
         "properties": {
+          "fix_recovery": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/IssueRecoveryAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/PRRepairAvailable"
+              },
+              {
+                "$ref": "#/components/schemas/RecoveryUnavailable"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Fix Recovery"
+          },
           "reason": {
             "title": "Reason",
             "type": "string"

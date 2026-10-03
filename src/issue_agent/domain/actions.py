@@ -23,7 +23,7 @@ from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperatio
 from .labels import Label
 from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding, WorkflowRevision
 if TYPE_CHECKING:
-    from .continuation_components import CIEpisodeReset
+    from .continuation_components import CIEpisodeReset, PRRepairCleanup
     from .self_clear import MachineClearProjection, BudgetClearProjection
 
 
@@ -331,6 +331,14 @@ class ClearIssueState:
     pr: int | None
     issue: int | None
     merged: bool
+    source: PRRepairCleanup | None = field(default=None, compare=False, repr=False)
+
+    def __post_init__(self) -> None:
+        from .continuation_components import PRRepairCleanup
+        if self.source is not None and (not isinstance(self.source, PRRepairCleanup)
+                or self.pr is None or self.source.binding.fence.key.target != PullRequestRef(self.pr)
+                or self.source.merged != self.merged):
+            raise ValueError("cleanup action differs from its selected PR disposition")
 
 
 @dataclass(frozen=True)
