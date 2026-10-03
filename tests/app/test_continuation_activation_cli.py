@@ -47,6 +47,8 @@ def test_ci_remediation_shadow_and_copied_activation_keep_exact_imported_hints(s
     install_workflow(control, held())
     (state / "pr-9.ci-rerun-head").write_text("head-1")
     (state / "pr-9.ci-cancel-head").write_text("head-1@2026-10-01T00:00:00Z")
+    (state / "pr-9.update-branch-head").write_text("head-1:base-1")
+    (state / "pr-9.ci-pending-escalated-head").write_text("head-1")
     before = dump(control)
     files = {path.name: path.read_bytes() for path in state.iterdir()}
     code, report, error = command(capsys, "fix", "shadow")
@@ -61,6 +63,11 @@ def test_ci_remediation_shadow_and_copied_activation_keep_exact_imported_hints(s
     assert isinstance(rerun, cc.ImportedCIRemediation) and isinstance(cancel, cc.ImportedCIRemediation)
     assert (rerun.head, cancel.head, cancel.decided_at) == ("head-1", "head-1", "2026-10-01T00:00:00Z")
     assert rerun.import_identity != cancel.import_identity
+    refresh = selected.component.state.branch_refresh
+    escalation = selected.component.state.pending_ci_escalation
+    assert isinstance(refresh, cc.ImportedBranchRefresh) and isinstance(escalation, cc.ImportedPendingCIEscalation)
+    assert (refresh.head, refresh.base, escalation.head) == ("head-1", "base-1", "head-1")
+    assert refresh.import_identity != escalation.import_identity
     assert dump(control) == before
     assert {path.name: path.read_bytes() for path in state.iterdir()} == files
 

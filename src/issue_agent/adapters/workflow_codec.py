@@ -70,6 +70,8 @@ _VALUES = (
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState, cc.PRBlankReplySource,
     cc.CIRemediationCapture, cc.OwedCIRemediation, cc.SettledCIRemediation, cc.ImportedCIRemediation,
+    cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.OwedPRRecoveryEffect,
+    cc.SettledPRRecoveryEffect, cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation,
     cc.FixInfraEpisode, cc.FixInfraReceipt, cc.IssueInfraPurchase,
     cc.StewardLaneState, cc.StewardState, cc.StewardAttemptSource, cc.StewardCommandGuard,
     cc.StewardFailed, cc.StewardVerdict, cc.StewardStopped, cc.GroomContent, cc.GroomNoFinding, cc.ContinuationImportBlocker,
@@ -218,7 +220,7 @@ _LEGACY_FIELDS: dict[str, dict[str, object]] = {
     "ReviewFamilyEpisodes": {"pr_repair": {"type": "InactivePRRepair", "fields": {}}},
     # Histories persisted before re-executions were counted had spent none.
     "ActiveReconciliation": {"reexecutions": 0},
-    "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None, "ci_rerun": None, "ci_cancel": None},
+    "PRRepairState": {"resumes": 0, "actual_model": None, "blank_reply": None, "ci_rerun": None, "ci_cancel": None, "branch_refresh": None, "pending_ci_escalation": None},
     "PRRepairPurchase": {"branch": "", "handoff": None, "advance_resume": False, "head": ""},
     "PRRepairResult": {"ci": None, "review": None, "rebase": None, "machine_block": None},
     "IssueRecoveryState": {"pending_ci": None, "pending_rebase": None, "infra_episode": None, "machine_block": None, "budget_block": None, "self_clear_ceiling_reported": False},
@@ -269,7 +271,7 @@ def _encode(value: object, depth: int = 0) -> object:
                 for field in _VALUE_FIELDS[type(value)]
                 # Resolve's accepted wire format stays byte-stable. Review
                 # commands retain their required binding; legacy audits omit it.
-                if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None or field.name in {"ci_rerun", "ci_cancel"} and getattr(value, field.name) is None))
+                if (not (type(value) is cc.PRRepairState and (field.name == "resumes" and value.resumes == 0 or field.name == "actual_model" and value.actual_model is None or field.name == "blank_reply" and value.blank_reply is None or field.name in {"ci_rerun", "ci_cancel", "branch_refresh", "pending_ci_escalation"} and getattr(value, field.name) is None))
                     and not (type(value) is cc.ContinuationCapture and field.name == "fix_infra_ceiling" and value.fix_infra_ceiling is None)
                     and not (type(value) is cc.IssueRecoveryState and field.name in {"pending_ci", "pending_rebase", "infra_episode", "machine_block", "budget_block"} and getattr(value, field.name) is None)
                     and not (type(value) is cc.IssueRecoveryState and field.name == "self_clear_ceiling_reported" and not value.self_clear_ceiling_reported)

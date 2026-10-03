@@ -20,7 +20,7 @@ from .workflow_identity import (
 ISSUE_FIELDS = ("resumed-at", "resumes", "ci-retries", "review-retries", "rebase-retries",
                 "infra-deaths", "self-clears", "branch", "session", "model", "machine-block",
                 "budget-block", "self-clear-ceiling", "ci-history", "stall-sig")
-PR_FIELDS = ("resumed-at", "session", "model", "branch", "infra-deaths", "stall-sig", "ci-rerun-head", "ci-cancel-head")
+PR_FIELDS = ("resumed-at", "session", "model", "branch", "infra-deaths", "stall-sig", "ci-rerun-head", "ci-cancel-head", "update-branch-head", "ci-pending-escalated-head")
 STEWARD_FIELDS = ("triage-at", "groom-at", "groom-content", "steward-stalls-triage",
                   "steward-stalls-groom", "infra-deaths")
 IMPORT_FAMILIES = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD)
@@ -33,6 +33,8 @@ def digest(value: object) -> str:
 
 
 def _plan_state_identity(state: ImportedState | None) -> object:
+    if isinstance(state, cc.PRRepairState) and (state.branch_refresh is not None or state.pending_ci_escalation is not None):
+        return (_plan_state_identity(replace(state, branch_refresh=None, pending_ci_escalation=None)), repr(state.branch_refresh), repr(state.pending_ci_escalation))
     if isinstance(state, cc.PRRepairState) and (state.ci_rerun is not None or state.ci_cancel is not None):
         return (_plan_state_identity(replace(state, ci_rerun=None, ci_cancel=None)), repr(state.ci_rerun), repr(state.ci_cancel))
     if isinstance(state, cc.IssueRecoveryState) and state.self_clear_ceiling_reported:
@@ -72,7 +74,7 @@ class LegacyContinuationRecord:
                        tuple((name, type(value).__name__, value.digest if isinstance(value, LegacyPresent)
                               else None if isinstance(value, LegacyAbsent) else value.reason)
                              for name, value in self.fields
-                             if name not in {"ci-rerun-head", "ci-cancel-head"} or not isinstance(value, LegacyAbsent))))
+                             if name not in {"ci-rerun-head", "ci-cancel-head", "update-branch-head", "ci-pending-escalated-head"} or not isinstance(value, LegacyAbsent))))
 
 
 ImportedState = cc.IssueRecoveryState | cc.PRRepairState | cc.StewardState
@@ -157,6 +159,19 @@ def _budget_block(record: LegacyContinuationRecord, text: str) -> BudgetBlock:
     return block
 
 
+def _imported_pr_recovery(record: LegacyContinuationRecord, name: str, text: str):
+    source = dict(record.fields)[name]
+    if not isinstance(source, LegacyPresent):
+        raise ValueError("PR recovery import requires its exact file provenance")
+    identity = "legacy:" + digest((record.root, name, source.digest))
+    if name == "update-branch-head":
+        head, separator, base = text.partition(":")
+        if not separator or ":" in base:
+            raise ValueError("branch refresh requires exact head:base provenance")
+        return cc.ImportedBranchRefresh(head, base, identity)
+    return cc.ImportedPendingCIEscalation(text, identity)
+
+
 def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[cc.ContinuationImportBlocker, ...]:
     """Only direct typed facts are imported; unsupported provenance stays held."""
     values: dict[str, str] = {}
@@ -194,6 +209,11 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                 try:
                     head, separator, at = text.partition("@") if name == "ci-cancel-head" else (text, "", "")
                     cc.ImportedCIRemediation(head, at if separator else "", "legacy:" + digest((record.root, name, source.digest)))
+                except (ValueError, TypeError) as exc:
+                    reason = str(exc)
+            elif name in {"update-branch-head", "ci-pending-escalated-head"}:
+                try:
+                    _imported_pr_recovery(record, name, text)
                 except (ValueError, TypeError) as exc:
                     reason = str(exc)
             elif name in {"session", "model", "ci-history", "stall-sig"} or name == "infra-deaths" and record.family is WorkflowFamily.STEWARD:
@@ -243,7 +263,9 @@ def classify_record(record: LegacyContinuationRecord) -> ImportedState | tuple[c
                 assert isinstance(source, LegacyPresent)
                 return cc.ImportedCIRemediation(head, at if separator else "", "legacy:" + digest((record.root, name, source.digest)))
             return cc.PRRepairState(consumed_reply_at=values.get("resumed-at", ""), branch=values.get("branch", ""),
-                                    infra_failures=count("infra-deaths"), ci_rerun=imported("ci-rerun-head"), ci_cancel=imported("ci-cancel-head"))
+                                    infra_failures=count("infra-deaths"), ci_rerun=imported("ci-rerun-head"), ci_cancel=imported("ci-cancel-head"),
+                                    branch_refresh=_imported_pr_recovery(record, "update-branch-head", values["update-branch-head"]) if "update-branch-head" in values else None,
+                                    pending_ci_escalation=_imported_pr_recovery(record, "ci-pending-escalated-head", values["ci-pending-escalated-head"]) if "ci-pending-escalated-head" in values else None)
         return cc.StewardState(cc.StewardLaneState(values.get("triage-at", ""), count("steward-stalls-triage"), count("infra-deaths")),
                               cc.StewardLaneState(values.get("groom-at", ""), count("steward-stalls-groom"), count("infra-deaths")),
                               cc.GroomContent(values.get("groom-content", ""), values.get("groom-content", "")))

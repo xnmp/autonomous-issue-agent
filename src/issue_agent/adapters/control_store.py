@@ -6375,11 +6375,12 @@ class SQLiteControlStore:
     def _require_ci_remediation_projection(self, db, selected: cc.SelectedPRRepair) -> None:
         from ..domain.continuation_import import ContinuationImportTarget
         key = selected.binding.fence.key
-        for field, kind in (("ci_rerun", CommandKind.RERUN_CHECKS), ("ci_cancel", CommandKind.CANCEL_CHECKS)):
+        for field, kind in (("ci_rerun", CommandKind.RERUN_CHECKS), ("ci_cancel", CommandKind.CANCEL_CHECKS),
+                            ("branch_refresh", CommandKind.UPDATE_BRANCH), ("pending_ci_escalation", CommandKind.RELABEL)):
             remedy = getattr(selected.component.state, field)
             if remedy is None:
                 continue
-            if isinstance(remedy, cc.ImportedCIRemediation):
+            if isinstance(remedy, (cc.ImportedCIRemediation, cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation)):
                 row = db.execute("SELECT decision_json FROM workflow_activation_imports WHERE repository=? AND family=? "
                     "AND epoch=? AND target_kind=? AND target_number=?", (key.repository, WorkflowFamily.PR_REPAIR.value,
                     selected.binding.authority.epoch, *workflow_scope(key)[1:])).fetchone()
@@ -6387,17 +6388,18 @@ class SQLiteControlStore:
                 if imported is None or not isinstance(imported.state, cc.PRRepairState) or getattr(imported.state, field) != remedy:
                     raise WorkflowAuthorityError("imported CI remediation lost its exact original decision")
                 continue
-            owed = remedy if isinstance(remedy, cc.OwedCIRemediation) else remedy.owed
+            owed = remedy if isinstance(remedy, (cc.OwedCIRemediation, cc.OwedPRRecoveryEffect)) else remedy.owed
             row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
             command = _command_from_row(row) if row is not None else None
             if (command is None or command.kind is not kind or command.repository != key.repository
                     or command.target != f"pr:{key.target.number}"
-                    or decode_workflow(command.payload.get("ci_remediation"), cc.CIRemediationCapture) != owed.capture
+                    or (decode_workflow(command.payload.get("ci_remediation"), cc.CIRemediationCapture) if isinstance(owed, cc.OwedCIRemediation)
+                        else self._pr_recovery_capture(command)) != owed.capture
                     or owed.capture.binding.fence.key != key or owed.capture.binding.authority != selected.binding.authority
                     or owed.capture.binding.episode_id != selected.binding.episode_id
                     or owed.capture.binding.fence.generation > selected.binding.fence.generation):
                 raise WorkflowAuthorityError("CI remediation lost its exact selected command")
-            if isinstance(remedy, cc.SettledCIRemediation):
+            if isinstance(remedy, (cc.SettledCIRemediation, cc.SettledPRRecoveryEffect)):
                 proof = db.execute("SELECT * FROM effect_receipts WHERE command_id=?", (str(owed.command_id),)).fetchone()
                 actual = EffectReceipt(CommandId(proof["command_id"]), proof["executor_identity"], _parse_stamp(proof["started_at"]),
                     _parse_stamp(proof["completed_at"]), EffectStatus(proof["status"]), proof["remote_object_id"],
@@ -7460,7 +7462,8 @@ class SQLiteControlStore:
                         raise WorkflowAuthorityError("repair return lost its PR aggregate")
                     applied = replace(state, consumed_reply_at=component.state.consumed_reply_at, resumes=component.state.resumes,
                                       blank_reply=component.state.blank_reply,
-                                      ci_rerun=component.state.ci_rerun, ci_cancel=component.state.ci_cancel)
+                                      ci_rerun=component.state.ci_rerun, ci_cancel=component.state.ci_cancel,
+                                      branch_refresh=component.state.branch_refresh, pending_ci_escalation=component.state.pending_ci_escalation)
                     after = replace(aggregate, revision=revision, pr_repair=replace(component, state=applied, watermarks=watermarks))
                 else:
                     from ..domain.workflow import IssueWorkflowShell
@@ -8641,6 +8644,8 @@ class SQLiteControlStore:
         )
         if "ci_remediation" in command.payload:
             self._record_ci_remediation(db, command)
+        if "pr_recovery" in command.payload:
+            self._record_pr_recovery(db, command)
         self._transition(
             db,
             "lifecycle_command",
@@ -8656,6 +8661,93 @@ class SQLiteControlStore:
             correlation=_command_correlation(command),
         )
         return PendingCommand(command, "pending", 0)
+
+    @staticmethod
+    def _pr_recovery_capture(command):
+        from .effects import action_from_command
+        from ..domain.actions import UpdateBranch, EscalateCiPending
+        value = decode_workflow(command.payload.get("pr_recovery"), object)
+        if not isinstance(value, (cc.BranchRefreshCapture, cc.PendingCIEscalationCapture)):
+            raise WorkflowAuthorityError("PR recovery requires its fixed captured variant")
+        action = action_from_command(command)
+        exact = ((isinstance(value, cc.BranchRefreshCapture) and isinstance(action, UpdateBranch)
+                  and (action.head, action.base) == (value.head, value.base))
+                 or (isinstance(value, cc.PendingCIEscalationCapture) and isinstance(action, EscalateCiPending)
+                     and (action.head, action.body) == (value.decision_head, value.body)))
+        if (not exact or command.workflow is not None or command.expected_revision != value.head
+                or command.repository != value.binding.fence.key.repository
+                or command.target != f"pr:{value.binding.fence.key.target.number}"
+                or deployment_role(command.repository, command.executor_identity) != "fix"):
+            raise WorkflowAuthorityError("PR recovery differs from its exact captured command/head/base")
+        return value
+
+    def _selected_pr_recovery(self, db, command):
+        from .workflow_rows import load_review_workflow_row
+        capture = self._pr_recovery_capture(command)
+        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
+        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+        if not isinstance(selected, cc.SelectedPRRepair) or selected.binding != capture.binding:
+            raise WorkflowAuthorityError("PR recovery binding is no longer current")
+        return aggregate, selected, capture
+
+    def _record_pr_recovery(self, db, command):
+        from .workflow_rows import persist_workflow_snapshot
+        aggregate, selected, capture = self._selected_pr_recovery(db, command)
+        field = "branch_refresh" if isinstance(capture, cc.BranchRefreshCapture) else "pending_ci_escalation"
+        before = getattr(selected.component.state, field)
+        prior = before.owed.capture if isinstance(before, cc.SettledPRRecoveryEffect) else before.capture if isinstance(before, cc.OwedPRRecoveryEffect) else before
+        if prior is not None and (prior.head, getattr(prior, "base", None)) == (capture.head, getattr(capture, "base", None)):
+            raise WorkflowAuthorityError("this head/base already owns its PR recovery effect")
+        state = replace(selected.component.state, **{field: cc.OwedPRRecoveryEffect(command.command_id, capture)})
+        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
+            pr_repair=replace(selected.component, state=state)))
+
+    def validate_pr_recovery(self, command):
+        with self.transaction() as db:
+            _, selected, capture = self._selected_pr_recovery(db, command)
+            field = "branch_refresh" if isinstance(capture, cc.BranchRefreshCapture) else "pending_ci_escalation"
+            if getattr(selected.component.state, field) != cc.OwedPRRecoveryEffect(command.command_id, capture):
+                raise WorkflowAuthorityError("PR recovery is not its exact owed command")
+
+    def current_pr_recovery_command(self, repository, pr, head, base=None):
+        from .workflow_rows import load_review_workflow_row
+        with self.transaction() as db:
+            aggregate = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
+            selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+            if not isinstance(selected, cc.SelectedPRRepair):
+                raise WorkflowAuthorityError("PR recovery authority is unavailable")
+            self._require_ci_remediation_projection(db, selected)
+            remedy = selected.component.state.branch_refresh if base is not None else selected.component.state.pending_ci_escalation
+            if remedy is None or isinstance(remedy, (cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation)):
+                return None
+            owed = remedy if isinstance(remedy, cc.OwedPRRecoveryEffect) else remedy.owed
+            capture = owed.capture
+            if (capture.head if isinstance(capture, cc.BranchRefreshCapture) else capture.decision_head) != head:
+                return None
+            if isinstance(capture, cc.BranchRefreshCapture) and capture.base != base:
+                return None
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
+            return PendingCommand(_command_from_row(row), row["state"], row["attempts"], row["refusals"])
+
+    def _settle_pr_recovery(self, db, command, receipt):
+        from .workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+        if receipt.status not in {EffectStatus.SUCCEEDED, EffectStatus.PERMANENT_FAILURE}:
+            return
+        capture = self._pr_recovery_capture(command)
+        aggregate = load_review_workflow_row(db, capture.binding.fence.key)
+        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+        if (not isinstance(selected, cc.SelectedPRRepair) or selected.binding.authority != capture.binding.authority
+                or selected.binding.episode_id != capture.binding.episode_id
+                or selected.binding.fence.generation < capture.binding.fence.generation):
+            return
+        field = "branch_refresh" if isinstance(capture, cc.BranchRefreshCapture) else "pending_ci_escalation"
+        owed = getattr(selected.component.state, field)
+        if owed != cc.OwedPRRecoveryEffect(command.command_id, capture):
+            return
+        normalized = replace(receipt, started_at=_parse_stamp(_stamp(receipt.started_at)), completed_at=_parse_stamp(_stamp(receipt.completed_at)))
+        state = replace(selected.component.state, **{field: cc.SettledPRRecoveryEffect(owed, normalized)})
+        persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
+            pr_repair=replace(selected.component, state=state)))
 
     def _selected_ci_remediation(self, db, command):
         from .workflow_rows import load_review_workflow_row
@@ -8743,6 +8835,9 @@ class SQLiteControlStore:
         registering_steward_verdict: bool = False,
         allow_blocked_submission_retry: bool = False,
     ) -> None:
+        if "pr_recovery" in command.payload:
+            self._selected_pr_recovery(db, command)
+            return
         if "ci_remediation" in command.payload:
             self._selected_ci_remediation(db, command)
             return
@@ -10312,7 +10407,7 @@ class SQLiteControlStore:
             if state not in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
                 raise ControlStoreError("command is not awaiting reconciliation")
             command = _command_from_row(row)
-            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload or "ci_remediation" in command.payload:
+            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload or "ci_remediation" in command.payload or "pr_recovery" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow reconciliation receipt requires the current command owner")
@@ -10360,7 +10455,7 @@ class SQLiteControlStore:
             if row["state"] != EffectStatus.RETRYABLE_FAILURE.value:
                 return False
             command = _command_from_row(row)
-            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload or "ci_remediation" in command.payload:
+            if command.workflow is not None or "steward_guard" in command.payload or "self_clear" in command.payload or "ci_remediation" in command.payload or "pr_recovery" in command.payload:
                 self._assert_owner_active(db, command.executor_identity)
                 if receipt.executor_identity != command.executor_identity:
                     raise ControlStoreError("workflow exhaustion receipt requires the current command owner")
@@ -10408,6 +10503,10 @@ class SQLiteControlStore:
         if command_row is None:
             raise ControlStoreError(f"receipt {receipt.command_id} has no lifecycle command")
         command = _command_from_row(command_row)
+        if "pr_recovery" in command.payload:
+            if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
+                raise WorkflowAuthorityError("PR recovery receipt requires its captured attempt owner")
+            self._settle_pr_recovery(db, command, receipt)
         if "ci_remediation" in command.payload:
             if not command_row["attempt_owner"] or receipt.executor_identity != command_row["attempt_owner"]:
                 raise WorkflowAuthorityError("CI remediation receipt requires its captured attempt owner")

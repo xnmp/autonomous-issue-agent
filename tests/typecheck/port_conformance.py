@@ -35,7 +35,6 @@ from issue_agent.app.roles import (
 import issue_agent.domain.workflow_ports as workflow_ports
 from issue_agent.domain.ports import (
     ActionExecutor,
-    CiPendingState,
     CiPromptReads,
     CommandRecovery,
     ControlStore,
@@ -73,7 +72,6 @@ from issue_agent.domain.ports import (
 COVERED_PORTS = frozenset(
     {
         "ActionExecutor",
-        "CiPendingState",
         "CiPromptReads",
         "CommandRecovery",
         "ControlStore",
@@ -243,10 +241,6 @@ def legacy_journal(locator: LegacyJournalLocator) -> LegacyJournal:
 
 
 def prediction_reader(store: Store) -> PredictionReader:
-    return store
-
-
-def ci_pending_state(store: Store) -> CiPendingState:
     return store
 
 

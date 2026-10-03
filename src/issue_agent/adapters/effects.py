@@ -390,6 +390,8 @@ class GitHubEffectExecutor:
         pending = (self.store.current_ci_remediation_command(self.repository, action.pr,
             CommandKind.RERUN_CHECKS if isinstance(action, RerunFailedChecks) else CommandKind.CANCEL_CHECKS,
             action.head, action.run_ids) if isinstance(action, (RerunFailedChecks, CancelWorkflowRuns))
+            else self.store.current_pr_recovery_command(self.repository, action.pr, action.head,
+                action.base if isinstance(action, UpdateBranch) else None) if isinstance(action, (UpdateBranch, EscalateCiPending))
             else self._pending_for_action(action))
         if pending is not None and _unresolved_workflow_command(pending):
             return self._reconcile_scheduled(pending, raise_unresolved=True)
@@ -606,7 +608,7 @@ class GitHubEffectExecutor:
             command = pending.command
             action = action_from_command(command)
         if pending.state == EffectStatus.SUCCEEDED.value:
-            if "ci_remediation" in command.payload:
+            if "ci_remediation" in command.payload or "pr_recovery" in command.payload:
                 return True
             current = self._reconcile(action, command)
             if current is True:
@@ -1051,6 +1053,8 @@ class GitHubEffectExecutor:
                     applied = self._run_submission(pending, raise_deferred=False)
                 elif (op := review_family_op(command)) is not None:
                     applied = self._execute_review(op, pending)
+                elif command.kind in {CommandKind.UPDATE_BRANCH, CommandKind.RERUN_CHECKS, CommandKind.CANCEL_CHECKS} or isinstance(action_from_command(command), EscalateCiPending):
+                    applied = self._execute(action_from_command(command), pending)
                 else:
                     applied = self.execute(action_from_command(command))
             except sqlite3.Error:
@@ -1732,6 +1736,13 @@ class GitHubEffectExecutor:
             capture = cc.CIRemediationCapture(selected.binding, action.head, action.run_ids,
                 action.decided_at if isinstance(action, CancelWorkflowRuns) else "")
             extra["ci_remediation"] = encode_workflow(capture)
+        if isinstance(action, (UpdateBranch, EscalateCiPending)):
+            selected = self.store.read_pr_repair(WorkflowKey(self.repository, PullRequestRef(action.pr)))
+            if not isinstance(selected, cc.SelectedPRRepair):
+                raise WorkflowAuthorityError("PR recovery authority is unavailable")
+            capture = (cc.BranchRefreshCapture(selected.binding, action.head, action.base) if isinstance(action, UpdateBranch)
+                else cc.PendingCIEscalationCapture(selected.binding, expected, action.head, action.body))
+            extra["pr_recovery"] = encode_workflow(capture)
         return command_for_action(
             action,
             self.config_version,
@@ -1853,6 +1864,11 @@ class GitHubEffectExecutor:
         return True
 
     def _revision_matches(self, command: LifecycleCommand, *, self_clear_reconciliation: bool = False) -> bool:
+        if "pr_recovery" in command.payload:
+            try:
+                self.store.validate_pr_recovery(command)
+            except WorkflowAuthorityError:
+                return False
         if "ci_remediation" in command.payload:
             try:
                 self.store.validate_ci_remediation(command)
@@ -2157,6 +2173,7 @@ def action_from_command(command: LifecycleCommand) -> Action:
                 or command.expected_revision
                 or ""
             ),
+            str(payload.get("base", "")),
         )
     if command.kind is CommandKind.RERUN_CHECKS:
         return RerunFailedChecks(

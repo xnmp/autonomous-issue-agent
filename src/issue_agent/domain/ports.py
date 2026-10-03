@@ -457,12 +457,6 @@ class PredictionReader(Protocol):
 
 
 @runtime_checkable
-class CiPendingState(Protocol):
-    """Read the escalated head; empty means absent, storage failures raise."""
-    def get_ci_pending_escalated_head(self, pr: int) -> str: ...
-
-
-@runtime_checkable
 class IssueStateReasonReads(Protocol):
     """Read GitHub state reason; transport failures raise."""
     def issue_state_reason(self, issue: int) -> str: ...

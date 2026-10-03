@@ -276,9 +276,8 @@ def test_runtime_ci_marker_accessors_are_removed():
 
 def test_ci_pending_escalated_head_marker_roundtrip():
     s, _ = _store()
-    assert s.get_ci_pending_escalated_head(100) == ""
-    s.set_ci_pending_escalated_head(100, "sha-1")
-    assert s.get_ci_pending_escalated_head(100) == "sha-1"
+    for name in ("get_ci_pending_escalated_head", "set_ci_pending_escalated_head", "get_update_branch_head", "set_update_branch_head"):
+        assert not hasattr(s, name)
 
 
 def test_cleanup_pr_merged_clears_the_ci_rerun_marker():
@@ -422,7 +421,7 @@ def test_every_pr_accessor_suffix_is_covered_by_exactly_one_cleaner():
     # drift: automerge_enabled/mark_automerge use pr_path, so `automerge` must
     # be in _PR_SUFFIXES (it used to sit, unused, in the issue tuple instead).
     # F2 retired the runtime accessor; historical files still need cleanup.
-    assert _accessor_suffixes("pr_path") | {"resumed-at", "ci-rerun-head", "ci-cancel-head"} == set(store_module._PR_SUFFIXES)
+    assert _accessor_suffixes("pr_path") | {"resumed-at", "ci-rerun-head", "ci-cancel-head", "update-branch-head", "ci-pending-escalated-head"} == set(store_module._PR_SUFFIXES)
 
 
 # ── merged/closed-unmerged cleanup orchestration (review M4/D8) ────────────
@@ -527,7 +526,7 @@ def test_every_state_namespace_across_all_three_path_methods_has_a_cleaner():
     used = {("issue_path", s) for s in _accessor_suffixes("issue_path")}
     used |= {("issue_path", "steward-stalls-triage"), ("issue_path", "ci-retries"), ("issue_path", "review-retries"), ("issue_path", "rebase-retries"), ("issue_path", "machine-block"), ("issue_path", "budget-block"), ("issue_path", "self-clears"), ("issue_path", "self-clear-ceiling")}
     used |= {("pr_path", s) for s in _accessor_suffixes("pr_path")}
-    used |= {("pr_path", s) for s in ("resumed-at", "ci-rerun-head", "ci-cancel-head")}
+    used |= {("pr_path", s) for s in ("resumed-at", "ci-rerun-head", "ci-cancel-head", "update-branch-head", "ci-pending-escalated-head")}
     used.add(("triage_at_path", None))  # single fixed namespace, no suffix param
 
     cleared = {("issue_path", s) for s in store_module._ISSUE_SUFFIXES}

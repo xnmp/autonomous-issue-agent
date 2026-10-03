@@ -42,6 +42,23 @@ def test_imported_ci_hints_preserve_exact_bounded_source_without_success_receipt
     assert different.ci_rerun.import_identity != value.ci_rerun.import_identity
 
 
+def test_imported_refresh_and_escalation_keep_exact_source_and_base_identity():
+    value = classify_record(record(WorkflowFamily.PR_REPAIR, **{
+        "update-branch-head": "head-1:base-1", "ci-pending-escalated-head": "head-1"}))
+    assert isinstance(value, cc.PRRepairState)
+    assert isinstance(value.branch_refresh, cc.ImportedBranchRefresh)
+    assert isinstance(value.pending_ci_escalation, cc.ImportedPendingCIEscalation)
+    assert (value.branch_refresh.head, value.branch_refresh.base, value.pending_ci_escalation.head) == ("head-1", "base-1", "head-1")
+    assert value.branch_refresh.import_identity != value.pending_ci_escalation.import_identity
+
+
+@pytest.mark.parametrize("name,text", [("update-branch-head", "head"), ("update-branch-head", ":base"),
+    ("update-branch-head", "head:base:other"), ("ci-pending-escalated-head", ""), ("ci-pending-escalated-head", "x" * 1000)])
+def test_malformed_pr_recovery_hint_refuses_exact_import_source(name, text):
+    value = classify_record(record(WorkflowFamily.PR_REPAIR, **{name: text}))
+    assert isinstance(value, tuple) and value and all(name in blocker.reason for blocker in value)
+
+
 @pytest.mark.parametrize("name,text", [("ci-rerun-head", ""), ("ci-rerun-head", "x" * 1000),
     ("ci-cancel-head", "@2026-10-01T00:00:00Z"), ("ci-cancel-head", "head@garbage"),
     ("ci-cancel-head", "head@2026-10-01T00:00:00Z@other")])

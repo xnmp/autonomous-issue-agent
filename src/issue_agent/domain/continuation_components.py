@@ -318,6 +318,84 @@ CIRemediation = OwedCIRemediation | SettledCIRemediation | ImportedCIRemediation
 
 
 @dataclass(frozen=True)
+class BranchRefreshCapture:
+    binding: WorkflowBinding
+    head: str
+    base: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, WorkflowBinding) or self.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("branch refresh requires selected PR repair authority")
+        validate_workflow_identifier(self.head, "branch refresh head")
+        validate_workflow_text(self.base, "branch refresh base", empty=True)
+
+
+@dataclass(frozen=True)
+class PendingCIEscalationCapture:
+    binding: WorkflowBinding
+    head: str
+    decision_head: str
+    body: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, WorkflowBinding) or self.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("pending CI escalation requires selected PR repair authority")
+        validate_workflow_identifier(self.head, "pending CI observed head")
+        validate_workflow_text(self.decision_head, "pending CI decision head", empty=True)
+        validate_workflow_text(self.body, "pending CI escalation body")
+        if self.decision_head and self.decision_head != self.head:
+            raise ValueError("pending CI decision differs from its observed head")
+
+
+PRRecoveryCapture = BranchRefreshCapture | PendingCIEscalationCapture
+
+
+@dataclass(frozen=True)
+class OwedPRRecoveryEffect:
+    command_id: CommandId
+    capture: PRRecoveryCapture
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.command_id, "PR recovery command")
+        if not isinstance(self.capture, (BranchRefreshCapture, PendingCIEscalationCapture)):
+            raise ValueError("PR recovery effect requires fixed captured provenance")
+
+
+@dataclass(frozen=True)
+class SettledPRRecoveryEffect:
+    owed: OwedPRRecoveryEffect
+    receipt: EffectReceipt
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.owed, OwedPRRecoveryEffect) or not isinstance(self.receipt, EffectReceipt)
+                or self.receipt.command_id != self.owed.command_id
+                or self.receipt.status not in {EffectStatus.SUCCEEDED, EffectStatus.PERMANENT_FAILURE}):
+            raise ValueError("PR recovery completion requires its exact terminal receipt")
+
+
+@dataclass(frozen=True)
+class ImportedBranchRefresh:
+    head: str
+    base: str
+    import_identity: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.head, "imported branch refresh head")
+        validate_workflow_text(self.base, "imported branch refresh base", empty=True)
+        validate_workflow_identifier(self.import_identity, "branch refresh import identity")
+
+
+@dataclass(frozen=True)
+class ImportedPendingCIEscalation:
+    head: str
+    import_identity: str
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.head, "imported pending CI head")
+        validate_workflow_identifier(self.import_identity, "pending CI import identity")
+
+
+@dataclass(frozen=True)
 class PRRepairState:
     consumed_reply_at: str = ""
     branch: str = ""
@@ -332,6 +410,8 @@ class PRRepairState:
     blank_reply: PRBlankReplySource | None = field(default=None, repr=False)
     ci_rerun: CIRemediation | None = field(default=None, repr=False)
     ci_cancel: CIRemediation | None = field(default=None, repr=False)
+    branch_refresh: OwedPRRecoveryEffect | SettledPRRecoveryEffect | ImportedBranchRefresh | None = field(default=None, repr=False)
+    pending_ci_escalation: OwedPRRecoveryEffect | SettledPRRecoveryEffect | ImportedPendingCIEscalation | None = field(default=None, repr=False)
 
     def __post_init__(self) -> None:
         _timestamp(self.consumed_reply_at, "consumed PR reply")
@@ -342,6 +422,13 @@ class PRRepairState:
         for remediation in (self.ci_rerun, self.ci_cancel):
             if remediation is not None and not isinstance(remediation, (OwedCIRemediation, SettledCIRemediation, ImportedCIRemediation)):
                 raise ValueError("CI remediation requires fixed typed provenance")
+        for remedy, captured, imported in ((self.branch_refresh, BranchRefreshCapture, ImportedBranchRefresh),
+                                           (self.pending_ci_escalation, PendingCIEscalationCapture, ImportedPendingCIEscalation)):
+            if remedy is None or isinstance(remedy, imported):
+                continue
+            owed = remedy.owed if isinstance(remedy, SettledPRRecoveryEffect) else remedy
+            if not isinstance(owed, OwedPRRecoveryEffect) or not isinstance(owed.capture, captured):
+                raise ValueError("PR recovery field differs from its fixed effect provenance")
         if self.actual_model is not None and not isinstance(self.actual_model, RepairModel):
             raise ValueError("actual repair model requires typed provenance")
         if self.blank_reply is not None and (not isinstance(self.blank_reply, PRBlankReplySource)

@@ -1308,6 +1308,15 @@ def test_advisory_unstable_refresh_fires_once_per_head_and_base():
     assert not any(isinstance(a, UpdateBranch) for a in actions)
 
 
+def test_behind_refresh_is_bounded_by_exact_head_base_with_independent_base_progress():
+    pr = replace(_approved_advisory_unstable_pr(), merge_state="BEHIND")
+    state = FixState(update_branch_head={100: "head-100:base-1"})
+    assert not any(isinstance(action, UpdateBranch) for action in decide_fix(
+        world(prs=[pr], base_head="base-1"), CFG, state, fixer_busy=False))
+    assert UpdateBranch(100, "head-100", "base-2") in decide_fix(
+        world(prs=[pr], base_head="base-2"), CFG, state, fixer_busy=False)
+
+
 def test_a_base_advance_rearms_the_advisory_refresh():
     """Adversarial F1 (this arm's whole reason to exist): an attempt made
     BEFORE the base gained the fix must not permanently disarm the refresh —

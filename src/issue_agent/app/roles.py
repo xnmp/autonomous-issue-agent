@@ -163,7 +163,6 @@ from ..domain.events import (
 )
 from ..domain.ports import (
     WorkflowControlError,
-    CiPendingState,
     CommandRecovery,
     EventSink,
     IssueStateReasonReads,
@@ -1950,6 +1949,8 @@ def _fix_state(
     ci_cancel_head = {}
     ci_remediations = {}
     ci_remediation_errors = {}
+    update_branch_head = {}
+    pending_ci_escalations = set()
     for pr in world.prs:
         try:
             if workflow_control is None:
@@ -1967,19 +1968,20 @@ def _fix_state(
                 return f"{capture.head}@{capture.decided_at}" if capture.decided_at else capture.head
             ci_rerun_head[pr.number] = head_marker(rerun)
             ci_cancel_head[pr.number] = head_marker(cancel)
+            refresh = selected.component.state.branch_refresh
+            escalation = selected.component.state.pending_ci_escalation
+            def recovery_capture(item):
+                return item.capture if isinstance(item, cc.OwedPRRecoveryEffect) else item.owed.capture if isinstance(item, cc.SettledPRRecoveryEffect) else item
+            refresh_capture = recovery_capture(refresh)
+            if refresh_capture is not None:
+                update_branch_head[pr.number] = f"{refresh_capture.head}:{refresh_capture.base}"
+            escalation_capture = recovery_capture(escalation)
+            if escalation_capture is not None:
+                pending_ci_escalations.add((pr.number, escalation_capture.decision_head
+                    if isinstance(escalation_capture, cc.PendingCIEscalationCapture) else escalation_capture.head))
         except (ValueError, sqlite3.Error) as exc:
             ci_remediation_errors[pr.number] = str(exc)
-    # keifu PR #177: the head whose wedged runs were already sent a cancel, so
-    # the deadline waits for GitHub instead of re-cancelling every poll.
-    update_branch_head = {
-        p.number: read(p.number, store.get_update_branch_head, "", error_key=breaker_key(p)) for p in world.prs
-    }
-    ci_pending_escalated = frozenset(
-        (p.number, head)
-        for p in world.prs
-        if isinstance(store, CiPendingState)
-        and (head := read(p.number, store.get_ci_pending_escalated_head, "", error_key=breaker_key(p)))
-    )
+    ci_pending_escalated = frozenset(pending_ci_escalations)
     issue_keys = {
         *[i.number for i in world.issues],
         *[key for p in world.prs if (key := breaker_key(p)) > 0],
@@ -2735,8 +2737,6 @@ def compose_fix_daemon(
     executor = Executor(
         gateway, remove_worktree=worktrees.remove, log=log,
         mark_automerge=store.mark_automerge,
-        mark_branch_update=store.set_update_branch_head,
-        mark_ci_pending_escalated=store.set_ci_pending_escalated_head,
         clear_issue_state=cleanup_fix_state,
         reset_ci_retries=reset_ci_episode,
         mark_self_clear_ceiling=control.mark_self_clear_ceiling,

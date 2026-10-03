@@ -404,17 +404,6 @@ class Store:
         self._remove(self.issue_path(key, "ci-history"))
         return removed
 
-    # PR → head a branch-refresh (advisory-UNSTABLE arm) was last dispatched
-    # for. Same head-keyed shape and same write-before-execute ordering as the
-    # ci-rerun marker above: refresh-but-not-marked is an unbounded push loop,
-    # marked-but-not-refreshed costs one retry next poll.
-    def get_update_branch_head(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "update-branch-head"))
-
-    def set_update_branch_head(self, pr: int, sha: str) -> None:
-        if sha:
-            self._write(self.pr_path(pr, "update-branch-head"), sha)
-
     # ── stall watchdog markers (no-silent-forever) ──
     # (signature, since_iso) per watched target: the observable state last
     # seen and when it first appeared. Written only when the signature
@@ -443,13 +432,6 @@ class Store:
             else self.issue_path(number, "stall-sig")
         )
         self._write(path, json.dumps({"sig": sig, "since": since}))
-
-    def get_ci_pending_escalated_head(self, pr: int) -> str:
-        return self._read(self.pr_path(pr, "ci-pending-escalated-head"))
-
-    def set_ci_pending_escalated_head(self, pr: int, sha: str) -> None:
-        if sha:
-            self._write(self.pr_path(pr, "ci-pending-escalated-head"), sha)
 
     # ── automerge marker ──
     def automerge_enabled(self, pr: int) -> bool:

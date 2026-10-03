@@ -829,6 +829,8 @@ def should_update_branch(
         return False
     if not pr.head_ref_oid:
         return False
+    if pr.number in state.ci_remediation_errors or state.update_branch_head.get(pr.number, "") == update_branch_marker(pr, base_head):
+        return False
     # Same containment as should_automerge: this PUSHES to the PR's branch, which
     # is not something to do to a PR the harness did not author.
     if not is_governed_branch(pr.head_ref_name):

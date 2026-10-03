@@ -796,10 +796,105 @@ def test_ambiguous_auto_merge_is_reconciled_without_duplicate(tmp_path) -> None:
     assert store.pending_commands() == ()
 
 
+@pytest.mark.parametrize("escalation", [False, True])
+def test_pr_recovery_receipt_bounds_same_head_after_remote_projection_restoration(tmp_path, escalation):
+    from issue_agent.domain.actions import EscalateCiPending
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    action = EscalateCiPending(7, "head-1", "stalled CI requires a human") if escalation else UpdateBranch(7, "head-1", "base-1")
+    assert executor.execute(action)
+    before = list(gateway.calls)
+    assert before
+    gateway.head = "head-1"
+    gateway.labels.clear()
+    restarted = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix")
+    assert restarted.execute(action)
+    assert gateway.calls == before
+
+
+@pytest.mark.parametrize("escalation", [False, True])
+def test_lost_pr_recovery_success_reconciles_once_and_new_identity_remains_eligible(tmp_path, escalation):
+    from issue_agent.domain.actions import EscalateCiPending
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    action = EscalateCiPending(7, "head-1", "stalled") if escalation else UpdateBranch(7, "head-1", "base-1")
+    name = "relabel" if escalation else "update_branch"
+    original = getattr(gateway, name)
+    def lost(*args):
+        original(*args)
+        raise RuntimeError("PR recovery success reply lost")
+    setattr(gateway, name, lost)
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(action)
+    field = "pending_ci_escalation" if escalation else "branch_refresh"
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    owed = getattr(store.read_pr_repair(key).component.state, field)
+    assert isinstance(owed, cc.OwedPRRecoveryEffect)
+    before = list(gateway.calls)
+    setattr(gateway, name, original)
+    restarted = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix")
+    assert restarted.drain_pending_commands() == 1
+    completed = getattr(store.read_pr_repair(key).component.state, field)
+    assert isinstance(completed, cc.SettledPRRecoveryEffect) and completed.owed == owed
+    assert restarted.execute(action)
+    assert gateway.calls == before
+    gateway.head = "head-2" if escalation else "head-1"
+    gateway.labels.clear()
+    next_action = EscalateCiPending(7, "head-2", "new head stalled") if escalation else UpdateBranch(7, "head-1", "base-2")
+    assert restarted.execute(next_action)
+    newer = getattr(store.read_pr_repair(key).component.state, field)
+    assert isinstance(newer, cc.SettledPRRecoveryEffect) and newer.owed.command_id != owed.command_id
+    assert len(gateway.calls) > len(before)
+
+
+@pytest.mark.parametrize("escalation", [False, True])
+def test_stale_pr_recovery_receipt_cannot_complete_replacement_head_or_base(tmp_path, escalation):
+    from issue_agent.adapters.durable_effects import EffectOutcome
+    from issue_agent.domain.contracts import EffectStatus
+    from issue_agent.domain.actions import EscalateCiPending
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    action = EscalateCiPending(7, "head-1", "stalled") if escalation else UpdateBranch(7, "head-1", "base-1")
+    old_command = executor._command(action)
+    store.enqueue_command(old_command)
+    store.begin_command(old_command.command_id)
+    gateway.head = "head-2" if escalation else "head-1"
+    newer_action = EscalateCiPending(7, "head-2", "new stalled") if escalation else UpdateBranch(7, "head-1", "base-2")
+    assert executor.execute(newer_action)
+    key = WorkflowKey("o/r", PullRequestRef(7))
+    before = store.read_pr_repair(key)
+    assert executor.effects.resolve_unknown(old_command, EffectOutcome(True, EffectStatus.SUCCEEDED))
+    assert store.read_pr_repair(key) == before
+
+
+@pytest.mark.parametrize("escalation", [False, True])
+def test_authorized_successor_receipts_original_pr_recovery_without_remote_repeat(tmp_path, escalation):
+    from issue_agent.domain.actions import EscalateCiPending
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    action = EscalateCiPending(7, "head-1", "stalled") if escalation else UpdateBranch(7, "head-1", "base-1")
+    name = "relabel" if escalation else "update_branch"
+    original = getattr(gateway, name)
+    def lost(*args):
+        original(*args)
+        raise RuntimeError("PR recovery success reply lost")
+    setattr(gateway, name, lost)
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(action)
+    before = list(gateway.calls)
+    setattr(gateway, name, original)
+    store.adopt_legacy_owner("o/r", "fix", "o/r:fix:successor", prior_owner_ids=("o/r:fix",))
+    with pytest.raises(RetiredOwnerError):
+        executor.execute(action)
+    successor = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix:successor")
+    assert successor.drain_pending_commands() == 1
+    assert successor.execute(action)
+    assert gateway.calls == before
+
+
 def test_ambiguous_branch_update_uses_original_revision_to_reconcile(
     tmp_path,
 ) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=True)
     action = UpdateBranch(7, "head-1")
     original = gateway.update_branch
 
@@ -890,18 +985,19 @@ def test_ci_lost_success_adopts_authorized_owner_and_refuses_retired_owner(tmp_p
 
 
 @pytest.mark.parametrize("settling", [False, True])
-def test_caught_ci_projection_failure_rolls_back_command_or_receipt_with_state(tmp_path, monkeypatch, settling):
+@pytest.mark.parametrize("refresh", [False, True])
+def test_caught_ci_projection_failure_rolls_back_command_or_receipt_with_state(tmp_path, monkeypatch, settling, refresh):
     from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
     from issue_agent.domain.contracts import EffectReceipt, EffectStatus
     from datetime import datetime, timezone
     executor, _, store = _executor(tmp_path, ci=True)
-    command = executor._command(RerunFailedChecks(7, "head-1", (42,)))
+    command = executor._command(UpdateBranch(7, "head-1", "base-1") if refresh else RerunFailedChecks(7, "head-1", (42,)))
     key = WorkflowKey("o/r", PullRequestRef(7))
     if settling:
         store.enqueue_command(command)
         store.begin_command(command.command_id)
     before = store.read_pr_repair(key)
-    name = "_settle_ci_remediation" if settling else "_record_ci_remediation"
+    name = ("_settle_pr_recovery" if settling else "_record_pr_recovery") if refresh else ("_settle_ci_remediation" if settling else "_record_ci_remediation")
     original = getattr(store, name)
     def fail_after_projection(*args):
         original(*args)
@@ -1199,7 +1295,7 @@ def test_pr_mutation_server_guard_rejects_check_to_write_head_race(
     action,
     race_attribute,
 ) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, ci=isinstance(action, UpdateBranch))
     setattr(gateway, race_attribute, "head-2")
 
     assert executor.execute(action) is False

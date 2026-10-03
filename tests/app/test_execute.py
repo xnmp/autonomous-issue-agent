@@ -80,35 +80,29 @@ def test_post_comment():
     assert gw.calls == [("comment", "issue", 5, "hello")]
 
 
-def test_ci_pending_escalation_marks_head_after_verified_write():
+def test_ci_pending_escalation_reuses_verified_label_and_posts_missing_comment():
     gw = FakeGateway(
         prs={100: PRView(100, head_ref_oid="head-100")}
     )
     gw.has_label = lambda kind, number, label: True
-    marked = []
-    ex = Executor(gw, mark_ci_pending_escalated=lambda pr, head: marked.append(
-        (pr, head)
-    ))
+    ex = Executor(gw)
 
     ex.execute(EscalateCiPending(100, "sha-1", "stalled"))
 
     assert [call[0] for call in gw.calls] == ["comment"]
 
 
-def test_ci_pending_escalation_withholds_marker_when_relabel_is_not_verified():
+def test_ci_pending_escalation_refuses_unverified_relabel():
     gw = FakeGateway(
         prs={100: PRView(100, head_ref_oid="head-100")}
     )
     gw.has_label = lambda kind, number, label: False
-    marked = []
-    ex = Executor(gw, mark_ci_pending_escalated=lambda pr, head: marked.append(
-        (pr, head)
-    ))
+    ex = Executor(gw)
 
     with pytest.raises(RuntimeError, match="not verified"):
         ex.execute(EscalateCiPending(100, "sha-1", "stalled"))
 
-    assert marked == []
+    assert any(call[0] == "relabel" for call in gw.calls)
 
 
 def test_close_issue():
@@ -161,32 +155,24 @@ def test_update_branch():
     assert gw.calls == [("update_branch", 100)]
 
 
-def test_branch_refresh_marks_the_attempt_before_asking_github():
-    # Same safety property (and the same ordering) as the CI re-run marker:
-    # marker THEN gh. Refreshed-but-not-marked is an unbounded push loop.
+def test_branch_refresh_executes_existing_remote_request():
     gw = FakeGateway(prs={100: PRView(100, head_ref_oid="head-100")})
-    marked = []
     ex = Executor(
-        gw, mark_branch_update=lambda pr, key: marked.append((pr, key))
+        gw
     )
     ex.execute(UpdateBranch(100, "head-100", "base-1"))
-    assert marked == [(100, "head-100:base-1")]
     assert ("update_branch", 100) in gw.calls
 
 
 def test_failed_branch_refresh_is_logged_and_journalled_not_silent():
-    # Adversarial F2: the attempt is spent either way (marker written first);
-    # what must not happen is spending it INVISIBLY.
     gw = FakeGateway(prs={})  # no PR 100 → update_branch returns False
-    marked, logged = [], []
+    logged = []
     j = _Journal()
     ex = Executor(
         gw,
-        mark_branch_update=lambda pr, key: marked.append((pr, key)),
         journal=j, log=logged.append,
     )
     ex.execute(UpdateBranch(100, "head-100", "base-1"))
-    assert marked == [(100, "head-100:base-1")]
     assert any("did not land" in line for line in logged)
     kind, fields = next(e for e in j.events if e[0] == "branch_refresh")
     assert (fields["pr"], fields["head"], fields["base"], fields["ok"]) == (

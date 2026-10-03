@@ -343,8 +343,6 @@ class Executor:
         run_agent: Callable[[RunAgent], None] | None = None,
         log: Callable[[str], None] | None = None,
         mark_automerge: Callable[[int], None] | None = None,
-        mark_branch_update: Callable[[int, str], None] | None = None,
-        mark_ci_pending_escalated: Callable[[int, str], None] | None = None,
         clear_issue_state: Callable[[int, int | None, bool], None] | None = None,
         reset_ci_retries: Callable[[ResetCiRetries], None] | None = None,
         retire_machine_block: Callable[[FinalizeMachineBlockRetirement], int] | None = None,
@@ -370,16 +368,6 @@ class Executor:
         # one wasted `gh pr merge --auto` per merge-ready PR per tick.
         self._mark_automerge = mark_automerge or _missing_handler(
             "mark_automerge"
-        )
-        # Persists the head an advisory-UNSTABLE branch-refresh was dispatched
-        # for (FixState.update_branch_head). Written BEFORE the update call,
-        # same ordering rationale as the ci-rerun marker: marked-but-not-
-        # refreshed costs one retry next poll; refreshed-but-not-marked is an
-        # unbounded push loop.
-        self._mark_branch_update = mark_branch_update
-        self._mark_ci_pending_escalated = (
-            mark_ci_pending_escalated
-            or _missing_handler("mark_ci_pending_escalated")
         )
         # Retires STATE_DIR files on the ClearIssueState arm (review M4/D8:
         # Store.clear_issue/clear_pr_review had zero production call sites).
@@ -574,7 +562,6 @@ class Executor:
         if isinstance(action, Relabel):
             self._human_wait_transition(action)
         elif isinstance(action, EscalateCiPending):
-            self._mark_ci_pending_escalated(action.pr, action.head)
             self._escalated(
                 Relabel(
                     Target.PR,
@@ -586,10 +573,6 @@ class Executor:
 
     def _apply_once(self, action: Action) -> None:
         if self._effect_executor.handles(action):
-            if isinstance(action, UpdateBranch) and self._mark_branch_update is not None:
-                self._mark_branch_update(
-                    action.pr, f"{action.head}:{action.base}"
-                )
             outcome = self._effect_executor.execute(action)
             if isinstance(action, Relabel):
                 if outcome is False:
@@ -699,7 +682,6 @@ class Executor:
                     raise LifecycleWriteUnverified(
                         f"CI stall escalation for PR #{action.pr} was not verified"
                     )
-                self._mark_ci_pending_escalated(action.pr, action.head)
                 self._escalated(
                     Relabel(
                         Target.PR,
