@@ -657,7 +657,11 @@ def compose_sliced(deployment, provider: ScriptedProvider, *, fault=lambda _: No
     remote = TriggerSlice(deployment.github_path, fault=fault, clock=deployment.clock.now)
     provider.launch = register_review_launch
     log: list[str] = []
-    review = roles.compose_review_daemon(cfg, remote, Store(cfg.review_state_dir), provider, log=log.append)
+    from unittest.mock import patch
+    import os
+    # This sliced fixture uses the same frozen operator scope as the real daemon.
+    with patch.dict(os.environ, {"TEST_CMD": "python -c 'from change0 import change0; assert change0 is True'"}):
+        review = roles.compose_review_daemon(cfg, remote, Store(cfg.review_state_dir), provider, log=log.append)
     return ReviewComposition(deployment, cfg, review, remote, provider, log)
 
 

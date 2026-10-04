@@ -166,12 +166,15 @@ def _carry_authority_and_exec(
 def main(argv: list[str] | None = None) -> None:
     arguments = list(sys.argv[1:] if argv is None else argv)
     if len(arguments) < 4:
-        raise SystemExit(
-            "usage: supervised_exec STATE_DIR RUN_ID TOKEN COMMAND [ARG ...]"
-        )
+        print("usage: supervised_exec STATE_DIR RUN_ID TOKEN COMMAND [ARG ...]", file=sys.stderr)
+        raise SystemExit(125)
     state_dir, raw_run_id, token, *command = arguments
     environment = dict(os.environ)
-    _register(state_dir, RunId(raw_run_id), token, environment)
+    try:
+        _register(state_dir, RunId(raw_run_id), token, environment)
+    except Exception as error:
+        print(f"supervised launcher unavailable: {type(error).__name__}: {error}", file=sys.stderr)
+        raise SystemExit(125) from error
     environment.pop(_PARENT_PID_ENV, None)
     environment.pop(_PARENT_START_ENV, None)
     _carry_authority_and_exec(command, environment)

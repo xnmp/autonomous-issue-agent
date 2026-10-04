@@ -545,7 +545,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/review_return.py` (bounded, unclassified review child result evidence),
 `domain/review_rejection.py`, `domain/review_workflow.py`, `domain/review_workflow_policy.py`,
 `domain/review_rearm.py`, `domain/review_control.py`, `domain/review_dispatch_record.py`,
-`domain/review_evidence.py`, `domain/deployment.py`
+`domain/review_evidence.py`, `domain/review_test_evidence.py` (revision/configuration-bound independent execution facts), `domain/deployment.py`
 (cycle-free typed target, generation, epoch and episode identities for the
 incremental gate/re-arm authority migration; the PR-owned review-rejection
 family has its own snapshot, continuation and handoff-free intents, sharing only
@@ -576,7 +576,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/effects.py`,
 `adapters/env_file.py`, `adapters/environment.py`,
 `adapters/event_log.py`, `adapters/github.py`,
-`adapters/governor.py`, `adapters/handover.py`,
+`adapters/governor.py`, `adapters/gate_transport.py` (trusted shell gate composition), `adapters/handover.py`,
 `adapters/heartbeat.py`, `adapters/journal.py`,
 `adapters/operator_effects.py`, `adapters/process_supervisor.py`,
 `adapters/reload.py`,
@@ -595,6 +595,7 @@ pull request retains its lever subject to fresh acceptance reads).
 commands executed by the review owner),
 `adapters/review_dispatch_holds.py` (transaction-local review submission and release holds),
 `adapters/review_execution_claims.py` (exact parent claim and lifecycle receipt validation),
+`adapters/review_test_execution.py` (supervised nonpaid operator tests and frozen-input proofs),
 `adapters/review_execution_control.py` (review-round preflight, source-backed registration and abandoned-round recovery),
 `adapters/review_round_sources.py` (transaction-local reconstruction of child, planning and submission receipts),
 `adapters/review_workflow_control.py` (the review owner's generation-fenced
@@ -613,7 +614,7 @@ adapters live under `adapters/dashweb/`.
 
 `app/` — composition and use-case orchestration:
 `app/cli.py`, `app/codex_resolution.py`, `app/config.py`, `app/dashboard.py`,
-`app/dispatch.py`,
+`app/dispatch.py`, `app/gate_check.py` (absolute advisory gate entry),
 `app/execute.py`, `app/identity_pools.py`, `app/infra_breaker.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,

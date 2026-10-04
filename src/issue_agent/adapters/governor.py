@@ -79,9 +79,16 @@ def _unbound_test_execution(_cmd: str) -> TestExecution:
 # ── worktree facts the gate rules need (injected; built from git) ─────────────
 @dataclass(frozen=True)
 class GateContext:
+    push_lookup_policy: gate.PushLookupPolicy = gate.PushLookupPolicy.CHECK_AVAILABLE_FACTS
+    instruction_blobs: Callable[[bool], tuple[tuple[str, str], ...] | None] = lambda staged: ()
+    commit_image_sizes: Callable[[], tuple[tuple[str, int], ...] | None] = lambda: ()
+    image_limit_bytes: int = 700 * 1024
+    policy_input_error: str | None = None
     base_branch: str = "dev"
     repository: str = ""                     # deployment repo (owner/name)
     branch: str = ""                         # current HEAD branch
+    history_available: bool = True
+    branch_diff_available: bool = True
     branch_subjects: tuple[str, ...] = ()    # commit subjects on branch since base
     # Subjects already on the observed remote PR branch (base..origin/<branch>);
     # published history the commit-log gate must not re-police (keifu #182).
@@ -228,8 +235,8 @@ _CHECK_TIMEOUT_S = 120.0
 #
 # Every place the harness executes a command it got from configuration or from
 # an agent-written marker MUST go through `run_target_command` (python) or its
-# bash twins (`prc_run_test_cmd` in plugin/hooks/checks/_pr_common.sh,
-# `run_target_test_cmd` in bin/point-at.sh). The 2026-07-29 self-hosting fork
+# shell launcher (`run_target_test_cmd` in bin/point-at.sh). The advisory shell
+# gates and their compatibility wrapper invoke this Python executor directly. The 2026-07-29 self-hosting fork
 # bomb (#63) is why: such a command can — via env inheritance or a
 # `.harness/test-cmd` marker — re-enter these very gates and re-run itself
 # without bound. Three defenses, all of which live HERE so no exec site can
@@ -263,11 +270,12 @@ TARGET_CMD_SCRUB_KNOBS = (
 )
 
 
-def target_cmd_scrub_set() -> set[str]:
+def target_cmd_scrub_set(environment: dict[str, str] | None = None) -> set[str]:
     """Every env name to drop from a target command's child env: the static
     floor plus the deployment manifest (HARNESS_DEPLOY_KNOBS) and the manifest
     var itself."""
-    manifest = os.environ.get("HARNESS_DEPLOY_KNOBS", "").split()
+    values = os.environ if environment is None else environment
+    manifest = values.get("HARNESS_DEPLOY_KNOBS", "").split()
     return set(TARGET_CMD_SCRUB_KNOBS) | set(manifest) | {"HARNESS_DEPLOY_KNOBS"}
 
 
@@ -281,6 +289,14 @@ def gate_depth() -> int:
         return max(0, int(raw))
     except ValueError:
         return 0
+
+
+def target_command_inputs(cmd: str, environment: dict[str, str], depth: int) -> tuple[tuple[str, ...], dict[str, str]]:
+    if depth >= 2:
+        raise ValueError("target command recursion limit")
+    env = {key: value for key, value in environment.items() if key not in target_cmd_scrub_set(environment)}
+    env["HARNESS_GATE_DEPTH"] = str(depth + 1)
+    return ("bash", "-c", cmd), env
 
 
 def run_target_command(
@@ -302,13 +318,11 @@ def run_target_command(
             file=sys.stderr,
         )
         return None, ""
-    scrub = target_cmd_scrub_set()
-    env = {k: v for k, v in os.environ.items() if k not in scrub}
-    env["HARNESS_GATE_DEPTH"] = str(depth + 1)
+    argv, env = target_command_inputs(cmd, dict(os.environ), depth)
     pipe = subprocess.PIPE if capture else None
     try:
         proc = subprocess.Popen(
-            ["bash", "-c", cmd], cwd=cwd or None, env=env, start_new_session=True,
+            argv, cwd=cwd or None, env=env, start_new_session=True,
             stdout=pipe, stderr=pipe, text=capture or None,
         )
     except OSError as e:
@@ -381,6 +395,11 @@ def complete_gate_context(
         fields["lint_cmd"] = values.get("LINT_CMD", "") or ""
     if not ctx.typecheck_cmd:
         fields["typecheck_cmd"] = values.get("TYPECHECK_CMD", "") or ""
+    image_limit = values.get("EVIDENCE_MAX_IMAGE_KB", "700")
+    if len(image_limit) > 7 or not image_limit.isascii() or not image_limit.isdigit() or int(image_limit) > 1024 * 1024:
+        fields["policy_input_error"] = "malformed EVIDENCE_MAX_IMAGE_KB"
+    else:
+        fields["image_limit_bytes"] = int(image_limit) * 1024
     if ctx.run_check is _no_check:
         fields["run_check"] = lambda cmd: run_check_fn(cmd, cwd)
     return replace(ctx, **fields) if fields else ctx
@@ -455,6 +474,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         lambda: gate.check_no_web(argv),
         lambda: gate.check_pr_base(pr_base, ctx.base_branch),
         lambda: gate.check_pr_body(body),
+        lambda: gate.ALLOW if ctx.history_available and ctx.branch_diff_available else gate.deny("required Git history/diff facts are unavailable"),
         lambda: gate.check_visual_evidence(
             ctx.visual_ac,
             ctx.changed_files,
@@ -477,6 +497,7 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
         ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
+        lambda: gate.check_generated_instructions(ctx.instruction_blobs(False)),
         # tests-immutable subjects are AUTO-DECLARED from the diff — no
         # trailer, so no malformed-trailer hint applies here.
         lambda: gate.check_tests_immutable(
@@ -546,7 +567,7 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     if mode is gate.PushGateMode.SKIP:
         return []
     precondition = gate.check_push_precondition(
-        branch, lookup, checks_runnable=ctx.base_resolvable
+        branch, lookup, checks_runnable=ctx.base_resolvable, policy=ctx.push_lookup_policy
     )
     if not precondition.ok:
         return [precondition.reason]
@@ -561,11 +582,13 @@ def _push_gate_for_branch(branch: str, ctx: GateContext) -> list[str]:
     # caller only ever reads `reasons[0]`, so returning one element changes
     # nothing observable. check-push.sh runs the same four in the same order.
     cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
+        lambda: gate.ALLOW if ctx.history_available and ctx.branch_diff_available else gate.deny("required Git history/diff facts are unavailable"),
         lambda: gate.check_commit_log(
             ctx.branch_subjects, ctx.published_subjects
         ),
         lambda: gate.check_no_evidence(ctx.changed_files),
         lambda: gate.check_no_harness_state(ctx.changed_files),
+        lambda: gate.check_generated_instructions(ctx.instruction_blobs(False)),
         lambda: gate.check_tests_immutable(
             tuple(dict.fromkeys(ctx.changed_files + ctx.touched_at_base)),
             ctx.exists_at_base,
@@ -665,21 +688,17 @@ def _gate_branch(
     return Verdict(result.ok, result.reason)
 
 
-def _gate_commit(
-    command: governor_policy.Governed, ctx: GateContext
-) -> Verdict:
-    message = _extract_after_flag(
-        list(command.checker_args), "-m", "--message"
-    )
-    for result in (
-        gate.check_commit_message(message),
-        gate.check_commit_order(
-            message, ctx.branch_subjects, ctx.base_resolvable
-        ),
-        gate.check_project_commands(
-            ctx.lint_cmd, ctx.typecheck_cmd, ctx.run_check
-        ),
+def commit_gate(argv: list[str], ctx: GateContext, *, include_order: bool = True) -> Verdict:
+    message = _extract_after_flag(argv, "-m", "--message")
+    for check in (
+        lambda: gate.check_commit_message(message),
+        lambda: gate.deny("required Git history facts are unavailable") if include_order and ctx.base_resolvable and not ctx.history_available else gate.ALLOW,
+        lambda: gate.check_commit_order(message, ctx.branch_subjects, ctx.base_resolvable) if include_order else gate.ALLOW,
+        lambda: gate.check_generated_instructions(ctx.instruction_blobs(True)),
+        lambda: gate.check_image_sizes(ctx.commit_image_sizes(), ctx.image_limit_bytes),
+        lambda: gate.check_project_commands(ctx.lint_cmd, ctx.typecheck_cmd, ctx.run_check),
     ):
+        result = check()
         if not result.ok:
             return Verdict(False, result.reason)
     test_cmd = gate.resolve_test_cmd(ctx.harness_test_cmd, ctx.env_test_cmd)
@@ -687,6 +706,10 @@ def _gate_commit(
         message, test_cmd, ctx.run_red_tests, ctx.verify_red_at_commit
     )
     return Verdict(red.ok, red.reason)
+
+
+def _gate_commit(command: governor_policy.Governed, ctx: GateContext) -> Verdict:
+    return commit_gate(list(command.checker_args), ctx)
 
 
 def _gate_pr_create(
@@ -758,6 +781,8 @@ def evaluate_command(command: str, ctx: GateContext) -> Verdict:
             governed = governor_policy.classify(words)
             if governed is None:
                 continue
+            if ctx.policy_input_error is not None:
+                return Verdict(False, ctx.policy_input_error)
             handler = _GATE_HANDLERS.get(governed.kind)
             if handler is None:
                 return Verdict(

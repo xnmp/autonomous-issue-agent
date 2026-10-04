@@ -336,6 +336,7 @@ class GitHubEffectExecutor:
         repository: str,
         identity: str,
         config_version: str = "",
+        test_configuration=None,
         repository_cap: Money | None = None,
         global_cap: Money | None = None,
         issue_cap: Money | None = None,
@@ -351,6 +352,7 @@ class GitHubEffectExecutor:
         self.repository = canonical_repository(repository)
         self.identity = identity
         self.config_version = config_version
+        self.test_configuration = test_configuration
         self.repository_cap = repository_cap
         self.global_cap = global_cap
         self.issue_cap = issue_cap
@@ -912,6 +914,14 @@ class GitHubEffectExecutor:
                 raise UnknownEffectOutcome(f"{command.command_id}: pre-write read is deferred on its schedule")
             return False
         started = self.store.now()
+        # Reconcile a previously delivered legacy review before enforcing new
+        # absent-write evidence. No upgrade can resend an already present effect.
+        present = self._check_bound_submission(op, command)
+        if present.check is ReviewCheck.PRESENT:
+            return bool(self.effects.execute(command, lambda: EffectOutcome(
+                True, EffectStatus.SUCCEEDED, remote_object_id=present.remote_object_id)))
+        if present.check is ReviewCheck.UNAVAILABLE:
+            self._defer_prewrite(pending, schedule, started, present.detail)
         try:
             applicability = self._submission_applicability(op, command)
         except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError):
@@ -940,6 +950,20 @@ class GitHubEffectExecutor:
     ) -> ReviewCommandCheck:
         """Fresh decision facts shared by ordinary writes and authorized retries."""
         assert command.workflow is not None
+        if op.event == "APPROVE":
+            from .review_test_execution import approval_test_error
+            from .workflow_rows import load_review_workflow_row, read_review_submission_registration
+            from ..domain.review_execution import CurrentReviewExecution
+            with self.store.transaction() as db:
+                state = load_review_workflow_row(db, command.workflow.fence.key)
+                registration = read_review_submission_registration(db, self.repository, str(command.command_id))
+                if (state is None or not isinstance(state.execution, CurrentReviewExecution) or registration is None
+                        or registration.round.binding != state.execution.binding):
+                    return ReviewCommandCheck(ReviewCheck.REFUSED, "approval lacks its current registered execution binding")
+                error = approval_test_error(db, self.repository, op.test_evidence_ref, self.test_configuration,
+                    command.workflow, state.execution.binding, op.head, op.patch_id)
+            if error:
+                return ReviewCommandCheck(ReviewCheck.REFUSED, error)
         observed, view = read_pull_request(
             self.gateway, command.workflow.fence.key, self.store.now(), reviews=False,
         )

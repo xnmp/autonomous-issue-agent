@@ -17,7 +17,7 @@ from tests.adapters.test_review_execution_stage import stage
 
 
 def command_for(snapshot, *, body="approved", patch_id="c" * 64):
-    op = BoundReviewSubmissionOp(9, "APPROVE", body, "b" * 40, "review-bot", patch_id, None)
+    op = BoundReviewSubmissionOp(9, "REQUEST_CHANGES", body, "b" * 40, "review-bot", patch_id, None)
     command_id = bound_review_command_id(op, snapshot.binding)
     return LifecycleCommand(command_id, f"github:{command_id}", CommandKind.SUBMIT_REVIEW,
                             "pr:9", op.head, op.payload(), "test", "o/r", OWNER,

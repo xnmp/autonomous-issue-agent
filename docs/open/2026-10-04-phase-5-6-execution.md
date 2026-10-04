@@ -43,10 +43,10 @@ now reuses existing durable escalation and bounded reconciliation. Measurement
 and eighteen publication recovery contracts pass independent review. The
 complete gate passed at 2026-10-04 12:22 UTC: 3,620 domain, 3,376 adapter and
 3,345 app cases, 123 hook checks, parity, four architecture contracts and both
-type checks. The offline Phase 5 milestone is verified. Live windows and whole
-Phase 5/6 acceptance remain pending.
+type checks. The offline Phase 5 milestone is verified at `eb5941f`. Live
+windows and whole Phase 5 acceptance remain pending.
 
-Phase 6 gate consolidation is reviewed in an isolated checkout. The approved
+Phase 6 gate consolidation is independently reviewed and integrated. The approved
 transport reuses the existing
 worktree context and governor compositions, with closed operation/capability
 facts and an absolute harness-owned Python entry. Shell decisions and their
@@ -58,7 +58,7 @@ failure, malformed statistics erasing test-policy subjects, and failed base-file
 reads masquerading as absence. Root also reproduced an SDK malformed-policy
 configuration bypass. All corrections pass independent verification: 186 final
 boundary cases, alongside the earlier policy/transport and hook suites. The gate
-slice is ready for integration and the combined Phase 6 full gate. ADR 0011
+slice is accepted with the combined Phase 6 full gate recorded below. ADR 0011
 records its single policy source and explicit retained transport capabilities;
 launcher preflight execution remains outside this slice.
 
@@ -92,3 +92,43 @@ holds and spend authority remain intact. Late old-configuration results cannot
 clear a current hold. Synchronous reconciliation can retire an obsolete head's
 question or inspect completed evidence; it must never execute tests or treat a
 successful trailer read as test evidence.
+
+The ordinary-test receipt implementation is integrated after final independent
+acceptance: 163 domain/executor/SQL/writer contracts and 17 composed/adversarial
+cases passed on the normal host. The implementation's affected snapshot passed
+1,195 cases, its latest executor regressions passed 33 cases, and both final
+pyrefly checks and architecture/layout checks passed. Two legacy approval
+fixtures now freeze real operator test commands while preserving their original
+approval, accounting, claim and recovery assertions; all eight affected cases
+and 228 neighboring module cases pass, with independent fixture review.
+
+The combined Phase 6 full `make test` passed at 2026-10-04 14:52 UTC: 3,643
+domain, 3,429 adapter and 3,370 app cases (10,442 total), 123 hook checks, parity,
+four architecture contracts and both final type checks. Phase 6's declared policy
+and independent-execution contracts are accepted locally. The deployment pause
+remains in force, and Phase 5 still requires actual live windows.
+
+The receipt slice adds 841 and removes 58 source lines across sixteen files,
+including two small domain/executor modules. It reuses existing SQL dedupe,
+round authority, schedules, holds, supervision and execution renewal. It adds
+no schema, queue, service, paid test leg, operator action or grant class.
+Across the complete Phase 6 production diff (`src/issue_agent` and
+`plugin/hooks/checks`), 1,127 source lines are added and 1,140 removed: a net
+reduction of thirteen lines while adding independent execution enforcement.
+
+Independent review reproduced and verified corrections for hidden index flags,
+Git stat-cache suppression, executable/symlink metadata, ambient Git scope,
+cancellation during teardown, inherited paid-run authority, bootstrap failure
+classification and copied-test deferral. Input proof uses a private fresh Git
+index with fixed observation settings; the launcher scrubs inherited authority
+and preserves actual target exits separately from infrastructure failure.
+The approach uses Git's existing [alternate-index mechanism](https://git-scm.com/docs/git-read-tree).
+
+Residual limits remain the trusted operator command and Git filter semantics,
+the existing remote read/write interval, and the supported supervision profile.
+The retained target's first qualification timed out after 600 seconds during
+native compilation and completed bounded teardown. The final reviewed executor
+then passed the exact same retained command in 258,591 ms with the warmed
+private cache, equal pre/post tree proof and no orphan processes. This is an
+isolated ordinary-command qualification. Phase 5's live migration, canary and
+actual unattended measurement remain pending.

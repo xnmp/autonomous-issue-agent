@@ -11,11 +11,12 @@ trap 'rm -rf "$scratch"' EXIT
 
 # ── Scrub-list drift check ────────────────────────────────────────────────────
 # One python source of truth (governor.TARGET_CMD_SCRUB_KNOBS, also consumed by
-# tests/conftest.py) and two bash hand-copies. They must name the same knobs —
+# tests/conftest.py) and the remaining launcher's bash hand-copy. The advisory
+# gates now invoke the Python executor directly. The launcher must name the same knobs —
 # this repo already learned (gate parity) that hand-kept twins drift silently.
 py_list="$(cd "$ROOT" && uv run --quiet python -c \
   'from issue_agent.adapters.governor import TARGET_CMD_SCRUB_KNOBS as K; print("\n".join(sorted(K)))')"
-for spec in "plugin/hooks/checks/_pr_common.sh:PRC_SCRUB_STATIC" "bin/point-at.sh:RTC_SCRUB_STATIC"; do
+for spec in "bin/point-at.sh:RTC_SCRUB_STATIC"; do
   f="${spec%%:*}"; var="${spec##*:}"
   sh_list="$(sed -n "s/^\(export \)\?${var}=\"\(.*\)\"$/\2/p" "$ROOT/$f" | tr ' ' '\n' | sort -u | grep .)"
   if [ "$py_list" != "$sh_list" ]; then
@@ -24,7 +25,7 @@ for spec in "plugin/hooks/checks/_pr_common.sh:PRC_SCRUB_STATIC" "bin/point-at.s
     exit 1
   fi
 done
-echo "scrub lists in sync (python + 2 bash copies)"
+echo "scrub lists in sync (python + remaining bash launcher)"
 
 # ── Hostile-env pytest leg ────────────────────────────────────────────────────
 # The adapter tests read LINT_CMD/TYPECHECK_CMD/… from the process env;

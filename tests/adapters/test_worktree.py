@@ -1365,3 +1365,49 @@ def test_build_gate_context_declares_nothing_when_the_body_log_fails():
     assert ctx.declared_exemptions == ()
     assert ctx.malformed_exemption_lines == 0
     assert ctx.branch_subjects == ("red: t", "green: impl")
+
+
+def test_red_assertion_failure_cannot_authorize_after_restore_failure(tmp_path):
+    runner = _builder_git()
+    runner.table["checkout -q HEAD"] = GitResult(128, "restore failed")
+    ctx = build_gate_context(str(tmp_path), git=runner, env_test_cmd="exit 1")
+    result = ctx.revert_and_run(("src/x.py",))
+    assert result.status is ExecutionStatus.INFRA_ERROR
+
+
+@pytest.mark.parametrize("failure", ["log origin/dev..HEAD --reverse", "log origin/dev..HEAD --format=%B", "diff --name-only", "diff --no-renames --diff-filter=MDRT", "diff --no-renames --diff-filter=M --numstat"])
+def test_required_git_history_or_diff_failure_is_not_an_empty_trusted_fact(tmp_path, failure):
+    runner = _builder_git()
+    runner.table = {failure: GitResult(128, ""), **{key: value for key, value in runner.table.items() if key != failure}}
+    ctx = build_gate_context(str(tmp_path), git=runner)
+    assert not (ctx.history_available and ctx.branch_diff_available)
+
+
+@pytest.mark.parametrize("row", ["truncated", "1\tx\ttests/a.py", "1\t0\t"])
+def test_malformed_numstat_denies_instead_of_losing_test_edit_evidence(tmp_path, row):
+    runner = _builder_git()
+    runner.table["diff --no-renames --diff-filter=M --numstat"] = GitResult(0, row)
+    ctx = build_gate_context(str(tmp_path), git=runner)
+    assert not ctx.branch_diff_available
+
+
+def test_failed_cat_file_requires_proven_base_tree_membership(tmp_path):
+    runner = _builder_git()
+    runner.table["cat-file -e origin/dev:tests/a.py"] = GitResult(128, "")
+    runner.table["ls-tree -z --name-only origin/dev -- tests/a.py"] = GitResult(0, "tests/a.py\x00")
+    ctx = build_gate_context(str(tmp_path), git=runner)
+    assert ctx.exists_at_base("tests/a.py")
+    runner.table["ls-tree -z --name-only origin/dev -- tests/a.py"] = GitResult(128, "")
+    with pytest.raises(ValueError, match="base-tree evidence is unavailable"):
+        ctx.exists_at_base("tests/a.py")
+
+
+def test_sdk_pr_denies_unavailable_base_membership_without_running_target(tmp_path):
+    runner = _builder_git(changed="tests/a.py\nsrc/x.py")
+    runner.table["ls-tree -z --name-only origin/dev -- tests/a.py"] = GitResult(128, "")
+    calls = []
+    ctx = build_gate_context(str(tmp_path), git=runner, env_test_cmd="true", run_tests=lambda cmd: calls.append(cmd) or True)
+    verdict = evaluate_command('gh pr create --base dev --body "## Acceptance Criteria\n- fixed\n\nFixes #5"', ctx)
+    assert not verdict.allowed
+    assert "failed safely" in verdict.reason
+    assert not calls

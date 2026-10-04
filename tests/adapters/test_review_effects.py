@@ -297,9 +297,9 @@ def test_linked_issue_guard_and_review_write_exclude_concurrent_operator_barrier
             return submit(*args, **kwargs)
 
         monkeypatch.setattr(rig.remote, "submit_review", guarded_submission)
-        assert rig.executor().submit_bound_review(PR, "APPROVE", "approved", HEAD,
+        assert rig.executor().submit_bound_review(PR, "REQUEST_CHANGES", "approved", HEAD,
                                                   workflow=state.binding, reviewer=BOT, patch_id=PATCH)
-        assert rig.remote.review_state("submitted-2") == "APPROVED"
+        assert rig.remote.review_state("submitted-2") == "CHANGES_REQUESTED"
     else:
         relabel = rig.remote.relabel
 
@@ -625,7 +625,7 @@ def authorized_submission_retry(rig):
 
     state = fresh()
     install_workflow(rig.store, state)
-    op = BoundReviewSubmissionOp(PR, "APPROVE", "approved", HEAD, BOT, PATCH, None)
+    op = BoundReviewSubmissionOp(PR, "REQUEST_CHANGES", "approved", HEAD, BOT, PATCH, None)
     command_id = bound_review_command_id(op, state.binding)
     command = LifecycleCommand(command_id, f"github:{command_id}", CommandKind.SUBMIT_REVIEW,
                                f"pr:{PR}", HEAD, op.payload(), repository="o/r", executor_identity=REVIEWER,
@@ -976,7 +976,7 @@ def test_a_later_review_of_another_command_is_never_claimed(tmp_path, state):
     change = accepted_rearm()
     commit_rearm(rig.store, change)
     with pytest.raises(TimeoutError):
-        rig.executor().submit_bound_review(PR, "APPROVE", "lgtm", HEAD, workflow=change.snapshot.binding,
+        rig.executor().submit_bound_review(PR, "REQUEST_CHANGES", "lgtm", HEAD, workflow=change.snapshot.binding,
                                            reviewer=BOT, patch_id=PATCH)
     command_id = rig.submission_id()
     rig.advance(3000)
@@ -1136,8 +1136,11 @@ def test_event_and_escalation_cause_must_pair(rig, rearm, event, cause, patch):
     ("APPROVE", None, PATCH), ("REQUEST_CHANGES", None, PATCH), ("COMMENT", "verdict", PATCH), ("COMMENT", "ceiling", PATCH),
 ])
 def test_valid_pairings_submit(rig, rearm, event, cause, patch):
-    assert rig.executor().submit_bound_review(PR, event, "x", HEAD, workflow=rearm.snapshot.binding, reviewer=BOT,
+    submitted = rig.executor().submit_bound_review(PR, event, "x", HEAD, workflow=rearm.snapshot.binding, reviewer=BOT,
                                               patch_id=patch, escalate_cause=cause)
+    assert submitted is (event != "APPROVE")
+    if event == "APPROVE":
+        assert rig.calls("submit_review") == []
 
 
 def test_a_mispaired_stored_submission_is_refused_at_enqueue(rig, rearm):
@@ -1330,3 +1333,22 @@ def test_a_projection_refusal_or_present_label_settles_without_waiting_for_dismi
     rig.drain()
     status, error = rig.receipt(projection(rearm).command_id)
     assert status == "permanent_failure" and "head moved" in error
+
+
+def test_legacy_present_approval_reconciles_before_missing_test_receipt_or_linkage(rig):
+    from issue_agent.adapters.effects import bound_review_command_id
+    from issue_agent.adapters.review_effects import BoundReviewSubmissionOp
+    from tests.domain.test_review_workflow_policy import fresh
+    state = fresh()
+    install_workflow(rig.store, state)
+    op = BoundReviewSubmissionOp(PR, "APPROVE", "legacy approval", HEAD, BOT, PATCH, None)
+    command_id = bound_review_command_id(op, state.binding)
+    command = LifecycleCommand(command_id, f"github:{command_id}", CommandKind.SUBMIT_REVIEW,
+        f"pr:{PR}", HEAD, op.payload(), repository="o/r", executor_identity=REVIEWER, workflow=state.binding)
+    rig.store.enqueue_command(command)
+    rig.remote.seed_review(PR, "legacy-present", author=BOT, state="APPROVED", commit=HEAD,
+        submitted_at=NOW.isoformat(), body=op.body + "\n\n" + review_command_marker(str(command_id)))
+    rig.remote.external_pr_change(PR, closing_issue=7)
+    rig.drain()
+    assert rig.state(command_id) == "succeeded" and rig.receipt_object(command_id) == "legacy-present"
+    assert rig.calls("submit_review") == []

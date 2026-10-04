@@ -1,16 +1,20 @@
 # Architecture implementation phases
 
-**Current execution — 2026-10-04:** phases 1–3 remain accepted. The approved
+**Current execution — 2026-10-04 UTC:** phases 1–3 remain accepted. The approved
 [Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven
 outcome gates accepted locally. A2 closes the production caller/removal matrix,
 independent whole-system review, copied rollback, dashboard outcomes and final
 full gate (2026-10-03 07:08 UTC, exit 0). Phase 5's offline measurement and
 operator-absent replays are independently reviewed and pass the full gate
 (2026-10-04 12:22 UTC, exit 0; 10,341 Python cases, hook checks, parity,
-architecture and both type checks). Phase 6's gate consolidation is reviewed;
-its independent test-evidence implementation follows under the
-[Phase 5/6 execution brief](2026-10-04-phase-5-6-execution.md). Neither phase is
-accepted yet. The [unattended-window proposal](2026-10-04-phase-5-unattended-windows.md)
+architecture and both type checks), committed as `eb5941f`. Phase 6's gate
+consolidation and independent test-evidence contracts are accepted locally after
+independent review and the combined full gate (2026-10-04 14:52 UTC, exit 0;
+10,442 Python cases, 123 hook checks, parity, four architecture contracts and both
+type checks). The [Phase 5/6 execution brief](2026-10-04-phase-5-6-execution.md)
+records the implementation and remaining limits. Whole Phase 5 acceptance still
+requires actual unattended measurement. Its
+[unattended-window proposal](2026-10-04-phase-5-unattended-windows.md)
 remains pending explicit release of the deployment pause. No live activation,
 service restart, paid external experiment, push or
 remote issue closure is claimed. The sole approved Jira counter exception is
@@ -249,7 +253,7 @@ keyboard flow, 320–1440 px layout), two independent adversarial reviews with
 all substantiated findings fixed and regression-tested. Python `make test` was
 green on the unchanged backend (1,624 domain / 1,753 adapter / 2,577 app).
 
-Overall status: **1–3 accepted; 4 in progress; 5–6 dependency-gated.** The
+Historical checkpoint status: **1–3 accepted; 4 in progress; 5–6 dependency-gated.** The
 [phase table](#phases-and-acceptance) below covers all six phases. Phase 3 ended
 with explicit offline review activation, legacy deletion and complete linked
 issue hold enforcement. Full `make test`: 2,869 domain, 2,401 adapter and 2,861
@@ -415,7 +419,7 @@ inventory is not permission to activate the new schema or restart deployment.
 
 ## Phases and acceptance
 
-| Phase / Astra owner | Dependencies | Work and acceptance |
+| Phase | Dependencies | Work and acceptance |
 | --- | --- | --- |
 | 1 — `phase_1_correctness` | None | Reproduce all four findings on current code; unify action-specific eligibility over terminal state and explicit holds; distinguish missing/corrupt/unreadable control records without starving healthy targets; revalidate completion and destructive effects against fresh facts. Valid self-authored updates must still complete. Establish the supported profile and incident/intervention baseline with the parent. |
 | 2 — `phase_2_composition` | Starts alongside 1; acceptance uses its fixes | Extend real daemon + durable executor + SQLite composition with a persistent GitHub double, restart and bounded fault injection. Cover remote success before receipt, duplicate delivery, partial relabel, stale completion and concurrent re-arm; prove held-state preservation, stable attempt identity, accounting conservation and visible uncertainty. |

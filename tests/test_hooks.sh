@@ -333,11 +333,8 @@ d=$(setup_pr_repo) || fixture_die "setup_pr_repo failed"
 ( fixture_cd "$d" && mkdir -p evidence && printf '\x89PNG' > evidence/shot.png && git add evidence/shot.png \
     && git -c core.hooksPath=/dev/null commit -qm "evidence: screenshot" )
 out=$( fixture_cd "$d" && BASE_BRANCH=dev bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$PR_BODY_OK" 2>&1 ); rc=$?
-# rc may be non-zero for OTHER reasons in this fixture; assert specifically that the
-# evidence check did NOT fire (no "evidence/" complaint in the output).
-printf '%s' "$out" | grep -qi 'evidence/' \
-  && no "committed evidence image allowed" "evidence complaint: ${out:0:160}" \
-  || ok "committed evidence image allowed"
+[ "$rc" -eq 0 ] && ok "committed evidence image allowed" \
+  || no "committed evidence image allowed" "rc=$rc out=${out:0:160}"
 rm -rf "$d"
 
 # green-without-red detected at PR gate too (log re-check). Build with only green.
@@ -1017,7 +1014,9 @@ for spec in "2:runner failure" "127:command not found" "137:killed or OOM"; do
     TEST_CMD="if [ -f add.py ]; then exit 0; else exit $bad_rc; fi" \
     bash "$CHECKS/check-pr.sh" pr create --base dev --title t --body "$RF_BODY" \
     2>&1 ); rc=$?
-  { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "infrastructure/cancellation"; } \
+  expected="infrastructure error"
+  [ "$bad_rc" != 137 ] || expected="was cancelled"
+  { [ "$rc" -eq 1 ] && printf '%s' "$out" | grep -q "$expected"; } \
     && ok "$label is not accepted as red-test evidence" \
     || no "$label red-test classification" "rc=$rc out=${out:0:200}"
   rm -rf "$d"
@@ -1111,14 +1110,15 @@ echo "== check-push.sh (push to an open PR) =="
 # non-empty → `gh pr list … --jq …` prints that number (PR exists); empty → prints
 # nothing (no PR). All other gh calls print nothing.
 make_gh_stub() {  # make_gh_stub <dir> <pr-number-or-empty>
-  local d="$1" n="$2"
+  local d="$1" n="$2" payload="[]"
+  [ -z "$n" ] || payload="[{\"number\":$n}]"
   fixture_require "$d"
   mkdir -p "$d/bin" || fixture_die "cannot create gh stub directory"
   cat > "$d/bin/gh" <<EOF
 #!/usr/bin/env bash
 # stub: only answers 'pr list … --head …'
 case " \$* " in
-  *" pr list "*) printf '%s' "$n" ;;
+  *" pr list "*) printf '%s' '$payload' ;;
   *) : ;;
 esac
 EOF
@@ -1193,7 +1193,8 @@ rm -rf "$d"
 # A `gh` that FAILS the lookup (network/auth error), logging one line per call so
 # the retry is observable. GH_CALL_LOG selects the log file.
 make_gh_failing_stub() {  # make_gh_failing_stub <dir> [<attempt-that-succeeds> <pr-number>]
-  local d="$1" ok_at="${2:-0}" n="${3:-}"
+  local d="$1" ok_at="${2:-0}" n="${3:-}" payload="[]"
+  [ -z "$n" ] || payload="[{\"number\":$n}]"
   fixture_require "$d"
   mkdir -p "$d/bin" || fixture_die "cannot create gh stub directory"
   cat > "$d/bin/gh" <<EOF
@@ -1202,7 +1203,7 @@ case " \$* " in
   *" pr list "*)
     echo call >> "\$GH_CALL_LOG"
     if [ "$ok_at" != 0 ] && [ "\$(wc -l < "\$GH_CALL_LOG")" -ge "$ok_at" ]; then
-      printf '%s' "$n"; exit 0
+      printf '%s' '$payload'; exit 0
     fi
     echo "error connecting to api.github.com" >&2; exit 1 ;;
   *) : ;;

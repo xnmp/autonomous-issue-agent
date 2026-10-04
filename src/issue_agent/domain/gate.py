@@ -11,8 +11,8 @@ take an injected `run_tests`/`revert_and_run` callable, so the *decision logic*
 (when to skip, fail-open, what counts as a failure) is tested purely with a
 fake callable, and only the ~3-line real shell-out lives in the adapter.
 
-File-name patterns + prefix sets are kept byte-for-byte consistent with the bash
-(PR_TEST_FILE_RE, VALID_PREFIX) — those constants are the contract.
+Both advisory transports compose these decisions over harness-collected facts;
+there is no shell policy copy.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def deny(reason: str) -> GateResult:
     return GateResult(False, reason)
 
 
-# ── shared constants (must match _pr_common.sh / check-commit*.sh) ────────────
+# ── policy constants ───────────────────────────────────────────────────────
 # "this looks like a test file" (PR_TEST_FILE_RE in _pr_common.sh).
 TEST_FILE_RE = re.compile(
     r"(e2e|integration|regression|test|spec).*\.(spec|test)\."
@@ -466,6 +466,48 @@ def check_no_harness_state(changed: Iterable[str]) -> GateResult:
                 "and keep it gitignored"
             )
     return ALLOW
+
+
+
+def check_generated_instructions(blobs: tuple[tuple[str, str], ...] | None) -> GateResult:
+    if blobs is None:
+        return deny("generated instruction evidence is unavailable")
+    if not isinstance(blobs, tuple) or len(blobs) > 2:
+        return deny("malformed generated instruction evidence")
+    for blob in blobs:
+        if not isinstance(blob, tuple) or len(blob) != 2:
+            return deny("malformed generated instruction evidence")
+        path, text = blob
+        if not isinstance(path, str) or path not in {"AGENTS.md", "AGENTS.override.md"} or not isinstance(text, str) or len(text) > 2_000_000:
+            return deny("malformed generated instruction evidence")
+        if "<!-- issue-agent generated instructions: start -->" in text:
+            return deny(f"{path} contains issue-agent generated instructions — restore the target-owned file")
+    return ALLOW
+
+
+def check_image_sizes(images: tuple[tuple[str, int], ...] | None, limit_bytes: int) -> GateResult:
+    if type(limit_bytes) is not int or not 0 <= limit_bytes <= 1024 * 1024 * 1024:
+        return deny("malformed evidence image size limit")
+    if limit_bytes == 0:
+        return ALLOW
+    if images is None:
+        return deny("evidence image sizes are unavailable")
+    if not isinstance(images, tuple) or len(images) > 8192:
+        return deny("malformed evidence image size fact")
+    for image in images:
+        if not isinstance(image, tuple) or len(image) != 2:
+            return deny("malformed evidence image size fact")
+        path, size = image
+        if not isinstance(path, str) or not path or len(path) > 4096 or type(size) is not int or not 0 <= size <= 2**63 - 1:
+            return deny("malformed evidence image size fact")
+        if size > limit_bytes:
+            return deny(f"image {path} exceeds the {limit_bytes // 1024}KB evidence size limit — downscale before committing")
+    return ALLOW
+
+
+class PushLookupPolicy(Enum):
+    REQUIRE_VERIFIED = "require_verified"
+    CHECK_AVAILABLE_FACTS = "check_available_facts"
 
 
 def check_visual_evidence(
@@ -1013,7 +1055,8 @@ def push_gate_mode(branch: str, lookup: OpenPrLookup) -> PushGateMode:
 
 
 def check_push_precondition(
-    branch: str, lookup: OpenPrLookup, checks_runnable: bool
+    branch: str, lookup: OpenPrLookup, checks_runnable: bool,
+    policy: PushLookupPolicy = PushLookupPolicy.CHECK_AVAILABLE_FACTS,
 ) -> GateResult:
     """DENY a push whose PR state could not be determined AND whose state-derived
     checks cannot be run either — nothing at all would be verified, so the
@@ -1026,8 +1069,12 @@ def check_push_precondition(
 
     Only governed branches are gated at all (an ungoverned branch never even
     calls gh in the bash), so a lookup error there is irrelevant."""
+    if not isinstance(policy, PushLookupPolicy):
+        return deny("malformed push lookup policy")
     if not is_governed_branch(branch):
         return ALLOW
+    if lookup is OpenPrLookup.ERROR and policy is PushLookupPolicy.REQUIRE_VERIFIED:
+        return deny(f"could not verify PR state for branch '{branch}' — the open-PR lookup failed twice (gh/network/auth error); check connectivity and retry the push shortly")
     if lookup is OpenPrLookup.ERROR and not checks_runnable:
         return deny(
             f"could not verify PR state for branch '{branch}' — the open-PR lookup "

@@ -995,3 +995,17 @@ def test_a_mass_test_rewrite_still_denies_and_teaches_no_trailer():
     assert not v.allowed
     assert "existing test files modified/deleted" in v.reason
     assert "Gate-Exemption" not in v.reason
+
+
+@pytest.mark.parametrize("value", ["malformed", "9" * 5000])
+def test_sdk_hook_malformed_policy_denies_governed_command_without_target_execution(monkeypatch, value):
+    monkeypatch.setenv("EVIDENCE_MAX_IMAGE_KB", value)
+    monkeypatch.setenv("LINT_CMD", "must-not-run")
+    calls = []
+    hook = make_pretooluse_hook(lambda cwd: ctx(run_check=lambda cmd: calls.append(cmd) or True))
+    result = asyncio.run(hook({"tool_input": {"command": "git commit -m 'green: test'"}, "cwd": "/x"}, "id", None))
+    assert result["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert "malformed EVIDENCE_MAX_IMAGE_KB" in result["hookSpecificOutput"]["permissionDecisionReason"]
+    assert not calls
+    ordinary = asyncio.run(hook({"tool_input": {"command": "pwd"}, "cwd": "/x"}, "id", None))
+    assert ordinary == {}

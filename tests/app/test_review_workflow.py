@@ -624,7 +624,9 @@ def test_failed_authority_submission_never_updates_the_reviewed_baseline():
     gw = RefusingGateway(prs={100: PRView(100, head_ref_oid="head")})
     store, runner = FakeStore(), FakeRunner(_approved())
     workflow = _workflow(gw, store, runner)
-    workflow.authority.submit = lambda *args, **kwargs: False
+    async def refuse(*args, **kwargs):
+        return None
+    workflow.authority.submit = refuse
     asyncio.run(workflow.review(100))
     assert len(runner.tasks) == 1
     assert review_state(store).head(100) == ""

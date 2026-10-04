@@ -95,13 +95,10 @@ dashboard-ui:
 dashboard:
 	@uv run --quiet --extra sdk --extra dash issue-agent dashboard
 
-# Gate parity (review M6). The harness has TWO gate implementations — the bash
-# checkers (live for codex) and domain/gate.py + adapters/governor.py (live for
-# the SDK/Claude path, the reviewer and the steward) — that shared a spec, not
-# code, and drifted. This suite runs golden cases through BOTH and fails on any
-# disagreement; it is the sync mechanism that replaced the "keep in sync"
-# comments. Deps mirror test-adapters (tree-sitter for the classifier); it is a
-# PEP 723 script, so `uv run` self-bootstraps pytest.
+# Gate transport parity: golden expected verdicts exercise the advisory shell
+# and SDK transports through one Python policy source. Mutation cases detect
+# policy weakening; explicit capability differences remain independently tested.
+# PEP 723 dependencies mirror test-adapters (tree-sitter for classification).
 test-parity:
 	@echo "== gate parity (pytest: bash checkers vs domain/gate.py) =="
 	@uv run --quiet tests/test_gate_parity.py

@@ -16,6 +16,8 @@ from ..domain import workflow as w
 from ..domain import review_workflow as rw
 from ..domain import review_dispatch_record as rd
 from ..domain import review_workflow_policy as rp
+from ..domain.review_evidence import EvidenceSchedule
+from ..domain import review_test_evidence as test_evidence
 from ..domain import review_execution as rx
 from ..domain import review_execution_migration as migration
 from ..domain.review_execution_import_plan import EligibleZeroHistoryReviewImport
@@ -36,7 +38,7 @@ from ..domain.world import Comment, IssueView
 from ..domain.outcome import ExitReason
 from ..domain.self_clear import BudgetBlock, MachineBlock, MachineBlocker, MachineClearProjection, BudgetClearProjection, BudgetWorld, BudgetLimitObservation
 from ..domain.actions import Target
-from ..domain.contracts import EffectReceipt, EffectStatus
+from ..domain.contracts import EffectReceipt, EffectStatus, TestExecution, TestExecutionStatus
 from ..domain.outcome import Adjudication
 from ..domain.effort import Effort
 from ..domain import resolve_split as split
@@ -58,6 +60,10 @@ def decode_self_clear_projection(payload: object) -> MachineClearProjection | Bu
     return value
 
 _VALUES = (
+    EvidenceSchedule, TestExecution, test_evidence.ReviewTestTreeProof,
+    test_evidence.OperatorTestCommand, test_evidence.OperatorTestWaiver, test_evidence.MissingOperatorTestCommand,
+    test_evidence.ReviewTestConfiguration, test_evidence.ReviewTestSubject, test_evidence.ReviewTestInvocation,
+    test_evidence.ReviewTestCompletion,
     EffectReceipt,
     MachineClearProjection, BudgetClearProjection, BudgetWorld, BudgetLimitObservation,
     BudgetScope, BudgetBlock, cc.RefusedBudgetBlock,
@@ -165,6 +171,7 @@ _VALUES = (
     preflight.ReviewPreflightSelection,
 )
 _ENUMS = (
+    TestExecutionStatus, test_evidence.ReviewTestOutcome, test_evidence.PostedReview,
     MachineBlocker, Target, EffectStatus,
     UsageSource, PricingBasis,
     LifecycleOperation,

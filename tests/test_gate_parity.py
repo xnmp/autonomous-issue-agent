@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import os
 import shlex
 import shutil
@@ -192,10 +193,11 @@ def write_gh_stub(repo: Path, pr_number: str) -> Path:
     stub_dir = repo / ".stub"
     stub_dir.mkdir(exist_ok=True)
     gh = stub_dir / "gh"
+    payload = json.dumps([{"number": int(pr_number)}] if pr_number else [])
     gh.write_text(
         "#!/usr/bin/env bash\n"
         'case " $* " in\n'
-        f'  *" pr list "*) printf \'%s\' "{pr_number}" ;;\n'
+        f'  *" pr list "*) printf \'%s\' \'{payload}\' ;;\n'
         "  *) : ;;\n"
         "esac\n"
     )
@@ -1100,17 +1102,18 @@ def test_absence_of_ported_rule_wiring_breaks_parity(name: str, tmp_path: Path) 
 
 # ── MUTATION tests: re-introduce the exact bug, assert the case flips ────────
 def _mutated_checks(tmp_path: Path, replacements: dict[str, str]) -> Path:
-    """A copy of plugin/hooks/checks/ with textual mutations applied. Each
-    replacement must actually match — a mutation that silently no-ops would
-    make the test pass for the wrong reason."""
-    dest = tmp_path / "mutated-checks"
+    """Mutate an isolated harness policy copy, reached through real shell entry."""
+    harness = tmp_path / "mutated-harness"
+    dest = harness / "plugin" / "hooks" / "checks"
     shutil.copytree(CHECKS, dest)
-    for path in sorted(dest.glob("*.sh")):
+    shutil.copytree(ROOT / "src", harness / "src")
+    (harness / ".venv").symlink_to(ROOT / ".venv", target_is_directory=True)
+    for path in sorted((harness / "src").rglob("*.py")):
         text = path.read_text()
-        for old, new in replacements.items():
+        for old, new in tuple(replacements.items()):
             if old in text:
                 text = text.replace(old, new)
-                replacements = {k: v for k, v in replacements.items() if k != old}
+                replacements.pop(old)
         path.write_text(text)
     assert not replacements, f"mutation did not apply: {sorted(replacements)}"
     return dest
@@ -1125,7 +1128,7 @@ def test_mutation_three_dot_log_range_reintroduces_the_m6_bug(tmp_path: Path) ->
     with "lacks an allowed prefix" — over a commit the branch does not even
     contain."""
     mutated = _mutated_checks(tmp_path, {
-        'log_range="$baseref..HEAD"': 'log_range="$baseref...HEAD"',
+        'f"{baseref}..HEAD"': 'f"{baseref}...HEAD"',
     })
     case = next(c for c in GOLDEN if c.name == "base_advanced_pr")
     bash, python = _run_case(case, tmp_path / "case", checks_dir=mutated)
@@ -1142,8 +1145,7 @@ def test_mutation_marker_precedence_reintroduces_the_p1r18_drift(tmp_path: Path)
     """Restore the old `.harness/test-cmd`-wins precedence in the bash and the
     two stacks disagree — the drift this wave closed (P1R-18)."""
     mutated = _mutated_checks(tmp_path, {
-        'local m=".harness/test-cmd" c="${TEST_CMD:-}"':
-            'local m=".harness/test-cmd" c=""',
+        '(env_test_cmd, harness_test_cmd)': '(harness_test_cmd, env_test_cmd)',
     })
     case = next(c for c in GOLDEN if c.name == "operator_tautological_test_cmd_blocks")
     bash, python = _run_case(case, tmp_path / "case", checks_dir=mutated)
@@ -1158,7 +1160,7 @@ def test_mutation_dropping_the_bash_adr_rule_breaks_parity(tmp_path: Path) -> No
     guard makes the bash allow a PR the Python gate denies.  Porting a rule is
     only half the job — both halves stay tested."""
     mutated = _mutated_checks(tmp_path, {
-        'if [ -d docs/adr ]; then': 'if false; then',
+        'lambda: gate.check_adr_references(ctx.load_adrs, ctx.changed_files, body)': 'lambda: gate.ALLOW',
     })
     case = next(c for c in GOLDEN if c.name == "adr_governed_path_uncited")
     bash, python = _run_case(case, tmp_path / "case", checks_dir=mutated)

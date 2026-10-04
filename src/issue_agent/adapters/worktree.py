@@ -8,8 +8,8 @@ markers, and wires the `run_tests` / `revert_and_run` / `exists_at_base` /
 `open_pr` callables (§1 + §10 + the push gate) over real git and `gh`.
 
 git/subprocess is injected as `run` so the path/branch logic is testable with a
-fake; the production default shells out. The §10 revert simulation mirrors
-_pr_common.sh:prc_check_red_fails (revert impl to base, run tests, restore HEAD).
+fake; the production default shells out. Both advisory transports reuse the
+§10 revert simulation (revert impl to base, run tests, restore HEAD).
 """
 
 from __future__ import annotations
@@ -1696,6 +1696,8 @@ def build_gate_context(
     baseref = _resolve_base_ref(git, cwd, base_branch)
     base_resolvable = baseref is not None
 
+    history_available = True
+    branch_diff_available = True
     subjects: tuple[str, ...] = ()
     published_subjects: tuple[str, ...] = ()
     declared_exemptions: tuple[ExemptionDeclaration, ...] = ()
@@ -1705,11 +1707,13 @@ def build_gate_context(
     additive_only: tuple[str, ...] = ()
     if baseref:
         log = git(["log", f"{baseref}..HEAD", "--reverse", "--format=%s"], cwd)
+        history_available = log.code == 0
         subjects = tuple(s for s in log.out.splitlines() if s)
         # #124 declarations are Gate-Exemption trailers anywhere on the
         # branch's commits: tracked history the agent cannot edit without
         # changing the branch, and nothing left in the repo after merge.
         bodies = git(["log", f"{baseref}..HEAD", "--format=%B"], cwd)
+        history_available = history_available and bodies.code == 0
         if bodies.code == 0:
             seen_decl: dict[ExemptionDeclaration, None] = {}
             for declaration in parse_exemption_declarations(bodies.out):
@@ -1760,13 +1764,18 @@ def build_gate_context(
             ],
             cwd,
         )
+        branch_diff_available = all(result.code == 0 for result in (diff, old_side, numstat))
         if numstat.code == 0:
             additive: list[str] = []
             for row in numstat.out.splitlines():
                 parts = row.split("\t", 2)
                 if len(parts) != 3:
-                    continue
+                    branch_diff_available = False
+                    break
                 added, deleted, path = parts
+                if not path or len(path) > 4096 or not ((added.isdigit() and deleted.isdigit()) or (added == deleted == "-")):
+                    branch_diff_available = False
+                    break
                 if deleted == "0" and added.isdigit() and added != "0":
                     additive.append(path)
             additive_only = tuple(additive)
@@ -1904,6 +1913,42 @@ def build_gate_context(
             except OSError:
                 continue
 
+    def instruction_blobs(staged: bool) -> tuple[tuple[str, str], ...] | None:
+        selected = git(["diff", "--cached", "--name-only", "--diff-filter=ACMR"], cwd) if staged else None
+        if selected is not None and selected.code != 0:
+            return None
+        paths = selected.out.splitlines() if selected is not None else changed
+        tree = None if staged else git(["ls-tree", "--name-only", "HEAD", "--", "AGENTS.md", "AGENTS.override.md"], cwd)
+        if tree is not None and tree.code != 0:
+            return None
+        present = set(tree.out.splitlines()) if tree is not None else set(paths)
+        blobs = []
+        for path in ("AGENTS.md", "AGENTS.override.md"):
+            if path not in paths or path not in present:
+                continue
+            blob = git(["show", f":{path}" if staged else f"HEAD:{path}"], cwd)
+            if blob.code != 0 or len(blob.out) > 2_000_000:
+                return None
+            blobs.append((path, blob.out))
+        return tuple(blobs)
+
+    def commit_image_sizes() -> tuple[tuple[str, int], ...] | None:
+        staged = git(["diff", "--cached", "--name-only", "--diff-filter=AM"], cwd)
+        local = git(["ls-files", "--others", "--modified", "--exclude-standard", "--", "evidence"], cwd)
+        if staged.code != 0 or local.code != 0:
+            return None
+        images = []
+        for path in dict.fromkeys(staged.out.splitlines() + local.out.splitlines()):
+            if os.path.splitext(path)[1].lower() not in {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}:
+                continue
+            try:
+                images.append((path, os.path.getsize(os.path.join(cwd, path))))
+            except FileNotFoundError:
+                continue
+            except OSError:
+                return None
+        return tuple(images)
+
     def open_pr(target_branch: str) -> OpenPrLookup:
         """Resolved ONLY when the governor actually gates a push (see
         `governor._push_gate`) — building this context must stay gh-free.
@@ -1917,7 +1962,18 @@ def build_gate_context(
     def exists_at_base(path: str) -> bool:
         if not baseref:
             return False
-        return git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0
+        if git(["cat-file", "-e", f"{baseref}:{path}"], cwd).code == 0:
+            return True
+        # cat-file uses the same failure code for absent objects and failed
+        # reads. A successful tree lookup must prove absence before granting
+        # new-test treatment or deleting an implementation in red verification.
+        tree = git(["ls-tree", "-z", "--name-only", baseref, "--", path], cwd)
+        if tree.code != 0:
+            raise ValueError("base-tree evidence is unavailable")
+        paths = tree.out.split("\x00")
+        if any(value and value != path for value in paths):
+            raise ValueError("malformed base-tree evidence")
+        return path in paths
 
     def _default_run_tests(cmd: str) -> bool | None:
         """Run the test command via `governor.run_target_command` (env scrub +
@@ -2064,11 +2120,18 @@ def build_gate_context(
                 started=started,
             )
         finally:
-            git(["checkout", "-q", "HEAD", "--", *impl_files], cwd)
+            restored = git(["checkout", "-q", "HEAD", "--", *impl_files], cwd)
+            if restored.code != 0:
+                return receipt(test_cmd, TestExecutionStatus.INFRA_ERROR, code=127,
+                    output="implementation restore failed", started=started)
 
     return GateContext(
+        history_available=history_available,
+        branch_diff_available=branch_diff_available,
         base_branch=base_branch,
         repository=repo,
+        instruction_blobs=instruction_blobs,
+        commit_image_sizes=commit_image_sizes,
         branch=branch,
         branch_subjects=subjects,
         published_subjects=published_subjects,

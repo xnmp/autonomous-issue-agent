@@ -1514,3 +1514,106 @@ def test_multi_review_out_of_order_child_returns_settle_one_round_and_one_charge
     restarted.tick(3)
     assert restarted.provider.tasks == [] and restarted.charges() == client.charges()
     assert len(restarted.submissions()) == 1 and restarted.state().execution == state.execution
+
+
+def test_ordinary_test_failure_requests_changes_and_survives_compatible_restart(deployment, tmp_path):
+    marker = tmp_path / "test-invocations"
+    command = f"echo run >> '{marker}'; exit 1"
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)), test_command=command)
+    client.boot()
+    client.tick()
+    assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"
+    assert marker.read_text().splitlines() == ["run"]
+    restarted = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)), test_command=command)
+    restarted.boot()
+    restarted.tick(2)
+    assert marker.read_text().splitlines() == ["run"]
+    assert all(review.state != "APPROVED" for review in restarted.bot_reviews())
+
+
+def test_ordinary_test_unavailable_backoff_prevents_paid_review_ticks(deployment):
+    from issue_agent.domain.workflow import ReconciliationPolicy
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK, OK)), test_command="")
+    client.workflow._policy = ReconciliationPolicy(initial_delay_seconds=600, maximum_delay_seconds=600,
+                                                   maximum_reads=2)
+    client.boot()
+    client.tick()
+    launches = len(client.provider.tasks)
+    assert launches == 1 and client.bot_reviews() == []
+    client.tick(3, minutes=0)
+    assert len(client.provider.tasks) == launches and client.bot_reviews() == []
+    client.tick(minutes=11)
+    assert len(client.provider.tasks) == launches + 1
+    assert any(isinstance(gate.cause, EvidenceUnavailable) and gate.gate_id.startswith("ordinary-test:")
+               for gate in client.gates())
+    client.tick(3, minutes=11)
+    assert len(client.provider.tasks) == launches + 1 and client.bot_reviews() == []
+
+
+@pytest.mark.parametrize("second_exit,expected", [(0, "APPROVED"), (1, "CHANGES_REQUESTED"), (2, None)])
+def test_copied_approval_requires_fresh_head_tests_with_closed_outcomes(deployment, tmp_path, second_exit, expected):
+    marker = tmp_path / "ordinary-runs"
+    command = f"if test -e '{marker}'; then exit {second_exit}; fi; touch '{marker}'"
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)), test_command=command)
+    client.boot()
+    client.tick()
+    assert client.bot_reviews()[-1].state == "APPROVED"
+    rebased = deployment.heads[2]
+    client.remote.set_diff(rebased, diff_text("change0", offset=9))
+    client.remote.external_pr_change(PR, head_ref_oid=rebased)
+    client.tick()
+    assert len(client.provider.tasks) == 1
+    reviews = [review for review in client.bot_reviews() if review.commit_id == rebased]
+    assert [review.state for review in reviews] == ([] if expected is None else [expected])
+    assert not any("planning is already sealed" in line for line in client.log)
+
+
+def test_composed_ordinary_test_cancellation_reaps_through_existing_role_supervision(deployment):
+    from tests.domain.test_review_test_evidence import invocation
+    client = compose_review(deployment, test_command="sleep 30")
+    runtime = client.review.runtime
+    executor = runtime._test_executor
+    assert executor is not None and runtime._test_configuration is not None and callable(runtime._test_checkout)
+    cwd = runtime._test_checkout(PR, deployment.heads[0])
+    selected = invocation(runtime._test_configuration)
+    selected = replace(selected, subject=replace(selected.subject, head_sha=deployment.heads[0]))
+    async def exercise():
+        task = asyncio.create_task(executor.execute(selected, cwd))
+        await asyncio.sleep(0.2)
+        kill = client.review.daemon.force_kill_dispatches
+        assert kill is not None and not task.done()
+        kill()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, 5)
+    asyncio.run(exercise())
+    client.boot()
+    assert executor.supervisor.recover_abandoned_orphans() == ()
+    assert client.bot_reviews() == [] and client.charges() == []
+
+
+def test_ordinary_test_ceiling_renewal_restarts_one_new_execution_subject(deployment):
+    from issue_agent.domain.workflow import ReconciliationPolicy, RequestReviewExecutionRenewal, KeepGuidance
+    from issue_agent.domain.review_control import execution_recovery_choices, ActionOffered, ReviewOperatorCommand
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)), test_command="")
+    client.workflow._policy = ReconciliationPolicy(maximum_reads=1)
+    client.boot()
+    client.tick()
+    before = client.state()
+    test_gate = next(gate for gate in client.gates() if gate.gate_id.startswith("ordinary-test:"))
+    view = client.workflow.review_control_view(KEY)
+    assert any(gate.gate_id == test_gate.gate_id and isinstance(choice, ActionOffered)
+               and choice.command is ReviewOperatorCommand.RENEW_EXECUTION
+               for gate, choice in execution_recovery_choices(view))
+    resumed = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)), test_command="true")
+    resumed.boot()
+    resumed.tick()
+    assert resumed.provider.tasks == [] and resumed.bot_reviews() == []
+    current = resumed.state()
+    request = RequestReviewExecutionRenewal("ordinary-renew:1", current.revision, test_gate.gate_id, KeepGuidance(),
+        current.execution.binding.execution_epoch, current.execution.binding.execution_episode,
+        expected_binding=current.binding)
+    assert isinstance(resumed.workflow.request_rearm(request, ACTOR), WorkflowCommitted)
+    resumed.tick(3)
+    assert len(resumed.provider.tasks) == 1 and resumed.bot_reviews()[-1].state == "APPROVED"
+    assert resumed.state().execution.binding.execution_episode != before.execution.binding.execution_episode

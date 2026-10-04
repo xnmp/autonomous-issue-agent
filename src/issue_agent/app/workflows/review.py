@@ -97,6 +97,9 @@ class BoundReviewRound:
     observation: object = field(compare=False, repr=False, default=None)
 
 
+from ...domain.review_test_evidence import PostedReview
+
+
 class ReviewAuthority(Protocol):
     """The review workflow authority a bound review consults and submits through."""
 
@@ -120,11 +123,13 @@ class ReviewAuthority(Protocol):
 
     def record_evidence(self, round: BoundReviewRound, error: str | None) -> None: ...
 
-    def submit(
+    def test_due(self, round: BoundReviewRound, patch_id: str) -> bool: ...
+
+    async def submit(
         self, round: BoundReviewRound, event: str, body: str, *, patch_id: str, escalate_cause: str | None,
         counted_past: frozenset[str] = frozenset(),
-    ) -> bool:
-        """True once the submission's receipt landed; its settlement decides any hold."""
+    ) -> PostedReview | None:
+        """The posted outcome once the submission's receipt landed; its settlement decides any hold."""
         ...
 
 
@@ -377,6 +382,10 @@ class ReviewWorkflow:
             self.authority.stop(bound, ReviewPlanningRefused("harness-diff:" + bound.plan.round.round_id))
             return
         signature = review_dom.patch_signature(diff)
+        assert self.authority is not None
+        if not self.authority.test_due(bound, signature):
+            self.authority.stop(bound, ReviewPlanningRefused("ordinary-test-backoff:" + bound.plan.round.round_id))
+            return
         guidance = bound.guidance
         discussion = self._pr_discussion(p)
         if self.cfg.review_mode is review_dom.ReviewMode.DELEGATED:
@@ -432,7 +441,7 @@ class ReviewWorkflow:
         grant_suffix = self._grant_suffix(
             p, signature, result, declared_exemptions
         )
-        if not self._submit_review(
+        if not await self._submit_review(
             p, result, bound.plan.displayed_round, prior,
             patch_id=signature,
             body_suffix=grant_suffix,
@@ -475,7 +484,11 @@ class ReviewWorkflow:
             self.authority.stop(bound, ReviewPlanningRefused("harness-diff:" + bound.plan.round.round_id))
             return
         signature = review_dom.patch_signature(diff)
-        patch_shortcut = self._bound_patch_unchanged(p, diff, signature, bound, claim_target)
+        assert self.authority is not None
+        if not self.authority.test_due(bound, signature):
+            self.authority.stop(bound, ReviewPlanningRefused("ordinary-test-backoff:" + bound.plan.round.round_id))
+            return
+        patch_shortcut = await self._bound_patch_unchanged(p, diff, signature, bound, claim_target)
         if patch_shortcut.settled:
             return
         non_resetting_approvals |= (
@@ -574,7 +587,7 @@ class ReviewWorkflow:
         grant_suffix = self._grant_suffix(
             p, signature, result, declared_exemptions
         )
-        if not self._submit_review(
+        if not await self._submit_review(
             p, result, round_number, prior,
             patch_id=signature,
             body_suffix=grant_suffix,
@@ -660,18 +673,18 @@ class ReviewWorkflow:
         # The complete harness read, never the world view's review list.
         return self.authority.prior_rejections(bound, non_resetting)
 
-    def _post(
+    async def _post(
         self, sub, bound: BoundReviewRound, patch_id: str,
         counted_past: frozenset[str] = frozenset(),
-    ) -> bool:
+    ) -> PostedReview | None:
         assert self.authority is not None
-        return self.authority.submit(
+        return await self.authority.submit(
             bound, sub.event, sub.body, patch_id=patch_id,
             escalate_cause=sub.escalate_cause if sub.escalate else None,
             counted_past=counted_past,
         )
 
-    def _bound_patch_unchanged(
+    async def _bound_patch_unchanged(
         self, p, diff: str, signature: str, bound: BoundReviewRound, claim_target: int | None,
     ) -> _PatchShortcut:
         """Reuse a verdict only against the same-generation reviewed baseline.
@@ -708,7 +721,11 @@ class ReviewWorkflow:
         if event is None:
             return _PatchShortcut()
         body = prior.body.strip() or "Mechanical rebase: patch is unchanged from the reviewed revision."
-        if not self.authority.submit(bound, event, body, patch_id=signature, escalate_cause=None):
+        posted = await self.authority.submit(bound, event, body, patch_id=signature, escalate_cause=None)
+        if posted is None:
+            if not self.authority.test_due(bound, signature):
+                self.cfg.log(f"re-review #{p.number}: copied verdict awaits independent ordinary-test evidence")
+                return _PatchShortcut(settled=True)
             self.cfg.log(
                 f"re-review #{p.number}: unchanged patch verdict could not be "
                 "bound to the new head — reviewing normally"
@@ -717,7 +734,7 @@ class ReviewWorkflow:
         self.cfg.log(
             f"re-review #{p.number}: head moved to {p.head_ref_oid[:8] or '?'} but the "
             "patch is unchanged against the reviewed baseline — copied the "
-            "verdict as a bound submission, no review agent run"
+            f"verdict as {posted.event}, no review agent run"
         )
         self._cleanup_checkout(p.number)
         return _PatchShortcut(settled=True)
@@ -1028,6 +1045,10 @@ class ReviewWorkflow:
                 self.authority.stop(bound, ReviewPlanningRefused("harness-diff:" + bound.plan.round.round_id))
                 return
         signature = review_dom.patch_signature(diff)
+        assert self.authority is not None
+        if not self.authority.test_due(bound, signature):
+            self.authority.stop(bound, ReviewPlanningRefused("ordinary-test-backoff:" + bound.plan.round.round_id))
+            return
         rcfg = self.cfg.review
         guidance = bound.guidance
         discussion = self._pr_discussion(p)
@@ -1094,7 +1115,7 @@ class ReviewWorkflow:
                 f"({gate.field('reason') or 'no behavioural change'}) "
                 f"→ {sub.event}"
             )
-            if self._post(sub, bound, signature, counted_past):
+            if await self._post(sub, bound, signature, counted_past):
                 self._cleanup_checkout(p.number)
             else:
                 self._no_progress(p, f"gate {sub.event} POST failed")
@@ -1208,7 +1229,7 @@ class ReviewWorkflow:
             # including returned failures when no verdict can be synthesized.
             self._no_progress(p, "incomplete fan-out, no verdict to submit")
             return
-        if not self._post(sub, bound, signature, counted_past):
+        if not await self._post(sub, bound, signature, counted_past):
             self._no_progress(p, "review POST failed")
             return  # failed POST → leave state untouched (retried next poll)
         self._cleanup_checkout(p.number)
@@ -1224,7 +1245,7 @@ class ReviewWorkflow:
                     f"review #{pr}: pinned checkout not removed ({exc})"
                 )
 
-    def _submit_review(
+    async def _submit_review(
         self,
         p,
         result,
@@ -1282,18 +1303,19 @@ class ReviewWorkflow:
                 issue_from_branch(p.head_ref_name), patch_id
             ),
         )
-        if not self._post(sub, bound, patch_id, counted_past):
+        posted = await self._post(sub, bound, patch_id, counted_past)
+        if posted is None:
             return False
         # Log the OUTCOME of a successful submit — always on (not DEBUG-gated).
-        escalated = " → escalated (needs-human-review)" if sub.escalate else ""
+        escalated = " → escalated (needs-human-review)" if posted.escalated else ""
         # Show the rejection tally that actually drives escalation, not merely
         # the push-derived round number.
         tally = (
             f", rejection {prior_rejections + 1}/{self.cfg.max_review_rejections}"
-            if sub.event != "APPROVE" else ""
+            if posted.event != "APPROVE" else ""
         )
         self.cfg.log(
-            f"review #{pr} r{round_number}{tally}: submitted {sub.event}{escalated}"
+            f"review #{pr} r{round_number}{tally}: submitted {posted.event}{escalated}"
         )
         return True
 

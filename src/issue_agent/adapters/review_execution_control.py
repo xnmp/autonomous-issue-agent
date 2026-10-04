@@ -105,6 +105,73 @@ class SQLiteReviewExecutionControl:
         self._preparation_control = preparation_control
         self._round_cursor = _START_CURSOR
 
+    def begin_test(self, invocation, test_control):
+        from ..domain.review_test_evidence import ReviewTestOutcome
+        from ..domain.review_evidence import evidence_due
+        from .review_test_execution import (read_test_intent, read_test_completion,
+            TEST_INTENT_NAMESPACE, TEST_INVOCATION_NAMESPACE)
+        subject = invocation.subject
+        if test_control._control is not self._control or test_control.writer != self._writer:
+            raise WorkflowAuthorityError("test evidence requires the same SQL authority")
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            state = load_review_workflow_row(db, subject.rejection.fence.key)
+            round_record = self._round_record(db, invocation.round.round_id)
+            if (not isinstance(state, ReviewWorkflowSnapshot) or state.binding != subject.rejection
+                    or not isinstance(state.execution, CurrentReviewExecution) or state.execution.binding != subject.execution
+                    or round_record is None or round_record[2].round != invocation.round):
+                raise WorkflowAuthorityError("test intent requires its current admitted round")
+            prior = read_test_intent(db, self._writer.repository, subject.identity)
+            schedule = test_control.ordinary_test_schedule(db, subject)
+            if prior is not None:
+                completion = read_test_completion(db, self._writer.repository, prior.invocation_id)
+                if completion is None:
+                    return prior, schedule
+                if completion.outcome is not ReviewTestOutcome.UNAVAILABLE:
+                    return completion, schedule
+            if state.gates or not evidence_due(schedule, subject.head_sha, now=self._control.now()):
+                return None, schedule
+            payload = encode_workflow(invocation)
+            prior_payload = encode_workflow(prior) if prior is not None else None
+            if prior is None:
+                changed = db.execute("INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                    (TEST_INTENT_NAMESPACE, self._writer.repository, subject.identity, _stamp(self._control.now()), payload)).rowcount
+            else:
+                changed = db.execute("UPDATE dedupe_keys SET claimed_at=?,payload_json=? WHERE namespace=? AND scope=? AND key=? AND payload_json=?",
+                    (_stamp(self._control.now()), payload, TEST_INTENT_NAMESPACE, self._writer.repository, subject.identity, prior_payload)).rowcount
+            if changed != 1:
+                raise WorkflowAuthorityError("test intent changed during claim")
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (TEST_INVOCATION_NAMESPACE, self._writer.repository, invocation.invocation_id, _stamp(self._control.now()), payload))
+            self._control._transition(db, "review_round", invocation.round.round_id, "ordinary_test_intent",
+                {"subject": subject.identity, "invocation": invocation.invocation_id})
+            return invocation, schedule
+
+    def finish_test(self, completion, expected_schedule, test_control):
+        from ..domain.review_test_evidence import ReviewTestOutcome
+        from .review_test_execution import read_test_intent, read_test_completion, TEST_COMPLETION_NAMESPACE
+        invocation = completion.invocation
+        subject = invocation.subject
+        if test_control._control is not self._control or test_control.writer != self._writer:
+            raise WorkflowAuthorityError("test evidence requires the same SQL authority")
+        with self._control.transaction() as db:
+            self._control._assert_owner_active(db, self._writer.owner_id)
+            prior = read_test_completion(db, self._writer.repository, invocation.invocation_id)
+            if prior is not None:
+                if prior != completion:
+                    raise WorkflowAuthorityError("test completion conflicts with its original evidence")
+                return prior
+            if read_test_intent(db, self._writer.repository, subject.identity) != invocation:
+                raise WorkflowAuthorityError("test invocation is no longer selected")
+            db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?)",
+                (TEST_COMPLETION_NAMESPACE, self._writer.repository, invocation.invocation_id,
+                    _stamp(self._control.now()), encode_workflow(completion)))
+            test_control._record_ordinary_test_in_tx(db, subject, expected_schedule,
+                error=completion.summary if completion.outcome is ReviewTestOutcome.UNAVAILABLE else None)
+            self._control._transition(db, "review_round", invocation.round.round_id, "ordinary_test_completed",
+                {"subject": subject.identity, "outcome": completion.outcome.value})
+            return completion
+
     def _write_current_outcome_in_tx(
         self, db: sqlite3.Connection, facts: ReviewRoundFacts, expected: WorkflowRevision,
     ) -> FinalizedReviewRound | DeferredReviewPreparation:
@@ -978,7 +1045,7 @@ class SQLiteReviewExecutionControl:
 
     def register_submission(
         self, round_id: str, expected: WorkflowRevision, command: LifecycleCommand,
-        kind: ReviewSubmissionKind,
+        kind: ReviewSubmissionKind, *, test_configuration=None,
     ) -> PendingCommand:
         """Append the command-to-round link and enqueue the remote effect atomically."""
         validate_workflow_identifier(round_id, "review round")
@@ -1069,6 +1136,13 @@ class SQLiteReviewExecutionControl:
             snapshot = load_review_workflow_row(db, expected.fence.key)
             if snapshot is None or not isinstance(snapshot.execution, CurrentReviewExecution):
                 raise WorkflowAuthorityError("review execution workflow is absent or inactive")
+            op = bound_submission_op(command)
+            if op is not None and op.event == "APPROVE":
+                from .review_test_execution import approval_test_error
+                error = approval_test_error(db, self._writer.repository, op.test_evidence_ref, test_configuration,
+                    command.workflow, snapshot.execution.binding, op.head, op.patch_id)
+                if error:
+                    raise WorkflowAuthorityError(error)
             if snapshot.revision != expected:
                 raise WorkflowRevisionConflict(snapshot.revision, "review submission aggregate version changed")
             if (snapshot.execution.binding != plan.round.binding

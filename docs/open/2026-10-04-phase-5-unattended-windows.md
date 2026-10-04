@@ -133,8 +133,27 @@ USD 22.75 is retained maximum exposure, not measured spend. These obligations
 were preserved; the preflight did not clear them or claim settlement. Resolve
 and subsequent family activation/rollback must be rehearsed again after
 positive reconciliation evidence is available. The configured target checkout
-also has existing edits on `fix/crop-editor-ux`; executor verification needs
+also has existing edits on `fix/crop-editor-ux`; executor verification uses
 an isolated checkout pinned to the selected revision.
+
+The 2026-10-04 offline executor qualification used a private checkout of
+configured `dev` at `7d13f05d465358c1a29acaaeeff654d50c13c50c`, with copied
+dependency/build caches and private cache paths. The first attempt exposed
+missing copied website dependencies and sandbox-denied local sockets. After
+copying those dependencies and permitting local sockets, the exact retained
+test command reached native compilation but exceeded its configured 600-second
+limit. The executor recorded `UNAVAILABLE` / `TIMED_OUT`, preserved equal
+pre/post tracked-tree proof and completed process teardown with no remaining
+orphans. This first run verifies bounded failure handling.
+
+The final reviewed executor then ran the same retained command with the warmed
+private cache at 2026-10-04 13:35–13:39 UTC. It passed in 258,591 ms, recorded
+equal pre/post committed/index/tracked-tree proof, and left no orphan processes.
+The tested configuration digest was
+`67a3122de6b766194cb5df5ce1208872dbbf40fc22615de1c1353e259ed87ab3`.
+This qualifies the ordinary test command in the isolated Linux checkout;
+it does not supply migration, paid-provider, canary or unattended-window
+acceptance. The original checkout and live authority were unchanged.
 
 No dates, accepted starting revisions, selected issue set, successful family
 activation/rollback, coverage declaration or live readout has been recorded.

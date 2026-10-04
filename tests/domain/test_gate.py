@@ -1,5 +1,8 @@
 """Gate-rule behaviour (Phase 1) — pure ports of check-*.sh + _pr_common.sh."""
 
+import pytest
+from issue_agent.domain import gate
+
 from issue_agent.domain.contracts import (
     TestExecution as ExecutionReceipt,
     TestExecutionStatus as ExecutionStatus,
@@ -1360,3 +1363,13 @@ def test_rust_test_files_are_recognized_as_tests():
     assert looks_like_test("src/app/mouse_test.rs")
     assert not looks_like_test("src/app/mouse.rs")
     assert not looks_like_test("tests/fixtures/data.json")
+
+
+@pytest.mark.parametrize("blobs", [None, [], (("AGENTS.md", None),), (("AGENTS.md", "x" * 2_000_001),), (([], "text"),), (("AGENTS.md",),)])
+def test_generated_instruction_missing_or_malformed_evidence_denies(blobs):
+    assert not gate.check_generated_instructions(blobs).ok
+
+
+@pytest.mark.parametrize("images,limit", [(None, 1), ((), True), ((("x.png", True),), 1), ((("x.png", None),), 1), ((("x.png", 2**64),), 1), (((),), 1)])
+def test_invalid_image_facts_cannot_authorize_a_commit(images, limit):
+    assert not gate.check_image_sizes(images, limit).ok

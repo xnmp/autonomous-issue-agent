@@ -544,6 +544,7 @@ def _effects(
     base_branch: str,
     repository_cap: Money | None = None,
     global_cap: Money | None = None,
+    test_configuration=None,
     issue_cap: Money | None = None,
     retry_ceiling: int = DEFAULT_EFFECT_RETRY_CEILING,
     journal: TypedJournal | None = None,
@@ -556,6 +557,7 @@ def _effects(
         repository=repository,
         identity=identity,
         config_version=config_version,
+        test_configuration=test_configuration,
         repository_cap=repository_cap,
         global_cap=global_cap,
         issue_cap=issue_cap,
@@ -3220,6 +3222,10 @@ def compose_review_daemon(
     cfg: HarnessConfig, gateway: GitHubGateway, store: Store, runner: AgentRuntime,
     *, log: Callable[[str], None] | None = None,
 ) -> ReviewDaemonComposition:
+    from ..adapters.review_test_execution import freeze_test_configuration, ReviewTestExecutor
+    from ..adapters.process_supervisor import ProcessSupervisor
+    test_configuration, test_environment = freeze_test_configuration(dict(os.environ), cfg.config_version)
+    test_executor = ReviewTestExecutor(ProcessSupervisor(process_supervision_state_dir(cfg, "review", cfg.review_state_dir)), test_environment)
     say: Callable[[str], None] = log or _log("review")
     repo_cfg = cfg.repository
     review_runtime = cfg.review_runtime
@@ -3305,6 +3311,7 @@ def compose_review_daemon(
         repository=cfg.repo,
         identity=owner_id,
         config_version=cfg.config_version,
+        test_configuration=test_configuration,
         base_branch=cfg.base_branch,
         retry_ceiling=cfg.effect_retry_ceiling,
         journal=journal,
@@ -3327,6 +3334,7 @@ def compose_review_daemon(
     runtime = _active_review_runtime(
         cfg, rcfg, control, gateway, store, effect_executor.actions, owner_id, say,
         runtime_preflight=runtime_binding.runtime_preflight,
+        test_configuration=test_configuration, test_executor=test_executor, test_checkout=review_checkout,
     )
     if runtime is not None:
         executor.bind_workflow_reconciliation(runtime.reconcile)
@@ -3583,6 +3591,7 @@ def _active_review_runtime(
     cfg: HarnessConfig, rcfg: ReviewConfig, control: SQLiteControlStore, gateway,
     store: Store, effects: GitHubEffectExecutor, owner_id: str, log,
     *, runtime_preflight: Callable[[], str | None] | None = None,
+    test_configuration=None, test_executor=None, test_checkout=None,
 ) -> ActiveReviewRuntime | None:
     """The review family's runtime, or None when the gateway cannot read reviews."""
     if not isinstance(gateway, ReviewReads):
@@ -3596,6 +3605,8 @@ def _active_review_runtime(
         workflow, effects, gateway, review_bot=rcfg.review_bot, log=log,
         mode=cfg.review_runtime.mode, runtime=cfg.review_runtime.runtime,
         failure_ceiling=cfg.review_runtime.max_unproductive_rounds,
+        test_configuration=test_configuration, test_executor=test_executor, test_checkout=test_checkout,
+        max_review_rejections=cfg.review_runtime.max_rejections,
     )
 
 
