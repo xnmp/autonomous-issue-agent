@@ -1,13 +1,18 @@
 # Phase 5 unattended-window proposal
 
-Status: prepared for review; **not authorized or started**. The architecture
+Status: preparation in progress; **not authorized or started**. The architecture
 plan's Protected window still applies. This document is not a deployment
 command or permission to activate live data.
 
 The existing [48-hour protocol](soak-protocol-unattended-48h.md) supplies the
-no-touch rule and halt adjudication. The new measurement export supplies
+no-touch rule and halt adjudication. Its 2026-08-02 approval and old keifu
+prerequisites do not authorize this deployment. This proposal governs release,
+profile, cost and cohort selection. The new measurement export supplies
 prospective observations, exposure and coverage. Controlled replays do not
-substitute for these windows.
+substitute for these windows. Retain the protocol's three-merge throughput
+target and report an unmet target explicitly. Its quality comparison requires
+a comparable baseline; the historical 69 paid legs and two observed merges do
+not establish one. Missing baseline or recurrence coverage remains unknown.
 
 ## Proposed scope and cost bound
 
@@ -36,6 +41,9 @@ Proposed operator overrides, using existing admission controls:
 | Per-issue cap | USD 25 |
 | Fix dispatch concurrency | 1 |
 | Maximum resolve-leg budget | USD 20 (current target value) |
+| Steward promotion | Disabled during each window |
+| Adopt unlabeled PRs | Disabled |
+| Fix and triage task model | Explicit `gpt-5.6-sol` |
 
 Retain lower existing leg/role ceilings. A configured maximum reservation
 larger than the remaining cap blocks admission; it is not permission to raise
@@ -46,6 +54,12 @@ pre-window obligations and other deployments must be inventoried first;
 this is not a bound on unaccounted historical obligations or a statement about
 the user's subscription bill.
 
+The USD 125 bound requires the same USD 25 global cap for every participating
+owner, at most five admitted UTC budget periods, and no new paid admission
+during analysis or beyond the window deadline while draining. A concurrent
+deployment using a different global cap is outside that bound. Verify those
+conditions before release; a later admission period requires a revised bound.
+
 The proposed configuration change uses these existing keys:
 
 ```sh
@@ -53,11 +67,18 @@ DAILY_SPEND_CAP_USD=25
 GLOBAL_DAILY_SPEND_CAP_USD=25
 ISSUE_SPEND_CAP_USD=25
 FIX_DISPATCH_CONCURRENCY=1
+STEWARD_PROMOTE=0
+REVIEW_ADOPT_UNLABELED=0
+FIX_MODEL=gpt-5.6-sol
+STEWARD_TRIAGE_MODEL=gpt-5.6-sol
 ```
 
 Apply them only to the explicitly authorized launch configuration and record
 its resolved version. The shared global limit covers other deployments using
 the same authority; their obligations belong in the pre-window inventory.
+Steward triage and grooming remain enabled so their unanswered questions,
+holds and effort remain observable. New ready-queue promotion is disabled;
+the initial resolve queue is selected before the no-touch interval.
 
 The proposed caps are much lower than the retained repository override of
 USD 700/day. Budget halts are valid measured outcomes. Low exposure or a
@@ -83,7 +104,17 @@ or cost per merge.
 
 ## Observation and halts
 
-For each window, admit only the frozen initial eligible work. No operator
+Freeze the complete initial issue/PR inventory and the selected initial
+resolve queue. Use the existing `selection: new_admissions` cohort: include
+every actual admission in the repository during the window, stratified by
+family and observed input/difficulty. Record inherited bindings explicitly
+when selecting inherited exposure. The initial inventory is a baseline,
+not a runtime allowlist. Steward triage/groom may observe new inputs; retain
+those admissions and their spend in the readout. An external change to resolve
+eligibility or review trigger labels is a protocol deviation requiring a stop
+and adjudication, not permission to silently exclude the resulting work.
+
+No operator
 comments, relabels, closes, dashboard commands, configuration changes or
 manual restarts during the window. Read-only monitoring is allowed; existing
 supervision may recover a crash. An emergency ends the window and is recorded
@@ -113,6 +144,11 @@ snapshot and current shared/repository configuration to the same version,
 `c312385cee5ebd45`. All configured roles use Codex; review mode is `single`;
 the Codex/review model is `gpt-5.6-sol`. The fix and triage task model fields are
 unset, so their actual per-run models still need frozen admission evidence.
+The proposed in-memory configuration explicitly fixes both task models and
+disables promotion and unlabeled review adoption. Its version is
+`f9e073a4b2d58c23`, with no configuration validation errors; it has not been
+written to the launch snapshot. All actual admission profiles still need to
+match the accepted launch version.
 The retained caps are repository USD 700/day, global USD 1500/day and issue
 USD 250. Proposed lower caps above have not been applied.
 
@@ -160,3 +196,47 @@ activation/rollback, coverage declaration or live readout has been recorded.
 These remain required before Phase 5's unattended-measurement acceptance. The
 historical 69 paid legs and two observed merges are not a comparable baseline
 denominator.
+
+### 2026-10-04 preparation audit
+
+The accepted harness revision is `0294b3e`. A read-only GitHub snapshot at
+14:55–14:57 UTC found 26 open issues, two open PRs and remote `dev` at
+`4eefa9080f1ae9d3a35b12137369096717ffb5d0`. That newer target revision has
+not inherited the ordinary-command qualification of `7d13f05`; freeze and
+qualify the actual selected target revision before release.
+
+The five current `ai-ready` issues need an explicit initial queue decision:
+
+| Issue | Initial inventory classification |
+| --- | --- |
+| [#523](https://github.com/xnmp/tauri-explorer/issues/523) | Substantial Git classification feature; ordinary Git tests and screenshots required |
+| [#531](https://github.com/xnmp/tauri-explorer/issues/531) | Merge-base navigation feature; screenshot required |
+| [#526](https://github.com/xnmp/tauri-explorer/issues/526) | Broader PR-action feature; scope and external capability qualification pending |
+| [#610](https://github.com/xnmp/tauri-explorer/issues/610) | AI-generated columns feature; scope and provider capability qualification pending |
+| [#710](https://github.com/xnmp/tauri-explorer/issues/710) | Windows-only smoke problem, outside this profile; retained retry count 3 equals ceiling 3, with no renewal proposed |
+
+These are inventory facts, not accepted admission decisions or difficulty
+scores. Do not infer visual capability from the ordinary unit-test command.
+Open PRs [#986](https://github.com/xnmp/tauri-explorer/pull/986) (human image
+editor work) and [#987](https://github.com/xnmp/tauri-explorer/pull/987)
+(Dependabot) have no review trigger label in this snapshot. The proposed
+unlabeled-adoption setting excludes them from new automatic review; retain
+them in the starting inventory and account for any inherited binding separately.
+
+At 15:01 UTC, the existing fix and steward activation rehearsal commands
+refused their private copies on the same three reservations and publication
+listed above. Successful activation/rollback is still unproven. A read-only
+check across the shared authority found no active runs, leases or dispatch
+claims; its three active reservations are the retained USD 22.75 maximum
+exposure. All four protected target services were inactive and disabled.
+
+The existing spend reconciler's read-only input path found no valid retained
+evidence for the triage/groom runs. Resolve retains a configured session
+reference, but its trusted usage read returns unavailable. All three runs are
+abandoned with `dead_lease`, no provider receipt ID and no settled charge.
+These observations do not authorize zero-cost settlement or release.
+
+Independent review accepts this document as a preparation draft. Release still
+requires positive reconciliation, copied activation/rollback, explicit starting
+queue and inherited-binding decisions, qualification of the selected target,
+the exact launch/profile freeze, dates, coverage and explicit authorization.
