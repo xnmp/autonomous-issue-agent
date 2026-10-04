@@ -70,7 +70,7 @@ _VALUES = (
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState, cc.PRBlankReplySource,
     cc.CIRemediationCapture, cc.OwedCIRemediation, cc.SettledCIRemediation, cc.ImportedCIRemediation,
-    cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.OwedPRRecoveryEffect,
+    cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.PublicationIdentityEscalationCapture, cc.OwedPRRecoveryEffect,
     cc.SettledPRRecoveryEffect, cc.ImportedBranchRefresh, cc.ImportedPendingCIEscalation,
     cc.FixInfraEpisode, cc.FixInfraReceipt, cc.IssueInfraPurchase,
     cc.StewardLaneState, cc.StewardState, cc.StewardAttemptSource, cc.StewardCommandGuard,

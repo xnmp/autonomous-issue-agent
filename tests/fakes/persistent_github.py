@@ -372,3 +372,35 @@ class PersistentGitHub:
         with self._connect() as db:
             return db.execute("SELECT 1 FROM reviews WHERE pr = ? AND state = ? AND body = ? AND commit_id = ?",
                               (pr, state, body, head)).fetchone() is not None
+
+    def workflow_run_attempts(self, head: str, run_ids: tuple[int, ...]) -> dict[int, int] | None:
+        prs = self.build_world().prs
+        known = {check.run_id for pr in prs if pr.head_ref_oid == head for check in pr.checks}
+        if any(run_id not in known for run_id in run_ids):
+            return None
+        with self._connect() as db:
+            return {run_id: int((db.execute("SELECT value FROM settings WHERE name=?", (f"attempt:{head}:{run_id}",)).fetchone() or (1,))[0]) for run_id in run_ids}
+
+    def advance_run_attempts(self, head: str, run_ids: tuple[int, ...], attempt: int) -> None:
+        with self._connect() as db:
+            for run_id in run_ids:
+                db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", (f"attempt:{head}:{run_id}", str(attempt)))
+
+    def rerun_failed_checks(self, head: str, run_ids: tuple[int, ...], expected_attempts: dict[int, int] | None = None) -> tuple[int, ...] | None:
+        attempts = self.workflow_run_attempts(head, run_ids)
+        if attempts is None or (expected_attempts is not None and attempts != expected_attempts):
+            return None
+        self._call("rerun", head, list(run_ids))
+        # Tests advance attempts explicitly after GitHub's asynchronous queue.
+        return run_ids
+
+    def set_failed_run_log(self, head: str, run_ids: tuple[int, ...], text: str) -> None:
+        with self._connect() as db:
+            db.execute("INSERT OR REPLACE INTO settings VALUES (?,?)", ("log:" + json.dumps([head, run_ids]), text))
+
+    def failed_run_log(self, head: str, run_ids: tuple[int, ...]) -> str:
+        if self.workflow_run_attempts(head, run_ids) is None:
+            raise RuntimeError("CI log request does not match the observed head/runs")
+        with self._connect() as db:
+            row = db.execute("SELECT value FROM settings WHERE name=?", ("log:" + json.dumps([head, run_ids]),)).fetchone()
+        return row[0] if row is not None else ""

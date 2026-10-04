@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-10-03. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-10-04. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -510,6 +510,8 @@ narrow conditions under which it may state a verdict rather than facts),
 (the #124 reviewer-granted gate exemptions: declaration/grant grammar, the
 exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
+`domain/measurement.py` (validated incident/intervention observations),
+`domain/cohort.py` (pure admission-cohort arithmetic and explicit coverage),
 `domain/governor_policy.py`, `domain/git_remote.py`, `domain/identity.py`,
 `domain/infra_breaker.py`, `domain/jira.py`,
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
@@ -565,6 +567,7 @@ pull request retains its lever subject to fresh acceptance reads).
 
 `adapters/` — filesystem, process, provider, and remote-I/O implementations:
 `adapters/accounting_runtime.py`, `adapters/agent_publish.py`,
+`adapters/measurement.py` (atomic observation recording and read-only SQL export),
 `adapters/agent_runner.py`, `adapters/app_token.py`,
 `adapters/child_env.py`, `adapters/claude_profile.py`,
 `adapters/codex_hook.py`, `adapters/codex_runner.py`,
@@ -614,6 +617,7 @@ adapters live under `adapters/dashweb/`.
 `app/execute.py`, `app/identity_pools.py`, `app/infra_breaker.py`,
 `app/launchd_main.py`,
 `app/loop.py`, `app/main.py`,
+`app/measurement.py` (local observation/export transport and cohort specification),
 `app/mcp.py`, `app/recovery.py`, `app/review_identity.py`, `app/roles.py`,
 `app/resolve_control.py`, `app/resolve_activation.py`, `app/review_activation.py`,
 `app/continuation_activation.py` (configured fixed fix/steward offline import, original-plan retry and copied rehearsal),

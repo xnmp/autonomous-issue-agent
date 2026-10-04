@@ -90,6 +90,24 @@ def event_type(name: str):
     return register
 
 
+@event_type("measurement.observation.recorded.v1")
+@dataclass(frozen=True)
+class MeasurementObservationRecorded(EventPayload):
+    record: Mapping[str, JsonValue]
+
+    def __post_init__(self) -> None:
+        from .measurement import observation_json, parse_observation
+
+        normalized = observation_json(parse_observation(self.record))
+        def freeze(value: Any) -> Any:
+            if isinstance(value, dict):
+                return MappingProxyType({key: freeze(item) for key, item in value.items()})
+            if isinstance(value, list):
+                return tuple(freeze(item) for item in value)
+            return value
+        object.__setattr__(self, "record", freeze(normalized))
+
+
 @event_type("agent.run.started.v1")
 @dataclass(frozen=True)
 class AgentRunStarted(EventPayload):

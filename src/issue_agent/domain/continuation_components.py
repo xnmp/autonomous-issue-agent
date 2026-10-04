@@ -347,7 +347,38 @@ class PendingCIEscalationCapture:
             raise ValueError("pending CI decision differs from its observed head")
 
 
-PRRecoveryCapture = BranchRefreshCapture | PendingCIEscalationCapture
+@dataclass(frozen=True)
+class PublicationIdentityEscalationCapture:
+    binding: WorkflowBinding
+    head: str
+    expected_branch: str
+    issue: int
+    checkout_branch: str
+    body: str
+    removed_label: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.binding, WorkflowBinding) or self.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("publication escalation requires selected PR repair authority")
+        validate_workflow_identifier(self.head, "publication head")
+        validate_workflow_integer(self.issue, "publication linked issue", minimum=1)
+        for name in ("expected_branch", "checkout_branch", "body", "removed_label"):
+            validate_workflow_text(getattr(self, name), name)
+        if self.expected_branch == self.checkout_branch or self.removed_label not in {"ai-pr-open", "ai-blocked"}:
+            raise ValueError("publication escalation requires a branch mismatch and lifecycle label")
+
+
+class PublicationIdentityMismatch(Exception):
+    """Harness-captured pre-admission fault; provider statuses cannot mint it."""
+
+    def __init__(self, capture: PublicationIdentityEscalationCapture):
+        if not isinstance(capture, PublicationIdentityEscalationCapture):
+            raise ValueError("publication refusal requires typed captured evidence")
+        self.capture = capture
+        super().__init__("repair checkout differs from the current remote branch")
+
+
+PRRecoveryCapture = BranchRefreshCapture | PendingCIEscalationCapture | PublicationIdentityEscalationCapture
 
 
 @dataclass(frozen=True)
@@ -357,7 +388,7 @@ class OwedPRRecoveryEffect:
 
     def __post_init__(self) -> None:
         validate_workflow_identifier(self.command_id, "PR recovery command")
-        if not isinstance(self.capture, (BranchRefreshCapture, PendingCIEscalationCapture)):
+        if not isinstance(self.capture, (BranchRefreshCapture, PendingCIEscalationCapture, PublicationIdentityEscalationCapture)):
             raise ValueError("PR recovery effect requires fixed captured provenance")
 
 
@@ -423,7 +454,7 @@ class PRRepairState:
             if remediation is not None and not isinstance(remediation, (OwedCIRemediation, SettledCIRemediation, ImportedCIRemediation)):
                 raise ValueError("CI remediation requires fixed typed provenance")
         for remedy, captured, imported in ((self.branch_refresh, BranchRefreshCapture, ImportedBranchRefresh),
-                                           (self.pending_ci_escalation, PendingCIEscalationCapture, ImportedPendingCIEscalation)):
+                                           (self.pending_ci_escalation, (PendingCIEscalationCapture, PublicationIdentityEscalationCapture), ImportedPendingCIEscalation)):
             if remedy is None or isinstance(remedy, imported):
                 continue
             owed = remedy.owed if isinstance(remedy, SettledPRRecoveryEffect) else remedy

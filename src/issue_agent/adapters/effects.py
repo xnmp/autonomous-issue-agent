@@ -17,6 +17,7 @@ from ..domain.actions import (
     CloseIssue,
     EnableAutoMerge,
     EscalateCiPending,
+    EscalatePRRecovery,
     PostComment,
     Relabel,
     CancelWorkflowRuns,
@@ -275,6 +276,8 @@ class ImmediateGitHubEffectExecutor:
         if isinstance(action, CancelWorkflowRuns):
             return self.gateway.cancel_workflow_runs(action.head, action.run_ids)
         if isinstance(action, EscalateCiPending):
+            if isinstance(action, EscalatePRRecovery):
+                raise WorkflowAuthorityError("publication refusal requires durable PR recovery authority")
             if (
                 not isinstance(self.gateway, CommentVerifier)
                 or not self.gateway.has_comment("pr", action.pr, action.body)
@@ -391,8 +394,12 @@ class GitHubEffectExecutor:
             CommandKind.RERUN_CHECKS if isinstance(action, RerunFailedChecks) else CommandKind.CANCEL_CHECKS,
             action.head, action.run_ids) if isinstance(action, (RerunFailedChecks, CancelWorkflowRuns))
             else self.store.current_pr_recovery_command(self.repository, action.pr, action.head,
-                action.base if isinstance(action, UpdateBranch) else None) if isinstance(action, (UpdateBranch, EscalateCiPending))
+                action.base if isinstance(action, UpdateBranch) else None,
+                action.capture if isinstance(action, EscalatePRRecovery) else None) if isinstance(action, (UpdateBranch, EscalateCiPending))
             else self._pending_for_action(action))
+        if pending is not None and isinstance(action, EscalatePRRecovery) and action_from_command(pending.command) != action:
+            self._execute(action_from_command(pending.command), pending)
+            pending = None
         if pending is not None and _unresolved_workflow_command(pending):
             return self._reconcile_scheduled(pending, raise_unresolved=True)
         return self._execute(action, pending)
@@ -630,7 +637,31 @@ class GitHubEffectExecutor:
                 command = pending.command
             else:
                 return False
-        if pending.state == "pending" and not self._revision_matches(command):
+        if isinstance(action, EscalatePRRecovery):
+            due, schedule = self._prewrite_schedule(pending)
+            if not due:
+                raise UnknownEffectOutcome(f"{command.command_id}: pre-write read is deferred on its schedule")
+            unresolved_schedule = self.store.command_reconciliation(command.command_id)
+            started = self.store.now()
+            if unresolved_schedule is not None and not reconciliation_due(unresolved_schedule, started):
+                raise UnknownEffectOutcome(f"{command.command_id}: unresolved guard read is deferred on its schedule")
+            try:
+                present = self._reconcile(action, command)
+                if present is True:
+                    return self.effects.execute(command, lambda: EffectOutcome(True, EffectStatus.SUCCEEDED))
+                applies = self._revision_matches(command)
+            except (sqlite3.Error, ControlStoreError, WorkflowAuthorityError):
+                raise
+            except Exception as exc:
+                if pending.state in {"executing", EffectStatus.UNKNOWN_OUTCOME.value}:
+                    self.store.record_scheduled_read(command.command_id, unresolved_schedule,
+                        expected_attempts=pending.attempts, read_started_at=started,
+                        executor_identity=self.identity, observed=None, error=str(exc), reexecution_ceiling=False)
+                    raise UnknownEffectOutcome(f"{command.command_id}: unresolved guard read unavailable ({exc})") from exc
+                self._defer_prewrite(pending, schedule, started, str(exc))
+            if not applies:
+                return self.effects.execute(command, lambda: EffectOutcome(False, EffectStatus.PERMANENT_FAILURE, error="publication refusal subject changed"))
+        if pending.state == "pending" and not isinstance(action, EscalatePRRecovery) and not self._revision_matches(command):
             self.effects.execute(
                 command,
                 lambda: EffectOutcome(
@@ -1155,7 +1186,8 @@ class GitHubEffectExecutor:
         revision) and the store makes the grant's single spend decision. The
         write's only receipts are verified success or unknown outcome.
         """
-        if command.workflow is None:
+        publication = command.workflow is None and isinstance(action_from_command(command), EscalatePRRecovery)
+        if command.workflow is None and not publication:
             raise ValueError("uncertain command reconciliation requires a workflow-bound command")
         settled = False
 
@@ -1168,7 +1200,7 @@ class GitHubEffectExecutor:
         def begin() -> bool:
             nonlocal settled
             grant = (self.store.retry_authorization(command.command_id)
-                     if isinstance(state, ReconciliationOnly) else None)
+                     if isinstance(state, ReconciliationOnly) and not publication else None)
             started = self.store.now()
             present, error, remote_object_id = self._observe_postcondition_evidence(command)
             if grant is None or present is not False:
@@ -1445,6 +1477,8 @@ class GitHubEffectExecutor:
                 action.head, action.run_ids
             ) is not None
         elif isinstance(action, EscalateCiPending):
+            if isinstance(action, EscalatePRRecovery) and command is not None and not self._revision_matches(command):
+                raise StaleExpectedRevision("publication refusal subject changed before comment")
             if not isinstance(self.gateway, CommentVerifier) or not self.gateway.has_comment(
                 "pr", action.pr, action.body
             ):
@@ -1452,8 +1486,10 @@ class GitHubEffectExecutor:
             if not isinstance(self.gateway, LabelVerifier) or not self.gateway.has_label(
                 "pr", action.pr, "needs-human-review"
             ):
+                if isinstance(action, EscalatePRRecovery) and command is not None and not self._revision_matches(command):
+                    raise StaleExpectedRevision("publication refusal subject changed before label")
                 self.gateway.relabel(
-                    "pr", action.pr, "ai-pr-open", "needs-human-review"
+                    "pr", action.pr, action.capture.removed_label if isinstance(action, EscalatePRRecovery) else "ai-pr-open", "needs-human-review"
                 )
             return True
         elif isinstance(action, AddDependency):
@@ -1740,8 +1776,11 @@ class GitHubEffectExecutor:
             selected = self.store.read_pr_repair(WorkflowKey(self.repository, PullRequestRef(action.pr)))
             if not isinstance(selected, cc.SelectedPRRepair):
                 raise WorkflowAuthorityError("PR recovery authority is unavailable")
-            capture = (cc.BranchRefreshCapture(selected.binding, action.head, action.base) if isinstance(action, UpdateBranch)
+            capture = (action.capture if isinstance(action, EscalatePRRecovery)
+                else cc.BranchRefreshCapture(selected.binding, action.head, action.base) if isinstance(action, UpdateBranch)
                 else cc.PendingCIEscalationCapture(selected.binding, expected, action.head, action.body))
+            if isinstance(action, EscalatePRRecovery) and selected.binding != action.capture.binding:
+                raise StaleExpectedRevision("publication refusal binding is no longer selected")
             extra["pr_recovery"] = encode_workflow(capture)
         return command_for_action(
             action,
@@ -1869,6 +1908,15 @@ class GitHubEffectExecutor:
                 self.store.validate_pr_recovery(command)
             except WorkflowAuthorityError:
                 return False
+            capture = decode_workflow(command.payload["pr_recovery"], object)
+            if isinstance(capture, cc.PublicationIdentityEscalationCapture):
+                from ..domain.world import issue_for_pr
+                current = self.gateway.get_pr(capture.binding.fence.key.target.number, mergeability=False, checks=False)
+                if not current.head_ref_oid or not current.head_ref_name or not current.content_known:
+                    raise UnknownEffectOutcome("publication refusal PR evidence unavailable")
+                return (current.state.upper() == "OPEN" and current.head_ref_oid == capture.head
+                    and current.head_ref_name == capture.expected_branch and issue_for_pr(current) == capture.issue
+                    and self.gateway.pr_for_issue(capture.issue, require_unique=True) == current.number)
         if "ci_remediation" in command.payload:
             try:
                 self.store.validate_ci_remediation(command)
@@ -2046,6 +2094,8 @@ def command_for_action(
     action_payload = ({field.name: _jsonable(getattr(action, field.name)) for field in fields(action)
                        if field.name != "self_clear"} if isinstance(action, Relabel) else _jsonable(action))
     action_payload.pop("workflow", None)
+    if isinstance(action, EscalatePRRecovery):
+        action_payload.pop("capture", None)
     if isinstance(action, Relabel):
         if action.self_clear is None:
             action_payload.pop("self_clear", None)
@@ -2100,6 +2150,8 @@ def action_from_command(command: LifecycleCommand) -> Action:
         raise ValueError("review-family commands execute only through their guarded review path")
     if command.kind is CommandKind.RELABEL:
         if {"pr", "head", "body"} <= payload.keys():
+            if "cause" in payload:
+                return EscalatePRRecovery(int(payload["pr"]), str(payload["head"]), str(payload["body"]), str(payload["cause"]), decode_workflow(payload["pr_recovery"], object))
             return EscalateCiPending(
                 int(payload["pr"]),
                 str(payload["head"]),
@@ -2262,7 +2314,7 @@ def _unresolved_workflow_command(pending) -> bool:
     # A bound review submission (review family only) is bounded like any
     # other workflow command; unbound submissions keep their legacy path.
     return (
-        command.workflow is not None
+        (command.workflow is not None or command.payload.get("cause") == "publication_identity")
         and pending.state in ("executing", EffectStatus.UNKNOWN_OUTCOME.value)
     )
 

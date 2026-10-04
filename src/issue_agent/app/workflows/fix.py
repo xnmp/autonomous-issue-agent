@@ -28,7 +28,7 @@ from ...domain.leg import Leg, LegTarget
 from ...domain import outcome
 from ..planners import tasks as task_builders
 from ..planners.tasks import FixTaskConfig
-from ...domain.actions import AgentKind, ClearIssueState, CloseIssue, PostComment, Relabel, RemoveWorktree, Target
+from ...domain.actions import EscalatePRRecovery, AgentKind, ClearIssueState, CloseIssue, PostComment, Relabel, RemoveWorktree, Target
 from ...domain.agent_task import RuntimeName, run_input_fingerprint
 from ...domain.workflow import AuthoredResolve, HeldProjection, ResolveResultKind, ResolveSession, ResolveStage, WorkflowConflict, WorkflowSnapshot
 from ...domain.workflow import ObservedIssue, NoLinkedPr, LinkedPrPresent
@@ -1779,7 +1779,12 @@ class FixWorkflow:
             discussion=as_untrusted(format_pr_discussion(p.comments)),
             human_reply=as_untrusted(reply) if reply is not None else None,
         )
-        return await self._run_logged(label, issue, current, kind=kind)
+        try:
+            return await self._run_logged(label, issue, current, kind=kind)
+        except cc.PublicationIdentityMismatch as exc:
+            capture = exc.capture
+            self.executor.execute_all([EscalatePRRecovery(p.number, capture.head, capture.body, "publication_identity", capture)])
+            return outcome.AgentResult(True, status="publication_identity_refused", summary=str(exc), exit_reason=outcome.ExitReason.RUNTIME_UNAVAILABLE)
 
     def _ci_task(self, p: PRView, issue: int, cwd: str, *, fork: bool = False,
                  session_id: str = "", fix_cfg: FixTaskConfig | None = None):

@@ -1,11 +1,18 @@
 # Architecture implementation phases
 
-**Current execution — 2026-10-03:** phases 1–3 remain accepted. The approved
+**Current execution — 2026-10-04:** phases 1–3 remain accepted. The approved
 [Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven
 outcome gates accepted locally. A2 closes the production caller/removal matrix,
 independent whole-system review, copied rollback, dashboard outcomes and final
-full gate (2026-10-03 07:08 UTC, exit 0). Phases 5 and 6 remain
-pending. No live activation, service restart, paid external experiment, push or
+full gate (2026-10-03 07:08 UTC, exit 0). Phase 5's offline measurement and
+operator-absent replays are independently reviewed and pass the full gate
+(2026-10-04 12:22 UTC, exit 0; 10,341 Python cases, hook checks, parity,
+architecture and both type checks). Phase 6's gate consolidation is reviewed;
+its independent test-evidence implementation follows under the
+[Phase 5/6 execution brief](2026-10-04-phase-5-6-execution.md). Neither phase is
+accepted yet. The [unattended-window proposal](2026-10-04-phase-5-unattended-windows.md)
+remains pending explicit release of the deployment pause. No live activation,
+service restart, paid external experiment, push or
 remote issue closure is claimed. The sole approved Jira counter exception is
 explicit in [ADR 0016](../adr/0016-phase-4-current-state-authority.md).
 

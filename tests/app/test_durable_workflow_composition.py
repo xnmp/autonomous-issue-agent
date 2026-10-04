@@ -26,6 +26,8 @@ from issue_agent.adapters.effects import GitHubEffectExecutor
 from issue_agent.adapters.event_log import EventLog, read_event_log
 from issue_agent.adapters.github import GhUnavailable
 from issue_agent.adapters.journal import JournalingRuntime
+from issue_agent.adapters.typed_journal import TypedJournal
+from issue_agent.app.infra_breaker import InfraBreaker
 from issue_agent.adapters.store import Store
 from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
@@ -133,7 +135,7 @@ UNKNOWN_READ_DELAY = timedelta(seconds=31)
 
 def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, role="fix", split=False,
             later: timedelta = timedelta(0), control_path: Path | None = None,
-            state_dir: Path | None = None) -> Composition:
+            state_dir: Path | None = None, supported_infra: bool = False) -> Composition:
     """``later`` restarts the process that much after the prior one (store clock)."""
     remote = PersistentGitHub(root / "github.db", fault=fault)
     control = SQLiteControlStore(str(control_path or root / "control.db"), now=lambda: datetime.now(timezone.utc) + later)
@@ -146,6 +148,8 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
     control.bind_event_outbox(events.prepare, events.append_committed)
     state = Store(state_dir=str(state_dir or root / role))
     messages = []
+    journal = TypedJournal(str(root / "legacy-events.jsonl"), events)
+    breaker = InfraBreaker(journal=journal, log=messages.append) if supported_infra else None
     effects = GitHubEffectExecutor(remote, control, repository="o/r", identity=f"o/r:{role}", log=messages.append)
     provider = provider or Provider()
     runtime = AccountingRuntime(
@@ -157,8 +161,8 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
     executor = Executor(remote, effect_executor=effects, retry_delays=(), log=messages.append, remove_worktree=lambda _: None, clear_issue_state=lambda action: state.cleanup_pr(action.pr, action.issue, action.merged))
     dispatcher = AgentDispatcher(
         DispatchConfig(fix=FixTaskConfig("o/r", agent_md="test", model="test-model"), fix_bot="fix-bot", log=messages.append,
-                       author_tests_split=split, operator_guidance=roles.review_guidance_reader(control, "o/r")),
-        remote, state, Worktrees(root), JournalingRuntime(runtime, events, repo="o/r", role="fix", runtime="claude"), executor, workflow_control=workflow,
+                       author_tests_split=split, max_infra_deaths=FixConfig(fix_bot="fix-bot").max_infra_deaths if supported_infra else 0, infra_breaker=breaker, operator_guidance=roles.review_guidance_reader(control, "o/r")),
+        remote, state, Worktrees(root), JournalingRuntime(runtime, journal, repo="o/r", role="fix", runtime="claude"), executor, workflow_control=workflow,
     )
     executor.bind_workflow_reconciliation(dispatcher.fix_workflow.reconcile_returns)
     dispatched = []
@@ -172,7 +176,7 @@ def compose(root: Path, *, fault=lambda _: None, provider=None, decide=None, rol
         world, FixConfig(fix_bot="fix-bot"),
         roles._fix_state(state, world, workflow_control=workflow), fixer_busy=False,
     ))
-    return Composition(Daemon("fix", remote.build_world, policy, executor, log=messages.append), remote, control, workflow, effects, provider, dispatched, messages)
+    return Composition(Daemon("fix", remote.build_world, policy, executor, log=messages.append, journal=journal, tick_gate=breaker.gate_reason if breaker else None), remote, control, workflow, effects, provider, dispatched, messages)
 
 
 def seed(root: Path, *labels: str) -> None:
@@ -1248,3 +1252,385 @@ def test_changed_issue_body_cannot_apply_obsolete_blocked_answer_or_reset_allowa
     assert not human.get_issue(7).has(Label.AI_BLOCKED)
     assert resumed.control.snapshot(scope).settled == Money("USD", 250_000 * len(provider.tasks))
     assert resumed.control.snapshot(scope).reserved == Money.zero("USD")
+
+
+def seed_repair_replay(root: Path, *, branch="fix/7-test", head="head-b", run_id=None) -> None:
+    from dataclasses import replace
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.world import Check
+    from issue_agent.domain.workflow_identity import WorkflowFamily, WorkflowKey, PullRequestRef
+    from tests.fakes.review_workflow import held
+    from tests.adapters.test_continuation_admission import active, install_secondary
+    seed(root, "ai-pr-open")
+    remote = PersistentGitHub(root / "github.db")
+    remote.seed_pr(pr(70, "ai-pr-open", closing_issue=7, head_ref_name=branch, head_ref_oid=head,
+                      checks=(Check("current-unit", bucket="fail", run_id=run_id),)))
+    control = SQLiteControlStore(str(root / "control.db"))
+    base = replace(held(key=WorkflowKey("o/r", PullRequestRef(70))), gates=())
+    install_workflow(control, base)
+    remote.link_pr(7, 70)
+    component = active(base.revision.fence.key, WorkflowFamily.PR_REPAIR)
+    install_secondary(control, replace(base, pr_repair=component), component)
+
+
+@pytest.mark.parametrize("matching", [False, True], ids=["mismatched-publication-identity", "matched-publication-identity"])
+def test_recorded_publication_identity_replay_is_bounded_without_operator(tmp_path, matching):
+    # Baseline escaped family branch-publication-identity; transport replay,
+    # not a claim to reproduce the original target repository verbatim.
+    from dataclasses import asdict
+    from issue_agent.domain.world import Check
+    seed_repair_replay(tmp_path, branch="fix/7-test" if matching else "test/7-diagnostics")
+    remote = PersistentGitHub(tmp_path / "github.db")
+    def published():
+        remote.external_pr_change(70, checks=[asdict(Check("current-unit", bucket="pass", run_id=702))])
+    provider = Provider(published, AgentResult(False, status="pushed", cost_usd=.25, session_id="publication-replay"))
+    first = compose(tmp_path, provider=provider, supported_infra=True)
+    first.daemon.tick()
+    restarted = compose(tmp_path, provider=provider, supported_infra=True)
+    for _ in range(8):
+        restarted.daemon.tick()
+    if matching:
+        assert len(provider.tasks) == 1
+        assert restarted.remote.get_pr(70).checks[0].bucket == "pass"
+        assert not restarted.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+    else:
+        assert provider.tasks == []
+        assert restarted.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+        assert any("publication" in message or "infra" in message for message in first.log + restarted.log)
+    with sqlite3.connect(restarted.control.path) as db:
+        assert db.execute("SELECT COUNT(*),COALESCE(SUM(amount_micros),0) FROM charges").fetchone() == ((1, 250_000) if matching else (0, 0))
+    assert restarted.control.active_reservation_runs() == ()
+
+
+def test_recorded_repair_context_replay_uses_current_head_after_restart(tmp_path):
+    # Baseline escaped repair-context-revision: stale historical context must
+    # not request another operator rerun of already consumed current evidence.
+    from dataclasses import asdict
+    from issue_agent.domain.world import Check
+    from issue_agent.domain.ci_history import CiAttempt
+    seed_repair_replay(tmp_path, head="head-a", run_id=701)
+    first = compose(tmp_path)
+    first.daemon.tick()
+    first.remote.advance_run_attempts("head-a", (701,), 2)
+    settled = compose(tmp_path, later=UNKNOWN_READ_DELAY)
+    settled.effects.drain_pending_commands()
+    Store(str(tmp_path / "fix")).append_ci_attempt(7, CiAttempt("head-a", ("obsolete-unit",)))
+    remote = PersistentGitHub(tmp_path / "github.db")
+    remote.external_pr_change(70, head_ref_oid="head-b", checks=[asdict(Check("current-unit", bucket="fail", run_id=702))])
+    remote.set_failed_run_log("head-b", (702,), "PINNED_HEAD_B_LOG: current failing assertion")
+    fresh = compose(tmp_path, later=UNKNOWN_READ_DELAY)
+    fresh.daemon.tick()
+    remote.advance_run_attempts("head-b", (702,), 2)
+    def repaired():
+        remote.external_pr_change(70, checks=[asdict(Check("current-unit", bucket="pass", run_id=702))])
+    provider = Provider(repaired, AgentResult(False, status="pushed", cost_usd=.25, session_id="repair-context-replay"))
+    restarted = compose(tmp_path, provider=provider, later=UNKNOWN_READ_DELAY * 2)
+    for _ in range(5):
+        restarted.daemon.tick()
+    assert len(provider.tasks) == 1
+    prompt = provider.tasks[0].prompt
+    assert "head-b" in prompt and "PINNED_HEAD_B_LOG" in prompt
+    assert "already consumed for this head" in prompt
+    assert "head-a" in prompt and "obsolete-unit" in prompt
+    assert restarted.remote.get_pr(70).checks[0].bucket == "pass"
+    assert [call for call in remote.calls if call[0] == "rerun"] == [["rerun", "head-a", [701]], ["rerun", "head-b", [702]]]
+    with sqlite3.connect(restarted.control.path) as db:
+        assert db.execute("SELECT COUNT(*),SUM(amount_micros) FROM charges").fetchone() == (1, 250_000)
+    assert restarted.control.active_reservation_runs() == ()
+
+
+def publication_recovery_action(composition):
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.actions import EscalatePRRecovery
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    selected = composition.control.read_pr_repair(WorkflowKey("o/r", PullRequestRef(70)))
+    capture = cc.PublicationIdentityEscalationCapture(selected.binding, "head-b", "test/7-diagnostics", 7, "fix/7-test", "Harness publication identity mismatch; repair checkout before resuming.", "ai-pr-open")
+    return EscalatePRRecovery(70, capture.head, capture.body, "publication_identity", capture)
+
+
+def enqueue_publication_recovery(composition, action):
+    from issue_agent.adapters.effects import command_for_action
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    return composition.control.enqueue_command(command_for_action(action, repository="o/r", executor_identity="o/r:fix", payload_extra={"pr_recovery": encode_workflow(action.capture)}))
+
+
+def test_publication_refusal_unsent_command_drains_after_restart(tmp_path):
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    original = compose(tmp_path)
+    action = publication_recovery_action(original)
+    enqueue_publication_recovery(original, action)
+    restarted = compose(tmp_path)
+    assert restarted.effects.drain_pending_commands() == 1
+    assert restarted.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+    assert len([call for call in restarted.remote.calls if call[0] == "comment_pr"]) == 1
+    assert restarted.provider.tasks == []
+
+
+@pytest.mark.parametrize("change", ["head", "branch", "generation", "linkage"])
+def test_publication_refusal_changed_subject_retires_without_remote_hold(tmp_path, change):
+    from dataclasses import replace
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    original = compose(tmp_path)
+    action = publication_recovery_action(original)
+    enqueue_publication_recovery(original, action)
+    if change == "head":
+        original.remote.external_pr_change(70, head_ref_oid="head-c")
+    elif change == "branch":
+        original.remote.external_pr_change(70, head_ref_name="other/7")
+    elif change == "linkage":
+        original.remote.link_pr(7, 71)
+    else:
+        from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+        with original.control.transaction() as db:
+            current = load_review_workflow_row(db, WorkflowKey("o/r", PullRequestRef(70)))
+            persist_workflow_snapshot(db, replace(current, revision=replace(current.revision, fence=replace(current.revision.fence, generation=current.revision.fence.generation + 1))))
+    restarted = compose(tmp_path)
+    restarted.effects.drain_pending_commands()
+    assert not restarted.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+    assert not any(call[0] in {"comment_pr", "relabel_pr"} for call in restarted.remote.calls)
+    assert restarted.provider.tasks == []
+
+
+def test_publication_refusal_unavailable_read_defers_without_write(tmp_path):
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    original = compose(tmp_path)
+    enqueue_publication_recovery(original, publication_recovery_action(original))
+    def unavailable(point):
+        if point == "observation_read":
+            raise GhUnavailable("transport", "publication observation unavailable")
+    restarted = compose(tmp_path, fault=unavailable)
+    restarted.effects.drain_pending_commands()
+    assert restarted.remote.calls == []
+    assert len(restarted.control.pending_commands()) == 1
+    available = compose(tmp_path, later=UNKNOWN_READ_DELAY)
+    available.effects.drain_pending_commands()
+    assert available.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+
+
+def test_publication_refusal_comment_does_not_authorize_stale_label(tmp_path):
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    action = publication_recovery_action(composed)
+    original_comment = composed.remote.comment
+    def changed_after_comment(kind, number, body):
+        original_comment(kind, number, body)
+        composed.remote.external_pr_change(70, head_ref_oid="head-c")
+    composed.remote.comment = changed_after_comment
+    from issue_agent.adapters.effects import StaleExpectedRevision
+    with pytest.raises(StaleExpectedRevision):
+        composed.effects.execute(action)
+    restarted = compose(tmp_path, later=UNKNOWN_READ_DELAY)
+    restarted.effects.drain_pending_commands()
+    assert not restarted.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+    assert len([call for call in restarted.remote.calls if call[0] == "comment_pr"]) == 1
+    assert not any(call[0] == "relabel_pr" for call in restarted.remote.calls)
+
+
+def test_publication_escalation_rejects_legacy_pending_ci_cause(tmp_path):
+    from issue_agent.domain.actions import EscalatePRRecovery
+    from issue_agent.domain import continuation_components as cc
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    publication = publication_recovery_action(composed)
+    pending = cc.PendingCIEscalationCapture(publication.capture.binding, "head-b", "head-b", "pending CI")
+    with pytest.raises(ValueError, match="typed cause"):
+        EscalatePRRecovery(70, "head-b", "pending CI", "pending_ci", pending)
+
+
+@pytest.mark.parametrize("error", [sqlite3.DatabaseError("authority storage failed"), RuntimeError("placeholder")])
+def test_publication_prewrite_storage_failure_remains_local(tmp_path, error):
+    from issue_agent.adapters.control_store import ControlStoreError
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    action = publication_recovery_action(composed)
+    enqueue_publication_recovery(composed, action)
+    fault = error if isinstance(error, sqlite3.Error) else ControlStoreError("authority storage failed")
+    original = composed.control.validate_pr_recovery
+    def broken(command):
+        raise fault
+    composed.control.validate_pr_recovery = broken
+    with pytest.raises(type(fault), match="authority storage failed"):
+        composed.effects.execute(action)
+    composed.control.validate_pr_recovery = original
+    assert composed.remote.calls == []
+    assert composed.effects.drain_pending_commands() == 1
+    assert composed.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+
+
+def test_publication_prewrite_schedule_survives_restart_gates_and_recovers(tmp_path):
+    from dataclasses import replace
+    from issue_agent.domain.workflow import EvidenceUnavailable, OpenGate, NoAuthorizedRemediation
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    key = WorkflowKey("o/r", PullRequestRef(70))
+    with composed.control.transaction() as db:
+        current = load_review_workflow_row(db, key)
+        unrelated = OpenGate("independent", 0, EvidenceUnavailable("other measurement", composed.control.now(), 1, "separate evidence"), NoAuthorizedRemediation("observe"))
+        persist_workflow_snapshot(db, replace(current, gates=(unrelated,)))
+    pending = enqueue_publication_recovery(composed, publication_recovery_action(composed))
+    reads = []
+    def unavailable(point):
+        if point == "observation_read":
+            reads.append(point)
+            raise GhUnavailable("transport", "publication read unavailable")
+    clock = composed.control.now()
+    restarted = compose(tmp_path, fault=unavailable)
+    restarted.control._now = lambda: clock
+    restarted.effects.drain_pending_commands()
+    schedule = restarted.control.prewrite_read(pending.command.command_id)
+    assert schedule.failed_reads == 1
+    assert schedule.next_read_at > clock
+    before = len(reads)
+    again = compose(tmp_path, fault=unavailable)
+    again.control._now = lambda: clock
+    again.effects.drain_pending_commands()
+    assert len(reads) == before
+    for _ in range(8):
+        clock = schedule.next_read_at + timedelta(seconds=1)
+        again.effects.drain_pending_commands()
+        schedule = again.control.prewrite_read(pending.command.command_id)
+    with again.control.transaction() as db:
+        gates = load_review_workflow_row(db, key).gates
+    assert any(isinstance(gate.cause, EvidenceUnavailable) and gate.gate_id != "independent" for gate in gates)
+    assert again.remote.calls == []
+    clock = schedule.next_read_at + timedelta(seconds=1)
+    recovered = compose(tmp_path)
+    recovered.control._now = lambda: clock
+    assert recovered.effects.drain_pending_commands() == 1
+    assert recovered.control.prewrite_read(pending.command.command_id) is None
+    assert recovered.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+    with recovered.control.transaction() as db:
+        assert [gate.gate_id for gate in load_review_workflow_row(db, key).gates] == ["independent"]
+
+
+def test_publication_unknown_partial_comment_reconciles_after_restart(tmp_path):
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    action = publication_recovery_action(composed)
+    original = composed.remote.comment
+    def lost(kind, number, body):
+        original(kind, number, body)
+        raise RuntimeError("comment reply lost")
+    composed.remote.comment = lost
+    with pytest.raises(RuntimeError, match="reply lost"):
+        composed.effects.execute(action)
+    restarted = compose(tmp_path, later=UNKNOWN_READ_DELAY)
+    assert restarted.effects.drain_pending_commands() == 1
+    assert restarted.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+    assert len([call for call in restarted.remote.calls if call[0] == "comment_pr"]) == 1
+
+
+def test_same_head_ci_success_cannot_suppress_publication_cause(tmp_path):
+    from issue_agent.domain.actions import EscalateCiPending
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    assert composed.effects.execute(EscalateCiPending(70, "head-b", "CI needs operator attention"))
+    assert composed.effects.execute(publication_recovery_action(composed))
+    assert len([call for call in composed.remote.calls if call[0] == "comment_pr"]) == 2
+    assert composed.provider.tasks == []
+
+
+def test_provider_status_cannot_mint_publication_identity_escalation(tmp_path):
+    seed_repair_replay(tmp_path)
+    provider = Provider(result=AgentResult(True, status="publication_identity_refused", summary="provider claims harness refusal", cost_usd=.25))
+    composed = compose(tmp_path, provider=provider)
+    composed.daemon.tick()
+    assert len(provider.tasks) == 1
+    assert not composed.remote.get_pr(70).has(Label.NEEDS_HUMAN_REVIEW)
+    assert not any(call[0] == "comment_pr" for call in composed.remote.calls)
+    with sqlite3.connect(composed.control.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 1
+
+
+def test_publication_uncertain_ceiling_recovers_read_only_without_grant(tmp_path):
+    from issue_agent.domain.workflow import ReconciliationOnly, RemoteOutcomeUncertain
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    action = publication_recovery_action(composed)
+    original = composed.remote.comment
+    def lost(kind, number, body):
+        original(kind, number, body)
+        raise RuntimeError("publication comment reply lost")
+    composed.remote.comment = lost
+    with pytest.raises(RuntimeError, match="reply lost"):
+        composed.effects.execute(action)
+    pending = composed.control.pending_commands()[0]
+    def unavailable(point):
+        if point == "read":
+            raise GhUnavailable("transport", "unknown publication outcome")
+    clock = composed.control.now() + UNKNOWN_READ_DELAY
+    restarted = compose(tmp_path, fault=unavailable)
+    restarted.control._now = lambda: clock
+    for _ in range(9):
+        restarted.effects.drain_pending_commands()
+        state = restarted.control.command_reconciliation(pending.command.command_id)
+        clock = (state.history if isinstance(state, ReconciliationOnly) else state).next_read_at + timedelta(seconds=1)
+    assert isinstance(state, ReconciliationOnly)
+    key = WorkflowKey("o/r", PullRequestRef(70))
+    with restarted.control.transaction() as db:
+        assert any(isinstance(gate.cause, RemoteOutcomeUncertain) for gate in load_review_workflow_row(db, key).gates)
+    remote = PersistentGitHub(tmp_path / "github.db")
+    remote.external_pr_change(70, labels=["needs-human-review"])
+    before = list(remote.calls)
+    recovered = compose(tmp_path)
+    recovered.control._now = lambda: clock
+    assert recovered.effects.drain_pending_commands() == 1
+    assert recovered.remote.calls == before
+    assert recovered.control.command_reconciliation(pending.command.command_id) is None
+    with recovered.control.transaction() as db:
+        assert load_review_workflow_row(db, key).gates == ()
+
+
+def test_publication_absent_partial_effect_unavailable_guard_uses_unresolved_schedule(tmp_path):
+    from issue_agent.domain.workflow import ReconciliationOnly, RemoteOutcomeUncertain
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    seed_repair_replay(tmp_path, branch="test/7-diagnostics")
+    composed = compose(tmp_path)
+    action = publication_recovery_action(composed)
+    original = composed.remote.comment
+    def lost(kind, number, body):
+        original(kind, number, body)
+        raise RuntimeError("comment reply lost")
+    composed.remote.comment = lost
+    with pytest.raises(RuntimeError, match="reply lost"):
+        composed.effects.execute(action)
+    pending = composed.control.pending_commands()[0]
+    clock = composed.control.now() + UNKNOWN_READ_DELAY
+    reads = []
+    def unavailable(*args, **kwargs):
+        reads.append(clock)
+        raise GhUnavailable("transport", "fresh subject unavailable")
+    restarted = compose(tmp_path)
+    restarted.control._now = lambda: clock
+    restarted.remote.has_comment = lambda *_: True
+    restarted.remote.has_label = lambda *_: False
+    restarted.remote.get_pr = unavailable
+    restarted.effects.drain_pending_commands()
+    state = restarted.control.command_reconciliation(pending.command.command_id)
+    assert state.failed_reads == 1
+    assert state.next_read_at > clock
+    assert restarted.control.prewrite_read(pending.command.command_id) is None
+    again = compose(tmp_path)
+    again.control._now = lambda: clock
+    again.remote.has_comment = lambda *_: True
+    again.remote.has_label = lambda *_: False
+    again.remote.get_pr = unavailable
+    before = len(reads)
+    again.effects.drain_pending_commands()
+    assert len(reads) == before
+    for _ in range(8):
+        clock = state.next_read_at + timedelta(seconds=1)
+        again.effects.drain_pending_commands()
+        state = again.control.command_reconciliation(pending.command.command_id)
+        if isinstance(state, ReconciliationOnly):
+            break
+    assert isinstance(state, ReconciliationOnly)
+    with again.control.transaction() as db:
+        assert any(isinstance(gate.cause, RemoteOutcomeUncertain) for gate in load_review_workflow_row(db, WorkflowKey("o/r", PullRequestRef(70))).gates)
+    assert not any(call[0] == "relabel_pr" for call in again.remote.calls)

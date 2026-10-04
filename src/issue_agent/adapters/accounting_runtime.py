@@ -457,7 +457,12 @@ class AccountingRuntime(AgentRuntime):
                 exit_reason=ExitReason.AGENT_ERROR,
             )
         if task.pr_repair_input is not None and publication.branch != task.pr_repair_input.branch:
-            return _return_refused("repair checkout differs from the current remote branch")
+            repair = task.pr_repair_input
+            raise cc.PublicationIdentityMismatch(cc.PublicationIdentityEscalationCapture(
+                repair.selection.binding, repair.head, repair.branch, issue, publication.branch,
+                f"Harness refused paid repair: checkout branch `{publication.branch}` differs from current PR branch `{repair.branch}` at `{repair.head}`. Correct the worktree/publication identity before resuming.",
+                "ai-blocked" if kind == "PR_RESUME" else "ai-pr-open",
+            ))
         dispatch_id = json.dumps(
             {
                 "repository": self.repository,

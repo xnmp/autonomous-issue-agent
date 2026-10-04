@@ -17,13 +17,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Literal, Union
 
 from .eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from .labels import Label
 from .workflow_identity import IssueRef, PullRequestRef, WorkflowBinding, WorkflowRevision
 if TYPE_CHECKING:
-    from .continuation_components import CIEpisodeReset, PRRepairCleanup
+    from .continuation_components import CIEpisodeReset, PRRepairCleanup, PublicationIdentityEscalationCapture
     from .self_clear import MachineClearProjection, BudgetClearProjection
 
 
@@ -262,6 +262,19 @@ class EscalateCiPending:
 
 
 @dataclass(frozen=True)
+class EscalatePRRecovery(EscalateCiPending):
+    cause: Literal["publication_identity"]
+    capture: PublicationIdentityEscalationCapture
+
+    def __post_init__(self) -> None:
+        from .continuation_components import PublicationIdentityEscalationCapture
+        if self.cause != "publication_identity" or not isinstance(self.capture, PublicationIdentityEscalationCapture):
+            raise ValueError("PR escalation requires its typed cause")
+        if (self.pr, self.head, self.body) != (self.capture.binding.fence.key.target.number, self.capture.head, self.capture.body):
+            raise ValueError("PR escalation differs from captured subject")
+
+
+@dataclass(frozen=True)
 class RunAgent:
     """Dispatch a headless agent. `number` is the issue (RESOLVE/RESUME/TRIAGE)
     or PR (PR_RESUME/ADDRESS_REVIEW/FIX_CI/REVIEW/RE_REVIEW); STEWARD_DRIVE
@@ -474,6 +487,7 @@ __all__ = [
     "RerunFailedChecks",
     "CancelWorkflowRuns",
     "EscalateCiPending",
+    "EscalatePRRecovery",
     "RunAgent",
     "RemoveWorktree",
     "ClearIssueState",

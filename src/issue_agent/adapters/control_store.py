@@ -8755,15 +8755,17 @@ class SQLiteControlStore:
     @staticmethod
     def _pr_recovery_capture(command):
         from .effects import action_from_command
-        from ..domain.actions import UpdateBranch, EscalateCiPending
+        from ..domain.actions import UpdateBranch, EscalateCiPending, EscalatePRRecovery
         value = decode_workflow(command.payload.get("pr_recovery"), object)
-        if not isinstance(value, (cc.BranchRefreshCapture, cc.PendingCIEscalationCapture)):
+        if not isinstance(value, (cc.BranchRefreshCapture, cc.PendingCIEscalationCapture, cc.PublicationIdentityEscalationCapture)):
             raise WorkflowAuthorityError("PR recovery requires its fixed captured variant")
         action = action_from_command(command)
         exact = ((isinstance(value, cc.BranchRefreshCapture) and isinstance(action, UpdateBranch)
                   and (action.head, action.base) == (value.head, value.base))
                  or (isinstance(value, cc.PendingCIEscalationCapture) and isinstance(action, EscalateCiPending)
-                     and (action.head, action.body) == (value.decision_head, value.body)))
+                     and (action.head, action.body) == (value.decision_head, value.body))
+                 or (isinstance(value, cc.PublicationIdentityEscalationCapture) and isinstance(action, EscalatePRRecovery)
+                     and action.capture == value and action.cause == "publication_identity"))
         if (not exact or command.workflow is not None or command.expected_revision != value.head
                 or command.repository != value.binding.fence.key.repository
                 or command.target != f"pr:{value.binding.fence.key.target.number}"
@@ -8786,11 +8788,23 @@ class SQLiteControlStore:
         field = "branch_refresh" if isinstance(capture, cc.BranchRefreshCapture) else "pending_ci_escalation"
         before = getattr(selected.component.state, field)
         prior = before.owed.capture if isinstance(before, cc.SettledPRRecoveryEffect) else before.capture if isinstance(before, cc.OwedPRRecoveryEffect) else before
-        if prior is not None and (prior.head, getattr(prior, "base", None)) == (capture.head, getattr(capture, "base", None)):
+        if isinstance(before, cc.OwedPRRecoveryEffect) and (isinstance(capture, cc.PublicationIdentityEscalationCapture) or isinstance(prior, cc.PublicationIdentityEscalationCapture)):
+            raise WorkflowAuthorityError("unfinished PR recovery predecessor must reconcile before replacement")
+        if prior is not None and self._pr_recovery_subject(prior) == self._pr_recovery_subject(capture):
             raise WorkflowAuthorityError("this head/base already owns its PR recovery effect")
         state = replace(selected.component.state, **{field: cc.OwedPRRecoveryEffect(command.command_id, capture)})
         persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
             pr_repair=replace(selected.component, state=state)))
+
+    def _command_reconciliation_binding(self, db, command):
+        if command.workflow is not None:
+            return command.workflow
+        if command.payload.get("cause") != "publication_identity":
+            raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
+        _, selected, capture = self._selected_pr_recovery(db, command)
+        if not isinstance(capture, cc.PublicationIdentityEscalationCapture) or selected.component.state.pending_ci_escalation != cc.OwedPRRecoveryEffect(command.command_id, capture):
+            raise WorkflowAuthorityError("publication reconciliation requires its exact owed capture")
+        return capture.binding
 
     def validate_pr_recovery(self, command):
         with self.transaction() as db:
@@ -8799,7 +8813,13 @@ class SQLiteControlStore:
             if getattr(selected.component.state, field) != cc.OwedPRRecoveryEffect(command.command_id, capture):
                 raise WorkflowAuthorityError("PR recovery is not its exact owed command")
 
-    def current_pr_recovery_command(self, repository, pr, head, base=None):
+    @staticmethod
+    def _pr_recovery_subject(capture):
+        if isinstance(capture, cc.PublicationIdentityEscalationCapture):
+            return ("publication_identity", capture.binding, capture.head, capture.expected_branch, capture.issue)
+        return ("branch_refresh", capture.head, capture.base) if isinstance(capture, cc.BranchRefreshCapture) else ("pending_ci", capture.decision_head)
+
+    def current_pr_recovery_command(self, repository, pr, head, base=None, escalation_capture=None):
         from .workflow_rows import load_review_workflow_row
         with self.transaction() as db:
             aggregate = load_review_workflow_row(db, WorkflowKey(repository, PullRequestRef(pr)))
@@ -8812,9 +8832,8 @@ class SQLiteControlStore:
                 return None
             owed = remedy if isinstance(remedy, cc.OwedPRRecoveryEffect) else remedy.owed
             capture = owed.capture
-            if (capture.head if isinstance(capture, cc.BranchRefreshCapture) else capture.decision_head) != head:
-                return None
-            if isinstance(capture, cc.BranchRefreshCapture) and capture.base != base:
+            requested = self._pr_recovery_subject(escalation_capture) if escalation_capture is not None else ("branch_refresh", head, base) if base is not None else ("pending_ci", head)
+            if self._pr_recovery_subject(capture) != requested and not ((escalation_capture is not None or isinstance(capture, cc.PublicationIdentityEscalationCapture)) and isinstance(remedy, cc.OwedPRRecoveryEffect)):
                 return None
             row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (str(owed.command_id),)).fetchone()
             return PendingCommand(_command_from_row(row), row["state"], row["attempts"], row["refusals"])
@@ -9250,14 +9269,11 @@ class SQLiteControlStore:
             raw, ActiveReconciliation | ReconciliationOnly | RetiredUncertainCommand | RetiredSettledCommand,
         )
 
-    @staticmethod
     def _require_reconciliation_gate(
-        db: sqlite3.Connection, command: LifecycleCommand,
+        self, db: sqlite3.Connection, command: LifecycleCommand,
         state: ReconciliationOnly | RetiredUncertainCommand,
     ) -> OpenGate:
-        binding = command.workflow
-        if binding is None:
-            raise WorkflowAuthorityError("command uncertainty has no captured workflow")
+        binding = self._command_reconciliation_binding(db, command)
         # The binding's family selects the only rows that can hold its gate.
         current = load_workflow_row(db, binding.fence.key)
         if current is None:
@@ -9679,9 +9695,7 @@ class SQLiteControlStore:
             if row is None or row["executor_identity"] != executor_identity:
                 raise WorkflowAuthorityError("command reconciliation belongs to another executor")
             command = _command_from_row(row)
-            binding = command.workflow
-            if binding is None:
-                raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
+            binding = self._command_reconciliation_binding(db, command)
             self._return_projection_attempt(db, command)
             state = self._command_reconciliation(row)
             if state != expected or int(row["attempts"]) != expected_attempts:
@@ -9795,9 +9809,7 @@ class SQLiteControlStore:
             if row is None or row["executor_identity"] != executor_identity:
                 raise WorkflowAuthorityError("command reconciliation belongs to another executor")
             command = _command_from_row(row)
-            binding = command.workflow
-            if binding is None:
-                raise WorkflowAuthorityError("typed command reconciliation requires workflow authority")
+            binding = self._command_reconciliation_binding(db, command)
             self._return_projection_attempt(db, command)
             if (row["state"] not in ("executing", "unknown_outcome")
                     or self._command_reconciliation(row) != expected or int(row["attempts"]) != expected_attempts):
@@ -9902,9 +9914,7 @@ class SQLiteControlStore:
             if row is None or row["executor_identity"] != executor_identity:
                 raise WorkflowAuthorityError("pre-write read belongs to another executor")
             command = _command_from_row(row)
-            binding = command.workflow
-            if binding is None:
-                raise WorkflowAuthorityError("a pre-write schedule requires workflow authority")
+            binding = self._command_reconciliation_binding(db, command)
             # A stale generation cannot begin; it must not open a hold either.
             self._validate_workflow_command(db, command)
             if (row["state"] not in ("pending", "retryable_failure") or self._prewrite_read(row) != expected
@@ -9975,7 +9985,7 @@ class SQLiteControlStore:
         Beginning ends any pre-write evidence schedule (the executor only
         begins after a complete guard read) and closes its visible hold.
         """
-        row = db.execute("SELECT workflow_binding_json, prewrite_read_json FROM lifecycle_commands WHERE command_id=?",
+        row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?",
                          (str(command_id),)).fetchone()
         now = _stamp(self._now())
         db.execute(
@@ -9983,8 +9993,8 @@ class SQLiteControlStore:
             "updated_at=?, attempt_owner=executor_identity, prewrite_read_json=NULL WHERE command_id=?",
             (now, str(command_id)),
         )
-        if row is not None and row["prewrite_read_json"] is not None and row["workflow_binding_json"] is not None:
-            binding = decode_workflow(row["workflow_binding_json"], WorkflowBinding)
+        if row is not None and row["prewrite_read_json"] is not None:
+            binding = self._command_reconciliation_binding(db, _command_from_row(row))
             self._reconciliation_gate(db, binding, prewrite_evidence_gate_id(command_id), None)
         self._transition(
             db,

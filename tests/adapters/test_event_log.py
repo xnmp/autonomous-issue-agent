@@ -477,6 +477,17 @@ def test_oversized_event_is_rejected_before_write(tmp_path) -> None:
 
 
 _SAMPLE = {
+    "record": {
+        "kind": "intervention",
+        "record_id": "intervention-id",
+        "repository": "owner/repo",
+        "actor": "operator",
+        "provenance": "operator recorded",
+        "occurred_at": "2026-07-30T00:00:00Z",
+        "category": "mechanical",
+        "source": "GitHub",
+        "description": "released human hold",
+    },
     "model": "model",
     "status": "ok",
     "is_error": False,
