@@ -81,6 +81,11 @@ env -u TMPDIR -u UV_PROJECT_ENVIRONMENT XDG_RUNTIME_DIR=/run/user/1000 \
 
 These times apply to the documented host and scratch storage. Smaller CI hosts
 can take longer; the required checks and serial diagnostic stay the same.
+CI uses the runner's disk-backed temporary directory because its runtime
+directory filled during the full SQLite histories. It runs two pytest workers
+and one Make job to fit the private runner's two CPUs, and records memory,
+disk capacity and inode availability before testing. The later hostile-environment
+check keeps the dependency environment prepared by the complete gate.
 
 Profiling identified delivered-outbox scans, repeated retirement decoding,
 repeated same-transaction proofs, SQL metadata preparation and real retry waits

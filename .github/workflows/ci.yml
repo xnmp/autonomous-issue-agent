@@ -18,6 +18,13 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Runtime-directory tmpfs filled during the real SQLite scale contracts.
+      # Keep their FULL durability while using the runner's disk-backed scratch.
+      TMPDIR: ${{ runner.temp }}
+      # Private Linux runners have two CPUs; avoid overlapping two worker pools.
+      TEST_WORKERS: "2"
+      TEST_SUITE_JOBS: "1"
     steps:
       - uses: actions/checkout@v5
 
@@ -48,6 +55,13 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
 
+      - name: Test resource capacity
+        run: |
+          nproc
+          free -h
+          df -h "$TMPDIR"
+          df -i "$TMPDIR"
+
       # The full suite: governor + hooks + orchestration + point-at + domain +
       # adapters + gate parity + import-linter architecture contracts.
       - name: make test
@@ -65,4 +79,8 @@ jobs:
       # clock, and `make test` is the self-hosted TEST_CMD paid on every gate
       # run — CI is the authoritative place for the expensive belt-and-braces.
       - name: make test-deployment-env
+        env:
+          # make test already synchronized every test extra. Bare uv run here
+          # would otherwise remove the SDK/dashboard and pytest dependencies.
+          UV_NO_SYNC: "1"
         run: make test-deployment-env
