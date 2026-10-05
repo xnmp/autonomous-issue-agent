@@ -255,7 +255,7 @@ def test_failed_suffix_retirement_rolls_back_if_caller_catches_failure(verdict, 
 
 SUCCESSOR = "o/r:steward:successor"
 
-def running_steward(tmp_path):
+def running_steward(tmp_path, *, lane=cc.StewardLane.TRIAGE):
     store=SQLiteControlStore(str(tmp_path/'control.db'),now=lambda:NOW);store.initialize();bind_events(store)
     revision=resolve_snapshot(7).revision;component=active(revision.fence.key,WorkflowFamily.STEWARD)
     shell=IssueWorkflowShell(revision,steward=component)
@@ -263,8 +263,10 @@ def running_steward(tmp_path):
         db.execute('INSERT INTO workflows VALUES (?,?,?,?,?,?)',(*workflow_scope(revision.fence.key),revision.fence.generation,revision.version,encode_workflow(shell)))
     install_secondary(store,shell,component)
     sel=cc.select_steward(shell)
-    buy=cc.StewardPurchase(cc.ContinuationCapture(sel.binding,sel.revision,'leg:triage'),cc.StewardLane.TRIAGE,NOW.isoformat(),3)
-    paid=replace(request('active-triage'),workflow=sel.binding,owner_id=OWNER,kind='TRIAGE',dispatch_id=json.dumps({'repository':'o/r','role':'steward','issue':7,'number':7,'kind':'TRIAGE','leg_id':'leg:triage'}))
+    from issue_agent.domain.triage import grooming_content
+    signature = grooming_content(IssueView(7, title="Groom me")) if lane is cc.StewardLane.GROOM else ""
+    buy=cc.StewardPurchase(cc.ContinuationCapture(sel.binding,sel.revision,'leg:triage'),lane,NOW.isoformat(),3,signature)
+    paid=replace(request('active-triage'),workflow=sel.binding,owner_id=OWNER,kind=lane.value.upper(),dispatch_id=json.dumps({'repository':'o/r','role':'steward','issue':7,'number':7,'kind':lane.value.upper(),'leg_id':'leg:triage'}))
     assert store.reserve_steward(paid,buy).admitted
     store.register_lease(Lease(paid.run_id,paid.dispatch_id,OWNER,123,123,NOW,456))
     return store,paid
@@ -308,6 +310,40 @@ def test_steward_return_and_reclaim_charge_one_lane_once(tmp_path, reclaimed_fir
     assert state.groom == cc.StewardLaneState()
     with reopened.transaction() as db:
         assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 1
+
+
+@pytest.mark.parametrize("kind", ["no-finding", "stopped"])
+def test_cohort_accepts_all_normal_paid_steward_return_variants(tmp_path, kind):
+    from issue_agent.adapters.measurement import export_cohort
+    from issue_agent.domain.cohort import CohortWindow
+    store, _, source, commands, _, _ = admitted(tmp_path, lane=cc.StewardLane.GROOM)
+    outcome = cc.GroomNoFinding(source) if kind == "no-finding" else cc.StewardStopped(
+        source, tuple(str(command.command_id) for command in commands))
+    assert store.record_steward_outcome(outcome, () if kind == "no-finding" else commands)
+    result = export_cohort(store.path, CohortWindow("o/r", NOW, NOW + timedelta(minutes=1), NOW + timedelta(minutes=2), primary_family="steward"))
+    assert result["failed_or_abandoned_spend_micros"] == ({"USD:provider_reported": 1} if kind == "stopped" else {})
+    assert result["failed_or_abandoned_spend_coverage"]["complete"]
+    assert not any("invalid execution" in gap for gap in result["coverage_gaps"])
+    assert result["run_execution_observations"][0]["outcome"] == ("failed" if kind == "stopped" else "completed_without_error")
+
+
+def test_steward_refinement_does_not_publish_a_future_result_at_an_old_cutoff(tmp_path):
+    from issue_agent.adapters.measurement import export_cohort
+    from issue_agent.domain.cohort import CohortWindow
+    store, paid = running_steward(tmp_path, lane=cc.StewardLane.GROOM)
+    store._now = lambda: NOW + timedelta(seconds=10)
+    assert store.reclaim_dead_leases(OWNER, lambda pid, start: False) == (paid.run_id,)
+    store._now = lambda: NOW + timedelta(seconds=90)
+    assert store.settle(money(paid.run_id)).disposition is AccountingDisposition.AVAILABLE
+    source = store.steward_admission(WorkflowAttemptIdentity(paid.workflow, paid.run_id, "leg:triage"))
+    assert store.record_steward_outcome(cc.GroomNoFinding(source))
+    window = CohortWindow("o/r", NOW, NOW + timedelta(minutes=1), NOW + timedelta(minutes=1), primary_family="steward")
+    before_refinement = export_cohort(store.path, window)
+    assert not before_refinement["failed_or_abandoned_spend_coverage"]["complete"]
+    assert before_refinement["run_execution_observations"][0]["outcome"] == "unknown"
+    final = export_cohort(store.path, replace(window, observation_cutoff=NOW + timedelta(minutes=2)))
+    assert final["failed_or_abandoned_spend_coverage"]["complete"]
+    assert final["run_execution_observations"][0]["outcome"] == "completed_without_error"
 
 
 def test_late_steward_return_cannot_change_new_human_episode(tmp_path):

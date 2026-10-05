@@ -147,8 +147,13 @@ def export_cohort(path: str, window):
         gaps.extend(admission_gaps)
         # workload_repository was added after the original runs table. Avoid
         # deriving repository scope from a role owner's spelling.
-        run_rows = db.execute("SELECT r.run_id,r.config_version,r.owner_id,r.kind,r.state,r.started_at,r.outcome,r.dispatch_id,b.model,b.workload_repository,c.currency,c.basis,c.amount_micros,c.settled_at FROM runs r JOIN budget_reservations b ON b.run_id=r.run_id LEFT JOIN charges c ON c.run_id=r.run_id WHERE b.workload_repository IN (?,'*') ORDER BY r.run_id", (window.repository,)).fetchall()
+        run_rows = db.execute("SELECT r.run_id,r.config_version,r.owner_id,r.kind,r.state,r.started_at,r.completed_at,r.outcome,r.dispatch_id,b.model,b.workload_repository,c.currency,c.basis,c.amount_micros,c.settled_at FROM runs r JOIN budget_reservations b ON b.run_id=r.run_id LEFT JOIN charges c ON c.run_id=r.run_id WHERE b.workload_repository IN (?,'*') ORDER BY r.run_id", (window.repository,)).fetchall()
         observations = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? ORDER BY key", (NAMESPACE, window.repository)).fetchall()
+        executions = {}
+        for row in run_rows:
+            proof, errors = execution_observation(db, window.repository, row, window.observation_cutoff)
+            executions[row["run_id"]] = proof
+            gaps.extend(errors)
     known_runs = {fact.run_id for fact in facts}
     runs = []
     unscoped_spend: dict[str, int] = {}
@@ -176,7 +181,113 @@ def export_cohort(path: str, window):
             dispatch = {}
         if not isinstance(dispatch, dict):
             dispatch = {}
-        runs.append(RunFact(row["run_id"], row["config_version"], row["owner_id"], row["kind"], row["state"], cost, dispatch.get("runtime") if isinstance(dispatch.get("runtime"), str) else None, row["model"] if row["model"] != "<runtime-default>" else None, dispatch.get("effort") if isinstance(dispatch.get("effort"), str) else None, row["outcome"]))
+        runs.append(RunFact(row["run_id"], row["config_version"], row["owner_id"], row["kind"], row["state"], cost, dispatch.get("runtime") if isinstance(dispatch.get("runtime"), str) else None, row["model"] if row["model"] != "<runtime-default>" else None, dispatch.get("effort") if isinstance(dispatch.get("effort"), str) else None, row["outcome"], executions[row["run_id"]]))
     result = cohort_readout(window, tuple(facts), tuple(runs), tuple(parse_observation(json.loads(row[0])) for row in observations), tuple(gaps))
     result["legacy_unknown_repository_spend_micros"] = unscoped_spend
     return result
+
+
+def execution_observation(db, repository, run, cutoff):
+    from .workflow_codec import decode_workflow
+    from ..domain.cohort import CompletedExecution, FailedExecution
+    from ..domain.continuation_components import StewardFailed, StewardStopped, StewardReturned, StewardPurchase
+    from ..domain.contracts import ContinuationAdmission, RunId
+    from ..domain.resolve_return import ReturnedResolve
+    from ..domain.review_return import ReturnedReviewChild
+    from ..domain.review_execution import ReviewChildAdmission
+    from ..domain.workflow import ResolveAdmission
+    from ..domain.workflow_identity import WorkflowFamily
+
+    def receipt(namespace, key):
+        row = db.execute("SELECT claimed_at,payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                         (namespace, repository, key)).fetchone()
+        if row is not None:
+            claimed = datetime.fromisoformat(row["claimed_at"].replace("Z", "+00:00"))
+            if claimed.tzinfo is None:
+                raise ValueError("execution receipt timestamp is naive")
+            if claimed <= cutoff:
+                return row["payload_json"]
+        return None
+
+    proofs, errors = [], []
+    run_id = run["run_id"]
+    for namespace in ("workflow-return", "review-execution-return", "continuation-return"):
+        key = SQLiteControlStore._continuation_receipt_key(RunId(run_id), WorkflowFamily.STEWARD) if namespace == "continuation-return" else run_id
+        try:
+            raw = receipt(namespace, key)
+            if raw is None:
+                continue
+            reference = f"{namespace}:{key}"
+            if namespace == "workflow-return":
+                returned = decode_workflow(raw, ReturnedResolve)
+                admission = decode_workflow(receipt("workflow-admission", run_id), ResolveAdmission)
+                if (returned.attempt != admission.attempt or str(returned.attempt.run_id) != run_id
+                        or returned.stage != admission.stage
+                        or admission.attempt.binding.fence.key.repository != repository):
+                    raise ValueError("resolve execution differs from its admitted attempt")
+                if returned.returned_at > cutoff:
+                    continue
+                failed = returned.is_error
+                reason = returned.exit_reason.value if returned.exit_reason is not None else returned.status or "agent_error"
+            elif namespace == "review-execution-return":
+                returned = decode_workflow(raw, ReturnedReviewChild)
+                admission = decode_workflow(receipt("review-execution-admission", run_id), ReviewChildAdmission)
+                if (returned.run_id != run_id or admission.run_id != run_id or returned.child != admission.child
+                        or returned.owner_id != admission.owner_id or returned.owner_id != run["owner_id"]
+                        or admission.child.round.binding.rejection.fence.key.repository != repository):
+                    raise ValueError("review execution differs from its admitted child")
+                if returned.returned_at > cutoff:
+                    continue
+                failed = returned.result.is_error
+                reason = returned.result.exit_reason.value if returned.result.exit_reason is not None else returned.result.status or "agent_error"
+            else:
+                captured = decode_workflow(raw, tuple)
+                purchased = decode_workflow(receipt("continuation-admission", key), tuple)
+                if (len(captured) != 2 or len(purchased) != 2 or not isinstance(captured[0], ContinuationAdmission)
+                        or not isinstance(purchased[0], StewardPurchase)
+                        or captured[0] != purchased[1] or str(captured[0].attempt.run_id) != run_id
+                        or captured[0].attempt.binding.fence.key.repository != repository
+                        or purchased[0].capture.binding != captured[0].attempt.binding
+                        or purchased[0].capture.leg_id != captured[0].attempt.leg_id
+                        or purchased[0].capture.revision.version + 1 != captured[0].admission_version
+                        or not isinstance(captured[1], StewardReturned)
+                        or captured[1].source.admission != captured[0]
+                        or captured[1].source.lane != purchased[0].lane
+                        or captured[1].source.input_at != purchased[0].baseline_at
+                        or captured[1].source.content_signature != purchased[0].content_signature):
+                    raise ValueError("steward execution differs from its admitted source")
+                # Recovery can be refined in place; its original claimed_at
+                # cannot timestamp the current payload. The same transaction
+                # always appends this control transition to the SQL outbox.
+                witness = db.execute("SELECT MAX(committed_at) FROM event_outbox WHERE json_valid(event_json) "
+                    "AND json_extract(event_json,'$.type')='control.transition.committed.v1' "
+                    "AND json_extract(event_json,'$.data.entity_kind')='steward_return' "
+                    "AND json_extract(event_json,'$.data.entity_id')=? "
+                    "AND json_extract(event_json,'$.producer.repository')=? "
+                    "AND json_extract(event_json,'$.correlation.run_id')=?", (key, repository, run_id)).fetchone()[0]
+                if witness is None:
+                    raise ValueError("steward execution lacks its atomic observation timestamp")
+                observed = datetime.fromisoformat(witness.replace("Z", "+00:00"))
+                if observed.tzinfo is None:
+                    raise ValueError("steward execution observation timestamp is naive")
+                if observed > cutoff:
+                    continue
+                failed = isinstance(captured[1], (StewardFailed, StewardStopped))
+                reason = captured[1].kind.value if isinstance(captured[1], StewardFailed) else "paid_stall_ceiling"
+            proofs.append(FailedExecution(reason, reference) if failed else CompletedExecution(reference))
+        except (ValueError, TypeError, KeyError) as error:
+            errors.append(f"invalid execution {namespace}:{key}: {error}")
+    if run["state"] in {"abandoned", "cancelled"} and run["completed_at"]:
+        try:
+            completed = datetime.fromisoformat(run["completed_at"].replace("Z", "+00:00"))
+            if completed.tzinfo is None:
+                raise ValueError("execution completion timestamp is naive")
+            if completed <= cutoff:
+                proofs.append(FailedExecution(run["outcome"] or run["state"], f"runs:{run_id}:completed_at"))
+        except (ValueError, TypeError) as error:
+            errors.append(f"invalid execution completion {run_id}: {error}")
+    if errors or len({type(proof) for proof in proofs}) > 1:
+        if not errors:
+            errors.append(f"conflicting execution observations: {run_id}")
+        return None, errors
+    return (proofs[0] if proofs else None), errors

@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-10-04. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-10-05. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -9,8 +9,11 @@ The [phase-4 simplification roadmap](../open/2026-09-30-phase-4-simplification-r
 and [ADR 0016](../adr/0016-phase-4-current-state-authority.md) govern selected
 continuation authority. Current SQL state and a bounded unresolved suffix
 replace archive certification, lifetime verification and selected Store
-continuity writers. A2 whole-system acceptance is complete; phases 5 and 6
-remain pending. Jira's explicitly retained legacy counter path is the sole
+continuity writers. A2 whole-system acceptance and Phase 6's declared policy/
+independent-execution contracts are complete. Phase 5's offline contracts and
+live cutover are verified; actual unattended windows and readout remain pending.
+Current evidence is in the [execution record](../open/2026-10-05-phase-5-live-execution.md).
+Jira's explicitly retained legacy counter path is the sole
 runtime exception; its mirror context remains advisory.
 
 Operator instructions live in [HARNESS.md](../../HARNESS.md); how to point the
@@ -114,20 +117,19 @@ tests pass.
    with a PR number. They are the densest defence in the codebase. When you move
    code, move its comment verbatim.
 
-## Required review guardrail — currently missing
+## Independent review execution
 
-The SDK reviewer is diff-only: its tool policy does not check out the PR branch
-or run `TEST_CMD`. It therefore cannot independently reproduce the resolve
-agent's reported result. On keifu PR #146, an independently executed review
-exposed a confident PR-body claim about a test failure that did not exist while
-confirming the code itself was correct. The current SDK path does not preserve
-that protection.
-
-Treat independent execution as a required guardrail for review-cost work, not as
-a current capability. Before making review cheaper in a way that relies more on
-the author's summary, either add independent branch execution or build an
-equally independent contradiction check. Do not claim the guardrail is present
-until a behavioral test enforces it (#36).
+Reviewer children remain diff-only. After source review and before an ordinary
+approval, the harness independently executes the frozen operator `TEST_CMD`
+against the exact PR checkout. Its stored receipt binds rejection/execution
+authority, head, patch and configuration, with pre/post tracked-tree proof and
+bounded supervised teardown. Durable writers recheck that evidence before an
+absent approval write; changed revisions or configuration cannot reuse a pass.
+Compatible rounds reuse completed results. Failure requests changes; timeout,
+interruption and unavailable execution follow bounded evidence holds. An explicit
+operator waiver is recorded separately. Behavioral contracts cover normal and
+copied approvals, unavailable execution, mutation, cancellation and restart.
+See [ADR 0011](../adr/0011-trusted-execution-and-gate-evidence.md).
 
 ## Enforcement: authority plus two advisory stacks
 

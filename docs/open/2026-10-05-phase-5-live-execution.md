@@ -164,6 +164,25 @@ to after actual bounded teardown so late settlements of admitted work are
 included. The exact 48-hour cohort interval and no post-deadline admission rule
 remain fixed.
 
+### Subsequent readout audit
+
+The read-only completion audit found a second concrete readout defect before
+window admission: both canary runs were accounting-completed/settled, while
+existing typed return receipts prove execution errors. The failure-cost field
+therefore omitted known charges. Window 1's future start was stopped while
+correcting this; its stop remains armed and window 2 remains unarmed.
+
+The correction separates observed execution evidence from accounting disposition,
+matching exact admitted attempts and the observation cutoff. Resolve-primary
+known failed spend is USD 0.236648; steward-primary is USD 0.395432, while total
+all-family spend remains USD 0.632080. Missing/conflicting evidence has explicit
+unknown coverage. Steward recovery can be refined in place, so the existing
+atomic outbox transition timestamps the current payload instead of its original
+claim time. Real reservation/settlement/return, lease-recovery refinement,
+valid stopped/no-finding outcomes and malformed-source regressions passed the
+focused gate. Independent review and the full gate precede renewed source freeze
+and rearming. No further paid pilot was purchased for these reader corrections.
+
 Freeze the final harness revision, exact unit hashes, resolved launch profile,
 selected/inherited bindings, issue/PR inventory and event offsets before start.
 No-touch means no operator comments, labels, configuration/code changes or

@@ -10,8 +10,10 @@ all 297 fix/165 steward holds remain preserved. The admission/accounting/
 cancellation canary settled USD 0.632080 and all roles stopped; it did not
 complete implementation. A reproduced measurement-receipt reader mismatch has
 a bounded independently reviewed correction. The two actual 48-hour windows
-are still required. Window 1's start/stop timers are armed for October 5 23:00
-through October 7 23:00 UTC; window 2 remains unarmed pending stopped readout.
+are still required. Window 1's October 5 23:00 through October 7 23:00 UTC
+schedule is prepared; its start is held while a second observed readout defect
+is corrected. Settled accounting must not imply successful execution. Window 2
+remains unarmed pending the first stopped readout.
 Current evidence,
 target qualification, authorization and finite controls are recorded in the
 [live execution record](2026-10-05-phase-5-live-execution.md).
@@ -461,7 +463,7 @@ inventory is not permission to activate the new schema or restart deployment.
 | 2 — `phase_2_composition` | Starts alongside 1; acceptance uses its fixes | Extend real daemon + durable executor + SQLite composition with a persistent GitHub double, restart and bounded fault injection. Cover remote success before receipt, duplicate delivery, partial relabel, stale completion and concurrent re-arm; prove held-state preservation, stable attempt identity, accounting conservation and visible uncertainty. |
 | 3 — `phase_3_gates` | Design may proceed alongside 1–2; implementation requires both accepted | Superseding ADR first where authority moves. Implement one complete generation-fenced gate/re-arm flow, accept it, then the second. Include operator command, continuation changes, dashboard projection, and aged-uncertain-command gates. Completion requires verified remote outcomes. Delete replaced choreography. |
 | 4 — `phase_4_continuations` | 3 accepted | First complete step 0.5 under ADR 0016: replace lifetime archive proof with atomic current-state authority and remove the superseded machinery. Then execute the finite issue roadmap to migrate selected eligibility-bearing counters, consumed replies and continuation episodes one family at a time. Shadow comparison, scoped epochs, old-writer fencing and rollback reconciliation precede cutover. Retire replaced Store suffixes and temporary flags; never operate two authorities. |
-| 5 — `phase_5_measurement` | 4 accepted | Implement incident/intervention records and comparable-cohort readouts, replay recorded interventions without an operator, and prepare/run authorized unattended windows. Include parked/abandoned work and operator diagnosis. Select new automation only from measured evidence; no automatic commitment to a diagnostic leg or general policy platform. Offline contracts, retained-obligation disposition, current-target qualification and live cutover are verified. Actual canary and two unattended windows/readout remain required under the approved bounded profile. |
+| 5 — `phase_5_measurement` | 4 accepted | Implement incident/intervention records and comparable-cohort readouts, replay recorded interventions without an operator, and prepare/run authorized unattended windows. Include parked/abandoned work and operator diagnosis. Select new automation only from measured evidence; no automatic commitment to a diagnostic leg or general policy platform. Offline contracts, retained-obligation disposition, current-target qualification, live cutover and bounded cancellation canary are verified. Two actual unattended windows/readout remain required under the approved bounded profile. |
 | 6 — `phase_6_policy` | Findings/measurements from preceding phases | Consolidate demonstrated shell/Python gate-policy duplication behind one source while retaining parity and evidence requirements. Preserve current capability validation; do not refactor runtime registries merely because they are parallel. Address independent revision-bound test execution as a distinct verification contract, without treating model review as execution evidence. |
 
 Each phase requires behavioral tests, independent adversarial review, a green

@@ -58,6 +58,17 @@ Production may enrich a launch-file snapshot with rendered prompts and runtime
 paths; archive both identities and verify their guardrails rather than assuming
 the launch-file fingerprint is the admitted one.
 
+Execution failure is observed separately from accounting settlement. The export
+uses exact admitted resolve/review return receipts and fixed steward outcomes;
+steward refinements use their atomic SQL-outbox observation timestamp. A later
+payload cannot establish an earlier execution outcome. Missing, conflicting or
+malformed evidence stays unknown. `completed_without_error` describes the paid
+execution; issue/PR outcomes require their separate observations.
+`failed_or_abandoned_spend_micros` is the primary-family run union, counted once,
+with explicit execution/charge coverage. An empty observed total with incomplete
+coverage is not measured zero unsuccessful spend. All admitted families retain
+their individual execution observations and accounting charges.
+
 A `workflow_measurement` input uses common identity/provenance/time fields plus `run_id`, `binding_ref` and `evidence_refs`. The run/binding pair must match an authoritative admission. Optional `profile` requires all six fields: deployment/runtime/model/posture/difficulty/config_version. One binding observation supplies deployment/posture/difficulty; frozen SQL runtime/model/config inputs automatically cover other admitted runs. Runtime/model annotations are needed only for missing actual inputs. For a fixed supported mix, `supported_profile` may use bounded `runtimes`/`models` arrays instead of mutually exclusive singular keys, under a frozen config_version. Exported runtime/model/kind mix counts and difficulty strata retain the observed distribution; membership in overlapping sets does not establish equivalent workloads. These operator observations are checked against frozen admission config/runtime/model inputs; `<runtime-default>` does not establish the actual model. Optional `outcome` is either `{"state":"merged","pr_number":44,"merged_at":"2026-10-04T01:00:00Z"}` or an open/held/parked/abandoned state with optional proven `pr_number`. `first_pass_approved` requires a proven PR; `recurrence_observed` requires a merged PR. `first_review_status:"not_reviewed"` explicitly records a PR which has not yet received a first review; absent first-review facts remain unknown even with a completeness declaration. Held/parked outcomes may supply UTC `held_since`, no later than the observation, to measure held duration; missing start stays unknown. Later annotations retain previously recorded facts; corrections can explicitly replace known facts. Every asserted profile/outcome has evidence and provenance.
 
 A `cohort_coverage` input uses common identity/provenance/time fields, exported `cohort_fingerprint`, `evidence_refs` and explicit booleans `human_complete`, `outcomes_complete`, `first_review_complete`, `recurrence_complete`. Complete recurrence coverage also requires positive `recurrence_horizon_seconds`. These are operator-reported completeness declarations. The fingerprint covers repository, exact window/cutoff, selection, primary family and expected profile. Missing coverage leaves observed floors and unknown complete rates.

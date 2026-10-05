@@ -78,6 +78,24 @@ class AdmissionFact:
 
 
 @dataclass(frozen=True)
+class FailedExecution:
+    reason: str
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        text(self.reason, "execution failure reason")
+        text(self.evidence_ref, "execution failure evidence")
+
+
+@dataclass(frozen=True)
+class CompletedExecution:
+    evidence_ref: str
+
+    def __post_init__(self) -> None:
+        text(self.evidence_ref, "execution completion evidence")
+
+
+@dataclass(frozen=True)
 class RunFact:
     run_id: str
     config_version: str
@@ -89,6 +107,7 @@ class RunFact:
     model: str | None = None
     effort: str | None = None
     outcome: str | None = None
+    execution: FailedExecution | CompletedExecution | None = None
 
     def __post_init__(self) -> None:
         for name in ("run_id", "config_version", "owner_id", "kind", "state"):
@@ -101,6 +120,8 @@ class RunFact:
         for name in ("runtime", "model", "effort", "outcome"):
             if getattr(self, name) is not None:
                 text(getattr(self, name), name)
+        if self.execution is not None and not isinstance(self.execution, (FailedExecution, CompletedExecution)):
+            raise ValueError("execution requires observed completion or failure evidence")
 
 
 def binding_reference(identity: str) -> str:
@@ -286,8 +307,10 @@ def cohort_readout(window: CohortWindow, admissions: tuple[AdmissionFact, ...], 
     audit_incidents = tuple(record for record in incident_records if record.finding_source == "audit")
     attributed_actions = tuple(record for record in activity if isinstance(record, HumanIntervention) and record.workflow_ref in {binding_reference(identity) for identity in primary})
     failed_spend: dict[str, int] = {}
+    failed_runs = {run.run_id for run in runs if run.run_id in selected_runs and isinstance(run.execution, FailedExecution)}
+    unknown_execution = sorted(run_id for run_id in selected_runs if run_id not in by_run or by_run[run_id].execution is None)
     for run in runs:
-        if run.run_id in selected_runs and run.cost is not None and (run.state in {"abandoned", "cancelled"} or run.outcome in {"error", "agent_error", "infra_error", "dead_lease", "timeout", "budget_exhausted"}):
+        if run.run_id in failed_runs and run.cost is not None:
             currency, basis, amount = run.cost
             key = f"{currency}:{basis}"
             failed_spend[key] = failed_spend.get(key, 0) + amount
@@ -318,6 +341,19 @@ def cohort_readout(window: CohortWindow, admissions: tuple[AdmissionFact, ...], 
         "difficulty_strata": dict(sorted(difficulty.items())),
         "binding_outcomes": held_states,
         "failed_or_abandoned_spend_micros": failed_spend,
+        "failed_or_abandoned_spend_coverage": {
+            "scope": "primary-family run union; each run counted once",
+            "basis": "observed execution evidence at cutoff; settlement alone proves no execution outcome",
+            "complete": not unknown_execution and all(by_run[run_id].cost is not None for run_id in failed_runs),
+            "unknown_execution_runs": unknown_execution,
+            "known_failed_runs_without_charge": sorted(run_id for run_id in failed_runs if by_run[run_id].cost is None),
+        },
+        "run_execution_observations": [{
+            "run_id": run.run_id,
+            "outcome": "failed" if isinstance(run.execution, FailedExecution) else "completed_without_error" if isinstance(run.execution, CompletedExecution) else "unknown",
+            "reason": run.execution.reason if isinstance(run.execution, FailedExecution) else None,
+            "evidence_ref": run.execution.evidence_ref if run.execution is not None else None,
+        } for run in runs if run.run_id in bindings_per_run],
         "coverage": {"provenance": "operator-reported completeness", "human_complete": human_complete, "outcomes_complete": complete_outcomes, "recurrence_complete": complete_recurrence, "accounting_complete": complete_accounting, "known_prs_missing_first_review": sorted(first_review_missing)},
         "first_pass_denominator": "distinct primary-cohort PRs with observed first-review outcomes, including unmerged/rejected PRs; rate requires declared outcome completeness",
         "first_pass_reviewed_prs": len(first_pass),
