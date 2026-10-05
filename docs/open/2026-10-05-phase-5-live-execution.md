@@ -278,8 +278,14 @@ plugin system. Fresh isolated qualification is required. Its native build and
 all four existing native outcome scenarios passed on the rebooted host with a
 fresh application profile. Deleted private cache paths were restored from
 retained caches; the earlier failed build log is preserved. The retained
-ordinary command hit its unchanged 600-second deadline with equal before/after
-tracked-tree proof and no orphan processes. A bounded investigation is pending;
-this failure does not qualify the new target. No paid start is armed while
-qualification remains incomplete. Harness runtime/tests are unchanged from
+ordinary command first hit its unchanged 600-second deadline with equal
+before/after tracked-tree proof and no orphan processes. A bounded investigation
+found 3,285 frontend tests passing in 6.73 seconds followed by active Rust
+compilation; the deleted private Cargo path prevented cache reuse. The failed
+receipt and complete diagnostic log remain archived. The subsequent existing
+executor run with the restored cache path passed at 22:56:26 UTC in 108,094 ms,
+retaining the same command, 600-second limit, equal source proofs and empty
+process registry. This qualifies the current target; it does not erase the
+failed attempt or supply unattended coverage. Window-1 start may now be armed
+after the final revision and evidence freeze. Harness runtime/tests are unchanged from
 the independently accepted `0cac7cc` source and green 304.138-second full gate.

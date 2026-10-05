@@ -14,8 +14,8 @@ are still required. The October 5 14:30 start ran until a host reboot at
 22:01:23 UTC; this is about 7½ hours of partial coverage, not a completed window.
 Its USD 13.787344 spend is settled, including trusted recovery of the interrupted
 triage run. Replacement window 1 is October 5 23:00 through October 7 23:00 UTC,
-conditional on fresh qualification of the externally advanced target and the
-final revision/evidence freeze. The partial run and canary share the original
+after fresh ordinary/native qualification of the externally advanced target;
+start requires the final revision/evidence freeze. The partial run and canary share the original
 USD 25 daily caps and five-period USD 125 aggregate bound; no budget is reset.
 Settled accounting no longer implies successful execution. Window 2
 remains unarmed pending the first stopped readout.
