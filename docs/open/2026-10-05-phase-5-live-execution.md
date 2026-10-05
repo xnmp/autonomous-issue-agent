@@ -69,7 +69,8 @@ target soak or either 48-hour harness window.
 The private 16-GiB compiler cache was moved from quota-limited `/tmp` to disk,
 preserving cached compilation and freeing scratch space. No accepted evidence
 or original application state was deleted. Issue #237 is merged; the complete
-harness gate passed repeatedly below five minutes on the reference host.
+harness gate now takes about five minutes on the reference host; the latest
+full gate took 304.138 seconds.
 
 ## Canary, queue and finite controls
 
@@ -86,10 +87,10 @@ The same approved aggregate bound is retained across five UTC budget periods:
 
 | Stage | UTC interval or cutoff |
 | --- | --- |
-| One-tick canary | October 5; absolute stop at 22:55 |
-| Window 1 | October 5 23:00 through October 7 23:00 |
+| One-tick canary | Completed October 5, 10:59–11:04; obsolete 22:55 timer stopped |
+| Window 1 | October 5 14:30 through October 7 14:30 |
 | Stopped readout | After all roles and children stop, before the second release |
-| Window 2 | October 7 23:45 through October 9 23:45 |
+| Window 2 | Conditional October 7 15:15 through October 9 15:15 |
 
 Both windows are nominal full 48-hour intervals. Record actual start/ready,
 admission, stop and settlement times and actual coverage. Early or partial
@@ -154,9 +155,10 @@ new-admission specification and a separate bounded inherited-canary specificatio
 with the three actual resolve/issue-recovery/steward binding references.
 Missing historical exposure and outcome/profile annotations remain unknown.
 
-Window 1's stop timer was armed and read back before its start timer. Both are
-active/waiting for the full October 5 23:00 through October 7 23:00 UTC interval.
-Both window-2 timers remain inactive. This is scheduled release, not observed
+The original October 5 23:00 through October 7 23:00 UTC controls were armed
+after the first reader correction. That release was superseded before admission
+by the independently accepted earlier schedule below. Both window-2 timers
+remain inactive. This is scheduled release, not observed
 48-hour coverage or completed Phase 5 acceptance. Final documentation-only HEAD
 and timer readback are appended to the private freeze before admission.
 At stopped readout, retain the deadline snapshot and advance observation cutoff
@@ -191,6 +193,26 @@ readout accounts for both known failed charges and preserves unknowns.
 Window 1's start was then rearmed for the same approved 48-hour interval;
 window 2 remains unarmed. A final documentation-only revision and timer/hash
 witness are appended before admission.
+
+### Earlier release after final CI
+
+Hosted CI run `37310239320` passed for published documentation-only revision
+`c08785c`; its runtime source is the fully tested `0cac7cc` revision. All release
+prerequisites are complete. Independent review accepted advancing the four
+existing calendar dates to the intervals in the table, saving eight and a half
+hours of idle time with the same five UTC periods and USD 125 aggregate bound.
+Source, configuration, prompts, models, caps and queue policy are unchanged.
+
+The old canary stop and both old window-1 timers were stopped before replacement.
+The four reviewed timer files were atomically replaced and the manager reloaded.
+The new window-1 stop was armed and read back for October 7 14:30 UTC before
+start. The obsolete canary timer and both window-2 timers remain inactive.
+Window-1 start is armed only after the final documentation revision and
+`window-1-prestart-earlier-release/` evidence freeze. Subsequent actual manager
+readback is retained privately; this schedule is not measured coverage.
+A missed 14:30 start requires an explicit replacement schedule, not catch-up.
+Window 2 remains conditional on stopped readout/adjudication and profile checks;
+if these miss October 7 15:15, postpone and recalculate before arming it.
 
 Freeze the final harness revision, exact unit hashes, resolved launch profile,
 selected/inherited bindings, issue/PR inventory and event offsets before start.

@@ -1,19 +1,14 @@
-# Proposed Phase 5 timing amendment
+# Approved Phase 5 timing amendment
 
-Current status: the bounded-window and standing accounting approvals cover this
-five-period allocation. Live prerequisites are recorded in the
-[execution record](2026-10-05-phase-5-live-execution.md). The finite controls
-are installed and verified; the canary stop timer is armed and the bounded
-canary has stopped. **Window 1's start/stop are armed; window 2 remains unarmed**.
-Paid services are stopped until the first scheduled start.
-The original proposal wording below is retained as preparation evidence.
-The [bounded window proposal](2026-10-04-phase-5-unattended-windows.md) remains
-approved within its original scope. This amendment requests different starting
-times and standalone window ceilings while preserving the USD 125 combined
-bound, the configured profile, all existing USD 25 caps and two complete
-48-hour observation intervals. The separate
-[retained-obligation decision](2026-10-05-phase-5-retained-obligations.md)
-also remains pending. No live authority or services have changed.
+Current status: bounded-window and standing accounting approvals cover this
+five-period allocation. The [execution record](2026-10-05-phase-5-live-execution.md)
+records completed recovery, activation, qualification, canary, full tests and
+hosted CI. Independent review accepted advancing the four existing calendars
+from the original 23:00/23:45 schedule to the times below. This preserves the
+USD 125 combined new-admission bound, configured profile, all USD 25 caps and
+two complete 48-hour intervals. The obsolete canary timer is stopped. Window 1's
+future stop is armed; its start requires the final evidence freeze. Both window-2
+timers remain inactive until the first stopped readout is adjudicated.
 
 ## Reason and concrete schedule
 
@@ -28,17 +23,16 @@ and [service shutdown contract](https://github.com/systemd/systemd/blob/v262/man
 
 Use the existing services and fixed-date systemd start/stop timers:
 
-| Stage | Proposed UTC interval or cutoff |
+| Stage | Accepted UTC interval or cutoff |
 | --- | --- |
-| One-tick canary | October 5; absolute stop armed for 22:55 before starting |
-| Window 1 | October 5 23:00 through October 7 23:00; exactly 48 hours |
+| One-tick canary | Completed October 5, 10:59–11:04; obsolete 22:55 timer stopped |
+| Window 1 | October 5 14:30 through October 7 14:30; exactly 48 hours |
 | Stopped readout | October 7 after all roles and children stop; finish before the next release |
-| Window 2 | October 7 23:45 through October 9 23:45; exactly 48 hours |
+| Window 2 | Conditional October 7 15:15 through October 9 15:15; exactly 48 hours |
 
 Request simultaneous stops of all three roles **at each window endpoint**,
 then retain the existing bounded cancellation, draining and receipts. The
-90-second shutdown bound fits within the first endpoint's one-hour midnight
-margin and the second endpoint's fifteen-minute margin. Record actual timing;
+90-second shutdown bound fits within the same-day margins at both endpoints. Record actual timing;
 the nominal schedule alone proves neither coverage nor stopping.
 
 Window 1 spans the October 5, 6 and 7 budget periods. Window 2 spans October
@@ -64,7 +58,7 @@ Historical unknown exposure remains outside this new-admission bound.
   its absolute stop timer. Restore the ordinary units before window 1.
 - Leave window 2 unarmed until the first stopped readout, halt adjudication and
   unchanged-profile check finish. Forty-five minutes is available, not assumed
-  sufficient. If readiness misses 23:45, postpone and recalculate the five-period
+  sufficient. If readiness misses October 7 15:15, postpone and recalculate the five-period
   bound before release; never compress or skip readout.
 - Preserve the no-touch rule. Partial starts, clock/host disruption, missed
   stops or post-deadline paid admissions invalidate the coverage claim. Record
@@ -76,14 +70,14 @@ Historical unknown exposure remains outside this new-admission bound.
   unmet targets, missing comparable baseline and unknown recurrence coverage.
 
 The exact offline unit drafts and hash manifest are at
-`/tmp/phase5-full48-control-alternative/`. Host `systemd-analyze --user verify`
+`.worktrees/phase5-preflight/earlier-release-controls/`. Host `systemd-analyze --user verify`
 accepted all ten service/timer files. Independent review accepted the period
 arithmetic and nominal intervals with the conditions above. The earlier
 23:58-cutoff draft is classified as a shorter observation and must not be
 installed as completed Phase 5 acceptance. This amendment adds no production
 code, controller, queue or worker. Actual live window evidence remains required.
 
-Dates are prospective. If approval arrives too late for this canary/start,
-prepare a new exact schedule with the same coverage and five-period constraints
-before release. Approval of this amendment does not authorize the separate
-unknown-accounting or obsolete-publication dispositions.
+Dates are prospective; actual runtime evidence remains required. A missed first
+start requires a replacement exact schedule and five-period calculation before
+release. The retained-obligation dispositions were already approved and applied;
+historical actual spend remains unknown.

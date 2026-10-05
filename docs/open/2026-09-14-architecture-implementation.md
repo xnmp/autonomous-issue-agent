@@ -3,16 +3,18 @@
 **Live checkpoint — 2026-10-05 after the bounded canary:** phases 1–4 are accepted and all
 37 Phase 4 tasks plus their tracking epic are closed after published-commit and
 independent acceptance verification. Phase 6's declared contracts are accepted.
-Issue #237 is merged; the complete reference-host gate passes below five minutes.
+Issue #237 is merged; the complete reference-host gate now takes about five minutes.
 The approved retained-obligation dispositions, live schema-40/family cutovers
 and bounded launch-profile application are complete. Historical uncertainty and
 all 297 fix/165 steward holds remain preserved. The admission/accounting/
 cancellation canary settled USD 0.632080 and all roles stopped; it did not
 complete implementation. A reproduced measurement-receipt reader mismatch has
 a bounded independently reviewed correction. The two actual 48-hour windows
-are still required. Window 1's October 5 23:00 through October 7 23:00 UTC
-schedule is armed after the second observed readout defect was corrected and
-the complete gate passed. Settled accounting no longer implies successful execution. Window 2
+are still required. Window 1's independently reviewed earlier interval is October 5
+14:30 through October 7 14:30 UTC, after the second observed readout defect was
+corrected, the complete gate passed and hosted CI succeeded. Its future stop is
+armed; start requires the final revision and evidence freeze.
+Settled accounting no longer implies successful execution. Window 2
 remains unarmed pending the first stopped readout.
 Current evidence,
 target qualification, authorization and finite controls are recorded in the
