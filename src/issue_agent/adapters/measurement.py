@@ -80,6 +80,7 @@ def read_observations(path: str, repository: str) -> tuple[Observation, ...]:
 
 def admission_facts(db: sqlite3.Connection, repository: str):
     from .workflow_codec import decode_workflow, encode_workflow
+    from ..domain.continuation_components import ContinuationPurchase
     from ..domain.cohort import AdmissionFact
     from ..domain.contracts import ContinuationAdmission
     from ..domain.review_execution import ReviewChildAdmission
@@ -97,7 +98,18 @@ def admission_facts(db: sqlite3.Connection, repository: str):
                 identity = encode_workflow(binding)
                 family = binding.authority.family.value
             elif row["namespace"] == "continuation-admission":
-                receipt = decode_workflow(row["payload_json"], ContinuationAdmission)
+                captured = decode_workflow(row["payload_json"], tuple)
+                if (len(captured) != 2 or not isinstance(captured[0], ContinuationPurchase)
+                        or not isinstance(captured[1], ContinuationAdmission)):
+                    raise ValueError("continuation receipt requires a purchase and admission pair")
+                purchase, receipt = captured
+                if (purchase.capture.binding != receipt.attempt.binding
+                        or purchase.capture.leg_id != receipt.attempt.leg_id
+                        or receipt.admission_version != purchase.capture.revision.version + 1):
+                    raise ValueError("continuation admission differs from its purchase capture")
+                if row["key"] != SQLiteControlStore._continuation_receipt_key(
+                        receipt.attempt.run_id, receipt.attempt.binding.authority.family):
+                    raise ValueError("continuation receipt key differs from its admitted run and family")
                 binding = receipt.attempt.binding
                 run_id = str(receipt.attempt.run_id)
                 identity = encode_workflow(binding)

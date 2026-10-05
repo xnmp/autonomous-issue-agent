@@ -3,8 +3,10 @@
 **Current live checkpoint — October 5:** offline Phase 5 and the declared
 Phase 6 contracts are accepted. All 37 Phase 4 tasks and the epic are closed;
 the schema-40/family cutover, retained-obligation dispositions and approved
-lower-cap configuration are applied. Current qualification and the remaining
-canary/two-window acceptance are in the
+lower-cap configuration are applied. The bounded cancellation canary settled
+USD 0.632080, all roles stopped, and its measurement-reader correction has been
+independently reviewed. Current qualification and the remaining two-window
+acceptance are in the
 [live execution record](2026-10-05-phase-5-live-execution.md). Earlier
 deployment-pause statements below describe their original checkpoints.
 

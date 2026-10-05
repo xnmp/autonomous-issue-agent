@@ -4,7 +4,9 @@
 covered retained-obligation dispositions and the five-period timing allocation.
 Live schema-40/all-family activation and the eight lower-cap/profile overrides
 are applied, with historical holds preserved. Current target qualification is
-at `af06e086`. No paid canary or unattended window has started. Follow the
+at `af06e086`. The bounded intentional-cancellation canary ran and settled
+USD 0.632080; no unattended window has started. Its actual enriched admission
+fingerprint is `9cbb861835df4825` (launch file `f9e073a4b2d58c23`). Follow the
 [live execution record](2026-10-05-phase-5-live-execution.md); the original
 midnight proposal and preparation inventories below are historical evidence.
 

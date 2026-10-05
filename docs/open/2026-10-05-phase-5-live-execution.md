@@ -32,7 +32,8 @@ The operator and service launch snapshots both resolve to
 issue caps USD 25, fix concurrency one, promotion disabled, unlabeled review
 adoption disabled, and explicit `gpt-5.6-sol` fix/triage models. Other inputs and
 credentials were preserved. All roles use Codex and single review mode.
-All six tauri-explorer/keifu services remain stopped and boot autostart disabled.
+All six tauri-explorer/keifu services are stopped and boot autostart disabled
+after the bounded canary described below.
 Keifu remains outside this release.
 
 Private durable evidence is at
@@ -72,13 +73,14 @@ harness gate passed repeatedly below five minutes on the reference host.
 
 ## Canary, queue and finite controls
 
-The canary candidate remains #755: the palette About command must show the
-actual application version. Recheck its current issue and execution history
-before adding readiness. Reassess the proposed #848/#985/#938/#786 window pool
-against the changed target; PR #991 changed image-editor shortcuts and the
-Git-watch cancellation fixture. Do not purchase duplicate implementation or
-count an external pre-window merge as an unattended outcome. Preserve the five
-old ready issues' sourced holds.
+The #755 pilot was open, lacked linked implementation and prior SQL bindings,
+and the qualified target had no About command. It was marked ready through the
+durable operator path before the canary. #848's navigation hints and #938's
+nested config-watch handover remain valid window candidates. Exclude #786
+because PR #991 already changed the cancellation fixture, and #985 because its
+requested crop shortcut overlaps the externally changed AI-edit shortcut.
+Do not purchase duplicate implementation or count an external pre-window merge
+as an unattended outcome. Preserve the old ready issues' sourced holds.
 
 The same approved aggregate bound is retained across five UTC budget periods:
 
@@ -108,8 +110,39 @@ stopped readout, halt adjudication and unchanged-profile check finish. A missed
 readout deadline postpones release and requires a new five-period calculation.
 
 The ten finite control units and three one-tick canary overrides were installed
-and verified at 10:44 UTC. Timers remain unarmed and services stopped; no paid
-canary or unattended-window start is claimed here yet.
+and verified at 10:44 UTC. The canary's future stop timer was armed before
+readiness and admission. Fix started at 10:59:03 UTC; review/steward started at
+11:01:37. All three reached readiness and stopped by 11:04:07 with service exit
+zero, no active runs/reservations/leases/claims/pending commands, no process-group
+or process-tree registrations, and dead launcher owners. Two cancelled launch
+intent receipts remain for ordinary boot reconciliation.
+
+This was an intentional-cancellation safety canary. The short one-tick drain
+deadline killed the unfinished resolve #755 and triage #781 children; it did
+not complete either issue or qualify successful paid implementation. Their
+genuine configured-rate-card charges settled at USD 0.236648 and USD 0.395432,
+total USD 0.632080. The sourced infrastructure failures remain one each;
+resolve failure count remains zero, no retry credit was reset, and #755 remains
+an inherited unfinished binding. Review performed observation without purchasing
+an unlabeled review. No 48-hour window has started.
+
+Production enriches the launch snapshot with rendered agent/review prompts and
+the harness path. Its actual admission fingerprint is `9cbb861835df4825`; the
+launch-file fingerprint remains `f9e073a4b2d58c23`. Reproduction proved those
+three changes and equality of all eight approved guardrail fields. Cohort
+expectations must use the actual admission fingerprint and retain both identities.
+
+The canary export exposed a measurement reader mismatch: immutable continuation
+receipts contain a `(purchase, admission)` pair, while the reader expected a
+root admission. The bounded reader correction validates the pair and its
+binding/leg/version agreement. Real-reservation regressions cover shared cost conservation,
+steward recording and malformed pairs. Corrected export of the same receipts
+contains resolve, issue-recovery and steward exposure, total USD 0.632080 with
+no unassigned triage charge. Missing historical receipts and outcome/profile
+annotations remain coverage gaps. Independent review accepted the correction
+after strengthening exact admission-version and receipt-key validation. The
+full gate remains required before the final window freeze; starts remain unarmed.
+
 Freeze the final harness revision, exact unit hashes, resolved launch profile,
 selected/inherited bindings, issue/PR inventory and event offsets before start.
 No-touch means no operator comments, labels, configuration/code changes or

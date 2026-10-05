@@ -3,7 +3,8 @@
 Current status: the bounded-window and standing accounting approvals cover this
 five-period allocation. Live prerequisites are recorded in the
 [execution record](2026-10-05-phase-5-live-execution.md). The finite controls
-are installed and verified; **timers remain unarmed and services stopped**.
+are installed and verified; the canary stop timer is armed and the bounded
+canary has stopped. **Both unattended starts remain unarmed and services stopped**.
 The original proposal wording below is retained as preparation evidence.
 The [bounded window proposal](2026-10-04-phase-5-unattended-windows.md) remains
 approved within its original scope. This amendment requests different starting

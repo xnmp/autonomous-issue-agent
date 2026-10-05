@@ -1,13 +1,16 @@
 # Architecture implementation phases
 
-**Live checkpoint — 2026-10-05 10:28 UTC:** phases 1–4 are accepted and all
+**Live checkpoint — 2026-10-05 after the bounded canary:** phases 1–4 are accepted and all
 37 Phase 4 tasks plus their tracking epic are closed after published-commit and
 independent acceptance verification. Phase 6's declared contracts are accepted.
 Issue #237 is merged; the complete reference-host gate passes below five minutes.
 The approved retained-obligation dispositions, live schema-40/family cutovers
 and bounded launch-profile application are complete. Historical uncertainty and
-all 297 fix/165 steward holds remain preserved. Paid services remain stopped;
-the canary and two actual 48-hour windows are still required. Current evidence,
+all 297 fix/165 steward holds remain preserved. The admission/accounting/
+cancellation canary settled USD 0.632080 and all roles stopped; it did not
+complete implementation. A reproduced measurement-receipt reader mismatch has
+a bounded independently reviewed correction. The two actual 48-hour windows
+are still required and their starts remain unarmed. Current evidence,
 target qualification, authorization and finite controls are recorded in the
 [live execution record](2026-10-05-phase-5-live-execution.md).
 
