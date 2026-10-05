@@ -10,7 +10,9 @@ all 297 fix/165 steward holds remain preserved. The admission/accounting/
 cancellation canary settled USD 0.632080 and all roles stopped; it did not
 complete implementation. A reproduced measurement-receipt reader mismatch has
 a bounded independently reviewed correction. The two actual 48-hour windows
-are still required and their starts remain unarmed. Current evidence,
+are still required. Window 1's start/stop timers are armed for October 5 23:00
+through October 7 23:00 UTC; window 2 remains unarmed pending stopped readout.
+Current evidence,
 target qualification, authorization and finite controls are recorded in the
 [live execution record](2026-10-05-phase-5-live-execution.md).
 

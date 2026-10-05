@@ -141,7 +141,28 @@ contains resolve, issue-recovery and steward exposure, total USD 0.632080 with
 no unassigned triage charge. Missing historical receipts and outcome/profile
 annotations remain coverage gaps. Independent review accepted the correction
 after strengthening exact admission-version and receipt-key validation. The
-full gate remains required before the final window freeze; starts remain unarmed.
+complete gate passed in 307.768 seconds before commit `a789fe3`.
+The accepted correction is observational; admission, accounting, shutdown,
+prompts and target source are unchanged, so no additional paid canary was bought.
+
+Ordinary service supervision has been restored, with restart on failure,
+forced reload exit 87, no one-tick limit and boot autostart still disabled.
+The exact supported launch/profile, source and unit hashes, current issue/PR
+inventory, event offsets and two remaining ready issues (#848/#938) are archived
+in `window-1-prestart/` beneath the private evidence directory. It contains the
+new-admission specification and a separate bounded inherited-canary specification
+with the three actual resolve/issue-recovery/steward binding references.
+Missing historical exposure and outcome/profile annotations remain unknown.
+
+Window 1's stop timer was armed and read back before its start timer. Both are
+active/waiting for the full October 5 23:00 through October 7 23:00 UTC interval.
+Both window-2 timers remain inactive. This is scheduled release, not observed
+48-hour coverage or completed Phase 5 acceptance. Final documentation-only HEAD
+and timer readback are appended to the private freeze before admission.
+At stopped readout, retain the deadline snapshot and advance observation cutoff
+to after actual bounded teardown so late settlements of admitted work are
+included. The exact 48-hour cohort interval and no post-deadline admission rule
+remain fixed.
 
 Freeze the final harness revision, exact unit hashes, resolved launch profile,
 selected/inherited bindings, issue/PR inventory and event offsets before start.
