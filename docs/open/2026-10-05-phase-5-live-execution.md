@@ -183,6 +183,15 @@ valid stopped/no-finding outcomes and malformed-source regressions passed the
 focused gate. Independent review and the full gate precede renewed source freeze
 and rearming. No further paid pilot was purchased for these reader corrections.
 
+The final independent review accepted the execution-evidence correction, and
+the complete gate passed in 304.138 seconds before commit `0cac7cc`.
+The corrected source was frozen with unchanged launch/admission profiles and
+controls in the new `window-1-prestart-execution-evidence/` archive. Its actual
+readout accounts for both known failed charges and preserves unknowns.
+Window 1's start was then rearmed for the same approved 48-hour interval;
+window 2 remains unarmed. A final documentation-only revision and timer/hash
+witness are appended before admission.
+
 Freeze the final harness revision, exact unit hashes, resolved launch profile,
 selected/inherited bindings, issue/PR inventory and event offsets before start.
 No-touch means no operator comments, labels, configuration/code changes or

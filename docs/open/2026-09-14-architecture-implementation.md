@@ -11,8 +11,8 @@ cancellation canary settled USD 0.632080 and all roles stopped; it did not
 complete implementation. A reproduced measurement-receipt reader mismatch has
 a bounded independently reviewed correction. The two actual 48-hour windows
 are still required. Window 1's October 5 23:00 through October 7 23:00 UTC
-schedule is prepared; its start is held while a second observed readout defect
-is corrected. Settled accounting must not imply successful execution. Window 2
+schedule is armed after the second observed readout defect was corrected and
+the complete gate passed. Settled accounting no longer implies successful execution. Window 2
 remains unarmed pending the first stopped readout.
 Current evidence,
 target qualification, authorization and finite controls are recorded in the
