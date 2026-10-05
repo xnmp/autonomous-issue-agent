@@ -68,6 +68,8 @@ def commit_review_execution_import(
                 if rejection_authority is None:
                     raise WorkflowAuthorityError("blocked migration requires existing rejection authority")
                 snapshot = replace(initial_review_workflow(key, rejection_authority), execution=decision)
+                from .continuation_activation import retain_deferred_pr_repair
+                snapshot = retain_deferred_pr_repair(db, snapshot)
                 db.execute("INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
                            (*workflow_scope(key), encode_workflow_episodes(snapshot)))
                 insert_workflow_component(db, key, rejection_authority, snapshot.episode.episode_id)
@@ -88,6 +90,8 @@ def commit_review_execution_import(
                 )
                 insert_workflow_component(db, key, authority, execution.binding.execution_episode)
                 insert_imported_review_execution_origin(db, plan.repository, receipt, claimed_at=now)
+            from .continuation_activation import retain_deferred_pr_repair
+            snapshot = retain_deferred_pr_repair(db, snapshot)
             after = replace(snapshot, revision=replace(snapshot.revision, version=snapshot.revision.version + 1),
                             execution=execution)
             persist_workflow_snapshot(db, after)

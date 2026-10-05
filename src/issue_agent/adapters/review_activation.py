@@ -279,6 +279,8 @@ class SQLiteReviewActivation:
         held = baselines = guided = 0
         for target in plan.imports:
             snapshot = imported_snapshot(plan, target)
+            from .continuation_activation import retain_deferred_pr_repair
+            snapshot = retain_deferred_pr_repair(db, snapshot)
             scope = workflow_scope(WorkflowKey(plan.repository, PullRequestRef(target.pr)))
             db.execute(
                 "INSERT INTO workflows VALUES (?, ?, ?, ?, ?, ?)",

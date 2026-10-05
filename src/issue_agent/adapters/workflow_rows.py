@@ -409,6 +409,53 @@ def encode_workflow_episodes(snapshot: AnyWorkflowSnapshot | IssueWorkflowShell)
     return encode_workflow((snapshot.authority, snapshot.episode))
 
 
+def initialize_new_continuations(db: sqlite3.Connection, snapshot: AnyWorkflowSnapshot | IssueWorkflowShell):
+    """First observation only; accepted historical decisions are never a fresh baseline."""
+    if not db.in_transaction:
+        raise ValueError("continuation discovery requires the creation transaction")
+    key = snapshot.revision.fence.key
+    created = []
+    def identity(family: WorkflowFamily):
+        authority = load_family_authority(db, family, key.repository)
+        if authority is None:
+            return None
+        if db.execute("SELECT 1 FROM workflow_activation_imports WHERE repository=? AND family=? AND target_kind=? AND target_number=?",
+                      (key.repository, family.value, *workflow_scope(key)[1:])).fetchone():
+            raise WorkflowAuthorityError("historical continuation decision cannot initialize fresh state")
+        evidence = db.execute("SELECT plan_digest FROM workflow_activation_evidence WHERE repository=? AND family=? AND epoch=? "
+                              "AND typeof(plan_digest)='text' AND length(CAST(plan_digest AS BLOB))=64",
+                              (key.repository, family.value, authority.epoch)).fetchone()
+        if evidence is None or any(c not in "0123456789abcdef" for c in evidence[0]):
+            raise WorkflowAuthorityError("continuation discovery requires accepted activation evidence")
+        from ..domain.workflow_identity import ContinuationComponentIdentity
+        episode = "fresh:" + hashlib.sha256(encode_workflow((snapshot.revision.fence, authority, evidence[0])).encode()).hexdigest()
+        return ContinuationComponentIdentity(key, authority, episode)
+    if isinstance(snapshot, ReviewWorkflowSnapshot):
+        from .continuation_activation import retain_deferred_pr_repair
+        snapshot = retain_deferred_pr_repair(db, snapshot)
+        if isinstance(snapshot.pr_repair, cc.InactivePRRepair):
+            selected = identity(WorkflowFamily.PR_REPAIR)
+            if selected:
+                snapshot = replace(snapshot, pr_repair=cc.ActivePRRepair(selected, cc.PRRepairState()))
+            if selected:
+                created.append(snapshot.pr_repair)
+    else:
+        if isinstance(snapshot.issue_recovery, cc.InactiveIssueRecovery):
+            selected = identity(WorkflowFamily.ISSUE_RECOVERY)
+            if selected:
+                snapshot = replace(snapshot, issue_recovery=cc.ActiveIssueRecovery(selected, cc.IssueRecoveryState()))
+                created.append(snapshot.issue_recovery)
+        if isinstance(snapshot.steward, cc.InactiveSteward):
+            selected = identity(WorkflowFamily.STEWARD)
+            if selected:
+                snapshot = replace(snapshot, steward=cc.ActiveSteward(selected, cc.StewardState()))
+                created.append(snapshot.steward)
+    for component in created:
+        if isinstance(component, (cc.ActiveIssueRecovery, cc.ActivePRRepair, cc.ActiveSteward)):
+            insert_workflow_component(db, key, component.identity.authority, component.identity.episode_id)
+    return snapshot
+
+
 def workflow_run_scope_bounds(key: WorkflowKey) -> tuple[str, str]:
     """Indexed target scope across retained epochs/episodes, never JSON payload scans."""
     prefix = json.dumps(workflow_scope(key), ensure_ascii=False, separators=(",", ":"))[:-1] + ","

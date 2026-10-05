@@ -241,7 +241,9 @@ class SQLiteWorkflowControl:
                 from ..domain.workflow import IssueWorkflowShell
                 snapshot = load_issue_aggregate(db, key)
                 if isinstance(snapshot, IssueWorkflowShell):
-                    return WorkflowMigrationRequired(key)
+                    return (WorkflowMigrationRequired(key) if snapshot.revision.fence.generation != 0
+                            or isinstance(snapshot.issue_recovery, cc.BlockedIssueRecovery)
+                            or isinstance(snapshot.steward, cc.BlockedSteward) else WorkflowAbsent(key))
                 return snapshot if snapshot is not None else WorkflowAbsent(key)
         except sqlite3.OperationalError as exc:
             return WorkflowUnavailable(key, f"workflow read unavailable: {exc}")
@@ -318,7 +320,7 @@ class SQLiteWorkflowControl:
         self._scope(observation.key)
         with self._control.transaction() as db:
             self._control._assert_owner_active(db, self.writer.owner_id)
-            prior = load_resolve_workflow_row(db, observation.key)
+            prior = load_issue_aggregate(db, observation.key)
             activation = db.execute(
                 "SELECT epoch FROM workflow_authority_epochs WHERE repository=? AND family=?",
                 (self.writer.repository, WorkflowFamily.RESOLVE.value),
@@ -330,20 +332,35 @@ class SQLiteWorkflowControl:
             except ValueError as exc:
                 raise WorkflowAuthorityError("resolve activation epoch is invalid") from exc
             snapshot = initial_resolve_workflow(observation, authority, now=self._control._now())
-            if prior is not None:
+            if isinstance(prior, WorkflowSnapshot):
                 return WorkflowCommitted(prior, idempotent=True)
             scope = workflow_scope(observation.key)
-            db.execute(
-                "INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
-                (*scope, encode_workflow((authority, snapshot.episode))),
-            )
+            from ..domain.workflow import IssueWorkflowShell
+            from .workflow_rows import encode_workflow_episodes, initialize_new_continuations
+            if isinstance(prior, IssueWorkflowShell):
+                if (prior.revision.fence.generation != 0 or isinstance(prior.issue_recovery, cc.BlockedIssueRecovery)
+                        or isinstance(prior.steward, cc.BlockedSteward)):
+                    raise WorkflowAuthorityError("historical issue migration hold prevents primary discovery")
+                snapshot = replace(snapshot, revision=replace(prior.revision, version=prior.revision.version + 1),
+                                   issue_recovery=prior.issue_recovery, steward=prior.steward)
+                db.execute("UPDATE workflows SET version=?,episode_json=? WHERE repository=? AND target_kind=? AND target_number=?",
+                           (snapshot.revision.version, encode_workflow_episodes(snapshot), *scope))
+            else:
+                db.execute("INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
+                           (*scope, encode_workflow_episodes(snapshot)))
+            snapshot = initialize_new_continuations(db, snapshot)
+            if not isinstance(snapshot, WorkflowSnapshot):
+                raise WorkflowAuthorityError("issue discovery lost its resolve snapshot")
+            db.execute("UPDATE workflows SET episode_json=? WHERE repository=? AND target_kind=? AND target_number=?",
+                       (encode_workflow_episodes(snapshot), *scope))
             insert_workflow_component(db, observation.key, authority, snapshot.episode.episode_id)
             db.execute(
                 "INSERT INTO workflow_evidence VALUES (?, ?, ?, ?, NULL, 'observation', ?)",
                 (snapshot.episode.episode_id, *scope, encode_workflow(observation)),
             )
             self._control._transition(db, "workflow", encode_workflow(observation.key), "discovered",
-                                      {"generation": 0, "version": 0, "epoch": authority.epoch})
+                                      {"generation": snapshot.revision.fence.generation,
+                                       "version": snapshot.revision.version, "epoch": authority.epoch})
             return WorkflowCommitted(snapshot)
 
     def lookup_rearm(self, key: WorkflowKey, request_id: str) -> RearmIntent | None:

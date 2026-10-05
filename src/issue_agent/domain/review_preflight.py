@@ -5,6 +5,7 @@ from datetime import datetime
 
 from .agent_task import RUNTIME_CAPABILITIES, RuntimeName
 from .labels import Label
+from .continuation_components import BlockedPRRepair
 from .review import ReviewMode, labels_holding_review
 from .review_execution import (
     MAX_EXECUTION_SUFFIX, BlockedReviewExecutionMigration, CurrentReviewExecution, ReusableReviewSession,
@@ -58,6 +59,8 @@ def require_review_execution_eligibility(
     snapshot: ReviewWorkflowSnapshot, head_sha: str, failure_ceiling: int,
 ) -> None:
     """Current paid-work allowance for an already selected review head."""
+    if isinstance(snapshot.pr_repair, BlockedPRRepair):
+        raise ValueError("historical PR repair migration is blocked")
     if isinstance(snapshot.execution, BlockedReviewExecutionMigration):
         raise ValueError("review execution migration is blocked")
     if not isinstance(snapshot.execution, CurrentReviewExecution):

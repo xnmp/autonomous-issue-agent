@@ -65,7 +65,24 @@ def test_retired_automerge_hint_cannot_suppress_sql_authorized_work(tmp_path, le
 @pytest.mark.parametrize("table", ["workflows", "workflow_evidence"])
 def test_discovery_write_failure_rolls_back_and_does_not_starve_existing_peer(tmp_path, table):
     store = Store(str(tmp_path))
-    control, workflows = workflow_control(tmp_path, numbers=(2,))
+    from issue_agent.adapters.continuation_activation import continuation_inventory_digest, publish_continuation_import
+    from issue_agent.adapters.workflow_rows import encode_workflow
+    from issue_agent.domain.continuation_import import ContinuationImportPlan, ContinuationImportTarget, digest
+    from issue_agent.domain.continuation_components import IssueRecoveryState
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    control = SQLiteControlStore(str(tmp_path / "control.db"))
+    control.initialize()
+    existing = resolve_snapshot(2)
+    install_workflow(control, existing)
+    families = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR)
+    with control.transaction() as db:
+        target = ContinuationImportTarget(existing.revision.fence.key, WorkflowFamily.ISSUE_RECOVERY,
+            existing.revision, digest("verified peer continuation"), IssueRecoveryState(),
+            authority_digest=digest(encode_workflow(existing)))
+        plan = ContinuationImportPlan("o/r", families, 1, digest("fixture source"),
+            continuation_inventory_digest(db, "o/r", families), digest("fixture files"), (target,))
+        publish_continuation_import(db, plan, now=control.now(), control=control)
+    workflows = SQLiteWorkflowControl(control, WorkflowWriter("o/r", "fix", "o/r:fix:fixture"), resolve_ceiling=3)
     missing_key = resolve_snapshot(1).revision.fence.key
     peer = workflows.load_workflow(resolve_snapshot(2).revision.fence.key)
     with control.transaction() as db:

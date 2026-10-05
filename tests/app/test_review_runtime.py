@@ -75,3 +75,26 @@ def test_rearm_and_dispatch_read_the_same_current_allowance(rig, tmp_path):
     assert counts == {9: 3} and errors == {}
     holds = review_external_holds(lambda pr: current_review_failures(control, "o/r", pr.number), 3)
     assert holds(observed(), view()) == ("unproductive review round ceiling",)
+
+
+def test_current_execution_historical_repair_hold_is_visible_and_owes_no_paid_review(rig):
+    from issue_agent.adapters.effects import GitHubEffectExecutor
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.app.review_runtime import ActiveReviewRuntime
+    from issue_agent.domain.review import ReviewConfig
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from tests.adapters.test_review_execution_admission import install_historical_repair_hold
+    from tests.adapters.test_review_execution_control import OWNER
+    store,_,gateway,selection,_=rig
+    install_historical_repair_hold(store,selection)
+    review=SQLiteReviewWorkflowControl(store,WorkflowWriter('o/r','review',OWNER),gateway=gateway,
+                                      ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
+    effects=GitHubEffectExecutor(gateway,store,repository='o/r',identity=OWNER,log=lambda _:None)
+    runtime=ActiveReviewRuntime(review,effects,gateway,review_bot='review-bot[bot]',log=lambda _:None)
+    plan=runtime.plan(SimpleNamespace(prs=[gateway.view]),ReviewConfig('review-bot[bot]'))
+    assert plan.held[9]=='historical_pr_repair_migration_blocked'
+    assert plan.owed=={} and plan.errors=={}
+    with store.transaction() as db:
+        assert db.execute('SELECT count(*) FROM review_execution_rounds').fetchone()[0]==0
+        assert db.execute('SELECT count(*) FROM runs').fetchone()[0]==0

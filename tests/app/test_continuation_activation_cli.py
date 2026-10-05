@@ -946,3 +946,386 @@ def test_self_clear_shadow_and_copy_preserve_one_exhausted_shared_allowance(stop
     assert (selected.component.state.self_clears, selected.component.state.self_clear_ceiling_reported) == (3, True)
     assert dump(control) == original_sql
     assert {path.name: path.read_bytes() for path in state.iterdir()} == original_files
+
+
+def retained_execution(control, *, index=101, kind='RESOLVE', number=7, issue=7, role='fix'):
+    from tests.adapters.test_control_store import _request
+    request = replace(_request(index, maximum=1, cap=100), kind=kind, owner_id=f'o/r:{role}:legacy',
+        dispatch_id=json.dumps(dict(repository='o/r',role=role,kind=kind,number=number,
+                                    issue=issue,breaker_key=issue if issue is not None else -number)))
+    assert control.reserve(request).admitted
+    assert control.complete_run(request.run_id,state='abandoned',outcome='dead_lease')
+    assert control.release(request.run_id,'test stopped unknown-capacity disposition').disposition.value=='available'
+    return request
+
+
+def accepted_import(stopped,capsys,tmp_path,family='fix'):
+    if family=='steward':Path(stopped[2]['STEWARD_STATE_DIR']).mkdir(parents=True,exist_ok=True)
+    code,report,error=command(capsys,family,'shadow')
+    assert code==0,error
+    saved=tmp_path/(family+'-retained-plan.json');saved.write_text(json.dumps(report))
+    code,accepted,error=command(capsys,family,'activate','--plan-file',str(saved),'--confirm-plan-digest',report['plan_digest'])
+    assert code==0 and accepted['status']=='activated',error
+    return report,saved
+
+
+@pytest.mark.parametrize('family,role,kind,component',[('fix','fix','RESOLVE','issue_recovery'),
+                                                     ('steward','steward','TRIAGE','steward')])
+def test_identified_retained_history_holds_only_its_target_and_imported_unspent_sibling_can_run(stopped,capsys,tmp_path,family,role,kind,component):
+    state,control,_=stopped
+    retained_execution(control,kind=kind,role=role)
+    root=state if family=='fix' else Path(stopped[2]['STEWARD_STATE_DIR'])
+    root.mkdir(parents=True,exist_ok=True)
+    (root/('issue-8.resumes' if family=='fix' else 'triage-8.at')).write_text('0' if family=='fix' else '2026-10-01T00:00:00Z')
+    report,_=accepted_import(stopped,capsys,tmp_path,family)
+    targets={t['number']:t for t in report['targets']}
+    assert not targets[7]['eligible'] and targets[8]['eligible']
+    assert any('historical executions' in b for b in targets[7]['blockers'])
+    with control.transaction() as db:
+        old=load_issue_aggregate(db,WorkflowKey('o/r',IssueRef(7)))
+        fresh=load_issue_aggregate(db,WorkflowKey('o/r',IssueRef(8)))
+    assert isinstance(getattr(old,component),cc.BlockedIssueRecovery if family=='fix' else cc.BlockedSteward)
+    if family=='fix':
+        from tests.adapters.test_continuation_admission import paid,purchase
+        # The continuation is allowed without inventing a primary resolve episode.
+        assert isinstance(fresh,IssueWorkflowShell)
+        selected=purchase(fresh,reply='2026-10-02T00:00:00Z',ceiling=5)
+        assert control.reserve_issue_recovery(paid('fresh-retained-sibling',selected),selected).admitted
+
+
+@pytest.mark.parametrize('change',['alter','add','remove'])
+def test_history_changed_after_plan_refuses_atomic_publication(stopped,capsys,change):
+    from issue_agent.adapters.resolve_activation import ResolveActivationRefused
+    state,control,_=stopped
+    request=retained_execution(control)
+    scope=continuation_activation.activation_scope('target',harness_root=cli.HARNESS_ROOT)
+    plan=continuation_activation.evaluate(scope,control)
+    if change=='add':retained_execution(control,index=102,number=8,issue=8)
+    else:
+        with control.transaction() as db:
+            if change=='alter':db.execute("UPDATE runs SET config_version='changed' WHERE run_id=?",(request.run_id,))
+            else:
+                for table in ('reservation_recovery','reservation_limits','budget_reservations','runs'):
+                    db.execute('DELETE FROM '+table+' WHERE run_id=?',(request.run_id,))
+    before=dump(control)
+    with pytest.raises(ResolveActivationRefused,match='inventory'):
+        with control.transaction() as db:
+            publish_continuation_import(db,plan,now=datetime.now(timezone.utc),control=control)
+    assert dump(control)==before
+
+
+def remote_retained_pr(monkeypatch,state):
+    from issue_agent.domain.review_workflow import CompleteReviews,ObservedPullRequest,PullRequestState
+    from issue_agent.domain.world import PRView
+    def read(gateway,key,now,**kwargs):
+        if state=='unreadable':return None,None
+        observed=ObservedPullRequest(key,'a'*40,PullRequestState(state),frozenset(),CompleteReviews(()),now)
+        return observed,PRView(key.target.number,'fix/7-retained','a'*40,closing_issue=7)
+    monkeypatch.setattr(continuation_activation,'read_pull_request',read)
+
+
+@pytest.mark.parametrize('state',['closed','merged'])
+def test_closed_retained_pr_is_deferred_without_primary_then_discovery_preserves_hold(stopped,capsys,tmp_path,monkeypatch,state):
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.labels import Label
+    from tests.fakes.persistent_github import PersistentGitHub
+    from issue_agent.domain.world import PRView
+    from issue_agent.domain.workflow import WorkflowCommitted
+    from issue_agent.adapters.control_store import SQLiteControlStore
+    _,control,_=stopped
+    retained_execution(control,kind='FIX_CI',number=9,issue=7)
+    remote_retained_pr(monkeypatch,state)
+    report,saved=accepted_import(stopped,capsys,tmp_path)
+    assert report['targets']==[dict(family='pr_repair',number=9,eligible=False,blockers=report['targets'][0]['blockers'])]
+    key=WorkflowKey('o/r',PullRequestRef(9))
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM workflows WHERE repository='o/r' AND target_kind='pr' AND target_number=9").fetchone()[0]==0
+        from issue_agent.adapters.continuation_activation import deferred_pr_repair
+        assert isinstance(deferred_pr_repair(db,key),cc.BlockedPRRepair)
+    restarted=SQLiteControlStore(control.path)
+    code,retry,error=command(capsys,'fix','activate','--plan-file',str(saved),'--confirm-plan-digest',report['plan_digest'])
+    assert code==0 and retry['status']=='already_active_with_this_plan',error
+    with restarted.transaction() as db:
+        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',1,'source','inventory',?)",(datetime.now(timezone.utc).isoformat(),))
+    remote=PersistentGitHub(tmp_path/'retained-remote.sqlite')
+    remote.seed_pr(PRView(9,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
+    review=SQLiteReviewWorkflowControl(restarted,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,
+                                      ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
+    discovered=review.ensure_observed_workflow(key)
+    assert isinstance(discovered,WorkflowCommitted)
+    assert isinstance(discovered.snapshot.pr_repair,cc.BlockedPRRepair)
+    assert review.ensure_observed_workflow(key).snapshot.pr_repair==discovered.snapshot.pr_repair
+
+
+@pytest.mark.parametrize('state',['open','unreadable'])
+def test_missing_primary_retained_pr_cannot_defer_without_proven_closed_state(stopped,capsys,monkeypatch,state):
+    _,control,_=stopped
+    retained_execution(control,kind='FIX_CI',number=9,issue=7)
+    remote_retained_pr(monkeypatch,state)
+    before=dump(control)
+    code,report,error=command(capsys,'fix','shadow')
+    assert code==2 and report is None and 'verified closed or merged' in error
+    assert dump(control)==before
+
+
+def test_genuinely_new_issue_after_activation_gets_active_secondary_and_paid_steward(stopped,capsys,tmp_path):
+    from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+    from issue_agent.domain.workflow import ObservedIssue
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.world import IssueView
+    from tests.fakes.workflow_authority import resolve_snapshot
+    from tests.adapters.test_workflow_admission import request
+    state,control,_=stopped
+    retained_execution(control)
+    retained_execution(control,index=102,kind='TRIAGE',role='steward')
+    install_workflow(control,resolve_snapshot(1))
+    accepted_import(stopped,capsys,tmp_path,'fix')
+    accepted_import(stopped,capsys,tmp_path,'steward')
+    key=WorkflowKey('o/r',IssueRef(99))
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM workflows WHERE target_kind='issue' AND target_number=99").fetchone()[0]==0
+    assert not list(state.glob('issue-99.*'))
+    workflow_control=SQLiteWorkflowControl(control,WorkflowWriter('o/r','fix','o/r:fix:test'),resolve_ceiling=3)
+    discovered=workflow_control.ensure_observed_workflow(ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())).snapshot
+    assert isinstance(discovered.issue_recovery,cc.ActiveIssueRecovery)
+    assert isinstance(discovered.steward,cc.ActiveSteward)
+    selected=cc.select_steward(discovered)
+    purchase=cc.StewardPurchase(cc.ContinuationCapture(selected.binding,selected.revision,'leg:new-steward'),
+                               cc.StewardLane.TRIAGE,control.now().isoformat(),2)
+    requested=replace(request('new-steward'),workflow=selected.binding,owner_id='o/r:steward:test',kind='TRIAGE',
+        dispatch_id=json.dumps(dict(repository='o/r',role='steward',kind='TRIAGE',issue=99,number=99,leg_id='leg:new-steward')))
+    assert control.reserve_steward(requested,purchase).admitted
+    with control.transaction() as db:
+        old=load_issue_aggregate(db,WorkflowKey('o/r',IssueRef(7)))
+        assert isinstance(old.issue_recovery,cc.BlockedIssueRecovery) and isinstance(old.steward,cc.BlockedSteward)
+
+
+def test_genuinely_new_pr_after_activation_gets_paid_repair_without_clearing_old_hold(stopped,capsys,tmp_path):
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.labels import Label
+    from issue_agent.domain.world import PRView
+    from tests.fakes.persistent_github import PersistentGitHub
+    from tests.adapters.test_workflow_admission import request
+    _,control,_=stopped
+    retained_execution(control)
+    accepted_import(stopped,capsys,tmp_path)
+    with control.transaction() as db:
+        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',1,'source','inventory',?)",(control.now().isoformat(),))
+    remote=PersistentGitHub(tmp_path/'new-pr-remote.sqlite')
+    remote.seed_pr(PRView(99,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
+    review=SQLiteReviewWorkflowControl(control,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,
+                                      ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
+    discovered=review.ensure_observed_workflow(WorkflowKey('o/r',PullRequestRef(99))).snapshot
+    assert isinstance(discovered.pr_repair,cc.ActivePRRepair)
+    selected=cc.select_pr_repair(discovered)
+    purchase=cc.PRRepairPurchase(cc.ContinuationCapture(selected.binding,selected.revision,'leg:new-repair'),
+                                allowance=cc.RepairAllowance.INFRA,ceiling=2)
+    requested=replace(request('new-repair'),workflow=selected.binding,
+        dispatch_id=json.dumps(dict(repository='o/r',role='fix',kind='FIX_CI',issue=None,number=99,leg_id='leg:new-repair')))
+    assert control.reserve_pr_repair(requested,purchase).admitted
+    with control.transaction() as db:
+        assert isinstance(load_issue_aggregate(db,WorkflowKey('o/r',IssueRef(7))).issue_recovery,cc.BlockedIssueRecovery)
+
+
+def test_changed_publisher_deferred_decision_refuses_primary_discovery(stopped,capsys,tmp_path,monkeypatch):
+    from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+    from issue_agent.adapters.workflow_codec import decode_workflow,encode_workflow
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.review_rejection import CountingRule
+    from issue_agent.domain.labels import Label
+    from issue_agent.domain.world import PRView
+    from tests.fakes.persistent_github import PersistentGitHub
+    _,control,_=stopped
+    retained_execution(control,kind='FIX_CI',number=9,issue=7)
+    remote_retained_pr(monkeypatch,'closed')
+    accepted_import(stopped,capsys,tmp_path)
+    with control.transaction() as db:
+        payload=db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-deferred-pr'").fetchone()[0]
+        receipt=decode_workflow(payload,tuple)
+        changed=replace(receipt[3],blockers=(cc.ContinuationImportBlocker('changed','unverified correction'),))
+        db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace='continuation-deferred-pr'",
+                   (encode_workflow((*receipt[:3],changed,receipt[4])),))
+        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',1,'source','inventory',?)",(control.now().isoformat(),))
+    remote=PersistentGitHub(tmp_path/'mutated-deferred-remote.sqlite')
+    remote.seed_pr(PRView(9,head_ref_oid='a'*40))
+    review=SQLiteReviewWorkflowControl(control,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,
+                                      ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
+    with pytest.raises(WorkflowAuthorityError,match='deferred PR repair import is unreadable'):
+        review.ensure_observed_workflow(WorkflowKey('o/r',PullRequestRef(9)))
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM workflows WHERE target_kind='pr' AND target_number=9").fetchone()[0]==0
+
+
+def test_steward_first_discovery_paid_state_survives_fix_promotion_and_repeat_observation(stopped,capsys,tmp_path,monkeypatch):
+    from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+    from issue_agent.domain.workflow import ObservedIssue,WorkflowAbsent
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.world import IssueView
+    from tests.fakes.workflow_authority import resolve_snapshot
+    from tests.adapters.test_workflow_admission import request
+    from tests.adapters.test_continuation_admission import money,receipt
+    _,control,_=stopped
+    retained_execution(control,kind='TRIAGE',role='steward')
+    accepted_import(stopped,capsys,tmp_path,'steward')
+    key=WorkflowKey('o/r',IssueRef(99));observation=ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())
+    writer=WorkflowWriter('o/r','steward','o/r:steward:test')
+    selected=control.ensure_steward_observed_issue(observation,writer=writer)
+    assert isinstance(selected,cc.SelectedSteward)
+    with control.transaction() as db:assert isinstance(load_issue_aggregate(db,key),IssueWorkflowShell)
+    purchase=cc.StewardPurchase(cc.ContinuationCapture(selected.binding,selected.revision,'leg:standalone-steward'),
+                               cc.StewardLane.TRIAGE,control.now().isoformat(),2)
+    requested=replace(request('standalone-steward'),workflow=selected.binding,owner_id=writer.owner_id,kind='TRIAGE',
+        dispatch_id=json.dumps(dict(repository='o/r',role='steward',kind='TRIAGE',issue=99,number=99,leg_id='leg:standalone-steward')))
+    assert control.reserve_steward(requested,purchase).admitted
+    returned=cc.StewardState(triage=cc.StewardLaneState(stalls=1))
+    assert control.settle_steward(money(requested.run_id),receipt(control,requested.run_id,WorkflowFamily.STEWARD),returned).disposition.value=='available'
+    measured=control.read_steward(key)
+    assert measured.component.state.triage.stalls==1
+    assert control.ensure_steward_observed_issue(observation,writer=writer)==measured
+    install_workflow(control,resolve_snapshot(1))
+    fix=SQLiteWorkflowControl(control,WorkflowWriter('o/r','fix','o/r:fix:test'),resolve_ceiling=3)
+    assert isinstance(fix.load_workflow(key),WorkflowAbsent)
+    discovery=[];original_transition=control._transition
+    def capture_transition(db,entity_kind,entity_id,state,detail=None,**kwargs):
+        if state=='discovered':discovery.append(detail)
+        return original_transition(db,entity_kind,entity_id,state,detail,**kwargs)
+    monkeypatch.setattr(control,'_transition',capture_transition)
+    promoted=fix.ensure_observed_workflow(ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())).snapshot
+    assert promoted.steward==measured.component
+    assert any(detail['generation']==promoted.revision.fence.generation and detail['version']==promoted.revision.version for detail in discovery)
+    assert fix.ensure_observed_workflow(ObservedIssue(key,IssueView(99,updated_at='2026-10-01T00:00:00Z'),control.now())).snapshot==promoted
+    oldkey=WorkflowKey('o/r',IssueRef(7));before=dump(control)
+    with pytest.raises(WorkflowAuthorityError,match='historical issue migration hold'):
+        fix.ensure_observed_workflow(ObservedIssue(oldkey,IssueView(7,updated_at='2026-10-01T00:00:00Z'),control.now()))
+    assert dump(control)==before
+
+
+@pytest.mark.parametrize('bad',['stale','future','foreign_writer','wrong_role','missing_evidence','malformed_evidence'])
+def test_steward_first_discovery_requires_fresh_scope_and_uncorrupted_activation(stopped,capsys,tmp_path,bad):
+    from datetime import timedelta
+    from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
+    from issue_agent.domain.workflow import ObservedIssue
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.world import IssueView
+    _,control,_=stopped
+    accepted_import(stopped,capsys,tmp_path,'steward')
+    writer=WorkflowWriter('o/r','steward','o/r:steward:test')
+    now=control.now()
+    if bad=='stale':now-=timedelta(seconds=301)
+    if bad=='future':now+=timedelta(seconds=1)
+    if bad=='foreign_writer':writer=WorkflowWriter('x/y','steward','x/y:steward:test')
+    if bad=='wrong_role':writer=WorkflowWriter('o/r','fix','o/r:fix:test')
+    if bad in {'missing_evidence','malformed_evidence'}:
+        with control.transaction() as db:
+            if bad=='missing_evidence':db.execute("DELETE FROM workflow_activation_evidence WHERE family='steward'")
+            else:db.execute("UPDATE workflow_activation_evidence SET plan_digest=? WHERE family='steward'",('z'*64,))
+    before=dump(control)
+    with pytest.raises((ValueError,WorkflowAuthorityError)):
+        control.ensure_steward_observed_issue(ObservedIssue(WorkflowKey('o/r',IssueRef(99)),IssueView(99,updated_at='2026-10-01T00:00:00Z'),now),writer=writer)
+    assert dump(control)==before
+
+
+def test_steward_observation_expiring_under_owner_lock_cannot_create_target(stopped,capsys,tmp_path,monkeypatch):
+    from datetime import timedelta
+    from issue_agent.domain.workflow import ObservedIssue
+    from issue_agent.domain.workflow_identity import WorkflowWriter
+    from issue_agent.domain.world import IssueView
+    _,control,_=stopped
+    accepted_import(stopped,capsys,tmp_path,'steward')
+    now=control.now();before=dump(control);original=control._assert_owner_active
+    def delayed(db,owner):
+        original(db,owner)
+        monkeypatch.setattr(control,'_now',lambda:now+timedelta(seconds=301))
+    monkeypatch.setattr(control,'_assert_owner_active',delayed)
+    with pytest.raises(ValueError,match='became stale'):
+        control.ensure_steward_observed_issue(ObservedIssue(WorkflowKey('o/r',IssueRef(99)),IssueView(99,updated_at='2026-10-01T00:00:00Z'),now),writer=WorkflowWriter('o/r','steward','o/r:steward:test'))
+    assert dump(control)==before
+
+
+@pytest.mark.parametrize("previous_inactive",[False,True])
+def test_deferred_fix_hold_survives_real_execution_import_primary_creation_and_saved_retry(stopped,capsys,tmp_path,monkeypatch,previous_inactive):
+    from issue_agent.adapters.review_execution_import_commit import commit_review_execution_import
+    from issue_agent.adapters.continuation_activation import deferred_pr_repair
+    from issue_agent.domain.review_execution_history_import import ReviewImportHistoryBlocked,ReviewImportBlocker,ReviewImportBlockerKind,ReviewImportSource
+    from issue_agent.domain.review_execution_import_plan import ReviewExecutionImportPlan
+    from issue_agent.domain.review_activation import OpenPullRequestsListed
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    _,control,_=stopped
+    retained_execution(control,kind='FIX_CI',number=9,issue=7)
+    remote_retained_pr(monkeypatch,'closed')
+    report,saved=accepted_import(stopped,capsys,tmp_path)
+    key=WorkflowKey('o/r',PullRequestRef(9));now=control.now()
+    with control.transaction() as db:
+        original=deferred_pr_repair(db,key)
+        db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',1,'source','inventory',?)",(now.isoformat(),))
+        history=ReviewImportHistoryBlocked(9,(ReviewImportBlocker(ReviewImportBlockerKind.ORIGIN,(ReviewImportSource('session','review:pr:9','f'*64),)),))
+        plan=ReviewExecutionImportPlan('o/r',OpenPullRequestsListed((9,)),1,'b'*64,'c'*64,'d'*64,(history,),now)
+        commit_review_execution_import(db,plan,now=now)
+        installed=load_review_workflow_row(db,key)
+        assert installed.pr_repair==original
+        if previous_inactive:
+            from issue_agent.adapters.workflow_rows import encode_workflow_episodes
+            db.execute("UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='pr' AND target_number=9",(encode_workflow_episodes(replace(installed,pr_repair=cc.InactivePRRepair())),))
+    if previous_inactive:
+        from tests.fakes.persistent_github import PersistentGitHub
+        from issue_agent.domain.world import PRView
+        from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
+        from issue_agent.domain.workflow_identity import WorkflowWriter
+        from issue_agent.domain.review_rejection import CountingRule
+        from issue_agent.domain.labels import Label
+        remote=PersistentGitHub(tmp_path/'previous-inactive.sqlite')
+        remote.seed_pr(PRView(9,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
+        observer=SQLiteReviewWorkflowControl(control,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
+        recovered=observer.ensure_observed_workflow(key).snapshot
+        assert recovered.pr_repair==original
+        assert recovered.execution==installed.execution and recovered.revision.fence==installed.revision.fence
+        assert recovered.revision.version==installed.revision.version+1
+        assert observer.ensure_observed_workflow(key).snapshot==recovered
+    code,retry,error=command(capsys,'fix','activate','--plan-file',str(saved),'--confirm-plan-digest',report['plan_digest'])
+    assert code==0 and retry['status']=='already_active_with_this_plan',error
+    from issue_agent.domain.review_preflight import require_review_execution_eligibility
+    with pytest.raises(ValueError,match="historical PR repair migration is blocked"):
+        require_review_execution_eligibility(installed,"a"*40,3)
+
+
+def test_actual_rejection_and_eligible_execution_imports_retain_deferred_repair_hold(stopped,capsys,tmp_path,monkeypatch):
+    from issue_agent.adapters.review_activation import SQLiteReviewActivation,read_legacy_review_state
+    from issue_agent.domain.review_activation import plan_review_activation,OpenPullRequestsListed,ReviewActivationPlan
+    from issue_agent.domain.review_workflow import ObservedPullRequest,CompleteReviews,PullRequestState,RecordedPullRequest
+    from issue_agent.domain.labels import Label
+    from issue_agent.adapters.workflow_rows import load_review_workflow_row
+    from issue_agent.adapters.continuation_activation import deferred_pr_repair
+    from issue_agent.domain.review_execution_history_import import ReviewImportNoHistoryObserved
+    from issue_agent.domain.review_execution_import_plan import screen_zero_history_review_import,EligibleZeroHistoryReviewImport,ReviewExecutionImportPlan
+    from issue_agent.domain.review_execution_counter_mapping import LegacyOpenPRCounterLink
+    from issue_agent.adapters.review_execution_import_commit import commit_review_execution_import
+    from issue_agent.domain.review_preflight import require_review_execution_eligibility
+    from issue_agent.domain.review_execution import CurrentReviewExecution
+    _,control,_=stopped
+    retained_execution(control,kind='FIX_CI',number=9,issue=7);remote_retained_pr(monkeypatch,'closed')
+    report,saved=accepted_import(stopped,capsys,tmp_path)
+    activation=SQLiteReviewActivation(control);inventory,recorded=activation.inventory('o/r')
+    root=tmp_path/'empty-review';root.mkdir();(root/'pr-9.operator-guidance').write_text('Preserve the existing migration hold.');key=WorkflowKey('o/r',PullRequestRef(9));now=control.now()
+    observed=ObservedPullRequest(key,'a'*40,PullRequestState.OPEN,frozenset({Label.AI_PR_OPEN}),CompleteReviews(()),now)
+    plan=plan_review_activation('o/r',read_legacy_review_state(str(root)),(observed,),OpenPullRequestsListed((9,)),inventory,ceiling=3,review_bot='bot',trigger_label=Label.AI_PR_OPEN,recorded=recorded)
+    assert isinstance(plan,ReviewActivationPlan)
+    assert tuple(target.pr for target in plan.imports)==(9,)
+    activation.activate(plan,revalidate=lambda:plan)
+    with control.transaction() as db:
+        snapshot=load_review_workflow_row(db,key);blocked=deferred_pr_repair(db,key)
+        assert snapshot.pr_repair==blocked
+        eligible=screen_zero_history_review_import(ReviewImportNoHistoryObserved(9,'b'*64),snapshot,RecordedPullRequest(observed),LegacyOpenPRCounterLink(9,'a'*40,'fix/9',None,None),'bot',now=now)
+        assert isinstance(eligible,EligibleZeroHistoryReviewImport)
+        execution_plan=ReviewExecutionImportPlan('o/r',OpenPullRequestsListed((9,)),1,'b'*64,'c'*64,'d'*64,(eligible,),now)
+        installed=commit_review_execution_import(db,execution_plan,now=now)[0]
+        assert isinstance(installed.execution,CurrentReviewExecution) and installed.pr_repair==blocked
+    with pytest.raises(ValueError,match='historical PR repair migration is blocked'):
+        require_review_execution_eligibility(installed,'a'*40,3)
+    code,retry,error=command(capsys,'fix','activate','--plan-file',str(saved),'--confirm-plan-digest',report['plan_digest'])
+    assert code==0 and retry['status']=='already_active_with_this_plan',error

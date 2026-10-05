@@ -582,6 +582,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/reload.py`,
 `adapters/repository_guidance.py`, `adapters/resolve_activation.py`, `adapters/review_activation.py`, `adapters/review_linkage.py`,
 `adapters/continuation_activation.py` (bounded raw continuation roots and atomic existing aggregate publication),
+`adapters/continuation_run_import.py` (bounded stopped SQL attribution; historical executions supply migration holds only),
 `adapters/review_execution_activation.py` (bounded read-only stopped file and SQL identity/ownership sources; ambiguous history retains source-specific blockers),
 `adapters/review_execution_import_observation.py` (read-only complete configured SQL import source collection with a cumulative source budget; no cursor advancement or activation authority),
 `adapters/review_execution_transition_proof.py` (bounded selected generation-transition receipt source; no lifetime replay),

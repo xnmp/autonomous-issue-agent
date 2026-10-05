@@ -10,7 +10,9 @@ import os
 from ..adapters.continuation_activation import (
     LEGACY_CONTINUATION_NAME, imported_component, publish_continuation_import,
     read_continuation_roots, read_import_plan, verify_original_plan,
+    continuation_inventory_digest,
 )
+from ..adapters.continuation_run_import import collect_continuation_runs
 from ..adapters.control_path import control_store_path
 from ..adapters.control_store import SQLiteControlStore
 from ..adapters.deployment_authority import deployment_effect_barrier
@@ -30,7 +32,7 @@ from ..domain.continuation_import import (
 from ..domain.refs import issue_from_branch
 from ..domain.resolve_activation import LegacyAbsent
 from ..domain.review_activation import OpenPullRequestsListed
-from ..domain.review_workflow import ObservedPullRequest
+from ..domain.review_workflow import ObservedPullRequest, PullRequestState
 from ..domain.workflow_identity import IssueRef, PullRequestRef, WorkflowFamily, WorkflowKey
 from .resolve_control import load_operator_configuration
 from .resolve_activation import _bind_operator_feed
@@ -76,6 +78,18 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
     mapped_issues: dict[int, list[int]] = {}
     linkage_blocks: dict[WorkflowKey, str] = {}
     remote_keys: set[WorkflowKey] = set()
+    with closing(control._connect()) as preliminary:
+        preliminary.execute("BEGIN")
+        inventories = tuple(family_inventory(preliminary, scope.repository, family, None) for family in scope.families)
+        if any(not inventory.quiescent for inventory in inventories):
+            raise ResolveActivationRefused("continuation inventory has pending work: " + "; ".join(reason for inventory in inventories for reason in inventory.blockers()))
+        historical = collect_continuation_runs(preliminary, scope.repository, scope.families)
+        primary_prs = preliminary.execute("SELECT target_number FROM workflows WHERE repository=? AND target_kind='pr' LIMIT ?",
+                                          (scope.repository, MAX_IMPORT_TARGETS + 1)).fetchall()
+        if len(primary_prs) > MAX_IMPORT_TARGETS:
+            raise ResolveActivationRefused("canonical PR sources exceed the stopped import bound")
+        primary_keys = {WorkflowKey(scope.repository, PullRequestRef(row[0])) for row in primary_prs}
+    closed_prs: dict[WorkflowKey, tuple[str, str]] = {}
     if WorkflowFamily.PR_REPAIR in scope.families:
         listing = read_open_pull_requests(scope.gateway, scope.repository)
         if not isinstance(listing, OpenPullRequestsListed):
@@ -103,6 +117,14 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
                     linkage_blocks[key] = "linked issue repair continuity requires its fixed handoff provenance parser"
         if read_open_pull_requests(scope.gateway, scope.repository) != listing:
             raise ResolveActivationRefused("current PR listing changed during continuation inventory")
+        historical_prs = {run.key for run in historical.runs if isinstance(run.key.target, PullRequestRef)}
+        historical_prs |= {record.key for record in records if isinstance(record.key.target, PullRequestRef)}
+        for key in sorted(historical_prs - remote_keys - primary_keys, key=lambda key: key.target.number):
+            observed, view = read_pull_request(scope.gateway, key, datetime.now(timezone.utc), reviews=False)
+            if (not isinstance(observed, ObservedPullRequest) or view is None
+                    or observed.state not in {PullRequestState.CLOSED, PullRequestState.MERGED}):
+                raise ResolveActivationRefused(f"PR #{key.target.number}: canonical rejection workflow prerequisite is missing; deferred import requires verified closed or merged state")
+            closed_prs[key] = (observed.state.value, observed.head_sha)
         for issue, prs in mapped_issues.items():
             if len(prs) > 1:
                 linkage_blocks[WorkflowKey(scope.repository, IssueRef(issue))] = "issue maps to multiple current PRs"
@@ -110,6 +132,9 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
     with closing(control._connect()) as db:
         db.execute("BEGIN")
         try:
+            histories = collect_continuation_runs(db, scope.repository, scope.families)
+            if histories != historical:
+                raise ResolveActivationRefused("historical run sources changed during continuation inventory")
             inventories = tuple(family_inventory(db, scope.repository, family, None) for family in scope.families)
             if any(not i.quiescent for i in inventories):
                 raise ResolveActivationRefused("continuation inventory has pending work: " + "; ".join(reason for i in inventories for reason in i.blockers()))
@@ -122,30 +147,19 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
             if any(row[0] != scope.repository or row[1] not in {"issue", "pr"} for row in identities):
                 raise ResolveActivationRefused("current target authority has noncanonical source ownership")
             canonical_keys = {WorkflowKey(scope.repository, IssueRef(row[2]) if row[1] == "issue" else PullRequestRef(row[2])) for row in identities}
-            keys = remote_keys | canonical_keys | {r.key for r in records}
+            keys = remote_keys | canonical_keys | {r.key for r in records} | {run.key for run in histories.runs}
             keys = {key for key in keys if isinstance(key.target, IssueRef) or WorkflowFamily.PR_REPAIR in scope.families}
             if len(keys) > MAX_IMPORT_TARGETS:
                 raise ResolveActivationRefused("continuation target inventory exceeds its bound")
             kinds = ("TRIAGE", "GROOM") if scope.families == (WorkflowFamily.STEWARD,) else ("ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE", "PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE")
-            unbound = db.execute("SELECT rowid,typeof(owner_id),length(CAST(owner_id AS BLOB)) FROM runs WHERE workflow_episode_key IS NULL LIMIT ?", (MAX_IMPORT_TARGETS + 1,)).fetchall()
-            if len(unbound) > MAX_IMPORT_TARGETS:
-                raise ResolveActivationRefused("unassigned run identity sources exceed the stopped import bound")
-            selected_role = "steward" if scope.families == (WorkflowFamily.STEWARD,) else "fix"
-            for row in unbound:
-                if row[1] != "text" or type(row[2]) is not int or row[2] > 512:
-                    raise ResolveActivationRefused("unassigned run owner is malformed or exceeds its identity bound")
-                owner = db.execute("SELECT owner_id FROM runs WHERE rowid=?", (row[0],)).fetchone()[0]
-                repository = _owner_repository(owner)
-                role = owner.split(":", 2)[1] if ":" in owner else ""
-                if repository is None or repository == scope.repository and (role == selected_role or role not in {"fix", "review", "steward"}):
-                    raise ResolveActivationRefused("unassigned prior fix/steward run evidence requires its fixed recovery parser")
             targets = []
             authority_sources = []
             for key in sorted(keys, key=lambda k: (type(k.target).__name__, k.target.number)):
-                if isinstance(key.target, PullRequestRef) and key not in canonical_keys:
+                deferred = isinstance(key.target, PullRequestRef) and key not in canonical_keys and key in closed_prs
+                if isinstance(key.target, PullRequestRef) and key not in canonical_keys and not deferred:
                     raise ResolveActivationRefused(f"PR #{key.target.number}: canonical rejection workflow prerequisite is missing")
-                current = load_issue_aggregate(db, key) if isinstance(key.target, IssueRef) else load_review_workflow_row(db, key)
-                if isinstance(key.target, PullRequestRef) and current is None:
+                current = None if deferred else load_issue_aggregate(db, key) if isinstance(key.target, IssueRef) else load_review_workflow_row(db, key)
+                if isinstance(key.target, PullRequestRef) and current is None and not deferred:
                     raise ResolveActivationRefused(f"PR #{key.target.number}: canonical rejection workflow prerequisite is missing")
                 authority_sources.append((type(key.target).__name__, key.target.number, None if current is None else encode_workflow(current)))
                 selected_families = (WorkflowFamily.STEWARD,) if scope.families == (WorkflowFamily.STEWARD,) else (WorkflowFamily.ISSUE_RECOVERY,) if isinstance(key.target, IssueRef) else (WorkflowFamily.PR_REPAIR,)
@@ -155,6 +169,13 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
                     selected = found[0] if found else LegacyContinuationRecord(key, family, "steward" if family is WorkflowFamily.STEWARD else "fix", tuple((name, LegacyAbsent()) for name in names))
                     value = classify_record(selected)
                     blockers = list(value) if isinstance(value, tuple) else []
+                    prior_runs = tuple(run.run_id for run in histories.runs if run.key == key and run.family is family)
+                    if prior_runs:
+                        blockers.append(cc.ContinuationImportBlocker("runs:" + digest((histories.source_digest, prior_runs)),
+                            f"{len(prior_runs)} historical executions lack verified continuation chronology"))
+                    if deferred:
+                        blockers.append(cc.ContinuationImportBlocker("closed-pr:" + digest((key.target.number, closed_prs[key])),
+                            "closed historical PR retains a deferred migration hold; no primary authority was created"))
                     if isinstance(value, cc.IssueRecoveryState) and value.review_failures.review_at:
                         prs = mapped_issues.get(key.target.number, [])
                         if len(prs) != 1:
@@ -175,8 +196,11 @@ def _evaluate(scope: ContinuationActivationScope, control: SQLiteControlStore, r
                                    digest(tuple(r.source_digest for r in found) or (selected.source_digest,)),
                                    None if blockers else value, tuple(blockers),
                                    authority_digest=digest(None if current is None else encode_workflow(current))))
-            return ContinuationImportPlan(scope.repository, scope.families, 1, digest((file_digest, mappings, authority_sources)),
-                                          digest(tuple(i.digest for i in inventories)), file_digest, tuple(targets))
+            sources = (file_digest, mappings, authority_sources)
+            if histories.source_digest != digest([]) or closed_prs:
+                sources += (histories.source_digest, tuple(sorted((key.target.number, value) for key, value in closed_prs.items())))
+            return ContinuationImportPlan(scope.repository, scope.families, 1, digest(sources),
+                                          continuation_inventory_digest(db, scope.repository, scope.families), file_digest, tuple(targets))
         finally:
             db.rollback()
 

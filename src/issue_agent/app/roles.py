@@ -3814,9 +3814,23 @@ def build_steward_daemon(
         report_recurrences(world)
         errors: dict[int, str] = {}
         from ..domain import continuation_components as cc
+        observed_at = parse_timestamp(world.now)
+        def observed_steward(issue):
+            selected = control.read_steward(WorkflowKey(cfg.repo, IssueRef(issue.number)))
+            if not isinstance(selected, cc.InactiveSteward):
+                return selected
+            if observed_at is None:
+                errors[issue.number] = "steward discovery requires a timestamped issue observation"
+                return selected
+            try:
+                return control.ensure_steward_observed_issue(
+                    ObservedIssue(WorkflowKey(cfg.repo, IssueRef(issue.number)), issue, observed_at),
+                    writer=WorkflowWriter(cfg.repo, "steward", owner_id))
+            except ValueError as exc:
+                raise WorkflowAuthorityError(str(exc)) from exc
         triage_state = {
             i.number: _control_value(errors, i.number,
-                lambda n: control.read_steward(WorkflowKey(cfg.repo, IssueRef(n))), cc.InactiveSteward())
+                lambda n: observed_steward(i), cc.InactiveSteward())
             for i in world.issues
         }
         for i in world.issues:

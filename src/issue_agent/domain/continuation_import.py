@@ -13,8 +13,8 @@ from .actions import Target
 from .self_clear import BudgetBlock, MachineBlock, MachineBlocker
 from .resolve_activation import LegacyAbsent, LegacyFile, LegacyPresent, LegacyUnreadable
 from .workflow_identity import (
-    WorkflowFamily, WorkflowKey, WorkflowRevision, canonical_workflow_repository,
-    family_owns_target, validate_workflow_integer,
+    IssueRef, PullRequestRef, WorkflowFamily, WorkflowKey, WorkflowRevision, canonical_workflow_repository,
+    family_owns_target, validate_workflow_identifier, validate_workflow_integer,
 )
 
 ISSUE_FIELDS = ("resumed-at", "resumes", "ci-retries", "review-retries", "rebase-retries",
@@ -25,6 +25,88 @@ STEWARD_FIELDS = ("triage-at", "groom-at", "groom-content", "steward-stalls-tria
                   "steward-stalls-groom", "infra-deaths")
 IMPORT_FAMILIES = (WorkflowFamily.ISSUE_RECOVERY, WorkflowFamily.PR_REPAIR, WorkflowFamily.STEWARD)
 MAX_IMPORT_TARGETS = 4096
+
+
+@dataclass(frozen=True)
+class LegacyContinuationRun:
+    """An attributed historical execution; attribution grants no continuation."""
+
+    run_id: str
+    key: WorkflowKey
+    family: WorkflowFamily
+    linked_issue: IssueRef | None = None
+
+    def __post_init__(self) -> None:
+        validate_workflow_identifier(self.run_id, "legacy continuation run")
+        if (not isinstance(self.key, WorkflowKey) or not isinstance(self.family, WorkflowFamily)
+                or self.family not in IMPORT_FAMILIES
+                or not family_owns_target(self.family, self.key.target)
+                or self.linked_issue is not None and (self.family is not WorkflowFamily.PR_REPAIR
+                    or not isinstance(self.key.target, PullRequestRef) or not isinstance(self.linked_issue, IssueRef))):
+            raise ValueError("legacy continuation run requires its exact family target and linkage")
+
+
+def legacy_dispatch_object(value: str) -> dict[str, object]:
+    def unique(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        result: dict[str, object] = {}
+        for key, item in pairs:
+            if key in result:
+                raise ValueError("duplicate dispatch field")
+            result[key] = item
+        return result
+    def finite(value: str) -> object:
+        raise ValueError("nonfinite dispatch value")
+    if not isinstance(value, str) or len(value.encode()) > 65536:
+        raise ValueError("dispatch exceeds its stopped-import bound")
+    try:
+        result = json.loads(value, object_pairs_hook=unique, parse_constant=finite)
+    except (TypeError, RecursionError, UnicodeError) as exc:
+        raise ValueError("invalid dispatch identity") from exc
+    if not isinstance(result, dict):
+        raise ValueError("dispatch must be an object")
+    return result
+
+
+def parse_legacy_continuation_run(*, run_id: str, owner_id: str, kind: str,
+                                  dispatch_id: str, workload_repository: str) -> LegacyContinuationRun:
+    """Attribute a historical leg without interpreting its chronology as credit."""
+    validate_workflow_identifier(owner_id, "legacy run owner")
+    parts = owner_id.split(":", 2)
+    if len(parts) != 3 or not parts[2]:
+        raise ValueError("historical owner lacks role identity")
+    repository, role, _ = parts
+    if canonical_workflow_repository(repository) != repository or workload_repository != repository:
+        raise ValueError("run owner and accounting repository disagree")
+    payload = legacy_dispatch_object(dispatch_id)
+    if (payload.get("repository") != repository or payload.get("role") != role
+            or payload.get("kind") != kind):
+        raise ValueError("dispatch disagrees with run owner or kind")
+    number, issue, counter = payload.get("number"), payload.get("issue"), payload.get("breaker_key")
+    if type(number) is not int:
+        raise ValueError("historical dispatch number must be an integer")
+    validate_workflow_integer(number, "historical dispatch number", minimum=1)
+    issue_kinds = {"ROUTE", "RESOLVE", "RESUME", "AUTHOR", "IMPLEMENT", "ADJUDICATE"}
+    pr_kinds = {"PR_RESUME", "FIX_CI", "ADDRESS_REVIEW", "REBASE"}
+    if role == "steward" and kind in {"TRIAGE", "GROOM"} or role == "fix" and kind in issue_kinds:
+        if type(issue) is not int or issue != number or type(counter) is not int or counter != issue:
+            raise ValueError("issue dispatch has contradictory target provenance")
+        family = WorkflowFamily.STEWARD if role == "steward" else WorkflowFamily.ISSUE_RECOVERY
+        return LegacyContinuationRun(run_id, WorkflowKey(repository, IssueRef(issue)), family)
+    if role != "fix" or kind not in pr_kinds or type(counter) is not int:
+        raise ValueError("unsupported historical continuation leg")
+    linked = None
+    if counter < 0:
+        if counter != -number or issue is not None:
+            raise ValueError("negative PR counter contradicts linked issue provenance")
+    else:
+        if type(issue) is not int:
+            raise ValueError("historical linked issue must be an integer")
+        validate_workflow_integer(issue, "historical linked issue", minimum=1)
+        if counter != issue:
+            raise ValueError("PR counter disagrees with linked issue")
+        linked = IssueRef(issue)
+    return LegacyContinuationRun(run_id, WorkflowKey(repository, PullRequestRef(number)),
+                                 WorkflowFamily.PR_REPAIR, linked)
 
 
 def digest(value: object) -> str:

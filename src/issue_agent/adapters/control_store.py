@@ -5870,7 +5870,8 @@ class SQLiteControlStore:
                 sealed_at is None or sealed_at.version > snapshot.revision.version):
             raise WorkflowAuthorityError("review child planning lacks an applicable completed seal")
         try:
-            require_review_execution_eligibility(snapshot, plan.head_sha, plan.failure_ceiling)
+            from .continuation_activation import retain_deferred_pr_repair
+            require_review_execution_eligibility(retain_deferred_pr_repair(db, snapshot), plan.head_sha, plan.failure_ceiling)
         except ValueError as exc:
             raise WorkflowAuthorityError(str(exc)) from exc
         from .review_execution_control import SQLiteReviewExecutionControl
@@ -6430,6 +6431,34 @@ class SQLiteControlStore:
         with self.transaction() as db:
             aggregate = load_issue_aggregate(db, key)
             return cc.select_steward(aggregate) if aggregate is not None else cc.InactiveSteward()
+
+    def ensure_steward_observed_issue(self, observation, *, writer) -> cc.StewardSelection:
+        from ..domain.workflow import IssueWorkflowShell, ObservedIssue
+        from ..domain.workflow_identity import WorkflowFence, WorkflowRevision, WorkflowWriter
+        from .workflow_rows import encode_workflow_episodes, initialize_new_continuations, load_issue_aggregate, load_family_authority
+        if (not isinstance(observation, ObservedIssue) or not isinstance(writer, WorkflowWriter)
+                or writer.role != "steward" or writer.repository != observation.key.repository
+                or deployment_role(writer.repository, writer.owner_id) != writer.role
+                or not 0 <= (self._now() - observation.observed_at).total_seconds() <= 300):
+            raise ValueError("steward discovery requires its bound writer and fresh issue observation")
+        key = observation.key
+        with self.transaction() as db:
+            self._assert_owner_active(db, writer.owner_id)
+            if not 0 <= (self._now() - observation.observed_at).total_seconds() <= 300:
+                raise ValueError("steward discovery observation became stale before creation")
+            aggregate = load_issue_aggregate(db, key)
+            if aggregate is not None:
+                return cc.select_steward(aggregate)
+            if load_family_authority(db, WorkflowFamily.STEWARD, key.repository) is None:
+                return cc.InactiveSteward()
+            aggregate = IssueWorkflowShell(WorkflowRevision(WorkflowFence(key, 0), 0))
+            db.execute("INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
+                       (*workflow_scope(key), encode_workflow_episodes(aggregate)))
+            aggregate = initialize_new_continuations(db, aggregate)
+            db.execute("UPDATE workflows SET episode_json=? WHERE repository=? AND target_kind=? AND target_number=?",
+                       (encode_workflow_episodes(aggregate), *workflow_scope(key)))
+            self._transition(db, "workflow", encode_workflow(key), "discovered", {"family": "steward"})
+            return cc.select_steward(aggregate)
 
     def _validate_pr_repair_sources(self, db, selected: cc.SelectedPRRepair) -> None:
         state = selected.component.state

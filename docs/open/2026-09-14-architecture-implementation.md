@@ -1,6 +1,6 @@
 # Architecture implementation phases
 
-**Current execution — 2026-10-04 UTC:** phases 1–3 remain accepted. The approved
+**Current execution — 2026-10-05 UTC:** phases 1–3 remain accepted. The approved
 [Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven
 outcome gates accepted locally. A2 closes the production caller/removal matrix,
 independent whole-system review, copied rollback, dashboard outcomes and final
@@ -15,10 +15,28 @@ type checks). The [Phase 5/6 execution brief](2026-10-04-phase-5-6-execution.md)
 records the implementation and remaining limits. Whole Phase 5 acceptance still
 requires actual unattended measurement. Its
 [unattended-window proposal](2026-10-04-phase-5-unattended-windows.md)
-remains pending explicit release of the deployment pause. No live activation,
+was approved by the user on 2026-10-04 at approximately 22:51 UTC. Actual start
+still requires copied activation/rollback, supported-target qualification and
+resolution of retained obligations; exceptional unknown-spend release was not
+included in that approval. No live activation,
 service restart, paid external experiment, push or
 remote issue closure is claimed. The sole approved Jira counter exception is
 explicit in [ADR 0016](../adr/0016-phase-4-current-state-authority.md).
+
+The approved live preflight exposed two startup gaps on retained data: unbound
+fix/steward execution history blocked the whole deployment, and truly new
+targets did not initialize secondary components after activation. The bounded
+[retained-import prerequisite](2026-10-04-phase-5-retained-import-brief.md)
+passed current-source private all-family qualification and independent review
+on 2026-10-05. All 297 fix and 165 steward histories remain held; original
+saved retries remain inert after all-family activation and restart. Historical
+uncertainty remains held. The complete gate passed on 2026-10-05 at 01:35:22 UTC
+in 15 minutes 30 seconds: 10,529 domain/adapter/app cases, 123 hook checks,
+parity, four architecture contracts and both type checks. All 22 frozen source
+and test hashes matched afterward; dashboard API coverage executed. The
+[retained-obligation proposal](2026-10-05-phase-5-retained-obligations.md)
+records the separate unknown-spend and obsolete-publication decision still
+required before live recovery.
 
 The checkpoint narratives below are historical evidence, not active
 implementation instructions. Recurring archive certification/censuses and
@@ -405,11 +423,13 @@ honest verification; phase agents are started as dependencies become ready.
 
 ## Protected window
 
-The Tauri fix/review/steward services and dashboard are stopped at the user's
-request. Do not restart deployments, publish target changes, or mutate live
-workflow authority during implementation. Inventory and preserve live data;
+The Tauri fix/review/steward services and dashboard were stopped at the user's
+request. On 2026-10-04 at approximately 22:51 UTC, the user approved the bounded
+[Phase 5 proposal](2026-10-04-phase-5-unattended-windows.md), releasing this pause
+within that proposal's scope and prerequisites. Other deployments remain
+paused. Inventory and preserve live data;
 exercise migration and rollback against isolated copies first. Actual live
-soak evidence requires explicit release of this pause and is not replaced by
+soak evidence requires satisfied preconditions and is not replaced by
 simulations. Existing spend caps and the trusted-inbound posture remain intact.
 
 Read-only machine-wide inventory on 2026-09-14 found no reserved, starting or
@@ -425,7 +445,7 @@ inventory is not permission to activate the new schema or restart deployment.
 | 2 — `phase_2_composition` | Starts alongside 1; acceptance uses its fixes | Extend real daemon + durable executor + SQLite composition with a persistent GitHub double, restart and bounded fault injection. Cover remote success before receipt, duplicate delivery, partial relabel, stale completion and concurrent re-arm; prove held-state preservation, stable attempt identity, accounting conservation and visible uncertainty. |
 | 3 — `phase_3_gates` | Design may proceed alongside 1–2; implementation requires both accepted | Superseding ADR first where authority moves. Implement one complete generation-fenced gate/re-arm flow, accept it, then the second. Include operator command, continuation changes, dashboard projection, and aged-uncertain-command gates. Completion requires verified remote outcomes. Delete replaced choreography. |
 | 4 — `phase_4_continuations` | 3 accepted | First complete step 0.5 under ADR 0016: replace lifetime archive proof with atomic current-state authority and remove the superseded machinery. Then execute the finite issue roadmap to migrate selected eligibility-bearing counters, consumed replies and continuation episodes one family at a time. Shadow comparison, scoped epochs, old-writer fencing and rollback reconciliation precede cutover. Retire replaced Store suffixes and temporary flags; never operate two authorities. |
-| 5 — `phase_5_measurement` | 4 accepted | Implement incident/intervention records and comparable-cohort readouts, replay recorded interventions without an operator, and prepare/run authorized unattended windows. Include parked/abandoned work and operator diagnosis. Select new automation only from measured evidence; no automatic commitment to a diagnostic leg or general policy platform. Live windows remain pending while the user's deployment pause is in force. |
+| 5 — `phase_5_measurement` | 4 accepted | Implement incident/intervention records and comparable-cohort readouts, replay recorded interventions without an operator, and prepare/run authorized unattended windows. Include parked/abandoned work and operator diagnosis. Select new automation only from measured evidence; no automatic commitment to a diagnostic leg or general policy platform. The bounded windows were approved on October 4; actual unattended acceptance remains pending retained-obligation disposition and the launch preconditions. |
 | 6 — `phase_6_policy` | Findings/measurements from preceding phases | Consolidate demonstrated shell/Python gate-policy duplication behind one source while retaining parity and evidence requirements. Preserve current capability validation; do not refactor runtime registries merely because they are parallel. Address independent revision-bound test execution as a distinct verification contract, without treating model review as execution evidence. |
 
 Each phase requires behavioral tests, independent adversarial review, a green

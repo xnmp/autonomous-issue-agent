@@ -31,6 +31,7 @@ from ..adapters.review_test_execution import ReviewTestExecutor
 from ..domain.review_test_evidence import (ReviewTestConfiguration, ReviewTestSubject, ReviewTestInvocation,
     ReviewTestCompletion, ReviewTestOutcome, PostedReview, posted_review)
 from ..domain.review_rounds import ReviewPlanningRefused
+from ..domain.continuation_components import BlockedPRRepair
 from ..adapters.review_execution_control import SQLiteReviewExecutionControl
 from ..adapters.workflow_rows import WorkflowAuthorityError, load_review_workflow_row
 from ..domain.actions import AgentKind
@@ -411,6 +412,9 @@ class ActiveReviewRuntime:
             if excluded is None:
                 errors[pr.number] = reason
             return ReviewDeferred(reason)
+        if isinstance(state.pr_repair, BlockedPRRepair):
+            held[pr.number] = "historical_pr_repair_migration_blocked"
+            return ReviewDeferred(held[pr.number])
         if not isinstance(state.execution, CurrentReviewExecution):
             reason = ("review_execution_migration_blocked" if isinstance(state.execution, BlockedReviewExecutionMigration)
                       else "review_execution_migration_required")

@@ -13,20 +13,21 @@ from ..domain import continuation_components as cc
 from ..domain.events import ControlTransitionCommitted, Correlation
 from ..domain.continuation_import import (
     ISSUE_FIELDS, PR_FIELDS, STEWARD_FIELDS, MAX_IMPORT_TARGETS,
-    ContinuationImportPlan, LegacyContinuationRecord, digest,
+    ContinuationImportPlan, ContinuationImportTarget, LegacyContinuationRecord, digest,
 )
 from ..domain.resolve_activation import LegacyAbsent, LegacyPresent, LegacyUnreadable, MAX_LEGACY_FILE_BYTES
 from ..domain.workflow import IssueFamilyEpisodes, IssueWorkflowShell
-from ..domain.review_workflow import ReviewFamilyEpisodes
+from ..domain.review_workflow import ReviewFamilyEpisodes, ReviewWorkflowSnapshot
 from ..domain.workflow_identity import (
     ContinuationComponentIdentity, FamilyAuthority, IssueRef, PullRequestRef, WorkflowFamily,
     WorkflowFence, WorkflowKey, WorkflowRevision,
 )
 from .control_store import SQLiteControlStore
+from .continuation_run_import import collect_continuation_runs
 from .resolve_activation import LegacyRoots, ResolveActivationRefused, _read_legacy_file, family_inventory
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, _unique_object, decode_workflow, encode_workflow
 from .workflow_rows import (
-    _require_secondary_component, encode_workflow_episodes, insert_workflow_component, load_issue_aggregate,
+    WorkflowAuthorityError, _require_secondary_component, encode_workflow_episodes, insert_workflow_component, load_issue_aggregate,
     load_review_workflow_row, persist_workflow_snapshot, workflow_scope,
 )
 
@@ -143,11 +144,23 @@ def verify_original_plan(db: sqlite3.Connection, plan: ContinuationImportPlan) -
         if row is None or tuple(row) != (plan.epoch, plan.source_digest, plan.inventory_digest) or evidence is None or evidence[0] != plan.plan_digest:
             raise ResolveActivationRefused("continuation original plan conflicts with accepted authority")
     for target in plan.targets:
-        row = db.execute("SELECT epoch,source_digest,decision_json FROM workflow_activation_imports WHERE repository=? AND family=? AND target_kind=? AND target_number=? AND typeof(epoch)='integer' AND typeof(source_digest)='text' AND length(CAST(source_digest AS BLOB))=64 AND typeof(decision_json)='text' AND length(CAST(decision_json AS BLOB))<=?", (plan.repository, target.family.value, *workflow_scope(target.key)[1:], MAX_WORKFLOW_PAYLOAD_BYTES)).fetchone()
-        if row is None or tuple(row) != (plan.epoch, plan.source_digest, encode_workflow(target)):
-            raise ResolveActivationRefused("continuation original selected decision is missing or conflicting")
+        deferred = target.family is WorkflowFamily.PR_REPAIR and target.revision is None and target.blockers
+        if deferred:
+            if deferred_pr_repair(db, target.key) != imported_component(plan, target):
+                raise ResolveActivationRefused("continuation deferred selected decision lost its receipt")
+        else:
+            row = db.execute("SELECT epoch,source_digest,decision_json FROM workflow_activation_imports WHERE repository=? AND family=? AND target_kind=? AND target_number=? AND typeof(epoch)='integer' AND typeof(source_digest)='text' AND length(CAST(source_digest AS BLOB))=64 AND typeof(decision_json)='text' AND length(CAST(decision_json AS BLOB))<=?", (plan.repository, target.family.value, *workflow_scope(target.key)[1:], MAX_WORKFLOW_PAYLOAD_BYTES)).fetchone()
+            if row is None or tuple(row) != (plan.epoch, plan.source_digest, encode_workflow(target)):
+                raise ResolveActivationRefused("continuation original selected decision is missing or conflicting")
         current = db.execute("SELECT generation,version,episode_json FROM workflows WHERE repository=? AND target_kind=? AND target_number=? AND typeof(episode_json)='text' AND length(CAST(episode_json AS BLOB))<=?", (*workflow_scope(target.key), MAX_WORKFLOW_PAYLOAD_BYTES)).fetchone()
         if current is None:
+            if (target.family is WorkflowFamily.PR_REPAIR and target.revision is None
+                    and target.blockers and not db.execute(
+                        "SELECT 1 FROM workflows WHERE repository=? AND target_kind=? AND target_number=?",
+                        workflow_scope(target.key)).fetchone() and not db.execute(
+                        "SELECT 1 FROM workflow_components WHERE repository=? AND target_kind=? AND target_number=?",
+                        workflow_scope(target.key)).fetchone()):
+                continue
             raise ResolveActivationRefused("accepted selected continuation target disappeared or is unreadable")
         expected = IssueFamilyEpisodes | IssueWorkflowShell if isinstance(target.key.target, IssueRef) else ReviewFamilyEpisodes
         payload = decode_workflow(current[2], expected)
@@ -182,6 +195,61 @@ def imported_component(plan: ContinuationImportPlan, target):
     return cc.ActiveSteward(component_id, target.state)
 
 
+def continuation_inventory_digest(db: sqlite3.Connection, repository: str, families: tuple[WorkflowFamily, ...]) -> str:
+    histories = collect_continuation_runs(db, repository, families)
+    inventory = digest(tuple(family_inventory(db, repository, family, None).digest for family in families))
+    return inventory if histories.source_digest == digest([]) else digest((inventory, histories.source_digest))
+
+
+def deferred_pr_repair(db: sqlite3.Connection, key: WorkflowKey) -> cc.BlockedPRRepair | None:
+    if not isinstance(key.target, PullRequestRef):
+        raise ValueError("deferred PR repair requires a PR target")
+    row = db.execute(
+        "SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-deferred-pr' AND scope=? AND key=? "
+        "AND typeof(payload_json)='text' AND length(CAST(payload_json AS BLOB))<=?",
+        (key.repository, str(key.target.number), MAX_WORKFLOW_PAYLOAD_BYTES),
+    ).fetchone()
+    if row is None:
+        if db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='continuation-deferred-pr' AND scope=? AND key=?",
+                      (key.repository, str(key.target.number))).fetchone():
+            raise ResolveActivationRefused("retained PR repair decision is unreadable")
+        return None
+    receipt = decode_workflow(row[0], tuple)
+    if len(receipt) != 5:
+        raise ResolveActivationRefused("retained PR repair decision has malformed receipt")
+    retained_epoch, source_digest, plan_digest, target, decision_digest = receipt
+    if not isinstance(target, ContinuationImportTarget):
+        raise ResolveActivationRefused("retained PR repair decision lacks a typed target")
+    epoch = db.execute("SELECT epoch,source_digest FROM workflow_authority_epochs WHERE repository=? AND family='pr_repair' "
+                       "AND typeof(epoch)='integer' AND typeof(source_digest)='text' AND length(CAST(source_digest AS BLOB))=64",
+                       (key.repository,)).fetchone()
+    plan_receipt = db.execute("SELECT plan_digest FROM workflow_activation_evidence WHERE repository=? AND family='pr_repair' AND epoch=? "
+                             "AND typeof(plan_digest)='text' AND length(CAST(plan_digest AS BLOB))=64",
+                             (key.repository, retained_epoch)).fetchone()
+    if (type(retained_epoch) is not int or epoch is None or tuple(epoch) != (retained_epoch, source_digest)
+            or not isinstance(source_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", source_digest)
+            or plan_receipt is None or plan_receipt[0] != plan_digest
+            or not isinstance(plan_digest, str) or not re.fullmatch(r"[0-9a-f]{64}", plan_digest)
+            or decision_digest != digest(encode_workflow(target))
+            or target.key != key or target.family is not WorkflowFamily.PR_REPAIR
+            or target.revision is not None or not target.blockers):
+        raise ResolveActivationRefused("retained PR repair decision lacks its exact deferred authority")
+    return cc.BlockedPRRepair(key, FamilyAuthority(WorkflowFamily.PR_REPAIR, retained_epoch),
+                              digest((plan_digest, WorkflowFamily.PR_REPAIR.value, key.target.number)), target.blockers)
+
+
+def retain_deferred_pr_repair(db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot) -> ReviewWorkflowSnapshot:
+    try:
+        retained = deferred_pr_repair(db, snapshot.revision.fence.key)
+    except ValueError as exc:
+        raise WorkflowAuthorityError("deferred PR repair import is unreadable") from exc
+    if retained is None:
+        return snapshot
+    if not isinstance(snapshot.pr_repair, cc.InactivePRRepair) and snapshot.pr_repair != retained:
+        raise WorkflowAuthorityError("canonical PR repair conflicts with its retained migration hold")
+    return replace(snapshot, pr_repair=retained)
+
+
 def publish_continuation_import(db: sqlite3.Connection, plan: ContinuationImportPlan, *, now: datetime, control: SQLiteControlStore) -> None:
     if (not isinstance(db, sqlite3.Connection) or not db.in_transaction
             or not isinstance(plan, ContinuationImportPlan) or not isinstance(now, datetime)
@@ -193,6 +261,9 @@ def publish_continuation_import(db: sqlite3.Connection, plan: ContinuationImport
         current = {}
         for target in plan.targets:
             if isinstance(target.key.target, PullRequestRef) and not db.execute("SELECT 1 FROM workflows WHERE repository=? AND target_kind=? AND target_number=?", workflow_scope(target.key)).fetchone():
+                if target.revision is None and target.blockers:
+                    current[target.key] = None
+                    continue
                 raise ResolveActivationRefused(f"PR #{target.key.target.number}: canonical rejection workflow prerequisite is missing")
             value = load_issue_aggregate(db, target.key) if isinstance(target.key.target, IssueRef) else load_review_workflow_row(db, target.key)
             if isinstance(target.key.target, PullRequestRef) and value is None:
@@ -203,13 +274,18 @@ def publish_continuation_import(db: sqlite3.Connection, plan: ContinuationImport
                 raise ResolveActivationRefused("selected continuation authority content changed before publication")
             current[target.key] = value
         inventories = tuple(family_inventory(db, plan.repository, family, None) for family in plan.families)
-        if any(not i.quiescent for i in inventories) or digest(tuple(i.digest for i in inventories)) != plan.inventory_digest:
+        if any(not i.quiescent for i in inventories) or continuation_inventory_digest(db, plan.repository, plan.families) != plan.inventory_digest:
             raise ResolveActivationRefused("continuation publication requires unchanged quiescent inventory")
         for family in plan.families:
             db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)", (plan.repository, family.value, plan.epoch, plan.source_digest, plan.inventory_digest, now.isoformat()))
             db.execute("INSERT INTO workflow_activation_evidence VALUES (?,?,?,?,?)", (plan.repository, family.value, plan.epoch, 0, plan.plan_digest))
         for target in plan.targets:
             value = current[target.key]
+            if value is None and isinstance(target.key.target, PullRequestRef):
+                receipt = (plan.epoch, plan.source_digest, plan.plan_digest, target, digest(encode_workflow(target)))
+                db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-deferred-pr',?,?,?,?)",
+                           (plan.repository, str(target.key.target.number), now.isoformat(), encode_workflow(receipt)))
+                continue
             if value is None:
                 value = IssueWorkflowShell(WorkflowRevision(WorkflowFence(target.key, 0), 0))
                 db.execute("INSERT INTO workflows VALUES (?,?,?,?,?,?)", (*workflow_scope(target.key), 0, 0, encode_workflow_episodes(value)))
@@ -220,6 +296,8 @@ def publish_continuation_import(db: sqlite3.Connection, plan: ContinuationImport
             current[target.key] = value
             db.execute("INSERT INTO workflow_activation_imports VALUES (?,?,?,?,?,?,?)", (plan.repository, target.family.value, plan.epoch, *workflow_scope(target.key)[1:], plan.source_digest, encode_workflow(target)))
         for value in current.values():
+            if value is None:
+                continue
             after = replace(value, revision=replace(value.revision, version=value.revision.version + 1))
             persist_workflow_snapshot(db, after)
         if control._event_factory is not None:

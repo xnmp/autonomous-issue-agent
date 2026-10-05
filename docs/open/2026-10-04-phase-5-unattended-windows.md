@@ -1,8 +1,11 @@
 # Phase 5 unattended-window proposal
 
-Status: preparation in progress; **not authorized or started**. The architecture
-plan's Protected window still applies. This document is not a deployment
-command or permission to activate live data.
+Status: the user approved this bounded proposal on 2026-10-04 at approximately
+22:51 UTC, releasing the deployment pause within its scope. **No canary or
+unattended window has started.** The preconditions below still apply. This
+approval does not authorize inventing usage or clearing unresolved historical
+accounting. An exceptional disposition of retained obligations requires its
+own concrete operator decision.
 
 The existing [48-hour protocol](soak-protocol-unattended-48h.md) supplies the
 no-touch rule and halt adjudication. Its 2026-08-02 approval and old keifu
@@ -85,7 +88,7 @@ USD 700/day. Budget halts are valid measured outcomes. Low exposure or a
 budget-limited sample must not be presented as evidence of improved quality
 or cost per merge.
 
-## Preconditions before requesting release
+## Preconditions before live admission
 
 - Complete the offline Phase 5/6 implementation, independent review and full
   test gates; record the accepted source revision.
@@ -98,9 +101,9 @@ or cost per merge.
 - Freeze the initial issue/PR inventory, difficulty strata, inherited-work
   selection, workflow binding references, cohort specification and event
   offsets. Include parked, abandoned and unmerged work.
-- Present the exact configuration diff, selected work and copied-data
-  preflight evidence for explicit release. Existing service autostart remains
-  disabled unless that release explicitly includes it.
+- Record the exact approved configuration diff, selected work and copied-data
+  preflight evidence before applying the approved release. Existing service
+  autostart remains disabled unless explicitly included in the release.
 
 ## Observation and halts
 
@@ -168,8 +171,8 @@ claim was found, but quiescence is blocked by these existing obligations:
 USD 22.75 is retained maximum exposure, not measured spend. These obligations
 were preserved; the preflight did not clear them or claim settlement. Resolve
 and subsequent family activation/rollback must be rehearsed again after
-positive reconciliation evidence is available. The configured target checkout
-also has existing edits on `fix/crop-editor-ux`; executor verification uses
+positive reconciliation or a specifically authorized exceptional disposition.
+The configured target checkout has existing edits; executor verification uses
 an isolated checkout pinned to the selected revision.
 
 The 2026-10-04 offline executor qualification used a private checkout of
@@ -236,7 +239,142 @@ reference, but its trusted usage read returns unavailable. All three runs are
 abandoned with `dead_lease`, no provider receipt ID and no settled charge.
 These observations do not authorize zero-cost settlement or release.
 
-Independent review accepts this document as a preparation draft. Release still
-requires positive reconciliation, copied activation/rollback, explicit starting
+Independent review accepted this document as a preparation draft; the user's
+subsequent approval authorizes the bounded proposal. Starting admission still
+requires resolved obligations, copied activation/rollback, explicit starting
 queue and inherited-binding decisions, qualification of the selected target,
-the exact launch/profile freeze, dates, coverage and explicit authorization.
+the exact launch/profile freeze, dates and coverage.
+
+### Approved preflight continuation — 2026-10-04 22:51 UTC onward
+
+The harness remains at `74219a7`; all six installed tauri-explorer/keifu role
+services remain stopped and disabled. The original authority is still schema
+18 and has not been migrated or written. A fresh GitHub inventory found 26
+open issues, one open PR (#987, Dependabot, no review trigger), and remote
+`dev` at `32bd6b6642bcda4b4e2b5b8f4ffb0bda7735d86f`. PR #986 has merged.
+The five ready issues remain #523, #531, #526, #610 and #710; this inventory
+does not itself settle the initial queue or capability qualification.
+
+The same retained ordinary command passed against a clean private checkout
+of `32bd6b6` at 23:03:23–23:05:01 UTC in 98,745 ms. It used the proposed
+resolved configuration `f9e073a4b2d58c23`, retained the 600-second deadline,
+proved equal pre/post committed/index/tracked-tree identity, and left no
+orphans. Cargo used the retained shared build-cache path
+`/home/chong/.cache/issue-agent/xnmp-tauri-explorer/cargo-target`; registry and
+Bun cache overrides were private. Its test-configuration digest is
+`665c85173bfcf4036d2eeb2a85871c7ef0895bdd19b9de9e3f50f87cbfe4906e`.
+This is ordinary-command qualification, not provider or live window acceptance.
+The private native build finished at 23:17:55 UTC in approximately 12.5 minutes,
+with embedded frontend assets and both E2E hook gates. Binary SHA-256:
+`1abc9a02f5ab73c9aca8cebe0c12daea9ea0fcf46f69f44428ac2bb7c42729f8`.
+One native qualification cycle passed at 23:20:15–23:20:22 UTC on an isolated
+Xvfb/openbox display and disposable configuration/data profile. All four
+existing scenarios passed: window/workspace, plugin churn, theme/accessibility
+and zoom, and preview/native input. Display scale was 1; an actual completion
+screenshot was retained and no owned application process remained. This is
+bounded native capability qualification, not a four-hour target soak or either
+48-hour harness window.
+
+Read-only recovery investigation confirms unavailable usage for all three
+retained runs. Resolve's exact Codex session ended with a quota refusal;
+`token_count.info` is absent, so the refusal is not measured zero usage.
+The host boot at 2026-10-03 03:46:08 UTC is later than all three runs and
+proves their original local processes are terminal. The USD 22.75 maximum
+exposure remains reserved. Generic explicit unknown-capacity release preserves
+unknown spend, but prevents later normal settlement through the existing API;
+that accounting disposition was not part of the bounded-window approval.
+
+The old publication's retained stdout records a successful branch push. Its
+expected commit is an ancestor of the final head of merged PR #623; the
+captured checkout and remote branch are now absent. Replaying it could recreate
+an obsolete branch. A copied-data rehearsal is preparing an explicit obsolete
+command retirement with the complete original receipt archived, without claiming
+a new success or inventing an exhausted retry ceiling. Neither exceptional
+disposition has been applied to live state.
+
+The corrected copied-data recovery rehearsal succeeded with unchanged original
+authority/configuration/source bytes: three unknown reservations released and
+the exact obsolete publication retired through existing public APIs; no charge,
+historical success or extra retry was invented. It preserved run outcomes,
+maximum exposure, command payload/owner/attempt count, unrelated SQL rows and
+five durable new events. Resolve activation then imported the three actual
+legacy records (#680, #696, #710), preserving their exhausted holds. The first
+fix and steward attempts refused 297 and 165 historical unbound runs
+respectively, preventing fresh-target activation. The
+[retained-import brief](2026-10-04-phase-5-retained-import-brief.md) scopes the
+bounded prerequisite, which now passes current-source private all-family
+qualification. All six family epochs reopen, all historical fix/steward targets
+remain held, and original saved-plan retries are inert after all-family
+activation. Historical SQL/accounting and publication rows match the recovered
+source; genuine PR #581 observation retains its exact repair hold across
+restart. Independent review accepted the candidate. The third preflight began
+before the final guard centralization and did not capture initial loaded-source
+hashes; final postactivation qualification used current source and archived its
+hashes. The final complete gate passed at 2026-10-05 01:35:22 UTC in 15 minutes
+30 seconds, with 10,529 domain/adapter/app cases, 123 hook checks, parity, four
+architecture contracts and both type checks. Dashboard API coverage executed;
+all 22 frozen source/test hashes matched afterward. The two fixture corrections
+preserve the original rollback assertions and optional-dashboard contract.
+
+Compatible current code reopened the complete stopped authority successfully.
+Predecessor `74219a7` is incompatible after deferred repair activation; rollback
+means remaining stopped or using compatible accepted code, without downgrading
+SQL or restoring legacy authority. All recovery dispositions above occurred on
+private copies. Their live equivalents still require the explicit
+[retained-obligation decision](2026-10-05-phase-5-retained-obligations.md).
+
+### Initial queue and finite window controls
+
+The 2026-10-05 00:24 UTC read-only inventory contains 27 open issues and open
+PRs #987 and #990, both without review triggers. Remote `dev` advanced to
+`bde6081d304890e7a3080bd17466543f41862328` through PR #988. Its ordinary
+command passed in 20,176 ms at 00:25:18–00:25:38 UTC with equal pre/post tree
+proof, configuration `f9e073a4b2d58c23` and test digest
+`f52aa96f4516027d431e9158c72ea297de071afe2ca0c4082034126e4c6217ae`.
+Final private-registry and host-process readback found no surviving test
+processes. The helper's `remaining_orphans` field lists a stale registration
+reaped by `recover_orphans`, whose return value denotes recovered IDs;
+the separate final readback confirms an empty registry and launch-intent set.
+The intervening target diff changes only the Arch installer and its evidence;
+native application and qualification sources match the earlier qualified tree.
+The native binary was qualified at `32bd6b6`, not rebuilt at `bde6081`.
+
+Select #755 for the canary and #848, #985, #938 and #786 as the subsequent
+resolve pool. These existing requests have no recorded linked execution or
+canonical issue workflow in the qualified private authority. Before labeling,
+repeat the exact target/history check against live authority and inventory.
+Retain the five old ready issues' sourced holds; do not renew or clear them.
+No target labels have changed during preparation.
+
+| Issue | Bounded requested outcome | Provisional difficulty and evidence |
+| --- | --- | --- |
+| [#755](https://github.com/xnmp/tauri-explorer/issues/755) | About palette command displays the actual application version | Small UI change; actual palette/version outcome and screenshot |
+| [#848](https://github.com/xnmp/tauri-explorer/issues/848) | Back/Forward hints reflect effective bindings, including rebinding | Small UI change; navigation outcome, rebinding and screenshot |
+| [#985](https://github.com/xnmp/tauri-explorer/issues/985) | Ctrl+E opens the existing editor for the selected image | Small UI change; native keyboard/editor outcome without a paid image request |
+| [#938](https://github.com/xnmp/tauri-explorer/issues/938) | Config watching survives retargeting into a nested watched root | Medium backend fix; actual Linux notification outcome |
+| [#786](https://github.com/xnmp/tauri-explorer/issues/786) | Git-watch cancellation tests establish their scheduling precondition deterministically | Small test correction; preserve real cancellation behavior and prove the regression assertion |
+
+These are operator selection estimates, not admitted difficulty facts or a
+comparable baseline. Record actual admission classifications in each readout.
+Include any unfinished canary binding explicitly as inherited work at the first
+window start. Select subsequent work before the no-touch interval, and report
+an empty or budget-limited queue honestly. The three-merge target is unchanged.
+
+Use the installed, currently disabled role units for finite observation;
+keep keifu stopped and service autostart disabled. The generic installer enables
+autostart, so running it unchanged would exceed this release scope. The canary
+uses the existing `ISSUE_AGENT_MAX_TICKS=1` control and bounded draining. Freeze
+the ordinary launch snapshot before the first window, with no canary tick limit.
+Schedule starts and simultaneous role stops with the existing systemd service
+manager, at exact UTC boundaries. Verify the end timer is armed before paid
+start. The executable freeze must name each installed unit and timer, its UTC
+dates, `AccuracySec`, `RandomizedDelaySec` and persistence, and demonstrate
+completed admission stops by the budget boundary; a requested stop alone is
+insufficient. Default timer coalescing is not that proof. Missing supervision,
+a missed boundary or a host reboot invalidates the window and requires
+adjudication. An early stop reports its shorter actual coverage, not a completed
+48-hour run. Stop closes admission before bounded teardown;
+do not admit in an extra UTC period while reading results. No new controller or
+worker is required. Read-only twenty-minute supervision may observe caps,
+service health and holds, but may not steer paid work during the no-touch
+interval. A necessary intervention ends and classifies that window.

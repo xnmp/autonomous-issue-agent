@@ -806,6 +806,14 @@ class SQLiteReviewWorkflowControl:
                 raise WorkflowAuthorityError("review workflow migration is required")
             prior = load_review_workflow_row(db, key)
             if prior is not None:
+                from .continuation_activation import retain_deferred_pr_repair
+                after = retain_deferred_pr_repair(db, prior)
+                if after != prior:
+                    after = replace(after, revision=replace(prior.revision, version=prior.revision.version + 1))
+                    persist_workflow_snapshot(db, after)
+                    self._control._transition(db, "workflow", encode_workflow(key), "migration_hold_installed",
+                                              {"family": "pr_repair", "version": after.revision.version})
+                    return WorkflowCommitted(after)
                 return WorkflowCommitted(prior, idempotent=True)
             execution_authority = load_family_authority(db, WorkflowFamily.REVIEW_EXECUTION, key.repository)
             snapshot = initial_review_workflow(key, authority)
@@ -862,6 +870,10 @@ class SQLiteReviewWorkflowControl:
                 ))
             db.execute("INSERT INTO workflows VALUES (?, ?, ?, 0, 0, ?)",
                        (*workflow_scope(key), encode_workflow_episodes(snapshot)))
+            from .workflow_rows import initialize_new_continuations
+            snapshot = initialize_new_continuations(db, snapshot)
+            db.execute("UPDATE workflows SET episode_json=? WHERE repository=? AND target_kind=? AND target_number=?",
+                       (encode_workflow_episodes(snapshot), *workflow_scope(key)))
             insert_workflow_component(db, key, authority, snapshot.episode.episode_id)
             observed_id = self._insert_evidence(db, key, recorded)
             if execution_authority is not None and not isinstance(snapshot.execution, BlockedReviewExecutionMigration):

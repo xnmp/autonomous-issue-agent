@@ -493,3 +493,55 @@ print(encode_workflow(control.register_stage(plan.round.round_id, current(store,
     assert not store.reserve(request(plan.children[0])).admitted
     assert receipt(store) is None and dump(store) == before
     assert_unpaid(store)
+
+
+def install_historical_repair_hold(store,selection):
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.continuation_import import ContinuationImportPlan,ContinuationImportTarget,digest
+    from issue_agent.domain.workflow_identity import WorkflowFamily
+    from issue_agent.adapters.continuation_activation import continuation_inventory_digest,imported_component
+    snapshot=current(store,selection)
+    families=(WorkflowFamily.ISSUE_RECOVERY,WorkflowFamily.PR_REPAIR)
+    key=snapshot.revision.fence.key
+    source=digest('retained unverified chronology')
+    target=ContinuationImportTarget(key,WorkflowFamily.PR_REPAIR,snapshot.revision,source,None,
+        (cc.ContinuationImportBlocker('history','unknown continuation chronology'),),
+        authority_digest=digest(encode_workflow(snapshot)))
+    with store.transaction() as db:
+        plan=ContinuationImportPlan('o/r',families,1,source,
+            continuation_inventory_digest(db,'o/r',families),source,(target,))
+        # A trusted migration fixture retains the selected paid stage so the
+        # last admission/launch guard is tested independently of cutover quiescence.
+        for family in families:
+            db.execute("INSERT INTO workflow_authority_epochs VALUES (?,?,?,?,?,?)",
+                       ('o/r',family.value,1,source,plan.inventory_digest,store.now().isoformat()))
+            db.execute("INSERT INTO workflow_activation_evidence VALUES (?,?,?,?,?)",
+                       ('o/r',family.value,1,0,plan.plan_digest))
+        db.execute("INSERT INTO workflow_activation_imports VALUES (?,?,?,?,?,?,?)",
+                   ('o/r','pr_repair',1,'pr',9,source,encode_workflow(target)))
+        changed=replace(snapshot,pr_repair=imported_component(plan,target))
+        db.execute("UPDATE workflows SET episode_json=? WHERE repository='o/r' AND target_kind='pr' AND target_number=9",
+                   (encode_workflow_episodes(changed),))
+    return current(store,selection)
+
+
+@pytest.mark.parametrize('boundary',['reservation','launch'])
+def test_current_execution_cannot_pay_or_launch_after_historical_repair_hold(planned,boundary):
+    from issue_agent.adapters.control_store import ControlStoreError
+    from tests.adapters.test_review_execution_launch import register
+    from issue_agent.domain.review_execution import CurrentReviewExecution
+    store,selection,_,child=planned
+    proposed=request(child)
+    if boundary=='launch':assert store.reserve(proposed).admitted
+    held=install_historical_repair_hold(store,selection)
+    assert isinstance(held.execution,CurrentReviewExecution)
+    if boundary=='reservation':
+        result=store.reserve(proposed)
+        assert not result.admitted and 'historical PR repair' in result.detail
+    else:
+        with pytest.raises((ControlStoreError,WorkflowAuthorityError),match='historical PR repair'):
+            register(store,proposed)
+    with store.transaction() as db:
+        assert db.execute('SELECT count(*) FROM charges').fetchone()[0]==0
+        assert db.execute('SELECT count(*) FROM leases').fetchone()[0]==0
+        assert db.execute("SELECT count(*) FROM runs WHERE state='running'").fetchone()[0]==0

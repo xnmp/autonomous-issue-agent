@@ -43,6 +43,7 @@ def test_cli_invalid_input_returns_failure_without_partial_record(tmp_path, caps
 
 
 def test_dashboard_measurement_access_returns_the_same_local_export(tmp_path):
+    pytest.importorskip("fastapi")
     from asgi_client import ASGITestClient
     from issue_agent.app.dashweb.server import create_app
     from issue_agent.app.measurement import local_export

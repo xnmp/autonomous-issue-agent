@@ -116,3 +116,13 @@ def test_preflight_distinguishes_blocked_migration_from_missing_activation():
             (ReviewImportSource("round", "retained-round", "a" * 64),)),)), "b" * 64, "c" * 64)
     with pytest.raises(ValueError, match="migration is blocked"):
         plan_review_preflight(replace(snapshot, execution=blocked), selection, now=NOW)
+
+
+def test_historical_pr_repair_hold_refuses_review_despite_current_execution():
+    from issue_agent.domain.continuation_components import BlockedPRRepair, ContinuationImportBlocker
+
+    snapshot, selection = active()
+    blocked = BlockedPRRepair(KEY, FamilyAuthority(WorkflowFamily.PR_REPAIR, 1), "historical-import",
+                              (ContinuationImportBlocker("run:old", "unverified repair chronology"),))
+    with pytest.raises(ValueError, match="historical PR repair migration is blocked"):
+        plan_review_preflight(replace(snapshot, pr_repair=blocked), selection, now=NOW)

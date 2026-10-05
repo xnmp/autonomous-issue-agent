@@ -352,6 +352,8 @@ def rehearse(scope: ReviewActivationScope, *, copy_to: str) -> JsonReport:
         with control.transaction() as db:
             for target in decision.imports:
                 expected = imported_snapshot(decision, target)
+                from ..adapters.continuation_activation import retain_deferred_pr_repair
+                expected = retain_deferred_pr_repair(db, expected)
                 if load_workflow_row(db, expected.revision.fence.key) != expected:
                     failures.append(f"pull request #{target.pr}: imported workflow differs from its decision")
         checks["imports_read_back"] = not failures
