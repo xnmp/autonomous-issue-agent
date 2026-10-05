@@ -24,6 +24,9 @@ jobs:
       TEST_SUITE_JOBS: "1"
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Rollback contracts archive an immutable historical SQL build.
+          fetch-depth: 0
 
       # `make test` shells out to git in temporary repos; the bash suites assert
       # on commit behaviour, so an unset identity fails them.
