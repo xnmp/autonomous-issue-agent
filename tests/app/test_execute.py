@@ -29,7 +29,7 @@ from issue_agent.domain.actions import (
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.eligibility import LifecycleOperation
-from issue_agent.domain.events import ActionApplied
+from issue_agent.domain.events import ActionApplied, ActionFailed, ActionRetried
 from issue_agent.domain.lifecycle import completion_guard
 from issue_agent.domain.world import IssueView, PRView
 from tests.fakes.in_memory_github import InMemoryGitHub as FakeGateway
@@ -170,6 +170,63 @@ class _TypedJournal:
 
     def emit(self, event):
         self.events.append(event)
+
+
+@pytest.mark.parametrize("recover", [False, True])
+def test_retry_retains_default_delays_attempts_and_reconciliation_order(recover):
+    from issue_agent.adapters.github import GhUnavailable
+
+    calls = []
+
+    class Effects:
+        def handles(self, action):
+            return isinstance(action, Relabel)
+
+        def execute(self, action):
+            calls.append("write")
+            raise GhUnavailable("network", "lost reply")
+
+        def reconcile(self, action):
+            calls.append("reconcile")
+            return recover
+
+    journal = _TypedJournal()
+    executor = Executor(FakeGateway(), effect_executor=Effects(), journal=journal)
+    action = Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING)
+    if recover:
+        executor.execute(action)
+    else:
+        with pytest.raises(GhUnavailable):
+            executor.execute(action)
+
+    delays = [1.0] if recover else [1.0, 3.0, 9.0]
+    assert executor.requested_retry_delays == delays
+    expected_calls = ["write", "reconcile"] if recover else [
+        "write", "reconcile", "write", "reconcile", "write", "reconcile", "write",
+    ]
+    assert calls == expected_calls
+    retries = [event.payload for event in journal.events if isinstance(event.payload, ActionRetried)]
+    assert [event.delay_ms for event in retries] == [int(delay * 1000) for delay in delays]
+    assert [event.attempt for event in retries] == list(range(1, len(delays) + 1))
+    terminal = journal.events[-1].payload
+    assert isinstance(terminal, ActionApplied if recover else ActionFailed)
+    if isinstance(terminal, ActionApplied):
+        assert terminal.attributes["attempts"] == 2
+    else:
+        assert terminal.attempts == 4
+        assert terminal.disposition == "retryable_failure"
+
+
+def test_isolated_executor_preserves_an_explicit_retry_sleeper():
+    from issue_agent.adapters.github import GhUnavailable
+
+    gateway = FakeGateway(fail_on={"relabel"})
+    slept = []
+    executor = Executor(gateway, sleep=slept.append)
+    with pytest.raises(GhUnavailable):
+        executor.execute(Relabel(Target.ISSUE, 5, Label.AI_READY, Label.AI_WORKING))
+    assert slept == [1.0, 3.0, 9.0]
+    assert executor.requested_retry_delays == []
 
 
 class _SuccessfulRelabelEffects:

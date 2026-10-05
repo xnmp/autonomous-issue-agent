@@ -28,7 +28,8 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
+import os
 from pathlib import Path
 import shlex
 import sqlite3
@@ -37,11 +38,13 @@ import sys
 
 from issue_agent.adapters.control_path import canonical_control_store_path
 from issue_agent.adapters.control_store import SQLiteControlStore
+from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.review_workflow_control import SQLiteReviewWorkflowControl
 from issue_agent.adapters.store import Store
 from issue_agent.app import roles
 from issue_agent.app.config import HarnessConfig, from_env
 from issue_agent.domain.labels import Label
+from issue_agent.domain.contracts import RunId
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.recovery import RecoveryTrigger
 from issue_agent.domain.review import ReviewMode
@@ -168,18 +171,30 @@ def verdicts(*decisions: str) -> list[AgentResult]:
 
 def register_review_launch(task) -> None:
     """Exercise the guarded launch boundary with an isolated local child."""
-    subprocess.run([sys.executable, "-c", """
-import os, sys
-from issue_agent.adapters.control_store import SQLiteControlStore
-from issue_agent.adapters.process_supervisor import ProcessSupervisor
-from issue_agent.domain.contracts import RunId
-identity = ProcessSupervisor.process_identity(os.getpid())
-assert identity is not None
-SQLiteControlStore(sys.argv[1]).register_process_lease(
-    RunId(sys.argv[2]), expected_owner_id=sys.argv[3], pid=identity.pid,
-    pgid=os.getpgrp(), process_start_ticks=identity.start_ticks)
-""", task.env["ISSUE_AGENT_CONTROL_DB"], task.env["ISSUE_AGENT_RUN_ID"],
-                    task.env["ISSUE_AGENT_OWNER_ID"]], start_new_session=True, check=True)
+    # Registration belongs to the supervisor; the real child only needs to
+    # remain live until its identity and isolated process group are bound.
+    with subprocess.Popen(
+        [sys.executable, "-S", "-c", "import sys; sys.stdin.buffer.read(1)"],
+        stdin=subprocess.PIPE, start_new_session=True,
+    ) as child:
+        try:
+            identity = ProcessSupervisor.process_identity(child.pid)
+            assert identity is not None
+            SQLiteControlStore(
+                task.env["ISSUE_AGENT_CONTROL_DB"], now=lambda: datetime.now(timezone.utc),
+            ).register_process_lease(
+                RunId(task.env["ISSUE_AGENT_RUN_ID"]),
+                expected_owner_id=task.env["ISSUE_AGENT_OWNER_ID"],
+                pid=identity.pid, pgid=os.getpgid(child.pid), process_start_ticks=identity.start_ticks,
+            )
+        finally:
+            try:
+                child.communicate(input=b"\n", timeout=5)
+            except subprocess.TimeoutExpired:
+                child.kill()
+                child.communicate()
+                raise
+        assert child.returncode == 0
 
 
 @dataclass

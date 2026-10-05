@@ -35,6 +35,8 @@ job someone still has to do; the same file in `history/` is a record.
 - [architecture.md](reference/architecture.md) — the current design, and the
   five properties a refactor must preserve
 - [codex-runner.md](reference/codex-runner.md) — the Codex runtime
+- [test-gate-performance.md](reference/test-gate-performance.md) — complete
+  test gate, measured qualification, fast feedback and serial diagnosis
 - [failure-modes.md](reference/failure-modes.md) — 110 recorded failure modes.
   Load-bearing: tests and comments cite these by number (`FAILURE-MODES #66`)
 

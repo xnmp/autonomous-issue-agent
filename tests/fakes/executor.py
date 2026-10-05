@@ -12,6 +12,9 @@ class ImmediateExecutor(Executor):
     """Exercise action behavior without provisioning a SQLite command store."""
 
     def __init__(self, gateway: Any, *args: Any, **kwargs: Any) -> None:
+        self.requested_retry_delays: list[float] = []
+        # Isolated action tests retain retry policy without waiting for a network.
+        kwargs.setdefault("sleep", self.requested_retry_delays.append)
         kwargs.setdefault(
             "effect_executor", ImmediateGitHubEffectExecutor(gateway)
         )

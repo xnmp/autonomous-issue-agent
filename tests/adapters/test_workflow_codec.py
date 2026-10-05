@@ -20,6 +20,43 @@ from issue_agent.domain.workflow_identity import (
 )
 
 
+@pytest.mark.parametrize("raw,field", [
+    (r'{"format":1,"\u0066ormat":1,"value":null}', "format"),
+    ('{"format":1,"value":[{"type":"datetime","value":"x","value":"y"}]}', "value"),
+    ('{"format":1,"value":null,"format":2,"value":false}', "format"),
+])
+def test_decoder_rejects_duplicate_fields_including_escaped_and_nested_keys(raw, field):
+    with pytest.raises(WorkflowEncodingError, match=f"duplicate workflow JSON field: {field}"):
+        decode_workflow(raw, object)
+
+
+def test_repeated_input_still_runs_domain_constructor_validation(monkeypatch):
+    from issue_agent.domain import workflow_identity
+
+    value = WorkflowRevision(WorkflowFence(WorkflowKey("o/r", IssueRef(7)), 3), 11)
+    raw = encode_workflow(value)
+    assert decode_workflow(raw, WorkflowRevision) == value
+
+    def refuse(_value, _name, **_kwargs):
+        raise ValueError("current constructor refuses this value")
+
+    monkeypatch.setattr(workflow_identity, "validate_workflow_integer", refuse)
+    with pytest.raises(WorkflowEncodingError, match="current constructor refuses"):
+        decode_workflow(raw, WorkflowRevision)
+
+
+@pytest.mark.parametrize("value", ["short", "x" * 20000, "é" * 10000],
+                         ids=["small", "large-ascii", "large-utf8"])
+def test_repeated_decode_preserves_changed_input_and_expected_root_validation(value):
+    raw = json.dumps({"format": 1, "value": value}, ensure_ascii=False)
+    assert decode_workflow(raw, str) == value
+    with pytest.raises(WorkflowEncodingError, match="wrong root variant"):
+        decode_workflow(raw, tuple)
+    changed = json.dumps({"format": 1, "value": value + "changed"}, ensure_ascii=False)
+    assert decode_workflow(changed, str) == value + "changed"
+    assert decode_workflow(raw, str) == value
+
+
 def snapshot():
     return WorkflowSnapshot(
         WorkflowRevision(WorkflowFence(WorkflowKey("o/r", IssueRef(7)), 3), 11),

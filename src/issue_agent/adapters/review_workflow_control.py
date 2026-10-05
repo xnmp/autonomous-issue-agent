@@ -80,7 +80,7 @@ from ..domain.workflow_identity import (
 )
 from ..domain.workflow_retry import RetryAuthorizationFacts, authorize_absent_retry, retry_authorization_refusal
 from .control_store import (
-    ControlStoreError, SQLiteControlStore, _command_from_row, load_bound_review_submission,
+    ControlStoreError, SQLiteControlStore, _command_from_row, _REVIEW_GENERATION_CANDIDATE, load_bound_review_submission,
     load_retry_authorization_facts, owe_escalation_signal,
 )
 from .deployment_authority import deployment_effect_barrier, deployment_role
@@ -964,15 +964,17 @@ class SQLiteReviewWorkflowControl:
         self, db: sqlite3.Connection, expected: WorkflowRevision, authorities: tuple[FamilyAuthority, ...],
         transition: WorkflowChanged,
         *, observation: RecordedPullRequest | None = None,
+        stored_prior: ReviewWorkflowSnapshot | None = None,
     ) -> WorkflowCommitted | WorkflowConflict:
         with self._control.mutation_savepoint(db):
             if observation is not None:
                 self._insert_evidence(db, expected.fence.key, observation)
-            return self._commit_in_tx(db, expected, authorities, transition)
+            return self._commit_in_tx(db, expected, authorities, transition, stored_prior=stored_prior)
 
     def _commit_in_tx(
         self, db: sqlite3.Connection, expected: WorkflowRevision, authorities: tuple[FamilyAuthority, ...],
         transition: WorkflowChanged,
+        *, stored_prior: ReviewWorkflowSnapshot | None = None,
     ) -> WorkflowCommitted | WorkflowConflict:
         if not isinstance(expected, WorkflowRevision) or not isinstance(transition, WorkflowChanged):
             raise ValueError("commit requires a typed revision and proposed transition")
@@ -983,7 +985,9 @@ class SQLiteReviewWorkflowControl:
             raise WorkflowAuthorityError("review commit requires a review-rejection snapshot")
         if not isinstance(authorities, tuple) or authorities != (transition.snapshot.authority,):
             raise WorkflowAuthorityError("review commit requires exactly its captured family authority")
-        prior = self._load(db, key)
+        # Acceptance paths already read and validated this row under the same
+        # BEGIN IMMEDIATE. Public proposal commits must load their own authority.
+        prior = self._load(db, key) if stored_prior is None else stored_prior
         if authorities != (prior.authority,):
             raise WorkflowAuthorityError("workflow family activation epoch changed")
         encoded = transition_receipt(transition)
@@ -1475,7 +1479,8 @@ class SQLiteReviewWorkflowControl:
         recorded = False
         for candidate in db.execute(
             "SELECT command_id,state,prewrite_read_json,workflow_reconciliation_json "
-            "FROM lifecycle_commands WHERE repository=? AND target=? AND workflow_binding_json IS NOT NULL",
+            "FROM lifecycle_commands WHERE repository=? AND target=? AND workflow_binding_json IS NOT NULL "
+            f"AND {_REVIEW_GENERATION_CANDIDATE}",
             (key.repository, f"pr:{key.target.number}"),
         ).fetchall():
             if (candidate["prewrite_read_json"] is None
@@ -1898,7 +1903,8 @@ class SQLiteReviewWorkflowControl:
             return proposal
         if isinstance(proposal, WorkflowUnchanged):
             return WorkflowCommitted(prior, idempotent=True)
-        return self._commit(db, prior.revision, (prior.authority,), proposal, observation=recorded)
+        return self._commit(db, prior.revision, (prior.authority,), proposal,
+                            observation=recorded, stored_prior=prior)
 
     # -- operator acceptance -------------------------------------------------------------------
 
@@ -2091,7 +2097,7 @@ class SQLiteReviewWorkflowControl:
                     return WorkflowConflict(prior.revision, proposal.reason)
                 if isinstance(proposal, WorkflowUnchanged):
                     return WorkflowCommitted(prior, idempotent=True)
-                return self._commit(db, prior.revision, (prior.authority,), proposal)
+                return self._commit(db, prior.revision, (prior.authority,), proposal, stored_prior=prior)
 
     def authorize_retry(
         self, command: AuthorizeAbsentRetry, actor: OperatorActor,

@@ -43,7 +43,7 @@ from ..domain.contracts import (
     TokenUsage,
     WorkflowAttemptIdentity,
 )
-from ..domain.workflow_identity import FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
+from ..domain.workflow_identity import FamilyAuthority, IssueRef, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision, validate_workflow_identifier, validate_workflow_integer
 from ..domain.workflow import (
     ActiveReconciliation, CommandAbsenceEvidence, CommandReconciliation, CommandRetryApplicability,
     ClosedRetryAuthorization, ConsumedRetryAuthorization, RearmObligation, ReconciliationPolicy, RetryAlreadyConsumed,
@@ -57,7 +57,7 @@ from ..domain.agent_task import RuntimeName
 from ..domain.review_execution import BlockedReviewExecutionMigration, CurrentReviewExecution, LaunchedReviewChild, ReviewCancellationReason, ReviewChildAdmission, ReviewChildAdmissionRefusal, ReviewChildIdentity, ReviewChildLaunchRegistration, ReviewPreparationFailure, ReviewPreparationKind, ReviewUnlaunchedRelease
 from ..domain.review_preflight import ReviewPreflightSelection, require_review_execution_eligibility
 from ..domain.review_return import ReviewReturnedEnvelope, ReturnedReviewChild, ReviewRuntimePreflightStop
-from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, classify_normal_review_return
+from ..domain.review_rounds import ReviewChildCancelled, ReviewChildEvidence, ReviewChildPending, ReviewChildRefused, ReviewChildReleased, ReviewChildReturned, ReviewChildSettledWithoutLaunch, ReviewParentAbandoned, ReviewPlanningComplete, ReviewPlanningOpen, ReviewPlanningSealed, ReviewRoundPlan, classify_normal_review_return
 from ..domain.review_workflow import AnyWorkflowSnapshot, BoundReviewSubmission, PendingReviewRearm, ReviewEpisode, ReviewWorkflowSnapshot
 from ..domain.review_workflow_policy import (
     ESCALATION_PROJECTION_PREFIX, HOLD_RESTORE_PREFIX, CeilingEscalation, ReviewSubmissionReceipt,
@@ -107,7 +107,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 39
+SCHEMA_VERSION = 40
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -1495,6 +1495,28 @@ _REPAIR_CURRENT_OWED = """json_valid(episode_json) AND (
 )"""
 
 
+# Only a canonical, constructor-valid ASCII retirement is safe to omit before
+# decoding. Malformed, noncanonical and Unicode receipts retain the full reader.
+_SETTLED_RETIREMENT_FIELDS = ("outcome_evidence_id", "retirement_evidence_id")
+_SETTLED_RETIREMENT_TEXT = " AND ".join(
+    f"json_type(workflow_reconciliation_json,'$.value.fields.{name}')='text' "
+    f"AND length(json_extract(workflow_reconciliation_json,'$.value.fields.{name}')) BETWEEN 1 AND 512 "
+    f"AND trim(json_extract(workflow_reconciliation_json,'$.value.fields.{name}'))<>'' "
+    f"AND instr(json_extract(workflow_reconciliation_json,'$.value.fields.{name}'),char(0))=0 "
+    f"AND json_extract(workflow_reconciliation_json,'$.value.fields.{name}') NOT GLOB '*[^ -~]*'"
+    for name in _SETTLED_RETIREMENT_FIELDS
+)
+_REVIEW_GENERATION_CANDIDATE = f"""(
+    prewrite_read_json IS NOT NULL OR state IN ('succeeded','permanent_failure') OR
+    CASE WHEN typeof(workflow_reconciliation_json)='text' AND json_valid(workflow_reconciliation_json)
+    THEN NOT (coalesce(({_SETTLED_RETIREMENT_TEXT}),0) AND workflow_reconciliation_json=
+        json_object('format',1,'value',json_object('fields',json_object(
+            'outcome_evidence_id',json_extract(workflow_reconciliation_json,'$.value.fields.outcome_evidence_id'),
+            'retirement_evidence_id',json_extract(workflow_reconciliation_json,'$.value.fields.retirement_evidence_id')
+        ),'type','RetiredSettledCommand')))
+    ELSE 1 END
+)"""
+
 _SCHEMA_MIGRATIONS = (
     # Version 9 is the immutable adoption baseline shipped by the architectural
     # hardening cutover. Its exact source digest already exists in deployed
@@ -2344,6 +2366,14 @@ ON dedupe_keys(scope,json_extract(payload_json,'{_REPAIR_BINDING}'),json_extract
 WHERE {_REPAIR_ADMISSION};
 CREATE INDEX reservations_active_workload ON budget_reservations(workload_repository,run_id)
 WHERE state='active';
+"""),
+    SchemaMigration(40, f"""
+CREATE INDEX event_outbox_pending ON event_outbox(outbox_id)
+WHERE emitted_at IS NULL AND failed_at IS NULL;
+CREATE INDEX event_outbox_pending_destination ON event_outbox(destination,outbox_id)
+WHERE emitted_at IS NULL AND failed_at IS NULL;
+CREATE INDEX lifecycle_review_generation_candidates ON lifecycle_commands(repository,target)
+WHERE workflow_binding_json IS NOT NULL AND {_REVIEW_GENERATION_CANDIDATE};
 """),
 )
 
@@ -7899,11 +7929,27 @@ class SQLiteControlStore:
         ).fetchone()
         if revision_row is None:
             raise ControlStoreError("review child evidence lost its workflow aggregate")
+        revision = WorkflowRevision(
+            WorkflowFence(plan.round.binding.rejection.fence.key, revision_row["generation"]),
+            revision_row["version"],
+        )
+        return SQLiteControlStore._read_planned_review_child_evidence(
+            db, repository, owner_id, selection, plan, revision,
+        )
 
-        def revision_recorded(revision: WorkflowRevision) -> bool:
-            return (revision.fence.generation < revision_row["generation"]
-                    or (revision.fence.generation == revision_row["generation"]
-                        and revision.version <= revision_row["version"]))
+    @staticmethod
+    def _read_planned_review_child_evidence(
+        db: sqlite3.Connection, repository: str, owner_id: str,
+        selection: ReviewPreflightSelection, plan: ReviewRoundPlan, revision: WorkflowRevision,
+    ) -> tuple[ReviewChildEvidence, ...]:
+        # Callers must have loaded the canonical preflight and current revision
+        # in this SQL snapshot; the public reader above always does so itself.
+        round_id = plan.round.round_id
+
+        def revision_recorded(recorded: WorkflowRevision) -> bool:
+            return (recorded.fence.generation < revision.fence.generation
+                    or (recorded.fence.generation == revision.fence.generation
+                        and recorded.version <= revision.version))
 
         runs = db.execute(
             "SELECT r.*,b.workload_repository,b.state AS budget_state,b.currency AS budget_currency,b.release_reason,"
@@ -11135,7 +11181,10 @@ class SQLiteControlStore:
         db.row_factory = sqlite3.Row
         db.execute(f"PRAGMA busy_timeout={self.busy_timeout_ms}")
         db.execute("PRAGMA foreign_keys=ON")
-        db.execute("PRAGMA journal_mode=WAL")
+        # Reassigning WAL reopens its transition path on every short-lived
+        # connection. Check the persisted mode first; retain the same repair.
+        if db.execute("PRAGMA journal_mode").fetchone()[0] != "wal":
+            db.execute("PRAGMA journal_mode=WAL")
         db.execute("PRAGMA synchronous=FULL")
         return db
 

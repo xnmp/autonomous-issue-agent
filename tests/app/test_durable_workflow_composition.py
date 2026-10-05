@@ -210,22 +210,26 @@ def _copied_authoritative_rows(path: Path) -> dict[str, tuple[str, ...]]:
 
 
 def _stopped_copy_index_rollback(path: Path) -> None:
-    """Explicit fixture-only schema39→38 rollback; every authority row survives."""
+    """Explicit fixture-only schema40→38 rollback; every authority row survives."""
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
-    migration = next(item for item in _SCHEMA_MIGRATIONS if item.version == 39)
-    names = ("workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload")
+    index_migrations = {
+        40: ("event_outbox_pending", "event_outbox_pending_destination", "lifecycle_review_generation_candidates"),
+        39: ("workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"),
+    }
     before = _copied_authoritative_rows(path)
     with sqlite3.connect(path) as db:
         db.execute("BEGIN IMMEDIATE")
-        assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (39, migration.digest)
         definitions = dict(db.execute("SELECT name,sql FROM sqlite_master WHERE type='index'"))
-        statements = tuple(_sql_statements(migration.source))
-        assert len(statements) == len(names)
-        for name, statement in zip(names, statements, strict=True):
-            assert definitions[name] == statement.strip().removesuffix(";")
-        for name in names:
-            db.execute(f'DROP INDEX "{name}"')
-        assert db.execute("DELETE FROM schema_migrations WHERE version=39 AND source_digest=?", (migration.digest,)).rowcount == 1
+        for version, names in index_migrations.items():
+            migration = next(item for item in _SCHEMA_MIGRATIONS if item.version == version)
+            assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (version, migration.digest)
+            statements = tuple(_sql_statements(migration.source))
+            assert len(statements) == len(names)
+            for name, statement in zip(names, statements, strict=True):
+                assert definitions[name] == statement.strip().removesuffix(";")
+            for name in names:
+                db.execute(f'DROP INDEX "{name}"')
+            assert db.execute("DELETE FROM schema_migrations WHERE version=? AND source_digest=?", (version, migration.digest)).rowcount == 1
         assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 38
     assert _copied_authoritative_rows(path) == before
 
@@ -234,7 +238,7 @@ def _forward_copy_indexes(path: Path, expected_rows: dict[str, tuple[str, ...]])
     SQLiteControlStore(str(path)).initialize()
     assert _copied_authoritative_rows(path) == expected_rows
     with sqlite3.connect(path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 39
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 40
         assert {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE name IN "
             "('workflow_repair_owed','continuation_pr_admission_identity','reservations_active_workload')")} == {
                 "workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"}
@@ -364,7 +368,7 @@ print(json.dumps({str(number): encode_workflow((value.binding, value.revision, v
     later_rows = _copied_authoritative_rows(copied_control)
     newer_sql = dump(blocked.control)
     refused = read_old_build()
-    assert refused.returncode != 0 and "39" in refused.stderr and "38" in refused.stderr
+    assert refused.returncode != 0 and "40" in refused.stderr and "38" in refused.stderr
     assert dump(blocked.control) == newer_sql
     _stopped_copy_index_rollback(copied_control)
     later_sql = dump(blocked.control)
@@ -479,7 +483,7 @@ print(json.dumps(encode_workflow((selected.binding, selected.revision, selected.
     later_rows = _copied_authoritative_rows(copied_control)
     newer_sql = dump(current)
     refused = read_old_build()
-    assert refused.returncode != 0 and "39" in refused.stderr and "38" in refused.stderr
+    assert refused.returncode != 0 and "40" in refused.stderr and "38" in refused.stderr
     assert dump(current) == newer_sql
     _stopped_copy_index_rollback(copied_control)
     later_sql = dump(current)
