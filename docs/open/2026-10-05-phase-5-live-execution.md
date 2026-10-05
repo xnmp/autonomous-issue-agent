@@ -225,3 +225,61 @@ work, shared/unassigned spend, holds and coverage gaps. Retain the three-merge
 target and explicitly report unmet targets. Missing comparable baseline,
 first-review or recurrence evidence remains unknown. Select further automation
 only from observed causes and a smaller tested alternative.
+
+### Reboot interruption and replacement release
+
+The October 5 14:30 UTC release actually started all three roles; notify-ready
+was observed at approximately 14:30:01. A host reboot interrupted it at
+22:01:23.595537 UTC. The steward journal records shutdown while triage was
+active and exit `1/FAILURE`; the new boot has no running protected role or
+active window timer. This is approximately 7 hours 31 minutes of partial
+coverage, not either required 48-hour window. Filesystem observation ended at
+21:50; manager/network observations have explicit gaps.
+
+Stopped evidence is archived in
+`interruption-20261005T220123Z/` beneath the private evidence directory: coherent
+before/after SQL, role journals/events, the exact provider rollout and linkage,
+recovery witnesses, cohort specifications, corrected outcome annotations and
+readouts. The unfinished triage run `031e16abbe684dc6a9d3a744a0b13a0a` remains
+abandoned with `dead_lease`. Existing boot recovery settled its trusted usage
+at USD 0.497793 with `reconciled` basis; settlement does not claim execution
+success. Its dead dispatch occurrence was released with the exact owner,
+occurrence and process identity through the existing API. A stale review-test
+launch intent was archived and removed through ordinary identity-aware boot
+process recovery. All active-run, reservation, lease, claim and pending-command
+counts are zero, and all role process registries are empty. No paid tick ran
+during recovery; historical holds and uncertainty were not reset.
+
+Charges for runs started during the partial interval total USD 13.787344;
+including the preceding canary, known October 5 charges total USD 14.419424.
+The new-binding readout and separately selected inherited-binding readout have
+different spend scopes; neither substitutes for that calendar-interval charge
+sum. PR #997, linked to resolve issue #848, remains open at
+`9fbfd98dd93d13dd37d0d873ad7fb77d3bb64c38`. Its first independent review at
+15:12:57 requested changes after operator tests failed. The verified primary
+cohort therefore has zero merges and zero approvals from one first-reviewed
+PR, including this unmerged PR. Human effort and recurrence coverage remain
+unknown. Budget refusals and intermittent GitHub/network unavailability remain
+findings; no policy dial was silently changed to improve the measurement.
+
+Independent review accepted replacement intervals October 5 23:00 through
+October 7 23:00 UTC, then conditional October 7 23:45 through October 9 23:45.
+These retain the same five USD 25 periods and USD 125 aggregate, including the
+partial run and canary; there is no fresh allowance. Both window-2 timers and
+the obsolete canary stop remain inactive. The correct future window-1 stop is
+armed before start. Its start requires final qualification and freeze; a missed
+start must be postponed with explicit period arithmetic, never caught up.
+Twenty inherited references are selected from actual canary/partial admission
+facts; unresolved, parked and rejected work remains visible.
+
+External PR #996 advanced target `dev` to
+`0a29f5411123e1e015e9ac3f55b94ec4fcb8418b`, changing the native and frontend
+plugin system. Fresh isolated qualification is required. Its native build and
+all four existing native outcome scenarios passed on the rebooted host with a
+fresh application profile. Deleted private cache paths were restored from
+retained caches; the earlier failed build log is preserved. The retained
+ordinary command hit its unchanged 600-second deadline with equal before/after
+tracked-tree proof and no orphan processes. A bounded investigation is pending;
+this failure does not qualify the new target. No paid start is armed while
+qualification remains incomplete. Harness runtime/tests are unchanged from
+the independently accepted `0cac7cc` source and green 304.138-second full gate.

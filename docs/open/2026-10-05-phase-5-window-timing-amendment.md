@@ -2,13 +2,16 @@
 
 Current status: bounded-window and standing accounting approvals cover this
 five-period allocation. The [execution record](2026-10-05-phase-5-live-execution.md)
-records completed recovery, activation, qualification, canary, full tests and
-hosted CI. Independent review accepted advancing the four existing calendars
-from the original 23:00/23:45 schedule to the times below. This preserves the
-USD 125 combined new-admission bound, configured profile, all USD 25 caps and
-two complete 48-hour intervals. The obsolete canary timer is stopped. Window 1's
-future stop is armed; its start requires the final evidence freeze. Both window-2
-timers remain inactive until the first stopped readout is adjudicated.
+records recovery, activation, qualification, canary, full tests and hosted CI.
+The earlier October 5 14:30 release ended with a host reboot at 22:01:23 UTC and
+is classified as partial coverage. Independent review accepted replacing it
+with the original 23:00/23:45 calendars below, subject to fresh target
+qualification and freeze. This preserves the USD 125 combined new-admission
+bound, configured profile and all USD 25 caps, including the partial run and
+canary in the same budget periods. No allowance is renewed. The reboot left
+all roles and timers inactive. Arm the future window-1 stop before start;
+both window-2 timers remain inactive until the first full stopped readout is
+adjudicated. The obsolete canary timer remains inactive.
 
 ## Reason and concrete schedule
 
@@ -26,9 +29,10 @@ Use the existing services and fixed-date systemd start/stop timers:
 | Stage | Accepted UTC interval or cutoff |
 | --- | --- |
 | One-tick canary | Completed October 5, 10:59–11:04; obsolete 22:55 timer stopped |
-| Window 1 | October 5 14:30 through October 7 14:30; exactly 48 hours |
+| Interrupted attempt | October 5 14:30 through 22:01:23; partial coverage only |
+| Replacement window 1 | October 5 23:00 through October 7 23:00; exactly 48 hours |
 | Stopped readout | October 7 after all roles and children stop; finish before the next release |
-| Window 2 | Conditional October 7 15:15 through October 9 15:15; exactly 48 hours |
+| Window 2 | Conditional October 7 23:45 through October 9 23:45; exactly 48 hours |
 
 Request simultaneous stops of all three roles **at each window endpoint**,
 then retain the existing bounded cancellation, draining and receipts. The
@@ -36,7 +40,7 @@ then retain the existing bounded cancellation, draining and receipts. The
 the nominal schedule alone proves neither coverage nor stopping.
 
 Window 1 spans the October 5, 6 and 7 budget periods. Window 2 spans October
-7, 8 and 9. The canary shares October 5 and both windows share October 7.
+7, 8 and 9. The canary and interrupted attempt share October 5; both full windows share October 7.
 These are five distinct USD 25 global periods: **USD 125 maximum aggregate
 new configured-card admissions**, under the existing shared-authority and
 no-extra-period conditions. Each window's standalone maximum becomes USD 75,
@@ -58,7 +62,7 @@ Historical unknown exposure remains outside this new-admission bound.
   its absolute stop timer. Restore the ordinary units before window 1.
 - Leave window 2 unarmed until the first stopped readout, halt adjudication and
   unchanged-profile check finish. Forty-five minutes is available, not assumed
-  sufficient. If readiness misses October 7 15:15, postpone and recalculate the five-period
+  sufficient. If readiness misses October 7 23:45, postpone and recalculate the five-period
   bound before release; never compress or skip readout.
 - Preserve the no-touch rule. Partial starts, clock/host disruption, missed
   stops or post-deadline paid admissions invalidate the coverage claim. Record
@@ -70,8 +74,9 @@ Historical unknown exposure remains outside this new-admission bound.
   unmet targets, missing comparable baseline and unknown recurrence coverage.
 
 The exact offline unit drafts and hash manifest are at
-`.worktrees/phase5-preflight/earlier-release-controls/`. Host `systemd-analyze --user verify`
-accepted all ten service/timer files. Independent review accepted the period
+`.worktrees/phase5-preflight/replacement-release-controls/`; the earlier controls
+remain archived separately. Host verification and actual manager readback must
+precede replacement admission. Independent review accepted the period
 arithmetic and nominal intervals with the conditions above. The earlier
 23:58-cutoff draft is classified as a shorter observation and must not be
 installed as completed Phase 5 acceptance. This amendment adds no production

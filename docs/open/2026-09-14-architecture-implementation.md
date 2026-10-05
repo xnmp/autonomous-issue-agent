@@ -10,10 +10,13 @@ all 297 fix/165 steward holds remain preserved. The admission/accounting/
 cancellation canary settled USD 0.632080 and all roles stopped; it did not
 complete implementation. A reproduced measurement-receipt reader mismatch has
 a bounded independently reviewed correction. The two actual 48-hour windows
-are still required. Window 1's independently reviewed earlier interval is October 5
-14:30 through October 7 14:30 UTC, after the second observed readout defect was
-corrected, the complete gate passed and hosted CI succeeded. Its future stop is
-armed; start requires the final revision and evidence freeze.
+are still required. The October 5 14:30 start ran until a host reboot at
+22:01:23 UTC; this is about 7½ hours of partial coverage, not a completed window.
+Its USD 13.787344 spend is settled, including trusted recovery of the interrupted
+triage run. Replacement window 1 is October 5 23:00 through October 7 23:00 UTC,
+conditional on fresh qualification of the externally advanced target and the
+final revision/evidence freeze. The partial run and canary share the original
+USD 25 daily caps and five-period USD 125 aggregate bound; no budget is reset.
 Settled accounting no longer implies successful execution. Window 2
 remains unarmed pending the first stopped readout.
 Current evidence,
