@@ -378,3 +378,14 @@ do not admit in an extra UTC period while reading results. No new controller or
 worker is required. Read-only twenty-minute supervision may observe caps,
 service health and holds, but may not steer paid work during the no-touch
 interval. A necessary intervention ends and classifies that window.
+
+### Prepared timing amendment — not yet approved
+
+The installed 90-second shutdown bound exposes a timing limit in the midnight
+proposal: an early stop shortens coverage, while an end-time stop can drain
+into another UTC period. The independently reviewed
+[timing amendment](2026-10-05-phase-5-window-timing-amendment.md) prepares two
+complete 48-hour intervals with same-day teardown margins and five shared
+global budget periods. It preserves USD 125 aggregate but changes starting
+times and standalone window ceilings. It has not been approved, installed or
+armed; neither draft timers nor qualification supply actual window acceptance.
