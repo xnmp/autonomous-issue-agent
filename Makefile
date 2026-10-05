@@ -2,6 +2,9 @@
 # No slash: GNU make resolves via PATH (NixOS has no /bin/bash).
 SHELL := bash
 HARNESS_ROOT := $(shell pwd)
+TEST_WORKERS ?= 4
+TEST_SUITE_JOBS ?= 3
+PYTEST_TIMING ?= --durations=10
 
 .PHONY: help test test-suites test-config-generated test-governor test-residuals test-hooks test-compose-env test-deployment-env test-point-at test-domain test-adapters test-app test-parity arch typecheck doctor dashboard-ui dashboard \
 	        install point-at run-fix run-review run-steward demo-gate \
@@ -31,9 +34,12 @@ help:
 # suites under a hostile env, substantially increasing wall clock — and `make test` is the
 # self-hosted TEST_CMD paid on every gate run. CI runs it as its own step.
 test:
-	@bash scripts/run_test_suite.sh $(MAKE) --no-print-directory test-suites
+	@uv sync --extra dev --extra sdk --extra dash
+	@UV_NO_SYNC=1 bash scripts/run_test_suite.sh $(MAKE) --no-print-directory -j$(TEST_SUITE_JOBS) test-suites
 
-test-suites: test-config-generated test-governor test-residuals test-hooks test-compose-env test-point-at test-domain test-adapters test-app test-parity arch typecheck
+# Start the two long tiers together; short contracts fit into their trailing
+# capacity instead of delaying the longest scale test by the shell gates.
+test-suites: test-adapters test-app test-config-generated test-governor test-residuals test-hooks test-compose-env test-point-at test-domain test-parity arch typecheck
 	@echo ""
 	@echo "✓ all suites passed"
 
@@ -69,21 +75,19 @@ test-point-at:
 
 test-domain:
 	@echo "== domain (pytest) =="
-	@uv run --quiet --with pytest --with tree-sitter --with tree-sitter-bash pytest tests/domain/
+	@uv run --quiet --extra dev pytest tests/domain/ $(PYTEST_TIMING)
 
 # Phase 2 adapters exercise real application wiring and the reused tree-sitter
 # bypass core, so declare the SDK and parser dependencies at this tier.
 test-adapters:
 	@echo "== adapters (pytest: AgentRunner mapping + in-process governor) =="
-	@uv run --quiet --extra sdk --with pytest pytest tests/adapters/
+	@uv run --quiet --extra dev --extra sdk --extra dash pytest tests/adapters/ -n $(TEST_WORKERS) --dist load --maxschedchunk=1 $(PYTEST_TIMING)
 
-# The orchestration/dashboard/CLI app layer. Deliberately NOT installed with
-# `--extra dash`:
-# the endpoint tests importorskip fastapi, so this target is the standing proof
-# that `make test` stays green on a machine that never installed the extra.
+# Include dashboard endpoints in the complete gate. Daemon installations still
+# keep the web extra optional; only the development environment includes it.
 test-app:
 	@echo "== app (pytest: orchestration + dashboard + endpoints) =="
-	@uv run --quiet --extra sdk --with pytest pytest tests/app/
+	@uv run --quiet --extra dev --extra sdk --extra dash pytest tests/app/ -n $(TEST_WORKERS) --dist load --maxschedchunk=1 $(PYTEST_TIMING)
 
 # Build the dashboard SPA into dashboard/dist (gitignored). Needed before
 # `issue-agent dashboard --serve` prefers the interactive UI over the v1 page.

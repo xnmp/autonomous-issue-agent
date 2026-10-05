@@ -8,6 +8,7 @@ choose an import or silently populate a newly added optional field.
 from dataclasses import fields, is_dataclass
 from datetime import datetime
 from enum import Enum
+from functools import lru_cache
 import json
 from typing import TypeVar
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
@@ -427,6 +428,14 @@ def _unique_object(pairs: list[tuple[str, object]]) -> dict[str, object]:
     return result
 
 
+@lru_cache(maxsize=128)
+def _parsed_workflow_json(raw: str) -> object:
+    # Private trees are read-only inputs to _decode, never returned to callers.
+    # The public decoder bounds cached inputs to 16 KiB and constructs typed
+    # values afresh so constructor and authority validation cannot be skipped.
+    return json.loads(raw, object_pairs_hook=_unique_object)
+
+
 def encode_workflow(value: object) -> str:
     try:
         encoded = json.dumps(
@@ -442,9 +451,13 @@ def encode_workflow(value: object) -> str:
 
 def decode_workflow(raw: str, expected: type[T]) -> T:
     try:
-        if not isinstance(raw, str) or len(raw.encode("utf-8")) > MAX_WORKFLOW_PAYLOAD_BYTES:
+        if not isinstance(raw, str):
             raise WorkflowEncodingError("workflow payload is invalid or too large")
-        envelope = json.loads(raw, object_pairs_hook=_unique_object)
+        source_bytes = len(raw.encode("utf-8"))
+        if source_bytes > MAX_WORKFLOW_PAYLOAD_BYTES:
+            raise WorkflowEncodingError("workflow payload is invalid or too large")
+        envelope = _parsed_workflow_json(raw) if type(raw) is str and source_bytes <= 16384 \
+            else json.loads(raw, object_pairs_hook=_unique_object)
         if not isinstance(envelope, dict) or set(envelope) != {"format", "value"} or type(envelope["format"]) is not int or envelope["format"] != 1:
             raise WorkflowEncodingError("unsupported workflow encoding format")
         decoded = _decode(envelope["value"])

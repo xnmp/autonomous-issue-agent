@@ -26,6 +26,13 @@ def load_review_preflight_record(
     if row is None:
         return None
     stored = decode_workflow(row["payload_json"], tuple)
+    return _read_review_preflight_record(db, repository, owner_id, request_id, stored)
+
+
+def _read_review_preflight_record(
+    db: sqlite3.Connection, repository: str, owner_id: str, request_id: str, stored: tuple,
+) -> tuple[ReviewPreflightSelection, ReviewRoundPlan, ReviewRoundPlan, sqlite3.Row]:
+    """Validate a receipt already read and decoded in the caller's SQL snapshot."""
     if (len(stored) != 3 or not isinstance(stored[0], ReviewPreflightSelection)
             or stored[0].request_id != request_id or stored[1] != owner_id
             or not isinstance(stored[2], ReviewRoundPlan)):

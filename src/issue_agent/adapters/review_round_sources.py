@@ -37,8 +37,8 @@ def read_review_round_sources(
     require_review_submission_receipts(
         db, repository, plan, selection.claim_occurrence_id, revision,
     )
-    children = SQLiteControlStore._read_review_child_evidence(
-        db, repository, parent_owner, plan.round.round_id,
+    children = SQLiteControlStore._read_planned_review_child_evidence(
+        db, repository, parent_owner, selection, plan, revision,
     )
     if isinstance(planning, ReviewParentAbandoned):
         children = tuple(

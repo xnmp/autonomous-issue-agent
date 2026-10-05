@@ -48,6 +48,7 @@ class BudgetedSqlConnection(sqlite3.Connection):
     _source_custom_functions: frozenset[str] = frozenset()
     _source_custom_collations: frozenset[str] = frozenset()
     _user_authorizer: Any = None
+    _source_metadata_sql: dict[str, str] | None = None
 
     def set_authorizer(self, authorizer_callback: Any) -> None:
         if self._source_budgets:
@@ -90,6 +91,8 @@ class BudgetedSqlConnection(sqlite3.Connection):
         return super().create_collation(name, callable)
 
     def _preflight_read(self, sql: str, parameters: Any) -> None:
+        if not self.in_transaction:
+            raise SqlReadBudgetExceeded("SQL source budget lost its transaction")
         statement = sql.strip().rstrip(";")
         head = statement.split(None, 1)[0].casefold() if statement else ""
         # Nested publishers use transaction-local savepoints under the same
@@ -106,18 +109,23 @@ class BudgetedSqlConnection(sqlite3.Connection):
             return
         # The outer SELECT uses SQLite's result-column names (including its
         # disambiguation of duplicate aliases), not caller-provided identifiers.
-        description = super().execute(f"SELECT * FROM ({statement}) LIMIT 0", parameters).description
-        if description is None:
-            raise SqlReadBudgetExceeded("SQL source budget requires a read-only result")
-        expressions = []
-        for column in description:
-            quoted = '"' + column[0].replace('"', '""') + '"'
-            expressions.append(
-                f"CASE typeof({quoted}) WHEN 'null' THEN 0 "
-                f"WHEN 'integer' THEN 8 WHEN 'real' THEN 8 "
-                f"ELSE octet_length({quoted}) END"
-            )
-        metadata_sql = f"SELECT {'+'.join(expressions) or '0'} FROM ({statement})"
+        templates = self._source_metadata_sql
+        metadata_sql = templates.get(statement) if templates is not None else None
+        if metadata_sql is None:
+            description = super().execute(f"SELECT * FROM ({statement}) LIMIT 0", parameters).description
+            if description is None:
+                raise SqlReadBudgetExceeded("SQL source budget requires a read-only result")
+            expressions = []
+            for column in description:
+                quoted = '"' + column[0].replace('"', '""') + '"'
+                expressions.append(
+                    f"CASE typeof({quoted}) WHEN 'null' THEN 0 "
+                    f"WHEN 'integer' THEN 8 WHEN 'real' THEN 8 "
+                    f"ELSE octet_length({quoted}) END"
+                )
+            metadata_sql = f"SELECT {'+'.join(expressions) or '0'} FROM ({statement})"
+            if templates is not None and len(templates) < 128 and len(metadata_sql) <= 16384:
+                templates[statement] = metadata_sql
         metadata = super().execute(metadata_sql, parameters)
         metadata.row_factory = None
         size, rows = 0, 0
@@ -196,6 +204,9 @@ def bounded_sql_source_reads(
     db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, min(previous_limit, MAX_SQL_VALUE_BYTES))
     db._source_budgets = previous + (budget,)
     if not previous:
+        # DDL is forbidden inside this transaction-local scope. Only column
+        # templates are reused: values, rows and budget charges are always fresh.
+        db._source_metadata_sql = {}
         sqlite3.Connection.set_authorizer(db, db._budget_authorizer)
     try:
         yield budget
@@ -204,5 +215,6 @@ def bounded_sql_source_reads(
     finally:
         db._source_budgets = previous
         if not previous:
+            db._source_metadata_sql = None
             sqlite3.Connection.set_authorizer(db, db._user_authorizer)
         db.setlimit(sqlite3.SQLITE_LIMIT_LENGTH, previous_limit)

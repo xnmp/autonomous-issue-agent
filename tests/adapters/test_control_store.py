@@ -64,7 +64,7 @@ from issue_agent.domain.projection import fold
 
 
 NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
-EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 40))
+EXPECTED_SCHEMA_VERSIONS = tuple(range(9, 41))
 
 
 def _store(tmp_path: Path) -> SQLiteControlStore:
@@ -121,6 +121,8 @@ def _historical_fixture(db: sqlite3.Connection, version: int) -> None:
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
 
     removals = {
+        40: ("DROP INDEX event_outbox_pending", "DROP INDEX event_outbox_pending_destination",
+             "DROP INDEX lifecycle_review_generation_candidates"),
         39: ("DROP INDEX workflow_repair_owed", "DROP INDEX continuation_pr_admission_identity",
              "DROP INDEX reservations_active_workload"),
         38: ("DROP INDEX lifecycle_self_clear_pending",),
@@ -2156,6 +2158,48 @@ def test_shared_outbox_flushes_only_the_bound_role_feed(tmp_path):
         fix_seen.append, destination=fix.feed_identity
     ) == 1
     assert [item.event_id for item in fix_seen] == ["fix-event"]
+
+
+@pytest.mark.parametrize("destination_scoped", [False, True])
+def test_idle_outbox_read_work_is_bounded_after_delivery_history(tmp_path, monkeypatch, destination_scoped):
+    store = _store(tmp_path)
+    producer = Producer("deployment", "o/r", "fix", 123, "boot")
+    other = Producer("deployment", "o/r", "review", 124, "boot")
+
+    def event(source, index):
+        return EventEnvelope(TelemetryWarning("history", str(index)), new_event_id(NOW),
+                             index, NOW, NOW, index, source)
+
+    with store.transaction() as db:
+        for index in range(1000):
+            store.enqueue_event(event(producer, index), db)
+    seen = []
+    assert store.flush_outbox(seen.append, limit=1000) == 1000
+    assert len(seen) == 1000
+    if destination_scoped:
+        with store.transaction() as db:
+            for index in range(1000):
+                store.enqueue_event(event(other, index), db)
+
+    work = []
+    connect = store._connect
+
+    def measured_connect(**kwargs):
+        db = connect(**kwargs)
+        db.set_progress_handler(lambda: work.append(1) or 0, 1)
+        return db
+
+    monkeypatch.setattr(store, "_connect", measured_connect)
+    destination = producer.feed_identity if destination_scoped else None
+    assert store.flush_outbox(seen.append, destination=destination) == 0
+    assert len(seen) == 1000
+    # An idle feed cannot scan delivered history or another role's pending feed.
+    assert len(work) < 100
+
+    reopened = SQLiteControlStore(store.path)
+    remaining = []
+    assert reopened.flush_outbox(remaining.append, limit=1000) == (1000 if destination_scoped else 0)
+    assert all(item.producer == other for item in remaining)
 
 
 def test_oversized_event_cannot_roll_back_operational_state_or_poison_outbox(

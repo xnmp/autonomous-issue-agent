@@ -398,4 +398,5 @@ index.html). If dist is missing, `/` returns a plain-HTML instruction page.
   `fetch: Callable` and tests stub it.
 - Frontend: `npm run build` + `tsc --noEmit` must pass; no JS test runner in
   v1 (vitest can come later).
-- `make test` must stay green without the `dash` extra installed.
+- `make test` prepares the `dash` extra so endpoint contracts execute; daemon
+  installations still keep that extra optional.

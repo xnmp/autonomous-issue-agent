@@ -1248,9 +1248,11 @@ def read_review_outcome_receipt(
     """One immutable indexed receipt contract for live references and exact retries."""
     metadata = db.execute(
         "SELECT reusable_after,typeof(payload_json) AS payload_type,"
-        "length(CAST(payload_json AS BLOB)) AS payload_bytes,claimed_at "
+        "length(CAST(payload_json AS BLOB)) AS payload_bytes,claimed_at,"
+        "CASE WHEN typeof(payload_json)='text' AND octet_length(payload_json) BETWEEN 1 AND ? "
+        "THEN payload_json END AS payload_json "
         "FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-        (REVIEW_OUTCOME_NAMESPACE, repository, round_id),
+        (MAX_WORKFLOW_PAYLOAD_BYTES, REVIEW_OUTCOME_NAMESPACE, repository, round_id),
     ).fetchone()
     if metadata is None:
         return None
@@ -1265,11 +1267,7 @@ def read_review_outcome_receipt(
             raise ValueError("outcome receipt time requires an offset")
     except ValueError as exc:
         raise WorkflowAuthorityError("review outcome receipt has a malformed claim time") from exc
-    row = db.execute(
-        "SELECT payload_json FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
-        (REVIEW_OUTCOME_NAMESPACE, repository, round_id),
-    ).fetchone()
-    return decode_workflow(row["payload_json"], tuple | CurrentReviewOutcomeReceipt)
+    return decode_workflow(metadata["payload_json"], tuple | CurrentReviewOutcomeReceipt)
 
 
 def require_current_review_productivity_receipt(
@@ -1362,8 +1360,19 @@ def _read_current_round_outcome(
     captured_receipt = read_review_outcome_receipt(db, episode[0], row["round_id"])
     if captured_receipt is None:
         raise WorkflowAuthorityError("current execution reference lacks its exact outcome receipt")
-    facts = decode_workflow(row["closure_json"], ReviewRoundFacts)
-    outcome = decode_workflow(row["outcome_json"], ReviewRoundOutcome)
+    # These values were just decoded and validated from the retained receipt.
+    # Exact canonical bytes permit reuse; other encodings keep the full decoder.
+    if isinstance(captured_receipt, CurrentReviewOutcomeReceipt):
+        receipt_facts, receipt_outcome = captured_receipt.facts, captured_receipt.outcome
+    elif (len(captured_receipt) == 2 and isinstance(captured_receipt[0], ReviewRoundFacts)
+          and isinstance(captured_receipt[1], ReviewRoundOutcome)):
+        receipt_facts, receipt_outcome = captured_receipt
+    else:
+        receipt_facts, receipt_outcome = None, None
+    facts = receipt_facts if receipt_facts is not None and row["closure_json"] == encode_workflow(receipt_facts) \
+        else decode_workflow(row["closure_json"], ReviewRoundFacts)
+    outcome = receipt_outcome if receipt_outcome is not None and row["outcome_json"] == encode_workflow(receipt_outcome) \
+        else decode_workflow(row["outcome_json"], ReviewRoundOutcome)
     if isinstance(captured_receipt, CurrentReviewOutcomeReceipt):
         require_current_review_productivity_receipt(db, captured_receipt)
     matching_receipt = (
@@ -1381,7 +1390,7 @@ def _read_current_round_outcome(
             or outcome.round.binding.execution_episode != episode[3]
             or not matching_receipt):
         raise WorkflowAuthorityError("current execution outcome disagrees with its retained receipt")
-    from .review_execution_claims import load_review_preflight_record
+    from .review_execution_claims import _read_review_preflight_record
     from .review_round_sources import read_review_round_sources
     from .control_store import ControlStoreError
 
@@ -1396,9 +1405,7 @@ def _read_current_round_outcome(
     captured = decode_workflow(preflight["payload_json"], tuple)
     if len(captured) != 3 or not isinstance(captured[1], str):
         raise WorkflowAuthorityError("current outcome preflight owner is malformed")
-    stored = load_review_preflight_record(db, episode[0], captured[1], row["round_id"])
-    if stored is None:
-        raise WorkflowAuthorityError("current outcome reference lost its allocated round")
+    stored = _read_review_preflight_record(db, episode[0], captured[1], row["round_id"], captured)
     selection, _, plan, source = stored
     planning = decode_workflow(source["planning_json"], ReviewPlanningOpen | ReviewPlanningSealed | ReviewParentAbandoned)
     revision_row = db.execute(
@@ -1725,7 +1732,8 @@ def persist_workflow_snapshot(db: sqlite3.Connection, after: AnyWorkflowSnapshot
         raise WorkflowAuthorityError("workflow component index is absent")
     # Closed causes remain forensic history, never a runtime file fallback.
     db.execute(
-        "UPDATE workflow_gates SET state='closed' WHERE repository=? AND target_kind=? AND target_number=?",
+        "UPDATE workflow_gates SET state='closed' WHERE repository=? AND target_kind=? AND target_number=? "
+        "AND state<>'closed'",
         scope,
     )
     for gate in after.gates:

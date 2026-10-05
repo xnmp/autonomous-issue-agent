@@ -63,6 +63,62 @@ def test_one_byte_short_refuses_before_cursor_and_does_not_charge_failed_read():
     db.close()
 
 
+def test_identical_sql_rechecks_changed_parameters_and_values_in_nested_scopes():
+    db = _db()
+    sql = "SELECT payload FROM source WHERE n=?"
+    with bounded_sql_source_reads(db, 8) as outer:
+        assert db.execute(sql, (7,)).fetchone() == (b"abc",)
+        with bounded_sql_source_reads(db, 5) as inner:
+            assert db.execute(sql, (9,)).fetchone() == (b"de",)
+            db.execute("UPDATE source SET payload=? WHERE n=9", (b"four",))
+            with pytest.raises(SqlReadBudgetExceeded):
+                db.execute(sql, (9,))
+            assert (inner.source_bytes, inner.rows) == (2, 1)
+        assert (outer.source_bytes, outer.rows) == (5, 2)
+    db.close()
+
+
+def test_later_scope_counts_columns_added_by_a_schema_change():
+    db = _db()
+    with bounded_sql_source_reads(db, 11) as budget:
+        assert db.execute("SELECT * FROM source WHERE n=7").fetchone() == (b"abc", 7)
+        assert budget.source_bytes == 11
+    db.execute("ALTER TABLE source ADD COLUMN extra")
+    db.execute("UPDATE source SET extra=?", (b"extra bytes",))
+    with bounded_sql_source_reads(db, 11) as budget:
+        with pytest.raises(SqlReadBudgetExceeded):
+            db.execute("SELECT * FROM source WHERE n=7")
+        assert (budget.source_bytes, budget.rows) == (0, 0)
+    db.close()
+
+
+@pytest.mark.parametrize("ending", ["commit", "rollback", "context_exit"])
+def test_ended_transaction_cannot_reuse_metadata_after_an_external_schema_change(tmp_path, ending):
+    path = tmp_path / "budget.db"
+    db = sqlite3.connect(path, factory=BudgetedSqlConnection)
+    db.execute("CREATE TABLE source (payload)")
+    db.execute("INSERT INTO source VALUES ('x')")
+    db.commit()
+    db.execute("BEGIN")
+    with bounded_sql_source_reads(db, 2) as budget:
+        assert db.execute("SELECT * FROM source").fetchone() == ("x",)
+        if ending == "context_exit":
+            with db:
+                pass
+        else:
+            getattr(db, ending)()
+        with sqlite3.connect(path) as other:
+            other.execute("ALTER TABLE source ADD COLUMN extra")
+            other.execute("UPDATE source SET extra=?", ("x" * 1000,))
+        with pytest.raises(SqlReadBudgetExceeded, match="lost its transaction"):
+            db.execute("SELECT * FROM source")
+        # Even SAVEPOINT must not restart a scope with stale column metadata.
+        with pytest.raises(SqlReadBudgetExceeded, match="lost its transaction"):
+            db.execute("SAVEPOINT replacement")
+        assert (budget.source_bytes, budget.rows) == (1, 1)
+    db.close()
+
+
 def test_last_row_oversize_and_row_ceiling_refuse_without_partial_charge():
     db = _db()
     with bounded_sql_source_reads(db, 4) as budget:

@@ -18,8 +18,15 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      # Private Linux runners have two CPUs; avoid overlapping two worker pools.
+      TEST_WORKERS: "2"
+      TEST_SUITE_JOBS: "1"
     steps:
       - uses: actions/checkout@v5
+        with:
+          # Rollback contracts archive an immutable historical SQL build.
+          fetch-depth: 0
 
       # `make test` shells out to git in temporary repos; the bash suites assert
       # on commit behaviour, so an unset identity fails them.
@@ -48,9 +55,22 @@ jobs:
           cache: npm
           cache-dependency-path: dashboard/package-lock.json
 
+      - name: Test resource capacity
+        env:
+          TMPDIR: ${{ runner.temp }}
+        run: |
+          nproc
+          free -h
+          df -h "$TMPDIR"
+          df -i "$TMPDIR"
+
       # The full suite: governor + hooks + orchestration + point-at + domain +
       # adapters + gate parity + import-linter architecture contracts.
       - name: make test
+        env:
+          # Runtime-directory tmpfs filled during the real SQLite histories.
+          # Keep FULL durability while using the runner's disk-backed scratch.
+          TMPDIR: ${{ runner.temp }}
         run: make test
 
       # Production compilation exercises the pre/post input snapshot and
@@ -65,4 +85,9 @@ jobs:
       # clock, and `make test` is the self-hosted TEST_CMD paid on every gate
       # run — CI is the authoritative place for the expensive belt-and-braces.
       - name: make test-deployment-env
+        env:
+          TMPDIR: ${{ runner.temp }}
+          # make test already synchronized every test extra. Bare uv run here
+          # would otherwise remove the SDK/dashboard and pytest dependencies.
+          UV_NO_SYNC: "1"
         run: make test-deployment-env

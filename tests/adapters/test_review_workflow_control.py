@@ -1023,6 +1023,19 @@ def test_generation_advance_does_not_rebuild_fully_settled_command_history(rig, 
 @pytest.mark.parametrize("raw", [
     "not JSON",
     '{"format":1,"value":{"type":"RetiredSettledCommand","fields":{}}}',
+    '{"format":1,"value":{"type":"RetiredSettledCommand","fields":'
+    '{"outcome_evidence_id":"ok","retirement_evidence_id":"ok","extra":1}}}',
+    '{"format":1,"value":{"type":"RetiredSettledCommand","fields":'
+    '{"outcome_evidence_id":"ok","outcome_evidence_id":"ok","retirement_evidence_id":"ok"}}}',
+    *[json.dumps({"format": 1, "value": {"type": "RetiredSettledCommand", "fields": {
+        "outcome_evidence_id": value, "retirement_evidence_id": "ok",
+    }}}, sort_keys=True, separators=(",", ":")) for value in (
+        None, 1, "", " ", "bad\x00identity", "bad\nidentity", "x" * 513,
+    )],
+    '{"format":true,"value":{"fields":{"outcome_evidence_id":"ok",'
+    '"retirement_evidence_id":"ok"},"type":"RetiredSettledCommand"}}',
+    '{"format":1,"value":{"fields":{"outcome_evidence_id":"ok",'
+    '"retirement_evidence_id":"bad\\u0000identity"},"type":"RetiredSettledCommand"}}',
 ])
 def test_generation_advance_refuses_malformed_retirement_without_committing(rig, raw):
     stopped, command = cancelled_rearm_with_settled_command(rig)
@@ -1036,6 +1049,26 @@ def test_generation_advance_refuses_malformed_retirement_without_committing(rig,
         ), ACTOR)
     assert rig.workflow() == stopped
     assert rig.commands() == commands
+
+
+@pytest.mark.parametrize("value", ["valid\x7fidentity", "validéidentity", "x" * 512])
+@pytest.mark.parametrize("field", ["outcome_evidence_id", "retirement_evidence_id"])
+def test_generation_advance_preserves_valid_non_ascii_and_boundary_retirements(rig, value, field):
+    stopped, command = cancelled_rearm_with_settled_command(rig)
+    fields = {"outcome_evidence_id": "ok", "retirement_evidence_id": "ok", field: value}
+    raw = json.dumps({"format": 1, "value": {
+        "type": "RetiredSettledCommand", "fields": fields,
+    }}, sort_keys=True, separators=(",", ":"))
+    with rig.store.transaction() as db:
+        db.execute("UPDATE lifecycle_commands SET workflow_reconciliation_json=? WHERE command_id=?",
+                   (raw, str(command)))
+    retired = rig.store.command_reconciliation(command)
+    continued = rig.control().continue_rearm(ContinueGrantedRearm(
+        "request:2", stopped.revision, "request:1", expected_binding=stopped.binding,
+    ), ACTOR)
+    assert isinstance(continued, WorkflowCommitted)
+    assert continued.snapshot.revision.fence.generation == stopped.revision.fence.generation + 1
+    assert rig.store.command_reconciliation(command) == retired
 
 
 @pytest.mark.parametrize("corrupt_binding", [False, True])
