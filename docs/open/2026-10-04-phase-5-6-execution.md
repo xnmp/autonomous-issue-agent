@@ -1,5 +1,13 @@
 # Phase 5/6 execution
 
+**Current live checkpoint — October 5:** offline Phase 5 and the declared
+Phase 6 contracts are accepted. All 37 Phase 4 tasks and the epic are closed;
+the schema-40/family cutover, retained-obligation dispositions and approved
+lower-cap configuration are applied. Current qualification and the remaining
+canary/two-window acceptance are in the
+[live execution record](2026-10-05-phase-5-live-execution.md). Earlier
+deployment-pause statements below describe their original checkpoints.
+
 The architecture plan is [2026-09-14-architecture-implementation.md](2026-09-14-architecture-implementation.md). Phase 4 is accepted at `0518c27`; its roadmap/evidence packaging is `34a622c`. The user authorized continuing Phases 5 and 6 on 2026-10-04.
 
 Work proceeds in three coherent implementation milestones. These are local work units, not new remote issues or a new workflow engine.

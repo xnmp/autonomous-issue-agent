@@ -1,6 +1,17 @@
 # Architecture implementation phases
 
-**Current execution — 2026-10-05 UTC:** phases 1–3 remain accepted. The approved
+**Live checkpoint — 2026-10-05 10:28 UTC:** phases 1–4 are accepted and all
+37 Phase 4 tasks plus their tracking epic are closed after published-commit and
+independent acceptance verification. Phase 6's declared contracts are accepted.
+Issue #237 is merged; the complete reference-host gate passes below five minutes.
+The approved retained-obligation dispositions, live schema-40/family cutovers
+and bounded launch-profile application are complete. Historical uncertainty and
+all 297 fix/165 steward holds remain preserved. Paid services remain stopped;
+the canary and two actual 48-hour windows are still required. Current evidence,
+target qualification, authorization and finite controls are recorded in the
+[live execution record](2026-10-05-phase-5-live-execution.md).
+
+**Earlier implementation checkpoint — 2026-10-05 UTC:** phases 1–3 remain accepted. The approved
 [Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven
 outcome gates accepted locally. A2 closes the production caller/removal matrix,
 independent whole-system review, copied rollback, dashboard outcomes and final
@@ -445,7 +456,7 @@ inventory is not permission to activate the new schema or restart deployment.
 | 2 — `phase_2_composition` | Starts alongside 1; acceptance uses its fixes | Extend real daemon + durable executor + SQLite composition with a persistent GitHub double, restart and bounded fault injection. Cover remote success before receipt, duplicate delivery, partial relabel, stale completion and concurrent re-arm; prove held-state preservation, stable attempt identity, accounting conservation and visible uncertainty. |
 | 3 — `phase_3_gates` | Design may proceed alongside 1–2; implementation requires both accepted | Superseding ADR first where authority moves. Implement one complete generation-fenced gate/re-arm flow, accept it, then the second. Include operator command, continuation changes, dashboard projection, and aged-uncertain-command gates. Completion requires verified remote outcomes. Delete replaced choreography. |
 | 4 — `phase_4_continuations` | 3 accepted | First complete step 0.5 under ADR 0016: replace lifetime archive proof with atomic current-state authority and remove the superseded machinery. Then execute the finite issue roadmap to migrate selected eligibility-bearing counters, consumed replies and continuation episodes one family at a time. Shadow comparison, scoped epochs, old-writer fencing and rollback reconciliation precede cutover. Retire replaced Store suffixes and temporary flags; never operate two authorities. |
-| 5 — `phase_5_measurement` | 4 accepted | Implement incident/intervention records and comparable-cohort readouts, replay recorded interventions without an operator, and prepare/run authorized unattended windows. Include parked/abandoned work and operator diagnosis. Select new automation only from measured evidence; no automatic commitment to a diagnostic leg or general policy platform. The bounded windows were approved on October 4; actual unattended acceptance remains pending retained-obligation disposition and the launch preconditions. |
+| 5 — `phase_5_measurement` | 4 accepted | Implement incident/intervention records and comparable-cohort readouts, replay recorded interventions without an operator, and prepare/run authorized unattended windows. Include parked/abandoned work and operator diagnosis. Select new automation only from measured evidence; no automatic commitment to a diagnostic leg or general policy platform. Offline contracts, retained-obligation disposition, current-target qualification and live cutover are verified. Actual canary and two unattended windows/readout remain required under the approved bounded profile. |
 | 6 — `phase_6_policy` | Findings/measurements from preceding phases | Consolidate demonstrated shell/Python gate-policy duplication behind one source while retaining parity and evidence requirements. Preserve current capability validation; do not refactor runtime registries merely because they are parallel. Address independent revision-bound test execution as a distinct verification contract, without treating model review as execution evidence. |
 
 Each phase requires behavioral tests, independent adversarial review, a green

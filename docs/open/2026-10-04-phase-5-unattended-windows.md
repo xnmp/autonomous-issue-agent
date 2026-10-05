@@ -1,5 +1,13 @@
 # Phase 5 unattended-window proposal
 
+**Current checkpoint — October 5:** the later standing accounting approval
+covered retained-obligation dispositions and the five-period timing allocation.
+Live schema-40/all-family activation and the eight lower-cap/profile overrides
+are applied, with historical holds preserved. Current target qualification is
+at `af06e086`. No paid canary or unattended window has started. Follow the
+[live execution record](2026-10-05-phase-5-live-execution.md); the original
+midnight proposal and preparation inventories below are historical evidence.
+
 Status: the user approved this bounded proposal on 2026-10-04 at approximately
 22:51 UTC, releasing the deployment pause within its scope. **No canary or
 unattended window has started.** The preconditions below still apply. This

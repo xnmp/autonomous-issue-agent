@@ -1,6 +1,11 @@
 # Phase 4 — simplification and issue roadmap
 
 Date: 2026-09-30. Baseline: `e077ce3`. **Step 0.5 and all seven Phase 4 outcome gates accepted locally.**
+Published completion verified 2026-10-05: all 37 tasks #200–236 and epic #199
+are closed. Independent audit verified their accepted commits on `dev`, A1/A2
+rollback/removal evidence, the approved Jira exception and complete passing CI.
+Phase 5's remaining live measurement is tracked in the
+[execution record](2026-10-05-phase-5-live-execution.md).
 Current checkpoint (2026-10-03): all 37 issues accepted locally through A2;
 whole-system caller/removal review, copied rehearsal, dashboard and full gate passed. The
 selected runtime families use current SQL authority; Jira's explicitly approved

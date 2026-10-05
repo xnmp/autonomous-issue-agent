@@ -1,5 +1,12 @@
 # Proposed disposition of retained obligations
 
+**Applied — 2026-10-05 03:02 UTC:** the user's explicit accounting approval
+authorized all four dispositions. The three capacity reservations were released
+and the obsolete publication retired through existing public APIs, with original
+evidence archived, unrelated rows conserved and no invented charges or success.
+The [live execution record](2026-10-05-phase-5-live-execution.md) records the
+subsequent schema-40/family cutover. The original proposal below is historical.
+
 Status: prepared for a separate operator decision. The approved Phase 5 windows
 do not authorize these accounting and command dispositions. All reported
 dispositions so far occurred on private copies; live authority remains stopped

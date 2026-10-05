@@ -2767,8 +2767,8 @@
   "a1_acceptance": {
     "key": "A1",
     "number": 235,
-    "status": "Refrozen8files after obsolete F7 advisory refusal fixture corrected; complete resolve acceptance and final both types green; required full rerun starting",
-    "goal_status": "active",
+    "status": "accepted",
+    "goal_status": "complete",
     "usage_at_start": {
       "thread": "01a0fdbc-6f2b-7921-8856-e337d3ec3c81",
       "tokens_used": 2422937,
@@ -2781,11 +2781,13 @@
       "focused": "Complete 11 affected/family contract files GREEN; all3configured copied fix/steward scenarios and real archived F14 SQL rollback GREEN. Advisory RED\u2192GREEN evidence retained. /tmp/phase4-a1-contracts-final.log",
       "review": "Independent f9_review clean after both steward rollback gap closed; all3copied scenarios independently passed",
       "types": "Both final pyrefly targets0errors after last fixture edit /tmp/phase4-a1-types-final-rerun.log",
-      "full_gate": "Refrozen8files; required full rerun /tmp/phase4-a1-full-final.log",
+      "full_gate": "Configured isolated copied fix and both steward lanes: actual dispatcher/admission/charges/return or remote-success crash/restart, exact SQL rollback using archived accepted F14 source on later copied database, original source/SQL unchanged.672complete selected contracts plus53resolve acceptance pass; independent review clean; final both types0 after last fixture edit. Full make test GREEN05:00:53\u201305:29:22UTC1708.76s:3585domain5.87s/3382adapter892.08s/3313app790.71s/hooks/parity/4architecture/bothpyrefly0. /tmp/phase4-a1-full-final.log. All8frozen source hashes verified.",
       "first_full_gate": "Failed only obsolete advisory stall-sig refusal fixture:3585domain5.95s/3382adapter907.36s/3312app1failure791.67s,1717.33s total. Original scales485.33s/205.34s retained. /tmp/phase4-a1-full.log",
       "fixture_correction": "Unsupported authoritative session provenance replaces advisory stall-sig; renamed test preserves unsupported-source/no-paid-work and original SQL/source assertions. Complete resolve_acceptance53GREEN /tmp/phase4-a1-resolve-acceptance-final.log. No production change."
     },
-    "last_checkpoint": "2026-10-03T05:00:51.443408+00:00"
+    "last_checkpoint": "2026-10-03T05:00:51.443408+00:00",
+    "accepted_commit": "b6687e726c330f54311f61766699df4344d098db",
+    "checkpoint_superseded_by_acceptance": true
   },
   "a2_acceptance": {
     "key": "A2",
@@ -2813,5 +2815,50 @@
     "tokens_used": 3309732,
     "time_used_seconds": 48281,
     "budget": null
+  },
+  "remote_closure": {
+    "verified_at": "2026-10-05T10:16:55Z",
+    "tasks": [
+      200,
+      201,
+      202,
+      203,
+      204,
+      205,
+      206,
+      207,
+      208,
+      209,
+      210,
+      211,
+      212,
+      213,
+      214,
+      215,
+      216,
+      217,
+      218,
+      219,
+      220,
+      221,
+      222,
+      223,
+      224,
+      225,
+      226,
+      227,
+      228,
+      229,
+      230,
+      231,
+      232,
+      233,
+      234,
+      235,
+      236
+    ],
+    "epic": 199,
+    "published_dev_commit": "39648de3c8869012a0afad8324d3a27a42c3dc9d",
+    "basis": "Independent acceptance audit, published accepting commits, passing complete CI; Jira existing-path exception retained; Phase5 live measurement remains pending"
   }
 }

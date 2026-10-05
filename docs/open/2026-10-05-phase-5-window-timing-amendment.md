@@ -1,6 +1,10 @@
 # Proposed Phase 5 timing amendment
 
-Status: prepared and independently reviewed; **not approved, installed or armed**.
+Current status: the bounded-window and standing accounting approvals cover this
+five-period allocation. Live prerequisites are recorded in the
+[execution record](2026-10-05-phase-5-live-execution.md). The finite controls
+are installed and verified; **timers remain unarmed and services stopped**.
+The original proposal wording below is retained as preparation evidence.
 The [bounded window proposal](2026-10-04-phase-5-unattended-windows.md) remains
 approved within its original scope. This amendment requests different starting
 times and standalone window ceilings while preserving the USD 125 combined
