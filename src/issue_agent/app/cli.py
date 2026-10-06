@@ -51,6 +51,8 @@ from .codex_resolution import (
 )
 from .config import (
     REPOINT_HISTORY_ENV,
+    FIX_MODEL_TIER_ENV_KEYS,
+    fix_runtime_names_from_env,
     default_state_dir as config_default_state_dir,
     parse_repoint_history,
 )
@@ -129,6 +131,7 @@ _OVERLAY_FIELDS = (
     "REPO", "TARGET_DIR", "STATE_DIR", "REVIEW_STATE_DIR", "STEWARD_STATE_DIR",
     "TEST_CMD", "BASE_BRANCH", "DAILY_SPEND_CAP_USD", "GLOBAL_DAILY_SPEND_CAP_USD",
     "FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME", "REVIEW_MODE",
+    *FIX_MODEL_TIER_ENV_KEYS,
     # Read by the dashboard's operator re-arm: which login's change requests
     # count toward the rejection ceiling, how many of them it takes, and the
     # same App → token identity the review daemon used to author them.
@@ -3015,7 +3018,7 @@ def _doctor_codex_binary(composed: dict) -> CodexResolutionReport | None:
     codex runtime (or pins CODEX_BIN). doctor.sh cannot do this: it checks the
     codex CONTRACT, not which of several installed codex binaries the daemons
     will exec, which is what broke keifu on 2026-08-02."""
-    selects_codex = any(
+    selects_codex = "codex" in fix_runtime_names_from_env(composed) or any(
         (composed.get(key) or "").strip().lower() == "codex"
         for key in CODEX_RUNTIME_KEYS
     )

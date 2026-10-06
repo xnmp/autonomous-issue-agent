@@ -223,3 +223,47 @@ def test_the_blindspot_line_stays_silent_on_a_fully_priced_cache_tier():
         daily_spend_cap_usd=cfg.daily_spend_cap_usd,
         unpriced_cached_models=cfg.codex_runtime.unpriced_cached_models,
     ) is None
+
+
+@pytest.mark.parametrize("model,expected", [
+    ("gpt-6.1-sol", (2.0, 10.0, 0.1)),
+    ("gpt-6-luna", (0.1, 0.5, 0.01)),
+])
+def test_new_model_runtime_sentinel_and_accounting_share_effective_prices(model, expected):
+    from issue_agent.app.roles import _rate_table
+    from issue_agent.domain.contracts import TokenUsage
+    from issue_agent.domain.pricing import price
+    cfg = from_env({"CODEX_COST_PER_MTOK": "gpt-5.6-sol=5/30/0.5"})
+    runtime_rates = rates_with_cache_for_model(model, cfg.codex_cost_per_mtok,
+        cfg.codex_cost_per_mtok_cached_in, fallback_in=cfg.codex_cost_per_mtok_in,
+        fallback_out=cfg.codex_cost_per_mtok_out)
+    assert runtime_rates == pytest.approx(expected)
+    usage = {"input_tokens": 2_000_000, "cache_read_input_tokens": 1_000_000,
+             "output_tokens": 1_000_000}
+    runtime_cost = codex_cost_usd(usage, cost_per_mtok_in=runtime_rates[0],
+        cost_per_mtok_out=runtime_rates[1], cost_per_mtok_cached_in=runtime_rates[2])
+    table = _rate_table(cfg, "codex")
+    assert table is not None
+    accounted_cost = price(TokenUsage(1_000_000, 1_000_000, cache_read_tokens=1_000_000), table.rates_for(model))
+    assert accounted_cost.micros == round(runtime_cost * 1_000_000)
+    assert budget_overrun_usd(usage, cost_per_mtok_in=runtime_rates[0],
+        cost_per_mtok_out=runtime_rates[1], cost_per_mtok_cached_in=runtime_rates[2],
+        max_budget_usd=runtime_cost - 0.01) == pytest.approx(runtime_cost)
+
+
+def test_sol_operator_prices_override_shipped_defaults_in_both_accounting_paths():
+    from issue_agent.app.roles import _rate_table
+    cfg = from_env({"CODEX_COST_PER_MTOK": "gpt-6.1-sol=3/12/0.25"})
+    rates = rates_with_cache_for_model("gpt-6.1-sol", cfg.codex_cost_per_mtok,
+        cfg.codex_cost_per_mtok_cached_in, fallback_in=5, fallback_out=30)
+    assert rates == (3, 12, 0.25)
+    table = _rate_table(cfg, "codex")
+    assert table is not None
+    assert table.rates_for("gpt-6.1-sol").cache_read_micros == 250_000
+
+
+def test_sol_two_component_operator_rate_uses_its_model_cache_discount():
+    cfg = from_env({"CODEX_COST_PER_MTOK": "gpt-6.1-sol=2/10"})
+    assert cfg.codex_cost_per_mtok_cached_in == (("gpt-6.1-sol", 0.1),)
+    assert rates_with_cache_for_model("gpt-6.1-sol", cfg.codex_cost_per_mtok,
+        cfg.codex_cost_per_mtok_cached_in, fallback_in=5, fallback_out=30) == (2, 10, 0.1)

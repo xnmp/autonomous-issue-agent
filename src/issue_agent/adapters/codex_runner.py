@@ -36,6 +36,7 @@ from ..domain.pricing import (
     ModelRates,
     usd_per_million_to_micros,
     with_default_model_rates,
+    default_cache_read_rate,
 )
 from ..domain.outcome import (
     AgentResult,
@@ -863,7 +864,7 @@ def rates_with_cache_for_model(
     for name, rate_cached_in in cached_table or ():
         if name == key:
             return rate_in, rate_out, rate_cached_in if rate_cached_in > 0 else rate_in
-    return rate_in, rate_out, rate_in / 10
+    return rate_in, rate_out, default_cache_read_rate(model, rate_in)
 
 
 def codex_cost_blindspot_warning(

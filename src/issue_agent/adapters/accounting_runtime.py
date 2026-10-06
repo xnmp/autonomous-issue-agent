@@ -292,6 +292,8 @@ class AccountingRuntime(AgentRuntime):
         self._identity.set((run_id, leg_id))
 
     async def run(self, task: RuntimePlan) -> AgentResult:
+        if task.runtime is not None and task.runtime.value != self.runtime_name:
+            return _return_refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
         issue, kind, number, claim_target, workflow, review_child = self._context.get()
         if review_child is not None and task.resolve_inputs is not None:

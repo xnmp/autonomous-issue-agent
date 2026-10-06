@@ -207,6 +207,10 @@ class RunIdentityRuntime(Protocol):
     def set_run_identity(self, run_id: str, leg_id: str) -> None: ...
 
 
+class RouteDecisionRecorder(Protocol):
+    def __call__(self, model: str | None, effort: object | None, runtime: str | None = None) -> None: ...
+
+
 @runtime_checkable
 class RunTelemetryRuntime(ContextualRuntime, Protocol):
     def leg_kind(self, kind: str) -> AbstractContextManager[None]: ...
@@ -214,5 +218,5 @@ class RunTelemetryRuntime(ContextualRuntime, Protocol):
     def route_receipt(
         self,
     ) -> AbstractContextManager[
-        Callable[[str | None, object | None], None]
+        RouteDecisionRecorder
     ]: ...

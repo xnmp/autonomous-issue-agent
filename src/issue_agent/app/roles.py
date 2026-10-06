@@ -147,6 +147,8 @@ from ..domain.pricing import (
     UnknownModelPolicy,
     usd_per_million_to_micros,
     with_default_model_rates,
+    default_cache_read_rate,
+    default_cache_write_rate,
 )
 from ..domain.recovery import RecoveryTrigger
 from ..domain.events import (
@@ -487,9 +489,9 @@ def _rate_table(
                 usd_per_million_to_micros(rate_in),
                 usd_per_million_to_micros(rate_out),
                 usd_per_million_to_micros(
-                    cached.get(model, rate_in / 10)
+                    cached.get(model, default_cache_read_rate(model, rate_in))
                 ),
-                usd_per_million_to_micros(rate_in),
+                usd_per_million_to_micros(default_cache_write_rate(model, rate_in)),
             )
             for model, rate_in, rate_out in (
                 with_default_model_rates(cfg.codex_cost_per_mtok)
@@ -1841,6 +1843,7 @@ def _fix_state(
     test_exemptions: dict[int, "ExemptionFacts"] | None = None,
     *,
     workflow_control: WorkflowControl | None = None,
+    available_runtimes: frozenset[str] = frozenset(),
 ) -> FixState:
     """Read the per-issue/PR orchestration state the fix decision needs."""
     errors: dict[int, str] = {}
@@ -1848,6 +1851,7 @@ def _fix_state(
     def read(key, reader, default, *, error_key=None):
         return _control_value(errors, key, reader, default, error_key=error_key)
 
+    available_runtimes = available_runtimes or frozenset({store.runtime})
     pr_issues = {breaker_key(p) for p in world.prs if breaker_key(p) > 0}
     sessions = frozenset()
     resumed = {}
@@ -1896,7 +1900,7 @@ def _fix_state(
         number for number in pr_issues
         if isinstance(workflow := resolve_workflows.get(number), WorkflowSnapshot)
         and workflow.episode.continuation.session is not None
-        and workflow.episode.continuation.session.runtime == store.runtime
+        and workflow.episode.continuation.session.runtime in available_runtimes
     )
     for pr in world.prs:
         number = breaker_key(pr)
@@ -1906,7 +1910,7 @@ def _fix_state(
                 raise ValueError("PR repair continuity is inactive or migration blocked")
             pr_resumed[pr.number] = repair.component.state.consumed_reply_at
             current_session = repair.component.state.session
-            if current_session is not None and current_session.runtime.value == store.runtime and repair.component.state.branch == pr.head_ref_name:
+            if current_session is not None and current_session.runtime.value in available_runtimes and repair.component.state.branch == pr.head_ref_name:
                 sessions = sessions | {number}
         except (ValueError, sqlite3.Error) as exc:
             pr_reply_errors[pr.number] = str(exc)
@@ -2661,6 +2665,7 @@ def compose_fix_daemon(
             # could not run → the prompts say nothing rather than attest a
             # capability that may not hold.
             environment_manifest=boot_manifest(cfg.evidence_stack),
+            runtime=cfg.fixer_runtime,
         ),
         max_review_rejections=cfg.max_review_rejections,
         author_tests_split=fix_runtime.author_tests_split,
@@ -2670,6 +2675,8 @@ def compose_fix_daemon(
         log=log,
         fix_bot=fix_runtime.bot,
         fixer_runtime=cfg.fixer_runtime,
+        fix_model_routes=cfg.fix_model_routes,
+        available_fix_runtimes=cfg.fix_runtimes,
         escalate_on_evidence=cfg.escalate_on_evidence,
         # The same ceiling `fix_cfg` escalates on, so a deterministic death can
         # saturate the counter rather than pay for cap-1 identical retries (#13).
@@ -2680,11 +2687,11 @@ def compose_fix_daemon(
         max_rebase_retries=fix_runtime.max_rebase_retries,
         **_spend_cfg(cfg, "fix"),
     )
-    runtime_binding = _FIX_RUNTIME_REGISTRY[cfg.fixer_runtime](
-        cfg, codex_runtime, runner
-    )
-    fix_runner = runtime_binding.runner
-    prepare_cwd = runtime_binding.prepare_cwd
+    runtime_bindings = {
+        provider: _FIX_RUNTIME_REGISTRY[provider](cfg, codex_runtime, runner)
+        for provider in sorted(cfg.fix_runtimes, key=lambda provider: provider.value)
+    }
+    prepare_cwd = runtime_bindings[cfg.fixer_runtime].prepare_cwd if not cfg.fix_model_routes else None
 
     control = _control_store(cfg, cfg.state_dir, journal)
     dcfg = replace(dcfg, operator_guidance=review_guidance_reader(control, cfg.repo))
@@ -2765,11 +2772,17 @@ def compose_fix_daemon(
     fix_reconciler = _LateReservationReconciler()
     from ..adapters.workspace_admission import WorkspaceAdmission
 
-    fix_runner = _with_accounting(
-        fix_runner, control, cfg, "fix", cfg.fixer_runtime.value, journal,
-        fix_reconciler,
-        admit=WorkspaceAdmission(control, worktrees, os.environ.get("GH_HOST", "github.com")),
-    )
+    from ..adapters.runtime_selection import SelectingRuntime
+
+    governed_runtimes = {
+        provider: _with_accounting(
+            binding.runner, control, cfg, "fix", provider.value, journal,
+            fix_reconciler,
+            admit=WorkspaceAdmission(control, worktrees, os.environ.get("GH_HOST", "github.com")),
+        ) for provider, binding in runtime_bindings.items()
+    }
+    fix_runner = (SelectingRuntime(governed_runtimes, cfg.fixer_runtime)
+                  if cfg.fix_model_routes else governed_runtimes[cfg.fixer_runtime])
     fix_runner = JournalingRuntime(
         fix_runner,
         journal,
@@ -2903,6 +2916,7 @@ def compose_fix_daemon(
                 gateway, world, fix_cfg, fix_cfg.review_bot, log
             ),
             workflow_control=workflow_control,
+            available_runtimes=frozenset(provider.value for provider in cfg.fix_runtimes),
         )
         for target, reason in state.control_errors.items():
             log(f"workflow {target} held: {reason}")

@@ -8,6 +8,9 @@ central dispatcher can become a thin role router.
 
 from __future__ import annotations
 
+from ...domain.agent_task import RUNTIME_CAPABILITIES
+from ...domain.model_routing import ModelRoute
+
 import contextlib
 import dataclasses
 import sqlite3
@@ -96,7 +99,7 @@ from .completion import execute_issue_completion
 
 
 def _discard_route_decision(
-    _model: str | None, _effort: object | None
+    _model: str | None, _effort: object | None, _runtime: str | None = None
 ) -> None:
     return None
 
@@ -125,6 +128,8 @@ class FixWorkflowConfig:
     # Escalate tier/effort when the harness has evidence the last attempt
     # under-delivered (#16). Off restores the pre-#16 behaviour exactly: the
     # router's verdict and the configured effort, whatever has happened before.
+    fix_model_routes: tuple[ModelRoute, ...] = ()
+    available_fix_runtimes: frozenset[RuntimeName] = frozenset()
     escalate_on_evidence: bool = True
     # Where `route_escalation` events land (adapters.journal.Journal, or None in
     # tests / when the daemon runs without one). Escalations must be queryable:
@@ -381,14 +386,36 @@ class FixWorkflow:
             raise WorkflowAuthorityError("resolve configuration is unavailable")
         session = state.episode.continuation.session
         if session is not None:
-            if session.runtime != self._resolve_runtime_name():
-                raise WorkflowAuthorityError("resolve session belongs to a different runtime")
-            cfg = dataclasses.replace(cfg, model=None if session.model == "<runtime-default>" else session.model)
+            runtime = self._available_runtime(session.runtime)
+            cfg = dataclasses.replace(cfg, model=None if session.model == "<runtime-default>" else session.model,
+                runtime=runtime, mints_visual_receipts=RUNTIME_CAPABILITIES[runtime].mints_visual_receipts)
         return self._escalated(cfg, issue, "resume", iss=iss)
 
     def _resolve_runtime_name(self) -> str:
         runtime = self.cfg.fixer_runtime
         return runtime.value if isinstance(runtime, RuntimeName) else runtime
+
+    def _available_runtime(self, name: str) -> RuntimeName:
+        runtime = RuntimeName(name)
+        available = self.cfg.available_fix_runtimes or frozenset({RuntimeName(self._resolve_runtime_name())})
+        if runtime not in available:
+            raise WorkflowAuthorityError("session runtime is unavailable in this deployment")
+        return runtime
+
+    def _with_route(self, cfg: FixTaskConfig, tier: str) -> FixTaskConfig:
+        route = task_builders.route_selection(tier, self._resolve_runtime_name(), self.cfg.fix_model_routes)
+        return dataclasses.replace(cfg, model=route.model, runtime=route.runtime,
+            mints_visual_receipts=RUNTIME_CAPABILITIES[route.runtime].mints_visual_receipts)
+
+    def _pr_runtime(self, selected: cc.SelectedPRRepair, issue: int) -> RuntimeName:
+        if not self.cfg.fix_model_routes:
+            return RuntimeName(self._resolve_runtime_name())
+        state = selected.component.state
+        retained = state.session or state.actual_model
+        if retained is not None:
+            return self._available_runtime(retained.runtime.value)
+        session = self._resolve_handoff_session(issue)
+        return self._available_runtime(session.runtime if session is not None else self._resolve_runtime_name())
 
 
     def _ensure_cwd(self, issue: int, branch: str, state: WorkflowSnapshot | None = None) -> str:
@@ -651,9 +678,7 @@ class FixWorkflow:
             effort=cfg.effort or DEFAULT_EFFORT,
         )
         if notches <= 0:
-            return cfg if tier is None else dataclasses.replace(
-                cfg, model=task_builders.route_model(tier, self.cfg.fixer_runtime)
-            )
+            return cfg if tier is None else self._with_route(cfg, tier)
         operator_pinned = bool(self.cfg.fix and self.cfg.fix.model)
         ceiling = leg == "resolve" and signals.requires_ceiling() and not operator_pinned
         stance = (
@@ -664,13 +689,8 @@ class FixWorkflow:
         # resolve has a router tier and may replace its normal route at the
         # hard-evidence ceiling; resumed repair legs preserve their transcript.
         tiered = tier is not None
-        model = (
-            (
-                task_builders.route_ceiling_model(self.cfg.fixer_runtime)
-                if ceiling else task_builders.route_model(stance.tier, self.cfg.fixer_runtime)
-            )
-            if tiered or ceiling else cfg.model
-        )
+        routed_cfg = self._with_route(cfg, TIER_LADDER[-1] if ceiling else stance.tier) if tiered or ceiling else cfg
+        model = routed_cfg.model
         # Same rule as the journal: name the tier move only when this leg chose
         # a tier, so the log cannot claim a climb the dispatch did not make.
         move = (
@@ -697,11 +717,11 @@ class FixWorkflow:
             if signals.failure_count() >= 2 else cfg.difficulty_notice
         )
         return dataclasses.replace(
-            cfg, model=model, effort=stance.effort, difficulty_notice=notice
+            routed_cfg, effort=stance.effort, difficulty_notice=notice
         )
 
     def _repair_fix_cfg(
-        self, issue: int, leg: str, *, iss=None, review_rounds: int = 0, inherited_model: str = ""
+        self, issue: int, leg: str, *, iss=None, review_rounds: int = 0, inherited_model: str = "", inherited_runtime: RuntimeName | None = None
     ) -> FixTaskConfig | None:
         """Effort-escalated config for a leg that resumes an existing session
         (address-review / fix-CI / rebase / resume). Its model stays attached to
@@ -716,9 +736,12 @@ class FixWorkflow:
         # swapped the routed reasoner for the configured default under the
         # live transcript. A pinned FIX_MODEL still wins; no stored marker
         # (pre-#21 sessions, unrouted resolves) keeps today's fallback.
-        if not cfg.model:
-            if inherited_model:
-                cfg = dataclasses.replace(cfg, model=None if inherited_model == "<runtime-default>" else inherited_model)
+        if inherited_runtime is not None:
+            runtime = self._available_runtime(inherited_runtime.value)
+            cfg = dataclasses.replace(cfg, runtime=runtime,
+                mints_visual_receipts=RUNTIME_CAPABILITIES[runtime].mints_visual_receipts)
+        if inherited_model and (not cfg.model or inherited_runtime is not None and inherited_runtime.value != self._resolve_runtime_name()):
+            cfg = dataclasses.replace(cfg, model=None if inherited_model == "<runtime-default>" else inherited_model)
         # Behind the kill switch: with escalation off nothing reads the labels,
         # so paying a `gh issue view` per repair leg would be pure waste.
         if iss is None and self.cfg.escalate_on_evidence:
@@ -772,8 +795,9 @@ class FixWorkflow:
         if cfg.model:
             return self._escalated(cfg, issue, "resolve", iss=iss), False
         state = self._resolve_state(issue, binding)
+        probe = task_builders.route_selection("trivial", self._resolve_runtime_name(), self.cfg.fix_model_routes)
         task = self._guided(task_builders.build_router_task(
-            as_untrusted(iss.title), as_untrusted(iss.body), runtime=self.cfg.fixer_runtime,
+            as_untrusted(iss.title), as_untrusted(iss.body), model=probe.model, runtime=probe.runtime.value,
             max_budget_usd=cfg.router_budget_usd, cwd=cwd,
         ), state)
         with self._route_receipt() as record_decision:
@@ -784,7 +808,9 @@ class FixWorkflow:
                 )
             except Exception as exc:  # noqa: BLE001 — routing is advisory, never fatal
                 self.cfg.log(f"agent #{issue}: route — failed ({exc}); dispatching unrouted")
-                return self._escalated(cfg, issue, "resolve", iss=iss), False
+                fallback = self._escalated(cfg, issue, "resolve", tier=DEFAULT_TIER if self.cfg.fix_model_routes else None, iss=iss)
+                record_decision(fallback.model, fallback.effort, fallback.runtime.value if fallback.runtime else self._resolve_runtime_name())
+                return fallback, False
             if not self._record_resolve_result(issue, result, ResolveStage.ROUTE, task, binding, outcome.ResolveFollowup.BLOCKED):
                 raise WorkflowAuthorityError("workflow changed while routing")
             tier = result.field("tier")
@@ -793,7 +819,7 @@ class FixWorkflow:
             routed = self._escalated(
                 cfg, issue, "resolve", tier=tier or DEFAULT_TIER, iss=iss
             )
-            record_decision(routed.model, routed.effort)
+            record_decision(routed.model, routed.effort, routed.runtime.value if routed.runtime else self._resolve_runtime_name())
             self.cfg.log(
                 f"agent #{issue}: route — tier={tier or 'unknown'} → model={routed.model}"
             )
@@ -903,8 +929,7 @@ class FixWorkflow:
         cfg = self.cfg.fix
         if cfg is None:
             raise WorkflowAuthorityError("resolve configuration is unavailable")
-        if context.selection.runtime != self._resolve_runtime_name():
-            raise WorkflowAuthorityError("split context belongs to a different runtime")
+        runtime = self._available_runtime(context.selection.runtime)
         model = (
             None
             if context.selection.model == "<runtime-default>"
@@ -913,6 +938,8 @@ class FixWorkflow:
         return dataclasses.replace(
             cfg,
             model=model,
+            runtime=runtime,
+            mints_visual_receipts=RUNTIME_CAPABILITIES[runtime].mints_visual_receipts,
             effort=context.selection.effort,
             difficulty_notice=context.selection.difficulty_notice,
         )
@@ -1138,7 +1165,7 @@ class FixWorkflow:
             retained.selection
             if retained is not None
             else SplitSelection(
-                self._resolve_runtime_name(),
+                fix_cfg.runtime.value if fix_cfg.runtime is not None else self._resolve_runtime_name(),
                 fix_cfg.model or "<runtime-default>",
                 fix_cfg.effort,
                 fix_cfg.difficulty_notice,
@@ -1469,7 +1496,7 @@ class FixWorkflow:
             if not isinstance(repair_selected, cc.SelectedPRRepair):
                 return
             branch = current_pr.head_ref_name
-            runtime = RuntimeName(self._resolve_runtime_name())
+            runtime = self._pr_runtime(repair_selected, issue)
             handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr_existing), branch, runtime)
                        if repair_selected.component.state.actual_model is None and repair_selected.component.state.session is None else None)
             repair = cc.PRRepairInput(repair_selected, branch, runtime, handoff, head=current_pr.head_ref_oid)
@@ -1485,7 +1512,7 @@ class FixWorkflow:
         else:
             assert repair is not None
             session_id = repair.session.handle if repair.session is not None else ""
-            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss, inherited_model=repair.model)
+            fix_cfg = self._repair_fix_cfg(issue, "resume", iss=iss, inherited_model=repair.model, inherited_runtime=repair.runtime)
         task = (
             task_builders.build_resume_task(as_untrusted(reply), cwd, session_id, fix_cfg, fork=fork)
             if session_id else task_builders.build_fresh_reply_task(
@@ -1625,7 +1652,7 @@ class FixWorkflow:
             return
         if not cc.reply_advances(reply_comment.created_at, selected.component.state.consumed_reply_at):
             return
-        runtime = RuntimeName(self._resolve_runtime_name())
+        runtime = self._pr_runtime(selected, issue)
         handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff,
@@ -1636,7 +1663,7 @@ class FixWorkflow:
         iss = self.gateway.get_issue(issue)
         session_id = repair.session.handle
         leg = "fix-ci" if any(check.bucket == "fail" and not check.advisory for check in p.checks) else "resume"
-        fix_cfg = self._repair_fix_cfg(issue, leg, iss=iss, inherited_model=repair.model)
+        fix_cfg = self._repair_fix_cfg(issue, leg, iss=iss, inherited_model=repair.model, inherited_runtime=repair.runtime)
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         fork = max(selected.component.state.resumes, handoff.resumes if handoff is not None else 0) + 1 >= self.cfg.fork_threshold
         if any(check.bucket == "fail" and not check.advisory for check in p.checks):
@@ -1671,7 +1698,11 @@ class FixWorkflow:
             return None
         if isinstance(state, WorkflowSnapshot):
             session = state.episode.continuation.session
-            if session is not None and session.runtime == self._resolve_runtime_name():
+            if session is not None:
+                try:
+                    self._available_runtime(session.runtime)
+                except WorkflowAuthorityError:
+                    return None
                 return session
         return None
 
@@ -1706,7 +1737,7 @@ class FixWorkflow:
         if p.state != "OPEN" or self.gateway.pr_for_issue(issue, require_unique=True) != pr:
             self.cfg.log(f"address-review #{pr}: current issue-to-PR linkage is ambiguous or changed")
             return
-        runtime = RuntimeName(self._resolve_runtime_name())
+        runtime = self._pr_runtime(selected, issue)
         handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff, review=cc.ReviewRepairInput(
@@ -1729,7 +1760,7 @@ class FixWorkflow:
             self._repair_fix_cfg(
                 issue, "address-review",
                 review_rounds=count_outstanding_change_requests(p.reviews, self.cfg.fix_bot),
-                inherited_model=repair.model,
+                inherited_model=repair.model, inherited_runtime=repair.runtime,
             ),
             fork=fork,
         )
@@ -1840,7 +1871,7 @@ class FixWorkflow:
         if not isinstance(issue_selected, cc.SelectedIssueRecovery):
             self.cfg.log(f"fix-ci #{pr}: issue recovery allowance is inactive or blocked")
             return
-        runtime = RuntimeName(self._resolve_runtime_name())
+        runtime = self._pr_runtime(selected, issue)
         handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff,
@@ -1850,7 +1881,7 @@ class FixWorkflow:
         attempt = make_attempt(p.head_ref_oid, [c.name for c in p.checks if c.bucket == "fail"])
         task = dataclasses.replace(self._ci_task(p, issue, cwd,
             session_id=repair.session.handle if repair.session is not None else "",
-            fix_cfg=self._repair_fix_cfg(issue, "fix-ci", inherited_model=repair.model)), pr_repair_input=repair)
+            fix_cfg=self._repair_fix_cfg(issue, "fix-ci", inherited_model=repair.model, inherited_runtime=repair.runtime)), pr_repair_input=repair)
         self.runner.set_context("fix", "FIX_CI", pr, issue, workflow=selected.binding)
         result = await self._run_pr_logged("fix-ci", issue, task, p, kind="FIX_CI", guidance=guidance)
         # An externally-killed session made no attempt, so it must not march the
@@ -1910,7 +1941,7 @@ class FixWorkflow:
         if p.state != "OPEN" or self.gateway.pr_for_issue(issue, require_unique=True) != pr:
             self.cfg.log(f"rebase #{pr}: current issue-to-PR linkage is ambiguous or changed")
             return
-        runtime = RuntimeName(self._resolve_runtime_name())
+        runtime = self._pr_runtime(selected, issue)
         handoff = (control.pr_repair_handoff(issue, PullRequestRef(pr), p.head_ref_name, runtime)
                    if selected.component.state.actual_model is None and selected.component.state.session is None else None)
         repair = cc.PRRepairInput(selected, p.head_ref_name, runtime, handoff, rebase=cc.RebaseRepairInput(
@@ -1919,7 +1950,7 @@ class FixWorkflow:
         cwd = self._ensure_cwd(issue, p.head_ref_name)
         task = task_builders.build_rebase_task(
             pr, self.cfg.base_branch, cwd, repair.session.handle if repair.session is not None else "",
-            self._repair_fix_cfg(issue, "rebase", inherited_model=repair.model)
+            self._repair_fix_cfg(issue, "rebase", inherited_model=repair.model, inherited_runtime=repair.runtime)
         )
         task = dataclasses.replace(task, pr_repair_input=repair)
         self.runner.set_context("fix", "REBASE", pr, issue, workflow=selected.binding)

@@ -26,6 +26,8 @@ DEFAULT_CACHE_READ_DISCOUNT = Decimal("0.1")
 # https://developers.openai.com/api/docs/models/gpt-6-astra
 CODEX_DEFAULT_MODEL_RATES: tuple[tuple[str, float, float], ...] = (
     ("gpt-6-astra", 10.0, 50.0),
+    ("gpt-6.1-sol", 2.0, 10.0),
+    ("gpt-6-luna", 0.1, 0.5),
 )
 
 
@@ -36,6 +38,14 @@ def with_default_model_rates(
     return configured + tuple(
         row for row in CODEX_DEFAULT_MODEL_RATES if row[0] not in names
     )
+
+
+def default_cache_read_rate(model: str | None, input_rate: float) -> float:
+    return input_rate / (20 if (model or "").strip().casefold() == "gpt-6.1-sol" else 10)
+
+
+def default_cache_write_rate(model: str, input_rate: float) -> float:
+    return input_rate * (1.25 if model.strip().casefold() in {row[0] for row in CODEX_DEFAULT_MODEL_RATES} else 1.0)
 
 
 class UnknownModelPolicy(str, Enum):
@@ -222,7 +232,7 @@ def parse_model_rate_table(
             rate_cached = (
                 float(components[2])
                 if len(components) == 3
-                else float(Decimal(components[0]) * DEFAULT_CACHE_READ_DISCOUNT)
+                else default_cache_read_rate(model, rate_in)
             )
             for value in (rate_in, rate_out, rate_cached):
                 usd_per_million_to_micros(value)

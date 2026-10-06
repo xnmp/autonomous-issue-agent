@@ -1,6 +1,6 @@
 # Architecture — how the harness works now
 
-Current as of 2026-10-05. This supersedes the numbered `0N-*.md` specs in
+Current as of 2026-10-06. This supersedes the numbered `0N-*.md` specs in
 `docs/archive/`, which describe the **original bash design**: the scripts they
 document have been deleted. Only the shared `plugin/hooks/checks/` gate stack
 remains because Codex uses it on the live Python path.
@@ -37,6 +37,10 @@ The layering is hexagonal and **machine-enforced** (import-linter contracts
 in `make test`): `domain/` is pure — no I/O, no env, no clock — `adapters/` is
 I/O, `app/` is wiring. New pure logic goes in `domain/`; new I/O goes behind an
 existing adapter or an injected callable.
+`domain/model_routing.py` validates immutable difficulty-tier provider/model
+selections. `adapters/runtime_selection.py` selects the existing governed
+provider stack before paid admission; each stack retains its own accounting
+runtime under one journaling wrapper. This adds no lifecycle state or worker.
 The Pyrefly seam gate structurally assigns every production adapter to each
 domain port it implements. An AST coverage contract requires every newly
 declared Protocol to join that checked set or an explicit documented exemption,

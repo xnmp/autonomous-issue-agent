@@ -64,6 +64,13 @@ class AccountedFixtureWorkflow(FixWorkflow):
             owner_id="o/r:fix:fixture", max_contract_rounds=self.cfg.max_contract_rounds,
             fix_infra_ceiling=getattr(self, "_fixture_infra_ceiling", 5),
         )
+        if self.cfg.available_fix_runtimes:
+            from issue_agent.adapters.runtime_selection import SelectingRuntime
+            from issue_agent.domain.agent_task import RuntimeName
+            accounted = SelectingRuntime({
+                provider: dataclasses.replace(accounted, runtime_name=provider.value)
+                for provider in self.cfg.available_fix_runtimes
+            }, RuntimeName(self._resolve_runtime_name()))
         journalled = original if isinstance(original, JournalingRuntime) else JournalingRuntime(
             accounted, Journal(str(Path(self.store._workflow_dir.name) / "events.jsonl")), repo="o/r", role="fix",
         )

@@ -13,6 +13,8 @@ Async because AgentRunner.run is async (the SDK query is a coroutine).
 
 from __future__ import annotations
 
+from ..domain.model_routing import ModelRoute
+
 import asyncio
 from dataclasses import dataclass, replace
 from collections.abc import Callable
@@ -103,6 +105,8 @@ class DispatchConfig:
 
     # Kill switch for the evidence-driven tier/effort ladder (#16). See
     # FixWorkflowConfig.escalate_on_evidence.
+    fix_model_routes: tuple[ModelRoute, ...] = ()
+    available_fix_runtimes: frozenset[RuntimeName] = frozenset()
     escalate_on_evidence: bool = True
     # Paid accounting is enforced by the runtime wrapper over SQLite. These two
     # fields only provide durable run attribution.
@@ -148,6 +152,8 @@ class DispatchConfig:
             log=self.log,
             fix_bot=self.fix_bot,
             fixer_runtime=self.fixer_runtime,
+            fix_model_routes=self.fix_model_routes,
+            available_fix_runtimes=self.available_fix_runtimes,
             escalate_on_evidence=self.escalate_on_evidence,
             infra_breaker=self.infra_breaker,
             operator_guidance=self.operator_guidance,

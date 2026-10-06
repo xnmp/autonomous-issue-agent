@@ -29,6 +29,7 @@ from ...domain.environment import EnvironmentManifest
 from ...domain.world import PRView
 from ...domain.trust import Untrusted, as_untrusted, untrusted_block
 from ...adapters.runtime_plan import McpServer, SubagentDef
+from ...domain.model_routing import ModelRoute
 from ...domain.agent_task import RuntimeName
 from ...domain.effort import DEFAULT_TIER, Effort, TIER_LADDER
 from ...domain.jira import (
@@ -82,6 +83,7 @@ class FixTaskConfig:
     # produce. Empty = probe unavailable → no section. Provenance:
     # harness-owned, see `_environment_manifest_section`.
     environment_manifest: EnvironmentManifest = EnvironmentManifest()
+    runtime: RuntimeName | None = None
 
 
 # ── fixer tool policy ─────────────────────────────────────────────────────────
@@ -266,6 +268,7 @@ def build_resolve_task(
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -325,6 +328,7 @@ def build_author_task(
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -383,6 +387,7 @@ def build_implement_task(
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -431,6 +436,7 @@ def build_adjudicate_task(
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -480,6 +486,7 @@ def build_resume_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -515,6 +522,7 @@ def build_fresh_reply_task(
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -561,6 +569,7 @@ def build_address_review_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -683,6 +692,7 @@ def build_fix_ci_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -720,6 +730,7 @@ def build_rebase_task(
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
         model=cfg.model,
+        runtime=cfg.runtime,
         effort=cfg.effort,
         max_budget_usd=cfg.max_budget_usd,
         cwd=cwd,
@@ -788,6 +799,15 @@ def route_model(tier: str, runtime: str = "claude") -> str:
     return tiers.get(tier) or tiers[DEFAULT_TIER]
 
 
+def route_selection(tier: str, runtime: str = "claude", overrides: tuple[ModelRoute, ...] = ()) -> ModelRoute:
+    selected_tier = tier if tier in TIER_LADDER else DEFAULT_TIER
+    for route in overrides:
+        if route.tier == selected_tier:
+            return route
+    provider = RuntimeName(runtime) if runtime in MODEL_TIERS else RuntimeName.CLAUDE
+    return ModelRoute(selected_tier, provider, route_model(selected_tier, provider.value))
+
+
 def route_ceiling_model(runtime: str = "claude") -> str:
     """The explicit expensive fallback reserved for proven-hard work.
 
@@ -829,6 +849,7 @@ def build_router_task(
         f"{_fenced('issue body', body)}"
     )
     return PlannedRun(
+        runtime=RuntimeName(runtime),
         prompt=prompt, schema=ROUTER_SCHEMA, disallowed_tools=FIXER_DENY,
         model=model or route_model("trivial", runtime),
         max_budget_usd=max_budget_usd, cwd=cwd,

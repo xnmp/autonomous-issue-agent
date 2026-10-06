@@ -479,11 +479,13 @@ class _DeferredRouteReceipt:
     duration_s: float = 0.0
     model: str = ""
     effort: str | None = None
+    selected_runtime: str | None = None
     context: RunContext | None = None
     run_id: str = ""
     leg_id: str = ""
 
-    def decide(self, model: str | None, effort: object | None) -> None:
+    def decide(self, model: str | None, effort: object | None, runtime: str | None = None) -> None:
+        self.selected_runtime = runtime
         self.model = model or ""
         self.effort = getattr(effort, "value", effort) or None
 
@@ -792,6 +794,7 @@ class JournalingRuntime:
     ) -> None:
         try:
             ctx = self.context
+            actual_runtime = task.runtime.value if task.runtime is not None else self.runtime
             cost = float(getattr(result, "cost_usd", 0.0) or 0.0)
             usage = _usage(result.usage)
             # The stream-summed accumulator, journaled beside `usage`. The two are
@@ -808,6 +811,8 @@ class JournalingRuntime:
                     "model": route_decision.model,
                     "effort": route_decision.effort,
                     "probe_model": probe_model,
+                    "probe_runtime": actual_runtime,
+                    "selected_runtime": route_decision.selected_runtime,
                 }
                 if route_decision is not None else {"model": probe_model}
             )
@@ -819,6 +824,8 @@ class JournalingRuntime:
                 "number": ctx.number,
                 "effort": route_fields.get("effort"),
                 "probe_model": route_fields.get("probe_model"),
+                "probe_runtime": route_fields.get("probe_runtime"),
+                "selected_runtime": route_fields.get("selected_runtime"),
                 "envelope_subtype": (
                     getattr(result, "envelope_subtype", "") or None
                 ),
@@ -850,12 +857,12 @@ class JournalingRuntime:
                         ),
                         max(0, int(round(duration_s * 1000))),
                         str(route_fields.get("model") or probe_model),
-                        self.runtime,
+                        actual_runtime,
                         Money.from_major("USD", max(0.0, cost)).micros,
                         "USD",
                         (
                             "configured_rate_card"
-                            if self.runtime == "codex"
+                            if actual_runtime == "codex"
                             else "provider_reported"
                         ),
                         usage,

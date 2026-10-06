@@ -24,6 +24,7 @@ import shutil
 from dataclasses import dataclass
 
 from .codex_resolution import Finding
+from .config import fix_runtime_names_from_env
 
 RUNTIME_KEYS = ("FIXER_RUNTIME", "REVIEWER_RUNTIME", "STEWARD_RUNTIME")
 # Roles shell out to these regardless of runtime; a service PATH that cannot
@@ -154,7 +155,7 @@ def _selected_runtime_binaries(env: dict) -> tuple[tuple[str, str], ...]:
     binary, so absence from PATH is suspicious but not fatal."""
     runtimes = {
         _unquoted((env.get(key) or "").strip()).lower() for key in RUNTIME_KEYS
-    }
+    } | fix_runtime_names_from_env(env)
     binaries: list[tuple[str, str]] = []
     codex_pin = _unquoted((env.get("CODEX_BIN") or "").strip())
     if "codex" in runtimes or codex_pin:

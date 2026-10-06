@@ -76,6 +76,30 @@ Important fields:
   resolves to `sonnet` under claude and to the Codex runner's own default
   under codex).
 - `MAX_BUDGET_USD` / `REVIEW_BUDGET_USD` bound a leg.
+- Configure implementer tiers with `FIX_MODEL_LOW`, `FIX_MODEL_MED`,
+  `FIX_MODEL_HIGH`, and `FIX_MODEL_XHIGH`, each as `runtime:model`. They map
+  to trivial, standard, complex, and exceptional difficulty. For example:
+
+  ```sh
+  FIX_MODEL=""
+  FIX_MODEL_LOW="codex:gpt-6-luna"
+  FIX_MODEL_MED="codex:gpt-6.1-sol"
+  FIX_MODEL_HIGH="claude:claude-opus-5-5"
+  FIX_MODEL_XHIGH="codex:gpt-6-astra"
+  ```
+
+  Blank tier settings retain the built-in ladder. Partial overrides are
+  supported. Malformed selections and known model/provider mismatches fail
+  configuration validation. A configured ladder uses Low for classification
+  and Med if classification fails. Each purchase uses its selected provider's
+  hooks and accounting; Claude and Codex remain available while overrides are
+  enabled so changing a tier preserves existing sessions, split stages and PR
+  repairs. Clearing every tier override restores single-provider operation;
+  finish existing cross-provider work first or retain an explicit override
+  until its transcripts are no longer needed. Returning to a single provider
+  can require a fresh PR repair session or leave an issue resume held.
+  `FIX_MODEL` still pins fresh work to `FIXER_RUNTIME` and bypasses
+  classification. Review and steward model settings are independent.
 - Unpinned implementers route by difficulty: `complex` uses Sol/Opus;
   `exceptional` uses Astra/Fable under Codex/Claude. Recurrence or two
   completed resolve/CI failures also select that exceptional ceiling. A pinned

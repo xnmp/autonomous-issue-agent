@@ -22,6 +22,7 @@ from ..adapters.agent_runner import DEFAULT_MAX_BUFFER_BYTES
 from ..adapters.control_path import machine_control_authority_root
 from ..adapters.env_file import source_env_file
 from ..domain.agent_task import RuntimeName
+from ..domain.model_routing import ModelRoute, parse_model_route
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.resolve_split import MAX_SPLIT_TRAIL
 from ..domain.review_rejection import MAX_COUNTED_REVIEWS
@@ -41,6 +42,23 @@ from ..domain.repository import (
     repository_validation_error,
 )
 
+
+
+FIX_MODEL_TIER_ENV_KEYS = ("FIX_MODEL_LOW", "FIX_MODEL_MED", "FIX_MODEL_HIGH", "FIX_MODEL_XHIGH")
+
+
+def fix_runtime_names_from_env(env: dict) -> frozenset[str]:
+    """Readiness includes providers retained for mixed-tier transcript continuity.
+
+    Doctor renders malformed configuration too; full model-route validation
+    remains the immutable config boundary rather than raising during discovery.
+    """
+    values = tuple(str(env.get(key) or "").strip().strip("\"'") for key in FIX_MODEL_TIER_ENV_KEYS)
+    providers = {value.partition(":")[0] for value in values if value}
+    if any(values):
+        providers.update(("claude", "codex"))
+    primary = str(env.get("FIXER_RUNTIME") or "").strip().strip("\"'").lower()
+    return frozenset(providers | ({primary} if primary else set()))
 
 SHELL_CMD_LOG_LIMIT = 120
 REPOINT_HISTORY_ENV = "REPOINTED_FROM_DEPLOYMENTS"
@@ -460,6 +478,11 @@ class HarnessConfig:
     steward_error_ceiling: int = DEFAULT_STEWARD_ERROR_CEILING
     review_trigger_label: str = "ai-pr-open"
     fix_model: str | None = None
+    # Explicit runtime:model overrides; empty retains the runtime-specific ladder.
+    fix_model_low: str = ""
+    fix_model_med: str = ""
+    fix_model_high: str = ""
+    fix_model_xhigh: str = ""
     # FIX_EFFORT: base reasoning effort for the fix legs, runtime-agnostic
     # (harness #16). None = say nothing and leave each runtime on its own default
     # — CODEX_REASONING_EFFORT for codex, the SDK's own for Claude — which is
@@ -734,6 +757,22 @@ class HarnessConfig:
         object.__setattr__(self, "repo", canonical_repository(self.repo))
 
     @property
+    def fix_model_routes(self) -> tuple[ModelRoute, ...]:
+        return tuple(parse_model_route(tier, value) for tier, value in (
+            ("trivial", self.fix_model_low), ("standard", self.fix_model_med),
+            ("complex", self.fix_model_high), ("exceptional", self.fix_model_xhigh),
+        ) if value.strip())
+
+    @property
+    def fix_runtimes(self) -> frozenset[RuntimeName]:
+        if not self.fix_model_routes:
+            return frozenset({self.fixer_runtime})
+        # Both native providers remain available to resume existing transcripts
+        # after a tier is reassigned. GLM additionally requires its operator profile.
+        return frozenset({self.fixer_runtime, RuntimeName.CLAUDE, RuntimeName.CODEX,
+            *(route.runtime for route in self.fix_model_routes)})
+
+    @property
     def config_version(self) -> str:
         """Stable identity of the immutable snapshot used by one admission."""
 
@@ -861,6 +900,17 @@ class HarnessConfig:
         # traceback three frames deep in int()/float()) and must never be lost
         # behind a range check on the substituted default.
         errors: list[str] = list(self.parse_errors)
+        for tier, name, value in (
+            ("trivial", "FIX_MODEL_LOW", self.fix_model_low),
+            ("standard", "FIX_MODEL_MED", self.fix_model_med),
+            ("complex", "FIX_MODEL_HIGH", self.fix_model_high),
+            ("exceptional", "FIX_MODEL_XHIGH", self.fix_model_xhigh),
+        ):
+            if value.strip():
+                try:
+                    parse_model_route(tier, value)
+                except ValueError as exc:
+                    errors.append(f"{name}: {exc}")
         _require_positive(errors, "POLL_SECONDS", self.poll_seconds)
         _require_positive(
             errors, "FIX_DISPATCH_CONCURRENCY", self.fix_dispatch_concurrency
@@ -960,7 +1010,7 @@ class HarnessConfig:
             ("JIRA_SYNC_BUDGET_USD", self.jira_budget_usd),
         ):
             _require_positive(errors, name, value)
-        if self.fixer_runtime is RuntimeName.GLM and not self.glm_settings_file.strip():
+        if (self.fixer_runtime is RuntimeName.GLM or any(value.strip().startswith("glm:") for value in (self.fix_model_low, self.fix_model_med, self.fix_model_high, self.fix_model_xhigh))) and not self.glm_settings_file.strip():
             # The glm runtime IS "the Claude runner plus a profile's env"; with no
             # profile there is nothing to inject and the fixer would silently run
             # on Anthropic credentials instead. Existence of the file is a
@@ -1086,6 +1136,10 @@ class HarnessConfig:
             f"escalate={'on' if self.escalate_on_evidence else 'off'} "
             f"dispatch_concurrency={self.fix_dispatch_concurrency} "
             f"{fix_budget}",
+            f"fix_tiers: low={self.fix_model_low or '(default)'} "
+            f"med={self.fix_model_med or '(default)'} "
+            f"high={self.fix_model_high or '(default)'} "
+            f"xhigh={self.fix_model_xhigh or '(default)'}",
             f"reviewer={self.reviewer_runtime.value} review_model={model(self.review_model)} "
             f"mode={self.review_mode.value} review_budget=${self.review_budget_usd:.2f} "
             f"rejections_cap={self.max_review_rejections}",

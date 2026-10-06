@@ -340,3 +340,42 @@ cohort: GPT-6 Luna, GPT-6.1 Sol through Codex, Claude Opus 5.5, and GPT-6 Astra.
 Provider selection, accounting and persisted-session continuity must match
 those choices. No fresh window is armed while this implementation and its
 new profile, accounting bound and qualification remain incomplete.
+
+### Configurable implementation tiers — October 6
+
+The requested implementation ladder is now configurable through
+`FIX_MODEL_LOW`, `FIX_MODEL_MED`, `FIX_MODEL_HIGH`, and `FIX_MODEL_XHIGH`.
+The settings use explicit `runtime:model` selections: Codex GPT-6 Luna,
+Codex GPT-6.1 Sol, Claude Opus 5.5, and Codex GPT-6 Astra respectively.
+The router uses Low; malformed or unavailable classification falls back to
+Med. Evidence escalation selects the configured exceptional ceiling.
+Each selected provider enters its own existing governed/accounted runtime
+before admission, under one journaling wrapper. Existing issue sessions,
+split selections and PR repair transcripts retain their originating provider
+and model when explicit tiers are reassigned. Returning all tiers to blank
+restores the documented single-provider behavior. Review and steward model
+settings remain independent.
+
+Independent adversarial review accepted routing, containment, shared caps,
+asynchronous correlation, continuity, readiness and pricing. Four production
+composition cases verified distinct provider dispatch through real SQL and
+temporary Git workspaces, with exact persisted runtime/model, observable
+issue disposition and settled reservations. New regressions also cover
+malformed input, fixed-model overrides, classifier failure, escalation,
+session/PR handoff, split execution, telemetry and missing tier-selected
+binaries. The full `make test` gate passed: 3,673 domain, 3,542 adapter and
+3,438 application cases, plus hooks and the other required contracts. The
+adapter suite took 275.97 seconds. An initial run passed the functional suites
+but exposed a missing architecture manifest entry; its corrected clean run
+is preserved alongside it.
+
+At 01:26:03 UTC, shared defaults and both launch snapshots received exactly
+the four tier settings and `FIX_MODEL=""`; all other inputs and USD 25 caps
+were preserved. Operator/service configuration versions agree on
+`9a39b52f0775815b`, and their file hashes are equal. Private before/after
+snapshots and the application report are at
+`model-tier-configuration-20261006T012603Z/` in the existing evidence root.
+The requested Codex IDs are present in the local model cache; native Claude
+credentials are present. This is offline qualification, not a paid model
+pilot or unattended coverage. All roles/timers remain stopped. A new frozen
+mixed-provider cohort and bounded allocation must precede the next window.

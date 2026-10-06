@@ -21,8 +21,10 @@ binding. The bounded correction preserves the recovery authority; full-planner,
 durable-effect and target-isolation regressions, independent review and the
 complete gate passed on October 6. No validation guard was weakened.
 Two fresh full windows, a new exact schedule/profile freeze and stopped
-readouts remain required. The user also requested configurable low/med/high/xhigh
-model routing; that work precedes the next frozen cohort. Prior admissions and
+readouts remain required. The requested configurable low/med/high/xhigh
+model routing is implemented, independently reviewed, fully tested and applied
+to both stopped launch snapshots. The new mixed-provider profile needs a fresh
+qualification and freeze before admission. Prior admissions and
 the canary retain their spend and the approved aggregate bound.
 Current evidence,
 target qualification, authorization and finite controls are recorded in the

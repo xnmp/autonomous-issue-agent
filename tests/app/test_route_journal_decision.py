@@ -100,3 +100,23 @@ def test_concurrent_route_receipts_keep_task_local_decisions(tmp_path):
         (5, 5, "opus", "haiku"),
         (7, 7, "sonnet", "haiku"),
     }
+
+
+def test_mixed_route_receipt_attributes_probe_cost_to_actual_provider(tmp_path):
+    from issue_agent.domain.agent_task import RuntimeName
+    from issue_agent.domain.events import AgentRunCompleted
+    from tests.adapters.test_journal_correlation import _CapturingSink
+    journal = _CapturingSink()
+    runtime = JournalingRuntime(SeqRunner([AgentResult(False, status="done", cost_usd=0.1)]),
+                               journal, repo="o/r", role="fix", runtime="claude")
+    async def dispatch():
+        runtime.set_context("fix", "RESOLVE", 5, 5)
+        with runtime.route_receipt() as decide:
+            with runtime.leg_kind("ROUTE"):
+                await runtime.run(RuntimePlan("classify", runtime=RuntimeName.CODEX, model="gpt-6-luna"))
+            decide("claude-opus-5-5", Effort.HIGH, "claude")
+    asyncio.run(dispatch())
+    route = next(event.payload for event in journal.events if isinstance(event.payload, AgentRunCompleted))
+    assert (route.runtime, route.pricing_basis, route.attributes["probe_runtime"], route.attributes["probe_model"]) == (
+        "codex", "configured_rate_card", "codex", "gpt-6-luna")
+    assert (route.attributes["selected_runtime"], route.model) == ("claude", "claude-opus-5-5")
