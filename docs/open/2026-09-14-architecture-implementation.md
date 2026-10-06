@@ -23,9 +23,23 @@ complete gate passed on October 6. No validation guard was weakened.
 Two fresh full windows, a new exact schedule/profile freeze and stopped
 readouts remain required. The requested configurable low/med/high/xhigh
 model routing is implemented, independently reviewed, fully tested and applied
-to both stopped launch snapshots. The new mixed-provider profile needs a fresh
-qualification and freeze before admission. Prior admissions and
+to both stopped launch snapshots. The new mixed-provider profile is qualified;
+a final freeze is required before full-window admission. Prior admissions and
 the canary retain their spend and the approved aggregate bound.
+Stopped recovery has reopened the three current accounted targets while
+preserving historical holds, money and retries. The replacement snapshots
+use USD 20 daily/global, USD 10 fix and USD 5 review ceilings, with issue USD 25.
+The new-profile ordinary qualification exposed an ambient desktop-plugin
+dependency; its failed receipt is retained. A separately reviewed explicit
+clean-configuration test policy passed the full suite in 19.16 seconds with
+unchanged source and completed cleanup. The target then advanced through
+PR #998; its full ordinary command and four native scenarios also passed.
+The exact frozen one-tick canary started at 02:32 UTC and stopped by 02:35.
+It verified admission and bounded cancellation/cleanup, settled USD 2.582646,
+and left no active obligations. Its interrupted inherited PR repair did not
+complete implementation. Ordinary supervision is restored, window 1's future
+stop is armed, and the final freeze precedes its still-unarmed start. Window 2
+remains conditional on the first full stopped readout and adjudication.
 Current evidence,
 target qualification, authorization and finite controls are recorded in the
 [live execution record](2026-10-05-phase-5-live-execution.md).

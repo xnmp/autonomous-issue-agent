@@ -9,10 +9,13 @@ remain accepted. Phase 5 still requires actual unattended windows and readout.
 
 ## Authorization and current state
 
-**October 6, 00:23 UTC:** all roles and window timers are stopped. Both live
-attempts ended as partial coverage. Historical arming instructions below are
-cancelled; the functional incident and pending model-tier configuration are
-recorded at the end of this document. Two full windows remain outstanding.
+**October 6, 02:40 UTC:** the qualified mixed-profile one-tick canary is stopped
+and fully accounted for. Ordinary supervision is restored, and window 1's
+October 8 03:00 UTC stop is armed. Both full-window starts remain unarmed
+pending the final freeze. Model tiers, the lower allocation and the explicit
+clean-configuration test policy are applied. Current target `5680ec0c` passed the full ordinary
+command and all four native scenarios before the canary freeze. Both earlier
+live attempts remain partial coverage. Two full windows remain outstanding.
 
 The bounded window approval and the user's later instruction, “approved, and
 all subsequent accounting decisions approved,” remain in force. They cover
@@ -49,7 +52,7 @@ qualification and current-target evidence. Files and nested directory entries
 were synchronized before live initialization. Rollback means stopped services
 or current compatible SQL code; older schema-39 code must not run this authority.
 
-## Current target qualification
+## Initial October 5 target qualification
 
 The supported target is Linux/x86_64 `xnmp/tauri-explorer`, with `dev` base,
 Codex and WebKitGTK. The isolated checkout is pinned to
@@ -379,3 +382,126 @@ The requested Codex IDs are present in the local model cache; native Claude
 credentials are present. This is offline qualification, not a paid model
 pilot or unattended coverage. All roles/timers remain stopped. A new frozen
 mixed-provider cohort and bounded allocation must precede the next window.
+
+### Stopped recovery and replacement allocation — October 6
+
+The copied-state rehearsal used real copied SQL, observed target facts, a fake
+remote/provider and fixture-only publication capabilities. It cleared the
+current #755/#938 projections under truthful USD 25 limits, preserved their
+infra/retry counts, and verified PR #997's original Codex `gpt-5.6-sol`
+transcript and fresh USD 10 repair admission. Recovery preserved copied money
+rows; the copied leg then settled 80 configured-card micros. No live paid call
+or source database change occurred in that rehearsal.
+
+Independent review accepted the actual stopped preparation, including durable
+before/after evidence and fresh source selection. At 01:51 UTC, the production
+executor applied only the two valid automatic projections: #755/#938 became
+ready and each self-clear count advanced from zero to one. PR #997's exact
+open head/link to #848 was rechecked; an explicit existing operator label
+transport removed its two budget labels. Fresh full-planner selection then
+discarded #848's stale marker. This was an operator reattempt decision, not a
+claim that the old USD 20 reservation fit its issue headroom. All roles stayed
+stopped, and runs, charges, reservation values, infra and retry counts were
+preserved. All 297/165 historical holds remained intact.
+
+At 01:54:27 UTC, both launch snapshots received exactly four lower-ceiling
+overrides: repository/global daily USD 20, fix USD 10 and review USD 5. The
+issue cap remains USD 25; model tiers and all other inputs are unchanged.
+Both snapshots agree on `3d55a2921d284b9a`; the rendered profile is
+`57d8e768fb21661a`. The [timing amendment](2026-10-05-phase-5-window-timing-amendment.md)
+records prospective October 6–8 and October 8–10 full intervals and a verified
+USD 120.520961 combined bound, including prior October 5/6 charges. No window
+is armed. Human effort remains unknown; both actual preparation interventions
+are recorded through the existing measurement API.
+
+The new-profile ordinary command ran on unchanged target `0a29f541` with the
+same 600-second executor bound and private caches. It failed with exit 101 in
+15,632 ms at 01:55:42 UTC. Source proofs are equal and teardown left no owned
+process. The failure receipt and log remain immutable under
+`bounded-model-profile-20261006T015427Z/`; a complete-output diagnostic is
+underway. Successful current-profile qualification and a bounded canary are
+still required before the final source/configuration/cohort freeze.
+
+### Clean test profile and advanced target — October 6
+
+The complete-output diagnostic reproduced one genuine Rust assertion failure.
+The rename test discovered the operator's enabled Trace provenance plugin, but
+a headless unit has no initialized plugin host. The warning was “Rename
+completed, but Trace could not update its locator: Plugin host is not
+initialized.” No user plugin was launched, written or disabled; the desktop
+application remained untouched. The failure and diagnostic logs are retained.
+
+Independent review accepted an explicit operator test-policy change. Each
+`TEST_CMD` invocation now creates a fresh private `XDG_CONFIG_HOME`, runs the
+same full Vitest and Cargo suites and assertions, and cleans up on normal exit.
+Setup or cleanup failures return infrastructure exit 125, preserving genuine
+suite exit codes. The policy isolates configuration; it does not claim to
+isolate every XDG data or cache path, and a kill/reboot can leave owned scratch.
+This is clean-profile test coverage, with native plugin scenarios qualified
+separately. It does not repair the upstream ambient-profile-dependent fixture.
+
+At 02:14:59 UTC, both stopped launch snapshots received only the new `TEST_CMD`.
+Harness configuration versions remain `3d55a2921d284b9a`/`57d8e768fb21661a`;
+the frozen test-evidence identity changed. The bounded executor then passed
+the full suite on `0a29f541` in 19,160 ms. Actual harness HEAD/import path and
+all 213 gate-input hashes were verified; tracked pre/post proofs are equal.
+Process groups and trees are empty, the retained launch intent is cancelled,
+and the private configuration directory was removed. The earlier failed
+receipt remains separate and unchanged. Immutable artifacts are under
+`private-test-profile-20261006T021459Z/`. Qualification-specific compiler-cache
+overrides remain explicit; this receipt does not pretend to have the service's
+exact workload environment digest.
+
+The bounded canary controls disable automatic and forced reload restarts,
+limit each role to one tick, and arm an absolute 02:40 UTC stop before any
+start. Its prestart freeze refused admission when the actual target `dev` had
+advanced to `5680ec0c` via PR #998. That change adds plugin installation and
+native file-picker behavior. Fresh ordinary and native qualification is
+required; no paid service was started and neither full-window start is armed.
+A missed proposed start will be postponed and its period bound recalculated.
+
+Current-target qualification completed before canary launch: `5680ec0c`'s full
+ordinary command passed in 94,482 ms with equal tracked proofs and all 213
+harness hashes matching the full gate. Native build took 48.603 seconds; all
+four unchanged scenarios passed in 7.6 seconds. Actual remote tip, checkout
+and merge-base matched after qualification. Owned native processes and fixture
+were removed; ordinary supervision retained only a cancelled tombstone. The
+prior binary and receipts were preserved. The new binary SHA256 is
+`7f37d4acc62dca25d64ee5fdaff6f37f37b730c029677cc2e7f2f734e3dd91f5`.
+
+The exact current-source/configuration/timer/ledger freeze succeeded. All three
+roles reached readiness on October 6 at 02:32:15–16 UTC with zero restarts.
+The fix role admitted `ADDRESS_REVIEW` for PR #997 under rendered configuration
+`57d8e768fb21661a`, with a USD 10 reservation and its original `gpt-5.6-sol`
+provider/session. A grooming leg for #755 completed; review and steward then
+finished their one tick and stopped. This does not claim live execution of
+all four new tier models. The fix leg and stopped accounting readout remain
+pending, and no full window is armed. Canary spend shares October 6's existing
+USD 20 daily ceiling. The test-profile preparation intervention is recorded
+with unknown human duration through the existing measurement API.
+
+### Stopped mixed-profile canary — October 6
+
+All roles finished their one tick before the absolute stop. The fix role
+began draining at 02:33:34; its remaining repair exceeded the shutdown grace
+and was killed at 02:34:44. The normal recovery classified it as infrastructure
+death, not a successful agent attempt. PR #997 remains open at its original
+`9fbfd98d` head. No implementation or review approval is claimed.
+
+The October 6 02:37:38 stopped readback verified zero active runs, reservations,
+leases, dispatch claims, pending lifecycle commands, process groups or process
+trees. Launch-intent records are cancelled tombstones. Both legs have trusted
+configured-card settlement totaling **USD 2.582646**. Known October 6 charges
+are now USD 4.523293, inside its existing USD 20 allowance. The source and
+profile were unchanged; historical holds and all real retry/infra counters
+remain preserved. Evidence is immutable under
+`mixed-profile-canary-stopped-20261006T023738Z/`, including stopped SQL,
+journals, actual PR readback and separate cohort exports. Twenty-eight actual
+admission binding references form the explicit inherited window export.
+
+This canary qualifies admission, accounting and bounded cancellation/cleanup.
+It does not establish implementation success or live access to every new tier
+model. Hosted CI for `d5a6d42` remains in progress; the complete local gate is
+green. At 02:41 UTC, ordinary supervision was restored and the October 8 03:00 UTC
+stop was armed and read back. The proposed full interval requires the final
+documented source/configuration/cohort freeze before its still-unarmed start.

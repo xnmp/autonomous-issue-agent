@@ -5,12 +5,58 @@ five-period allocation. The [execution record](2026-10-05-phase-5-live-execution
 records the completed preparation and two partial attempts. The October 5
 14:30 release ended with a reboot; the replacement 23:00 release was stopped
 on October 6 at 00:23:08 after a functional budget-recovery planner failure.
-All role services and all window/canary timers are inactive. Neither attempt
+The current-profile one-tick canary started at 02:32 UTC after qualification
+and freeze, with the 02:40 UTC stop armed first. It stopped by 02:35 and
+settled USD 2.582646. Ordinary supervision is restored and the window-1 stop
+is armed for October 8 03:00 UTC; both starts and window 2's stop are inactive.
+Canary spend stays inside October 6's existing allowance. Neither earlier attempt
 supplies full 48-hour acceptance. The schedules below are cancelled historical
-controls, not future authorization to catch up. Two fresh full intervals need
-new period arithmetic and a final profile/source/cohort freeze, including the
-requested configurable model tiers. Prior charges remain counted against the
+controls, not future authorization to catch up. The replacement allocation
+below is verified; the two full intervals still need final source/profile/cohort
+freezes and actual coverage. Prior charges remain counted against the
 approved aggregate bound; no allowance or held workflow is reset.
+
+## Replacement mixed-profile allocation — October 6
+
+This supersedes the cancelled calendars below. The candidate first interval
+is October 6 03:00 through October 8 03:00 UTC; the conditional second is
+October 8 03:45 through October 10 03:45 UTC. Each is exactly 48 hours.
+Neither start is armed. The first release requires successful current-profile
+qualification, a bounded canary and the final freeze. A missed start is
+postponed with new period arithmetic; it is never caught up.
+
+There are five future UTC budget periods, October 6–10, plus the already-paid
+October 5 period. The repository/global caps are now USD 20 per future day;
+the issue cap remains USD 25, fix legs are bounded at USD 10 and review legs
+at USD 5. October 6's known USD 4.523293, including the latest canary, is inside its
+USD 20 allowance.
+The combined ceiling is **USD 100 + USD 20.520961 = USD 120.520961**, within
+the original approved USD 125 aggregate. The standalone windows each span
+three USD 20 periods, so their USD 60 maxima cannot be added: October 8 is
+shared. Other deployments remain stopped, and no new admission is permitted
+in October 5 or October 11. Historical unknown spend remains unknown.
+
+The four requested implementation tiers, preserved legacy PR transcript and
+independent review/steward settings define a new cohort. The exact snapshot
+version is `3d55a2921d284b9a`; its rendered version is `57d8e768fb21661a`.
+Prior partial attempts remain separate evidence. Independent review accepted
+this allocation and the existing stopped recovery path. Before lowering caps,
+truthful current-USD-25 recovery cleared #755/#938; a separately recorded
+operator disposition removed PR #997's budget labels and its current typed
+marker. Ledger values and retry/infra counts were preserved. The two automatic
+clears consumed their existing self-clear allowance once; no counter was reset.
+
+The new-profile ordinary qualification failed with exit 101 on October 6;
+its receipt is retained. The diagnosed ambient-plugin dependency led to a
+reviewed explicit clean-configuration `TEST_CMD` policy and a separate full
+bounded pass in 19.16 seconds. Its exact command, test-evidence identity and
+launch-file hashes must be frozen; the harness configuration version alone
+does not encode `TEST_CMD`. Target PR #998 advanced `dev` before the first canary
+freeze. Its ordinary suite and all four native scenarios then passed. The
+current-profile canary completed its stopped admission/accounting/cancellation
+readout, with no implementation outcome claimed. Ordinary supervision and
+the final full-window freeze remain required. Window 2 remains
+unarmed until the first full stopped readout and halt adjudication are complete.
 
 ## Reason and cancelled historical schedule
 
