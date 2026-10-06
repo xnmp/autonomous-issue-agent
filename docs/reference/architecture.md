@@ -355,7 +355,8 @@ that matters is not "wrong answer" but "loop that bills forever":
   `MAX_INFRA_DEATHS`'s business. State is in-memory: a restart re-arms.
 - `MAX_BUDGET_USD` per-leg spend cap — native on the Claude SDK; on codex the
   harness prices streamed rollout counters and kills the process group on
-  crossing when `CODEX_ENFORCE_BUDGET=1` and both token prices are positive
+  crossing when `CODEX_ENFORCE_BUDGET=1` and a captured rate card or positive
+  legacy token prices are available
 - `AGENT_MAX_RUNTIME_SECONDS` wall cap, checked between events
 - repository/global/issue caps over atomic SQLite reservations; an armed cap
   blocks admission if accounting is unavailable or the runtime is unpriceable
@@ -373,6 +374,19 @@ envelope is missing, an armed cap conservatively prices the observed stream
 accumulator; if neither trustworthy usage nor pricing authority exists, the
 full reservation remains active instead of becoming new headroom.
 
+Codex 0.160 native review children share their parent's run and reservation.
+The run-scoped observer joins durable spawn call/output receipts to canonical
+child metadata, then prices each child's own response usage at its actual model
+using the same captured card as the parent. Copied fork prefixes and referenced
+ancestor history are excluded. The configured card also prices root-only work;
+legacy scalar rates cannot override its cap decision. Missing lineage, model,
+usage or completion returns `ACCOUNTING_UNAVAILABLE` and retains the full
+obligation. Recovery requires the complete version-2 invocation/card evidence;
+unsettled legacy version-1 recovery evidence stays reserved because it cannot establish child
+accounting. JSONL remains evidence for the authoritative SQLite settlement.
+The publishing user task explicitly authorizes step 8's bounded fresh reviewers,
+scoped verifiers and required evidence capture within this same leg's budget.
+
 Counters decay on any leg that returns a result, so the ceilings bound
 *consecutive* failure rather than accumulating over a healthy issue's lifetime.
 
@@ -388,6 +402,11 @@ command executes, its child wrapper verifies the launcher's PID/start identity,
 persists PID/PGID/start-ticks in the SQLite `leases` table, and verifies the
 launcher again. A launcher death before registration refuses `exec`; a death
 after registration is recoverable through the same authoritative run record.
+A transport retry can replace that run's process lease only under the same
+active owner and dispatch, after the kernel proves the prior process group is
+absent and the new identity is live. It revalidates continuation admission and
+journals the replacement. Attached review children keep their immutable launch
+receipt and cannot use this replacement path.
 
 Each deployment has a role/repository/checkout-scoped lock and a stable
 deployment identity. Locks live in a private per-user host runtime directory,
@@ -523,6 +542,7 @@ exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
+`domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,
 `domain/review.py`, `domain/self_clear.py`
@@ -577,6 +597,7 @@ pull request retains its lever subject to fresh acceptance reads).
 `adapters/agent_runner.py`, `adapters/app_token.py`,
 `adapters/child_env.py`, `adapters/claude_profile.py`,
 `adapters/codex_hook.py`, `adapters/codex_runner.py`,
+`adapters/codex_child_usage.py` (bounded native lineage, own-response observation and frozen-card recovery),
 `adapters/control_path.py`, `adapters/control_store.py`,
 `adapters/deployment_authority.py`, `adapters/durable_effects.py`,
 `adapters/effects.py`,

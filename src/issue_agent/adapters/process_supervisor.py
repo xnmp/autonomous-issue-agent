@@ -753,6 +753,19 @@ class ProcessSupervisor:
 
         return cls._group_identities(pgid)
 
+    @staticmethod
+    def group_is_absent(pgid: int) -> bool:
+        """Prove kernel group absence; an incomplete process scan cannot do so."""
+        if type(pgid) is not int or pgid <= 0:
+            return False
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return True
+        except OSError:
+            return False
+        return False
+
     @classmethod
     def process_identity(cls, pid: int) -> ProcessIdentity | None:
         """Return the reuse-safe identity for a currently live process."""

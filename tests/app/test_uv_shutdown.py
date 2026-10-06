@@ -24,16 +24,19 @@ from tests.fakes.in_memory_github import InMemoryGitHub
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 active = sys.argv[1] == "active"
 workers = []
+ready = False
+def emit(line):
+    os.write(1, (line + "\n").encode())
 handler = _TerminationHandler()
 def terminate(s, frame):
-    print("TERM", flush=True)
+    emit("TERM")
     handler(s, frame)
 signal.signal(signal.SIGTERM, terminate)
 def run(action):
     p = subprocess.Popen([sys.executable, "-S", "-c", "import time; time.sleep(30)"])
     workers.append(p)
-    print("OWNED", p.pid, ProcessSupervisor.process_identity(p.pid).start_ticks, flush=True)
-    print("READY", os.getpid(), flush=True)
+    emit(f"OWNED {p.pid} {ProcessSupervisor.process_identity(p.pid).start_ticks}")
+    emit(f"READY {os.getpid()}")
     p.wait()
     print("REAPED", p.pid, p.returncode, flush=True)
 def cancel():
@@ -41,8 +44,10 @@ def cancel():
         if p.poll() is None:
             p.terminate()
 def sleep(seconds):
-    if not active:
-        print("READY", os.getpid(), flush=True)
+    global ready
+    if not active and not ready:
+        ready = True
+        emit(f"READY {os.getpid()}")
     time.sleep(.05)
 daemon = Daemon("private", lambda: WorldState(),
     lambda w: [RunAgent(AgentKind.RESOLVE, 1)] if active else [],
@@ -70,7 +75,8 @@ def test_uv_main_signal_finalizes_daemon_and_reaps_owned_workers(tmp_path, activ
         with selectors.DefaultSelector() as selector:
             selector.register(process.stdout, selectors.EVENT_READ)
             deadline = time.monotonic() + 10
-            while b"READY " not in output:
+            while not any(line.startswith(b"READY ") and line[6:].isdigit()
+                          for line in output.split(b"\n")[:-1]):
                 assert time.monotonic() < deadline, output.decode()
                 if selector.select(.1):
                     chunk = os.read(process.stdout.fileno(), 65536)

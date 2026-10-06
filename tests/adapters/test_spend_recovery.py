@@ -4,6 +4,8 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from issue_agent.adapters.codex_runner import write_spend_evidence
+from issue_agent.adapters.codex_child_usage import rate_table_evidence
+from issue_agent.domain.pricing import ModelRates, RateTable
 from issue_agent.adapters.control_store import (
     ReservationRequest,
     SQLiteControlStore,
@@ -18,7 +20,7 @@ from issue_agent.domain.contracts import (
 )
 
 
-NOW = datetime(2026, 7, 30, 12, tzinfo=timezone.utc)
+NOW = datetime.now(timezone.utc)
 
 
 def _reserved_store(tmp_path):
@@ -64,7 +66,7 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
 
     monkeypatch.setattr(store, "settle", record_settlement)
     codex_home = tmp_path / "codex-home"
-    rollout_dir = codex_home / "sessions" / "2026" / "07" / "30"
+    rollout_dir = codex_home / "sessions" / NOW.strftime("%Y/%m/%d")
     rollout_dir.mkdir(parents=True)
     (rollout_dir / "rollout-now-session-1.jsonl").write_text(
         '{"type":"event_msg","payload":{"type":"token_count","info":'
@@ -87,6 +89,11 @@ def test_reconciles_crashed_codex_reservation_from_rollout_usage(tmp_path, monke
             "cost_per_mtok_cached_in": 1,
             "codex_home": str(codex_home),
             "config_version": "cfg",
+            "native_usage_started_at": NOW.timestamp(),
+            "native_root_sessions": {},
+            "native_rate_table": rate_table_evidence(RateTable(
+                expected[0], expected[1], "USD", {"gpt": ModelRates(10000000, 20000000, 1000000, 10000000)})),
+            "native_usage_failure": "",
             **card,
         },
     )
@@ -106,6 +113,7 @@ def test_missing_rollout_does_not_fabricate_recovered_spend(tmp_path):
         str(evidence_dir),
         str(run_id),
         {
+            "version": 1,
             "cwd": str(tmp_path),
             "rollout_started_at": NOW.timestamp(),
             "session_id": "missing",
@@ -118,4 +126,16 @@ def test_missing_rollout_does_not_fabricate_recovered_spend(tmp_path):
     assert not CodexSpendReconciler(
         store, (str(evidence_dir),)
     ).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_legacy_receipt_retains_obligation_without_native_invocation_contract(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path)
+    evidence_dir = tmp_path / "spend-evidence"
+    write_spend_evidence(str(evidence_dir), str(run_id), {
+        "version": 1, "cwd": str(tmp_path), "rollout_started_at": NOW.timestamp(),
+        "session_id": "prior-session", "cost_per_mtok_in": 10,
+        "cost_per_mtok_out": 20, "cost_per_mtok_cached_in": 1,
+    })
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
     assert store.active_reservation_runs() == (run_id,)

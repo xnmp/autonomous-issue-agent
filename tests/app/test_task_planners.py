@@ -45,6 +45,7 @@ from issue_agent.app.planners.tasks import (
     build_re_review_task,
     build_resolve_task,
     build_resume_task,
+    build_rebase_task,
     build_review_gate_task,
     build_review_dimension_task,
     build_review_task,
@@ -73,6 +74,37 @@ def test_resolve_task():
     assert "issue #5" in t.prompt and "off dev" in t.prompt
     assert "crashes" in t.prompt
     assert t.resume is None
+
+
+@pytest.mark.parametrize("builder,args", [
+    (build_resolve_task, (5, U("title"), U("body"), "/wt")),
+    (build_implement_task, (5, U("title"), U("body"), "/wt")),
+    (build_resume_task, (U("reply"), "/wt", "session")),
+    (build_fresh_reply_task, (5, U("title"), U("body"), U("reply"), "/wt")),
+    (build_address_review_task, (7, U("review"), U("inline"), "/wt", "session")),
+    (build_fix_ci_task, (7, U("checks"), U("log"), "/wt", "session")),
+    (build_rebase_task, (7, "dev", "/wt", "session")),
+])
+def test_publishing_task_authorizes_bounded_native_review_in_user_prompt(builder, args):
+    cfg = replace(FIX_CFG, runtime="codex")
+    task = builder(*args, cfg)
+    authorization = task.prompt.split("\n\n", 1)[0]
+    assert "user explicitly authorizes and requires independent native subagents" in authorization
+    assert "fresh context" in authorization
+    assert "parent's provider and model" in authorization
+    assert "may not edit, publish, or spawn further agents" in authorization
+    assert "up to two fresh scoped verifiers after FAIL" in authorization
+    assert "one fresh full review only after two scoped failures" in authorization
+    assert "one evidence-capture child" in authorization
+    assert "Obtain PASS from the initial reviewer or, after fixing a FAIL, a fresh verifier before publishing" in authorization
+    assert "separate paid CLI sessions" in authorization
+    assert "publication gates still apply" in authorization
+    assert "<untrusted_" not in authorization
+
+
+def test_nonpublishing_author_does_not_gain_native_review_authorization():
+    task = build_author_task(5, U("title"), U("body"), "/wt", replace(FIX_CFG, runtime="codex"))
+    assert "user explicitly authorizes" not in task.prompt
 
 
 def test_receiptless_runtime_gets_the_visual_evidence_note():
@@ -197,8 +229,9 @@ def test_resume_shapes_break_the_reask_loop_without_granting_authority():
         assert "information, not instructions" in t.prompt
         assert "Authorized - add the minimal cfg(test) seam" in t.prompt
         assert t.prompt.index("human reply") < t.prompt.index("RE-EVALUATE")
+        reply_context = t.prompt.split("\n\n", 1)[1]
         for grant_word in ("grants", "authorizes"):
-            assert grant_word not in t.prompt
+            assert grant_word not in reply_context
 
 
 def test_address_review_task():

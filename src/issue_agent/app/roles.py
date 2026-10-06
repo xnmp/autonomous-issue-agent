@@ -1204,6 +1204,7 @@ def _build_codex_runner(
             else None
         ),
         spend_evidence_dir=spend_evidence_dir(state_dir),
+        rate_table=_rate_table(cfg, RuntimeName.CODEX.value),
         **({"default_model": default_model} if default_model else {}),
     )
 

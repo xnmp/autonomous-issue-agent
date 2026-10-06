@@ -55,6 +55,19 @@ Current evidence,
 target qualification, authorization and finite controls are recorded in the
 [live execution record](2026-10-05-phase-5-live-execution.md).
 
+The native accounting correction and publishing-task authorization have since
+passed independent code review and focused contracts. Parent and native child
+usage share one reservation and captured rate card; incomplete or malformed
+evidence retains the obligation. The full gate passed on October 6 at 06:03 UTC:
+10,770 Python cases, 123 hook checks, architecture and both type checks, in about
+4½ minutes. Actual Codex 0.160 native-session qualification remains pending. Hosted CI
+for the preceding shutdown commit exposed a readiness-print race in its test;
+the fixture now waits for an atomically emitted complete readiness line while
+retaining the exact shutdown assertions. No paid role or replacement timer has
+been started. The proposed October 6 cap of USD 13 plus five future USD 18 periods
+and known October 5 spend totals USD 123.520961 within the existing USD 125
+admission allocation; it is reviewed arithmetic, not an applied launch profile.
+
 **Earlier implementation checkpoint — 2026-10-05 UTC:** phases 1–3 remain accepted. The approved
 [Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven
 outcome gates accepted locally. A2 closes the production caller/removal matrix,

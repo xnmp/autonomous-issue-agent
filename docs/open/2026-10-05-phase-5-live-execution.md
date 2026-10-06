@@ -567,3 +567,48 @@ charge total differs from cohort-selected spend: new-binding exposure is
 USD 0.222796, while inherited export includes prior bound work. No merge is
 observed; outcome, first-pass, human-duration and recurrence coverage remain
 unknown. The three-merge target is explicitly unmet.
+
+### Native accounting correction — October 6, services stopped
+
+Independent review accepted the run-scoped native observer and its accounting,
+recovery, supervisor and task-contract integration. It uses Codex 0.160's durable
+spawn call/output receipts, canonical child metadata and own-response usage,
+excluding inherited copied/reference history. Parent and child models are priced
+with one captured card and settle one existing reservation. Root-only work uses
+that same card. Incomplete lineage, counters or completion retains the full
+obligation; malformed version-2 recovery cannot fall back to parent-only charges,
+and unsettled legacy version-1 recovery evidence remains reserved. Historical
+settled records remain unchanged. No additional service, lifecycle
+table or child paid leg was introduced.
+
+The user task now explicitly authorizes step 8's initial fresh reviewer, bounded
+fresh scoped verification after FAIL, the conditional fresh full review, and
+required evidence capture. Children share the leg budget; source implementation
+delegation, nested delegation and separate paid CLI sessions are excluded.
+The supervised transport-retry contract also exposed an existing stale lease:
+replacement now requires the same active owner/dispatch, current continuation
+admission, a live new identity and affirmative kernel absence of the prior group.
+Attached review launch receipts remain immutable.
+
+Hosted CI for `04efa61` completed with one shutdown-fixture failure: the test
+signalled on a partial `READY ` print, joining the handler's `TERM` to that line
+despite clean finalization. A private reproduction confirmed the race. Atomic
+event emission and complete-line synchronization preserve exactly-once TERM,
+finalization and process-cleanup assertions. The first complete new-source gate
+passed application/adapter behavior but failed the architecture inventory for
+the two new modules. After the inventory and captured-card exit-check corrections,
+the complete gate passed at 06:03 UTC: 3,684 domain, 3,638 adapter and 3,448
+application cases (10,770 total), 123 hook checks, architecture and both type
+checks. Exact source/test inputs and all 18 pre-existing user changes were
+preserved throughout the run. The complete gate took 4 minutes 32 seconds.
+Actual native paid qualification remains required before worker activation.
+
+Known charges remain USD 31.259535. A reviewed prospective allocation uses
+October 6 daily/global USD 13, followed by USD 18 on each of October 7–11:
+USD 20.520961 + USD 13 + 5 × USD 18 = USD 123.520961. This leaves USD 1.479039
+below the original USD 125 admission allocation and USD 2.261426 of October 6
+preparation headroom. A finite native qualification may use at most four
+USD 0.25 one-shot quotes with no automatic retries. These are proposals;
+configuration, paid probes and new calendars have not been applied. Sampled
+enforcement may overshoot an admitted quote during an in-flight response; actual
+charges and unknown retained obligations must be preserved and reported.

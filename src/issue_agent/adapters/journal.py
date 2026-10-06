@@ -59,6 +59,7 @@ from ..domain.events import (
     Correlation,
 )
 from ..domain.outcome import AgentResult, ExitReason, deterministic_death
+from ..domain.run_usage import MeasuredRunUsage, UnavailableRunUsage
 from ..domain.ports import EventSink
 from .handover import (
     HandoverScope,
@@ -837,6 +838,18 @@ class JournalingRuntime:
                     else None
                 ),
             }
+            if isinstance(result.run_usage, (MeasuredRunUsage, UnavailableRunUsage)):
+                attributes["usage_by_session"] = [
+                    {"session_id": sample.session_id, "model": sample.model,
+                     "input_tokens": sample.usage.input_tokens,
+                     "output_tokens": sample.usage.output_tokens,
+                     "cache_read_tokens": sample.usage.cache_read_tokens,
+                     "cache_write_tokens": sample.usage.cache_write_tokens,
+                     "source": sample.usage.source.value}
+                    for sample in result.run_usage.samples
+                ]
+                if isinstance(result.run_usage, UnavailableRunUsage):
+                    attributes["usage_unavailable"] = result.run_usage.detail
             attributes = {
                 key: value
                 for key, value in attributes.items()

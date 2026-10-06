@@ -45,6 +45,7 @@ from ..domain.outcome import (
 )
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
+from ..domain.run_usage import MeasuredRunUsage, UnavailableRunUsage, price_run_usage, total_usage
 from ..domain.refs import is_governed_branch
 from ..domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowWriter
 from ..domain.workflow import ResolveSession, ResolveStage
@@ -793,8 +794,23 @@ class AccountingRuntime(AgentRuntime):
                     returned_review=returned_review,
                 )
 
+        observed = result.run_usage
+        if isinstance(observed, UnavailableRunUsage):
+            self.store.record_reservation_retained(
+                run_id, "native run usage unavailable: " + observed.detail,
+                returned_review=returned_review,
+            )
+            return result
+        if observed is not None and (not isinstance(observed, MeasuredRunUsage)
+                                     or self.runtime_name != "codex" or self.rate_table is None):
+            self.store.record_reservation_retained(
+                run_id, "native run usage lacks valid pricing authority",
+                returned_review=returned_review,
+            )
+            return result
         try:
-            usage = _token_usage(result.usage, self.runtime_name)
+            usage = (total_usage(observed.samples) if isinstance(observed, MeasuredRunUsage)
+                     else _token_usage(result.usage, self.runtime_name))
             provider_amount = Money.from_major("USD", result.cost_usd)
         except (ValueError, TypeError, OverflowError, InvalidOperation):
             retain_invalid_accounting()
@@ -887,11 +903,9 @@ class AccountingRuntime(AgentRuntime):
                 retain_invalid_accounting()
                 raise RuntimeError("configured-rate settlement needs a model")
             try:
-                amount = price(
-                    usage,
-                    self.rate_table.rates_for(model),
-                    self.rate_table.currency,
-                )
+                amount = (price_run_usage(observed, self.rate_table)
+                          if isinstance(observed, MeasuredRunUsage) else price(
+                              usage, self.rate_table.rates_for(model), self.rate_table.currency))
             except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
                 retain_invalid_accounting()
                 raise

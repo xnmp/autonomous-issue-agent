@@ -3523,9 +3523,33 @@ class SQLiteControlStore:
                         db, WorkflowWriter(repository, deployment_role(repository, expected_owner_id), expected_owner_id), run["owner_id"]))
                 )
                 if not identical:
-                    raise ControlStoreError(
-                        f"conflicting live process lease for run: {run_id}"
-                    )
+                    from .process_supervisor import ProcessSupervisor
+                    try:
+                        incoming_group_matches = os.getpgid(pid) == pgid
+                    except OSError:
+                        incoming_group_matches = False
+                    if (review_attached or existing["owner_id"] != expected_owner_id
+                            or run["owner_id"] != expected_owner_id
+                            or existing["dispatch_id"] != run["dispatch_id"]
+                            or not incoming_group_matches
+                            or not ProcessSupervisor.matches_identity(pid, process_start_ticks)
+                            or ProcessSupervisor.matches_identity(existing["pid"], existing["process_start_ticks"])
+                            or not ProcessSupervisor.group_is_absent(existing["pgid"])):
+                        raise ControlStoreError(f"conflicting live process lease for run: {run_id}")
+                    self._require_continuation_launch(db, run_id)
+                    # A transport retry shares its paid run. It can replace
+                    # ownership only after the prior process group is gone;
+                    # attached review children retain their immutable receipt.
+                    started_at = _parse_stamp(_stamp(self._now()))
+                    db.execute("UPDATE leases SET pid=?,pgid=?,process_start_ticks=?,started_at=? WHERE run_id=?",
+                               (pid, pgid, process_start_ticks, _stamp(started_at), str(run_id)))
+                    self._transition(db, "lease", str(run_id), "active", {
+                        "dispatch_id": run["dispatch_id"], "owner_id": expected_owner_id,
+                        "pid": pid, "pgid": pgid, "process_start_ticks": process_start_ticks,
+                        "replaced_pid": existing["pid"], "replaced_start_ticks": existing["process_start_ticks"],
+                    }, correlation=Correlation(dispatch_id=run["dispatch_id"], run_id=str(run_id)))
+                    return Lease(run_id, run["dispatch_id"], expected_owner_id,
+                                 pid, pgid, started_at, process_start_ticks)
                 if review_attached:
                     self._require_review_launch_receipt(
                         db, run_id, review_scope[0], run, existing,

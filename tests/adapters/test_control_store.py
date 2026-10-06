@@ -7,6 +7,8 @@ import multiprocessing
 import os
 import sqlite3
 import subprocess
+import signal
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from datetime import datetime, timedelta, timezone
@@ -1562,6 +1564,52 @@ def test_spawned_process_lease_binds_to_reserved_run_identity(tmp_path):
             pgid=125,
             process_start_ticks=100,
         )
+
+
+@pytest.mark.parametrize("prior", ["leader-live", "worker-live", "reaped"])
+def test_same_run_transport_retry_replaces_only_a_fully_reaped_owned_process_group(tmp_path, monkeypatch, prior):
+    store = _store(tmp_path)
+    request = dataclasses.replace(_request(1), owner_id="owner")
+    assert store.reserve(request).admitted
+    script = "import subprocess,sys; child=subprocess.Popen([sys.executable,'-S','-c','import time; time.sleep(30)']); print(child.pid,flush=True); command=sys.stdin.readline(); child.terminate(); child.wait()"
+    old = subprocess.Popen([sys.executable, "-S", "-u", "-c", script], start_new_session=True,
+                           stdin=subprocess.PIPE, stdout=subprocess.PIPE)
+    new = subprocess.Popen([sys.executable, "-S", "-c", "import time; time.sleep(30)"], start_new_session=True)
+    try:
+        assert old.stdout is not None
+        assert int(old.stdout.readline()) > 0
+        old_identity, new_identity = ProcessSupervisor.process_identity(old.pid), ProcessSupervisor.process_identity(new.pid)
+        assert old_identity is not None and new_identity is not None
+        original = store.register_process_lease(request.run_id, expected_owner_id="owner", pid=old.pid,
+                                                pgid=old.pid, process_start_ticks=old_identity.start_ticks)
+        if prior == "worker-live":
+            old.terminate()
+            old.wait(timeout=5)
+            monkeypatch.setattr(ProcessSupervisor, "live_group_identities", lambda _pgid: ())
+        if prior == "reaped":
+            assert old.stdin is not None
+            old.stdin.write(b"reap\n")
+            old.stdin.flush()
+            old.wait(timeout=5)
+            assert ProcessSupervisor.group_is_absent(old.pid)
+            replacement = store.register_process_lease(request.run_id, expected_owner_id="owner", pid=new.pid,
+                                                       pgid=new.pid, process_start_ticks=new_identity.start_ticks)
+            assert replacement.run_id == original.run_id
+            assert replacement.dispatch_id == original.dispatch_id
+            assert store.leases() == (replacement,)
+        else:
+            with pytest.raises(ControlStoreError, match="conflicting"):
+                store.register_process_lease(request.run_id, expected_owner_id="owner", pid=new.pid,
+                                             pgid=new.pid, process_start_ticks=new_identity.start_ticks)
+            assert store.leases() == (original,)
+        assert store.active_reservation_runs() == (request.run_id,)
+    finally:
+        for process in (old, new):
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            process.communicate(timeout=5)
 
 
 def test_pid_reuse_does_not_keep_a_dead_lease(tmp_path):

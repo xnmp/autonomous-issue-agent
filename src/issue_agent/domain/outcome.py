@@ -97,6 +97,7 @@ from .actions import (  # noqa: F401
 )
 from .labels import Label
 from .contracts import WorkflowAttemptIdentity
+from .run_usage import RunUsage
 
 
 _DECLARED_STATUS_KEYS = ("status", "decision")
@@ -147,6 +148,7 @@ class ExitReason(str, Enum):
     # TRANSPORT_DEATH, which is a session that started and then lost its stream,
     # and from AGENT_ERROR, which is a session that ran and reported failure.
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
+    ACCOUNTING_UNAVAILABLE = "accounting_unavailable"  # work ran; its complete charge is unknown
 
 
 def infra_death(reason: ExitReason | None) -> bool:
@@ -253,6 +255,7 @@ def infra_class_failure(result: AgentResult) -> bool:
     return (
         infra_death(result.exit_reason)
         or runtime_unavailable(result.exit_reason)
+        or result.exit_reason is ExitReason.ACCOUNTING_UNAVAILABLE
         or result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES
     )
 
@@ -265,7 +268,8 @@ def infra_class_reason(result: AgentResult) -> str:
     """
     if result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
         return result.envelope_subtype
-    if infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason):
+    if (infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason)
+            or result.exit_reason is ExitReason.ACCOUNTING_UNAVAILABLE):
         return result.exit_reason.value if result.exit_reason else ""
     return ""
 
@@ -411,6 +415,8 @@ class AgentResult:
     admission_budget_block: AdmissionBudgetBlock | None = None
     # Minted by accounting from captured admission context, never model output.
     workflow_attempt: WorkflowAttemptIdentity | None = None
+    # Runtime-authored only: structured model output cannot supply accounting.
+    run_usage: RunUsage | None = None
 
     def field(self, name: str, default: str = "") -> str:
         if isinstance(self.structured, dict):

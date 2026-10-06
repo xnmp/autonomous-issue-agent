@@ -7,24 +7,22 @@ import os
 from dataclasses import dataclass
 
 from .codex_runner import (
-    codex_cost_usd,
     discover_rollout_session,
     read_rollout_usage,
     remove_spend_evidence,
     spend_evidence_path,
     usage_delta,
 )
+from .codex_child_usage import CodexChildUsageMeter, recovered_rate_table
+from ..domain.run_usage import MeasuredRunUsage, RunUsage, UnavailableRunUsage, price_run_usage, total_usage
 from .control_store import (
     AccountingDisposition,
     SQLiteControlStore,
     SettlementRequest,
 )
 from ..domain.contracts import (
-    Money,
     PricingBasis,
     RunId,
-    TokenUsage,
-    UsageSource,
 )
 
 
@@ -46,24 +44,13 @@ class CodexSpendReconciler:
                 continue
             try:
                 session_id = self._session_id(evidence)
-                usage = self._usage(evidence, session_id)
-                if usage is None:
+                native = self._native_usage(evidence, session_id)
+                if not isinstance(native, MeasuredRunUsage):
                     return False
-                amount = Money.from_major(
-                    "USD",
-                    codex_cost_usd(
-                        usage,
-                        cost_per_mtok_in=float(
-                            evidence["cost_per_mtok_in"]
-                        ),
-                        cost_per_mtok_out=float(
-                            evidence["cost_per_mtok_out"]
-                        ),
-                        cost_per_mtok_cached_in=float(
-                            evidence["cost_per_mtok_cached_in"]
-                        ),
-                    ),
-                )
+                rates = recovered_rate_table(evidence["native_rate_table"])
+                if rates is None:
+                    return False
+                amount = price_run_usage(native, rates)
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 return False
             result = self.store.settle(
@@ -72,10 +59,9 @@ class CodexSpendReconciler:
                     amount,
                     PricingBasis.RECONCILED,
                     f"codex-recovered:{session_id}:{run_id}",
-                    _token_usage(usage),
-                    str(evidence.get("rate_card_id") or "codex-config"),
-                    str(evidence.get("rate_card_version")
-                        or evidence.get("config_version") or "recovered"),
+                    total_usage(native.samples),
+                    rates.rate_card_id,
+                    rates.version,
                 )
             )
             if result.disposition is not AccountingDisposition.AVAILABLE:
@@ -108,6 +94,30 @@ class CodexSpendReconciler:
             or not required.issubset(value)
         ):
             return None
+        version = value.get("version")
+        if type(version) is not int or version not in (1, 2):
+            return None
+        native_fields = {"native_usage_started_at", "native_root_sessions",
+                         "native_rate_table", "native_usage_failure"}
+        if version == 2:
+            if not (native_fields | {"codex_home", "model", "baseline_session_id", "baseline_usage"}).issubset(value):
+                return None
+            stamp, roots, failure = (value["native_usage_started_at"], value["native_root_sessions"],
+                                     value["native_usage_failure"])
+            if (type(stamp) not in (int, float) or not 0 < stamp <= 10**12
+                    or not isinstance(roots, dict) or len(roots) > 65
+                    or not all(isinstance(sid, str) and sid and isinstance(model, str)
+                               for sid, model in roots.items())
+                    or not isinstance(failure, str) or len(failure) > 2048
+                    or not isinstance(value["model"], str) or not isinstance(value["codex_home"], str)):
+                return None
+        elif native_fields.intersection(value):
+            return None
+        baseline = value.get("baseline_usage")
+        if baseline is not None and (not isinstance(baseline, dict)
+                                     or not isinstance(value.get("baseline_session_id"), str)
+                                     or not value["baseline_session_id"]):
+            return None
         return value
 
     @staticmethod
@@ -129,19 +139,34 @@ class CodexSpendReconciler:
             str(evidence.get("codex_home") or "") or None,
         )
         baseline = evidence.get("baseline_usage")
-        return usage_delta(usage, baseline if isinstance(baseline, dict) else None)
+        return usage_delta(usage, baseline if isinstance(baseline, dict)
+                           and session_id == evidence.get("baseline_session_id") else None)
 
-
-def _token_usage(raw: dict) -> TokenUsage:
-    input_total = max(0, int(raw.get("input_tokens", 0) or 0))
-    cache_read = max(0, int(raw.get("cache_read_input_tokens", 0) or 0))
-    cache_write = max(
-        0, int(raw.get("cache_creation_input_tokens", 0) or 0)
-    )
-    return TokenUsage(
-        max(0, input_total - cache_read - cache_write),
-        max(0, int(raw.get("output_tokens", 0) or 0)),
-        min(cache_read, input_total),
-        min(cache_write, max(0, input_total - cache_read)),
-        UsageSource.RECONCILED,
-    )
+    def _native_usage(self, evidence: dict, session_id: str) -> RunUsage | None:
+        if evidence["version"] == 1:
+            return UnavailableRunUsage("legacy evidence lacks native child rates and invocation baselines")
+        if evidence.get("native_usage_failure"):
+            return UnavailableRunUsage(str(evidence["native_usage_failure"])[:2048])
+        roots = evidence.get("native_root_sessions")
+        if not isinstance(roots, dict) or len(roots) > 65:
+            raise ValueError("native recovery roots are malformed")
+        if session_id in roots and roots[session_id] != evidence["model"]:
+            return UnavailableRunUsage("native recovery root disagrees with its captured model")
+        roots = {**roots, session_id: str(evidence.get("model") or "")}
+        rates = recovered_rate_table(evidence.get("native_rate_table"))
+        if rates is None:
+            return UnavailableRunUsage("native recovery lacks its frozen price card")
+        meter = CodexChildUsageMeter(str(evidence.get("codex_home") or os.path.expanduser("~/.codex")),
+                                    float(evidence["native_usage_started_at"]),
+                                    rates, str(evidence["cwd"]))
+        for root, model in roots.items():
+            if not isinstance(root, str) or not isinstance(model, str):
+                raise ValueError("native recovery identity is malformed")
+            usage = self._usage(evidence, root)
+            if usage is None or not model:
+                return UnavailableRunUsage("native recovery root usage or model is missing")
+            observed = meter.sample(root, model, usage)
+            if isinstance(observed, UnavailableRunUsage):
+                return observed
+        observed = meter.sample(session_id, roots[session_id], self._usage(evidence, session_id), final=True)
+        return observed if observed is not None else MeasuredRunUsage(tuple(meter.roots.values()))

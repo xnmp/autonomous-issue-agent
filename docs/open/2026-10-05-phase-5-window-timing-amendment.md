@@ -135,3 +135,20 @@ The calendars above are cancelled historical evidence. A future release requires
 a replacement exact schedule and allocation calculation before admission;
 actual runtime evidence remains required. The retained-obligation dispositions were already approved and applied;
 historical actual spend remains unknown.
+
+### Reviewed future allocation, not armed — October 6
+
+Known October 5 charges are USD 20.520961 and October 6 charges are USD 10.738574.
+The prospective replacement uses an October 6 preparation cap of USD 13 and
+five future UTC daily/global caps of USD 18: USD 123.520961 maximum admission
+allocation including the earlier charges, leaving USD 1.479039 under USD 125.
+October 6 preparation headroom is USD 2.261426; a proposed finite native
+qualification uses at most four USD 0.25 quotes without automatic retries.
+Unknown obligations stay retained and observed overrun charges remain counted.
+
+Nominal full intervals are October 7 00:30–October 9 00:30 UTC and, conditionally,
+October 9 01:15–October 11 01:15 UTC. Both include October 9, so the five shared
+budget periods apply once. The second start requires the first full stopped
+readout and adjudication. No preparation cap or new timer has been applied;
+delayed readiness requires fresh dates, period arithmetic and source/profile
+freezes. The cancelled calendars above cannot be reused or caught up.

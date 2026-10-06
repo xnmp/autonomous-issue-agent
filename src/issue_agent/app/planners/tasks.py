@@ -154,6 +154,29 @@ _RESUME_REMINDER = (
     "concrete reason are real — follow them instead of retrying."
 )
 
+# Native delegation must be authorized in the user task itself; appended
+# project context does not grant it under the runtime's delegation policy.
+_FIXER_REVIEW_AUTHORIZATION = (
+    "The user explicitly authorizes and requires independent native subagents "
+    "for AGENT.md step 8 before publishing this leg's changes: one adversarial "
+    "reviewer, up to two fresh scoped verifiers after FAIL, and one fresh full "
+    "review only after two scoped failures. Give each a self-contained request "
+    "and a fresh context; use the native tool's fresh-context option when available "
+    "and distinct task names where supported. Keep the parent's provider and "
+    "model by using the tool defaults. Reviewers may inspect the diff and run "
+    "scoped verification, but may not edit, publish, or spawn further agents. "
+    "If visual evidence is still uncaptured, one evidence-capture child is also "
+    "authorized to produce only the required screenshots; it may not edit source, "
+    "publish, or delegate. Follow step 8's concurrent capture/review instructions. "
+    "Obtain PASS from the initial reviewer or, after fixing a FAIL, a fresh "
+    "verifier before publishing. "
+    "If these bounded reviews are exhausted, return blocked with the unresolved "
+    "findings. Clarifying follow-ups are allowed, but cannot replace fresh "
+    "verification after a FAIL. All children share this leg's budget. This authorization "
+    "does not extend to implementation delegation or separate paid CLI sessions. "
+    "All existing tests, evidence requirements and publication gates still apply.\n\n"
+)
+
 
 # Adjusts AGENT.md's visual-evidence instructions for runtimes that cannot mint
 # trusted read receipts (#153): the gate no longer requires receipts there, so
@@ -263,7 +286,7 @@ def build_resolve_task(
         "status=blocked with 'needs' set to exactly what you need."
     )
     return PlannedRun(
-        prompt=prompt,
+        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
@@ -382,7 +405,7 @@ def build_implement_task(
         f"succeeds, or status=blocked with 'needs'.{upheld}"
     )
     return PlannedRun(
-        prompt=prompt,
+        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
         schema=IMPLEMENT_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
@@ -481,7 +504,7 @@ def build_resume_task(
         "'needs'."
     )
     return PlannedRun(
-        prompt=prompt,
+        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
@@ -517,7 +540,7 @@ def build_fresh_reply_task(
         "return status=blocked with 'needs' set to exactly what you need."
     )
     return PlannedRun(
-        prompt=prompt,
+        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, None),
         disallowed_tools=FIXER_DENY,
@@ -564,7 +587,7 @@ def build_address_review_task(
         f"{_fenced('inline comments', inline)}"
     )
     return PlannedRun(
-        prompt=prompt,
+        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
@@ -687,7 +710,7 @@ def build_fix_ci_task(
         f"{_fenced('ci log tail', failed_log)}"
     )
     return PlannedRun(
-        prompt=prompt,
+        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
@@ -725,7 +748,7 @@ def build_rebase_task(
         "the conflict genuinely requires a human decision."
     )
     return PlannedRun(
-        prompt=prompt,
+        prompt=_FIXER_REVIEW_AUTHORIZATION + prompt,
         schema=FIX_SCHEMA,
         append_system_prompt=_fix_system_prompt(cfg, session_id),
         disallowed_tools=FIXER_DENY,
