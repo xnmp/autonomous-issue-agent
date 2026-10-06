@@ -381,9 +381,12 @@ using the same captured card as the parent. Copied fork prefixes and referenced
 ancestor history are excluded. The configured card also prices root-only work;
 legacy scalar rates cannot override its cap decision. Missing lineage, model,
 usage or completion returns `ACCOUNTING_UNAVAILABLE` and retains the full
-obligation. Recovery requires the complete version-2 invocation/card evidence;
-unsettled legacy version-1 recovery evidence stays reserved because it cannot establish child
+obligation. Recovery requires the complete version-2 invocation/card evidence.
+Unsettled legacy version-1 recovery evidence stays reserved because it cannot establish child
 accounting. JSONL remains evidence for the authoritative SQLite settlement.
+Native accounting uncertainty cannot expire through the legacy completed-run
+grace release; only actual reconciliation or an explicit accounting disposition
+can remove its obligation.
 The publishing user task explicitly authorizes step 8's bounded fresh reviewers,
 scoped verifiers and required evidence capture within this same leg's budget.
 

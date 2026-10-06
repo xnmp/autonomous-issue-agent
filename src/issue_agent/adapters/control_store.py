@@ -4005,11 +4005,14 @@ class SQLiteControlStore:
         reason: str,
         *,
         returned_review: ReturnedReviewChild | None = None,
+        accounting_failure: ExitReason | None = None,
     ) -> bool:
         """Retain uncertain spend, or capture its return after reconciliation wins."""
 
         if not reason:
             raise ValueError("reservation retention reason is required")
+        if accounting_failure is not None and accounting_failure is not ExitReason.ACCOUNTING_UNAVAILABLE:
+            raise ValueError("retention requires an unavailable-accounting reason")
         if returned_review is not None and (
             not isinstance(returned_review, ReturnedReviewChild)
             or returned_review.run_id != str(run_id)
@@ -4064,12 +4067,16 @@ class SQLiteControlStore:
                 "UPDATE runs SET "
                 "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
                 "THEN state ELSE 'completed' END, "
-                "outcome=CASE WHEN state IN ('completed','cancelled','abandoned') "
+                "outcome=CASE WHEN state IN ('cancelled','abandoned') THEN outcome "
+                "WHEN ?='accounting_unavailable' OR outcome='accounting_unavailable' THEN 'accounting_unavailable' "
+                "WHEN state IN ('completed','cancelled','abandoned') "
                 "THEN outcome ELSE 'spend_unreconciled' END, "
                 "completed_at=COALESCE(completed_at, ?) WHERE run_id=? "
                 "AND (state NOT IN ('completed','cancelled','abandoned') "
-                "OR completed_at IS NULL)",
-                (now, str(run_id)),
+                "OR completed_at IS NULL OR (?='accounting_unavailable' AND state NOT IN ('cancelled','abandoned') "
+                "AND outcome IS NOT 'accounting_unavailable'))",
+                (accounting_failure.value if accounting_failure else None, now, str(run_id),
+                 accounting_failure.value if accounting_failure else None),
             ).rowcount
             lease_removed = db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),)).rowcount
             if review_return is not None and not review_return[1]:
@@ -4081,6 +4088,21 @@ class SQLiteControlStore:
                     correlation=_run_correlation(run_id, row["dispatch_id"]),
                 )
             return True
+
+    def record_accounting_unavailable(self, run_id: RunId, reason: str) -> bool:
+        """Fence unknown billing without changing proof that work never launched."""
+        if not reason:
+            raise ValueError("unavailable accounting requires a reason")
+        with self.transaction() as db:
+            changed = db.execute(
+                "UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=? "
+                "AND outcome IS NOT 'accounting_unavailable' AND state NOT IN ('cancelled','abandoned') "
+                "AND EXISTS(SELECT 1 FROM budget_reservations b WHERE b.run_id=runs.run_id AND b.state='active')",
+                (str(run_id),),
+            ).rowcount
+            if changed:
+                self._event(db, ReservationRetained(str(run_id), reason), correlation=Correlation(run_id=str(run_id)))
+            return bool(changed)
 
     def record_admission_reconciled(
         self,
@@ -8421,7 +8443,8 @@ class SQLiteControlStore:
             "UPDATE runs SET "
             "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
             "THEN state ELSE 'completed' END, "
-            "outcome=CASE WHEN state IN ('completed','cancelled','abandoned') "
+            "outcome=CASE WHEN outcome='accounting_unavailable' THEN 'settled' "
+            "WHEN state IN ('completed','cancelled','abandoned') "
             "THEN outcome ELSE 'settled' END, "
             "provider_receipt_id=?, completed_at=COALESCE(completed_at, ?) "
             "WHERE run_id=?",

@@ -265,7 +265,7 @@ class ReviewChildFailed:
     def __post_init__(self) -> None:
         if not isinstance(self.reason, ExitReason) or self.reason in (
             ExitReason.OK, ExitReason.OPERATOR_CANCELLED, ExitReason.KILLED_EXTERNALLY,
-            ExitReason.RUNTIME_UNAVAILABLE, ExitReason.BUDGET_EXHAUSTED,
+            ExitReason.RUNTIME_UNAVAILABLE, ExitReason.ACCOUNTING_UNAVAILABLE, ExitReason.BUDGET_EXHAUSTED,
         ):
             raise ValueError("failed child requires a non-cancellation failure reason")
         if not isinstance(self.determinism, (OrdinaryReviewFailure, DeterministicReviewFailure)):
@@ -292,7 +292,7 @@ class ReviewChildInfrastructureFailure:
     def __post_init__(self) -> None:
         if not isinstance(self.reason, ExitReason) or self.reason not in (
             ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
-            ExitReason.TRANSPORT_DEATH,
+            ExitReason.TRANSPORT_DEATH, ExitReason.ACCOUNTING_UNAVAILABLE,
         ):
             raise ValueError("review infrastructure failure requires a non-striking exit reason")
 
@@ -342,7 +342,7 @@ def classify_normal_review_return(
         return ReviewChildSucceeded(session)
     if envelope.is_error and reason in (
         ExitReason.KILLED_EXTERNALLY, ExitReason.RUNTIME_UNAVAILABLE,
-        ExitReason.TRANSPORT_DEATH,
+        ExitReason.TRANSPORT_DEATH, ExitReason.ACCOUNTING_UNAVAILABLE,
     ):
         return ReviewChildInfrastructureFailure(reason)
     if envelope.is_error and reason is ExitReason.BUDGET_EXHAUSTED:

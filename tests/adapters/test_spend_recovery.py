@@ -1,4 +1,5 @@
 from datetime import datetime, timedelta, timezone
+import json
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -9,6 +10,7 @@ from issue_agent.domain.pricing import ModelRates, RateTable
 from issue_agent.adapters.control_store import (
     ReservationRequest,
     SQLiteControlStore,
+    AccountingDisposition,
 )
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
 from issue_agent.domain.contracts import (
@@ -23,7 +25,7 @@ from issue_agent.domain.contracts import (
 NOW = datetime.now(timezone.utc)
 
 
-def _reserved_store(tmp_path):
+def _reserved_store(tmp_path, *, runtime=None):
     store = SQLiteControlStore(str(tmp_path / "control.db"), now=lambda: NOW)
     store.initialize()
     scope = BudgetScope(
@@ -39,7 +41,7 @@ def _reserved_store(tmp_path):
     request = ReservationRequest(
         ReservationId("reservation"),
         run_id,
-        "dispatch",
+        json.dumps({"runtime": runtime}) if runtime else "dispatch",
         scope,
         PriceQuote("gpt", "card", "v1", NOW, Money("USD", 1_000_000)),
         Money("USD", 2_000_000),
@@ -137,5 +139,36 @@ def test_legacy_receipt_retains_obligation_without_native_invocation_contract(tm
         "session_id": "prior-session", "cost_per_mtok_in": 10,
         "cost_per_mtok_out": 20, "cost_per_mtok_cached_in": 1,
     })
+    store.record_reservation_retained(run_id, "prior completed unmeasured run")
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.release_retained(run_id, "unmeasured grace elapsed", NOW + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_unavailable_recovery_preserves_proven_unlaunched_release(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    assert not CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)).reconcile(run_id)
+    result = store.release_unlaunched(run_id, "provider was never launched")
+    assert result.disposition is AccountingDisposition.AVAILABLE
+    assert store.active_reservation_runs() == ()
+
+
+@pytest.mark.parametrize("runtime", ["claude", "glm"])
+def test_codex_recovery_does_not_change_other_providers_unmeasured_policy(tmp_path, runtime):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime=runtime)
+    store.record_reservation_retained(run_id, "provider return is unmeasured")
+    assert not CodexSpendReconciler(store, (str(tmp_path / "missing-codex-evidence"),)).reconcile(run_id)
+    assert store.release_retained(run_id, "existing completed unmeasured grace elapsed",
+                                  NOW + timedelta(days=365)).disposition is AccountingDisposition.AVAILABLE
+    assert store.active_reservation_runs() == ()
+
+
+def test_running_codex_uncertainty_survives_generic_completion_and_grace(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET state='running' WHERE run_id=?", (str(run_id),))
+    assert not CodexSpendReconciler(store, (str(tmp_path / "missing-evidence"),)).reconcile(run_id)
+    store.record_reservation_retained(run_id, "generic post-run retention")
+    assert store.release_retained(run_id, "completed unmeasured grace elapsed",
+                                  NOW + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
     assert store.active_reservation_runs() == (run_id,)

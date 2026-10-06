@@ -5,6 +5,7 @@ from dataclasses import replace
 import json
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -19,6 +20,7 @@ from issue_agent.adapters.codex_child_usage import rate_table_evidence
 from issue_agent.adapters.codex_runner import CodexRunner, write_spend_evidence, spend_evidence_path
 from issue_agent.adapters.process_supervisor import ProcessSupervisor
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
+from issue_agent.adapters.control_store import AccountingDisposition
 from tests.adapters.test_spend_recovery import _reserved_store
 from tests.adapters.test_codex_child_usage import (
     ROOT, CHILD, OTHER, NOW, START, RATES, metadata, spawn, child_records, event, write,
@@ -75,6 +77,25 @@ def test_unknown_child_keeps_full_obligation_even_when_parent_has_a_valid_charge
         assert db.execute("SELECT maximum_micros FROM budget_reservations").fetchone()[0] == 2_000_000
 
 
+def test_unknown_native_spend_does_not_become_headroom_after_unmeasured_grace(tmp_path):
+    result = AgentResult(True, status="blocked", exit_reason=ExitReason.ACCOUNTING_UNAVAILABLE,
+                         run_usage=UnavailableRunUsage("child receipt is incomplete"))
+    wrapper, control = _wrapper(tmp_path, Runtime(result))
+    wrapper = replace(wrapper, rate_table=table())
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    asyncio.run(wrapper.run(RuntimePlan("work", model="sol", max_budget_usd=2)))
+    run_id = control.active_reservation_runs()[0]
+    control.record_reservation_retained(run_id, "later generic reconciliation still has no receipt")
+    release = control.release_retained(run_id, "completed-unmeasured grace elapsed",
+                                       datetime.now(timezone.utc) + timedelta(days=365))
+    assert release.disposition is AccountingDisposition.CONFLICT
+    assert control.active_reservation_runs() == (run_id,)
+    with control.transaction() as db:
+        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+        assert db.execute("SELECT maximum_micros FROM budget_reservations").fetchone()[0] == 2_000_000
+        assert db.execute("SELECT outcome FROM runs").fetchone()[0] == "accounting_unavailable"
+
+
 def recovery_files(tmp_path):
     home = tmp_path / "codex"
     parent_tokens = {"input_tokens": 1000, "cached_input_tokens": 500, "output_tokens": 10}
@@ -118,7 +139,7 @@ def test_native_recovery_settles_exact_frozen_mixed_price_once(tmp_path, fork):
 @pytest.mark.parametrize("fault", ["native_usage_started_at", "native_root_sessions", "native_rate_table",
                                   "native_usage_failure", "baseline_session_id", "unsupported-version",
                                   "boolean-version", "failure-shape", "invalid-card", "unfinished-child",
-                                  "sticky-failure", "huge-start", "wrong-root-model"])
+                                  "sticky-failure", "huge-start", "wrong-root-model", "currency-conflict"])
 def test_malformed_or_incomplete_native_recovery_never_downgrades_to_parent_only(tmp_path, fault):
     store, scope, run_id = _reserved_store(tmp_path)
     home, evidence = recovery_files(tmp_path)
@@ -138,11 +159,17 @@ def test_malformed_or_incomplete_native_recovery_never_downgrades_to_parent_only
         evidence["native_usage_started_at"] = 10**1000
     elif fault == "wrong-root-model":
         evidence["native_root_sessions"][ROOT] = "luna"
+    elif fault == "currency-conflict":
+        evidence["native_rate_table"]["currency"] = "EUR"
     else:
         evidence["native_usage_failure"] = "previous observation failed"
     directory = tmp_path / "evidence"
     write_spend_evidence(str(directory), str(run_id), evidence)
+    control_reason = "legacy completed return awaiting reconciliation"
+    store.record_reservation_retained(run_id, control_reason)
     assert not CodexSpendReconciler(store, (str(directory),)).reconcile(run_id)
+    assert store.release_retained(run_id, "legacy unmeasured grace elapsed",
+                                  datetime.now(timezone.utc) + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
     assert store.active_reservation_runs() == (run_id,)
     assert store.snapshot(scope).settled == Money("USD", 0)
     assert list(directory.iterdir())
@@ -297,6 +324,8 @@ def test_cancellation_kills_owned_groups_and_keeps_incomplete_child_evidence_for
     with open(spend_evidence_path(str(directory), str(run_id))) as stream:
         evidence = json.load(stream)
     assert evidence["native_usage_failure"]
+    assert control.release_retained(run_id, "legacy unmeasured grace elapsed",
+                                    datetime.now(timezone.utc) + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
     assert not CodexSpendReconciler(control, (str(directory),)).reconcile(run_id)
     assert control.active_reservation_runs() == (run_id,)
     with control.transaction() as db:

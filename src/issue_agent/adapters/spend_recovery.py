@@ -38,6 +38,8 @@ class CodexSpendReconciler:
     def reconcile(self, run_id: RunId) -> bool:
         if self.store.reconcile_review_preflight_stop(run_id):
             return True
+        if not self._belongs_to_codex(run_id):
+            return False
         for directory in self.evidence_dirs:
             evidence = self._read(directory, run_id)
             if evidence is None:
@@ -46,13 +48,13 @@ class CodexSpendReconciler:
                 session_id = self._session_id(evidence)
                 native = self._native_usage(evidence, session_id)
                 if not isinstance(native, MeasuredRunUsage):
-                    return False
+                    return self._unavailable(run_id, "Codex recovery cannot establish complete run usage")
                 rates = recovered_rate_table(evidence["native_rate_table"])
                 if rates is None:
-                    return False
+                    return self._unavailable(run_id, "Codex recovery has no captured price card")
                 amount = price_run_usage(native, rates)
             except (KeyError, TypeError, ValueError, ArithmeticError):
-                return False
+                return self._unavailable(run_id, "Codex recovery evidence is malformed or unpriceable")
             result = self.store.settle(
                 SettlementRequest(
                     run_id,
@@ -65,10 +67,31 @@ class CodexSpendReconciler:
                 )
             )
             if result.disposition is not AccountingDisposition.AVAILABLE:
-                return False
+                return self._unavailable(run_id, "Codex measured recovery settlement was refused")
             remove_spend_evidence(directory, run_id)
             return True
+        return self._unavailable(run_id, "Codex recovery evidence is missing or invalid")
+
+    def _unavailable(self, run_id: RunId, reason: str) -> bool:
+        self.store.record_accounting_unavailable(run_id, reason)
         return False
+
+    def _belongs_to_codex(self, run_id: RunId) -> bool:
+        with self.store.transaction() as db:
+            row = db.execute("SELECT dispatch_id FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
+        if row is None:
+            return False
+        try:
+            metadata = json.loads(row["dispatch_id"])
+        except (TypeError, ValueError):
+            metadata = None
+        runtime = metadata.get("runtime") if isinstance(metadata, dict) else None
+        if runtime in ("claude", "glm", "codex"):
+            return runtime == "codex"
+        # Older runs lack structured dispatch metadata. A per-run file in
+        # this harness-owned Codex directory establishes only its provider,
+        # never usable counters from malformed content.
+        return any(os.path.isfile(spend_evidence_path(directory, str(run_id))) for directory in self.evidence_dirs if directory)
 
     def _read(self, directory: str, run_id: RunId) -> dict | None:
         if not directory:

@@ -60,13 +60,24 @@ passed independent code review and focused contracts. Parent and native child
 usage share one reservation and captured rate card; incomplete or malformed
 evidence retains the obligation. The full gate passed on October 6 at 06:03 UTC:
 10,770 Python cases, 123 hook checks, architecture and both type checks, in about
-4½ minutes. Actual Codex 0.160 native-session qualification remains pending. Hosted CI
-for the preceding shutdown commit exposed a readiness-print race in its test;
+4½ minutes. Hosted CI for the published correction (`fc9fa30`) passed at
+06:46 UTC, including deployment-environment checks. Actual Codex 0.160
+native-session qualification remains pending. Hosted CI for the preceding
+shutdown commit exposed a readiness-print race in its test;
 the fixture now waits for an atomically emitted complete readiness line while
 retaining the exact shutdown assertions. No paid role or replacement timer has
 been started. The proposed October 6 cap of USD 13 plus five future USD 18 periods
 and known October 5 spend totals USD 123.520961 within the existing USD 125
 admission allocation; it is reviewed arithmetic, not an applied launch profile.
+
+Preparing the finite native check exposed a legacy grace-release gap. Unknown
+native billing now keeps its full obligation until reconciliation or an explicit
+accounting disposition; proven unlaunched work retains its safe release path.
+Recovered review billing preserves the existing normal-confirmation contract
+and operator cancellation. Independent review accepted the correction, and the
+complete gate passed at 07:01 UTC: 10,781 Python cases, 123 hook checks,
+architecture and both type checks in 4½ minutes. The bounded native check has
+not run, and no worker or timer has been started.
 
 **Earlier implementation checkpoint — 2026-10-05 UTC:** phases 1–3 remain accepted. The approved
 [Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven

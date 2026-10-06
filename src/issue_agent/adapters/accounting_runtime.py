@@ -792,6 +792,7 @@ class AccountingRuntime(AgentRuntime):
                 self.store.record_reservation_retained(
                     run_id, "review accounting calculation unavailable",
                     returned_review=returned_review,
+                    accounting_failure=(ExitReason.ACCOUNTING_UNAVAILABLE if result.run_usage is not None else None),
                 )
 
         observed = result.run_usage
@@ -799,6 +800,7 @@ class AccountingRuntime(AgentRuntime):
             self.store.record_reservation_retained(
                 run_id, "native run usage unavailable: " + observed.detail,
                 returned_review=returned_review,
+                accounting_failure=ExitReason.ACCOUNTING_UNAVAILABLE,
             )
             return result
         if observed is not None and (not isinstance(observed, MeasuredRunUsage)
@@ -806,6 +808,7 @@ class AccountingRuntime(AgentRuntime):
             self.store.record_reservation_retained(
                 run_id, "native run usage lacks valid pricing authority",
                 returned_review=returned_review,
+                accounting_failure=ExitReason.ACCOUNTING_UNAVAILABLE,
             )
             return result
         try:

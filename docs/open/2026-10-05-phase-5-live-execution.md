@@ -602,6 +602,8 @@ application cases (10,770 total), 123 hook checks, architecture and both type
 checks. Exact source/test inputs and all 18 pre-existing user changes were
 preserved throughout the run. The complete gate took 4 minutes 32 seconds.
 Actual native paid qualification remains required before worker activation.
+Hosted CI for the published correction (`fc9fa30`, run `37422191511`) passed
+at 06:46:46 UTC, including the dashboard and deployment-environment checks.
 
 Known charges remain USD 31.259535. A reviewed prospective allocation uses
 October 6 daily/global USD 13, followed by USD 18 on each of October 7–11:
@@ -612,3 +614,26 @@ USD 0.25 one-shot quotes with no automatic retries. These are proposals;
 configuration, paid probes and new calendars have not been applied. Sampled
 enforcement may overshoot an admitted quote during an in-flight response; actual
 charges and unknown retained obligations must be preserved and reported.
+
+### Unknown native spend remains an obligation — October 6
+
+Preparation exposed a legacy completed-run grace path that could release an
+unknown native charge. The corrected billing marker is sticky across generic
+retention, while cancelled/abandoned execution provenance remains intact.
+Codex recovery marks only Codex obligations; proven unlaunched release and
+other providers' existing policy remain unchanged. Missing native accounting
+is a non-striking review infrastructure outcome. Recovered dead-lease billing
+stays pending until an equal normal completion confirms it; cancellation is
+never promoted by a billing receipt, and repeated retained returns are inert.
+
+Independent review accepted the complete correction. The first new full gate
+failed a new regression's incorrect expectation of immediate execution
+promotion by recovered billing; its receipt is preserved. The test now verifies
+the established confirmation contract. The final complete gate passed at
+07:01:15 UTC: 3,686 domain, 3,647 adapter and 3,448 application cases (10,781
+total), 123 hook checks, architecture and both type checks in 4 minutes
+30 seconds. Exact source/test inputs and all 18 existing user changes stayed
+unchanged. A finance-reviewed fresh native check reserves at most USD 0.25,
+within the four-case USD 0.76 quote envelope and probe-only USD 13 limits.
+It requires newly prepared committed source and actual model, usage, charge,
+authority-conservation and process-absence evidence. No paid check has run.

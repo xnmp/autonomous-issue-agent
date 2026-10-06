@@ -175,6 +175,53 @@ def test_normal_failed_return_is_typed_only_after_settlement(admitted):
     assert evidence[0].result.reason is ExitReason.AGENT_ERROR
 
 
+@pytest.mark.parametrize("reclaimed", [False, True])
+def test_late_accounting_reconciliation_completes_non_striking_review_evidence(admitted, reclaimed):
+    store, _, proposed = admitted
+    child = proposed.review_child
+    assert child is not None
+    register(store, proposed)
+    if reclaimed:
+        store.reclaim_dead_leases(lambda _pid, _ticks: False)
+    raw = returned(store, proposed, result=AgentResult(True, status="blocked", exit_reason=ExitReason.ACCOUNTING_UNAVAILABLE))
+    assert store.record_reservation_retained(proposed.run_id, "native usage missing", returned_review=raw,
+                                             accounting_failure=ExitReason.ACCOUNTING_UNAVAILABLE)
+    with store.transaction() as db:
+        event_count = db.execute("SELECT count(*) FROM event_outbox").fetchone()[0]
+    assert store.record_reservation_retained(proposed.run_id, "native usage missing", returned_review=raw,
+                                             accounting_failure=ExitReason.ACCOUNTING_UNAVAILABLE)
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM event_outbox").fetchone()[0] == event_count
+    assert observed(store, child) == (ReviewChildPending(child),)
+    assert store.settle_review_return(settlement(proposed, basis=PricingBasis.RECONCILED), raw).disposition is AccountingDisposition.AVAILABLE
+    if reclaimed:
+        # Recovered billing cannot attest that the execution owner returned.
+        assert observed(store, child) == (ReviewChildPending(child),)
+        assert store.settle_review_return(settlement(proposed), raw).disposition is AccountingDisposition.AVAILABLE
+    evidence = observed(store, child)
+    assert len(evidence) == 1 and isinstance(evidence[0], ReviewChildReturned)
+    assert evidence[0].result == ReviewChildInfrastructureFailure(ExitReason.ACCOUNTING_UNAVAILABLE)
+    assert store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert db.execute("SELECT count(*) FROM charges WHERE run_id=?", (str(proposed.run_id),)).fetchone()[0] == 1
+
+
+def test_late_accounting_confirmation_does_not_reverse_operator_cancellation(admitted):
+    store, _, proposed = admitted
+    register(store, proposed)
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET state='cancelled',outcome='operator_cancelled' WHERE run_id=?", (str(proposed.run_id),))
+    raw = returned(store, proposed, result=AgentResult(True, status="blocked", exit_reason=ExitReason.ACCOUNTING_UNAVAILABLE))
+    assert store.record_reservation_retained(proposed.run_id, "native usage missing", returned_review=raw,
+                                             accounting_failure=ExitReason.ACCOUNTING_UNAVAILABLE)
+    assert store.settle_review_return(settlement(proposed, basis=PricingBasis.RECONCILED), raw).disposition is AccountingDisposition.AVAILABLE
+    assert store.settle_review_return(settlement(proposed), raw).disposition is AccountingDisposition.CONFLICT
+    with store.transaction() as db:
+        row = db.execute("SELECT state,outcome FROM runs WHERE run_id=?", (str(proposed.run_id),)).fetchone()
+        assert tuple(row) == ("cancelled", "operator_cancelled")
+        assert db.execute("SELECT count(*) FROM charges WHERE run_id=?", (str(proposed.run_id),)).fetchone()[0] == 1
+
+
 def test_reconciled_charge_before_raw_return_stays_pending_until_return_capture(admitted):
     store, _, proposed = admitted
     child = proposed.review_child

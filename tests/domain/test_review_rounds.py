@@ -81,6 +81,7 @@ def test_normal_success_only_retains_an_eligible_reviewer_session(runtime, kind,
     (True, ExitReason.TRANSPORT_DEATH, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.KILLED_EXTERNALLY, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.RUNTIME_UNAVAILABLE, rounds.ReviewChildInfrastructureFailure),
+    (True, ExitReason.ACCOUNTING_UNAVAILABLE, rounds.ReviewChildInfrastructureFailure),
     (True, ExitReason.BUDGET_EXHAUSTED, rounds.ReviewChildBudgetExhausted),
     (True, ExitReason.OPERATOR_CANCELLED, type(None)),
     (False, ExitReason.AGENT_ERROR, type(None)),
@@ -90,6 +91,11 @@ def test_normal_return_classification_waits_for_special_or_contradictory_results
     launched = launch(plan().children[0])
     envelope = review_returned_envelope(AgentResult(is_error, exit_reason=reason))
     assert isinstance(rounds.classify_normal_review_return(launched, RuntimeName.CLAUDE, envelope), expected)
+
+
+def test_unknown_accounting_cannot_be_constructed_as_a_striking_review_failure():
+    with pytest.raises(ValueError):
+        rounds.ReviewChildFailed(ExitReason.ACCOUNTING_UNAVAILABLE)
 
 
 def failure(child, *, deterministic=False):
