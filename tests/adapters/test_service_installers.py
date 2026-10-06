@@ -267,6 +267,9 @@ def test_systemd_installer_renders_validated_units_with_absolute_uv(tmp_path):
     )
     assert all("NotifyAccess=all" in unit.read_text() for unit in role_units)
     assert all("WatchdogSec=300" in unit.read_text() for unit in role_units)
+    assert all("KillMode=mixed" in unit.read_text() for unit in role_units)
+    assert all("TimeoutStopSec=90" in unit.read_text() for unit in role_units)
+    assert all("FinalKillSignal=SIGKILL" in unit.read_text() for unit in role_units)
     assert all(
         "Environment=ISSUE_AGENT_DEPLOYMENT_ID=target-repo"
         in unit.read_text()

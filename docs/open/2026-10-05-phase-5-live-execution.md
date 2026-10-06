@@ -9,13 +9,14 @@ remain accepted. Phase 5 still requires actual unattended windows and readout.
 
 ## Authorization and current state
 
-**October 6, 02:40 UTC:** the qualified mixed-profile one-tick canary is stopped
-and fully accounted for. Ordinary supervision is restored, and window 1's
-October 8 03:00 UTC stop is armed. Both full-window starts remain unarmed
-pending the final freeze. Model tiers, the lower allocation and the explicit
-clean-configuration test policy are applied. Current target `5680ec0c` passed the full ordinary
-command and all four native scenarios before the canary freeze. Both earlier
-live attempts remain partial coverage. Two full windows remain outstanding.
+**October 6, after the 03:27 UTC stop:** all paid roles and finite timers are off.
+The 03:00 mixed-profile attempt ended after repeated publication/worker-contract
+failures; its settled USD 6.215281 and failed shutdown exits are preserved.
+All three attempts are partial coverage. Model tiers, the lower allocation
+and clean-configuration test policy remain applied. Target `5680ec0c` passed
+the full ordinary command and four native scenarios. Two full windows remain
+outstanding; their prior calendars are cancelled. Root-cause fixes, native
+child accounting qualification and new bounded dates precede another launch.
 
 The bounded window approval and the user's later instruction, “approved, and
 all subsequent accounting decisions approved,” remain in force. They cover
@@ -501,7 +502,68 @@ admission binding references form the explicit inherited window export.
 
 This canary qualifies admission, accounting and bounded cancellation/cleanup.
 It does not establish implementation success or live access to every new tier
-model. Hosted CI for `d5a6d42` remains in progress; the complete local gate is
+model. Hosted CI `37399295859` for `d5a6d42` completed successfully; the complete local gate is
 green. At 02:41 UTC, ordinary supervision was restored and the October 8 03:00 UTC
 stop was armed and read back. The proposed full interval requires the final
 documented source/configuration/cohort freeze before its still-unarmed start.
+
+### Third partial attempt and stopped contract repairs — October 6
+
+The final freeze captured published `d5d56482`, target `5680ec0c`, both launch
+hashes, rendered configuration `57d8e768fb21661a`, accepted local/hosted gates
+and 28 explicit inherited binding references. The timer triggered at 03:00;
+all three roles reached readiness at 03:00:01 with zero restarts. The 03:20
+read-only observation found unchanged source/profile and original process IDs.
+Luna routing and Sol 6.1 implementation actually ran; the inherited PR repair
+kept its original Sol 5.6 session. No live Claude/Astra qualification is claimed.
+
+PR #997's repair twice returned blocked because the publication validator
+required resolve authority for an admitted PR-repair workflow. Remote PR #997
+stayed open at `9fbfd98d`; local repair work remained preserved. The worker's
+claimed test passes are agent assertions, not trusted independent gate receipts.
+Issue #755 returned blocked because its required pre-PR review subagent lacked
+explicit authorization in the delivered user task. The late native policy
+permits delegation only when explicitly requested; the parent approval was
+not delivered as worker authority.
+
+An operator cost intervention stopped the attempt at 03:27:09 instead of
+purchasing further repeated failures. All five finite timers are inactive.
+Post-stop SQL has zero active runs/reservations/leases/claims/pending commands;
+all role MainPIDs are zero. Fix/steward exited 1 and review exited 0. A bounded
+private reproduction showed group TERM reaching uv and Python, followed by
+uv forwarding a second TERM that triggers forced shutdown. Failed service
+results are retained; they are not reset to manufacture a clean stop.
+
+The narrow publication correction accepts only the captured repair's branch
+and existing PR-body update, with exact admission, source, branch, target and
+current-family fencing. PR creation stays prohibited. Repair-specific crash
+recovery and newer-admission fencing regressions accompany independent review.
+The service correction routes initial TERM to the uv wrapper with
+`KillMode=mixed`, retaining the 90-second whole-cgroup SIGKILL bound and the
+intentional second-signal hard exit. Both changes require the complete gate.
+The complete gate subsequently passed on October 6: 10,678 Python cases,
+123 hook checks, architecture contracts and both type checks. Independent
+review accepted the complete publication/shutdown changes and their behavioral
+regressions. All paid services remain stopped pending child-accounting work.
+
+Authorizing native review subagents alone would expose an accounting gap:
+Codex child rollouts have separately recorded usage, while the existing meter
+watches the root. Before activation, child usage must join the same reservation,
+in-flight ceiling, final settlement and teardown witness. Unknown usage/model
+attribution must retain the obligation. This is a runtime-meter correction;
+no reviewer service or new orchestration layer is authorized or needed.
+
+The third partial interval settled **USD 6.215281**. Known October 6 charges
+now total **USD 10.738574**, and October 5/6 combined known charges are
+**USD 31.259535**. No charge, counter or historical hold was reset. A fresh
+two-window schedule must include these charges and preparation within the
+original USD 125 aggregate. No replacement calendar is armed.
+Immutable before/after SQL, stop decision, journals and readback are under
+`publication-contract-incident-20261006T032708Z/` in the existing evidence root.
+Its `partial-measurement/` archive contains 20 observations recorded through
+the existing measurement API, separate new/inherited cohort exports and
+before/after SQL proving financial and lifecycle rows unchanged. The calendar
+charge total differs from cohort-selected spend: new-binding exposure is
+USD 0.222796, while inherited export includes prior bound work. No merge is
+observed; outcome, first-pass, human-duration and recurrence coverage remain
+unknown. The three-merge target is explicitly unmet.

@@ -9121,6 +9121,9 @@ class SQLiteControlStore:
                 return
             if role != "fix":
                 raise WorkflowAuthorityError("resolve commands require the repository's fix owner")
+            if binding.authority.family is WorkflowFamily.PR_REPAIR:
+                self._validate_pr_repair_publication(db, command, captured_run)
+                return
             require_resolve_binding(db, binding, allow_gated=True)
             if command.target.startswith("issue:") and command.target != f"issue:{binding.fence.key.target.number}":
                 raise WorkflowAuthorityError("issue command target disagrees with its workflow")
@@ -9128,6 +9131,50 @@ class SQLiteControlStore:
                 raise WorkflowAuthorityError("publication command lacks its captured run authority")
         except (ValueError, TypeError) as exc:
             raise ControlStoreError(str(exc)) from exc
+
+    def _validate_pr_repair_publication(
+        self, db: sqlite3.Connection, command: LifecycleCommand,
+        captured_run: sqlite3.Row | None,
+    ) -> None:
+        binding = command.workflow
+        if (binding is None or captured_run is None
+                or command.kind not in {CommandKind.PUBLISH_BRANCH, CommandKind.UPDATE_PULL_REQUEST_BODY}):
+            raise WorkflowAuthorityError("PR repair authority only publishes its admitted branch or existing PR body")
+        aggregate = load_review_workflow_row(db, binding.fence.key)
+        selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
+        if (not isinstance(selected, cc.SelectedPRRepair) or selected.binding != binding
+                or selected.component.gates):
+            raise WorkflowAuthorityError("PR repair publication authority is stale, held or unavailable")
+        self._validate_pr_repair_sources(db, selected)
+        dispatch = json.loads(captured_run["dispatch_id"])
+        leg = dispatch.get("leg_id")
+        if (not isinstance(leg, str) or not leg
+                or captured_run["kind"] not in {"FIX_CI", "ADDRESS_REVIEW", "REBASE", "PR_RESUME"}
+                or dispatch.get("kind") != captured_run["kind"]
+                or type(dispatch.get("number")) is not int
+                or dispatch["number"] != binding.fence.key.target.number):
+            raise WorkflowAuthorityError("PR repair publication differs from its admitted target or leg")
+        attempt = WorkflowAttemptIdentity(binding, RunId(command.payload["run_id"]), leg)
+        admission = self._pr_repair_admission(db, attempt)
+        purchase, _ = self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
+        if (not isinstance(purchase, cc.PRRepairPurchase)
+                or not purchase.branch or purchase.branch != command.payload.get("branch")
+                or selected.component.state.branch and selected.component.state.branch != purchase.branch
+                or selected.component.watermarks.last_admitted != admission.admission_version
+                or selected.component.watermarks.last_admitted_fence != binding.fence):
+            raise WorkflowAuthorityError("PR repair publication lost its exact admitted branch")
+        issue = dispatch.get("issue")
+        if (type(issue) is not int or issue <= 0 or issue_from_branch(purchase.branch) != issue
+                or purchase.handoff is not None
+                and purchase.handoff.source.binding.fence.key.target.number != issue):
+            raise WorkflowAuthorityError("PR repair publication differs from its captured linked issue")
+        if command.kind is CommandKind.PUBLISH_BRANCH:
+            if command.target != f"branch:{command.repository}:{purchase.branch}":
+                raise WorkflowAuthorityError("PR repair publication target differs from its admitted branch")
+        elif (command.target != f"pull-request-body:{command.repository}:{binding.fence.key.target.number}"
+                or type(command.payload.get("number")) is not int
+                or command.payload["number"] != binding.fence.key.target.number):
+            raise WorkflowAuthorityError("PR repair publication target differs from its existing pull request")
 
     @staticmethod
     def _publication_command_run(db: sqlite3.Connection, command: LifecycleCommand) -> sqlite3.Row | None:

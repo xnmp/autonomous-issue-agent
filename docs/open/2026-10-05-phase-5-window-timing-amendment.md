@@ -2,28 +2,30 @@
 
 Current status: bounded-window and standing accounting approvals cover this
 five-period allocation. The [execution record](2026-10-05-phase-5-live-execution.md)
-records the completed preparation and two partial attempts. The October 5
+records the completed preparation and three partial attempts. The October 5
 14:30 release ended with a reboot; the replacement 23:00 release was stopped
 on October 6 at 00:23:08 after a functional budget-recovery planner failure.
 The current-profile one-tick canary started at 02:32 UTC after qualification
 and freeze, with the 02:40 UTC stop armed first. It stopped by 02:35 and
-settled USD 2.582646. Ordinary supervision is restored and the window-1 stop
-is armed for October 8 03:00 UTC; both starts and window 2's stop are inactive.
-Canary spend stays inside October 6's existing allowance. Neither earlier attempt
+settled USD 2.582646. The mixed-profile attempt then ran from 03:00 to 03:27:09
+and was stopped for publication and worker-authorization failures. Its
+USD 6.215281 is settled; all paid roles and all five timers are off. No attempt
 supplies full 48-hour acceptance. The schedules below are cancelled historical
-controls, not future authorization to catch up. The replacement allocation
-below is verified; the two full intervals still need final source/profile/cohort
-freezes and actual coverage. Prior charges remain counted against the
+controls, not future authorization to catch up. Known October 6 charges are
+USD 10.738574; October 5/6 known charges total USD 31.259535. New future dates
+and an allocation including preparation are required before arming a start.
+Prior charges remain counted against the
 approved aggregate bound; no allowance or held workflow is reset.
 
-## Replacement mixed-profile allocation — October 6
+## Cancelled mixed-profile allocation — October 6
 
-This supersedes the cancelled calendars below. The candidate first interval
-is October 6 03:00 through October 8 03:00 UTC; the conditional second is
+This superseded the older calendars below. The proposed first interval
+was October 6 03:00 through October 8 03:00 UTC; the conditional second was
 October 8 03:45 through October 10 03:45 UTC. Each is exactly 48 hours.
-Neither start is armed. The first release requires successful current-profile
-qualification, a bounded canary and the final freeze. A missed start is
-postponed with new period arithmetic; it is never caught up.
+The first began but ended after 27 minutes; the second was never armed.
+Both calendars are cancelled. The allocation below describes that release,
+not a newly approved allowance. A future release requires the contract fixes,
+qualification, freeze and new period arithmetic; it is never caught up.
 
 There are five future UTC budget periods, October 6–10, plus the already-paid
 October 5 period. The repository/global caps are now USD 20 per future day;

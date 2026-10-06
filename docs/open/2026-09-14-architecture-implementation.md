@@ -15,7 +15,7 @@ are still required. The October 5 14:30 attempt ended with a host reboot at
 from October 5 23:00 until October 6 00:23:08 UTC, when an operator stop ended
 it after budget recovery repeatedly failed inside the full fix planner. Its
 USD 8.042184 spend is settled and all roles, leases and timers are stopped.
-Both attempts are partial coverage. The recovery action already had its own
+Those attempts are partial coverage. The recovery action already had its own
 family authority, but generic issue binding added a contradictory resolve
 binding. The bounded correction preserves the recovery authority; full-planner,
 durable-effect and target-isolation regressions, independent review and the
@@ -37,9 +37,20 @@ PR #998; its full ordinary command and four native scenarios also passed.
 The exact frozen one-tick canary started at 02:32 UTC and stopped by 02:35.
 It verified admission and bounded cancellation/cleanup, settled USD 2.582646,
 and left no active obligations. Its interrupted inherited PR repair did not
-complete implementation. Ordinary supervision is restored, window 1's future
-stop is armed, and the final freeze precedes its still-unarmed start. Window 2
-remains conditional on the first full stopped readout and adjudication.
+complete implementation. A third attempt started at 03:00 UTC and was stopped
+at 03:27:09 after repeated PR-repair publication rejection and a missing
+worker authorization for required independent review. Its USD 6.215281 spend
+is settled. All roles have stopped, all finite timers are off, and active
+runs, reservations, leases, claims and commands are zero. Fix/steward's failed
+shutdown exits are preserved as incident evidence. Known October 6 charges
+are USD 10.738574; known October 5/6 charges total USD 31.259535. All three
+attempts remain partial coverage. PR-repair publication and uv-backed service
+shutdown corrections passed independent review and the full gate on October 6
+(10,678 Python cases, 123 hook checks, architecture and both type checks).
+Required native review subagents must be authorized and included in the same
+run's spend enforcement before another paid release. The two full windows
+need new future dates, an allocation within the existing USD 125 aggregate
+including preparation and prior charges, and fresh source/profile/cohort freezes.
 Current evidence,
 target qualification, authorization and finite controls are recorded in the
 [live execution record](2026-10-05-phase-5-live-execution.md).

@@ -37,6 +37,8 @@ RestartForceExitStatus=87
 TimeoutStopSec=90
 WatchdogSec=300
 KillSignal=SIGTERM
+# uv forwards TERM to Python; signalling both would trigger forced shutdown.
+KillMode=mixed
 FinalKillSignal=SIGKILL
 MemoryMax=4G
 # Independent review reruns Chromium acceptance suites under this cgroup.
