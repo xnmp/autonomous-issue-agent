@@ -41,6 +41,7 @@ def _effects_factory(effects):
 def _env(tmp_path, **extra):
     env = {
         "REPO": "o/r",
+        "TARGET_DIR": str(tmp_path / "checkout"),
         "STATE_DIR": str(tmp_path / "fix"),
         "REVIEW_STATE_DIR": str(tmp_path / "review"),
         "STEWARD_STATE_DIR": str(tmp_path / "steward"),

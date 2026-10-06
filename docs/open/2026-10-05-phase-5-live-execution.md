@@ -846,3 +846,17 @@ October 6–10 periods, the conservative allocation is USD 20.520961 + 5 × USD 
 + USD 0.75 + USD 5 = USD 116.270961, leaving USD 8.729039 beneath USD 125.
 The partial's routing charges are already included in October 6's allowance.
 New future dates and accounting arithmetic must be verified before release.
+
+The earlier documentation-only hosted run `37441927986` ended at 09:52:45
+with one webhook fixture failure: missing `gh` expected exit 127 but received
+the duplicate-forwarder exit 3. Independent reproduction found parallel
+fixtures sharing `(webhook, o/r, "")` because `_env()` omitted `TARGET_DIR`.
+Each ordinary fixture now receives its private checkout identity; the
+intentional duplicate-forwarder case still shares one identity. All nine
+webhook tests pass with two workers. Production locking and error policy
+are unchanged. A fresh complete gate is required for this fixture correction.
+It subsequently passed at 11:18:27 in 274.385 seconds, with 10,795 Python
+cases, 123 hooks, architecture and both type checks; source hashes were
+unchanged. The earlier full hostile-environment drill covers identical
+adapter, hook and production inputs; the only later test change is the
+isolated app webhook fixture.
