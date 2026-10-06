@@ -1,6 +1,6 @@
 # Architecture implementation phases
 
-**Live checkpoint — 2026-10-05 after the bounded canary:** phases 1–4 are accepted and all
+**Live checkpoint — 2026-10-06 after the partial-window stop:** phases 1–4 are accepted and all
 37 Phase 4 tasks plus their tracking epic are closed after published-commit and
 independent acceptance verification. Phase 6's declared contracts are accepted.
 Issue #237 is merged; the complete reference-host gate now takes about five minutes.
@@ -10,15 +10,20 @@ all 297 fix/165 steward holds remain preserved. The admission/accounting/
 cancellation canary settled USD 0.632080 and all roles stopped; it did not
 complete implementation. A reproduced measurement-receipt reader mismatch has
 a bounded independently reviewed correction. The two actual 48-hour windows
-are still required. The October 5 14:30 start ran until a host reboot at
-22:01:23 UTC; this is about 7½ hours of partial coverage, not a completed window.
-Its USD 13.787344 spend is settled, including trusted recovery of the interrupted
-triage run. Replacement window 1 is October 5 23:00 through October 7 23:00 UTC,
-after fresh ordinary/native qualification of the externally advanced target;
-start requires the final revision/evidence freeze. The partial run and canary share the original
-USD 25 daily caps and five-period USD 125 aggregate bound; no budget is reset.
-Settled accounting no longer implies successful execution. Window 2
-remains unarmed pending the first stopped readout.
+are still required. The October 5 14:30 attempt ended with a host reboot at
+22:01:23 UTC; its USD 13.787344 spend is settled. The replacement attempt ran
+from October 5 23:00 until October 6 00:23:08 UTC, when an operator stop ended
+it after budget recovery repeatedly failed inside the full fix planner. Its
+USD 8.042184 spend is settled and all roles, leases and timers are stopped.
+Both attempts are partial coverage. The recovery action already had its own
+family authority, but generic issue binding added a contradictory resolve
+binding. The bounded correction preserves the recovery authority; full-planner,
+durable-effect and target-isolation regressions, independent review and the
+complete gate passed on October 6. No validation guard was weakened.
+Two fresh full windows, a new exact schedule/profile freeze and stopped
+readouts remain required. The user also requested configurable low/med/high/xhigh
+model routing; that work precedes the next frozen cohort. Prior admissions and
+the canary retain their spend and the approved aggregate bound.
 Current evidence,
 target qualification, authorization and finite controls are recorded in the
 [live execution record](2026-10-05-phase-5-live-execution.md).

@@ -2255,7 +2255,8 @@ def _bind_issue_actions(actions: list[Action], state: FixState) -> list[Action]:
     """Retain the decision snapshot through claims and all issue effects.
 
     Missing authority drops the affected command, never late-binds it at the
-    executor. PR-only commands and paid PR repair remain in their own family.
+    executor. Self-clear projections, PR-only commands and paid PR repair
+    retain their own family authority.
     """
     bound: list[Action] = []
     for action in actions:
@@ -2268,6 +2269,8 @@ def _bind_issue_actions(actions: list[Action], state: FixState) -> list[Action]:
                 if action.requires is not None else None
             )
             bound.append(replace(action, requires=claim, workflow=workflow.binding))
+        elif isinstance(action, Relabel) and action.self_clear is not None:
+            bound.append(action)
         elif isinstance(action, CloseIssue) or (
             isinstance(action, (Relabel, PostComment)) and action.target is Target.ISSUE
         ):

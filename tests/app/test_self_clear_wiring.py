@@ -75,6 +75,47 @@ def _seed_clear_count(store, issue, count):
             state=replace(current.issue_recovery.state, self_clears=count))))
 
 
+@pytest.mark.parametrize("labels", [
+    frozenset({Label.AI_BLOCKED, Label.NEEDS_BUDGET_REVIEW}),
+    frozenset({Label.AI_BLOCKED}),
+    frozenset({Label.NEEDS_BUDGET_REVIEW}),
+])
+def test_full_fix_planner_recovers_budget_hold_without_starving_ready_peer(tmp_path, labels):
+    from issue_agent.app.roles import _fix_state
+    from issue_agent.domain.actions import AgentKind, Relabel, RunAgent
+    from issue_agent.domain.fix import FixConfig, decide_fix
+    from tests.app.test_control_record_isolation import workflow_control
+    from tests.fakes.accounted_workflow import seed_imported_budget_hold
+
+    control, workflows = workflow_control(tmp_path, numbers=(7, 8))
+    store = Store(str(tmp_path))
+    object.__setattr__(store, "_workflow_db", control)
+    block = BudgetBlock(7, Target.ISSUE, 7, 2_000_000, "issue:7", 5_000_000)
+    seed_imported_budget_hold(control, block)
+    held = IssueView(7, labels=labels, updated_at="held-revision")
+    ready = IssueView(8, labels=frozenset({Label.AI_READY}), updated_at="ready-revision")
+    observed = WorldState(issues=(held, ready))
+    state = _fix_state(store, observed, workflow_control=workflows)
+    state = replace(state, budget_worlds={7: _observed_budget(store, observed, block)})
+
+    actions = decide_fix(observed, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
+    recovery = [action for action in actions if isinstance(action, Relabel) and action.self_clear is not None]
+    assert len(recovery) == 1
+    assert [action.number for action in actions if isinstance(action, RunAgent)] == [8]
+
+    gateway = InMemoryGitHub(issues=(held, ready))
+    assert _executor(gateway, store, _Journal()).execute_all(recovery)
+    assert gateway.issues[7].labels == frozenset({Label.AI_READY})
+    assert gateway.issues[8].labels == ready.labels
+    assert _recovery_state(store, 7).budget_block is None
+    assert _recovery_state(store, 7).self_clears == 1
+
+    current = WorldState(issues=(gateway.issues[7],))
+    next_actions = decide_fix(current, FixConfig(fix_bot="fix-bot"),
+        _fix_state(store, current, workflow_control=workflows), fixer_busy=False)
+    assert [(action.kind, action.number) for action in next_actions if isinstance(action, RunAgent)] == [(AgentKind.RESOLVE, 7)]
+
+
 @pytest.mark.parametrize("cause", ["machine", "budget"])
 def test_lost_recovery_reply_adopts_same_source_after_actual_paid_return_once(tmp_path, cause, monkeypatch):
     from issue_agent.domain import continuation_components as cc

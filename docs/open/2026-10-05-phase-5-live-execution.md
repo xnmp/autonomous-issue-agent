@@ -9,6 +9,11 @@ remain accepted. Phase 5 still requires actual unattended windows and readout.
 
 ## Authorization and current state
 
+**October 6, 00:23 UTC:** all roles and window timers are stopped. Both live
+attempts ended as partial coverage. Historical arming instructions below are
+cancelled; the functional incident and pending model-tier configuration are
+recorded at the end of this document. Two full windows remain outstanding.
+
 The bounded window approval and the user's later instruction, “approved, and
 all subsequent accounting decisions approved,” remain in force. They cover
 the documented retained-obligation dispositions and the five-period timing
@@ -289,3 +294,49 @@ process registry. This qualifies the current target; it does not erase the
 failed attempt or supply unattended coverage. Window-1 start may now be armed
 after the final revision and evidence freeze. Harness runtime/tests are unchanged from
 the independently accepted `0cac7cc` source and green 304.138-second full gate.
+
+
+### Functional budget-recovery failure — October 6
+
+At 00:20 UTC, read-only supervision found no resolving admission after the
+budget period changed. Actual fix journals show five failed poll passes from
+00:01:40.182691 onward: `self-clear relabel does not match its selected recovery
+projection`. Preserved SQL and actual issue observations reproduce this through
+full `decide_fix` for #755 and #938. Their old USD 20 refusal fits the October 6
+repository/global headroom of USD 23.059353; the failure is authority routing,
+not an ongoing daily-cap refusal. Process liveness did not establish functional
+progress.
+
+The operator ended the attempt through the existing bounded stop service.
+Actual fix shutdown began at 00:23:08.498893 and finished at 00:23:08.666277 UTC;
+all roles stopped successfully. Both window-1 timers were disabled, window 2
+and canary controls remained inactive, and the finite read-only collector was
+terminated. Global active-run, reservation, lease, dispatch-claim and pending
+command counts are zero. The 1-hour-23-minute interval is partial coverage.
+It contains six triage and fourteen groom purchases costing USD 8.042184, with
+no resolve purchase. Known October 5 charges total USD 20.520961; October 6
+charges before this stop total USD 1.940647. The earlier partial interval and
+canary are retained; no credit, money, historical hold or retry count was reset.
+
+Private `self-clear-incident-20261006T002308Z/` evidence contains coherent
+before/after SQL, full and stop journals, the real reproducer, incident and
+intervention observations, both partial-cohort exports and the quiescence
+summary. Human effort remains an observed floor. This escaped systemic finding
+is separate from the first attempt's external reboot.
+
+The correction preserves typed recovery `Relabel` authority in the generic
+issue-action binder. Its constructor still rejects contradictory authority,
+and the existing effect/SQL path still checks owner, target, revision, original
+hold provenance, ceiling and current accounting. Three new regressions cover
+full/half-cleared labels through the full planner and durable effect, verify
+SQL retirement and ready-peer planning, and verify the recovered issue's next
+resolve decision. Independent adversarial review also reproduced the original
+failure and refused stale revisions, forged epochs and missing provenance while
+a healthy peer progressed. The complete `make test` gate passed on October 6
+in about five minutes; its full log is retained. No paid pilot tested this fix.
+
+The user requested configurable low/med/high/xhigh model tiers before the next
+cohort: GPT-6 Luna, GPT-6.1 Sol through Codex, Claude Opus 5.5, and GPT-6 Astra.
+Provider selection, accounting and persisted-session continuity must match
+those choices. No fresh window is armed while this implementation and its
+new profile, accounting bound and qualification remain incomplete.
