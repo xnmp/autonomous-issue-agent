@@ -296,3 +296,80 @@ def test_relative_followup_reference_joins_corroborated_current_child(prepared):
     result = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
     assert isinstance(result, MeasuredRunUsage)
     assert price_run_usage(result, RATES).micros == 1224
+
+
+@pytest.mark.parametrize("target", [ROOT, "/root"])
+def test_child_message_to_current_parent_preserves_complete_mixed_usage(prepared, target):
+    home, meter = prepared
+    call = event("response_item", {"type": "function_call", "name": "send_message", "call_id": "report",
+                 "arguments": json.dumps({"target": target, "message": "Review complete"})})
+    write(home, CHILD, [*child_records(home.parent), call])
+    result = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
+    assert isinstance(result, MeasuredRunUsage)
+    assert price_run_usage(result, RATES).micros == 1224
+
+
+@pytest.mark.parametrize("operation", ["followup_task", "send_input", "resume_agent"])
+def test_child_cannot_activate_its_parent_as_an_unaccounted_followup(prepared, operation):
+    home, meter = prepared
+    call = event("response_item", {"type": "function_call", "name": operation, "call_id": "activate",
+                 "arguments": json.dumps({"target": "/root", "message": "Continue"})})
+    write(home, CHILD, [*child_records(home.parent), call])
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+@pytest.mark.parametrize("target", [OTHER, "/root/foreign"])
+def test_message_cannot_borrow_an_unwitnessed_recipients_usage_baseline(prepared, target):
+    home, meter = prepared
+    call = event("response_item", {"type": "function_call", "name": "send_message", "call_id": "foreign",
+                 "arguments": json.dumps({"target": target, "message": "Review"})})
+    write(home, CHILD, [*child_records(home.parent), call])
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+@pytest.mark.parametrize("target", [OTHER, "/root/other"])
+def test_messages_between_current_siblings_preserve_both_usage_receipts(prepared, target):
+    home, meter = prepared
+    write(home, ROOT, [metadata(ROOT, home.parent), *spawn(), *spawn(child=OTHER, task="other")])
+    call = event("response_item", {"type": "function_call", "name": "send_message", "call_id": "peer",
+                 "arguments": json.dumps({"target": target, "message": "Compare findings"})})
+    write(home, CHILD, [*child_records(home.parent), call])
+    write(home, OTHER, child_records(home.parent, sid=OTHER, agent_path="/root/other"))
+    result = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
+    assert isinstance(result, MeasuredRunUsage)
+    assert price_run_usage(result, RATES).micros == 1298
+
+
+def test_parent_notification_does_not_complete_the_childs_usage(prepared):
+    home, meter = prepared
+    call = event("response_item", {"type": "function_call", "name": "send_message", "call_id": "unfinished",
+                 "arguments": json.dumps({"target": "/root", "message": "Still reviewing"})})
+    write(home, CHILD, [*child_records(home.parent, complete=False), call])
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+@pytest.mark.parametrize("reverse", [False, True])
+def test_notification_cannot_hide_activation_of_the_same_recipient(prepared, reverse):
+    home, meter = prepared
+    calls = [event("response_item", {"type": "function_call", "name": operation, "call_id": operation,
+                   "arguments": json.dumps({"target": "/root", "message": "Continue"})})
+             for operation in ("send_message", "followup_task")]
+    write(home, CHILD, [*child_records(home.parent), *(reversed(calls) if reverse else calls)])
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+@pytest.mark.parametrize("complete", [False, True])
+def test_notification_during_live_usage_needs_completion_before_final_receipt(prepared, complete):
+    home, meter = prepared
+    records = child_records(home.parent, complete=False)
+    records.append(event("response_item", {"type": "function_call", "name": "send_message", "call_id": "live",
+                         "arguments": json.dumps({"target": "/root", "message": "Reviewing"})}))
+    write(home, CHILD, records)
+    streamed = meter.sample(ROOT, "sol", PARENT_USAGE)
+    assert isinstance(streamed, MeasuredRunUsage)
+    assert price_run_usage(streamed, RATES).micros == 1224
+    if complete:
+        with path(home, CHILD).open("a") as stream:
+            stream.write(json.dumps(event("event_msg", {"type": "task_complete", "turn_id": "turn:" + CHILD})) + "\n")
+    final = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
+    assert isinstance(final, MeasuredRunUsage if complete else UnavailableRunUsage)

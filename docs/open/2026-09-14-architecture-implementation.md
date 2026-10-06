@@ -1,5 +1,25 @@
 # Architecture implementation phases
 
+**Latest live finding — October 6, 10:22 UTC:** the 10:00 unattended attempt
+was stopped after 22 minutes as a cost intervention, with no full-window
+acceptance. A freshly spawned review child's notification to its own parent
+was falsely classified as an unknown paid follow-up. Two routing charges
+total USD 0.006798; the unfinished resolve retains its USD 5 reservation and
+has no authoritative charge. All services/timers are stopped. Independent
+diagnosis identified the message-operation defect, and behavioral regressions
+reproduced it. The narrow correction passes recorded-event replay without
+converting unfinished usage into a settlement; independent review accepted
+its authority/pricing boundary. The complete gate passed in 4 minutes 36
+seconds (10,795 Python cases, 123 hook checks, architecture and both type
+checks); the complete hostile-environment drill also passed with two workers.
+An independently reviewed exact-run disposition creates no charge, preserves
+USD 5 uncertainty and cancels the unpriced obligation without changing
+workflows or unrelated money. #755's conservative envelope is explicitly
+USD 30 (USD 25 ledger authority plus USD 5 uncertainty); the aggregate
+admission/uncertainty envelope is USD 116.270961 within USD 125. It is not an
+invoice ceiling. Renewed live qualification and both actual 48-hour windows
+remain outstanding.
+
 **Live checkpoint — 2026-10-06 after the partial-window stop:** phases 1–4 are accepted and all
 37 Phase 4 tasks plus their tracking epic are closed after published-commit and
 independent acceptance verification. Phase 6's declared contracts are accepted.

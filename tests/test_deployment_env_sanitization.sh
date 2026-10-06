@@ -30,6 +30,8 @@ echo "scrub lists in sync (python + remaining bash launcher)"
 # ── Hostile-env pytest leg ────────────────────────────────────────────────────
 # The adapter tests read LINT_CMD/TYPECHECK_CMD/… from the process env;
 # tests/conftest.py must neutralize an operator's exported values.
+# Reuse the normal adapter runner so CI's bounded worker pool also applies
+# here; a serial replay of the real SQLite histories dominated this drill.
 env \
   TEST_CMD=true LINT_CMD=true TYPECHECK_CMD=true EDIT_CHECK_CMD=true \
   ALLOW_UNTESTED=1 RED_MUST_FAIL=0 VERIFY_RED_AT_COMMIT=0 \
@@ -41,7 +43,7 @@ env \
   STEWARD_STATE_DIR="$scratch/steward-state" \
   HARNESS_DEPLOY_KNOBS="STATE_DIR REVIEW_STATE_DIR STEWARD_STATE_DIR CUSTOM_DEPLOY_KNOB" \
   CUSTOM_DEPLOY_KNOB="leaks-unless-manifest-scrubbed" \
-  sh -c "cd '$ROOT' && uv run --quiet pytest tests/adapters -q"
+  sh -c "cd '$ROOT' && make --no-print-directory test-adapters"
 
 env \
   TEST_CMD=true \

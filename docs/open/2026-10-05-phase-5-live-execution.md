@@ -771,3 +771,78 @@ At 09:14:59 ordinary supervision was restored, the obsolete canary stop was
 disabled and only the first full window's October 8 10:00 UTC stop was armed.
 Both start timers and the second stop remain inactive. The final stopped
 source/configuration/target/cohort freeze precedes first-window release.
+
+### Fourth partial attempt and native-message defect — October 6
+
+Published documentation `fb19180` has identical runtime/test inputs to accepted
+`f3a1e31`. The final stopped freeze succeeded, then the first window was armed
+at 09:19:30 for October 6 10:00 to October 8 10:00, with its stop armed first.
+The actual timer fired at 10:00:00 and all three roles reached readiness at
+10:00:01 with no restarts. The 20-minute read-only collector confirmed unchanged
+source, boot and profile. The second window remained unarmed.
+
+Issue #755 dispatched: Luna routing selected Sol 6.1 and settled USD 0.002889.
+Resolve run `bbbe9ee61eab48868ccaadd5fabf7266` ran from 10:00:59 to 10:02:14,
+then the meter killed it with `accounting_unavailable`. It retained its full
+USD 5 reservation and no resolve charge. The journal's USD 0.18 is incomplete
+parent telemetry, not a bill. A second routing purchase cost USD 0.003909;
+measured window charges total USD 0.006798. A recorded budget refusal now
+blocks #755 against USD 15.806462 committed and the USD 18 daily cap, but can
+clear after UTC rollover. This was not a permanent accounting admission fence.
+Independent safety review found no immediate cap escape or grace release.
+
+Recorded native events identify a specific false refusal: this reservation
+freshly spawned `/root/adversarial_about_755`, and the child called
+`send_message(target="/root")`. The meter incorrectly required the recipient
+to be the sender's child. Notifications do not activate another turn. The
+correction preserves the operation identity and permits notifications only
+between corroborated current participants; turn-starting operations retain
+the original child-baseline restriction. Per-model pricing, lineage and final
+usage/completion checks remain intact. Regressions reproduced the refusal
+before the correction, and independent source review accepted the boundary.
+Recorded-event replay now counts both observed components incrementally but
+still refuses final settlement because both native turns are unfinished.
+The historical obligation is not repriced or released by this correction.
+
+An operator cost intervention stopped the attempt at 10:22:16 before repeating
+known unproductive work. This is a protocol deviation and partial coverage,
+not a completed soak or a claim that caps failed. All three roles stopped
+successfully; all finite timers and the obsolete collector are inactive.
+The immutable stopped SQL/cohort/readout at `stationary-window-1-partial-stopped/`
+has zero active runs, leases, claims or pending commands and the sole USD 5
+unknown reservation. Empty registries and absent matching processes are
+verified; exact failed-group ESRCH is not claimed. Earlier USD 0.75 uncertainty
+remains separately preserved. Two actual full windows still need fresh future
+dates, qualification, freeze and stopped readouts.
+
+The hosted performance finding also prompted one bounded execution change:
+the hostile-environment adapter replay reuses `make test-adapters` instead of
+a serial pytest invocation, retaining CI's two workers, the complete suite,
+all hostile values, hooks, disk scratch and FULL durability. Its actual drill
+and the complete normal gate must pass before publication; no speedup is
+claimed in advance. The actual drill subsequently passed with the full 3,661
+adapter cases in 348.30 seconds and all 123 hook checks. The complete normal
+gate passed at 10:43:28 in 275.845 seconds: 3,686 domain, 3,661 adapter and
+3,448 app cases (10,795 total), 123 hooks, architecture and both type checks.
+Its source hashes stayed unchanged. Hosted performance comparison remains
+pending; local/hosted timings are not interchangeable.
+
+The exact failed run's operator disposition was independently reviewed and
+applied only while all roles, timers, collector and owned process registries
+were stopped. It retires the USD 5 reservation as `cancelled/released`, creates
+no charge, preserves the original native failure evidence and conserves all
+other financial, workflow and lifecycle rows. Late normal success/session
+promotion remains barred. USD 5 is retained explicitly outside SQL; combined
+preserved uncertainty is now USD 5.75, not measured zero.
+
+This is an explicit accounting exception under the user's standing approval.
+The admission issue cap remains USD 25, so #755's conservative envelope is
+USD 30 including its USD 5 historical uncertainty. It is not enforced as USD 30
+in SQL and is not an invoice ceiling. Further unknown dispositions require
+recalculation. Other targets keep their existing caps and captured requests;
+a global reduction to USD 20 was rejected because it would strand PR #997's
+original USD 10 request. With future full windows still confined to the five
+October 6–10 periods, the conservative allocation is USD 20.520961 + 5 × USD 18
++ USD 0.75 + USD 5 = USD 116.270961, leaving USD 8.729039 beneath USD 125.
+The partial's routing charges are already included in October 6's allowance.
+New future dates and accounting arithmetic must be verified before release.

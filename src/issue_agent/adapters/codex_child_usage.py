@@ -114,7 +114,7 @@ class CodexChildUsageMeter:
     children: dict[str, tuple[str, str | None]] = field(default_factory=dict, init=False)
     spawn_calls: dict[tuple[str, str], str | None] = field(default_factory=dict, init=False)
     spawn_outputs: dict[tuple[str, str], tuple[str | None, str | None]] = field(default_factory=dict, init=False)
-    followups: set[tuple[str, str]] = field(default_factory=set, init=False)
+    followups: set[tuple[str, str, str]] = field(default_factory=set, init=False)
     failure: str = field(default="", init=False)
     _bytes: int = field(default=0, init=False)
     _metadata_headers: dict[Path, dict] = field(default_factory=dict, init=False)
@@ -251,7 +251,7 @@ class CodexChildUsageMeter:
                     sender = (((source.get("subagent") or {}).get("thread_spawn") or {}).get("agent_path")
                               if isinstance(source, dict) else None) or "/root"
                     target = target if target.startswith("/") else sender + "/" + target
-                self.followups.add((rollout.session_id, target))
+                self.followups.add((rollout.session_id, target, payload["name"]))
             if item_kind == "function_call" and payload.get("name") == "spawn_agent":
                 if not isinstance(call_id, str) or not call_id:
                     raise ValueError("native spawn call lacks identity")
@@ -409,7 +409,17 @@ class CodexChildUsageMeter:
                 if len(self.rollouts) == before:
                     break
             self._resolve_spawn_outputs(final=final)
-            for parent, target in self.followups:
+            participants = set(self.roots) | set(self.children)
+            message_targets = participants | {path for _, path in self.children.values() if path}
+            if self.roots:
+                message_targets.add("/root")
+            for parent, target, operation in self.followups:
+                # Notifications cannot activate another turn; every participant
+                # still needs its own corroborated baseline and complete usage.
+                if operation == "send_message":
+                    if parent in participants and target in message_targets:
+                        continue
+                    raise ValueError("native message lacks this reservation's participant baseline")
                 if not any(owner == parent and target in {sid, path}
                            for sid, (owner, path) in self.children.items()):
                     raise ValueError("native follow-up lacks this reservation's child baseline")
