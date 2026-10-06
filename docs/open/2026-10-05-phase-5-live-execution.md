@@ -636,4 +636,138 @@ total), 123 hook checks, architecture and both type checks in 4 minutes
 unchanged. A finance-reviewed fresh native check reserves at most USD 0.25,
 within the four-case USD 0.76 quote envelope and probe-only USD 13 limits.
 It requires newly prepared committed source and actual model, usage, charge,
-authority-conservation and process-absence evidence. No paid check has run.
+authority-conservation and process-absence evidence. No paid check had run at
+the 07:01 checkpoint.
+
+### First actual native accounting check — October 6
+
+The initial scratch invocation was refused locally because it was not inside
+a Git repository. No provider session or rollout was produced, and its
+USD 0.25 reservation stayed held. A separately reviewed exact-run operator
+disposition preserved the failed artifacts, financial and workflow rows and
+USD 0.25 conservative unknown exposure. It is neither measured zero nor a
+qualification pass. Scratch preparation now initializes and verifies an isolated
+Git repository without changing the target. The five named one-shot cases
+have a USD 1.01 total quote ceiling; no automatic retry is enabled.
+
+The named replacement completed at 07:13:40 UTC. Actual Codex 0.160 receipts
+contain a Luna root and exactly one Sol child, with their own response usage
+and completed turns. An independent reconstruction of each rounded captured-card
+component yields USD 0.001111 root plus USD 0.034827 child, matching one
+USD 0.035938 authoritative charge. Workflow and lifecycle row hashes match
+before/after; the owned group is absent by kernel check and active runs,
+reservations, leases, claims and commands are zero. Independent review accepted
+this fresh case. Subsequent cases are recorded below.
+
+Known October 6 charges are now USD 10.774512; known October 5/6 charges total
+USD 31.295473. The proposed bound including preserved local-refusal uncertainty
+is USD 20.520961 + USD 13 + 5 × USD 18 + USD 0.25 = USD 123.770961,
+leaving USD 1.229039 beneath the original USD 125 admission allocation.
+Applied service caps remain unchanged, all workers/timers remain off, and no
+full-window profile, calendar or Phase 5 acceptance is claimed.
+
+### Scoped native qualification and remaining limits — October 6
+
+Independent review accepted the actual copied-prefix fork: child ordinal 9
+excludes inherited records, and root USD 0.000919 plus child USD 0.000667
+matches one USD 0.001586 charge. Reference-base forks were not emitted and
+remain unqualified.
+
+The first cap check ended on the private 60-second idle watchdog while its
+long child had no usage receipt. It did not witness budget termination.
+The full USD 0.01 reservation stayed held; its exact operator disposition
+preserves USD 0.25 uncertainty. Production idle remains 900 seconds. The
+short replacement kept a hard 120-second bound with idle disabled and verified
+final overrun detection: root USD 0.001111 plus child USD 0.022455 equals one
+USD 0.023566 charge. The USD 0.013566 quote variance is recorded. CLI exit 0
+and the absence of a budget-kill log preclude an in-flight termination claim.
+
+Independent review accepted cancellation, teardown and retention: the intent
+was persisted before cancellation, the first child turn completed, and its
+second turn started without completion or usage. Reconciliation refused to
+guess; SQL held the full USD 0.25 with no charge or lease, preserving
+`abandoned/dead_lease`. The group is absent. Its subsequent exact operator
+disposition preserves that uncertainty, intent and all unrelated authority.
+The legacy completion event's zero-cost fallback is excluded from billing;
+SQL remains authority and billing is unknown. No further probe is planned.
+
+Six named admissions quoted USD 1.02. Three measured configured-card charges
+total USD 0.061090; three dispositions preserve USD 0.75 uncertainty. Known
+October 6 charges are USD 10.799664 and October 5/6 total USD 31.320625.
+The earlier future allocation including uncertainty is USD 124.270961 within
+USD 125. A stationary alternative covering five October 6–10 periods at USD 18
+daily/global, with USD 5 fix/review limits, has a reviewed arithmetic bound
+of USD 111.270961 including all today's preparation and uncertainty. It is
+unapplied; existing budget holds retain their original quote amounts and must
+be inspected before freezing a cohort. No allowance or historical hold resets.
+
+Hosted run `37427276252` for `f3a1e31` was interrupted by SIGTERM with no failing
+assertion. The cancellation origin is unknown; diagnostic artifacts are
+preserved. One rerun of that exact revision is pending. No speculative source
+fix, new profile, canary, calendar or worker start is claimed. Two actual full
+48-hour windows and their stopped readouts remain outstanding.
+
+### Stationary profile staged — October 6, 08:22 UTC
+
+The reviewed profile is applied to both operator and service snapshots:
+USD 18 daily/global, USD 5 fix/review and USD 25 per issue. Both live files
+match SHA-256 `60ea408500780adce3162bec2795d810989cc0905d022d465f7b3b4b1994ff53`;
+snapshot configuration is `af894cc5d599712f`, rendered admission configuration
+is `ef29bbbe3129132b`. All model selections, prices, credentials, the exact
+qualified test command and other inputs are preserved. Per-file replacements
+are atomic; verified matching readback and stopped deployments establish success.
+Historical holds, allowances and financial rows were not reset.
+
+Fresh current-state reads replace the old hold snapshot: #755 revision 14 has
+no budget or machine hold and one self-clear; #938 revision 8 retains a USD 10
+request and one self-clear; issue #848/PR #997 revision 23 retains a USD 10
+request and two self-clears. Lowering the new quote to USD 5 does not rewrite
+those requests. Shared role reservations may defer admission.
+
+The exact hosted rerun's main suite passed at 08:24:33 and dashboard checks at
+08:25:34. Its hostile-environment drill remains live; no whole-CI pass is claimed.
+The one-tick canary drop-ins were installed at 08:42:50, retaining `KillMode=mixed`,
+setting one tick and disabling restart. Only the future protective canary stop
+is armed, verified for 09:50 UTC with no catch-up. Protected daemons remain stopped.
+Draft full windows are October 6 10:00 to October 8 10:00, then conditionally
+October 8 10:45 to October 10 10:45; all full-window timers remain unarmed.
+Current CI acceptance, canary/cleanup, refreshed cohorts and freeze precede release.
+Missing the start requires new future dates and period arithmetic.
+
+### Green CI and stopped observation canary — October 6, 09:10 UTC
+
+Hosted run `37427276252`, attempt 2, completed successfully for `f3a1e31`.
+Its main suite took 46 minutes 36 seconds; the serial hostile-environment
+adapter and hook rerun took 40 minutes 14 seconds. The main adapter suite's
+two real SQLite history tests took 933 and 742 seconds, while the whole
+adapter suite took 26 minutes 29 seconds and app suite 18 minutes 39 seconds.
+The accepted local full gate remains 4 minutes 30 seconds on the unchanged
+source. Completed logs are retained; no test coverage, durability or timeout
+was weakened and no speculative performance patch was made.
+
+The independently reviewed freeze captured the exact source, profile, target,
+unit containment, current empty process registries and SQL, the passing CI
+receipt and the future 09:50 protective stop before launch. All three roles
+started at 09:07:57 with one tick and no restart. Journals record natural
+`loop completed` and clean stops by 09:09:18. The immutable stopped readout at
+09:10:08 has no new paid runs or charges and zero active runs, reservations,
+leases, claims or commands; role MainPIDs and owned process groups/trees are
+zero. The target-scoped measurement export and 31 actual inherited admission
+references are retained separately. This is observation/cleanup qualification,
+not fresh paid-admission or implementation success.
+
+Issue #755 remains externally `ai-blocked` from the earlier worker delegation
+authorization refusal. Its actual resolve revision 14 has zero failures,
+no gates or pending intent, and its original Codex Sol 6.1 session. Its
+issue-recovery component retains one self-clear, zero resumes/infra failures
+and no machine/budget blocker. Independent review accepted the existing durable
+operator transition adding `ai-ready` and removing `ai-blocked` on exact #755.
+It was applied with verified remote readback and matching full workflow and
+financial hashes before/after. It queues RESOLVE and preserves the old session;
+it does not claim transcript RESUME. Typed rearm would reject `NOT_EXHAUSTED`.
+Captured #938/PR #997 budget requests and all allowance/history remain intact.
+
+At 09:14:59 ordinary supervision was restored, the obsolete canary stop was
+disabled and only the first full window's October 8 10:00 UTC stop was armed.
+Both start timers and the second stop remain inactive. The final stopped
+source/configuration/target/cohort freeze precedes first-window release.

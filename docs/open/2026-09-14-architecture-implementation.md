@@ -76,8 +76,46 @@ accounting disposition; proven unlaunched work retains its safe release path.
 Recovered review billing preserves the existing normal-confirmation contract
 and operator cancellation. Independent review accepted the correction, and the
 complete gate passed at 07:01 UTC: 10,781 Python cases, 123 hook checks,
-architecture and both type checks in 4½ minutes. The bounded native check has
-not run, and no worker or timer has been started.
+architecture and both type checks in 4½ minutes. The bounded native check had
+not run at that checkpoint. No protected daemon or release timer has been started.
+
+The first check was refused locally because the private scratch directory lacked
+a Git repository. Its explicit operator disposition preserves USD 0.25 unknown
+exposure and claims no measured zero or qualification. A named replacement
+completed at 07:13 UTC with an actual Luna parent and Sol child; independently
+recomputed usage matches one USD 0.035938 configured-card charge. Independent
+review accepted that fresh case and an actual copied-prefix fork costing
+USD 0.001586. A long private cap check ended on its shorter idle watchdog and
+remains inconclusive. Its short replacement verified final overrun detection:
+USD 0.023566 settled against a USD 0.01 quote, without an in-flight kill claim.
+The cancellation case verified persisted intent, unfinished child work,
+process teardown and full retained uncertainty. Exact operator dispositions
+preserve USD 0.75 total uncertainty; no billing-zero claim is made.
+Known October 5/6 charges are now USD 31.320625. The earlier proposed allocation
+including uncertainty totals USD 124.270961 within USD 125. In-flight cap
+killing and reference-base forks remain unqualified. Latest hosted CI was
+interrupted by SIGTERM with no failing assertion; one exact-revision rerun is
+pending. Full-window acceptance remains outstanding.
+
+At 08:22 UTC the reviewed stationary profile was applied to both stopped
+snapshots: USD 18 daily/global, USD 5 fix/review and USD 25 per issue. Models,
+prices and the qualified test command are unchanged. Its five-period admission
+envelope, including known prior spend and USD 0.75 uncertainty, is USD 111.270961
+within USD 125; sampled responses can exceed quotes. Current authority shows
+#755 has no budget hold, while #938 and PR #997 retain their original USD 10
+requests and retry allowances. The hosted main suite and dashboard passed;
+the hostile-environment step subsequently passed at 09:05:48 UTC and the
+whole hosted rerun is green. The 09:07:57 canary completed naturally with no
+restarts by 09:09:18. Its stopped readout has no new paid runs or charges and
+zero active reservations, leases, claims or commands. This verifies a clean
+observation tick, without proving fresh paid admission. #755 still has the
+external blocked label from its earlier worker-authorization refusal; its
+authoritative episode has no decision, machine or budget gate. Independent
+review accepted its existing durable label recovery; #755 is now ready, with
+byte-equivalent workflow and financial state before/after. This queues RESOLVE,
+without a rearm, allowance reset or transcript-resume claim. The first full
+window's October 8 10:00 UTC protective stop is armed; starts remain unarmed
+pending the final stopped freeze.
 
 **Earlier implementation checkpoint — 2026-10-05 UTC:** phases 1–3 remain accepted. The approved
 [Phase 4 roadmap](2026-09-30-phase-4-simplification-roadmap.md) has all 37 issues and seven
