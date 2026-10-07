@@ -177,6 +177,24 @@ def test_the_installed_sdk_accepts_max_buffer_size():
     }
 
 
+def test_bundled_claude_cli_supports_configured_opus_55(tmp_path):
+    import subprocess
+    from pathlib import Path
+
+    import pytest
+
+    sdk = pytest.importorskip("claude_agent_sdk")
+    # SDK releases can lag the CLI required by a configured model. Check the
+    # executable we actually launch, without making a paid provider request.
+    executable = Path(sdk.__file__).parent / "_bundled" / "claude"
+    completed = subprocess.run(
+        [str(executable), "--version"], cwd=tmp_path, capture_output=True,
+        text=True, check=True, timeout=10,
+    )
+    version = tuple(int(part) for part in completed.stdout.split()[0].split("."))
+    assert version >= (2, 1, 280), completed.stdout
+
+
 # ── reasoning effort (#16) ────────────────────────────────────────────────────
 def test_effort_reaches_the_options_as_the_sdk_word():
     from issue_agent.domain.effort import Effort

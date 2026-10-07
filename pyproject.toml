@@ -25,7 +25,7 @@ issue-agent-publish = "issue_agent.adapters.agent_publish:main"
 # (fix/review/steward), not just the fixer. Declared here (not only as Makefile
 # `--with`) so `python -m issue_agent.app.main <role>` works after a plain install.
 sdk = [
-    "claude-agent-sdk>=0.2.110",
+    "claude-agent-sdk>=0.2.158",
     "pyjwt[crypto]>=2.8",
     "tree-sitter>=0.21",
     "tree-sitter-bash>=0.21",
@@ -33,7 +33,7 @@ sdk = [
 dev = [
     "pytest>=8",
     "pytest-xdist>=3.6",
-    "claude-agent-sdk>=0.2.110",
+    "claude-agent-sdk>=0.2.158",
     "pyjwt[crypto]>=2.8",
     "import-linter>=2.0",
     "tree-sitter>=0.21",
