@@ -699,6 +699,8 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
         '[ "${TEST_CMD:-}" = "uv run pytest" ] || exit 10\n'
         '[ -z "${ISSUE_AGENT_AUTHORITY_BUNDLE:-}" ] || exit 11\n'
         '[ "${ISSUE_AGENT_DURABLE_PUBLISH:-}" = "1" ] || exit 12\n'
+        '[ "${CARGO_INCREMENTAL:-}" = "0" ] || exit 13\n'
+        '[ "${CARGO_TARGET_DIR:-}" = "/operator/shared-cargo-target" ] || exit 14\n'
         f'echo started > "{marker}"\n'
         "sleep 30\n"
     )
@@ -715,6 +717,8 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
             "TEST_CMD": "uv run pytest",
             "ISSUE_AGENT_AUTHORITY_BUNDLE": "must-stay-in-carrier",
             "ISSUE_AGENT_DURABLE_PUBLISH": "1",
+            "CARGO_INCREMENTAL": "0",
+            "CARGO_TARGET_DIR": "/operator/shared-cargo-target",
             CHILD_ENV_MANIFEST: (
                 "TEST_CMD ISSUE_AGENT_AUTHORITY_BUNDLE "
                 "ISSUE_AGENT_DURABLE_PUBLISH"

@@ -9,6 +9,9 @@ CHILD_ENV_MANIFEST = "ISSUE_AGENT_CHILD_ENV_KEYS"
 _BASE_KEYS = frozenset(
     {
         "API_TIMEOUT_MS",
+        # Direct worker builds must share the operator's cache and storage policy.
+        "CARGO_INCREMENTAL",
+        "CARGO_TARGET_DIR",
         "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK",
         "CLAUDE_AGENT_SDK_VERSION",
         "CLAUDE_CODE_ENTRYPOINT",

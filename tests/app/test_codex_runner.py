@@ -475,6 +475,32 @@ sleep 30
         os.kill(pid, 0)
 
 
+def test_native_codex_child_receives_operator_cargo_settings(tmp_path, monkeypatch):
+    observed = tmp_path / "environment.txt"
+    monkeypatch.setenv("CARGO_TARGET_DIR", "/operator/shared-cargo-target")
+    monkeypatch.setenv("CARGO_INCREMENTAL", "0")
+    monkeypatch.setenv("GH_TOKEN", "publication-secret")
+    body = r'''
+printf '%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${GH_TOKEN-unset}" > "$OBSERVED_ENV"
+out=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "-o" ]; then out="$a"; fi
+  prev="$a"
+done
+printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
+'''
+    result = asyncio.run(CodexRunner(
+        codex_bin=_fake_codex(str(tmp_path), body),
+        env={"OPENAI_API_KEY": "test-key", "OBSERVED_ENV": str(observed)},
+    ).run(RuntimePlan(prompt="x")))
+
+    assert result.status == "done"
+    assert observed.read_text().splitlines() == [
+        "/operator/shared-cargo-target", "0", "unset",
+    ]
+
+
 def test_run_parses_output_file_and_session_stdout_fallback():
     # Session id on STDOUT exercises the FALLBACK branch only — real `codex exec`
     # emits it on stderr (covered by test_run_reads_session_id_from_stderr, the
