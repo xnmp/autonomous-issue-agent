@@ -171,6 +171,17 @@ journalctl --user -u issue-agent-fix-watcher-<name> -f
 systemctl --user status 'issue-agent-*-<name>'
 ```
 
+Systemd also writes `issue_agent_service_terminal` to the role's journal after
+each invocation, including failed startup or daemon termination. The record
+carries the unit, invocation, manager result and available exit code/status.
+Empty fields remain unknown. Retain it with the manager transitions and cgroup
+OOM evidence when investigating a stop; a signal status does not identify its
+sender, and exit 137 alone does not establish OOM. If the manager or journal
+cannot write the record, its absence is an evidence gap. The `-` prefix ignores
+an unsuccessful logging-command exit; a logging spawn failure or timeout may
+still affect the unit's result. Retain the original main-process exit fields
+with that result.
+
 On launchd, logs live under the deployment state directory rather than shared
 `/tmp` names.
 
