@@ -119,6 +119,45 @@ def test_duplicate_response_delivery_is_idempotent_across_incremental_samples(pr
     assert meter.sample(ROOT, "sol", PARENT_USAGE, final=True) == first
 
 
+@pytest.mark.parametrize("prefix_length", [2, 3])
+def test_child_startup_can_acquire_model_and_usage_between_samples(prepared, prefix_length):
+    home, meter = prepared
+    records = child_records(home.parent)
+    write(home, CHILD, records[:prefix_length])
+    for _ in range(2):
+        pending = meter.sample(ROOT, "sol", PARENT_USAGE)
+        assert isinstance(pending, MeasuredRunUsage)
+        assert price_run_usage(pending, RATES).micros == 1150
+    with path(home, CHILD).open("a") as stream:
+        stream.write("".join(json.dumps(record) + "\n" for record in records[prefix_length:]))
+    observed = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
+    assert isinstance(observed, MeasuredRunUsage)
+    assert price_run_usage(observed, RATES).micros == 1224
+    assert meter.sample(ROOT, "sol", PARENT_USAGE, final=True) == observed
+
+
+def test_pending_child_model_cannot_settle_as_parent_only_usage(prepared):
+    home, meter = prepared
+    write(home, CHILD, child_records(home.parent)[:2])
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE), MeasuredRunUsage)
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+@pytest.mark.parametrize("evidence_index", [3, 4, 5])
+def test_child_usage_or_completion_without_model_fails_during_execution(prepared, evidence_index):
+    home, meter = prepared
+    records = child_records(home.parent)
+    write(home, CHILD, [*records[:2], records[evidence_index]])
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE), UnavailableRunUsage)
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+def test_explicit_unpriced_startup_model_fails_before_usage(prepared):
+    home, meter = prepared
+    write(home, CHILD, child_records(home.parent, model="unpriced")[:3])
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE), UnavailableRunUsage)
+
+
 @pytest.mark.parametrize("fault", ["unknown-model", "foreign-record", "negative", "boolean", "cache-overlap",
                                   "missing-usage", "empty-usage", "unfinished", "truncated", "unsupported-version"])
 def test_incomplete_child_accounting_never_becomes_a_parent_only_receipt(prepared, fault):

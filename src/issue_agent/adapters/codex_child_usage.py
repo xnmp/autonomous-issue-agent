@@ -480,6 +480,13 @@ class CodexChildUsageMeter:
                     if final and rollout.token_counts.get(turn, []) != receipts:
                         raise ValueError("native response usage is missing or token counts are ambiguous")
                     actual_model = rollout.models.get(turn)
+                    # Native task_started can precede turn_context. Only an
+                    # unfinished turn without usage evidence can await it;
+                    # final settlement still requires every child's receipts.
+                    if (actual_model is None and not final and not receipts
+                            and not rollout.token_counts.get(turn)
+                            and turn not in rollout.completed_turns):
+                        continue
                     if not actual_model or self.rates is None or actual_model.strip().casefold() not in self.rates.rates:
                         raise ValueError("native child turn model has no explicit configured rates")
                     grouped.setdefault(actual_model, []).extend(receipts)
