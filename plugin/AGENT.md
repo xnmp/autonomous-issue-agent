@@ -23,6 +23,9 @@ blocked summary.
 ## Efficiency
 Think harder up front and try to get the plan right the first time, so you
 don't keep going back to edit it — each re-plan costs a full model round-trip.
+Run resource-heavy browser tests, typechecks and compiler suites sequentially.
+Honor the operator's configured worker counts; concurrent checks share the
+daemon's memory limit and can kill the entire run.
 
 ## Design priors (read FIRST — these encode knowledge you may not have)
 - Read `INVARIANTS.md` and the `docs/adr/` index before writing code. These are

@@ -7,6 +7,7 @@ import json
 import os
 import stat
 import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -80,6 +81,59 @@ def _chatty_body(sid: str = SID, seconds: int = 40) -> str:
         f'for i in $(seq 1 {seconds}); do echo "exec step $i" >&2; sleep 0.05; done\n'
         "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
     )
+
+
+@pytest.mark.parametrize("home_source", [
+    "inherited", "runner", "task", "empty_task", "relative_runner", "relative_task",
+    "symlink_parent",
+])
+def test_accounting_uses_the_launched_child_home_without_scanning_foreign_archive(
+    tmp_path, monkeypatch, home_source,
+):
+    ambient = tmp_path / "ambient"
+    monkeypatch.setenv("HOME", str(ambient))
+    foreign = ambient / ".codex"
+    day = foreign / "sessions" / datetime.now(timezone.utc).strftime("%Y/%m/%d")
+    day.mkdir(parents=True)
+    for number in range(513):
+        (day / f"foreign-{number}.txt").touch()
+    selected = tmp_path / "selected"
+    worktree = tmp_path / "worktree"
+    worktree.mkdir()
+    runner_env = {"OPENAI_API_KEY": "k"}
+    task_env = {}
+    monkeypatch.setenv("CODEX_HOME", str(foreign))
+    if home_source == "inherited":
+        monkeypatch.setenv("CODEX_HOME", str(selected))
+    elif home_source == "runner":
+        runner_env["CODEX_HOME"] = str(selected)
+    elif home_source == "task":
+        runner_env["CODEX_HOME"] = str(foreign)
+        task_env["CODEX_HOME"] = str(selected)
+    elif home_source == "empty_task":
+        runner_env["HOME"] = str(tmp_path / "child-home")
+        runner_env["CODEX_HOME"] = str(foreign)
+        task_env["CODEX_HOME"] = ""
+        selected = tmp_path / "child-home" / ".codex"
+    elif home_source.startswith("relative_"):
+        selected = worktree / "relative-home"
+        (runner_env if home_source == "relative_runner" else task_env)["CODEX_HOME"] = "relative-home"
+    else:
+        actual = tmp_path / "actual" / "work"
+        actual.mkdir(parents=True)
+        alias = tmp_path / "alias"
+        alias.symlink_to(actual, target_is_directory=True)
+        runner_env["CODEX_HOME"] = str(alias / ".." / "relative-home")
+        selected = actual.parent / "relative-home"
+    _write_rollout(selected, input_tokens=10_000, output_tokens=100)
+    observed = tmp_path / "observed-home"
+    body = f'(cd -P -- "${{CODEX_HOME:-$HOME/.codex}}" && pwd -P) > "{observed}"\n' + _chatty_body(seconds=1)
+    result = asyncio.run(_runner(tmp_path, body, env=runner_env).run(
+        RuntimePlan(prompt="x", cwd=str(worktree), env=task_env, max_budget_usd=20.0),
+    ))
+    assert observed.read_text().strip() == str(selected)
+    assert result.exit_reason is ExitReason.OK
+    assert result.cost_usd == pytest.approx(0.053)
 
 
 def test_priced_spend_reports_only_when_the_threshold_is_reached():
@@ -213,6 +267,8 @@ def test_headerless_run_uses_rollout_for_inflight_budget_enforcement(
         },
     }
     token_count = {
+        "timestamp": "2099-07-29T00:00:01Z",
+        "type": "event_msg",
         "payload": {
             "type": "token_count",
             "info": {"last_token_usage": usage, "total_token_usage": usage},
@@ -286,6 +342,8 @@ def test_implausible_early_rollout_usage_is_rejected_not_budget_killed(
         },
     }
     token_count = {
+        "timestamp": "2099-07-29T00:00:01Z",
+        "type": "event_msg",
         "payload": {
             "type": "token_count",
             "info": {"last_token_usage": usage, "total_token_usage": usage},

@@ -9,7 +9,8 @@ CHILD_ENV_MANIFEST = "ISSUE_AGENT_CHILD_ENV_KEYS"
 _BASE_KEYS = frozenset(
     {
         "API_TIMEOUT_MS",
-        # Direct worker builds must share the operator's cache and storage policy.
+        # Direct worker builds must share the operator's storage and worker limits.
+        "CARGO_BUILD_JOBS",
         "CARGO_INCREMENTAL",
         "CARGO_TARGET_DIR",
         "CLAUDE_AGENT_SDK_SKIP_VERSION_CHECK",
@@ -27,6 +28,7 @@ _BASE_KEYS = frozenset(
         "LOGNAME",
         "NO_PROXY",
         "PATH",
+        "PW_WORKERS",
         "SHELL",
         "SSL_CERT_DIR",
         "SSL_CERT_FILE",

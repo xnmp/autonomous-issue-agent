@@ -701,6 +701,8 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
         '[ "${ISSUE_AGENT_DURABLE_PUBLISH:-}" = "1" ] || exit 12\n'
         '[ "${CARGO_INCREMENTAL:-}" = "0" ] || exit 13\n'
         '[ "${CARGO_TARGET_DIR:-}" = "/operator/shared-cargo-target" ] || exit 14\n'
+        '[ "${CARGO_BUILD_JOBS:-}" = "2" ] || exit 15\n'
+        '[ "${PW_WORKERS:-}" = "1" ] || exit 16\n'
         f'echo started > "{marker}"\n'
         "sleep 30\n"
     )
@@ -719,6 +721,8 @@ def test_supervised_sdk_cli_registers_session_before_target_executes(
             "ISSUE_AGENT_DURABLE_PUBLISH": "1",
             "CARGO_INCREMENTAL": "0",
             "CARGO_TARGET_DIR": "/operator/shared-cargo-target",
+            "CARGO_BUILD_JOBS": "2",
+            "PW_WORKERS": "1",
             CHILD_ENV_MANIFEST: (
                 "TEST_CMD ISSUE_AGENT_AUTHORITY_BUNDLE "
                 "ISSUE_AGENT_DURABLE_PUBLISH"

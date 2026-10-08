@@ -475,13 +475,15 @@ sleep 30
         os.kill(pid, 0)
 
 
-def test_native_codex_child_receives_operator_cargo_settings(tmp_path, monkeypatch):
+def test_native_codex_child_receives_operator_build_settings(tmp_path, monkeypatch):
     observed = tmp_path / "environment.txt"
     monkeypatch.setenv("CARGO_TARGET_DIR", "/operator/shared-cargo-target")
     monkeypatch.setenv("CARGO_INCREMENTAL", "0")
+    monkeypatch.setenv("CARGO_BUILD_JOBS", "2")
+    monkeypatch.setenv("PW_WORKERS", "1")
     monkeypatch.setenv("GH_TOKEN", "publication-secret")
     body = r'''
-printf '%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${GH_TOKEN-unset}" > "$OBSERVED_ENV"
+printf '%s\n%s\n%s\n%s\n%s\n' "${CARGO_TARGET_DIR-unset}" "${CARGO_INCREMENTAL-unset}" "${CARGO_BUILD_JOBS-unset}" "${PW_WORKERS-unset}" "${GH_TOKEN-unset}" > "$OBSERVED_ENV"
 out=""
 prev=""
 for a in "$@"; do
@@ -497,7 +499,7 @@ printf '%s' '{"status":"done","summary":"ok","needs":""}' > "$out"
 
     assert result.status == "done"
     assert observed.read_text().splitlines() == [
-        "/operator/shared-cargo-target", "0", "unset",
+        "/operator/shared-cargo-target", "0", "2", "1", "unset",
     ]
 
 

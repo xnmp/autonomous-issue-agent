@@ -1319,6 +1319,22 @@ class CodexRunner(AgentRuntime):
         and get None (#43)."""
         return task.model or self.default_model
 
+    def _child_environment(self, task: RuntimePlan) -> dict[str, str]:
+        return child_process_env(
+            os.environ,
+            {**git_identity_env(self._resolved_model(task)), **self.env, **task.env},
+            additional_keys=(self.provider.env_key,),
+        )
+
+    @staticmethod
+    def _accounting_home(environment: dict[str, str], cwd: str | None) -> str:
+        # An explicit empty CODEX_HOME resets to the child's HOME, not the carrier's.
+        home = environment.get("CODEX_HOME") or os.path.join(
+            environment.get("HOME") or os.path.expanduser("~"), ".codex",
+        )
+        # Codex resolves relative homes from its execution directory.
+        return os.path.realpath(os.path.join(cwd or os.getcwd(), home))
+
     def _pump_slice(self) -> float:
         """How long one stderr-readline chunk blocks. The poll slice floored by
         whichever caps are armed, so a cap SHORTER than the slice still trips on
@@ -1530,7 +1546,7 @@ class CodexRunner(AgentRuntime):
         # Captured once — retries inside this run resume a session whose earlier
         # attempts were never ledgered, so their tokens must stay in the total.
         baseline_sid = task.resume or ""
-        codex_home = task.env.get("CODEX_HOME") or None
+        codex_home = self._accounting_home(self._child_environment(task), task.cwd)
         baseline_usage = (
             read_rollout_usage(baseline_sid, codex_home=codex_home)
             if baseline_sid
@@ -1734,18 +1750,8 @@ class CodexRunner(AgentRuntime):
         import asyncio
 
         model = self._resolved_model(task)
-        # Commit attribution: author/committer name carries the effective model.
-        # Below self.env/task.env so an explicit override stays an override.
-        proc_env = child_process_env(
-            os.environ,
-            {
-                **git_identity_env(model),
-                **self.env,
-                **task.env,
-            },
-            additional_keys=(self.provider.env_key,),
-        )
-        codex_home = proc_env.get("CODEX_HOME") or None
+        proc_env = self._child_environment(task)
+        codex_home = self._accounting_home(proc_env, task.cwd)
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
         # Rollout metadata uses wall-clock UTC while the plausibility guard only
         # needs elapsed process time. Keep the two clocks separate: wall time
