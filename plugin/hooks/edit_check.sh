@@ -16,13 +16,15 @@ fi
 # bound), via the shared wrapper. rc 213 = it re-entered the gate; block with
 # the real cause rather than a fake check failure.
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-# shellcheck source=/dev/null
-[ -f "$HERE/checks/_pr_common.sh" ] && . "$HERE/checks/_pr_common.sh"
-if declare -f prc_run_test_cmd >/dev/null; then
-  out=$(prc_run_test_cmd "$EDIT_CHECK_CMD" 2>&1); rc=$?
-else
-  out=$(eval "$EDIT_CHECK_CMD" 2>&1); rc=$?
+# Missing or partially loaded transport must never run a target command outside
+# the harness's bounded executor.
+if [ ! -r "$HERE/checks/_pr_common.sh" ] ||
+   ! . "$HERE/checks/_pr_common.sh" ||
+   ! declare -f prc_run_test_cmd >/dev/null; then
+  echo "Edit check blocked: shared execution transport is unavailable" >&2
+  exit 2
 fi
+out=$(prc_run_test_cmd "$EDIT_CHECK_CMD" 2>&1); rc=$?
 if [ "$rc" -eq "${PRC_GATE_RECURSION_RC:-213}" ]; then
   echo "GATE RECURSION: EDIT_CHECK_CMD re-entered the harness gate and was refused (see #63): $EDIT_CHECK_CMD" >&2
   echo "$out" >&2

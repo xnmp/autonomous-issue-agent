@@ -1,10 +1,13 @@
 import asyncio
 import os
+import shlex
 import shutil
 import stat
 import subprocess
 import tomllib
 from pathlib import Path
+
+import pytest
 
 
 def _system_bin_dirs() -> str:
@@ -102,6 +105,76 @@ def test_edit_check_delegates_to_the_shared_guarded_wrapper(tmp_path) -> None:
     assert "plugin/hooks/edit_check.sh" in text
     assert "EDIT_CHECK_CMD=" in text
     assert "out=$(" not in text
+
+
+@pytest.mark.parametrize(
+    "transport",
+    [None, "return 0\n", "prc_run_test_cmd() { eval \"$1\"; }\nreturn 1\n"],
+    ids=["missing", "missing-executor", "failed-source"],
+)
+def test_edit_check_refuses_unavailable_transport(tmp_path, transport) -> None:
+    hook = tmp_path / "edit_check.sh"
+    source = Path(__file__).resolve().parents[2] / "plugin/hooks/edit_check.sh"
+    shutil.copyfile(source, hook)
+    if transport is not None:
+        checks = tmp_path / "checks"
+        checks.mkdir()
+        (checks / "_pr_common.sh").write_text(transport)
+    marker = tmp_path / "command-ran"
+
+    completed = subprocess.run(
+        ["bash", str(hook)],
+        env={"PATH": _system_bin_dirs(), "EDIT_CHECK_CMD": f"touch {shlex.quote(str(marker))}"},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 2
+    assert "shared execution transport is unavailable" in completed.stderr
+    assert not marker.exists()
+
+
+def test_edit_check_without_command_does_not_require_transport(tmp_path) -> None:
+    hook = tmp_path / "edit_check.sh"
+    source = Path(__file__).resolve().parents[2] / "plugin/hooks/edit_check.sh"
+    shutil.copyfile(source, hook)
+
+    completed = subprocess.run(
+        ["bash", str(hook)],
+        env={"PATH": _system_bin_dirs(), "EDIT_CHECK_CMD": ""},
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert completed.stderr == b""
+
+
+def test_edit_check_executes_with_scrubbed_controls(tmp_path) -> None:
+    hook = Path(__file__).resolve().parents[2] / "plugin/hooks/edit_check.sh"
+    marker = tmp_path / "command-ran"
+    command = (
+        'test -z "${CUSTOM_KNOB:-}" && '
+        'test -z "${HARNESS_DEPLOY_KNOBS:-}" && '
+        f"touch {shlex.quote(str(marker))}"
+    )
+
+    completed = subprocess.run(
+        ["bash", str(hook)],
+        env={
+            "PATH": _system_bin_dirs(),
+            "EDIT_CHECK_CMD": command,
+            "HARNESS_DEPLOY_KNOBS": "CUSTOM_KNOB",
+            "CUSTOM_KNOB": "operator-control",
+        },
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert marker.exists()
 
 
 def test_codex_cannot_mint_trusted_screenshot_receipts(tmp_path) -> None:

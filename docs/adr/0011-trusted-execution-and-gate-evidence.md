@@ -30,6 +30,11 @@ and can validate keyed screenshot receipts. Both preserve two-dot commit history
 and merge-base diffs. The separate bin/point-at preflight/bootstrap and its
 launcher environment scrub remain outside this policy consolidation. Indeterminate evidence denies a governed commit, push, or PR.
 
+Optional edit-time checks provide advisory feedback rather than publication
+evidence. A configured shell edit check refuses execution when its shared
+transport is missing or fails to load; it never falls back to an unbounded
+shell evaluator. A blank edit-check command remains a no-op.
+
 An operator `TEST_CMD` has precedence over repository-local declarations.
 Tests run through the harness-owned execution boundary with recursion limits,
 timeouts, process-group teardown, and a child environment that removes
