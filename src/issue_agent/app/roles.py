@@ -128,7 +128,7 @@ from ..domain.triage import (
     triage_candidates,
 )
 from ..domain.jira import jira_phase, jira_sync_needed
-from ..domain.actions import AgentKind, Relabel, ResetCiRetries, RunAgent, Target
+from ..domain.actions import AgentKind, NoOp, Relabel, ResetCiRetries, RunAgent, Target
 from ..adapters.runtime_plan import AgentRuntime, RuntimePlan
 from ..domain.effect_retry import DEFAULT_EFFECT_RETRY_CEILING
 from ..domain.outcome import AgentResult
@@ -2967,6 +2967,8 @@ def compose_fix_daemon(
         rejected: list[RunAgent] = []
         rejected_issues: set[int] = set()
         for action in decided:
+            if isinstance(action, NoOp) and action.reason:
+                log(action.reason)
             if not isinstance(action, RunAgent):
                 continue
             issue, paths = action_reservation(action, world)

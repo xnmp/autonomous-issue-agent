@@ -1400,6 +1400,31 @@ def test_router_predictions_are_injected_before_the_overlap_decision(tmp_path):
     assert enriched.issues[0].predicted_paths == frozenset({"backend/app/x.py"})
 
 
+def test_fix_daemon_reports_a_pending_repair_hold(tmp_path, monkeypatch):
+    from issue_agent.app.config import HarnessConfig
+    from issue_agent.app.roles import compose_fix_daemon
+    from issue_agent.domain.actions import NoOp
+
+    reason = "rebase #1019 held: waiting for the current workflow's durable rebase return"
+    monkeypatch.setattr("issue_agent.app.roles.decide_fix", lambda *_args, **_kwargs: [NoOp(reason)])
+    logs = []
+
+    class QuietGateway(FakeGateway):
+        def build_world(self):
+            return WorldState()
+
+    daemon = compose_fix_daemon(
+        HarnessConfig(repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
+                      state_dir=str(tmp_path / "state")),
+        QuietGateway(), Store(str(tmp_path / "state")), FakeWorktrees(),
+        FakeRunner(AgentResult(is_error=False)), log=logs.append,
+    ).daemon
+
+    daemon.tick()
+
+    assert reason in logs
+
+
 def test_daemon_holds_predicted_overlap_before_every_resolve_dispatch(tmp_path):
     """Persisted router hints must cross the real daemon decision seam."""
     from issue_agent.app.config import HarnessConfig

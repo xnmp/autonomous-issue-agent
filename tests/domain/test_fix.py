@@ -20,6 +20,7 @@ from issue_agent.domain.actions import (
     RerunFailedChecks,
     ResetCiRetries,
     RunAgent,
+    NoOp,
     Target,
 )
 from issue_agent.domain.exemptions import (
@@ -72,6 +73,8 @@ from issue_agent.domain.workflow_identity import (
 
 from tests.fakes.workflow_authority import with_issue_recovery
 from issue_agent.domain.continuation_components import IssueRecoveryState
+from issue_agent.domain import continuation_components as cc
+from issue_agent.domain.contracts import ContinuationAdmission
 
 CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
 
@@ -892,6 +895,58 @@ def test_conflicting_pr_dispatches_rebase():
     actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
     runs = _run_agents(actions)
     assert runs and runs[0].kind == AgentKind.REBASE and runs[0].number == 100
+
+
+def _workflow_with_pending_rebase(pending_generation):
+    snapshot = _workflow(5)
+    if pending_generation is not None:
+        component = snapshot.issue_recovery
+        assert isinstance(component, cc.ActiveIssueRecovery)
+        fence = WorkflowFence(snapshot.revision.fence.key, pending_generation)
+        pending = ContinuationAdmission(
+            WorkflowAttemptIdentity(component.identity.bind(fence), RunId("pending-rebase"), "rebase-leg"),
+            1,
+        )
+        snapshot = replace(snapshot, issue_recovery=replace(
+            component,
+            state=replace(component.state, pending_rebase=pending),
+            watermarks=cc.ContinuationWatermarks(1, 0, fence),
+        ))
+    return snapshot
+
+
+@pytest.mark.parametrize("pending_generation", [None, 1, 2])
+def test_unresolved_current_rebase_does_not_starve_ready_issue(pending_generation):
+    snapshot = _workflow_with_pending_rebase(pending_generation)
+    observed = world(
+        issues=[issue(995, "ai-ready")],
+        prs=[pr(100, "ai-pr-open", head_ref_name="fix/5-x", mergeable="CONFLICTING")],
+    )
+    actions = decide_fix(observed, CFG, FixState(resolve_workflows={5: snapshot}),
+                         fixer_busy=False, dispatch_slots=1)
+    runs = _run_agents(actions)
+    expected = (AgentKind.RESOLVE, 995) if pending_generation == 2 else (AgentKind.REBASE, 100)
+    assert [(run.kind, run.number) for run in runs] == [expected]
+    if pending_generation == 2:
+        assert any(isinstance(action, NoOp) and action.reason for action in actions)
+
+
+
+@pytest.mark.parametrize("counter", ["infra_deaths", "rebase_retries"])
+def test_pending_rebase_preserves_retry_ceiling_and_unrelated_ready_work(counter):
+    ceiling = CFG.max_infra_deaths if counter == "infra_deaths" else CFG.max_rebase_retries
+    state = FixState(
+        resolve_workflows={5: _workflow_with_pending_rebase(2)},
+        infra_deaths={5: ceiling} if counter == "infra_deaths" else {},
+        rebase_retries={5: ceiling} if counter == "rebase_retries" else {},
+    )
+    observed = world(issues=[issue(995, "ai-ready")], prs=[
+        pr(100, "ai-pr-open", head_ref_name="fix/5-x", mergeable="CONFLICTING"),
+    ])
+    actions = decide_fix(observed, CFG, state, fixer_busy=False, dispatch_slots=1)
+    assert any(isinstance(action, Relabel) and action.number == 100
+               and action.add == Label.NEEDS_HUMAN_REVIEW for action in actions)
+    assert [(run.kind, run.number) for run in _run_agents(actions)] == [(AgentKind.RESOLVE, 995)]
 
 
 def test_mergeable_pr_does_not_dispatch_rebase():
