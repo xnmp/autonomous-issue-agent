@@ -35,6 +35,7 @@ from .actions import (
     RerunFailedChecks,
     ResetCiRetries,
     RunAgent,
+    NoOp,
     Target,
 )
 from .self_clear import (
@@ -1686,6 +1687,18 @@ def infra_escalation_reason(cap: int) -> str:
 
 
 # ── composition ────────────────────────────────────────────────────────────
+def _has_pending_rebase_return(state: FixState, issue: int) -> bool:
+    workflow = state.resolve_workflows.get(issue)
+    if not isinstance(workflow, WorkflowSnapshot) or not isinstance(
+        workflow.issue_recovery, cc.ActiveIssueRecovery
+    ):
+        return False
+    pending = workflow.issue_recovery.state.pending_rebase
+    return pending is not None and cc.rebase_return_is_current(
+        cc.SelectedIssueRecovery(workflow.revision, workflow.issue_recovery), pending
+    )
+
+
 def decide_fix(
     world: WorldState,
     cfg: FixConfig,
@@ -1988,6 +2001,13 @@ def decide_fix(
                         pr.number,
                         f"rebase failed {cfg.max_rebase_retries}× without a clean "
                         "merge — the conflict needs a human.",
+                    ))
+                    continue
+                # Admission refuses an unresolved allowance; selecting it again
+                # would consume the slot without launching any paid work.
+                if _has_pending_rebase_return(state, issue_n):
+                    actions.append(NoOp(
+                        f"rebase #{pr.number} held: waiting for the current workflow's durable rebase return"
                     ))
                     continue
                 actions.append(RunAgent(AgentKind.REBASE, pr.number))
