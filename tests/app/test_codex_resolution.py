@@ -289,9 +289,10 @@ def _doctor_args(name="app"):
 
 
 def _stub_doctor(tmp_path, monkeypatch, env_file: str):
-    """Real env composition (shared.env, no overlay); only doctor.sh is stubbed,
+    """Real env composition (shared.env, no overlay); doctor.sh and host install are stubbed,
     so the python-side codex report is exercised against a really-sourced env."""
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path / "repos"))
+    monkeypatch.setattr(cli, "entrypoint_drift", lambda: "")
     monkeypatch.setattr(cli, "SHARED_ENV", env_file)
     real_run = subprocess.run
 

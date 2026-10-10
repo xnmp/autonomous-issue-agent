@@ -72,7 +72,7 @@ _VALUES = (
     cc.ReviewRetryState, cc.IssueReviewPurchase, cc.ReviewRepairResult,
     cc.IssueRebasePurchase, cc.RebaseRepairResult, cc.RebaseAllowanceReset,
     cc.IssueCIPurchase, cc.CIRepairResult, cc.CIEpisodeReset,
-    IssueCompletionGuard, Money, TokenUsage, SettlementRequest, cc.RepairModel, cc.PRRepairResult, cc.PRRepairNotLaunched, cc.RepairHandoff,
+    IssueCompletionGuard, Money, TokenUsage, SettlementRequest, cc.RepairModel, cc.PRRepairResult, cc.PRRepairNotLaunched, cc.PRRepairUnreturned, cc.RepairHandoff,
     ContinuationImportPlan, ContinuationImportTarget,
     ContinuationAdmission, identity.ContinuationComponentIdentity,
     cc.ContinuationWatermarks, cc.RepairSession, cc.IssueRecoveryState, cc.PRRepairState, cc.PRBlankReplySource,

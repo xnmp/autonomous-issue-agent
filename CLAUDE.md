@@ -117,6 +117,15 @@ stable taxonomy. Boot and suspension recovery kill orphans, reclaim leases,
 reconcile unsettled spend, drain commands reconcile-first, and emit abandoned
 run corrections.
 
+PR-repair accounting disposition does not itself acknowledge paired workflow
+admissions. `reconcile_pr_repair_returns` also recovers launched terminal work
+without a captured return, after leases, dispatch bindings, publications and
+active money are gone. Its distinct `PRRepairUnreturned` acknowledgment keeps
+attempt debt and prior session provenance; it never invents output or spend.
+Selection is not acknowledgment authority: a real result captured before the
+mutation recheck wins. The architecture reference maps both race orderings and
+crash boundaries to behavioral tests.
+
 The governor is advisory. Current agent children still inherit publication
 capability, so the supported posture is trusted inbound content only. See the
 capability matrix before changing runtime/tool/credential boundaries.

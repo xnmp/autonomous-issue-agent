@@ -22,3 +22,6 @@ direction, non-negotiables only) still holds.
 
 Re-measured 2026-10-02 after the private test scratch instructions: 6,716
 UTF-8 bytes and 885 whitespace-delimited words.
+
+Re-measured 2026-10-10 after the PR-repair acknowledgment constraint: 7,299
+UTF-8 bytes and 959 whitespace-delimited words.

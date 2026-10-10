@@ -434,8 +434,10 @@ def test_doctor_preserves_a_failing_doctor_sh_exit_code(tmp_path, monkeypatch):
 
 
 def _doctor_rc(tmp_path, monkeypatch, extra: dict, *, sh_rc: int) -> int:
+    # Identity findings are independent of the host's entrypoint installation.
     monkeypatch.setattr(cli, "SHARED_ENV", str(tmp_path / "absent.env"))
-    monkeypatch.setattr(cli, "check_overlay_mismatch", lambda *a, **k: "")
+    for independent_check in ("entrypoint_drift", "check_overlay_mismatch"):
+        monkeypatch.setattr(cli, independent_check, lambda *a, **k: "")
     monkeypatch.setattr(cli, "_resolve_context", lambda _a: ("o/r", str(tmp_path), "r"))
     monkeypatch.setattr(
         cli, "_composed_env", lambda _env: {"IDENTITY_MODE": "three", **extra}

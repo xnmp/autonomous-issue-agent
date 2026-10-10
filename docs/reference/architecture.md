@@ -215,7 +215,35 @@ sources therefore extend one decision table rather than adding recovery loops.
 V20 indexes the workflow episode on existing admitted runs. Adjudication allowance
 reads are bounded and episode-scoped; generation changes do not renew them. A
 strict never-launched release carries a distinct terminal proof, while ambiguous
-execution continues counting. Migration validates immutable run/admission/budget
+execution continues counting. A launched PR repair (REBASE, ADDRESS_REVIEW,
+FIX_CI, linked reply) that ends without a captured `pr-repair-result` is
+acknowledged by `reconcile_pr_repair_returns` only once its run is terminal,
+lease- and claim-free, has no unresolved publication command, and its reservation
+is already released or settled; an
+active reservation keeps the hold until an explicit accounting disposition. The
+acknowledgment writes a `PRRepairUnreturned` receipt (no output, session, model
+or settlement), charges the paired issue allowance one attempt so existing
+breakers still bound retries, and changes only the exact current admissions.
+Existing session/model provenance and financial evidence remain unchanged; a
+late normal result cannot overwrite this acknowledgment. Recovery shares the
+existing ceiling of 32 completions per reconciliation pass.
+
+PR-repair acknowledgment crash/concurrency matrix (ADR 0003, ADR 0016):
+selection is read-only and releases its transaction before acknowledgment.
+The mutation transaction re-proves eligibility; SQLite's writer serialization
+orders competing capture against that recheck and the paired state/receipt/outbox
+writes. No process or network operation runs inside either transaction.
+
+| Interruption or competing writer | Durable outcome and retry | Behavioral test in `tests/app/` |
+|---|---|---|
+| After candidate selection, before mutation | No state changed; the next reconciliation reselects and acknowledges once. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-selection]` |
+| During paired state/receipt/outbox writes | The transaction/savepoint rolls back both components and receipts; retry completes once. | `test_pr_repair_terminal_recovery_guards.py::test_acknowledgment_rolls_back_both_components_and_receipts_on_write_failure` |
+| Commit succeeds but the caller never receives the return | Both components and the distinct acknowledgment remain committed; retry adds no debt or receipt. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-commit]` |
+| Normal result captured after selection, before acknowledgment's recheck | Capture wins; acknowledgment returns false without mutation. The next ordinary pass applies the real result/session exactly once. | `test_pr_repair_recovery_interleavings.py::test_capture_between_selection_and_acknowledgment_wins` |
+| Acknowledgment commits before normal capture | The late capture is refused, retaining prior genuine session/model and financial records. | `test_pr_repair_terminal_recovery_guards.py::test_settled_recovery_preserves_prior_session_and_money_and_refuses_late_capture` |
+| Newer generation or admission supersedes the selected run | Exact admission guards preserve the newer components. | `test_pr_repair_terminal_recovery.py::test_stale_unreturned_repair_cannot_rewrite_a_newer_generation`; `test_pr_repair_terminal_recovery_guards.py::test_recovered_run_cannot_clear_newer_pending_admission` |
+
+Migration validates immutable run/admission/budget
 provenance atomically before deriving the index; it does not activate a workflow
 family. This migration has been exercised only against isolated test databases.
 Every migration is digest-validated and individually transactional; restart
