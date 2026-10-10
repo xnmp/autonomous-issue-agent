@@ -1,1 +1,1 @@
-uv run pytest tests/app/test_pr_repair_terminal_recovery.py -q
+uv run pytest tests/app/test_dashweb_snapshots.py

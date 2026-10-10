@@ -6379,6 +6379,13 @@ class SQLiteControlStore:
             self._require_repair_writer(db, writer, admission, run["owner_id"])
             if run["reservation_state"] == "released":
                 raise WorkflowAuthorityError("released repair reservation cannot produce paid output")
+            acknowledged = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                (key.repository, receipt_key)).fetchone()
+            if acknowledged is not None:
+                payload = decode_workflow(acknowledged[0], tuple)
+                if len(payload) == 2 and isinstance(payload[1], cc.PRRepairUnreturned):
+                    raise WorkflowAuthorityError("unreturned repair acknowledgment cannot become a normal return")
             dispatch = json.loads(run['dispatch_id'])
             linked_reply = self._linked_issue_reply_admission(db, admission.attempt, run)
             ci_purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueCIPurchase)]
@@ -6479,7 +6486,15 @@ class SQLiteControlStore:
                     (run_id, writer.repository, receipt_key, *lineage)).fetchone()
                 if row is not None:
                     rows.append(row)
+            unreturned = sorted(run_id for run_id in run_ids if self._pr_repair_unreturned(db, RunId(run_id), lineage))
         completed = 0
+        for run_id in unreturned:
+            if completed >= 32:
+                break
+            try:
+                completed += int(self._acknowledge_unreturned_pr_repair(RunId(run_id), writer))
+            except (WorkflowAuthorityError, WorkflowEncodingError, ValueError):
+                continue
         for row in sorted(rows, key=lambda item: (item["claimed_at"], item["key"])):
             if completed >= 32:
                 break
@@ -6495,6 +6510,54 @@ class SQLiteControlStore:
             except (WorkflowAuthorityError, WorkflowEncodingError, ValueError):
                 continue
         return completed
+
+    def _pr_repair_unreturned(self, db, run_id: RunId, lineage: tuple[str, ...]) -> bool:
+        """A launched repair run is terminal, quiescent and money-disposed, with no return.
+
+        An active reservation still owns its accounting disposition, and a lease
+        or dispatch claim means a process may yet return; both keep the hold.
+        Retention can mark an unlaunched preflight as reconcile_only, so the
+        process registration's persisted start timestamp is also required.
+        """
+        owners = ",".join("?" for _ in lineage)
+        repair_key = self._continuation_receipt_key(run_id, WorkflowFamily.PR_REPAIR)
+        return db.execute(
+            "SELECT 1 FROM runs r JOIN budget_reservations b USING(run_id) JOIN reservation_recovery rr USING(run_id) "
+            f"WHERE r.run_id=? AND r.owner_id IN ({owners}) AND r.state IN ('completed','cancelled','abandoned') "
+            "AND r.started_at IS NOT NULL "
+            "AND r.outcome IS NOT 'unlaunched_released' AND rr.policy IN ('running','reconcile_only') "
+            "AND b.state IN ('released','settled') "
+            "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id) "
+            "AND NOT EXISTS(SELECT 1 FROM dispatch_claim_runs d WHERE d.run_id=r.run_id) "
+            "AND NOT EXISTS(SELECT 1 FROM lifecycle_commands c WHERE "
+            "c.kind IN ('publish_branch','open_pull_request','update_pull_request_body') "
+            "AND c.state NOT IN ('succeeded','permanent_failure') "
+            "AND CAST(json_extract(c.payload_json,'$.run_id') AS TEXT)=r.run_id) "
+            "AND NOT EXISTS(SELECT 1 FROM dedupe_keys k WHERE k.namespace IN ('pr-repair-result','continuation-return') "
+            "AND k.scope=b.workload_repository AND k.key=?)",
+            (str(run_id), *lineage, repair_key)).fetchone() is not None
+
+    def _acknowledge_unreturned_pr_repair(self, run_id: RunId, writer) -> bool:
+        with self.transaction() as db, self.mutation_savepoint(db):
+            self._assert_owner_active(db, writer.owner_id)
+            # Re-proved in the mutating transaction: a return, lease or claim
+            # observed after selection keeps the ordinary path authoritative.
+            if not self._pr_repair_unreturned(db, run_id, self._owner_lineage(db, writer.repository, writer.owner_id)):
+                return False
+            run = db.execute("SELECT owner_id,continuations_json FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
+            purchases = [item for item in decode_workflow(run["continuations_json"], tuple)
+                         if isinstance(item, cc.PRRepairPurchase) and item.branch]
+            if len(purchases) != 1:
+                return False
+            purchase = purchases[0]
+            admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
+            self._require_repair_writer(db, writer, admission, run["owner_id"])
+            self._finish_pr_repair_without_return(db, run_id, launched=True)
+            self._transition(db, "pr_repair", str(run_id), "unreturned_acknowledged",
+                {"pr": admission.attempt.binding.fence.key.target.number,
+                 "admission_version": admission.admission_version},
+                correlation=Correlation(run_id=str(run_id)))
+            return True
 
     def settle_steward(self, request: SettlementRequest, admission: ContinuationAdmission,
                        state: cc.StewardState) -> SettlementResult:
@@ -8660,20 +8723,29 @@ class SQLiteControlStore:
             return ReleaseResult(AccountingDisposition.AVAILABLE, run_id)
 
     def _finish_unlaunched_pr_repair(self, db, run_id: RunId) -> None:
+        self._finish_pr_repair_without_return(db, run_id, launched=False)
+
+    def _finish_pr_repair_without_return(self, db, run_id: RunId, *, launched: bool) -> None:
+        # A launched run without a captured return still consumed its paired
+        # allowance: it is charged as an attempt so existing breakers bound it,
+        # while the repair side records no output, session or settlement.
         from .workflow_rows import persist_workflow_snapshot
         run = db.execute("SELECT continuations_json,dispatch_id FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
         for purchase in decode_workflow(run[0], tuple):
             if isinstance(purchase, cc.IssueRebasePurchase):
                 admission = self._rebase_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-                self._apply_rebase_result(db, cc.RebaseRepairResult(admission, cc.RebaseCharge.NOT_LAUNCHED))
+                self._apply_rebase_result(db, cc.RebaseRepairResult(admission,
+                    cc.RebaseCharge.ATTEMPT if launched else cc.RebaseCharge.NOT_LAUNCHED))
                 continue
             if isinstance(purchase, cc.IssueReviewPurchase):
                 admission = self._review_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-                self._apply_review_result(db, cc.ReviewRepairResult(admission, cc.ReviewCharge.NOT_LAUNCHED))
+                self._apply_review_result(db, cc.ReviewRepairResult(admission,
+                    cc.ReviewCharge.ATTEMPT if launched else cc.ReviewCharge.NOT_LAUNCHED))
                 continue
             if isinstance(purchase, cc.IssueCIPurchase):
                 admission = self._ci_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
-                self._apply_ci_result(db, cc.CIRepairResult(admission, cc.CICharge.NOT_LAUNCHED))
+                self._apply_ci_result(db, cc.CIRepairResult(admission,
+                    cc.CICharge.ATTEMPT if launched else cc.CICharge.NOT_LAUNCHED))
                 continue
             if not isinstance(purchase, cc.PRRepairPurchase) or not purchase.branch:
                 continue
@@ -8684,7 +8756,7 @@ class SQLiteControlStore:
             key = admission.attempt.binding.fence.key
             receipt_key = self._continuation_receipt_key(run_id, WorkflowFamily.PR_REPAIR)
             if db.execute("SELECT 1 FROM dedupe_keys WHERE namespace='pr-repair-result' AND scope=? AND key=?", (key.repository, receipt_key)).fetchone():
-                raise WorkflowAuthorityError("unlaunched repair contradicts a captured paid output")
+                raise WorkflowAuthorityError("repair without a return contradicts a captured paid output")
             aggregate = load_review_workflow_row(db, key)
             selected = cc.select_pr_repair(aggregate) if aggregate is not None else None
             if isinstance(selected, cc.SelectedPRRepair) and cc.continuation_return_is_current(selected, admission):
@@ -8692,7 +8764,8 @@ class SQLiteControlStore:
                     pr_repair=replace(selected.component, watermarks=replace(selected.component.watermarks, last_applied=admission.admission_version)))
                 persist_workflow_snapshot(db, after)
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('continuation-return',?,?,?,?)",
-                (key.repository, receipt_key, _stamp(self._now()), encode_workflow((admission, cc.PRRepairNotLaunched(admission)))))
+                (key.repository, receipt_key, _stamp(self._now()), encode_workflow((admission,
+                    cc.PRRepairUnreturned(admission) if launched else cc.PRRepairNotLaunched(admission)))))
 
     def _release(
         self,

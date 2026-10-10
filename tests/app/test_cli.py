@@ -1150,6 +1150,8 @@ def _start_args(**overrides) -> argparse.Namespace:
 
 
 def _prep_mismatch_overlay(tmp_path, monkeypatch) -> None:
+    # Overlay behavior must not depend on the host's installed checkout.
+    monkeypatch.setattr(cli, "entrypoint_drift", lambda: "")
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
     shared = tmp_path / "shared.env"
     shared.write_text("")
@@ -1168,6 +1170,7 @@ def _install_state(
     live=(),
     foreign=(),
     timeout=False,
+    harness_root="/opt/test-harness",
 ):
     """PATH resolution for the declared console scripts, plus a recording stub
     for `make install` that can flip what PATH resolves afterwards. `foreign`
@@ -1176,6 +1179,9 @@ def _install_state(
     calls: list[list[str]] = []
     state = {"present": set(present), "foreign": set(foreign)}
     scripts = set(cli.declared_console_scripts())
+    # Exercise installation paths, including explicit transient cases, without
+    # deriving the simulated install from wherever pytest itself was launched.
+    monkeypatch.setattr(cli, "HARNESS_ROOT", harness_root)
     real_which, real_run = cli.shutil.which, cli.subprocess.run
     venv_bin = os.path.join(cli.HARNESS_ROOT, ".venv", "bin")
 
@@ -1295,11 +1301,9 @@ def test_drift_flags_an_install_resolving_into_a_transient_worktree(monkeypatch)
     """#187: `make install` inside an agent worktree bakes the transient venv
     into the launcher; from inside that process every other check reads
     coherent, so the path itself is the signature."""
-    monkeypatch.setattr(
-        cli, "HARNESS_ROOT", "/home/u/repo/.claude/worktrees/agent-x"
-    )
     _install_state(
-        monkeypatch, present=("issue-agent", "issue-agent-publish")
+        monkeypatch, present=("issue-agent", "issue-agent-publish"),
+        harness_root="/home/u/repo/.claude/worktrees/agent-x",
     )
 
     assert "transient agent worktree" in cli.entrypoint_drift()
@@ -1308,11 +1312,9 @@ def test_drift_flags_an_install_resolving_into_a_transient_worktree(monkeypatch)
 def test_heal_refuses_to_reinstall_from_a_transient_worktree(monkeypatch, capsys):
     """`make install` from the transient process would reinstall the transient
     tree — the exact state being healed."""
-    monkeypatch.setattr(
-        cli, "HARNESS_ROOT", "/home/u/repo/.claude/worktrees/agent-x"
-    )
     calls = _install_state(
-        monkeypatch, present=("issue-agent", "issue-agent-publish")
+        monkeypatch, present=("issue-agent", "issue-agent-publish"),
+        harness_root="/home/u/repo/.claude/worktrees/agent-x",
     )
 
     assert cli.heal_entrypoint_drift() is False
