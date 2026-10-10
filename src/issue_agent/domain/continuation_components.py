@@ -1312,6 +1312,20 @@ class PRRepairNotLaunched:
 
 
 @dataclass(frozen=True)
+class PRRepairUnreturned:
+    """A launched repair proven terminal and quiescent with no captured return.
+
+    It acknowledges the admission only; it carries no output, session, model or
+    settlement, so it cannot be read back as a normal paid return.
+    """
+    admission: ContinuationAdmission
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.admission, ContinuationAdmission) or self.admission.attempt.binding.authority.family is not WorkflowFamily.PR_REPAIR:
+            raise ValueError("unreturned repair requires its exact admission")
+
+
+@dataclass(frozen=True)
 class PRRepairResult:
     admission: ContinuationAdmission
     state: PRRepairState
