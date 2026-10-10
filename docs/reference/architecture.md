@@ -215,7 +215,19 @@ sources therefore extend one decision table rather than adding recovery loops.
 V20 indexes the workflow episode on existing admitted runs. Adjudication allowance
 reads are bounded and episode-scoped; generation changes do not renew them. A
 strict never-launched release carries a distinct terminal proof, while ambiguous
-execution continues counting. Migration validates immutable run/admission/budget
+execution continues counting. A launched PR repair (REBASE, ADDRESS_REVIEW,
+FIX_CI, linked reply) that ends without a captured `pr-repair-result` is
+acknowledged by `reconcile_pr_repair_returns` only once its run is terminal,
+lease- and claim-free, has no unresolved publication command, and its reservation
+is already released or settled; an
+active reservation keeps the hold until an explicit accounting disposition. The
+acknowledgment writes a `PRRepairUnreturned` receipt (no output, session, model
+or settlement), charges the paired issue allowance one attempt so existing
+breakers still bound retries, and changes only the exact current admissions.
+Existing session/model provenance and financial evidence remain unchanged; a
+late normal result cannot overwrite this acknowledgment. Recovery shares the
+existing ceiling of 32 completions per reconciliation pass.
+Migration validates immutable run/admission/budget
 provenance atomically before deriving the index; it does not activate a workflow
 family. This migration has been exercised only against isolated test databases.
 Every migration is digest-validated and individually transactional; restart
