@@ -1667,11 +1667,13 @@ def require_review_binding(
 
 
 def linked_issue_workflow_holds(db: sqlite3.Connection, key: WorkflowKey) -> tuple[str, ...]:
-    """Join issue gates without initializing an inactive or unobserved family."""
-    _require_family(key, WorkflowFamily.RESOLVE)
-    authority = load_family_authority(db, WorkflowFamily.RESOLVE, key.repository)
-    snapshot = load_resolve_workflow_row(db, key) if authority is not None else None
-    if snapshot is None:
+    """Join issue gates without initializing an inactive or unobserved family.
+
+    An inert shell is a validated aggregate with no gates or re-arm intent, so
+    it holds nothing; the strict resolve loader rejects it by design.
+    """
+    snapshot = load_issue_aggregate(db, key)
+    if not isinstance(snapshot, WorkflowSnapshot):
         return ()
     holds = ("unresolved workflow gates",) if snapshot.gates else ()
     if isinstance(snapshot.intent, PendingRearm):
