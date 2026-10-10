@@ -89,6 +89,27 @@ def test_empty_sources_are_observational_and_cover_every_open_pr():
     assert all(isinstance(item, ReviewImportNoHistoryObserved) for item in results)
 
 
+def test_multiple_retained_sources_hold_one_target_and_preserve_each_provenance():
+    refs = (ReviewImportSource('pr-file', 'old:pr:7:session', 'a' * 64),
+            ReviewImportSource('pr-file', 'older:pr:7:round', 'b' * 64),
+            ReviewImportSource('workflow', 'pr:7', 'c' * 64))
+    held, fresh = classify_review_import_history(*_sources(prs=(7, 8)),
+        retained_target_sources=tuple((7, source) for source in refs))
+    assert isinstance(held, ReviewImportHistoryBlocked) and held.pr == 7
+    assert [(blocker.kind, set(blocker.sources)) for blocker in held.blockers] == [
+        (ReviewImportBlockerKind.ORIGIN, set(refs)),
+    ]
+    assert isinstance(fresh, ReviewImportNoHistoryObserved) and fresh.pr == 8
+
+
+@pytest.mark.parametrize('digest', ['a' * 64, 'b' * 64])
+def test_repeated_or_conflicting_retained_source_identity_refuses(digest):
+    first = ReviewImportSource('pr-file', 'old:pr:7:session', 'a' * 64)
+    other = ReviewImportSource('pr-file', 'old:pr:7:session', digest)
+    with pytest.raises(ValueError, match='unique retained target sources'):
+        classify_review_import_history(*_sources(), retained_target_sources=((7, first), (7, other)))
+
+
 def test_empty_candidate_digest_binds_complete_inventory():
     only, = classify_review_import_history(*_sources())
     first, _ = classify_review_import_history(*_sources(prs=(7, 8)))

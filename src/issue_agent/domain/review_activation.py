@@ -582,6 +582,20 @@ def _reads_by_number(repository: str, reads: tuple[PullRequestRead, ...]) -> dic
     return by_number
 
 
+def _subsuming_record(records: list[LegacyReviewRecord]) -> LegacyReviewRecord | None:
+    if len(records) == 1:
+        return records[0]
+    fields = ('last_sha', 'patch_id', 'guidance')
+    if any(isinstance(getattr(record, field), LegacyUnreadable) for record in records for field in fields):
+        return None
+    candidate = min(records, key=lambda record: (
+        -sum(isinstance(getattr(record, field), LegacyPresent) for field in fields), record.root))
+    # Select an original complete record; fragments cannot manufacture a baseline.
+    return candidate if all(isinstance(getattr(record, field), LegacyAbsent)
+                            or getattr(record, field) == getattr(candidate, field)
+                            for record in records for field in fields) else None
+
+
 def _imports(
     repository: str, entries: tuple[LegacyReviewEntry, ...], reads: dict[int, PullRequestRead],
     listing: OpenPullRequests, digest: str, *, ceiling: int, review_bot: str, trigger_label: Label,
@@ -596,18 +610,19 @@ def _imports(
             blockers.append(f"unmapped legacy key {entry.name!r} in {entry.root}: {entry.reason}")
         else:
             records.setdefault(entry.pr, []).append(entry)
+    selected = {pr: _subsuming_record(found) for pr, found in records.items()}
     blockers.extend(
         f"pull request #{pr}: ambiguous duplicate legacy records in {', '.join(sorted(r.root for r in found))}"
-        for pr, found in sorted(records.items()) if len(found) > 1
+        for pr, found in sorted(records.items()) if len(found) > 1 and selected[pr] is None
     )
     listed = listing.numbers if isinstance(listing, OpenPullRequestsListed) else ()
     imports: list[ImportedReviewTarget] = []
     per_pr = {item.pr: item for item in facts}
     for pr in sorted(set(records) | set(listed)):
         found = records.get(pr, [])
-        if len(found) > 1:
+        if len(found) > 1 and selected[pr] is None:
             continue
-        record = found[0] if found else None
+        record = selected[pr] if found else None
         read = reads.get(pr)
         if read is None:
             blockers.append(f"pull request #{pr} was not read")

@@ -187,7 +187,7 @@ def test_nonreview_root_counter_without_an_open_key_remains_in_full_audit(source
     ("pr-9.session", "claude:old-session"),
     ("pr-9.round", "2"),
 ))
-def test_historical_root_with_open_review_key_requires_provenance(sources, tmp_path, filename, contents):
+def test_historical_counters_require_provenance_and_pr_markers_remain_captured(sources, tmp_path, filename, contents):
     control, gateway, roots, _files, links = sources
     old = tmp_path / "old-review"
     old.mkdir()
@@ -199,8 +199,13 @@ def test_historical_root_with_open_review_key_requires_provenance(sources, tmp_p
     with held_legacy_execution_counter_sources(
         control, gateway, "o/r", complete_roots, files, links, review_state_dir=roots[0][1],
     ) as held:
-        assert isinstance(held, BlockedLegacyExecutionCounterSources)
-        assert "historical" in held.reason
+        if filename.startswith('issue-'):
+            assert isinstance(held, BlockedLegacyExecutionCounterSources)
+            assert "historical" in held.reason
+        else:
+            assert isinstance(held, HeldLegacyExecutionCounterSources)
+            assert any(item.source.root == f'extra:{old.resolve()}' for item in held.roots.values.prs)
+            assert not any(item.source.root == f'extra:{old.resolve()}' for item in held.mapping.files.prs)
 
 
 def test_historical_root_without_an_open_review_key_is_retained(sources, tmp_path):

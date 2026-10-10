@@ -132,7 +132,9 @@ def held_legacy_execution_counter_sources(
         if has_unattributed_historical_review_files(
             files, review_state_dir,
             other_role_state_dirs=other_role_state_dirs,
-            prs=frozenset(links.listing.numbers),
+            # Attributable PR files are retained as sourced migration holds;
+            # historical counters still cannot authorize current review debit.
+            prs=frozenset(),
             counter_keys=frozenset(
                 key for link in links.links
                 for key in ((-link.pr, link.linked_issue) if link.linked_issue is not None else (-link.pr,))

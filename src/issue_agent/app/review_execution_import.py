@@ -33,7 +33,7 @@ from ..domain.review_execution_import_plan import (
     screen_zero_history_review_import, review_import_candidate_digest,
 )
 from ..domain.review_workflow import RecordedPullRequest
-from ..domain.resolve_activation import DeploymentInventory
+from ..domain.resolve_activation import DeploymentInventory, LegacyPresent
 from ..domain.workflow_identity import WorkflowWriter, canonical_workflow_repository
 from .config import HarnessConfig, configured_prior_owner_ids, owner_identity_for_target
 
@@ -94,6 +94,16 @@ def verify_configured_legacy_execution_import_sources(
     )
 
 
+def _historical_pr_sources(counters: HeldLegacyExecutionCounterSources) -> tuple[tuple[int, ReviewImportSource], ...]:
+    current_paths = {os.path.realpath(path) for path in (counters.review_state_dir, *counters.other_role_state_dirs)}
+    historical_labels = {root.label for root in counters.roots.roots if root.resolved_path not in current_paths}
+    # Archival files prove history, never the producer or credit of current state.
+    return tuple((item.source.pr, ReviewImportSource('pr-file', f'{item.source.root}:pr:{item.source.pr}:{suffix}', value.digest))
+                 for item in counters.roots.values.prs if item.source.root in historical_labels
+                 for suffix, value in (('session', item.source.session), ('round', item.source.round))
+                 if isinstance(value, LegacyPresent))
+
+
 def classify_configured_legacy_review_import_history(
     cfg: HarnessConfig, db: sqlite3.Connection,
     counters: HeldLegacyExecutionCounterSources,
@@ -116,6 +126,7 @@ def classify_configured_legacy_review_import_history(
         verified.sql.commands, verified.sql.rounds,
         receipts=verified.sql.receipts, outcome_receipts=verified.sql.outcomes,
         generation_receipts=verified.sql.generation,
+        retained_target_sources=_historical_pr_sources(verified.counters),
     )
     if isinstance(histories, ReviewImportScopeBlocked):
         return histories
@@ -208,7 +219,7 @@ def assess_configured_review_execution_import_candidates(
         generation_receipts=verified.sql.generation,
         retained_target_sources=tuple((pr, ReviewImportSource("workflow", f"pr:{pr}", source.row_digest))
                                       for pr, source in retained_by_pr.items()
-                                      if pr not in retained.listing.numbers),
+                                      if pr not in retained.listing.numbers) + _historical_pr_sources(verified.counters),
     )
     if isinstance(histories, ReviewImportScopeBlocked):
         return BlockedReviewImportObservationSet(

@@ -84,7 +84,7 @@ def classify_review_import_history(
             or any(not isinstance(item, tuple) or len(item) != 2 or type(item[0]) is not int
                    or not 1 <= item[0] <= 2**63 - 1 or not isinstance(item[1], ReviewImportSource)
                    for item in retained_target_sources)
-            or len({item[0] for item in retained_target_sources}) != len(retained_target_sources)):
+            or len({(pr, source.kind, source.identity) for pr, source in retained_target_sources}) != len(retained_target_sources)):
         raise ValueError("review import requires unique retained target sources")
 
     for observed, expected_type in ((receipts, CompleteLegacyReviewSubmissionReceipts),

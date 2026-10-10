@@ -187,9 +187,33 @@ def test_an_unreadable_legacy_file_refuses_activation(field):
 # -- sources that cannot be imported ------------------------------------------------------
 
 
-def test_duplicate_records_across_state_roots_refuse_without_choosing_either():
-    found = reasons(plan([record(root="review"), record(root="fix")], [observed(7, review())]))
+def test_conflicting_records_across_state_roots_refuse_without_choosing_either():
+    found = reasons(plan([record(root="review"), record(last_sha=OLD, root="fix")], [observed(7, review())]))
     assert "ambiguous duplicate legacy records in fix, review" in found
+
+
+@pytest.mark.parametrize('partial', [record(patch_id=None, root='old'), record(last_sha=None, root='old'), record(root='old')])
+def test_compatible_duplicates_use_one_original_verified_baseline_and_bind_all_sources(partial):
+    complete = record(guidance='Keep the API stable')
+    read = observed(7, review('APPROVED'))
+    single = plan([complete], [read])
+    combined = plan([partial, complete], [read])
+    assert isinstance(combined, ReviewActivationPlan)
+    assert combined.source_digest != single.source_digest
+    assert (combined.imports[0].baseline, combined.imports[0].guidance) == (single.imports[0].baseline, single.imports[0].guidance)
+    assert combined == plan([complete, partial], [read])
+    fresh = only(plan([complete, partial], [observed(7)]))
+    assert fresh.baseline is None and fresh.fresh_reason
+
+
+@pytest.mark.parametrize('entries', [
+    [record(patch_id=None), record(last_sha=None, root='old')],
+    [record(), record(patch_id='d' * 64, root='old')],
+    [record(guidance='first'), record(guidance='second', root='old')],
+    [record(), record(last_sha=LegacyUnreadable('unreadable'), root='old')],
+])
+def test_duplicate_fragments_conflicts_and_unreadable_sources_still_refuse(entries):
+    assert 'ambiguous duplicate legacy records' in reasons(plan(entries, [observed(7, review('APPROVED'))]))
 
 
 def test_unmapped_legacy_keys_refuse():

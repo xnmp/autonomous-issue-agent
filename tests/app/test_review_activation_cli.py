@@ -87,9 +87,30 @@ def test_review_cli_includes_extra_legacy_roots(review_launch, capsys, tmp_path)
     _state, control, _env, _remote = review_launch
     extra = tmp_path / "old-review"
     extra.mkdir()
-    (extra / "pr-7.last-sha").write_text("a" * 40)
+    (extra / "pr-7.last-sha").write_text("b" * 40)
     before = dump(control)
     code, result, _ = run(capsys, "shadow", "--legacy-state-dir", str(extra))
     assert code == 0 and result["status"] == "blocked"
     assert any("multiple roots" in reason or "duplicate" in reason for reason in result["blockers"])
     assert dump(control) == before
+
+
+def test_compatible_old_marker_rehearses_and_activates_without_dropping_sources(review_launch, capsys, tmp_path):
+    state, control, _env, _remote = review_launch
+    settle(control)
+    extra = tmp_path / 'compatible-old-review'
+    extra.mkdir()
+    (extra / 'pr-7.last-sha').write_bytes((state / 'pr-7.last-sha').read_bytes())
+    before = dump(control)
+    files = {str(f): f.read_bytes() for root in (state, extra) for f in root.iterdir() if f.is_file()}
+    flags = ('--legacy-state-dir', str(extra))
+    code, report, error = run(capsys, 'shadow', *flags)
+    assert code == 0 and report['status'] == 'ready', error
+    assert len(report['legacy_roots']) == 4
+    code, rehearsal, error = run(capsys, 'rehearse', *flags, '--copy-to', str(tmp_path / 'compatible-copy'))
+    assert code == 0 and all(rehearsal['checks'].values()), error
+    assert dump(control) == before
+    assert {name: Path(name).read_bytes() for name in files} == files
+    code, accepted, error = run(capsys, 'activate', *flags, '--confirm-plan-digest', report['plan']['plan_digest'])
+    assert code == 0 and accepted['status'] == 'activated', error
+    assert {name: Path(name).read_bytes() for name in files} == files

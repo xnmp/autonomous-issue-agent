@@ -199,6 +199,63 @@ def test_configured_history_blocks_real_legacy_round_file(sources):
     assert [blocker.kind for blocker in result[0].blockers] == [ReviewImportBlockerKind.ORIGIN]
 
 
+@pytest.mark.parametrize('markers', [
+    [('pr-9.round', '2')], [('pr-9.session', 'claude:old-session')],
+    [('pr-9.round', '2'), ('pr-9.session', 'claude:old-session')],
+])
+def test_declared_historical_pr_marker_holds_its_target_without_current_root_credit(sources, tmp_path, markers):
+    cfg, control, _gateway, roots, _files, _links = sources
+    gateway = OnePRGateway()
+    old = tmp_path / 'old-review'
+    old.mkdir()
+    for filename, contents in markers:
+        (old / filename).write_text(contents)
+    all_roots = (*roots, (f'extra:{old.resolve()}', str(old)))
+    files = read_complete_legacy_execution_root_files(all_roots)
+    links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
+    observed = _sql_sources(cfg, control, include_prior=True)
+    with held_legacy_execution_counter_sources(control, gateway, cfg.repo, all_roots, files, links,
+        review_state_dir=cfg.review_state_dir, other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = classify_configured_legacy_review_import_history(cfg, db, held, observed, extra_roots=(str(old),))
+    assert len(result) == 1 and isinstance(result[0], ReviewImportHistoryBlocked)
+    assert result[0].pr == 9 and {b.kind for b in result[0].blockers} == {ReviewImportBlockerKind.ORIGIN}
+    assert any(str(old) in ref.identity for b in result[0].blockers for ref in b.sources)
+
+
+@pytest.mark.parametrize('with_closed_workflow', [False, True])
+def test_historical_marker_holds_only_its_pr_and_keeps_fresh_sibling_eligible(sources, tmp_path, with_closed_workflow):
+    cfg, control, _gateway, roots, _files, _links = sources
+    gateway = OnePRGateway()
+    key = _record_review_workflow(control, 9)
+    if with_closed_workflow:
+        _record_review_workflow(control, 10)
+    old = tmp_path / 'old-review'
+    old.mkdir()
+    (old / 'pr-10.session').write_text('claude:old-session')
+    older = tmp_path / 'older-review'
+    older.mkdir()
+    (older / 'pr-10.round').write_text('2')
+    all_roots = (*roots, (f'extra:{old.resolve()}', str(old)), (f'extra:{older.resolve()}', str(older)))
+    files = read_complete_legacy_execution_root_files(all_roots)
+    links = read_complete_legacy_open_counter_links(control, gateway, cfg.repo)
+    observed = _sql_sources(cfg, control, include_prior=True)
+    recorded = RecordedPullRequest(ObservedPullRequest(key, 'a' * 40, PullRequestState.OPEN,
+        frozenset({Label.AI_PR_OPEN}), CompleteReviews(()), datetime.now(timezone.utc)))
+    with held_legacy_execution_counter_sources(control, gateway, cfg.repo, all_roots, files, links,
+        review_state_dir=cfg.review_state_dir, other_role_state_dirs=(cfg.state_dir, cfg.steward_state_dir)) as held:
+        assert isinstance(held, HeldLegacyExecutionCounterSources)
+        with control.transaction() as db:
+            result = assess_configured_review_execution_import_candidates(cfg, db, held, observed, (recorded,), extra_roots=(str(old), str(older)))
+    assert isinstance(result, ObservedReviewExecutionImportCandidates)
+    clean, historical = result.candidates
+    assert isinstance(clean, EligibleZeroHistoryReviewImport) and clean.pr == 9
+    assert isinstance(historical, ReviewImportHistoryBlocked) and historical.pr == 10
+    assert any(str(old) in ref.identity for b in historical.blockers for ref in b.sources)
+    assert any(str(older) in ref.identity for b in historical.blockers for ref in b.sources)
+
+
 def _record_review_workflow(control, pr):
     key = WorkflowKey("o/r", PullRequestRef(pr))
     snapshot = initial_review_workflow(key, FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, 1))
