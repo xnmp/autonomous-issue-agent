@@ -8418,6 +8418,10 @@ class SQLiteControlStore:
             if request.amount.micros > maximum
             else None
         )
+        # One instant per settlement: the migration-canary recognizer requires
+        # reservation updated_at == charge settled_at, and separate clock reads
+        # straddled millisecond boundaries (native CI, #249).
+        settled_at = _stamp(self._now())
         db.execute(
             "INSERT INTO charges(run_id, provider_receipt_id, amount_micros, "
             "currency, basis, usage_json, rate_card_id, rate_card_version, "
@@ -8431,13 +8435,13 @@ class SQLiteControlStore:
                 encoded_usage,
                 request.rate_card_id,
                 request.rate_card_version,
-                _stamp(self._now()),
+                settled_at,
             ),
         )
         db.execute(
             "UPDATE budget_reservations SET state='settled', updated_at=? "
             "WHERE run_id=?",
-            (_stamp(self._now()), str(request.run_id)),
+            (settled_at, str(request.run_id)),
         )
         db.execute(
             "UPDATE runs SET "
@@ -8450,7 +8454,7 @@ class SQLiteControlStore:
             "WHERE run_id=?",
             (
                 request.provider_receipt_id,
-                _stamp(self._now()),
+                settled_at,
                 str(request.run_id),
             ),
         )
@@ -8465,7 +8469,7 @@ class SQLiteControlStore:
                     "UPDATE runs SET state='completed', outcome='settled', "
                     "completed_at=? WHERE run_id=? AND state='abandoned' "
                     "AND outcome='dead_lease'",
-                    (_stamp(self._now()), str(request.run_id)),
+                    (settled_at, str(request.run_id)),
                 ).rowcount
             )
             if corrected_dead_lease:
@@ -8473,7 +8477,7 @@ class SQLiteControlStore:
                     "UPDATE reservation_recovery SET "
                     "reason='normal settlement won recovery race', "
                     "updated_at=? WHERE run_id=?",
-                    (_stamp(self._now()), str(request.run_id)),
+                    (settled_at, str(request.run_id)),
                 )
         db.execute("DELETE FROM leases WHERE run_id=?", (str(request.run_id),))
         self._event(

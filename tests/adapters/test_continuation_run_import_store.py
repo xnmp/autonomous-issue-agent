@@ -1,6 +1,8 @@
 from dataclasses import replace
+from datetime import datetime, timedelta, timezone
 import json
 import pytest
+from issue_agent.adapters.control_store import SQLiteControlStore
 from issue_agent.adapters.continuation_run_import import collect_continuation_runs
 from issue_agent.adapters.resolve_activation import ResolveActivationRefused
 from issue_agent.domain.workflow_identity import WorkflowFamily, IssueRef
@@ -209,6 +211,27 @@ def test_exact_migration_verifier_probe_is_passive_read_only_accounting_evidence
         assert {table: list(db.execute('SELECT * FROM ' + table)) for table in before} == before
         db.execute("UPDATE runs SET completed_at=strftime('%Y-%m-%dT%H:%M:%fZ',completed_at,'+0.001 seconds')")
     assert snapshot(store).source_digest != selected.source_digest
+
+
+@pytest.mark.parametrize('version', [1, 2, 3])
+def test_migration_verifier_probe_is_recognised_when_the_clock_advances_between_writes(tmp_path, version):
+    # Native CI caught settlement stamps straddling a millisecond boundary; the
+    # verifier then refused its own probe as unattributable history (#249).
+    instant = [datetime(2026, 10, 10, 11, 33, 34, tzinfo=timezone.utc)]
+
+    def ticking_clock():
+        instant[0] += timedelta(milliseconds=1)
+        return instant[0]
+
+    store = SQLiteControlStore(str(tmp_path / 'control.db'), now=ticking_clock)
+    store.initialize()
+    migration_canary(store, version)
+
+    assert snapshot(store).runs == ()
+    with store.transaction() as db:
+        settled = db.execute('SELECT settled_at FROM charges').fetchone()[0]
+        updated = db.execute('SELECT updated_at FROM budget_reservations').fetchone()[0]
+    assert settled == updated
 
 
 @pytest.mark.parametrize('sql', [
