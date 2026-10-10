@@ -1,3 +1,7 @@
+import signal
+import subprocess
+import sys
+
 import pytest
 
 from issue_agent.adapters.control_store import (
@@ -39,6 +43,53 @@ def test_startup_failures_map_to_permanent_exit_classes(
     with pytest.raises(SystemExit) as stopped:
         main_module.main(["fix"])
     assert stopped.value.code is expected
+
+
+def test_daemon_drains_on_sigterm_but_restores_the_callers_handler_on_exit(
+    tmp_path, monkeypatch
+):
+    env_file = tmp_path / "agent.env"
+    env_file.write_text('REPO="o/r"\nFIX_BOT="fixer"\n')
+    monkeypatch.setenv("AGENT_ENV", str(env_file))
+    monkeypatch.setattr(main_module, "acquire", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(
+        main_module, "_recover_pre_adapter_processes", lambda *_args: ()
+    )
+    callers_handler = signal.getsignal(signal.SIGTERM)
+
+    def build_role(*_args, **_kwargs):
+        # The running daemon converts the first SIGTERM into an orderly drain.
+        with pytest.raises(SystemExit) as drained:
+            signal.raise_signal(signal.SIGTERM)
+        assert drained.value.code == ExitCode.CLEAN
+        raise ValueError("stop after observing the drain")
+
+    monkeypatch.setattr(main_module, "build_role", build_role)
+
+    with pytest.raises(SystemExit) as stopped:
+        main_module.main(["fix"])
+
+    assert stopped.value.code is ExitCode.INVALID_CONFIG
+    assert signal.getsignal(signal.SIGTERM) is callers_handler
+
+
+def test_daemon_process_keeps_the_drain_handler_through_interpreter_teardown():
+    # A second SIGTERM while executor threads are joined must still map to the
+    # stable TRANSIENT hard exit, so the process entry never restores SIG_DFL.
+    probe = (
+        "import signal, sys\n"
+        "import issue_agent.app.main as m\n"
+        "m._serve = lambda role: None\n"
+        "sys.argv = ['main', 'fix']\n"
+        "m._process_main()\n"
+        "assert isinstance(signal.getsignal(signal.SIGTERM), m._TerminationHandler)\n"
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", probe], capture_output=True, text=True, timeout=60
+    )
+
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_reload_candidate_runs_full_config_validation(monkeypatch):

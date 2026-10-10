@@ -357,16 +357,38 @@ def build_role(
     raise SystemExit(f"unknown role: {role!r} (use fix|review|steward)")
 
 
-def main(argv: list[str] | None = None) -> None:
+def _role(argv: list[str] | None) -> str:
     argv = argv if argv is not None else sys.argv[1:]
-    if not argv:
+    if not argv or argv[0] not in ("fix", "review", "steward"):
         raise SystemExit(ExitCode.INVALID_CONFIG)
-    role = argv[0]
-    if role not in ("fix", "review", "steward"):
-        raise SystemExit(ExitCode.INVALID_CONFIG)
+    return argv[0]
 
+
+def main(argv: list[str] | None = None) -> None:
+    """In-process entry: the drain handler is scoped to this call.
+
+    Callers such as test workers must not inherit it; a leaked handler turned
+    a stray SIGTERM into SystemExit(0) instead of a visible crash (#249).
+    """
+    role = _role(argv)
+    previous = signal.signal(signal.SIGTERM, _TerminationHandler())
+    try:
+        _serve(role)
+    finally:
+        if previous is not None:
+            signal.signal(signal.SIGTERM, previous)
+
+
+def _process_main() -> None:
+    # The daemon process keeps the handler through interpreter teardown, so a
+    # second SIGTERM while executor threads are joined still hard-exits with
+    # TRANSIENT rather than dying as signal 15.
+    role = _role(None)
     signal.signal(signal.SIGTERM, _TerminationHandler())
+    _serve(role)
 
+
+def _serve(role: str) -> None:
     # Single-instance guard: refuse to start a second daemon of the same (role,
     # repo). A duplicate would poll independently and double-dispatch (two fixers
     # both grab ai-ready), breaking the single-fixer invariant. flock auto-frees
@@ -522,4 +544,4 @@ def main(argv: list[str] | None = None) -> None:
 
 
 if __name__ == "__main__":
-    main()
+    _process_main()
