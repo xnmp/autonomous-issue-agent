@@ -1439,8 +1439,8 @@ def test_oauth_mode_emits_no_provider_overrides_and_no_model_flag():
 def test_oauth_mode_preflight_accepts_codex_login_credentials(monkeypatch):
     """With no API key, the credentials `codex login` stored are sufficient —
     and with neither, the error says to run `codex login`."""
-    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-    monkeypatch.delenv("CODEX_HOME", raising=False)
+    for inherited_auth in ("OPENAI_API_KEY", "CODEX_HOME"):
+        monkeypatch.delenv(inherited_auth, raising=False)
     tmp = tempfile.mkdtemp()
     codex = _fake_codex(tmp, "exit 0\n")
     home = tempfile.mkdtemp()
