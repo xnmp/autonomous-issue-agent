@@ -1,0 +1,36 @@
+[Unit]
+Description=GitHub Actions native CI runner (autonomous-issue-agent)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# GitHub's documented service entrypoint runs with the dedicated identity.
+Type=simple
+User=issue-agent-ci
+Group=issue-agent-ci
+WorkingDirectory=/var/lib/issue-agent-ci/runner
+ExecStart=/var/lib/issue-agent-ci/runner/runsvc.sh
+Restart=on-failure
+RestartSec=5s
+UMask=0077
+NoNewPrivileges=true
+ProtectHome=true
+ProtectSystem=strict
+PrivateTmp=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+ReadWritePaths=/var/lib/issue-agent-ci
+RuntimeDirectory=issue-agent-ci
+RuntimeDirectoryMode=0700
+Environment=XDG_RUNTIME_DIR=/run/issue-agent-ci
+Environment=PATH=/usr/local/bin:/usr/bin:/bin
+CPUQuota=600%
+MemoryMax=12G
+MemorySwapMax=0
+TasksMax=512
+KillMode=mixed
+TimeoutStopSec=120s
+
+[Install]
+WantedBy=multi-user.target

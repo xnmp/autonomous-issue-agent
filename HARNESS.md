@@ -189,6 +189,11 @@ Uninstall with `issue-agent uninstall-service`.
 
 ## Runtime and trust model
 
+Repository CI can use one native local GitHub Actions runner instead of paid
+GitHub-hosted minutes. See [native CI setup](docs/reference/self-hosted-ci.md)
+for the dedicated account, standard runner service, limits and installation.
+The runner retains all existing checks and reports genuine GitHub CI results.
+
 The daemon observes GitHub, computes pure `Action` values, and submits remote
 mutations as durable `LifecycleCommand`s. `GitHubEffectExecutor` handles daemon
 actions; paid agents must use `issue-agent-publish git push …` and

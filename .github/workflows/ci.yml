@@ -15,39 +15,51 @@ concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # This repository has one native runner; GitHub serializes jobs on it.
+    runs-on: [self-hosted, linux, x64, issue-agent-ci]
+    timeout-minutes: 30
     env:
-      # Private Linux runners have two CPUs; avoid overlapping two worker pools.
-      TEST_WORKERS: "2"
-      TEST_SUITE_JOBS: "1"
+      TEST_WORKERS: "4"
+      TEST_SUITE_JOBS: "2"
+      UV_PYTHON: "3.12"
     steps:
       - uses: actions/checkout@v5
         with:
           # Rollback contracts archive an immutable historical SQL build.
           fetch-depth: 0
+          persist-credentials: false
 
       # `make test` shells out to git in temporary repos; the bash suites assert
       # on commit behaviour, so an unset identity fails them.
+      # The runner context is unavailable in job-level env, so later steps get
+      # the per-job global config through GITHUB_ENV.
       - name: Configure git identity
         run: |
+          export GIT_CONFIG_GLOBAL="$RUNNER_TEMP/gitconfig"
+          echo "GIT_CONFIG_GLOBAL=$GIT_CONFIG_GLOBAL" >> "$GITHUB_ENV"
           git config --global user.name "CI"
           git config --global user.email "ci@example.invalid"
           git config --global init.defaultBranch main
 
-      # tests/test_point_at.sh runs shellcheck; jq + gh are used by the
-      # orchestration fakes. jq and gh ship on ubuntu-latest.
-      - name: Install shellcheck
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+      - name: Check preinstalled tools
+        run: |
+          for tool in bash git make jq gh shellcheck; do
+            command -v "$tool" || exit 2
+          done
 
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
 
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
+      # uv's managed Python supports the native Linux host without requiring
+      # a distribution-specific setup-python download or system changes.
+      - name: Install managed Python
+        run: uv python install 3.12
 
       - uses: actions/setup-node@v4
         with:
@@ -56,38 +68,19 @@ jobs:
           cache-dependency-path: dashboard/package-lock.json
 
       - name: Test resource capacity
-        env:
-          TMPDIR: ${{ runner.temp }}
         run: |
           nproc
           free -h
-          df -h "$TMPDIR"
-          df -i "$TMPDIR"
+          df -h "$XDG_RUNTIME_DIR"
+          df -i "$XDG_RUNTIME_DIR"
 
-      # The full suite: governor + hooks + orchestration + point-at + domain +
-      # adapters + gate parity + import-linter architecture contracts.
-      - name: make test
-        env:
-          # Runtime-directory tmpfs filled during the real SQLite histories.
-          # Keep FULL durability while using the runner's disk-backed scratch.
-          TMPDIR: ${{ runner.temp }}
-        run: make test
-
-      # Production compilation exercises the pre/post input snapshot and
-      # immutable output-manifest publisher; npm test pins its race guard.
-      - name: dashboard build and tests
+      # Reuse the existing bounded process group and per-run scratch cleanup
+      # for every check, including the hostile-environment replay.
+      - name: Complete CI validation
         run: |
-          make dashboard-ui
-          cd dashboard && npm test
-
-      # Hostile-env re-run of the shell suites (#63 class). Deliberately a CI
-      # step and not part of `make test`: it doubles the bash suites' wall
-      # clock, and `make test` is the self-hosted TEST_CMD paid on every gate
-      # run — CI is the authoritative place for the expensive belt-and-braces.
-      - name: make test-deployment-env
-        env:
-          TMPDIR: ${{ runner.temp }}
-          # make test already synchronized every test extra. Bare uv run here
-          # would otherwise remove the SDK/dashboard and pytest dependencies.
-          UV_NO_SYNC: "1"
-        run: make test-deployment-env
+          bash scripts/run_test_suite.sh bash -euc '
+            make test
+            make dashboard-ui
+            (cd dashboard && npm test)
+            UV_NO_SYNC=1 make test-deployment-env
+          '
