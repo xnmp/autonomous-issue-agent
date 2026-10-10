@@ -1149,9 +1149,11 @@ def _start_args(**overrides) -> argparse.Namespace:
     return argparse.Namespace(**base)
 
 
-def _prep_mismatch_overlay(tmp_path, monkeypatch) -> None:
-    # Overlay behavior must not depend on the host's installed checkout.
-    monkeypatch.setattr(cli, "entrypoint_drift", lambda: "")
+def _prep_mismatch_overlay(tmp_path, monkeypatch, *, isolate_entrypoint=True) -> None:
+    # Overlay-only cases ignore host installation; install cases supply their
+    # own PATH fixture and must retain real drift detection.
+    if isolate_entrypoint:
+        monkeypatch.setattr(cli, "entrypoint_drift", lambda: "")
     monkeypatch.setattr(cli, "REPOS_DIR", str(tmp_path))
     shared = tmp_path / "shared.env"
     shared.write_text("")
@@ -1374,15 +1376,16 @@ def test_start_still_launches_the_preflight_after_a_failed_reinstall(
 ):
     """Fallback is today's behaviour: the preflight runs and reports the
     stale/partial install verbatim, rather than a second Python-side error."""
-    _prep_mismatch_overlay(tmp_path, monkeypatch)
+    _prep_mismatch_overlay(tmp_path, monkeypatch, isolate_entrypoint=False)
     execve_calls: list = []
     monkeypatch.setattr(cli.os, "execve", lambda *a: execve_calls.append(a))
-    _install_state(monkeypatch, present=("issue-agent",), install_rc=1)
+    install_calls = _install_state(monkeypatch, present=("issue-agent",), install_rc=1)
 
     cli.cmd_start(
         _start_args(repo="acme/app", target_dir="/srv/acme-app", name="app")
     )
 
+    assert install_calls == [["make", "install"]]
     assert len(execve_calls) == 1
     assert "point-at.sh" in " ".join(execve_calls[0][1])
 
