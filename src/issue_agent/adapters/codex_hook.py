@@ -75,6 +75,7 @@ def _gov_script(
     base_branch: str = "",
     repository: str = "",
     test_failure_exit_codes: str = "",
+    test_cmd: str = "",
 ) -> str:
     gate_base = (
         f"export BASE_BRANCH={shlex.quote(base_branch)}"
@@ -114,6 +115,9 @@ fi
 {gate_base}
 {gate_repo}
 {gate_red_codes}
+# Freeze operator test authority here; the paid child's environment cannot
+# replace it. Target markers retain their existing no-operator fallback.
+export TEST_CMD={shlex.quote(test_cmd)}
 # Codex PostToolUse executes inside the paid child and cannot mint trusted
 # visual evidence. Remove an ambient/exported path on every governed command.
 unset HARNESS_SCREENSHOTS_READ
@@ -236,6 +240,7 @@ def write_hook_config(
             test_failure_exit_codes=os.environ.get(
                 "GATE_TEST_FAILURE_EXIT_CODES", ""
             ),
+            test_cmd=os.environ.get("TEST_CMD", ""),
         ))
     os.chmod(
         gov_script_path,

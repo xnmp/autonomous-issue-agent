@@ -4,6 +4,7 @@ import shlex
 import shutil
 import stat
 import subprocess
+import sys
 import tomllib
 from pathlib import Path
 
@@ -89,6 +90,75 @@ def test_generated_governor_receives_operator_base_without_exporting_to_agent(
 
     assert completed.returncode == 0
     assert completed.stdout == "canary/dashboard-e2e"
+
+
+@pytest.mark.parametrize("child_command", [None, "exit 0"])
+def test_generated_governor_runs_frozen_operator_command_in_scrubbed_target(
+    tmp_path, monkeypatch, child_command,
+) -> None:
+    worktree = tmp_path / "worktree"
+    binaries = tmp_path / "bin"
+    worktree.mkdir()
+    binaries.mkdir()
+    artifact = worktree / "result"
+    injected = worktree / "injected"
+    literal = f'$(touch {injected}); operator "suite"'
+    command = (
+        f"printf '%s' {shlex.quote(literal)} > {shlex.quote(str(artifact))}; "
+        'test -z "${TEST_CMD+x}" || exit 9; exit 7'
+    )
+    monkeypatch.setenv("TEST_CMD", command)
+    probe = tmp_path / "probe.py"
+    probe.write_text(
+        "import os, sys\n"
+        "from issue_agent.adapters.governor import run_target_command\n"
+        "command = os.environ.get('TEST_CMD', '')\n"
+        "if not command.strip(): sys.exit(2)\n"
+        "code, _ = run_target_command(command, os.getcwd(), 10)\n"
+        "sys.exit(2 if code is None else code)\n"
+    )
+    uv = binaries / "uv"
+    uv.write_text(f"#!/bin/sh\nexec {shlex.quote(sys.executable)} {shlex.quote(str(probe))}\n")
+    uv.chmod(0o755)
+    config = write_hook_config(str(worktree), state_dir=str(tmp_path / "state"))
+    monkeypatch.setenv("TEST_CMD", "exit 0")
+    environment = {"PATH": f"{binaries}:{_system_bin_dirs()}"}
+    if child_command is not None:
+        environment["TEST_CMD"] = child_command
+
+    completed = subprocess.run(
+        [str(Path(config).parent / "hooks" / "gov.sh")],
+        cwd=worktree, env=environment, capture_output=True, text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 7, completed.stderr
+    assert artifact.read_text() == literal
+    assert not injected.exists()
+
+
+@pytest.mark.parametrize("operator_command", [None, "", "   "])
+def test_generated_governor_without_operator_command_does_not_trust_child_env(
+    tmp_path, monkeypatch, operator_command,
+) -> None:
+    if operator_command is None:
+        monkeypatch.delenv("TEST_CMD", raising=False)
+    else:
+        monkeypatch.setenv("TEST_CMD", operator_command)
+    binaries = tmp_path / "bin"
+    binaries.mkdir()
+    uv = binaries / "uv"
+    uv.write_text('#!/bin/sh\ncase "$TEST_CMD" in ""|"   ") exit 2;; *) exit 9;; esac\n')
+    uv.chmod(0o755)
+    config = write_hook_config(str(tmp_path), state_dir=str(tmp_path / "state"))
+
+    completed = subprocess.run(
+        [str(Path(config).parent / "hooks" / "gov.sh")],
+        env={"PATH": f"{binaries}:{_system_bin_dirs()}", "TEST_CMD": "exit 0"},
+        capture_output=True, text=True, check=False,
+    )
+
+    assert completed.returncode == 2, completed.stderr
 
 
 def test_edit_check_delegates_to_the_shared_guarded_wrapper(tmp_path) -> None:
