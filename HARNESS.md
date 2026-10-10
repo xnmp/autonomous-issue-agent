@@ -172,15 +172,41 @@ systemctl --user status 'issue-agent-*-<name>'
 ```
 
 Systemd also writes `issue_agent_service_terminal` to the role's journal after
-each invocation, including failed startup or daemon termination. The record
-carries the unit, invocation, manager result and available exit code/status.
-Empty fields remain unknown. Retain it with the manager transitions and cgroup
-OOM evidence when investigating a stop; a signal status does not identify its
-sender, and exit 137 alone does not establish OOM. If the manager or journal
-cannot write the record, its absence is an evidence gap. The `-` prefix ignores
-an unsuccessful logging-command exit; a logging spawn failure or timeout may
-still affect the unit's result. Retain the original main-process exit fields
-with that result.
+each invocation, including failed startup or daemon termination. The
+`ExecStopPost` hook `bin/service-terminal-evidence.sh` records the invocation,
+the manager result and available exit code/status. It runs inside the unit's
+cgroup, so it also records that cgroup's `oom`/`oom_kill` counters and
+`memory_peak`. Empty manager fields and `unknown` counters are evidence gaps,
+never zero. A signal status does not identify its sender. Exit 137 alone does
+not establish OOM, but `result=oom-kill` with a nonzero `oom_kill` does. Join
+the record to the manager's own transitions for the same invocation, including
+the stop or start job type and result:
+
+```bash
+journalctl --user -o short-iso USER_INVOCATION_ID=<id> + _SYSTEMD_INVOCATION_ID=<id>
+```
+
+The journal does not record which client issued a stop job; that attribution
+stays unknown unless other evidence names it. If the manager or journal cannot
+write the record, or the checkout moved since installation, its absence is an
+evidence gap. The `-` prefix ignores an unsuccessful hook exit; a hook spawn
+failure or timeout may still affect the unit's result. Retain the original
+main-process exit fields with that result.
+
+To exercise the hook without a paid role, run throwaway transient units with
+the same hook, then read their journals as above and `systemctl --user
+reset-failed 'iaa-terminal-probe-*'`:
+
+```bash
+hook="-/bin/sh $PWD/bin/service-terminal-evidence.sh"
+systemd-run --user --unit=iaa-terminal-probe-signal -p "ExecStopPost=$hook" \
+  python3 -c 'import os, signal; os.kill(os.getpid(), signal.SIGKILL)'
+systemd-run --user --unit=iaa-terminal-probe-oom -p MemoryMax=32M \
+  -p MemorySwapMax=0 -p "ExecStopPost=$hook" python3 -c "b = b'x' * (256 << 20)"
+```
+
+Expect `result=signal exit_status=KILL oom_kill=0` and `result=oom-kill
+exit_status=KILL oom_kill=1` respectively.
 
 On launchd, logs live under the deployment state directory rather than shared
 `/tmp` names.

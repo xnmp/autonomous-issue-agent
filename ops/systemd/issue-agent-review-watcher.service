@@ -46,8 +46,9 @@ MemoryMax=4G
 TasksMax=1024
 StandardOutput=journal
 StandardError=journal
-# The manager can record a terminal result even when the daemon cannot flush.
-ExecStopPost=-/usr/bin/echo issue_agent_service_terminal invocation=${INVOCATION_ID} result=${SERVICE_RESULT} exit_code=${EXIT_CODE} exit_status=${EXIT_STATUS}
+# The manager can record a terminal result even when the daemon cannot flush;
+# the hook runs in the unit's cgroup and adds its OOM counters.
+ExecStopPost=-/bin/sh "@HARNESS_ROOT@/bin/service-terminal-evidence.sh"
 
 [Install]
 WantedBy=default.target
