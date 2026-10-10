@@ -93,6 +93,65 @@ def _passive(run: dict[str, object], reservations: tuple[dict[str, object], ...]
             and {(l["repository"], l["dimension"], l["period_id"], l["period_start"], l["period_end"]) for l in limits if l["currency"] == "USD"} == scopes)
 
 
+def _migration_canary(run: dict[str, object], reservations: tuple[dict[str, object], ...],
+                      charges: tuple[dict[str, object], ...], limits: tuple[dict[str, object], ...],
+                      repository: str) -> bool:
+    """Recognize the verifier's settled accounting probes, never model executions."""
+    rid = run['run_id']
+    if not isinstance(rid, str):
+        return False
+    identity = re.fullmatch(r'migration-canary-(?:(v2|v3)-)?([0-9a-f]{16})(?:-([0-9a-f]{16}))?-'
+                            + re.escape(repository), rid)
+    if identity is None or bool(identity[3]) != (identity[1] == 'v3'):
+        return False
+    if (run['owner_id'], run['kind'], run['state'], run['outcome'], run['config_version'],
+        run['dispatch_id'], run['provider_receipt_id'], run['started_at']) != (
+            repository + ':migration', 'migration-canary', 'completed', 'settled', 'migration-canary-v1',
+            'dispatch-' + rid, 'receipt-' + rid, None):
+        return False
+    if any(run[name] is not None for name in ('workflow_binding_json', 'workflow_episode_key', 'review_round_id', 'review_child_id')):
+        return False
+    continuations = legacy_dispatch_object(str(run['continuations_json']))
+    if (set(continuations) != {'format', 'value'} or type(continuations['format']) is not int
+            or continuations['format'] != 1 or continuations['value'] != []):
+        return False
+    if len(reservations) != 1 or len(charges) != 1 or len(limits) != 1:
+        return False
+    reservation, charge, limit = reservations[0], charges[0], limits[0]
+    dimension = 'repository' if identity[1] is None else 'migration-canary:' + identity[2]
+    if (reservation['reservation_id'], reservation['repository'], reservation['workload_repository'],
+        reservation['dimension'], reservation['state'], reservation['currency'], reservation['maximum_micros'],
+        reservation['cap_micros'], reservation['model'], reservation['rate_card_id'], reservation['rate_card_version'],
+        reservation['config_version'], reservation['period_timezone'], reservation['release_reason']) != (
+            'reservation-' + rid, repository, repository, dimension, 'settled', 'USD', 1,
+            9_000_000_000_000_000_000, 'migration-canary', 'migration-canary', '1', 'migration-canary-v1', 'UTC', None):
+        return False
+    if (charge['provider_receipt_id'], charge['amount_micros'], charge['currency'], charge['basis'],
+        charge['usage_json'], charge['rate_card_id'], charge['rate_card_version']) != (
+            'receipt-' + rid, 1, 'USD', 'synthetic', None, None, None):
+        return False
+    scope_fields = ('repository', 'dimension', 'period_id', 'period_start', 'period_end',
+                    'period_timezone', 'currency', 'cap_micros')
+    if any(limit[name] != reservation[name] for name in scope_fields):
+        return False
+    # The verifier settles before completing the run; those timestamps can differ.
+    stamps = (reservation['quote_effective_at'], reservation['created_at'], charge['settled_at'], run['completed_at'])
+    try:
+        parsed = tuple(datetime.fromisoformat(str(stamp).replace('Z', '+00:00')) for stamp in stamps)
+        if any(value.tzinfo is None or value.astimezone(timezone.utc).isoformat(timespec='milliseconds').replace('+00:00', 'Z') != stamp
+               for value, stamp in zip(parsed, stamps)):
+            return False
+        start = parsed[0].replace(hour=0, minute=0, second=0, microsecond=0)
+        end = start + timedelta(days=1)
+        return (start <= parsed[0] <= parsed[1] <= parsed[2] <= parsed[3] < end
+                and reservation['updated_at'] == charge['settled_at']
+                and (reservation['period_id'], reservation['period_start'], reservation['period_end']) == (
+                    start.date().isoformat(), start.isoformat(timespec='milliseconds').replace('+00:00', 'Z'),
+                    end.isoformat(timespec='milliseconds').replace('+00:00', 'Z')))
+    except (ValueError, OverflowError):
+        return False
+
+
 def collect_continuation_runs(db: sqlite3.Connection, repository: str,
                               families: tuple[WorkflowFamily, ...]) -> LegacyContinuationRunSnapshot:
     if not db.in_transaction or canonical_workflow_repository(repository) != repository:
@@ -139,13 +198,13 @@ def collect_continuation_runs(db: sqlite3.Connection, repository: str,
                         ("repository", repo), ("role", role), ("kind", run["kind"]))):
                     raise ValueError("foreign dispatch contradicts explicit accounting owner")
                 continue
+            if role == 'migration' and _migration_canary(run, rs, cs, ls, repository):
+                evidence.append((run, rs, cs, ls))
+                continue
             if len(parts) != 3 or role not in {"fix", "review", "steward"} or not parts[2]:
                 raise ValueError("historical owner lacks attributable role")
             if role != ("steward" if families == (WorkflowFamily.STEWARD,) else "fix"):
                 continue
-            dispatch = legacy_dispatch_object(dispatch_id)
-            if (dispatch.get("repository"), dispatch.get("role"), dispatch.get("kind")) != (repo, role, run["kind"]):
-                raise ValueError("historical dispatch contradicts owner or kind")
             if repo != repository or role == "review" or role != ("steward" if families == (WorkflowFamily.STEWARD,) else "fix"):
                 continue
             attributed = parse_legacy_continuation_run(run_id=rid, owner_id=owner, kind=kind,

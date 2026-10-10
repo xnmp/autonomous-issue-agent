@@ -969,6 +969,49 @@ def accepted_import(stopped,capsys,tmp_path,family='fix'):
     return report,saved
 
 
+@pytest.mark.parametrize('with_migration_probes', [False, True])
+def test_missing_legacy_repository_can_rehearse_and_activate_without_clearing_history(stopped, capsys, tmp_path, with_migration_probes):
+    from tests.adapters.test_continuation_admission import paid, purchase
+    from tests.adapters.test_continuation_run_import_store import migration_canary
+
+    state, control, _ = stopped
+    if with_migration_probes:
+        for version in (1, 2, 3):
+            migration_canary(control, version)
+    request = retained_execution(control)
+    payload = json.loads(request.dispatch_id)
+    del payload['repository']
+    with control.transaction() as db:
+        db.execute('UPDATE runs SET dispatch_id=? WHERE run_id=?', (json.dumps(payload), request.run_id))
+        accounting = {table: list(db.execute('SELECT * FROM ' + table))
+                      for table in ('runs', 'charges', 'budget_reservations', 'reservation_limits')}
+    (state / 'issue-7.resumes').write_text('2')
+    (state / 'issue-8.resumes').write_text('0')
+    original = dump(control)
+    files = {path.name: path.read_bytes() for path in state.iterdir()}
+    code, report, error = command(capsys, 'fix', 'shadow')
+    assert code == 0, error
+    assert {target['number']: target['eligible'] for target in report['targets']} == {7: False, 8: True}
+    copy = tmp_path / 'missing-repository-copy'
+    code, rehearsal, error = command(capsys, 'fix', 'rehearse', '--copy-to', str(copy))
+    assert code == 0 and all(rehearsal['checks'].values()), error
+    assert dump(control) == original
+    assert {path.name: path.read_bytes() for path in state.iterdir()} == files
+    saved = tmp_path / 'missing-repository-plan.json'
+    saved.write_text(json.dumps(report))
+    code, accepted, error = command(capsys, 'fix', 'activate', '--plan-file', str(saved),
+                                    '--confirm-plan-digest', report['plan_digest'])
+    assert code == 0 and accepted['status'] == 'activated', error
+    with control.transaction() as db:
+        assert {table: list(db.execute('SELECT * FROM ' + table)) for table in accounting} == accounting
+        old = load_issue_aggregate(db, WorkflowKey('o/r', IssueRef(7)))
+        fresh = load_issue_aggregate(db, WorkflowKey('o/r', IssueRef(8)))
+    assert isinstance(old.issue_recovery, cc.BlockedIssueRecovery)
+    assert isinstance(fresh, IssueWorkflowShell)
+    selected = purchase(fresh, reply='2026-10-02T00:00:00Z', ceiling=5)
+    assert control.reserve_issue_recovery(paid('fresh-after-legacy-import', selected), selected).admitted
+
+
 @pytest.mark.parametrize('family,role,kind,component',[('fix','fix','RESOLVE','issue_recovery'),
                                                      ('steward','steward','TRIAGE','steward')])
 def test_identified_retained_history_holds_only_its_target_and_imported_unspent_sibling_can_run(stopped,capsys,tmp_path,family,role,kind,component):

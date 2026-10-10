@@ -47,3 +47,32 @@ def test_row_and_accounting_identity_must_agree(field,value):
                 dispatch_id=json.dumps(dict(repository='o/r',role='fix',kind='RESOLVE',number=7,issue=7,breaker_key=7)))
     kwargs[field]=value
     with pytest.raises(ValueError):parse_legacy_continuation_run(**kwargs)
+
+
+@pytest.mark.parametrize('kind,number,issue,counter', [
+    ('RESOLVE', 7, 7, 7), ('ROUTE', 7, 7, 7), ('ADDRESS_REVIEW', 9, 7, 7),
+])
+def test_older_dispatch_without_repository_uses_agreeing_owner_and_accounting(kind, number, issue, counter):
+    result = parse_legacy_continuation_run(
+        run_id='run', owner_id='o/r:fix:owner', kind=kind, workload_repository='o/r',
+        dispatch_id=json.dumps(dict(role='fix', kind=kind, number=number, issue=issue, breaker_key=counter)),
+    )
+    assert result.key.repository == 'o/r'
+    assert result.key.target == (PullRequestRef(number) if kind == 'ADDRESS_REVIEW' else IssueRef(issue))
+
+
+@pytest.mark.parametrize('field,value', [
+    ('workload_repository', ''), ('workload_repository', 'x/y'), ('owner_id', 'x/y:fix:owner'),
+])
+def test_missing_repository_cannot_replace_missing_or_conflicting_corroboration(field, value):
+    arguments = dict(run_id='run', owner_id='o/r:fix:owner', kind='RESOLVE', workload_repository='o/r',
+                     dispatch_id=json.dumps(dict(role='fix', kind='RESOLVE', number=7, issue=7, breaker_key=7)))
+    arguments[field] = value
+    with pytest.raises(ValueError):
+        parse_legacy_continuation_run(**arguments)
+
+
+@pytest.mark.parametrize('repository', [None, '', False, []])
+def test_present_repository_must_be_valid_even_when_owner_and_accounting_agree(repository):
+    with pytest.raises(ValueError):
+        parsed(repository=repository)

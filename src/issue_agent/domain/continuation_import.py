@@ -78,7 +78,8 @@ def parse_legacy_continuation_run(*, run_id: str, owner_id: str, kind: str,
     if canonical_workflow_repository(repository) != repository or workload_repository != repository:
         raise ValueError("run owner and accounting repository disagree")
     payload = legacy_dispatch_object(dispatch_id)
-    if (payload.get("repository") != repository or payload.get("role") != role
+    # Older dispatches omit repository; owner and accounting still corroborate it.
+    if ("repository" in payload and payload["repository"] != repository or payload.get("role") != role
             or payload.get("kind") != kind):
         raise ValueError("dispatch disagrees with run owner or kind")
     number, issue, counter = payload.get("number"), payload.get("issue"), payload.get("breaker_key")
