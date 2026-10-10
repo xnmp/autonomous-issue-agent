@@ -36,6 +36,12 @@ repositories and conflicting remote registrations refuse rather than being
 replaced. GitHub's runner application updates itself; the host's OS and tools
 remain the operator's responsibility. A powered-off host leaves jobs queued.
 
+An interrupted installation resumes on rerun: an existing matching account and
+`.runner` registration are reused rather than registered again. The installer's
+download scratch honours `TMPDIR`; point it at disk-backed storage when the
+operator's `/tmp` is small or quota-limited, as the first installation needed
+after `curl: (23)` from a full `/tmp`.
+
 ## Workflow and operation
 
 [CI](../../.github/workflows/ci.yml) validates preinstalled tools, installs its
