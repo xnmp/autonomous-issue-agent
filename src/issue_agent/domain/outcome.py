@@ -149,6 +149,10 @@ class ExitReason(str, Enum):
     # and from AGENT_ERROR, which is a session that ran and reported failure.
     RUNTIME_UNAVAILABLE = "runtime_unavailable"
     ACCOUNTING_UNAVAILABLE = "accounting_unavailable"  # work ran; its complete charge is unknown
+    # The leg ended its own turn while a background child task it started was
+    # still pending. A headless leg can never receive that child's notification,
+    # so a `blocked` it declares is waiting on itself, not on a human (#255).
+    BACKGROUND_CHILD_PENDING = "background_child_pending"
 
 
 def infra_death(reason: ExitReason | None) -> bool:
@@ -224,6 +228,13 @@ def no_session_evidence(
         or (output or "").strip()
         or (num_turns or 0) > 0
     )
+
+
+def reclassify_pending_background_block(
+    result: AgentResult, pending_children: int
+) -> AgentResult:
+    """Strip a self-inflicted human-input block from a headless leg (#255)."""
+    return result
 
 
 def infra_class_failure(result: AgentResult) -> bool:
