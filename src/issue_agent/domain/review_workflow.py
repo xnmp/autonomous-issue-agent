@@ -616,6 +616,13 @@ def body_review_command(body: object) -> str | None:
     return command if _marker_command(command) else None
 
 
+def without_review_command_marker(body: str) -> str:
+    """Remove only a recognized final-line marker; unmarked review text is lossless."""
+    if body_review_command(body) is None:
+        return body
+    return body.rstrip().rsplit("\n", 1)[0].rstrip() if "\n" in body.rstrip() else ""
+
+
 @dataclass(frozen=True)
 class SubmittedReviewFact:
     """One submitted review from a complete read; `commit_id` None is an unresolved commit.

@@ -28,6 +28,7 @@ from ...domain.ci_history import CiAttempt
 from ...domain.environment import EnvironmentManifest
 from ...domain.world import PRView
 from ...domain.trust import Untrusted, as_untrusted, untrusted_block
+from ...domain.review_workflow import without_review_command_marker
 from ...adapters.runtime_plan import McpServer, SubagentDef
 from ...domain.model_routing import ModelRoute
 from ...domain.agent_task import RuntimeName
@@ -177,6 +178,11 @@ _FIXER_REVIEW_AUTHORIZATION = (
     "All existing tests, evidence requirements and publication gates still apply.\n\n"
 )
 
+_HUMAN_MESSAGES = (
+    "Messages to humans, including 'needs' and 'summary', must not quote internal identifiers "
+    "(command/run/invocation ids, hashes, worktree paths); describe the situation in plain words instead.\n"
+)
+
 
 # Adjusts AGENT.md's visual-evidence instructions for runtimes that cannot mint
 # trusted read receipts (#153): the gate no longer requires receipts there, so
@@ -246,7 +252,7 @@ def _fix_system_prompt(cfg: FixTaskConfig, session_id: str | None) -> str:
     base = _RESUME_REMINDER if (session_id or "").strip() else cfg.agent_md
     # Appended on fresh AND resumed sessions, same reasoning as the visual
     # notice: a resumed transcript predates whatever policy was added since.
-    base += _STANDING_POLICY_NOTICE
+    base += _STANDING_POLICY_NOTICE + "\n" + _HUMAN_MESSAGES
     if not cfg.mints_visual_receipts:
         base += _UNRECEIPTED_VISUAL_NOTICE
     return base + _environment_notice(cfg) + _difficulty_notice(cfg)
@@ -575,6 +581,7 @@ def build_address_review_task(
         "and publish with `issue-agent-publish git push …`.\n"
         "Return status=pushed when done, or status=blocked with 'needs' "
         "if a request is unclear.\n"
+        + _HUMAN_MESSAGES +
         "Existing evidence/ captures carry forward for acceptance criteria whose "
         "behavior this repair does not change. Re-capture only criteria affected by "
         "the feedback or by your fix; keep each carried or new image mapped to its "
@@ -583,7 +590,7 @@ def build_address_review_task(
         "it REPLACES the body, so pass the complete text, keeping the "
         "'## Acceptance Criteria' section and the 'Fixes #<issue>' line. Do not "
         "escalate for a PR-body edit; this is the supported operation for it.\n\n"
-        f"{_fenced('review body', review_body)}\n\n"
+        f"{_fenced('review body', as_untrusted(without_review_command_marker(review_body.value)))}\n\n"
         f"{_fenced('inline comments', inline)}"
     )
     return PlannedRun(

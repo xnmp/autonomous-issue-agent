@@ -9,9 +9,11 @@ from issue_agent.domain.review_test_evidence import (
     MissingOperatorTestCommand, OperatorTestCommand, OperatorTestWaiver, ReviewTestConfiguration,
     ReviewTestSubject, ReviewTestInvocation, ReviewTestCompletion, ReviewTestTreeProof, ReviewTestOutcome,
     posted_review,
+    failed_test_review_body,
     test_only_rejection_release_eligible as release_eligible,
 )
 from tests.domain.test_review_execution import binding
+from issue_agent.domain.review_workflow import mark_review_body
 
 HEAD = "a" * 40
 PATCH = "b" * 64
@@ -112,3 +114,45 @@ def test_test_only_rejection_release_requires_exact_failed_harness_evidence(mism
     elif mismatch == "execution":
         arguments["execution"] = replace(subject.execution, execution_episode="another-execution")
     assert release_eligible(**arguments) is (mismatch is None)
+
+
+@pytest.mark.parametrize("exit_code", [None, 1, 42])
+def test_failed_test_review_has_plain_header_and_deterministic_details(exit_code):
+    body = failed_test_review_body("failed\néchec 日本語\n", exit_code)
+    assert body == failed_test_review_body("failed\néchec 日本語\n", exit_code)
+    header = body.splitlines()[0]
+    assert header == ("Independent operator tests failed on this head."
+                      if exit_code is None else f"Independent operator tests failed on this head (exit {exit_code}).")
+    assert HEAD not in header and PATCH not in header
+    assert "<details><summary>Full test output (tail)</summary>\n\n" in body
+    assert body.endswith("\n\n</details>")
+    assert "échec 日本語" in body
+
+
+def test_failed_test_preview_shows_last_25_nonempty_lines_and_details_keep_full_tail():
+    from markdown_it import MarkdownIt
+
+    output = "\n \n".join(f"failure {i}" for i in range(40))
+    body = failed_test_review_body("failed\n" + output, 1)
+    blocks = [token.content for token in MarkdownIt().parse(body) if token.type == "fence"]
+    assert blocks == ["\n".join(f"failure {i}" for i in range(15, 40)) + "\n", output + "\n"]
+
+
+def test_test_output_cannot_close_its_markdown_fence():
+    from markdown_it import MarkdownIt
+
+    output = "failure\n```\n</details>\n``````\nlast failure"
+    body = failed_test_review_body("failed\n" + output, 1)
+    blocks = [token.content for token in MarkdownIt().parse(body) if token.type == "fence"]
+    assert blocks == [output + "\n", output + "\n"]
+
+
+@pytest.mark.parametrize("output", ["", "x" * 1000000, "`" * 1000000, ("```\n" * 250000)])
+def test_huge_review_output_fits_submission_and_marker_bounds(output):
+    from markdown_it import MarkdownIt
+
+    body = failed_test_review_body("failed\n" + output, 1)
+    assert len(body) <= 65536 - 1024
+    assert len(mark_review_body(body, "c" * 512)) <= 65536
+    assert body.endswith("</details>")
+    assert len([token for token in MarkdownIt().parse(body) if token.type == "fence"]) == 2

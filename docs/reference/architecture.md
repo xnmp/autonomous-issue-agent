@@ -629,7 +629,8 @@ exemptable-vs-security rule classification, and the merge-withholding rule),
 (level-triggered retirement of machine-checkable blocks — #180 publication/checks
 blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/steward.py`, `domain/steward_stall.py`,
-`domain/supervision.py`, `domain/triage.py`, `domain/trust.py`, and
+`domain/supervision.py`, `domain/terminal_output.py` (pure terminal escape cleanup and bounded output tails),
+`domain/triage.py`, `domain/trust.py`, and
 `domain/world.py`, `domain/workflow_identity.py`, `domain/workflow.py`,
 `domain/continuation_components.py` (fixed secondary component variants, current target-fence selection and ordered continuity watermarks),
 `domain/continuation_import.py` (closed stopped fix/steward source fields and typed import decisions),

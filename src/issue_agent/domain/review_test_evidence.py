@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 import hashlib
+import re
 
 from .contracts import TestExecution, TestExecutionStatus
 from .review_execution import ReviewExecutionBinding, ReviewRoundIdentity
@@ -17,6 +18,25 @@ SUMMARY_LIMIT = 16384
 
 EXECUTOR_POLICY = "ordinary-test-v1"
 ENVIRONMENT_POLICY = "target-child-v1"
+
+
+def failed_test_review_body(summary: str, exit_code: int | None) -> str:
+    """Deterministic markdown within the submission bound, including marker room."""
+    header = "Independent operator tests failed on this head"
+    header += f" (exit {exit_code})." if exit_code is not None else "."
+    output = summary.removeprefix("failed\n")[-SUMMARY_LIMIT:]
+
+    def render(tail: str) -> str:
+        fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", tail)), default=0))
+        preview = "\n".join([line for line in tail.splitlines() if line.strip()][-25:])
+        return (f"{header}\n\n{fence}\n{preview}\n{fence}\n\n"
+                "<details><summary>Full test output (tail)</summary>\n\n"
+                f"{fence}\n{tail}\n{fence}\n\n</details>")
+
+    body = render(output)
+    # Four fences plus two copies of the tail cost at most six times its length.
+    limit = 65536 - 1024 - 256  # marker and optional rejection-ceiling preamble
+    return body if len(body) <= limit else render(output[-(limit - len(header) - 256) // 6:])
 
 
 def digest(value: str) -> str:

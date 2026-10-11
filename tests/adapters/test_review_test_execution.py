@@ -247,6 +247,46 @@ def test_empty_output_yields_outcome_only_summary(tmp_path):
     assert result.summary.strip() == ReviewTestOutcome.FAILED.value
 
 
+def test_completion_captures_clean_terminal_output(tmp_path):
+    result, _, _, _ = run(tmp_path, "printf '\\033[32méchec 日本語\\033[0m\\n'; exit 1")
+    assert result.summary == "failed\néchec 日本語\n"
+    assert "\x1b" not in result.summary
+
+
+@pytest.mark.parametrize("escape", [b"\x1b[32m", b"\x1b]title\x07", b"\x1b]title\x1b\\", b"\x1b7"])
+@pytest.mark.parametrize("split", [1, 2, 3])
+def test_truncated_and_chunked_capture_does_not_expose_escape_fragments(escape, split):
+    from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
+
+    output = _OutputTail()
+    output.extend(b"x" * (2 * EVIDENCE_TAIL_BYTES) + escape[:split])
+    output.extend(escape[split:] + b"FAIL\n" + b"y" * (EVIDENCE_TAIL_BYTES - 8))
+    text = output.text()
+    assert "FAIL\n" in text
+    assert "32m" not in text and "title" not in text and "\x1b" not in text
+
+
+@pytest.mark.parametrize("opener,terminator", [(b"\x1b]", b"\x07"), (b"\x1b[", b"m")])
+def test_escape_larger_than_capture_bound_does_not_leak_its_continuation(opener, terminator):
+    from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
+
+    output = _OutputTail()
+    output.extend(opener + b"3" * (4 * EVIDENCE_TAIL_BYTES))
+    output.extend(b"33" + terminator + "résultat".encode())
+    assert output.text().endswith("résultat")
+    assert "3" not in output.text() and "\x1b" not in output.text()
+
+
+def test_oversized_osc_with_split_string_terminator_keeps_following_output():
+    from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
+
+    output = _OutputTail()
+    output.extend(b"\x1b]" + b"title" * EVIDENCE_TAIL_BYTES + b"\x1b")
+    output.extend(b"\\FAIL\n")
+    assert output.text().endswith("FAIL\n")
+    assert "title" not in output.text() and "\x1b" not in output.text()
+
+
 def test_interleaved_streams_stay_bounded_and_keep_last_line(tmp_path):
     command = "for i in $(seq 1 20000); do echo out$i; echo err$i >&2; done; echo FINAL-LINE >&2; exit 1"
     result, _, _, _ = run(tmp_path, command)
