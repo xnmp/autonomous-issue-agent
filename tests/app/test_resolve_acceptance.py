@@ -1211,7 +1211,7 @@ def activation_cli(bare, monkeypatch, capsys):
     # These stopped activation sources exercise resolve/fix authority. Stall
     # telemetry has its separate F12 parser and explicit refusal case below.
     from issue_agent.app import roles
-    monkeypatch.setattr(roles, "_stall_reporter", lambda *_args: lambda _world: None)
+    monkeypatch.setattr(roles, "_stall_reporter", lambda *_args: lambda *_report_args: None)
 
     from issue_agent.app import continuation_activation
     original_scope = continuation_activation.activation_scope
