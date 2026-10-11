@@ -316,6 +316,7 @@ class ReviewControlView:
     trigger_label: Label = field(kw_only=True)
     execution_ceiling: int = field(default=0, kw_only=True)
     execution_episode_open: bool = field(default=False, kw_only=True)
+    # Harness-minted release eligibility, not arbitrary submitted verdicts.
     confirmed_verdicts: tuple[ReviewSubmissionReceipt, ...] = field(default=(), kw_only=True)
 
     def __post_init__(self) -> None:
@@ -326,7 +327,7 @@ class ReviewControlView:
         if type(self.execution_episode_open) is not bool:
             raise ValueError("execution view requires verified unfinished membership")
         if (not isinstance(self.confirmed_verdicts, tuple) or len(self.confirmed_verdicts) > MAX_WORKFLOW_GATES + 1
-                or any(not isinstance(item, ReviewSubmissionReceipt) or not item.escalated
+                or any(not isinstance(item, ReviewSubmissionReceipt)
                        or item.submission.binding.fence.key != self.snapshot.revision.fence.key
                        for item in self.confirmed_verdicts)):
             raise ValueError("execution view requires this target's selected confirmed verdicts")

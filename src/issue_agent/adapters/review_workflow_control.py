@@ -50,6 +50,7 @@ from ..domain.review_rounds import (
     FinalizedReviewRound, ReviewParentAbandoned, ReviewPlanningOpen, ReviewPlanningSealed,
 )
 from ..domain.review_rejection import CountingRule, ReviewProjectionRefused, ReviewRejectionCeiling, ReviewVerdictHold
+from ..domain.review_test_evidence import test_only_rejection_release_eligible
 from ..domain.review_workflow import (
     CancelledReviewRearm, CompleteReviews, CompletedReviewRearm, ObservedPullRequest, PendingReviewRearm,
     PullRequestState, PullRequestUnavailable, RecordedPullRequest, ReviewRearmIntent, ReviewRearmPreflight,
@@ -85,9 +86,10 @@ from .control_store import (
 )
 from .deployment_authority import deployment_effect_barrier, deployment_role
 from .review_effects import (
-    PullRequestProjectionOp, ReviewCheck, ReviewReads, check_review_op, observe_pull_request, read_pull_request,
-    review_family_op,
+    PullRequestProjectionOp, ReviewCheck, ReviewReads, bound_submission_op, check_review_op, observe_pull_request,
+    read_pull_request, review_family_op,
 )
+from .review_test_execution import read_test_completion
 from .review_dispatch_holds import (
     RECORDED_REVIEW_NAMESPACE as _RECORDED_REVIEW_NAMESPACE,
     RELEASE_RESOLVED_NAMESPACE as _RELEASE_RESOLVED_NAMESPACE,
@@ -1134,6 +1136,7 @@ class SQLiteReviewWorkflowControl:
     def _fixed_verdict_receipt(
         self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot, identity: CommandId | None = None,
     ) -> ReviewSubmissionReceipt | None:
+        """Mint release eligibility from registered commands and harness completions."""
         baseline = snapshot.episode.continuation
         selected = baseline.source.command_id if isinstance(baseline, ReviewedBaseline) and isinstance(
             baseline.source, BoundReviewSubmission,
@@ -1152,7 +1155,7 @@ class SQLiteReviewWorkflowControl:
             receipt = load_bound_review_submission(db, CommandId(identity))
         except KeyError as exc:
             raise WorkflowAuthorityError("selected verdict command is absent") from exc
-        if not isinstance(receipt, ReviewSubmissionReceipt) or not receipt.escalated:
+        if not isinstance(receipt, ReviewSubmissionReceipt):
             return None
         registration = read_review_submission_registration(db, self._writer.repository, identity)
         if registration is None:
@@ -1168,6 +1171,17 @@ class SQLiteReviewWorkflowControl:
             round.sequence)
         if outcome.round != round:
             raise WorkflowAuthorityError("selected verdict source changed its exact round identity")
+        if not receipt.escalated:
+            row = db.execute("SELECT * FROM lifecycle_commands WHERE command_id=?", (identity,)).fetchone()
+            op = bound_submission_op(_command_from_row(row))
+            if op is None or not test_only_rejection_release_eligible(
+                event=op.event, reference=op.test_evidence_ref,
+                completion=read_test_completion(db, key.repository, op.test_evidence_ref)
+                    if op.test_evidence_ref is not None else None,
+                rejection=receipt.submission.binding, execution=round.binding,
+                head=receipt.head_sha, patch=receipt.patch_id,
+            ):
+                return None
         return receipt
 
     def _old_execution_episode_open(self, db: sqlite3.Connection, snapshot: ReviewWorkflowSnapshot) -> bool:

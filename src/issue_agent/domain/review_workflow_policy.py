@@ -1418,6 +1418,7 @@ def _request_fixed_review_rearm(
     test_gate = next((g for g in snapshot.gates if isinstance(g, OpenGate) and g.gate_id == command.gate_id
         and ordinary_test_hold(g, execution.binding, pr.head_sha)), None)
     if isinstance(command, RequestReviewVerdictRelease):
+        # Acceptance and transition validation independently mint release eligibility.
         baseline = snapshot.episode.continuation
         retained = next((gate for gate in snapshot.gates if isinstance(gate, OpenGate)
             and isinstance(gate.cause, ReviewVerdictHold)
@@ -1425,7 +1426,7 @@ def _request_fixed_review_rearm(
         baseline_matches = (isinstance(baseline, ReviewedBaseline) and verdict_receipt is not None
             and baseline.source == verdict_receipt.submission and baseline.head_sha == verdict_receipt.head_sha
             and baseline.patch_id == verdict_receipt.patch_id)
-        if (not isinstance(verdict_receipt, ReviewSubmissionReceipt) or not verdict_receipt.escalated
+        if (not isinstance(verdict_receipt, ReviewSubmissionReceipt)
                 or verdict_receipt.submission.command_id != command.submission_command_id
                 or verdict_receipt.submission.binding.fence.key != snapshot.revision.fence.key
                 or verdict_receipt.submission.binding.authority != snapshot.authority
@@ -1435,7 +1436,7 @@ def _request_fixed_review_rearm(
                         and retained.cause.head_sha == verdict_receipt.head_sha)
                 or pr.head_sha != verdict_receipt.head_sha
                 or command.gate_id != review_verdict_release_gate_id(snapshot, verdict_receipt.submission)):
-            return _reject(WorkflowRejection.INVALID_SCOPE, "release requires the current selected confirmed ESCALATE verdict")
+            return _reject(WorkflowRejection.INVALID_SCOPE, "release requires the current selected release-eligible verdict")
         grant = ReviewVerdictReleaseGrant(verdict_receipt.submission, verdict_receipt.head_sha)
         cause = ReviewVerdictHold(command.submission_command_id, verdict_receipt.head_sha)
         after_execution = _advanced_execution(snapshot, revision, WorkflowMutation.REQUEST_REARM, applied_sequences)
@@ -1460,6 +1461,8 @@ def _request_fixed_review_rearm(
         selected_gate = test_gate
         if test_gate is None:
             holds = tuple(hold for hold in holds if hold != UNPRODUCTIVE_ROUND_HOLD)
+        # Only an ESCALATE survives renewal as a hold: a test-only rejection is
+        # bound to its head, and retaining it would strand a moved head behind it.
         if isinstance(verdict_receipt, ReviewSubmissionReceipt) and verdict_receipt.escalated:
             verdict_id = review_verdict_release_gate_id(snapshot, verdict_receipt.submission)
             if not any(_open(gate).gate_id == verdict_id for gate in snapshot.gates):
@@ -1841,6 +1844,8 @@ class ReviewTransitionFacts:
     - `rule`: the configured counting rule, captured only by a NEW gate.
     - `escalation`: the ceiling escalation receipt a NEW gate requires.
     - `submission`: the SUBMIT_REVIEW command/receipt facts a recorded review requires.
+    - `verdict_receipt`: a registered ESCALATE or harness test-only rejection
+      independently confirmed as release-eligible, never a caller's claim.
     - `accepted_preflight`: the stopped intent's accepted preflight for
       decision-changed supersession.
     - `retry`: the command's retry-grant facts for an operator retry grant.

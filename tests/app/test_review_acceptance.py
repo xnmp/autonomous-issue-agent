@@ -1531,6 +1531,152 @@ def test_ordinary_test_failure_requests_changes_and_survives_compatible_restart(
     assert all(review.state != "APPROVED" for review in restarted.bot_reviews())
 
 
+def offered_verdict_releases(client):
+    from issue_agent.app.dashweb.review_control import read_review_control
+
+    view = read_review_control(client.workflow, PR).model_dump()
+    assert "execution" in view, view
+    return [gate for gate in view["execution"]["recovery_choices"]
+            if any(action["state"] == "offered" and action["operation"] == "release_verdict"
+                   for action in gate["actions"])]
+
+
+def test_operator_test_only_rejection_allows_same_head_review_after_operator_rearm(deployment, tmp_path):
+    from issue_agent.domain.actions import PostComment, Relabel
+    from issue_agent.domain.outcome import pr_resume_actions
+    from issue_agent.domain.workflow import KeepGuidance, RequestReviewVerdictRelease
+
+    marker = tmp_path / "operator-test-invocations"
+    command = (f"if test -e '{marker}'; then echo rerun >> '{marker}'; exit 0; fi; "
+               f"echo initial > '{marker}'; exit 1")
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK, OK)), test_command=command)
+    client.boot()
+    client.tick()
+    assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"
+    head = client.remote.get_pr(PR).head_ref_oid
+    for action in pr_resume_actions(PR, AgentResult(False, status="ok", summary="Failure was a flake; no push.")):
+        if isinstance(action, PostComment):
+            client.remote.comment("pr", PR, action.body)
+        elif isinstance(action, Relabel):
+            client.remote.relabel("pr", PR, action.remove.value if action.remove else None,
+                                  action.add.value if action.add else None)
+    client.tick(3)
+    assert len(client.bot_reviews()) == 1 and marker.read_text().splitlines() == ["initial"]
+    (choice,) = offered_verdict_releases(client)
+    before = client.state()
+    request = RequestReviewVerdictRelease("test-only-release:1", before.revision, choice["gate_id"], KeepGuidance(),
+        before.execution.binding.execution_epoch, before.execution.binding.execution_episode,
+        before.episode.continuation.source.command_id, expected_binding=before.binding)
+    accepted = client.workflow.request_rearm(request, ACTOR)
+    assert isinstance(accepted, WorkflowCommitted) and not accepted.idempotent
+    assert isinstance(accepted.snapshot.episode.continuation, FreshReviewRequired)
+    assert accepted.snapshot.execution.binding.execution_episode == before.execution.binding.execution_episode
+    assert accepted.snapshot.execution.state.failures == before.execution.state.failures
+    assert accepted.snapshot.intent.authorized == accepted.snapshot.intent.dismissals == ()
+    replayed = client.workflow.request_rearm(request, ACTOR)
+    assert isinstance(replayed, WorkflowCommitted) and replayed.idempotent
+    client.tick(3)
+    assert client.remote.get_pr(PR).head_ref_oid == head
+    assert [review.state for review in client.bot_reviews()] == ["CHANGES_REQUESTED", "APPROVED"]
+    assert marker.read_text().splitlines() == ["initial", "rerun"]
+    assert len(client.provider.tasks) == 2 and offered_verdict_releases(client) == []
+    replayed = client.workflow.request_rearm(request, ACTOR)
+    assert isinstance(replayed, WorkflowCommitted) and replayed.idempotent
+    client.tick(3)
+    assert len(client.provider.tasks) == 2 and marker.read_text().splitlines() == ["initial", "rerun"]
+
+
+def test_execution_renewal_on_a_moved_head_is_not_held_by_an_old_test_only_rejection(deployment, tmp_path):
+    from issue_agent.app.dashweb.review_control import read_review_control
+    from issue_agent.domain.review_rejection import ReviewVerdictHold
+    from issue_agent.domain.review_workflow import CompletedReviewRearm
+    from issue_agent.domain.workflow import KeepGuidance, RequestReviewExecutionRenewal
+
+    marker = tmp_path / "operator-test-invocations"
+    command = f"if test -e '{marker}'; then exit 0; fi; touch '{marker}'; exit 1"
+    failures = [AgentResult(True, status="error", exit_reason=ExitReason.AGENT_ERROR, cost_usd=0.1) for _ in range(5)]
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK) + failures + verdicts(OK)),
+                            test_command=command)
+    client.boot()
+    client.tick(2)
+    assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"
+    client.remote.external_pr_change(PR, head_ref_oid=deployment.heads[1])
+    client.tick(7)
+    before = client.state()
+    assert before.execution.state.failures == 5
+    view = read_review_control(client.workflow, PR).model_dump()
+    (choice,) = [gate for gate in view["execution"]["recovery_choices"]
+                 if any(a["operation"] == "renew_execution" and a["state"] == "offered" for a in gate["actions"])]
+    request = RequestReviewExecutionRenewal("moved-head:renew", before.revision, choice["gate_id"], KeepGuidance(),
+        before.execution.binding.execution_epoch, before.execution.binding.execution_episode,
+        expected_binding=before.binding)
+    assert isinstance(client.workflow.request_rearm(request, ACTOR), WorkflowCommitted)
+    client.tick(5)
+    assert isinstance(client.state().intent, CompletedReviewRearm)
+    assert not [gate for gate in client.gates() if isinstance(gate.cause, ReviewVerdictHold)]
+    assert client.bot_reviews()[-1].state == "APPROVED"
+    assert client.remote.get_pr(PR).head_ref_oid == deployment.heads[1]
+
+
+def test_reviewer_findings_rejection_offers_no_verdict_release(deployment, tmp_path):
+    marker = tmp_path / "operator-test-invocations"
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(RC)),
+                            test_command=f"echo run >> '{marker}'; exit 1")
+    client.boot()
+    client.tick(3)
+    assert client.bot_reviews()[-1].state == "CHANGES_REQUESTED"
+    assert not marker.exists() and offered_verdict_releases(client) == []
+
+
+@pytest.mark.parametrize("mismatch", ["head", "binding", "reference", "missing", "malformed"])
+def test_test_only_rejection_release_rechecks_harness_evidence(deployment, mismatch):
+    from issue_agent.adapters.review_test_execution import TEST_COMPLETION_NAMESPACE, read_test_completion
+    from issue_agent.adapters.workflow_codec import encode_workflow
+    from issue_agent.domain.workflow import KeepGuidance, RequestReviewVerdictRelease, WorkflowRejected
+
+    client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)), test_command="exit 1")
+    client.boot()
+    client.tick(2)
+    (choice,) = offered_verdict_releases(client)
+    before = client.state()
+    submission = before.episode.continuation.source.command_id
+    request = RequestReviewVerdictRelease("test-only-release:untrusted", before.revision, choice["gate_id"],
+        KeepGuidance(), before.execution.binding.execution_epoch, before.execution.binding.execution_episode,
+        submission, expected_binding=before.binding)
+    with client.review.control.transaction() as db:
+        row = db.execute("SELECT payload_json FROM lifecycle_commands WHERE command_id=?", (submission,)).fetchone()
+        payload = json.loads(row["payload_json"])
+        reference = payload["test_evidence_ref"]
+        evidence = read_test_completion(db, KEY.repository, reference)
+        assert evidence is not None
+        if mismatch == "missing":
+            db.execute("DELETE FROM dedupe_keys WHERE namespace=? AND scope=? AND key=?",
+                       (TEST_COMPLETION_NAMESPACE, KEY.repository, reference))
+        else:
+            invocation = evidence.invocation
+            if mismatch == "head":
+                head = deployment.heads[1]
+                invocation = replace(invocation, subject=replace(invocation.subject, head_sha=head))
+                evidence = replace(evidence, invocation=invocation,
+                    execution=replace(evidence.execution, repository_revision=head),
+                    before=replace(evidence.before, head_sha=head), after=replace(evidence.after, head_sha=head))
+            elif mismatch == "binding":
+                binding = replace(invocation.subject.execution, execution_episode="another-execution")
+                invocation = replace(invocation, subject=replace(invocation.subject, execution=binding),
+                                     round=replace(invocation.round, binding=binding))
+                evidence = replace(evidence, invocation=invocation)
+            elif mismatch == "reference":
+                evidence = replace(evidence, invocation=replace(invocation, invocation_id="another-invocation"))
+            db.execute("UPDATE dedupe_keys SET payload_json=? WHERE namespace=? AND scope=? AND key=?",
+                       ("{}" if mismatch == "malformed" else encode_workflow(evidence),
+                        TEST_COMPLETION_NAMESPACE, KEY.repository, reference))
+    assert offered_verdict_releases(client) == []
+    assert isinstance(client.workflow.request_rearm(request, ACTOR), WorkflowRejected)
+    client.tick(3)
+    assert client.state().episode.continuation == before.episode.continuation
+    assert len(client.provider.tasks) == len(client.bot_reviews()) == 1
+
+
 def test_ordinary_test_unavailable_backoff_prevents_paid_review_ticks(deployment):
     from issue_agent.domain.workflow import ReconciliationPolicy
     client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK, OK)), test_command="")
