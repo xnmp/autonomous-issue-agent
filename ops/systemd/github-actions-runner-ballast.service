@@ -8,8 +8,6 @@ After=network-online.target
 Type=simple
 User=ballast-ci
 Group=ballast-ci
-# /dev/kvm for the Android emulator; the account itself stays in no extra group.
-SupplementaryGroups=kvm
 WorkingDirectory=/var/lib/ballast-ci/runner
 ExecStart=/var/lib/ballast-ci/runner/runsvc.sh
 Restart=on-failure

@@ -60,13 +60,16 @@ name, label, service or unit, so caches and credentials cannot cross repositorie
 | Limits | 6 CPU, 12 GB, 512 tasks | `CPUQuota=1200%`, `MemoryMax=24G`, `TasksMax=2048` |
 
 The Ballast unit is the hardened template with only those limits raised (Android
-builds plus an x86_64 emulator) and `SupplementaryGroups=kvm` added. The grant is
-unit-level: the `ballast-ci` account itself still has no groups beyond its
-primary one, and the identity check refuses any other. `/dev/kvm` is currently
-`0666 root:kvm`, but the grant keeps the emulator working on hosts where it is
-`0660`. The installer refuses if the host has no `kvm` group, because systemd
-cannot start a unit naming a missing group. Every identity, public-repository
-and foreign-registration refusal applies per profile.
+builds plus an x86_64 emulator). It grants no supplementary groups, and the
+installer asserts the installed unit has none. Upstream systemd's udev rules
+(`50-udev-default.rules`, shipped by Arch and Debian) make `/dev/kvm` mode
+`0666`, so the `kvm` group adds nothing for KVM and would also expose
+`/dev/udmabuf` (`0660 root:kvm`). If a host's `/dev/kvm` is not world-readable
+and writable, KVM is unavailable to the runner; that is a deliberate operator
+decision, not something the installer overrides. Every identity,
+public-repository and foreign-registration refusal applies per profile. Root
+operates only on the runner home; the runner tree is extracted and inspected as
+the runner user, since jobs can write there.
 
 Trust: the runner executes workflow code as `ballast-ci` with no sandbox. Use it
 only for the private repository and trusted pull requests; never route fork PRs

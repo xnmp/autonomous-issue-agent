@@ -4,8 +4,8 @@
 set -euo pipefail
 
 # BEGIN PROFILES (pure data; tests source this block to compare profiles)
-# unit_groups is a unit-level SupplementaryGroups grant. It never changes the
-# account's own groups, which must stay exactly its primary group.
+# No profile grants supplementary groups: /dev/kvm is world-rw under upstream
+# systemd udev rules, and the kvm group would also expose /dev/udmabuf.
 load_profile() {
     case $1 in
         default)
@@ -16,7 +16,6 @@ load_profile() {
             runner_label=issue-agent-ci
             service=issue-agent-ci-runner.service
             unit_file=github-actions-runner.service
-            unit_groups=
             ;;
         ballast)
             repository=xnmp/ballast
@@ -26,7 +25,6 @@ load_profile() {
             runner_label=ballast-ci
             service=ballast-ci-runner.service
             unit_file=github-actions-runner-ballast.service
-            unit_groups=kvm
             ;;
         *) return 1 ;;
     esac
@@ -46,12 +44,6 @@ sudo -n true || { echo "Authenticate with sudo -v, then rerun." >&2; exit 2; }
 [[ $(gh api "repos/$repository" --jq .private) == true ]] || {
     echo "Refusing a native runner for a public repository." >&2; exit 2;
 }
-if [[ -n $unit_groups ]]; then
-    # A missing group makes systemd refuse to start the unit (status 216).
-    getent group "$unit_groups" >/dev/null || {
-        echo "Host group required by the service unit is missing: $unit_groups" >&2; exit 2;
-    }
-fi
 
 if getent passwd "$runner_user" >/dev/null; then
     account=$(getent passwd "$runner_user")
@@ -74,18 +66,21 @@ if getent passwd "$runner_user" >/dev/null; then
 else
     sudo -n useradd --system --user-group --home-dir "$runner_home" --shell /usr/bin/nologin "$runner_user"
 fi
-for path in "$runner_home" "$runner_dir"; do
-    sudo -n test ! -L "$path" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
-    if sudo -n test -e "$path"; then
-        sudo -n test -d "$path" || exit 2
-    fi
-done
-sudo -n install -d -m 0700 -o "$runner_user" -g "$runner_user" "$runner_home" "$runner_dir"
+# Root touches only $runner_home, whose parent is root-owned, so the check
+# below cannot race. Everything inside it is runner-writable: root never
+# names a path beneath it (a job could swap runner/ for a symlink).
+sudo -n test ! -L "$runner_home" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
+if sudo -n test -e "$runner_home"; then
+    sudo -n test -d "$runner_home" || exit 2
+fi
+sudo -n install -d -m 0700 -o "$runner_user" -g "$runner_user" "$runner_home"
+sudo -n -u "$runner_user" /usr/bin/test ! -L "$runner_dir" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
+sudo -n -u "$runner_user" /usr/bin/install -d -m 0700 "$runner_dir"
 
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
-if ! sudo -n test -f "$runner_dir/.runner"; then
-    [[ $(sudo -n find "$runner_dir" -mindepth 1 -maxdepth 1 -print -quit) == "" ]] || {
+if ! sudo -n -u "$runner_user" /usr/bin/test -f "$runner_dir/.runner"; then
+    [[ $(sudo -n -u "$runner_user" /usr/bin/find "$runner_dir" -mindepth 1 -maxdepth 1 -print -quit) == "" ]] || {
         echo "Unconfigured runner directory is not empty; inspect it before installing." >&2; exit 2;
     }
     [[ $(gh api "repos/$repository/actions/runners" | jq --arg name "$runner_name" '[.runners[] | select(.name == $name)] | length') == 0 ]] || {
@@ -97,8 +92,9 @@ if ! sudo -n test -f "$runner_dir/.runner"; then
     [[ $url == https://github.com/actions/runner/releases/download/* && $checksum =~ ^[a-f0-9]{64}$ ]] || exit 2
     curl --fail --location --silent --show-error "$url" -o "$scratch/runner.tgz"
     printf '%s  %s\n' "$checksum" "$scratch/runner.tgz" | sha256sum --check --status
-    sudo -n tar -xzf "$scratch/runner.tgz" -C "$runner_dir"
-    sudo -n chown -R "$runner_user:$runner_user" "$runner_dir"
+    # The verified tarball is streamed so the runner user, not root, writes the tree.
+    # shellcheck disable=SC2024 # the operator, not the runner, reads the scratch file
+    sudo -n -u "$runner_user" /usr/bin/tar -xzf - -C "$runner_dir" < "$scratch/runner.tgz"
     token=$(gh api --method POST "repos/$repository/actions/runners/registration-token" --jq .token)
     # Official input transport removes this environment value after reading
     # it. stdin keeps the one-hour credential out of argv and shell traces.
@@ -111,8 +107,8 @@ if ! sudo -n test -f "$runner_dir/.runner"; then
     ' _ "$runner_dir" "https://github.com/$repository" "$runner_name" "$runner_label"
     unset token
 else
-    sudo -n test ! -L "$runner_dir/.runner" || exit 2
-    [[ $(sudo -n jq -er .gitHubUrl "$runner_dir/.runner") == "https://github.com/$repository" ]] || exit 2
+    sudo -n -u "$runner_user" /usr/bin/test ! -L "$runner_dir/.runner" || exit 2
+    [[ $(sudo -n -u "$runner_user" /usr/bin/jq -er .gitHubUrl "$runner_dir/.runner") == "https://github.com/$repository" ]] || exit 2
 fi
 
 if ! command -v shellcheck >/dev/null; then
@@ -142,7 +138,7 @@ sudo -n install -m 0644 "$root/ops/systemd/$unit_file" "/etc/systemd/system/$ser
 sudo -n systemctl daemon-reload
 [[ $(systemctl show "$service" -p User --value) == "$runner_user" &&
    $(systemctl show "$service" -p Group --value) == "$runner_user" &&
-   $(systemctl show "$service" -p SupplementaryGroups --value) == "$unit_groups" &&
+   $(systemctl show "$service" -p SupplementaryGroups --value) == "" &&
    $(systemctl show "$service" -p DropInPaths --value) == "" &&
    $(systemctl show "$service" -p FragmentPath --value) == "/etc/systemd/system/$service" &&
    $(systemctl show "$service" -p WorkingDirectory --value) == "$runner_dir" ]] || exit 2

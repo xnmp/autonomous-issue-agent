@@ -19,11 +19,29 @@ tool = Path(sys.argv[0]).name
 args = sys.argv[1:]
 if tool == 'sudo':
     if args == ['-n', 'true']: sys.exit(0)
+    with open(fixture['sudo_log'], 'a') as log: log.write(json.dumps(args) + '\\n')
     Path(fixture['mutation']).write_text(' '.join(args))
-    sys.exit(99)
+    if not fixture['proceed']: sys.exit(99)
+    # Success path: a fresh host that stops at the first service mutation.
+    if 'systemctl' in args: sys.exit(99)
+    if '-u' in args:
+        sys.stdin.read()
+        if '/usr/bin/test' in args and '-f' in args: sys.exit(1)
+    sys.exit(0)
 if tool == 'gh':
     with open(fixture['gh_log'], 'a') as log: log.write(' '.join(args) + '\\n')
-    print('true'); sys.exit(0)
+    endpoint = ' '.join(args)
+    if endpoint.endswith('/actions/runners'): print('{"runners": []}')
+    elif 'downloads' in endpoint:
+        print(json.dumps({'download_url': 'https://github.com/actions/runner/releases/download/v1/r.tgz',
+                          'sha256_checksum': 'a' * 64}))
+    elif 'registration-token' in endpoint: print('SECRET-TOKEN')
+    else: print('true')
+    sys.exit(0)
+if tool == 'curl':
+    Path(args[args.index('-o') + 1]).write_bytes(b'archive')
+    sys.exit(0)
+if tool in ('sha256sum', 'shellcheck'): sys.exit(0)
 if tool == 'id':
     print(fixture['groups'] if args[0] == '-G' else '1000')
     sys.exit(0)
@@ -41,7 +59,6 @@ sys.exit(99)
 ROOT = Path(__file__).resolve().parents[2]
 INSTALLER = ROOT / "bin/install-ci-runner.sh"
 SYSTEMD = ROOT / "ops/systemd"
-KVM_GROUP = "kvm:x:78:"
 
 
 class Profile:
@@ -63,16 +80,16 @@ BALLAST = Profile("ballast", ["ballast"], "ballast-ci", "/var/lib/ballast-ci", "
 PROFILES = pytest.mark.parametrize("profile", [DEFAULT, BALLAST], ids=lambda p: p.name)
 
 
-def run_installer(tmp_path, profile, passwd, group, groups, host_groups=(KVM_GROUP,), args=None):
+def run_installer(tmp_path, profile, passwd, group, groups, args=None, proceed=False):
     binaries = tmp_path / "bin"
     binaries.mkdir()
     mutation = tmp_path / "host-mutation"
     gh_log = tmp_path / "gh.log"
     fixture = {
-        "passwd": passwd, "group": [*group, *host_groups], "groups": groups,
-        "mutation": str(mutation), "gh_log": str(gh_log),
+        "passwd": passwd, "group": group, "groups": groups, "proceed": proceed,
+        "mutation": str(mutation), "gh_log": str(gh_log), "sudo_log": str(tmp_path / "sudo.log"),
     }
-    for tool in ("sudo", "gh", "id", "getent"):
+    for tool in ("sudo", "gh", "id", "getent", "curl", "sha256sum", "shellcheck"):
         target = binaries / tool
         target.write_text(f"#!{sys.executable}\n{STUB}")
         target.chmod(0o755)
@@ -82,6 +99,11 @@ def run_installer(tmp_path, profile, passwd, group, groups, host_groups=(KVM_GRO
         capture_output=True, text=True, check=False,
     )
     return result, mutation, gh_log
+
+
+def sudo_calls(tmp_path):
+    log = tmp_path / "sudo.log"
+    return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
 
 def refusal_cases(p):
@@ -134,25 +156,6 @@ def test_a_new_account_is_created_with_the_profile_identity(tmp_path, profile):
     )
 
 
-def test_ballast_refuses_when_the_unit_supplementary_group_is_missing(tmp_path):
-    result, mutation, _ = run_installer(
-        tmp_path, BALLAST, [BALLAST.dedicated], [BALLAST.group], BALLAST.uid, host_groups=(),
-    )
-
-    assert result.returncode == 2
-    assert "kvm" in result.stderr
-    assert not mutation.exists()
-
-
-def test_the_default_profile_does_not_require_the_kvm_group(tmp_path):
-    result, mutation, _ = run_installer(
-        tmp_path, DEFAULT, [DEFAULT.dedicated], [DEFAULT.group], DEFAULT.uid, host_groups=(),
-    )
-
-    assert "kvm" not in result.stderr
-    assert mutation.exists()
-
-
 @pytest.mark.parametrize("args", [["unknown"], [""], ["default", "ballast"], ["BALLAST"]])
 def test_unknown_or_extra_profile_arguments_are_refused_before_any_work(tmp_path, args):
     result, mutation, gh_log = run_installer(
@@ -181,7 +184,7 @@ def profile_values(name):
     """Evaluate the installer's own profile table, the single source of truth."""
     script = INSTALLER.read_text()
     block = script[script.index("# BEGIN PROFILES"):script.index("# END PROFILES")]
-    fields = "repository runner_user runner_home runner_name runner_label service unit_file unit_groups runner_dir"
+    fields = "repository runner_user runner_home runner_name runner_label service unit_file runner_dir"
     code = f'{block}\nload_profile "$1"\nfor f in {fields}; do printf "%s=%s\\n" "$f" "${{!f}}"; done'
     out = subprocess.run(["bash", "-c", code, "_", name], capture_output=True, text=True, check=True).stdout
     return dict(line.split("=", 1) for line in out.splitlines())
@@ -196,7 +199,6 @@ def test_default_profile_keeps_the_existing_runner_identity():
         "runner_label": "issue-agent-ci",
         "service": "issue-agent-ci-runner.service",
         "unit_file": "github-actions-runner.service",
-        "unit_groups": "",
         "runner_dir": "/var/lib/issue-agent-ci/runner",
     }
 
@@ -208,7 +210,6 @@ def test_ballast_profile_is_the_documented_private_repository_runner():
     assert values["runner_user"] == values["runner_name"] == values["runner_label"] == "ballast-ci"
     assert values["runner_home"] == "/var/lib/ballast-ci"
     assert values["service"] == "ballast-ci-runner.service"
-    assert values["unit_groups"] == "kvm"
 
 
 def test_profiles_share_no_account_home_service_name_label_unit_or_repository():
@@ -224,7 +225,7 @@ def unit_directives(path):
     return [line for line in path.read_text().splitlines() if line and not line.startswith("#")]
 
 
-def test_ballast_unit_differs_from_the_hardened_template_only_in_limits_and_kvm():
+def test_ballast_unit_differs_from_the_hardened_template_only_in_declared_limits():
     template = unit_directives(SYSTEMD / "github-actions-runner.service")
     ballast = unit_directives(SYSTEMD / "github-actions-runner-ballast.service")
     renamed = [
@@ -232,11 +233,9 @@ def test_ballast_unit_differs_from_the_hardened_template_only_in_limits_and_kvm(
         for line in template
     ]
 
-    assert set(ballast) - set(renamed) == {
-        "CPUQuota=1200%", "MemoryMax=24G", "TasksMax=2048", "SupplementaryGroups=kvm",
-    }
+    assert set(ballast) - set(renamed) == {"CPUQuota=1200%", "MemoryMax=24G", "TasksMax=2048"}
     assert {line.split("=")[0] for line in set(renamed) - set(ballast)} == {"CPUQuota", "MemoryMax", "TasksMax"}
-    assert len(ballast) == len(renamed) + 1
+    assert len(ballast) == len(renamed)
 
 
 @PROFILES
@@ -248,7 +247,7 @@ def test_each_unit_runs_as_its_profile_account_and_confines_writes_to_its_home(p
     assert unit["ReadWritePaths"] == values["runner_home"]
     assert unit["WorkingDirectory"] == values["runner_dir"]
     assert unit["ExecStart"] == f"{values['runner_dir']}/runsvc.sh"
-    assert unit.get("SupplementaryGroups", "") == values["unit_groups"]
+    assert "SupplementaryGroups" not in unit
     assert (unit["ProtectSystem"], unit["NoNewPrivileges"], unit["MemorySwapMax"]) == ("strict", "true", "0")
 
 
@@ -259,3 +258,53 @@ def test_installer_hardcodes_no_profile_path_outside_the_profile_table():
     assert "/var/lib/" not in outside
     assert "xnmp/" not in outside
     assert "issue-agent-ci" not in outside
+
+
+@PROFILES
+def test_fresh_install_registers_and_extracts_as_the_runner_user_with_profile_values(tmp_path, profile):
+    result, _, gh_log = run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed=True)
+    calls = sudo_calls(tmp_path)
+    runner_dir = f"{profile.home}/runner"
+
+    assert result.returncode == 99, result.stderr
+    config = next(c for c in calls if any("config.sh" in arg for arg in c))
+    assert config[:3] == ["-n", "-u", profile.user]
+    # Values arrive as positional arguments after the script, never inside it.
+    assert config[-4:] == [runner_dir, f"https://github.com/{profile.repository}", profile.user, profile.user]
+    script = next(arg for arg in config if "config.sh" in arg)
+    assert profile.user not in script and profile.repository not in script
+    extract = next(c for c in calls if "/usr/bin/tar" in c)
+    assert extract[:3] == ["-n", "-u", profile.user]
+    assert extract[-4:] == ["-xzf", "-", "-C", runner_dir]
+    assert "SECRET-TOKEN" not in result.stdout + result.stderr + json.dumps(calls)
+    assert f"repos/{profile.repository}/actions/runners/registration-token" in gh_log.read_text()
+
+
+@PROFILES
+def test_root_names_no_path_beneath_the_runner_home(tmp_path, profile):
+    run_installer(tmp_path, profile, [profile.dedicated], [profile.group], profile.uid, proceed=True)
+
+    root_calls = [c for c in sudo_calls(tmp_path) if c[:2] != ["-n", "-u"]]
+    assert root_calls
+    for call in root_calls:
+        assert not any(arg.startswith(f"{profile.home}/") for arg in call), call
+
+
+def test_installer_source_never_passes_a_runner_dir_path_to_root_sudo():
+    script = INSTALLER.read_text()
+    root_lines = [
+        line for line in script.splitlines()
+        if "sudo -n " in line and 'sudo -n -u "$runner_user"' not in line and not line.lstrip().startswith("#")
+    ]
+
+    assert root_lines
+    for line in root_lines:
+        assert "$runner_dir" not in line, line
+    assert "chown -R" not in script
+
+
+def test_runner_name_lookup_binds_the_name_with_jq_arg_not_interpolation():
+    script = INSTALLER.read_text()
+
+    assert "jq --arg name" in script
+    assert 'select(.name==\\"' not in script
