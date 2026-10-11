@@ -52,6 +52,20 @@ obligations follow (operator, 2026-08-08):
   fall across deployments ($126/merge → $5.49/merge over eight); if a class
   recurs, the prior fix treated the instance, not the generator.
 
+  **This test gates every fix the manager ships, dispatches or accepts.**
+  - Before briefing a fix agent, name the mechanism or intervention the fix
+    removes. Do not brief "add a variant, a counter and a ceiling".
+  - Every brief carries the constraint and requires a report of net `src/`
+    lines and mechanisms removed or added.
+  - The adversarial reviewer is asked to reject unjustified additions.
+  - A fix that creates a new state must give it an owner, a ceiling and an
+    exit (automatic, or a typed operator re-arm). A state with no exit is a
+    future dead end.
+  - When the next gap appears within hours of a fix, suspect that fix first.
+  - 2026-10-11: two merged fixes (#262, #269) and two first-draft briefs
+    failed this test. Each added state that produced the next gap (#271,
+    #272); see `CLAUDE.md` "Fixes must not grow the surface".
+
 Accepted residuals live in [docs/open/residuals.md](../open/residuals.md) with
 named triggers — e.g. platform-invisible CI (a Windows-only failure cannot be
 reproduced by a Linux leg; the environment manifest keeps legs from burning
