@@ -29,6 +29,7 @@ class NativeFailure(str, Enum):
     """
 
     AMBIGUOUS_TOKEN_COUNTS = "native response usage is missing or token counts are ambiguous"
+    UNFINISHED_TURNS = "native child has unfinished turns or turns without usage"
 
     @classmethod
     def parse(cls, raw: object) -> "NativeFailure | None":
@@ -50,6 +51,12 @@ def normalize_usage(raw: dict) -> TokenUsage:
     if cached + written > inputs:
         raise ValueError("cache tokens exceed inclusive input")
     return TokenUsage(inputs - cached - written, outputs, cached, written, UsageSource.ROLLOUT)
+
+
+def total_usage_of(usages: list[TokenUsage]) -> TokenUsage:
+    return TokenUsage(sum(u.input_tokens for u in usages), sum(u.output_tokens for u in usages),
+                      sum(u.cache_read_tokens for u in usages), sum(u.cache_write_tokens for u in usages),
+                      UsageSource.ROLLOUT)
 
 
 def root_usage(raw: dict) -> TokenUsage:
@@ -115,9 +122,6 @@ class _Rollout:
     usage: dict[str, tuple[str, TokenUsage]] = field(default_factory=dict)
     completed_turns: set[str] = field(default_factory=set)
     started_turns: set[str] = field(default_factory=set)
-    token_counts: dict[str, list[TokenUsage | None]] = field(default_factory=dict)
-    # Raw (total, last) of the previous token_count, kept across incremental reads.
-    last_count: tuple[dict, dict] | None = None
 
 
 @dataclass
@@ -357,22 +361,6 @@ class CodexChildUsageMeter:
                     raise ValueError("native observer exceeded its turn bound")
                 rollout.started_turns.add(turn)
                 rollout.active_turn = turn
-        elif event_kind == "token_count":
-            info = payload.get("info") or {}
-            raw = info.get("last_token_usage")
-            total = info.get("total_token_usage")
-            # Codex re-emits a token_count (e.g. after a rate-limit refresh) with
-            # an unchanged cumulative total and last usage: no tokens were added,
-            # so it is not a further response. Only exact equality of both
-            # well-formed counters qualifies; anything else stays ambiguous.
-            counters = (total, raw) if isinstance(total, dict) and total and isinstance(raw, dict) else None
-            if counters is not None and counters == rollout.last_count:
-                return
-            rollout.last_count = counters
-            normalized = normalize_usage(raw) if isinstance(raw, dict) else None
-            if sum(len(v) for r in self.rollouts.values() for v in r.token_counts.values()) >= self.max_responses:
-                raise ValueError("native observer exceeded its token-count bound")
-            rollout.token_counts.setdefault(rollout.active_turn, []).append(normalized)
 
     def _resolve_spawn_outputs(self, *, final: bool) -> None:
         for (parent, _), (sid, path) in self.spawn_outputs.items():
@@ -425,7 +413,22 @@ class CodexChildUsageMeter:
                 raise ValueError("native usage event is malformed")
             self._event(rollout, event)
 
+    def _blocking_tail(self, rollout: _Rollout) -> bool:
+        """An unterminated record blocks final settlement, except a receipted session's killed write
+        (a truncated prefix of one record: its in-flight request has no receipt, so it prices at zero)."""
+        if rollout.tail and rollout.usage:
+            try:
+                json.loads(rollout.tail)
+            except json.JSONDecodeError as exc:
+                return not (exc.msg.startswith("Unterminated string") or exc.pos >= len(rollout.tail.rstrip()))
+            except UnicodeDecodeError as exc:
+                return exc.reason != "unexpected end of data"
+        return bool(rollout.tail)
+
     def sample(self, session_id: str, model: str, usage: dict | None, *, final: bool = False) -> RunUsage | None:
+        """A session with receipts is priced as exactly the sum of its receipts in this run's window
+        [started_at, ended_at]; the counter prices only sessions without any. An in-flight request
+        has no receipt and so costs zero (operator, 2026-10-11)."""
         samples: list[ModelUsage] = []
         if self.failure:
             return UnavailableRunUsage(self.failure, tuple(self.roots.values()))
@@ -445,6 +448,13 @@ class CodexChildUsageMeter:
                 if len(self.rollouts) == before:
                     break
             self._resolve_spawn_outputs(final=final)
+            receipted: set[str] = set()
+            for sid in {*self.roots, session_id} - {""}:
+                rollout = self.rollouts.get(sid)
+                root_model = self.roots[sid].model if sid in self.roots else (model if sid == session_id else "")
+                if rollout is not None and rollout.usage and root_model:
+                    self.roots[sid] = ModelUsage(sid, root_model, total_usage_of([u for _, u in rollout.usage.values()]))
+                    receipted.add(sid)
             participants = set(self.roots) | set(self.children)
             message_targets = participants | {path for _, path in self.children.values() if path}
             if self.roots:
@@ -466,8 +476,8 @@ class CodexChildUsageMeter:
                 raise ValueError("native child lacks its parent's durable spawn receipt")
             if not self.children:
                 if self.rates is not None and self.roots:
-                    if final and (session_id not in self.roots or usage is None
-                                  or any(r.tail for r in self.rollouts.values())):
+                    if final and (session_id not in self.roots or usage is None and session_id not in receipted
+                                  or any(self._blocking_tail(r) for r in self.rollouts.values())):
                         raise ValueError("parent native usage is missing or incomplete")
                     if any(not self.rates.priceable(root.model) for root in self.roots.values()):
                         raise ValueError("native parent model has no configured rates")
@@ -475,7 +485,8 @@ class CodexChildUsageMeter:
                 return None
             if final and session_id not in self.roots:
                 raise ValueError("native parent model or usage is unavailable")
-            if final and (usage is None or session_id not in self.roots or any(r.tail for r in self.rollouts.values())):
+            if final and (usage is None and session_id not in receipted or session_id not in self.roots
+                          or any(self._blocking_tail(r) for r in self.rollouts.values())):
                 raise ValueError("parent native usage is missing or incomplete")
             samples.extend(self.roots.values())
             if self.rates is None or any(not self.rates.priceable(root.model) for root in self.roots.values()):
@@ -508,30 +519,19 @@ class CodexChildUsageMeter:
                 if not own_turns:
                     own_turns = {turn for turn, _ in rollout.usage.values()} - ancestor_turns
                 usage_turns = {turn for turn, _ in rollout.usage.values()}
-                if final and (not own_turns or not own_turns <= usage_turns or not own_turns <= rollout.completed_turns):
-                    raise ValueError("native child has unfinished turns or turns without usage")
+                if final and (not own_turns or not own_turns & rollout.completed_turns <= usage_turns):
+                    raise ValueError(NativeFailure.UNFINISHED_TURNS.value)
                 grouped: dict[str, list[TokenUsage]] = {}
                 for turn in own_turns:
                     receipts = [tokens for record_turn, tokens in rollout.usage.values() if record_turn == turn]
-                    if final and rollout.token_counts.get(turn, []) != receipts:
-                        raise ValueError(NativeFailure.AMBIGUOUS_TOKEN_COUNTS.value)
                     actual_model = rollout.models.get(turn)
-                    # Native task_started can precede turn_context. Only an
-                    # unfinished turn without usage evidence can await it;
-                    # final settlement still requires every child's receipts.
-                    if (actual_model is None and not final and not receipts
-                            and not rollout.token_counts.get(turn)
-                            and turn not in rollout.completed_turns):
+                    # Native task_started can precede turn_context; a turn with no receipt has cost nothing yet.
+                    if actual_model is None and not receipts:
                         continue
                     if not actual_model or self.rates is None or actual_model.strip().casefold() not in self.rates.rates:
                         raise ValueError("native child turn model has no explicit configured rates")
                     grouped.setdefault(actual_model, []).extend(receipts)
-                for actual_model, counters in grouped.items():
-                    if counters:
-                        samples.append(ModelUsage(sid, actual_model, TokenUsage(
-                            sum(t.input_tokens for t in counters), sum(t.output_tokens for t in counters),
-                            sum(t.cache_read_tokens for t in counters), sum(t.cache_write_tokens for t in counters),
-                            UsageSource.ROLLOUT)))
+                samples.extend(ModelUsage(sid, m, total_usage_of(c)) for m, c in grouped.items() if c)
             return MeasuredRunUsage(tuple(samples)) if samples else None
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             self.failure = str(exc)[:2048] or "native child usage unavailable"

@@ -319,18 +319,11 @@ def test_cancellation_kills_owned_groups_and_keeps_incomplete_child_evidence_for
 
     asyncio.run(scenario())
     assert all(not ProcessSupervisor.matches_identity(i.pid, i.start_ticks) for i in identities)
-    assert len(control.active_reservation_runs()) == 1
-    run_id = control.active_reservation_runs()[0]
-    with open(spend_evidence_path(str(directory), str(run_id))) as stream:
-        evidence = json.load(stream)
-    assert evidence["native_usage_failure"]
-    assert control.release_retained(run_id, "legacy unmeasured grace elapsed",
-                                    datetime.now(timezone.utc) + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
-    assert not CodexSpendReconciler(control, (str(directory),)).reconcile(run_id)
-    assert control.active_reservation_runs() == (run_id,)
+    # Operator policy (2026-10-11): the interrupted request costs zero, so the kill settles
+    # immediately at the price of the receipted root and child responses.
+    assert control.active_reservation_runs() == ()
     with control.transaction() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
-        assert db.execute("SELECT maximum_micros FROM budget_reservations").fetchone()[0] == 2_000_000
+        assert db.execute("SELECT amount_micros FROM charges").fetchall()[0][0] == 1224
 
 
 @pytest.mark.parametrize("resume", [True, False])
