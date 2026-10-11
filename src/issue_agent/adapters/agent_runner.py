@@ -393,6 +393,11 @@ def _trace_message(msg: Any) -> str:
 # The CLI reports a killed task as `killed` on task_updated and `stopped` on
 # task_notification; both vocabularies end a task.
 _TERMINAL_TASK_STATUSES = frozenset({"completed", "failed", "stopped", "killed"})
+# Delegated agent work, the only kind whose completion wakes the leg: the SDK's
+# own in-flight ledger tracks exactly these. A background shell or monitor may
+# never reach a terminal status, so its presence says nothing about whether a
+# human question is genuine.
+_DELEGATED_TASK_TYPES = frozenset({"local_agent", "local_workflow"})
 
 
 def background_task_transition(msg: Any) -> tuple[str, bool] | None:
@@ -400,7 +405,8 @@ def background_task_transition(msg: Any) -> tuple[str, bool] | None:
 
     Read from the base `subtype`/`data` fields every SDK build populates, so an
     older SDK that yields a generic SystemMessage is tracked the same way as
-    the typed Task*Message subclasses. A terminal state can arrive on EITHER a
+    the typed Task*Message subclasses. Only delegated agent work starts a
+    pending child; an untyped start is not evidence. A terminal state can arrive on EITHER a
     task_notification or a task_updated patch (the SDK documents both), so
     both clear the task. Anything else, or a malformed payload, is None —
     never raises on a lifecycle event.
@@ -413,6 +419,8 @@ def background_task_transition(msg: Any) -> tuple[str, bool] | None:
     if not isinstance(task_id, str) or not task_id:
         return None
     if subtype == "task_started":
+        if data.get("task_type") not in _DELEGATED_TASK_TYPES:
+            return None
         return task_id, True
     if subtype == "task_notification":
         return task_id, False

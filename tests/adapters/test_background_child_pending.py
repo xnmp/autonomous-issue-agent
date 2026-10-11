@@ -15,6 +15,8 @@ import sys
 import types
 from dataclasses import dataclass, field
 
+import pytest
+
 from issue_agent.adapters.agent_runner import AgentRunner
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.actions import PostComment, Relabel, Target
@@ -48,8 +50,11 @@ class _SystemMessage:
     data: dict = field(default_factory=dict)
 
 
-def _started(task_id: str) -> _SystemMessage:
-    return _SystemMessage("task_started", {"task_id": task_id, "description": "adversarial review"})
+def _started(task_id: str, task_type: object = "local_agent") -> _SystemMessage:
+    return _SystemMessage(
+        "task_started",
+        {"task_id": task_id, "description": "adversarial review", "task_type": task_type},
+    )
 
 
 def _notified(task_id: str, status: str = "completed") -> _SystemMessage:
@@ -179,3 +184,37 @@ def test_pending_child_does_not_demote_a_non_blocked_result(monkeypatch):
     assert classify_outcome(result) is Outcome.OK
     assert result.exit_reason is ExitReason.OK
 
+
+
+def test_delegated_workflow_task_counts_as_a_pending_child(monkeypatch):
+    result = _run(
+        monkeypatch,
+        [_started("w1", "local_workflow"), _ResultMessage(structured_output=_BLOCKED)],
+    )
+    assert result.exit_reason is ExitReason.BACKGROUND_CHILD_PENDING
+
+
+@pytest.mark.parametrize(
+    "task_type",
+    ["local_bash", "monitor", None, "", 7, "x" * 100_000],
+    ids=["shell", "monitor", "absent", "empty", "non-string", "huge"],
+)
+def test_only_delegated_agent_work_is_a_pending_child(monkeypatch, task_type):
+    # A background shell (a dev server, `tail -f`) may never reach a terminal
+    # status, so it says nothing about whether a human question is genuine; the
+    # SDK's own in-flight ledger excludes it for the same reason. An untyped or
+    # malformed start is not evidence either.
+    started = _started("s1", task_type)
+    if task_type is None:
+        del started.data["task_type"]
+    result = _run(monkeypatch, [started, _ResultMessage(structured_output=_BLOCKED)])
+    assert classify_outcome(result) is Outcome.BLOCKED
+    assert _asks_human(resolve_actions(253, result, None))
+
+
+def test_thousands_of_settled_children_leave_no_pending_child(monkeypatch):
+    events = []
+    for i in range(5_000):
+        events += [_started(f"t{i}"), _notified(f"t{i}")]
+    result = _run(monkeypatch, [*events, _ResultMessage(structured_output=_BLOCKED)])
+    assert classify_outcome(result) is Outcome.BLOCKED

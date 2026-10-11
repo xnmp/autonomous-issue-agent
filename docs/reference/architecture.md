@@ -418,7 +418,7 @@ can remove its obligation.
 The publishing user task explicitly authorizes step 8's bounded fresh reviewers,
 scoped verifiers and required evidence capture within this same leg's budget.
 
-A Claude leg that declares `blocked` while a background task it started is still
+A Claude leg that declares `blocked` while a delegated agent task it started is still
 non-terminal (tracked from SDK `task_started` / `task_notification` /
 `task_updated`) cannot ever receive that task's notification. The runner
 reclassifies it as an infra-class `BACKGROUND_CHILD_PENDING` error instead of a
