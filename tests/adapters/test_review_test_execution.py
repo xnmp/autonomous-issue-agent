@@ -226,3 +226,38 @@ def test_target_symlink_config_cannot_hide_committed_file_type_change(tmp_path):
     link.write_text("tracked")
     with pytest.raises(ValueError):
         clean_tree(str(cwd), head)
+
+
+def test_huge_output_keeps_failure_summary_printed_last(tmp_path):
+    result, _, _, _ = run(tmp_path, "head -c 1000000 /dev/zero | tr '\\0' x; echo; echo 'FAILED 3 tests: test_widget'; exit 1")
+    assert result.outcome is ReviewTestOutcome.FAILED
+    assert result.summary.rstrip().endswith("FAILED 3 tests: test_widget")
+    assert "earlier output omitted" in result.summary
+    assert len(result.summary) <= 4096
+
+
+def test_output_shorter_than_bound_is_kept_in_full_without_marker(tmp_path):
+    result, _, _, _ = run(tmp_path, "echo first; echo second >&2; exit 1")
+    assert "first" in result.summary and "second" in result.summary
+    assert "omitted" not in result.summary
+
+
+def test_empty_output_yields_outcome_only_summary(tmp_path):
+    result, _, _, _ = run(tmp_path, "exit 1")
+    assert result.summary.strip() == ReviewTestOutcome.FAILED.value
+
+
+def test_interleaved_streams_stay_bounded_and_keep_last_line(tmp_path):
+    command = "for i in $(seq 1 3000); do echo out$i; echo err$i >&2; done; echo FINAL-LINE >&2; exit 1"
+    result, _, _, _ = run(tmp_path, command)
+    assert len(result.summary) <= 4096
+    assert "FINAL-LINE" in result.summary
+    assert "out1\n" not in result.summary
+
+
+@pytest.mark.parametrize("prefix", ["", "a"])
+def test_multibyte_character_split_at_cut_decodes_cleanly(tmp_path, prefix):
+    result, _, _, _ = run(tmp_path, f"printf {prefix!r}; for i in $(seq 3000); do printf é; done; echo END; exit 1")
+    assert "�" not in result.summary
+    assert result.summary.rstrip().endswith("éEND")
+    assert len(result.summary) <= 4096
