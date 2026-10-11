@@ -249,9 +249,13 @@ if {mode!r}.startswith("retry") and attempt == 1:
     worker.wait()
     print("stream disconnected before completion", file=sys.stderr, flush=True)
     sys.exit(1)
-if {mode!r} == "clean" or {mode!r}.startswith("retry"):
+if {mode!r} in {{"clean", "pre-final"}} or {mode!r}.startswith("retry"):
     worker.terminate()
     worker.wait()
+    if {mode!r} == "pre-final":
+        import signal
+        print("before final", file=sys.stderr, flush=True)
+        signal.pause()
     pathlib.Path(sys.argv[sys.argv.index("-o") + 1]).write_text(json.dumps({{"status": "pushed", "summary": "done", "needs": ""}}))
 else:
     for i in range(100):
@@ -273,20 +277,54 @@ def native_runner(tmp_path, script, directory):
     )
 
 
-@pytest.mark.parametrize("mode", ["chatty", "clean"])
+@pytest.mark.parametrize("mode", ["chatty", "clean", "pre-final"])
 @pytest.mark.parametrize("legacy_rates", [True, False])
-def test_native_child_crossing_cap_stops_inflight_or_final_success_under_one_reservation(tmp_path, mode, legacy_rates):
+def test_native_child_crossing_cap_stops_inflight_or_final_success_under_one_reservation(
+    tmp_path, mode, legacy_rates, monkeypatch,
+):
+    spawn_process = asyncio.create_subprocess_exec
+
+    async def spawn_at_boundary(*args, **kwargs):
+        proc = await spawn_process(*args, **kwargs)
+        # Usage is already over cap before the fake writes its final output.
+        # Select each ordering explicitly instead of racing the watchdog poll.
+        assert proc.stderr is not None
+        if mode == "clean":
+            await proc.stderr.read()
+        elif mode == "pre-final":
+            await proc.stderr.readuntil(b"before final\n")
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn_at_boundary)
     directory = tmp_path / "evidence"
     runner = native_runner(tmp_path, native_executable(tmp_path, mode=mode), directory)
+    if mode == "clean":
+        # Final accounting must enforce the cap without a periodic sample.
+        runner = replace(runner, wall_clock=lambda: 0)
     if not legacy_rates:
         runner = replace(runner, cost_per_mtok_in=0, cost_per_mtok_out=0, cost_per_mtok_cached_in=(("sol", 0),))
     wrapper, control = _wrapper(tmp_path, runner, evidence_dir=str(directory))
     wrapper = replace(wrapper, rate_table=RATES,
                       budget_policy=BudgetPolicy({("fix", "RESOLVE"): Money("USD", 1200)}))
     wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
-    result = asyncio.run(wrapper.run(RuntimePlan("work", cwd=str(tmp_path), model="sol", max_budget_usd=.0012,
-                                                env={"CODEX_HOME": str(tmp_path / "codex")})))
+    async def run():
+        # Bound failure cleanup if the watchdog stops enforcing the cap;
+        # the process/stream events above determine the race ordering.
+        try:
+            return await asyncio.wait_for(wrapper.run(RuntimePlan(
+                "work", cwd=str(tmp_path), model="sol", max_budget_usd=.0012,
+                env={"CODEX_HOME": str(tmp_path / "codex")},
+            )), timeout=30)
+        except BaseException:
+            runner.process_supervisor.force_kill_all()
+            raise
+
+    result = asyncio.run(run())
     assert (tmp_path / "finished").exists() == (mode == "clean")
+    if mode == "clean":
+        assert result.summary == "done"
+    else:
+        assert "mid-run; killed" in result.summary
     assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert result.cost_usd == pytest.approx(.001224)
     assert isinstance(result.run_usage, MeasuredRunUsage)
