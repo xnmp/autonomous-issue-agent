@@ -173,6 +173,39 @@ def test_observer_limits_fail_closed(prepared, bound, value):
     assert isinstance(observed, UnavailableRunUsage)
 
 
+@pytest.mark.parametrize("v1", [False, True])
+def test_shared_home_with_2000_unrelated_rollouts_keeps_owned_usage(prepared, v1):
+    home, meter = prepared
+    write(home, ROOT, [metadata(ROOT, home.parent), *spawn(v1=v1)])
+    for i in range(2000):
+        sid = f"019fa244-0000-7de0-8e18-{i:012x}"
+        write(home, sid, [metadata(sid, home.parent, parent=OTHER)])
+    observed = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
+    assert isinstance(observed, MeasuredRunUsage)
+    assert price_run_usage(observed, RATES).micros == 1224
+
+
+def test_pathological_shared_directory_fails_closed(prepared):
+    home, meter = prepared
+    directory = path(home, ROOT).parent
+    for i in range(65534):
+        (directory / f"unrelated-{i}").touch()
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), MeasuredRunUsage)
+    (directory / "one-too-many").touch()
+    observed = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
+    assert isinstance(observed, UnavailableRunUsage)
+    assert observed.detail == "native rollout discovery exceeded its scan bound"
+
+
+def test_non_rollout_entries_do_not_consume_owned_file_bound(prepared):
+    home, meter = prepared
+    for i in range(513):
+        (path(home, ROOT).parent / f"unrelated-{i}").touch()
+    observed = replace(meter, max_files=2).sample(ROOT, "sol", PARENT_USAGE, final=True)
+    assert isinstance(observed, MeasuredRunUsage)
+    assert price_run_usage(observed, RATES).micros == 1224
+
+
 def test_child_cannot_borrow_a_foreign_parent_receipt(prepared):
     home, meter = prepared
     write(home, CHILD, child_records(home.parent, parent=OTHER))
