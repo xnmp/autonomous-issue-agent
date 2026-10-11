@@ -417,12 +417,18 @@ class CodexChildUsageMeter:
         """An unterminated record blocks final settlement, except a receipted session's killed write
         (a truncated prefix of one record: its in-flight request has no receipt, so it prices at zero)."""
         if rollout.tail and rollout.usage:
+            tail = rollout.tail
             try:
-                json.loads(rollout.tail)
-            except json.JSONDecodeError as exc:
-                return not (exc.msg.startswith("Unterminated string") or exc.pos >= len(rollout.tail.rstrip()))
+                tail = tail.decode()
             except UnicodeDecodeError as exc:
-                return exc.reason != "unexpected end of data"
+                # Only a multibyte character cut off at the very end is a killed write.
+                if exc.reason != "unexpected end of data" or exc.end != len(tail):
+                    return True
+                tail = tail[:exc.start].decode()
+            try:
+                json.loads(tail)
+            except json.JSONDecodeError as exc:
+                return not (exc.msg.startswith("Unterminated string") or exc.pos >= len(tail.rstrip()))
         return bool(rollout.tail)
 
     def sample(self, session_id: str, model: str, usage: dict | None, *, final: bool = False) -> RunUsage | None:
@@ -455,6 +461,8 @@ class CodexChildUsageMeter:
                 if rollout is not None and rollout.usage and root_model:
                     self.roots[sid] = ModelUsage(sid, root_model, total_usage_of([u for _, u in rollout.usage.values()]))
                     receipted.add(sid)
+                    if final and rollout.completed_turns - {turn for turn, _ in rollout.usage.values()}:
+                        raise ValueError(NativeFailure.UNFINISHED_TURNS.value)
             participants = set(self.roots) | set(self.children)
             message_targets = participants | {path for _, path in self.children.values() if path}
             if self.roots:

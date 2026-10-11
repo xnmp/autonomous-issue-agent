@@ -631,3 +631,54 @@ def test_other_frozen_classes_stay_final_even_when_rollouts_would_meter(tmp_path
 
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
     assert store.active_reservation_runs() == (run_id,)
+
+
+@pytest.mark.parametrize("fault", ["absent", "later"])
+def test_recovery_settles_a_receipted_root_without_a_usable_counter(tmp_path, fault):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    body = [_root_receipt(1)]
+    if fault == "later":  # a later leg's counter lies beyond this run's end
+        body += [_count(CHILD_TOKENS, _scaled(1)), {**_count(CHILD_TOKENS, _scaled(2)), "timestamp": _later(60)}]
+    home = _root_home(tmp_path, body)
+    evidence_dir = _frozen_evidence(tmp_path, home, UNFINISHED)
+
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.active_reservation_runs() == ()
+    assert store.snapshot(scope).settled == Money("USD", CHILD_RESPONSE_MICROS)
+
+
+def test_completed_root_turn_without_a_receipt_is_not_settled_from_the_others(tmp_path):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    home = _root_home(tmp_path, [
+        _root_receipt(1), _ev("event_msg", {"type": "task_complete", "turn_id": "t"}),
+        _ev("event_msg", {"type": "task_started", "turn_id": "u"}),
+        _ev("turn_context", {"turn_id": "u", "model": "gpt"}),
+        _ev("event_msg", {"type": "task_complete", "turn_id": "u"}), _count(CHILD_TOKENS, _scaled(2))])
+
+    assert isinstance(_root_sample(tmp_path, home, _counter(2)), UnavailableRunUsage)
+    evidence_dir = _frozen_evidence(tmp_path, home, "")
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_a_tail_with_a_syntax_error_before_a_cut_multibyte_character_fails_closed(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    home = _killed_child_home(tmp_path, responses=2)
+    with next(home.rglob(f"*{CHILD}.jsonl")).open("ab") as stream:
+        stream.write(b'{"timestamp":INVALID,"note":"\xe2')
+    evidence_dir = _frozen_evidence(tmp_path, home, UNFINISHED)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_a_valid_prefix_ending_in_a_cut_multibyte_character_is_the_killed_write(tmp_path):
+    home = _killed_child_home(tmp_path, responses=2)
+    with next(home.rglob(f"*{CHILD}.jsonl")).open("ab") as stream:
+        stream.write(b'{"note":"\xe2')
+
+    assert price_run_usage(_final(_meter(tmp_path, home), final=True), CARD).micros == ROOT_ONLY_MICROS + 2 * CHILD_RESPONSE_MICROS
