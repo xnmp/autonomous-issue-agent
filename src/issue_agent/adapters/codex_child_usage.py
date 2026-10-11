@@ -127,6 +127,9 @@ class CodexChildUsageMeter:
     max_bytes: int = 256 * 1024 * 1024
     max_record_bytes: int = 16 * 1024 * 1024
     max_responses: int = 4096
+    # Recovery bound: events after the run's harness-owned end belong to a later
+    # leg that may resume the same sessions. A missing timestamp fails closed.
+    ended_at: float | None = None
     roots: dict[str, ModelUsage] = field(default_factory=dict, init=False)
     rollouts: dict[str, _Rollout] = field(default_factory=dict, init=False)
     children: dict[str, tuple[str, str | None]] = field(default_factory=dict, init=False)
@@ -218,6 +221,8 @@ class CodexChildUsageMeter:
                 self._locate(sid)
 
     def _event(self, rollout: _Rollout, event: dict) -> None:
+        if self.ended_at is not None and _timestamp(event.get("timestamp")) > self.ended_at:
+            return
         kind, payload = event.get("type"), event.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("native rollout payload is malformed")

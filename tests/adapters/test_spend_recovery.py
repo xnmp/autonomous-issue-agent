@@ -252,7 +252,8 @@ def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settl
     assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
 
     assert store.active_reservation_runs() == ()
-    assert store.snapshot(scope).settled.micros > 0
+    # root 500 uncached in/10 out/500 cached + child 600/20/400 counted once.
+    assert store.snapshot(scope).settled == Money("USD", 12_500)
     assert not any(evidence_dir.iterdir())
     payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
     assert NativeUsageRemetered(str(run_id), "AMBIGUOUS_TOKEN_COUNTS", "measured") in payloads
@@ -288,6 +289,63 @@ def test_frozen_ambiguous_failure_fails_closed_when_rollouts_are_unusable(tmp_pa
         next(home.rglob(f"*{CHILD}.jsonl")).unlink()
     else:
         next(home.rglob(f"*{CHILD}.jsonl")).write_text("{not json\n")
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def _end_run_at(store, run_id, at):
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET state='completed', completed_at=? WHERE run_id=?",
+                   (at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), str(run_id)))
+
+
+def _later(seconds):
+    return (NOW + timedelta(seconds=seconds)).isoformat()
+
+
+def test_later_leg_activity_on_the_resumed_root_is_not_billed_to_the_ended_run(tmp_path):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    assert store.record_accounting_unavailable(run_id, AMBIGUOUS)
+    _end_run_at(store, run_id, NOW + timedelta(seconds=10))
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    # A later leg resumes the root: bigger cumulative total and a brand-new child.
+    other = "019fa244-0000-7de0-8e18-e56f423bbbcf"
+    rollout = next(home.rglob(f"*{ROOT}.jsonl"))
+    huge = {"input_tokens": 9_000_000, "output_tokens": 900_000, "cached_input_tokens": 100}
+    later = [{"timestamp": _later(60), "type": "response_item", "payload": {
+                 "type": "function_call", "name": "spawn_agent", "call_id": "c2",
+                 "arguments": json.dumps({"task_name": "again", "message": "go"})}},
+             {"timestamp": _later(60), "type": "response_item", "payload": {
+                 "type": "function_call_output", "call_id": "c2",
+                 "output": json.dumps({"task_name": "/root/again", "nickname": None})}},
+             {**_count(huge, huge), "timestamp": _later(61)}]
+    with rollout.open("a") as stream:
+        stream.write("".join(json.dumps(e) + "\n" for e in later))
+    turn = "turn:later"
+    _write_rollout(home, other, [
+        {**_meta(other, tmp_path, ROOT), "timestamp": _later(60)},
+        {**_ev("event_msg", {"type": "task_started", "turn_id": turn}), "timestamp": _later(60)},
+        {**_ev("turn_context", {"turn_id": turn, "model": "gpt"}), "timestamp": _later(60)},
+        {**_ev("token_usage_record", {"thread_id": other, "turn_id": turn, "response_id": "x",
+                                      "usage": CHILD_TOKENS, "thread_token_usage": CHILD_TOKENS}),
+         "timestamp": _later(60)}])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.snapshot(scope).settled == Money("USD", 12_500)
+
+
+def test_untimestamped_root_usage_inside_the_bounded_window_fails_closed(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, NOW + timedelta(seconds=10))
+    home = _native_home(tmp_path)
+    rollout = next(home.rglob(f"*{ROOT}.jsonl"))
+    with rollout.open("a") as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 1, "output_tokens": 1}}}}) + "\n")
     evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
 
     assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)

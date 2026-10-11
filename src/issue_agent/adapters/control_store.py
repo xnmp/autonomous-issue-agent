@@ -25,6 +25,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from ..domain import continuation_components as cc
+from .codex_child_usage import NativeFailure
 from ..domain.contracts import ContinuationAdmission
 
 from ..domain.contracts import (
@@ -4105,13 +4106,26 @@ class SQLiteControlStore:
                 self._event(db, ReservationRetained(str(run_id), reason), correlation=Correlation(run_id=str(run_id)))
             return bool(changed)
 
-    def record_native_remetered(self, run_id: RunId, failure_class: str, outcome: str) -> None:
-        """Journal a recovery that re-metered a frozen failure class (once per settlement)."""
-        if not failure_class or not outcome:
-            raise ValueError("native re-meter journal requires its failure class and outcome")
+    def run_completed_at(self, run_id: RunId) -> float | None:
+        """Harness-owned end of a run (epoch seconds), or None while it has none."""
         with self.transaction() as db:
-            self._event(db, NativeUsageRemetered(str(run_id), failure_class, outcome),
-                        correlation=Correlation(run_id=str(run_id)))
+            row = db.execute("SELECT completed_at FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
+        return _parse_stamp(row["completed_at"]).timestamp() if row is not None and row["completed_at"] else None
+
+    def record_native_remetered(self, run_id: RunId, failure: NativeFailure, outcome: str) -> bool:
+        """Journal a re-metered recovery once per run and failure class."""
+        if not outcome:
+            raise ValueError("native re-meter journal requires its outcome")
+        with self.transaction() as db:
+            claimed = db.execute(
+                "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
+                "VALUES ('native-remetered',?,?,?,?)",
+                (str(run_id), failure.name, _stamp(self._now()), outcome),
+            ).rowcount
+            if claimed:
+                self._event(db, NativeUsageRemetered(str(run_id), failure.name, outcome),
+                            correlation=Correlation(run_id=str(run_id)))
+            return bool(claimed)
 
     def record_admission_reconciled(
         self,

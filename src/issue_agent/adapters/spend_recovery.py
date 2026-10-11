@@ -46,7 +46,8 @@ class CodexSpendReconciler:
                 continue
             try:
                 session_id = self._session_id(evidence)
-                native = self._native_usage(evidence, session_id)
+                ended_at = self.store.run_completed_at(run_id)
+                native = self._native_usage(evidence, session_id, ended_at)
                 if not isinstance(native, MeasuredRunUsage):
                     return self._unavailable(run_id, "Codex recovery cannot establish complete run usage")
                 rates = recovered_rate_table(evidence["native_rate_table"])
@@ -70,7 +71,7 @@ class CodexSpendReconciler:
             if result.disposition is not AccountingDisposition.AVAILABLE:
                 return self._unavailable(run_id, "Codex measured recovery settlement was refused")
             if remetered is not None:
-                self.store.record_native_remetered(run_id, remetered.name, "measured")
+                self.store.record_native_remetered(run_id, remetered, "measured")
             remove_spend_evidence(directory, run_id)
             return True
         return self._unavailable(run_id, "Codex recovery evidence is missing or invalid")
@@ -157,18 +158,19 @@ class CodexSpendReconciler:
             str(evidence.get("codex_home") or "") or None,
         )
 
-    def _usage(self, evidence: dict, session_id: str) -> dict | None:
+    def _usage(self, evidence: dict, session_id: str, ended_at: float | None = None) -> dict | None:
         if not session_id:
             return None
         usage = read_rollout_usage(
             session_id,
             str(evidence.get("codex_home") or "") or None,
+            until=ended_at,
         )
         baseline = evidence.get("baseline_usage")
         return usage_delta(usage, baseline if isinstance(baseline, dict)
                            and session_id == evidence.get("baseline_session_id") else None)
 
-    def _native_usage(self, evidence: dict, session_id: str) -> RunUsage | None:
+    def _native_usage(self, evidence: dict, session_id: str, ended_at: float | None = None) -> RunUsage | None:
         if evidence["version"] == 1:
             return UnavailableRunUsage("legacy evidence lacks native child rates and invocation baselines")
         frozen = evidence.get("native_usage_failure")
@@ -187,15 +189,15 @@ class CodexSpendReconciler:
             return UnavailableRunUsage("native recovery lacks its frozen price card")
         meter = CodexChildUsageMeter(str(evidence.get("codex_home") or os.path.expanduser("~/.codex")),
                                     float(evidence["native_usage_started_at"]),
-                                    rates, str(evidence["cwd"]))
+                                    rates, str(evidence["cwd"]), ended_at=ended_at)
         for root, model in roots.items():
             if not isinstance(root, str) or not isinstance(model, str):
                 raise ValueError("native recovery identity is malformed")
-            usage = self._usage(evidence, root)
+            usage = self._usage(evidence, root, ended_at)
             if usage is None or not model:
                 return UnavailableRunUsage("native recovery root usage or model is missing")
             observed = meter.sample(root, model, usage)
             if isinstance(observed, UnavailableRunUsage):
                 return observed
-        observed = meter.sample(session_id, roots[session_id], self._usage(evidence, session_id), final=True)
+        observed = meter.sample(session_id, roots[session_id], self._usage(evidence, session_id, ended_at), final=True)
         return observed if observed is not None else MeasuredRunUsage(tuple(meter.roots.values()))
