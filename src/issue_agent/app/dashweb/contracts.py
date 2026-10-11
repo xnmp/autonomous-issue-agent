@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -215,6 +215,102 @@ class ModelBadge(Contract):
     effort: str | None
 
 
+StageId = Literal["triage", "resolve", "review", "ci", "merge"]
+
+
+class StageRail(Contract):
+    """Where the issue is on the five-stage track, from one stage-visit fold."""
+
+    current: StageId
+    # A stage past `current` but at or before `furthest` was reached earlier
+    # and rewound (e.g. a CI fix sent the patch back to review).
+    furthest: StageId
+    resolve_attempts: int
+    review_rounds: int
+    ci_runs: int
+    steps: int
+    # A paid leg is running now.
+    live: bool
+
+
+class TrackChip(Contract):
+    kind: str
+    outcome: Literal["passed", "failed", "changes_requested", "done", "running"]
+    # Consecutive identical steps folded into this one.
+    count: int
+
+
+class StageVisit(Contract):
+    stage: StageId
+    steps: list[TrackChip]
+
+
+class BlockedOnIssue(Contract):
+    kind: Literal["issue"]
+    # None when GitHub reports an open dependency without naming it.
+    issue: int | None
+
+
+class BlockedOnPr(Contract):
+    kind: Literal["pr"]
+    pr: int
+
+
+class BlockedOnOverlap(Contract):
+    kind: Literal["overlap"]
+    issue: int | None
+    pr: int | None
+
+
+class BlockedOnTriage(Contract):
+    kind: Literal["triage"]
+    why: Literal["parked", "awaiting_reply"]
+
+
+class BlockedOnQueue(Contract):
+    kind: Literal["queue"]
+    priority: Literal["P1", "P2", "P3"] | None
+
+
+BlockedOn = Annotated[
+    BlockedOnIssue | BlockedOnPr | BlockedOnOverlap | BlockedOnTriage | BlockedOnQueue,
+    Field(discriminator="kind"),
+]
+
+
+class BoardNeedsYou(Contract):
+    status: Literal["needs_you"]
+    ask: Literal["rearm", "escalated", "budget", "awaiting_reply", "merge", "stalled"]
+    headline: str
+    reason: str
+    # When the operator's wait began.
+    since_ts: str | None
+
+
+class BoardWorking(Contract):
+    status: Literal["working"]
+    activity: Literal["agent", "ci", "merge", "handoff"]
+    headline: str
+    reason: str
+    # The row's last activity.
+    since_ts: str | None
+
+
+class BoardBlocked(Contract):
+    status: Literal["blocked"]
+    on: BlockedOn
+    headline: str
+    reason: str
+    # When the hold began; None for a row still queued.
+    since_ts: str | None
+
+
+BoardStatus = Annotated[
+    BoardNeedsYou | BoardWorking | BoardBlocked,
+    Field(discriminator="status"),
+]
+
+
 class IssueCard(Contract):
     issue: int
     title: str | None
@@ -251,6 +347,13 @@ class IssueCard(Contract):
     human_action: Literal["merge-ready", "awaiting-reply", "escalated"] | None = None
     human_wait_since_ts: str | None = None
     human_wait_s: float | None = None
+    # The issues board group; None once the issue is done.
+    board: BoardStatus | None = None
+    rail: StageRail | None = None
+    # cost / projected cost, present only at or above the 2x alarm.
+    overspend_ratio: float | None = None
+    # The router's difficulty tier; None means untriaged.
+    tier: Literal["trivial", "standard", "complex", "exceptional"] | None = None
     projected_eta_s: float | None
     models: list[str]
     model_badges: list[ModelBadge] = []
@@ -280,6 +383,8 @@ class PendingCard(Contract):
     pr_url: str | None = None
     pr_state: str | None = None
     pr_ci_state: Literal["passing", "failing", "pending"] | None = None
+    board: BoardStatus | None = None
+    rail: StageRail | None = None
 
 
 class BacklogCard(Contract):
@@ -299,6 +404,10 @@ class BacklogCard(Contract):
     issue_type: str | None = None
     difficulty: str | None = None
     impact: str | None = None
+    # Present only while the steward waits on the author: that row is also on
+    # the issues board, blocked on triage.
+    board: BoardStatus | None = None
+    rail: StageRail | None = None
 
 
 class ToastNotification(Contract):
@@ -405,6 +514,12 @@ class IssueDetailPayload(Warned):
     leg_running: bool = False
     steps: list[IssueStep]
     events: list[dict[str, Any]]
+    rail: StageRail | None = None
+    # One entry per visit to a stage, oldest first.
+    history: list[StageVisit] = []
+    # The harness's full escalation comment while the escalation is active.
+    # It relays agent prose: clients render it as text, never as Markdown.
+    harness_message: str | None = None
 
 
 class StepEventsPayload(Warned):

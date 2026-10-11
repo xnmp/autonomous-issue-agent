@@ -27,6 +27,7 @@ from ...adapters.store import Store
 from ...adapters.typed_journal import TypedJournal
 from ...domain import dashboard as dash
 from ...domain.labels import Label
+from ...domain.review import IdentityMode
 
 # (target, number, labels added, labels removed) — one applied park/unpark move.
 _ParkMove = tuple[str, int, tuple[str, ...], tuple[str, ...]]
@@ -153,6 +154,28 @@ def _detail_limits(name: str, repo: str) -> tuple[dict[str, float], int]:
         caps,
         max(0, cfg.max_unproductive_review_rounds),
     )
+
+
+_AUTOMERGE_CONFIG_FIELDS = ("AUTO_MERGE", "IDENTITY_MODE")
+
+
+def _harness_merges(name: str, repo: str) -> bool:
+    """Whether the fixer merges approved, green PRs itself on this repo.
+
+    The same two knobs `automerge_in_scope` reads first. An unreadable
+    configuration answers False, which surfaces a merge-ready PR to the
+    operator rather than letting it sit in Working on a guess.
+    """
+    try:
+        configured = {
+            field: value
+            for field in _AUTOMERGE_CONFIG_FIELDS
+            if (value := cli.deployment_env_field(name, field))
+        }
+        cfg = config.from_env({"REPO": repo, **configured})
+    except Exception:  # noqa: BLE001 - a display hint never fails the board
+        return False
+    return cfg.auto_merge and cfg.identity_mode == IdentityMode.THREE
 
 
 def _detail(exc: BaseException) -> str:
@@ -372,6 +395,11 @@ class Backend:
             key, lambda: _detail_limits(name, repo)
         )
 
+    def _cached_harness_merges(self, name: str, repo: str) -> bool:
+        return bool(self._detail_configs.get_or_load(
+            ("automerge", name, repo), lambda: _harness_merges(name, repo)
+        ))
+
     def _review_unproductive_rounds(
         self, snapshot: dash.Snapshot, row: dash.IssueRow,
     ) -> tuple[dict[int, int | None], list[str]]:
@@ -421,6 +449,7 @@ class Backend:
         ledger_rows = verification_payload.get("rows", [])
         issue_status, pr_status = verification.status_indexes(ledger_rows)
         issue_reason, pr_reason = verification.reason_indexes(ledger_rows)
+        automerge = self._cached_harness_merges(name, snap.repo)
 
         def card(row):
             model = snapshots.projection_model(row)
@@ -439,6 +468,7 @@ class Backend:
                 pr_verification_reason=(
                     pr_reason.get(pr) if pr is not None else None
                 ),
+                automerge=automerge,
             )
 
         row_by_issue = {row.issue: row for row in rows}
@@ -486,6 +516,7 @@ class Backend:
                         issue,
                         row_by_issue.get(number),
                         gh_prs=gh_prs,
+                        automerge=automerge,
                     )
                 )
             for number in sorted(backlog_numbers):
@@ -511,6 +542,7 @@ class Backend:
                             issue,
                             row_by_issue.get(number),
                             gh_prs=gh_prs,
+                            automerge=automerge,
                         )
                     )
                 elif snapshots.is_backlog(issue):

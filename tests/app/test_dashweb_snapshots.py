@@ -3044,3 +3044,328 @@ def test_a_card_reports_every_label_of_a_heavily_tagged_issue():
     )
 
     assert len(snapshots.issue_card(row, NOW)["labels"]) == 500
+
+
+# ── issues board: status union, rail, overspend, tier ─────────────────────────
+def board_of(card) -> dict:
+    return card["board"]
+
+
+def ask_of(card) -> str | None:
+    board = card["board"]
+    return board["ask"] if board and board["status"] == "needs_you" else None
+
+
+_REVIEW_APPROVE = {"ts": ts(hours=1), "event": "agent_run", "role": "review",
+                   "kind": "REVIEW", "issue": 7, "number": 12, "status": "APPROVE",
+                   "exit_reason": "ok"}
+_MERGE_READY_PR = {
+    "state": "OPEN", "reviewDecision": "APPROVED", "autoMergeRequest": None,
+    "isDraft": False, "mergeable": "MERGEABLE", "mergeStateStatus": "CLEAN",
+    "statusCheckRollup": [{"conclusion": "SUCCESS", "completedAt": ts(minutes=20)}],
+    "latestReviews": [{"state": "APPROVED", "submittedAt": ts(minutes=30)}],
+}
+
+
+def test_a_breaker_escalation_asks_for_a_re_arm_and_waits_from_the_escalation():
+    card = snapshots.issue_card(row_view([BREAKER_COMMENT, ESCALATION]), NOW)
+
+    assert ask_of(card) == "rearm"
+    assert board_of(card)["headline"] == "Re-arm or close"
+    assert board_of(card)["reason"].startswith("5 review rounds on this PR ended")
+    assert board_of(card)["since_ts"] == ts(hours=2)
+
+
+def test_an_escalation_without_a_breaker_comment_asks_the_operator_to_answer():
+    card = snapshots.issue_card(row_view([ESCALATION]), NOW)
+
+    assert ask_of(card) == "escalated"
+
+
+def test_a_budget_review_label_asks_for_spend_approval():
+    card = snapshots.issue_card(
+        row_view([BREAKER_COMMENT, ESCALATION]), NOW,
+        gh_issue={"labels": ["needs-budget-review"], "updatedAt": ts(hours=2)},
+    )
+
+    assert ask_of(card) == "budget"
+
+
+def test_a_budget_review_comment_asks_for_spend_approval_without_a_label_view():
+    budget = {**BREAKER_COMMENT, "action": {
+        **BREAKER_COMMENT["action"],
+        "body": "**Budget review needed:** the resolve leg reached its configured cap.",
+    }}
+    card = snapshots.issue_card(row_view([budget, ESCALATION]), NOW)
+
+    assert ask_of(card) == "budget"
+    assert board_of(card)["reason"] == "The resolve leg reached its configured cap."
+
+
+def test_an_unanswered_agent_question_awaits_a_reply():
+    card = snapshots.issue_card(_blocked_row(), NOW)
+
+    assert ask_of(card) == "awaiting_reply"
+
+
+def test_escalated_while_a_leg_is_running_stays_needs_you():
+    start = {"ts": ts(minutes=10), "event": "agent_run_start", "role": "fix",
+             "kind": "FIX_CI", "issue": 7, "number": 12, "dispatch": "d9"}
+    row = row_for([RESOLVE, BREAKER_COMMENT, ESCALATION, start], 7)
+
+    card = snapshots.issue_card(row, NOW, gh_issue=ESCALATED_ISSUE)
+
+    assert card["leg_running"] is True
+    assert board_of(card)["status"] == "needs_you"
+
+
+def test_a_re_armed_row_with_a_lifetime_escalation_does_not_alarm():
+    row = row_view([BREAKER_COMMENT, ESCALATION, UNBLOCK])
+
+    card = snapshots.issue_card(row, NOW)
+
+    assert row.escalations or any(e.get("event") == "escalation" for e in row.events)
+    assert board_of(card)["status"] != "needs_you"
+
+
+@pytest.mark.parametrize("automerge,status", [(True, "working"), (False, "needs_you")])
+def test_merge_ready_is_working_only_where_the_harness_merges(automerge, status):
+    row = replace(row_for([RESOLVE, _REVIEW_APPROVE], 7), prs=(12,))
+
+    card = snapshots.issue_card(row, NOW, gh_prs={12: _MERGE_READY_PR}, automerge=automerge)
+
+    assert board_of(card)["status"] == status
+    if status == "needs_you":
+        assert ask_of(card) == "merge"
+    else:
+        assert board_of(card)["headline"] == "Ready to merge"
+
+
+def test_a_parked_pending_issue_is_blocked_on_triage():
+    card = snapshots.pending_card({"number": 34, "labels": ["ai-parked", "ai-triage"]}, None)
+
+    assert board_of(card) == {
+        "status": "blocked", "on": {"kind": "triage", "why": "parked"},
+        "headline": "Waiting on triage",
+        "reason": "Parked for human review. Unpark it to hand it back to the harness.",
+        "since_ts": None,
+    }
+
+
+def test_a_steward_question_puts_a_backlog_row_on_the_board_blocked_on_triage():
+    events = [
+        v2_event(WorldObserved("issue", 3, "h", {"present": True, "state": "OPEN", "labels": ["ai-triage"]}),
+                 "world", 0, issue=3),
+        v2_event(TriageDispositionRecorded("blocked_on_human_reply"), "triage", 1, role="steward", issue=3),
+    ]
+    row = v2_deployment(events).issues[0]
+
+    card = snapshots.backlog_card({"number": 3, "labels": ["ai-triage"]}, NOW, row)
+
+    assert board_of(card)["on"] == {"kind": "triage", "why": "awaiting_reply"}
+    assert board_of(card)["since_ts"] is not None
+    assert card["rail"]["current"] == "triage"
+
+
+@pytest.mark.parametrize("labels", [[], ["ai-triage"]])
+def test_the_rest_of_the_backlog_stays_off_the_board(labels):
+    card = snapshots.backlog_card({"number": 3, "labels": labels}, NOW)
+
+    assert card["board"] is None and card["rail"] is None
+
+
+@pytest.mark.parametrize(
+    "event,on",
+    [
+        ({"event": "deferred", "state": "waiting", "reason": "blocker", "blocker_issue": 1082},
+         {"kind": "issue", "issue": 1082}),
+        ({"event": "deferred", "state": "waiting", "reason": "overlap", "blocker_pr": 55},
+         {"kind": "overlap", "issue": None, "pr": 55}),
+        ({"event": "hold", "reason": "overlap", "blocker": "pr#41"},
+         {"kind": "pr", "pr": 41}),
+        ({"event": "hold", "reason": "overlap"},
+         {"kind": "overlap", "issue": None, "pr": None}),
+        # A malformed blocker number is not a target the row can name.
+        ({"event": "deferred", "state": "waiting", "reason": "blocker", "blocker_issue": True},
+         {"kind": "issue", "issue": None}),
+    ],
+)
+def test_a_hold_is_blocked_on_its_target_from_when_it_began(event, on):
+    hold = {"ts": ts(hours=5), "issue": 9, **event}
+    card = snapshots.pending_card({"number": 9, "labels": ["ai-ready"]}, row_view([hold], issue=9, legs=[{**RESOLVE, "issue": 9, "number": 9}]))
+
+    assert board_of(card)["status"] == "blocked"
+    assert board_of(card)["on"] == on
+    assert board_of(card)["since_ts"] == ts(hours=5)
+
+
+def test_a_queued_pending_issue_waits_on_the_queue_with_no_wait_start():
+    card = snapshots.pending_card({"number": 9, "labels": ["ai-ready", "P1"]}, None)
+
+    assert board_of(card)["on"] == {"kind": "queue", "priority": "P1"}
+    assert board_of(card)["since_ts"] is None
+    assert card["rail"] == {
+        "current": "triage", "furthest": "triage", "resolve_attempts": 0,
+        "review_rounds": 0, "ci_runs": 0, "steps": 0, "live": False,
+    }
+
+
+def _stalled(**details):
+    return {"ts": ts(minutes=30), "event": "telemetry.warning.v1", "issue": 7,
+            "code": "target_stalled", "warning": "issue #7 unchanged for 90 min",
+            "details": {"kind": "issue", "level": 3, **details}}
+
+
+def test_a_stall_is_needs_you_and_says_the_harness_stopped_without_escalating():
+    card = snapshots.issue_card(row_view([RESOLVE, _stalled(age_seconds=5400)]), NOW)
+
+    assert ask_of(card) == "stalled"
+    assert board_of(card)["reason"].endswith("The harness stopped without escalating.")
+    # The stall began when the signature stopped changing, not when it was noticed.
+    assert board_of(card)["since_ts"] == ts(minutes=120)
+
+
+def test_a_stall_reports_the_current_non_blocking_deferral_reason():
+    defer = {"ts": ts(hours=2), "event": "deferred", "state": "waiting", "issue": 7,
+             "reason": "fix_leg_active"}
+    card = snapshots.issue_card(row_view([RESOLVE, defer, _stalled(age_seconds=60)]), NOW)
+
+    assert ask_of(card) == "stalled"
+    assert board_of(card)["reason"].startswith("Deferred: fix_leg_active.")
+
+
+@pytest.mark.parametrize("age", [None, "soon", -5, float("nan"), True, 10**18])
+def test_a_stall_with_a_malformed_age_is_dated_by_its_own_event(age):
+    card = snapshots.issue_card(row_view([RESOLVE, _stalled(age_seconds=age)]), NOW)
+
+    assert ask_of(card) == "stalled"
+    assert board_of(card)["since_ts"] == ts(minutes=30)
+
+
+def test_progress_after_a_stall_answers_it():
+    later = {**RESOLVE, "ts": ts(minutes=5)}
+    card = snapshots.issue_card(row_view([_stalled(age_seconds=60), later]), NOW)
+
+    assert ask_of(card) is None
+
+
+def test_a_done_card_leaves_the_board():
+    row = replace(row_for([RESOLVE], 7), done=True)
+
+    assert snapshots.issue_card(row, NOW)["board"] is None
+
+
+@pytest.mark.parametrize(
+    "labels",
+    [
+        ["ai-ready", "needs-human-review", "ai-parked", "ai-blocked", "needs-budget-review"],
+        ["ai-done", "ai-working", "P1", "P2"],
+        ["", "NEEDS-HUMAN-REVIEW", "ai-parked "],
+    ],
+)
+def test_contradictory_label_sets_produce_one_coherent_board_state(labels):
+    row = row_view([BREAKER_COMMENT, ESCALATION])
+    card = snapshots.issue_card(row, NOW, gh_issue={"labels": labels})
+    pending = snapshots.pending_card({"number": 7, "labels": labels}, row)
+
+    for board in (card["board"], pending["board"]):
+        assert board["status"] in {"needs_you", "working", "blocked"}
+        assert board["headline"] and board["reason"]
+    if "ai-parked" in labels:
+        assert pending["board"]["on"] == {"kind": "triage", "why": "parked"}
+
+
+def _pr_observed(head, state, minutes):
+    facts = {"head_sha": head, **({"ci_summary": {"state": state}} if state else {})}
+    return {"ts": ts(minutes=minutes), "event": "world.observed.v1", "issue": 7,
+            "subject_kind": "pr", "subject_number": 12, "facts": facts}
+
+
+def test_the_rail_counts_review_rounds_ci_runs_and_resolve_attempts():
+    legs = [
+        {**RESOLVE, "ts": ts(hours=5), "exit_reason": "wall_cap"},
+        {**RESOLVE, "ts": ts(hours=4)},
+        {**_REVIEW_APPROVE, "ts": ts(hours=3)},
+        {**FIX_CI_2, "ts": ts(minutes=160)},
+        {**_REVIEW_APPROVE, "ts": ts(minutes=120), "kind": "RE_REVIEW"},
+    ]
+    events = [*legs[:3], _pr_observed("aaa", "failure", 170), *legs[3:],
+              _pr_observed("bbb", "pending", 100), _pr_observed("bbb", "ok", 90)]
+    row = replace(row_view(events, legs=legs), prs=(12,))
+
+    card = snapshots.issue_card(row, NOW)
+    detail = snapshots.issue_detail(row, NOW)
+
+    assert card["rail"]["resolve_attempts"] == 2
+    assert card["rail"]["review_rounds"] == 2
+    assert card["rail"]["ci_runs"] == 2
+    assert card["rail"]["current"] == "ci"
+    assert [visit["stage"] for visit in detail["history"]] == ["resolve", "review", "ci", "review", "ci"]
+    assert detail["history"][-1]["steps"] == [{"kind": "CI", "outcome": "passed", "count": 1}]
+    assert detail["rail"] == card["rail"]
+
+
+def test_checks_reported_before_the_first_approval_stay_in_review():
+    legs = [{**RESOLVE, "ts": ts(hours=4)},
+            {**_REVIEW_APPROVE, "ts": ts(hours=3), "status": "REQUEST_CHANGES"}]
+    events = [legs[0], _pr_observed("aaa", "ok", 200), legs[1]]
+    row = replace(row_view(events, legs=legs), prs=(12,))
+
+    detail = snapshots.issue_detail(row, NOW)
+
+    assert detail["rail"]["current"] == "review"
+    assert detail["rail"]["furthest"] == "review"
+    assert [visit["stage"] for visit in detail["history"]] == ["resolve", "review"]
+
+
+def test_a_superseded_head_whose_checks_never_settled_is_not_still_running():
+    events = [_pr_observed("old", "pending", 50), _pr_observed("new", None, 40)]
+
+    detail = snapshots.issue_detail(row_view(events), NOW)
+
+    ci_chips = [chip for visit in detail["history"] for chip in visit["steps"] if chip["kind"] == "CI"]
+    assert ci_chips == [{"kind": "CI", "outcome": "done", "count": 1}]
+
+
+def test_the_detail_carries_the_full_harness_message_not_the_row_line():
+    detail = snapshots.issue_detail(row_view([BREAKER_COMMENT, ESCALATION]), NOW)
+
+    assert detail["harness_message"].endswith("second line")
+    assert detail["escalation_reason"] != detail["harness_message"]
+
+
+def test_a_huge_harness_message_is_bounded():
+    huge = {**BREAKER_COMMENT, "action": {
+        **BREAKER_COMMENT["action"], "body": "**Circuit breaker:** " + "x" * 50_000,
+    }}
+
+    detail = snapshots.issue_detail(row_view([huge, ESCALATION]), NOW)
+
+    assert len(detail["harness_message"]) == 4000
+
+
+@pytest.mark.parametrize(
+    "cost,projected,ratio",
+    [(3.98, 2.0, None), (4.0, 2.0, 2.0), (33.35, 4.28, 7.79), (5.0, None, None), (5.0, 0.0, None)],
+)
+def test_the_overspend_ratio_appears_only_at_twice_the_projection(cost, projected, ratio):
+    row = replace(row_for([RESOLVE], 7), cost_usd=cost)
+
+    assert snapshots.issue_card(row, NOW, projected_cost_usd=projected)["overspend_ratio"] == ratio
+
+
+@pytest.mark.parametrize("tier,expected", [("complex", "complex"), ("galaxy-brain", None), (None, None), (7, None)])
+def test_the_tier_comes_from_the_route_completion_and_only_from_the_ladder(tier, expected):
+    route = {"ts": ts(hours=4), "event": "agent_run", "role": "fix", "kind": "ROUTE",
+             "issue": 7, "number": 7, "status": "done", "exit_reason": "ok",
+             "model": "gpt-6.1-sol", **({"tier": tier} if tier is not None else {})}
+
+    assert snapshots.issue_card(row_view([route, RESOLVE]), NOW)["tier"] == expected
+
+
+def test_board_cards_validate_against_the_http_contract():
+    from issue_agent.app.dashweb.contracts import BacklogCard, IssueCard, PendingCard
+
+    IssueCard.model_validate(snapshots.issue_card(row_view([BREAKER_COMMENT, ESCALATION]), NOW))
+    PendingCard.model_validate(snapshots.pending_card({"number": 9, "labels": ["ai-ready"]}, None))
+    BacklogCard.model_validate(snapshots.backlog_card({"number": 3, "labels": []}, NOW))

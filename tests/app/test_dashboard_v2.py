@@ -714,6 +714,9 @@ def test_v2_dashboard_places_current_unowned_open_issue_in_backlog(
             "issue_type": "bug",
             "difficulty": None,
             "impact": None,
+            # No steward question is outstanding, so it stays off the board.
+            "board": None,
+            "rail": None,
         }
     ]
     assert deployment.metrics.in_flight_issues == 0

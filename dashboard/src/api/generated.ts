@@ -450,6 +450,8 @@ export interface components {
             age_days: number | null;
             /** Age S */
             age_s?: number | null;
+            /** Board */
+            board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardBlocked"]) | null;
             /** Body */
             body: string | null;
             /** Comments */
@@ -464,6 +466,7 @@ export interface components {
             issue_type?: string | null;
             /** Labels */
             labels: string[];
+            rail?: components["schemas"]["StageRail"] | null;
             /** Recurrence */
             recurrence: boolean;
             /** Recurrence Count */
@@ -477,6 +480,131 @@ export interface components {
             title: string | null;
             /** Url */
             url: string | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** BlockedOnIssue */
+        BlockedOnIssue: {
+            /** Issue */
+            issue: number | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "issue";
+        } & {
+            [key: string]: unknown;
+        };
+        /** BlockedOnOverlap */
+        BlockedOnOverlap: {
+            /** Issue */
+            issue: number | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "overlap";
+            /** Pr */
+            pr: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** BlockedOnPr */
+        BlockedOnPr: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "pr";
+            /** Pr */
+            pr: number;
+        } & {
+            [key: string]: unknown;
+        };
+        /** BlockedOnQueue */
+        BlockedOnQueue: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "queue";
+            /** Priority */
+            priority: ("P1" | "P2" | "P3") | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** BlockedOnTriage */
+        BlockedOnTriage: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "triage";
+            /**
+             * Why
+             * @enum {string}
+             */
+            why: "parked" | "awaiting_reply";
+        } & {
+            [key: string]: unknown;
+        };
+        /** BoardBlocked */
+        BoardBlocked: {
+            /** Headline */
+            headline: string;
+            /** On */
+            on: components["schemas"]["BlockedOnIssue"] | components["schemas"]["BlockedOnPr"] | components["schemas"]["BlockedOnOverlap"] | components["schemas"]["BlockedOnTriage"] | components["schemas"]["BlockedOnQueue"];
+            /** Reason */
+            reason: string;
+            /** Since Ts */
+            since_ts: string | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "blocked";
+        } & {
+            [key: string]: unknown;
+        };
+        /** BoardNeedsYou */
+        BoardNeedsYou: {
+            /**
+             * Ask
+             * @enum {string}
+             */
+            ask: "rearm" | "escalated" | "budget" | "awaiting_reply" | "merge" | "stalled";
+            /** Headline */
+            headline: string;
+            /** Reason */
+            reason: string;
+            /** Since Ts */
+            since_ts: string | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "needs_you";
+        } & {
+            [key: string]: unknown;
+        };
+        /** BoardWorking */
+        BoardWorking: {
+            /**
+             * Activity
+             * @enum {string}
+             */
+            activity: "agent" | "ci" | "merge" | "handoff";
+            /** Headline */
+            headline: string;
+            /** Reason */
+            reason: string;
+            /** Since Ts */
+            since_ts: string | null;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            status: "working";
         } & {
             [key: string]: unknown;
         };
@@ -739,6 +867,8 @@ export interface components {
         IssueCard: {
             /** Attention Reason */
             attention_reason?: string | null;
+            /** Board */
+            board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardBlocked"]) | null;
             /** Cost Usd */
             cost_usd: number | null;
             /** Done */
@@ -788,6 +918,8 @@ export interface components {
             model_badges: components["schemas"]["ModelBadge"][];
             /** Models */
             models: string[];
+            /** Overspend Ratio */
+            overspend_ratio?: number | null;
             /** Pr */
             pr: number | null;
             /** Pr Ci State */
@@ -808,6 +940,7 @@ export interface components {
             projected_eta_s: number | null;
             /** Projected Model */
             projected_model?: string | null;
+            rail?: components["schemas"]["StageRail"] | null;
             /** Rounds */
             rounds: number | null;
             /** Stage */
@@ -816,6 +949,8 @@ export interface components {
             started_ts: string | null;
             /** Steps */
             steps: components["schemas"]["CardStep"][];
+            /** Tier */
+            tier?: ("trivial" | "standard" | "complex" | "exceptional") | null;
             /** Title */
             title: string | null;
             /** Url */
@@ -841,6 +976,13 @@ export interface components {
             events: {
                 [key: string]: unknown;
             }[];
+            /** Harness Message */
+            harness_message?: string | null;
+            /**
+             * History
+             * @default []
+             */
+            history: components["schemas"]["StageVisit"][];
             /** Idle Active */
             idle_active: boolean;
             /** Idle S */
@@ -858,6 +1000,7 @@ export interface components {
             prs: number[];
             /** Pull Requests */
             pull_requests: components["schemas"]["PullRequestLink"][];
+            rail?: components["schemas"]["StageRail"] | null;
             /** Stage */
             stage: string | null;
             /** Steps */
@@ -1176,6 +1319,8 @@ export interface components {
         };
         /** PendingCard */
         PendingCard: {
+            /** Board */
+            board?: (components["schemas"]["BoardNeedsYou"] | components["schemas"]["BoardWorking"] | components["schemas"]["BoardBlocked"]) | null;
             /** Body */
             body?: string | null;
             /** Held */
@@ -1198,6 +1343,7 @@ export interface components {
             pr_url?: string | null;
             /** Priority */
             priority: ("P1" | "P2" | "P3") | null;
+            rail?: components["schemas"]["StageRail"] | null;
             /** Title */
             title: string | null;
             /** Url */
@@ -2353,6 +2499,46 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /**
+         * StageRail
+         * @description Where the issue is on the five-stage track, from one stage-visit fold.
+         */
+        StageRail: {
+            /** Ci Runs */
+            ci_runs: number;
+            /**
+             * Current
+             * @enum {string}
+             */
+            current: "triage" | "resolve" | "review" | "ci" | "merge";
+            /**
+             * Furthest
+             * @enum {string}
+             */
+            furthest: "triage" | "resolve" | "review" | "ci" | "merge";
+            /** Live */
+            live: boolean;
+            /** Resolve Attempts */
+            resolve_attempts: number;
+            /** Review Rounds */
+            review_rounds: number;
+            /** Steps */
+            steps: number;
+        } & {
+            [key: string]: unknown;
+        };
+        /** StageVisit */
+        StageVisit: {
+            /**
+             * Stage
+             * @enum {string}
+             */
+            stage: "triage" | "resolve" | "review" | "ci" | "merge";
+            /** Steps */
+            steps: components["schemas"]["TrackChip"][];
+        } & {
+            [key: string]: unknown;
+        };
         /** StepEventsPayload */
         StepEventsPayload: {
             /** Events */
@@ -2406,6 +2592,20 @@ export interface components {
             input_tokens: number | null;
             /** Output Tokens */
             output_tokens: number | null;
+        } & {
+            [key: string]: unknown;
+        };
+        /** TrackChip */
+        TrackChip: {
+            /** Count */
+            count: number;
+            /** Kind */
+            kind: string;
+            /**
+             * Outcome
+             * @enum {string}
+             */
+            outcome: "passed" | "failed" | "changes_requested" | "done" | "running";
         } & {
             [key: string]: unknown;
         };

@@ -6,8 +6,10 @@ processes, HTTP, GitHub, or rendering.
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, field
+from enum import Enum
 from collections.abc import Callable
 from datetime import date, datetime, timedelta, timezone
 from typing import Iterable, Literal, Mapping
@@ -1782,3 +1784,565 @@ def unsettled_start_events(events, window_s: float, now_fn) -> list[dict]:
         if missing > 0:
             outstanding.extend(start_events[-missing:])
     return outstanding
+
+
+# ── issues board: stage track ─────────────────────────────────────────────────
+# The board shows where an issue is on a fixed five-stage track and how much it
+# churned there. One fold produces the ordered stage visits; the rail, its
+# counts and the drawer history all read that one sequence, so they can never
+# disagree about the same issue.
+class Stage(str, Enum):
+    TRIAGE = "triage"
+    RESOLVE = "resolve"
+    REVIEW = "review"
+    CI = "ci"
+    MERGE = "merge"
+
+
+STAGE_ORDER: tuple[Stage, ...] = tuple(Stage)
+
+# Synthetic step kinds the projection adds for observations that are not legs:
+# one CI run per distinct PR head with observed checks, and the merge itself.
+CI_RUN_KIND = "CI"
+MERGE_KIND = "MERGE"
+
+_STAGE_OF_KIND: Mapping[str, Stage] = {
+    **{kind: Stage.TRIAGE for kind in ("TRIAGE", "STEWARD_DRIVE", "JIRA_SYNC", "GROOM")},
+    **{kind: Stage.RESOLVE for kind in ("RESOLVE", "RESUME", "ROUTE")},
+    **{kind: Stage.REVIEW for kind in ("REVIEW", "RE_REVIEW", "ADDRESS_REVIEW")},
+    "FIX_CI": Stage.CI,
+    CI_RUN_KIND: Stage.CI,
+    MERGE_KIND: Stage.MERGE,
+}
+_RESOLVE_ATTEMPT_KINDS = frozenset({"RESOLVE", "RESUME"})
+
+
+def stage_of_kind(kind: str) -> Stage | None:
+    """The stage a step kind belongs to, or None when it inherits one.
+
+    REBASE and PR_RESUME are repairs inside whatever stage is in progress, as
+    are operator interventions and any kind this build does not know. A rebase
+    is never a stage of its own: it adds a CI run (a new head), and it returns
+    the issue to Review only when a reviewer runs again on the changed patch.
+    """
+    return _STAGE_OF_KIND.get(kind.strip().upper())
+
+
+class StepOutcome(str, Enum):
+    PASSED = "passed"
+    FAILED = "failed"
+    CHANGES_REQUESTED = "changes_requested"
+    DONE = "done"
+    RUNNING = "running"
+
+
+@dataclass(frozen=True)
+class TrackStep:
+    """One thing that happened to an issue: a leg, an operator step, or an
+    observation. `verdict` marks a review decision, which is what one review
+    round means (a failed review run decides nothing)."""
+
+    kind: str
+    outcome: StepOutcome
+    ts: datetime | None = None
+    verdict: bool = False
+
+
+@dataclass(frozen=True)
+class TrackChip:
+    """Consecutive identical steps (same kind, same result) folded into one."""
+
+    kind: str
+    outcome: StepOutcome
+    count: int
+
+
+@dataclass(frozen=True)
+class StageVisit:
+    stage: Stage
+    chips: tuple[TrackChip, ...]
+
+    @property
+    def steps(self) -> int:
+        return sum(chip.count for chip in self.chips)
+
+
+@dataclass(frozen=True)
+class StageTrack:
+    visits: tuple[StageVisit, ...]
+    current: Stage
+    furthest: Stage
+    resolve_attempts: int
+    review_rounds: int
+    ci_runs: int
+
+    @property
+    def steps(self) -> int:
+        return sum(visit.steps for visit in self.visits)
+
+
+_NEVER = datetime.max.replace(tzinfo=timezone.utc)
+
+
+def stage_track(steps: Iterable[TrackStep]) -> StageTrack:
+    """Fold an issue's steps into its ordered stage visits.
+
+    Steps are ordered by timestamp; a step with no usable timestamp sorts
+    after every stamped one and keeps its relative order. A step whose kind
+    names no stage inherits the stage in progress (Triage before anything
+    happened). A visit ends when the stage changes, so going back to an
+    earlier stage, e.g. a CI fix whose new patch is reviewed again, starts a
+    new visit rather than extending the old one.
+
+    CI runs alongside review on every head, but the CI stage is what follows
+    an approval: an approving review decision moves the stage in progress to
+    CI, and a CI run observed before the patch is approved stays in the stage
+    in progress. Otherwise every PR whose checks report before its first
+    review would read as having been sent back from CI.
+
+    Counts:
+      resolve attempts — RESOLVE and RESUME runs, whatever their outcome;
+      review rounds    — review decisions (`verdict` steps);
+      CI runs          — one per PR head on which CI was observed (the
+                         projection's CI steps). A journal with no head
+                         observations still has its FIX_CI legs: each answered
+                         a failed run, so they are counted instead.
+    """
+    ordered = sorted(
+        steps,
+        key=lambda step: _aware(step.ts) if isinstance(step.ts, datetime) else _NEVER,
+    )
+    visits: list[tuple[Stage, list[TrackChip]]] = []
+    in_progress = Stage.TRIAGE
+    for step in ordered:
+        kind = step.kind.strip().upper()
+        if kind != CI_RUN_KIND:
+            in_progress = stage_of_kind(kind) or in_progress
+        if not visits or visits[-1][0] is not in_progress:
+            visits.append((in_progress, []))
+        chips = visits[-1][1]
+        if chips and (chips[-1].kind, chips[-1].outcome) == (step.kind, step.outcome):
+            chips[-1] = TrackChip(step.kind, step.outcome, chips[-1].count + 1)
+        else:
+            chips.append(TrackChip(step.kind, step.outcome, 1))
+        if step.verdict and step.outcome is StepOutcome.PASSED and kind in REVIEW_KINDS:
+            in_progress = Stage.CI
+    kinds = [step.kind.strip().upper() for step in ordered]
+    folded = tuple(StageVisit(stage, tuple(chips)) for stage, chips in visits)
+    return StageTrack(
+        visits=folded,
+        current=in_progress,
+        furthest=max(
+            (in_progress, *(visit.stage for visit in folded)),
+            key=STAGE_ORDER.index,
+        ),
+        resolve_attempts=sum(kind in _RESOLVE_ATTEMPT_KINDS for kind in kinds),
+        review_rounds=sum(step.verdict for step in ordered),
+        ci_runs=kinds.count(CI_RUN_KIND) or kinds.count("FIX_CI"),
+    )
+
+
+def _aware(stamp: datetime) -> datetime:
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+
+
+# ── issues board: status ──────────────────────────────────────────────────────
+# Every in-flight or queued issue is in exactly one of three groups. The
+# variants below are the only shapes a row can take, so "escalated and
+# working" or "blocked on nothing" cannot be expressed.
+class Ask(str, Enum):
+    REARM = "rearm"
+    ESCALATED = "escalated"
+    BUDGET = "budget"
+    AWAITING_REPLY = "awaiting_reply"
+    MERGE = "merge"
+    STALLED = "stalled"
+
+
+class Activity(str, Enum):
+    AGENT = "agent"
+    CI = "ci"
+    MERGE = "merge"
+    HANDOFF = "handoff"
+
+
+@dataclass(frozen=True)
+class OnIssue:
+    # None when GitHub reports an open dependency without naming it.
+    issue: int | None
+
+
+@dataclass(frozen=True)
+class OnPr:
+    pr: int
+
+
+@dataclass(frozen=True)
+class OnOverlap:
+    issue: int | None = None
+    pr: int | None = None
+
+
+TriageWhy = Literal["parked", "awaiting_reply"]
+
+
+@dataclass(frozen=True)
+class OnTriage:
+    why: TriageWhy
+
+
+@dataclass(frozen=True)
+class OnQueue:
+    priority: str | None = None
+
+
+BlockedOn = OnIssue | OnPr | OnOverlap | OnTriage | OnQueue
+
+
+@dataclass(frozen=True)
+class NeedsYou:
+    ask: Ask
+    headline: str
+    reason: str
+    since: datetime | None
+
+
+@dataclass(frozen=True)
+class Working:
+    activity: Activity
+    headline: str
+    reason: str
+    since: datetime | None
+
+
+@dataclass(frozen=True)
+class Blocked:
+    on: BlockedOn
+    headline: str
+    reason: str
+    since: datetime | None
+
+
+BoardStatus = NeedsYou | Working | Blocked
+
+
+# Facts the projection has already parsed and attributed. Each is a variant,
+# not a flag: the decision below matches on shape.
+@dataclass(frozen=True)
+class Escalated:
+    since: datetime | None
+    # The harness's own escalation comment (first line), when one was paired.
+    reason: str | None = None
+    # A circuit breaker tripped: only an explicit re-arm grants another try.
+    breaker: bool = False
+    # The cap decision (`needs-budget-review`) is what resumes it.
+    budget: bool = False
+
+
+@dataclass(frozen=True)
+class AwaitingReply:
+    since: datetime | None
+    question: str | None = None
+
+
+@dataclass(frozen=True)
+class MergeReady:
+    since: datetime | None
+
+
+Attention = Escalated | AwaitingReply | MergeReady
+
+
+@dataclass(frozen=True)
+class Hold:
+    on: OnIssue | OnPr | OnOverlap
+    since: datetime | None
+
+
+@dataclass(frozen=True)
+class TriageHold:
+    why: TriageWhy
+    since: datetime | None
+
+
+@dataclass(frozen=True)
+class StallObserved:
+    since: datetime | None
+    # The current deferral reason (#296) when a journalled defer gives one.
+    deferral: str | None = None
+
+
+@dataclass(frozen=True)
+class BoardFacts:
+    track: StageTrack
+    attention: Attention | None = None
+    triage: TriageHold | None = None
+    running_kind: str | None = None
+    hold: Hold | None = None
+    # Current-head CI rollup of the open PR, None when unknown or no PR.
+    ci: Literal["pending", "passing", "failing"] | None = None
+    stall: StallObserved | None = None
+    # An ai-ready issue with nothing in progress: it waits for the fixer.
+    queued: bool = False
+    priority: str | None = None
+    # The harness merges approved, green PRs itself on this repository.
+    automerge: bool = False
+    last_activity: datetime | None = None
+
+
+_RUNNING_HEADLINE: Mapping[str, str] = {
+    "RESOLVE": "Resolving",
+    "RESUME": "Resolving",
+    "ROUTE": "Routing",
+    "REVIEW": "Reviewing",
+    "RE_REVIEW": "Reviewing",
+    "ADDRESS_REVIEW": "Addressing review",
+    "FIX_CI": "Fixing CI",
+    "REBASE": "Rebasing",
+    "PR_RESUME": "Resuming",
+    "TRIAGE": "Triaging",
+    "GROOM": "Grooming",
+    "STEWARD_DRIVE": "Triaging",
+    "JIRA_SYNC": "Syncing Jira",
+}
+
+# Framing the harness puts around its own escalation comments
+# (domain/lifecycle.py PrEscalation/IssueEscalation, domain/outcome.py budget
+# review). The headline already says it, so the row's reason drops it.
+_BREAKER_PREFIX = "Circuit breaker:"
+_BREAKER_SUFFIX = "Escalating to a human."
+_BUDGET_PREFIX = "Budget review needed:"
+
+
+def _sentence(text: str) -> str:
+    text = text.strip()
+    if not text:
+        return text
+    text = text[0].upper() + text[1:]
+    return text if text.endswith((".", "?", "!")) else f"{text}."
+
+
+def _short_reason(reason: str | None, *prefixes: str) -> str | None:
+    """The harness message without the framing the headline already says."""
+    if not reason or not reason.strip():
+        return None
+    text = reason.strip()
+    for prefix in prefixes:
+        if text.casefold().startswith(prefix.casefold()):
+            text = text[len(prefix):].strip()
+    if text.endswith(_BREAKER_SUFFIX):
+        text = text[: -len(_BREAKER_SUFFIX)].strip()
+    return _sentence(text) or None
+
+
+def _approved(track: StageTrack) -> bool:
+    """Whether the newest review decision approved the patch."""
+    for visit in reversed(track.visits):
+        for chip in reversed(visit.chips):
+            if chip.kind.strip().upper() in REVIEW_KINDS and chip.outcome in {
+                StepOutcome.PASSED,
+                StepOutcome.CHANGES_REQUESTED,
+            }:
+                return chip.outcome is StepOutcome.PASSED
+    return False
+
+
+def _needs_you(attention: Attention) -> NeedsYou:
+    if isinstance(attention, AwaitingReply):
+        return NeedsYou(
+            Ask.AWAITING_REPLY,
+            "Reply to the agent",
+            _short_reason(attention.question)
+            or "The agent asked a question. Reply on GitHub to unblock it.",
+            attention.since,
+        )
+    if isinstance(attention, MergeReady):
+        return NeedsYou(
+            Ask.MERGE,
+            "Merge the PR",
+            "Approved and green. The harness does not merge on this repository.",
+            attention.since,
+        )
+    if attention.budget:
+        return NeedsYou(
+            Ask.BUDGET,
+            "Approve spend or close",
+            _short_reason(attention.reason, _BUDGET_PREFIX)
+            or "Spend reached its cap. Only a cap decision resumes it.",
+            attention.since,
+        )
+    if attention.breaker:
+        return NeedsYou(
+            Ask.REARM,
+            "Re-arm or close",
+            _short_reason(attention.reason, _BREAKER_PREFIX)
+            or "A circuit breaker holds it until you re-arm.",
+            attention.since,
+        )
+    return NeedsYou(
+        Ask.ESCALATED,
+        "Answer the agent",
+        _short_reason(attention.reason) or "Escalated. See the issue comments.",
+        attention.since,
+    )
+
+
+def _working_reason(track: StageTrack, kind: str) -> str:
+    if kind in REVIEW_KINDS:
+        return f"Review round {track.review_rounds + 1}."
+    if kind == "ADDRESS_REVIEW":
+        return f"Review round {max(track.review_rounds, 1)} asked for changes."
+    if kind == "FIX_CI":
+        return f"CI run {max(track.ci_runs, 1)} failed."
+    if kind in _RESOLVE_ATTEMPT_KINDS:
+        return f"Attempt {max(track.resolve_attempts, 1)}."
+    if kind == "REBASE":
+        return "Bringing the branch up to date with its base."
+    return "An agent is working on it."
+
+
+def _handoff(facts: BoardFacts) -> Working:
+    """Nothing is running, but the next move is the harness's."""
+    track, since = facts.track, facts.last_activity
+    last = track.visits[-1].chips[-1] if track.visits else None
+    kind = last.kind.strip().upper() if last is not None else ""
+    if last is not None and last.outcome is StepOutcome.FAILED:
+        name = kind.replace("_", " ").lower()
+        return Working(Activity.HANDOFF, "Retrying", f"The last step ({name}) failed; the harness tries again.", since)
+    if last is not None and last.outcome is StepOutcome.CHANGES_REQUESTED:
+        return Working(Activity.HANDOFF, "Changes requested", f"Review round {track.review_rounds} asked for changes.", since)
+    if last is not None and _approved(track) and facts.ci == "passing":
+        then = " The harness merges it next." if facts.automerge else ""
+        return Working(Activity.MERGE, "Ready to merge", f"Approved on review round {track.review_rounds} and green.{then}", since)
+    if last is not None and _approved(track):
+        return Working(Activity.HANDOFF, "Approved", f"Approved on review round {track.review_rounds}. Waiting for CI.", since)
+    if last is not None and (kind in RESOLVE_KINDS | REPAIR_KINDS or kind == CI_RUN_KIND):
+        return Working(Activity.HANDOFF, "Awaiting review", "The reviewer picks it up next.", since)
+    return Working(Activity.HANDOFF, "Up next", "The harness picks it up on its next tick.", since)
+
+
+def _blocked_on(hold: Hold) -> Blocked:
+    on = hold.on
+    if isinstance(on, OnIssue) and on.issue is None:
+        return Blocked(on, "Waiting on a dependency", "Starts when its open dependency closes.", hold.since)
+    if isinstance(on, OnIssue):
+        return Blocked(on, f"Waiting for #{on.issue}", f"Starts when #{on.issue} merges.", hold.since)
+    if isinstance(on, OnPr):
+        return Blocked(on, f"Waiting for PR #{on.pr}", f"Starts when PR #{on.pr} merges.", hold.since)
+    target = (
+        f"#{on.issue}" if on.issue is not None
+        else f"PR #{on.pr}" if on.pr is not None
+        else None
+    )
+    if target is None:
+        return Blocked(on, "Waiting on an overlap", "Its files overlap work in flight. Starts when that merges.", hold.since)
+    return Blocked(on, f"Waiting for {target}", f"Its files overlap {target}. Starts when that merges.", hold.since)
+
+
+def board_status(facts: BoardFacts) -> BoardStatus:
+    """Which group a row belongs to, and the one line that says why.
+
+    Precedence, first match wins:
+      1. parked: the operator moved it out of the pipeline on purpose;
+      2. escalated or awaiting a reply: nothing moves until a person acts,
+         even while a leg is still running (that leg cannot clear the hold);
+      3. approved and green: the harness merges it (Working) unless it does
+         not merge on this repository (Needs you);
+      4. a leg is running;
+      5. a hold on another issue or PR, or a file overlap;
+      6. the steward is waiting on the author's reply;
+      7. CI is running on the current head;
+      8. stalled: no leg, hold or escalation, yet nothing changed for a whole
+         stall threshold, so the harness stopped without escalating;
+      9. queued for the fixer;
+     10. otherwise the harness owns the next move.
+    """
+    triage = facts.triage
+    if triage is not None and triage.why == "parked":
+        return Blocked(
+            OnTriage("parked"),
+            "Waiting on triage",
+            "Parked for human review. Unpark it to hand it back to the harness.",
+            triage.since,
+        )
+    attention = facts.attention
+    if isinstance(attention, MergeReady):
+        if not facts.automerge:
+            return _needs_you(attention)
+        return Working(
+            Activity.MERGE,
+            "Ready to merge",
+            f"Approved on review round {max(facts.track.review_rounds, 1)} and green. The harness merges it next.",
+            facts.last_activity,
+        )
+    if attention is not None:
+        return _needs_you(attention)
+    if facts.running_kind is not None:
+        kind = facts.running_kind.strip().upper()
+        return Working(
+            Activity.AGENT,
+            _RUNNING_HEADLINE.get(kind, "Agent running"),
+            _working_reason(facts.track, kind),
+            facts.last_activity,
+        )
+    if facts.hold is not None:
+        return _blocked_on(facts.hold)
+    if triage is not None:
+        return Blocked(
+            OnTriage("awaiting_reply"),
+            "Waiting on triage",
+            "The steward asked the author a question. Set a priority to queue it.",
+            triage.since,
+        )
+    if facts.ci == "pending":
+        reason = (
+            f"Approved on review round {facts.track.review_rounds}."
+            if _approved(facts.track)
+            else f"Run {max(facts.track.ci_runs, 1)} on the current head."
+        )
+        return Working(Activity.CI, "CI running", reason, facts.last_activity)
+    if facts.stall is not None:
+        deferral = (facts.stall.deferral or "").strip()
+        lead = f"Deferred: {deferral}. " if deferral else "Nothing is moving it. "
+        return NeedsYou(
+            Ask.STALLED,
+            "Investigate the stall",
+            lead + "The harness stopped without escalating.",
+            facts.stall.since,
+        )
+    if facts.queued:
+        priority = f" ({facts.priority})" if facts.priority else ""
+        return Blocked(
+            OnQueue(facts.priority),
+            "Queued",
+            f"Starts when the fixer picks it up{priority}.",
+            None,
+        )
+    return _handoff(facts)
+
+
+OVERSPEND_ALARM_RATIO = 2.0
+
+
+def overspend_ratio(cost_usd: object, budget_usd: object) -> float | None:
+    """Spend over the projected cost, only when it is a row-level alarm.
+
+    The threshold is deliberately 2x: at 1.5x it flagged most of a live board,
+    which is noise rather than a signal. Unknown, non-positive or non-finite
+    figures have no ratio.
+    """
+    cost, budget = _finite(cost_usd), _finite(budget_usd)
+    if cost is None or budget is None or budget <= 0:
+        return None
+    ratio = cost / budget
+    # An overflowing quotient is not a figure anyone can act on, and JSON
+    # cannot carry it.
+    if not math.isfinite(ratio) or ratio < OVERSPEND_ALARM_RATIO:
+        return None
+    return round(ratio, 2)
+
+
+def _finite(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    return float(value) if math.isfinite(value) else None
