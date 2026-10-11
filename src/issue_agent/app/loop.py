@@ -353,7 +353,7 @@ class Daemon:
         self._shutdown_terminalization_required |= cancel
         if self._shutdown_deadline is None:
             self._shutdown_deadline = (
-                time.monotonic() + self.shutdown_timeout_seconds
+                self.monotonic() + self.shutdown_timeout_seconds
             )
         with self._dispatch_lock:
             if self._dispatch_closed:
@@ -459,7 +459,7 @@ class Daemon:
     def _remaining_shutdown_time(self) -> float:
         if self._shutdown_deadline is None:
             return self.shutdown_timeout_seconds
-        return max(0.0, self._shutdown_deadline - time.monotonic())
+        return max(0.0, self._shutdown_deadline - self.monotonic())
 
     def _prepare_shutdown(self) -> bool:
         if self._shutdown_prepared:
@@ -843,7 +843,7 @@ class Daemon:
             return True
         if self._shutdown_deadline is None:
             self._shutdown_deadline = (
-                time.monotonic() + self.shutdown_timeout_seconds
+                self.monotonic() + self.shutdown_timeout_seconds
             )
         self._finalize_clean = self._bounded_shutdown_call(
             self.finalize,
