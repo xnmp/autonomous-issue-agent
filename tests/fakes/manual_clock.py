@@ -1,4 +1,9 @@
-"""Hand-driven monotonic clock for tests that must own deadline expiry."""
+"""Hand-driven monotonic clock for tests that must own deadline expiry.
+
+The clock sets a Daemon's shutdown budget, but its wait() windows are still
+real time. Give the worker-unwind window seconds (shutdown timeout 30) and
+close a window by advancing the clock in the hook that ends it.
+"""
 
 
 class ManualClock:
