@@ -203,4 +203,7 @@ class CodexSpendReconciler:
             if not model or root not in meter.roots:
                 return UnavailableRunUsage("native recovery root usage or model is missing")
         observed = meter.sample(session_id, roots[session_id], self._usage(evidence, session_id, ended_at), final=True)
+        if ended_at is None and any(r.usage for r in meter.rollouts.values()):
+            # An unbounded receipt window could absorb a later leg's responses.
+            return UnavailableRunUsage("native re-meter requires the run's recorded end")
         return observed if observed is not None else MeasuredRunUsage(tuple(meter.roots.values()))

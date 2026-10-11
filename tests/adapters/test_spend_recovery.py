@@ -682,3 +682,22 @@ def test_a_valid_prefix_ending_in_a_cut_multibyte_character_is_the_killed_write(
         stream.write(b'{"note":"\xe2')
 
     assert price_run_usage(_final(_meter(tmp_path, home), final=True), CARD).micros == ROOT_ONLY_MICROS + 2 * CHILD_RESPONSE_MICROS
+
+
+@pytest.mark.parametrize("tail", ['[1,', '"not an event', '   [{"a":'])
+def test_a_non_object_unterminated_tail_is_not_a_killed_event_write(tmp_path, tail):
+    home = _killed_child_home(tmp_path, responses=2, tail=tail)
+
+    assert isinstance(_final(_meter(tmp_path, home), final=True), UnavailableRunUsage)
+
+
+@pytest.mark.parametrize("frozen", ["", UNFINISHED])
+def test_recovery_never_settles_a_receipt_window_without_the_runs_end(tmp_path, frozen):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    home = _root_home(tmp_path, [_root_receipt(1), {**_root_receipt(2), "timestamp": _later(60)}])
+    evidence_dir = _frozen_evidence(tmp_path, home, frozen)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.active_reservation_runs() == (run_id,)
+    assert store.snapshot(scope).settled == Money("USD", 0)

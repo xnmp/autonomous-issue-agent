@@ -425,6 +425,8 @@ class CodexChildUsageMeter:
                 if exc.reason != "unexpected end of data" or exc.end != len(tail):
                     return True
                 tail = tail[:exc.start].decode()
+            if not tail.lstrip().startswith("{"):
+                return True
             try:
                 json.loads(tail)
             except json.JSONDecodeError as exc:
