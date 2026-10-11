@@ -1425,6 +1425,76 @@ def test_fix_daemon_reports_a_pending_repair_hold(tmp_path, monkeypatch):
     assert reason in logs
 
 
+@pytest.mark.parametrize("issue_state,pr_state,held", [
+    ("closed", "CLOSED", False),
+    ("closed", "MERGED", False),
+    ("open", "CLOSED", True),
+    ("closed", "OPEN", True),
+    (None, "OPEN", True),
+    (None, "MERGED", False),
+    (None, "", False),
+])
+def test_fix_daemon_reports_workflow_holds_only_for_open_targets(
+    tmp_path, issue_state, pr_state, held,
+):
+    from issue_agent.app.roles import compose_fix_daemon
+
+    observed = WorldState(
+        issues=() if issue_state is None else (IssueView(514, state=issue_state),),
+        prs=(PRView(678, state=pr_state, closing_issue=514),),
+        now="2026-10-11T00:00:00Z",
+    )
+
+    class Gateway(FakeGateway):
+        def build_world(self):
+            return observed
+
+    logs = []
+    daemon = compose_fix_daemon(
+        HarnessConfig(repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
+                      state_dir=str(tmp_path / "state"),
+                      control_authority_root=str(tmp_path / "authority")),
+        Gateway(issues=observed.issues, prs={678: observed.prs[0]}),
+        Store(str(tmp_path / "state")), FakeWorktrees(),
+        FakeRunner(AgentResult(is_error=False)), log=logs.append,
+    ).daemon
+
+    daemon.tick()
+
+    reason = "workflow 514 held: CI issue recovery authority is inactive or migration blocked"
+    assert (reason in logs) is held
+    if not held:
+        assert not any(" held:" in line for line in logs)
+
+
+def test_fix_daemon_still_cleans_up_a_closed_target_without_reporting_a_hold(tmp_path):
+    from issue_agent.app.roles import compose_fix_daemon
+
+    closed = IssueView(514, state="closed", labels=frozenset({Label.AI_PR_OPEN}),
+                       updated_at="2026-10-11T00:00:00Z")
+
+    class Gateway(FakeGateway):
+        def build_world(self):
+            return WorldState(issues=tuple(self.issues.values()), now="2026-10-11T00:00:00Z")
+
+    gateway = Gateway(issues=(closed,))
+    worktrees = FakeWorktrees()
+    logs = []
+    composition = compose_fix_daemon(
+        HarnessConfig(repo="o/r", fix_bot=FIX_BOT, target_dir=str(tmp_path),
+                      state_dir=str(tmp_path / "state"),
+                      control_authority_root=str(tmp_path / "authority")),
+        gateway, Store(str(tmp_path / "state")), worktrees,
+        FakeRunner(AgentResult(is_error=False)), log=logs.append,
+    )
+    install_workflow(composition.control, resolve_snapshot(514))
+
+    actions = composition.daemon.tick()
+
+    assert gateway.get_issue(514).labels == frozenset({Label.AI_DONE}), (logs, actions)
+    assert not any(" held:" in line for line in logs)
+
+
 def test_daemon_holds_predicted_overlap_before_every_resolve_dispatch(tmp_path):
     """Persisted router hints must cross the real daemon decision seam."""
     from issue_agent.app.config import HarnessConfig
