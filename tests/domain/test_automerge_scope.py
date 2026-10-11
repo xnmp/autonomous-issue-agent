@@ -9,6 +9,8 @@ not.
 """
 from __future__ import annotations
 
+from tests.domain.builders import observed_pr
+
 import pytest
 
 from issue_agent.domain.fix import FixConfig, FixState, should_automerge, should_update_branch
@@ -22,7 +24,6 @@ def _cfg(**kw):
     values = {
         "auto_merge": True,
         "identity_mode": IdentityMode.THREE,
-        "arm_on_open": True,
         "fix_bot": "fix-bot",
     }
     values.update(kw)
@@ -43,7 +44,7 @@ def _pr(branch: str, **kw):
         ),
     )
     kw.setdefault("checks", GREEN)
-    return PRView(
+    return observed_pr(
         number=532,
         head_ref_name=branch,
         head_ref_oid=head,
@@ -90,7 +91,7 @@ def test_a_closing_reference_cannot_buy_a_foreign_pr_a_merge():
 
 def test_foreign_prs_are_not_branch_updated_either():
     """should_update_branch PUSHES to the PR's branch."""
-    pr = PRView(number=532, head_ref_name="dependabot/cargo/lru-0.18.1",
+    pr = observed_pr(number=532, head_ref_name="dependabot/cargo/lru-0.18.1",
                 head_ref_oid="head", reviews=(
                     Review("APPROVED", "review-bot", commit_id="head"),
                 ), checks=GREEN,
@@ -99,7 +100,7 @@ def test_foreign_prs_are_not_branch_updated_either():
 
 
 def test_harness_prs_are_still_branch_updated():
-    pr = PRView(number=532, head_ref_name="fix/504-tab-titles",
+    pr = observed_pr(number=532, head_ref_name="fix/504-tab-titles",
                 head_ref_oid="head", reviews=(
                     Review("APPROVED", "review-bot", commit_id="head"),
                 ), checks=GREEN,
@@ -112,7 +113,7 @@ PENDING = (Check(name="ci", state="IN_PROGRESS", bucket="pending"),)
 
 
 def test_verified_gate_never_bypasses_current_head_review_and_ci():
-    pr = PRView(
+    pr = observed_pr(
         number=540,
         head_ref_name="fix/522-lanes",
         head_ref_oid="head",
@@ -126,26 +127,26 @@ def test_verified_gate_never_bypasses_current_head_review_and_ci():
 def test_arm_on_open_still_respects_scope_and_conflicts():
     """Early arming relaxes ONLY the review/CI wait; every ownership and
     once-only guard keeps its teeth."""
-    cfg = _cfg(arm_on_open=True)
-    foreign = PRView(number=1, head_ref_name="dependabot/npm/x", reviews=(), checks=())
+    cfg = _cfg()
+    foreign = observed_pr(number=1, head_ref_name="dependabot/npm/x", reviews=(), checks=())
     assert should_automerge(foreign, FixState(), cfg) is False
-    ours = PRView(number=2, head_ref_name="fix/9-t", reviews=(), checks=())
+    ours = observed_pr(number=2, head_ref_name="fix/9-t", reviews=(), checks=())
     assert should_automerge(ours, FixState(), cfg) is False
-    conflicted = PRView(number=3, head_ref_name="fix/9-t", reviews=(), checks=(),
+    conflicted = observed_pr(number=3, head_ref_name="fix/9-t", reviews=(), checks=(),
                         mergeable="CONFLICTING")
     assert should_automerge(conflicted, FixState(), cfg) is False
     solo = FixConfig(auto_merge=True, identity_mode=IdentityMode.SOLO,
-                     arm_on_open=True,
+
                      fix_bot="fix-bot")
     assert should_automerge(ours, FixState(), solo) is False
 
 
 def test_unreviewed_or_red_ci_never_merges_regardless_of_server_gate():
-    unreviewed = PRView(number=4, head_ref_name="fix/9-t", reviews=(), checks=GREEN)
-    assert should_automerge(unreviewed, FixState(), _cfg(arm_on_open=False)) is False
+    unreviewed = observed_pr(number=4, head_ref_name="fix/9-t", reviews=(), checks=GREEN)
+    assert should_automerge(unreviewed, FixState(), _cfg()) is False
     red = _pr("fix/9-t",
                  checks=(Check(name="ci", state="COMPLETED", bucket="fail"),))
-    assert should_automerge(red, FixState(), _cfg(arm_on_open=False)) is False
+    assert should_automerge(red, FixState(), _cfg()) is False
 
 
 def test_exact_head_approval_and_green_ci_merge_without_server_gate():
@@ -154,14 +155,14 @@ def test_exact_head_approval_and_green_ci_merge_without_server_gate():
     (2026-08-01 voyage: requiring the server gate unconditionally zeroed
     merges on every repo whose base cannot carry verifiable protection)."""
     pr = _pr("fix/9-t")
-    assert should_automerge(pr, FixState(), _cfg(arm_on_open=False)) is True
+    assert should_automerge(pr, FixState(), _cfg()) is True
     # …and the approval must still bind the CURRENT head, server gate or not.
     stale = _pr(
         "fix/9-t",
         head_ref_oid="new-head",
         reviews=(Review(author="review-bot", state="APPROVED", commit_id="old-head"),),
     )
-    assert should_automerge(stale, FixState(), _cfg(arm_on_open=False)) is False
+    assert should_automerge(stale, FixState(), _cfg()) is False
 
 
 # ── #48: a failed checks read must never arm a merge ──────────────────────────
@@ -170,7 +171,7 @@ def test_unread_checks_do_not_automerge():
     treated like OK, and an approved PR could arm auto-merge on a tick whose
     checks were never read. UNKNOWN closes the gate; next successful read
     re-opens it (cost: one poll of latency)."""
-    pr = PRView(number=532, head_ref_name="fix/504-tab-titles",
+    pr = observed_pr(number=532, head_ref_name="fix/504-tab-titles",
                 head_ref_oid="head", merge_state="CLEAN",
                 reviews=(Review("APPROVED", "review-bot", commit_id="head"),),
                 checks=(), checks_known=False)
@@ -185,7 +186,7 @@ def test_honest_no_checks_still_automerges():
 
 
 def test_unread_checks_do_not_branch_update():
-    pr = PRView(number=532, head_ref_name="fix/504-tab-titles",
+    pr = observed_pr(number=532, head_ref_name="fix/504-tab-titles",
                 head_ref_oid="head",
                 reviews=(Review("APPROVED", "review-bot", commit_id="head"),),
                 checks=(), checks_known=False,
@@ -194,6 +195,6 @@ def test_unread_checks_do_not_branch_update():
 
 
 def test_verified_gate_does_not_turn_unread_checks_into_merge_evidence():
-    pr = PRView(number=540, head_ref_name="fix/522-lanes", reviews=(),
+    pr = observed_pr(number=540, head_ref_name="fix/522-lanes", reviews=(),
                 checks=(), checks_known=False)
     assert should_automerge(pr, FixState(), _cfg()) is False

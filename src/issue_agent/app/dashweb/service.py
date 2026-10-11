@@ -238,9 +238,6 @@ class Backend:
             name=name, repo=repo, target_dir=target_dir, journal_paths=list(journal_paths),
             log_dir=cli.log_dir(), ledger_path=default_ledger_path(), now_fn=self.now_fn,
             stale_after_s=self.stale_after_s, control_db_path=control_db_path,
-            ci_ignore_checks=config.from_env({
-                "CI_IGNORE_CHECKS": cli.deployment_env_field(name, "CI_IGNORE_CHECKS"),
-            }).ci_ignore_checks,
         )
 
     def repos(self) -> dict:

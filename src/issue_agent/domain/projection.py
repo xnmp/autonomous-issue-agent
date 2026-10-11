@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Iterable, Mapping
@@ -31,16 +30,31 @@ class _PRCI:
     head: str = ""
     state: str = ""
     ci_state: str | None = None
+    gate: str | None = None
 
-    def observe(self, facts: Mapping[str, JsonValue], ignore: str) -> _PRCI:
+    def observe(self, facts: Mapping[str, JsonValue]) -> _PRCI:
         head = facts.get("head_sha", self.head)
         state = "MERGED" if self.state == "MERGED" else facts.get("state", self.state)
         head = head if isinstance(head, str) else ""
         state = state if isinstance(state, str) else ""
         signal = self.ci_state if head == self.head else None
-        if facts.get("checks_known") is True:
-            signal = _observed_ci(facts, ignore) or signal
-        return _PRCI(head, state, signal if head and state == "OPEN" else None)
+        gate = self.gate if head == self.head else None
+        summary = facts.get("ci_summary")
+        if isinstance(summary, dict) and summary.get("basis") == "required-checks":
+            value = summary.get("state")
+            if value in ("pending", "ok", "failure", "none"):
+                gate = value
+                signal = "pending" if summary.get("activity") == "pending" else gate
+            else:
+                signal = _observed_ci(facts) or signal
+                gate = None
+        elif "ci_unavailable" in facts:
+            gate, signal = None, None
+        elif facts.get("checks_known") is True or isinstance(facts.get("checks"), list):
+            signal = _observed_ci(facts) or signal
+            gate = signal
+        visible = bool(head) and state == "OPEN"
+        return _PRCI(head, state, signal if visible else None, gate if visible else None)
 
 
 @dataclass(frozen=True)
@@ -66,7 +80,7 @@ class ReadModel:
     events: tuple[EventEnvelope, ...] = ()
 
 
-def fold(events: Iterable[EventEnvelope], *, ci_ignore_checks: str = "") -> ReadModel:
+def fold(events: Iterable[EventEnvelope]) -> ReadModel:
     unique = {event.event_id: event for event in events}
     ordered = sorted(unique.values(), key=lambda event: event.order_key)
     runs: dict[str, RunProjection] = {}
@@ -161,7 +175,7 @@ def fold(events: Iterable[EventEnvelope], *, ci_ignore_checks: str = "") -> Read
         elif isinstance(payload, WorldObserved):
             if payload.subject_kind == "pr" and payload.facts.get("present") is not False:
                 pr_ci[payload.subject_number] = pr_ci.get(payload.subject_number, _PRCI()).observe(
-                    payload.facts, ci_ignore_checks
+                    payload.facts
                 )
             feed_key = (
                 event.producer.deployment,
@@ -181,6 +195,7 @@ def fold(events: Iterable[EventEnvelope], *, ci_ignore_checks: str = "") -> Read
         facts = world_facts.get(("pr", number))
         if facts is not None and facts.get("present") is True:
             facts["ci_state"] = projected.ci_state
+            facts["ci_gate"] = projected.gate
     return ReadModel(
         runs=MappingProxyType(runs),
         levels=MappingProxyType(levels),
@@ -198,23 +213,18 @@ def fold(events: Iterable[EventEnvelope], *, ci_ignore_checks: str = "") -> Read
     )
 
 
-def _observed_ci(facts: Mapping[str, JsonValue], ignore: str) -> str | None:
-    summary = facts.get("ci_summary")
-    if isinstance(summary, dict) and summary.get("policy") == hashlib.sha256(ignore.encode()).hexdigest():
-        state = summary.get("state")
-        if isinstance(state, str) and state in ("pending", "ok", "failure", "none"):
-            return state
+def _observed_ci(facts: Mapping[str, JsonValue]) -> str | None:
     checks = facts.get("checks")
     if not isinstance(checks, list) or any(
         not isinstance(check, dict)
         or any(not isinstance(check.get(key), str) for key in ("name", "state", "bucket"))
-        or not isinstance(check.get("advisory", False), bool)
+        or not check["name"]
         for check in checks
     ):
         return None
     state = ci_state(
-        (Check(check["name"], check["state"], check["bucket"], advisory=check.get("advisory", False))
-         for check in checks), ignore
+        (Check(check["name"], check["state"], check["bucket"])
+         for check in checks)
     ).value
     # A retained running job proves activity; omitted jobs cannot prove settlement.
     return state if facts.get("checks_total", len(checks)) == len(checks) or state == "pending" else None

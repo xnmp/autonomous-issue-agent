@@ -2,7 +2,7 @@
 
 These functions carry hard-won lessons and are tested in isolation:
   * `ci_state` — pending OUTRANKS failure (the #49 anti-loop rule), with
-    CI_IGNORE_CHECKS dropping environmentally-stuck checks first.
+    repository-required reports deciding eligibility.
   * `pending_deadline_breached` — the BOUND on how long that pending state may
     last (#30). It does not reorder the precedence above; it says when waiting
     on it has stopped being waiting and become a deadlock.
@@ -12,7 +12,9 @@ These functions carry hard-won lessons and are tested in isolation:
 
 from __future__ import annotations
 
-import re
+from dataclasses import dataclass
+
+from .checks import CIObservation, Observed, RequiredCheck, Unavailable
 from collections.abc import Iterable
 from datetime import datetime, timezone
 
@@ -20,17 +22,77 @@ from .identity import login_eq
 from .world import Check, Review, CIState
 
 
-def _kept(checks: Iterable[Check], ignore_regex: str) -> list[Check]:
-    """Checks surviving CI_IGNORE_CHECKS. Shared by `ci_state` and the pending
-    deadline so an operator-ignored check can never drive either — an ignored
-    check is, by definition, one the harness has been told not to reason about."""
-    pattern = re.compile(ignore_regex) if ignore_regex else None
-    return [
-        c
-        for c in checks
-        if not c.advisory
-        and (pattern is None or not pattern.search(c.name or ""))
-    ]
+@dataclass(frozen=True)
+class Clear:
+    pass
+
+
+@dataclass(frozen=True)
+class Queued:
+    checks: tuple[Check, ...]
+
+
+@dataclass(frozen=True)
+class Executing:
+    checks: tuple[Check, ...]
+
+
+@dataclass(frozen=True)
+class MissingRequired:
+    requirements: tuple[RequiredCheck, ...]
+
+
+@dataclass(frozen=True)
+class Waiting:
+    reason: Queued | Executing | MissingRequired
+
+
+@dataclass(frozen=True)
+class Failed:
+    checks: tuple[Check, ...]
+
+    def __post_init__(self) -> None:
+        if not self.checks or any(c.bucket != "fail" for c in self.checks):
+            raise ValueError("failed CI requires nonempty failures")
+
+
+def repair_evidence_incomplete(observation: CIObservation) -> bool:
+    result = reduce_ci(observation)
+    return isinstance(result, Unavailable) or (isinstance(result, Waiting) and isinstance(result.reason, MissingRequired))
+
+
+def gated_checks(observation: CIObservation | Iterable[Check]) -> tuple[Check, ...]:
+    if isinstance(observation, Unavailable):
+        return ()
+    if isinstance(observation, Observed):
+        return tuple(c for c in observation.reports if not observation.policy or c.required)
+    return tuple(observation)
+
+
+def reduce_ci(observation: CIObservation) -> Clear | Waiting | Failed | Unavailable:
+    if isinstance(observation, Unavailable):
+        return observation
+    eligible = gated_checks(observation)
+    witnesses = {(c.name, c.app_id) for c in eligible if c.required}
+    names = {name for name, _ in witnesses}
+    missing = tuple(sorted((r for r in observation.policy
+        if (r.context not in names if r.app_id is None else (r.context, r.app_id) not in witnesses)),
+        key=lambda r: (r.context, r.app_id or 0)))
+    if missing:
+        return Waiting(MissingRequired(missing))
+    pending = tuple(c for c in eligible if _is_pending(c))
+    if pending:
+        return Waiting(Executing(pending) if any(c.state != "QUEUED" for c in pending) else Queued(pending))
+    failures = tuple(c for c in eligible if c.bucket == "fail")
+    return Failed(failures) if failures else Clear()
+
+
+def cancelled_ci_unverified(observation: CIObservation, cancelled_head: str, rerun_head: str) -> bool:
+    # Empty-policy green after our cancellation can mean every job was skipped;
+    # only spending the existing rerun relinquishes the cancellation's authority.
+    return (isinstance(observation, Observed) and not observation.policy
+        and observation.head == cancelled_head and observation.head != rerun_head
+        and isinstance(reduce_ci(observation), Clear))
 
 
 def _is_pending(check: Check) -> bool:
@@ -59,12 +121,14 @@ def parse_timestamp(raw: str) -> datetime | None:
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
 
 
-def pending_checks(checks: Iterable[Check], ignore_regex: str = "") -> tuple[Check, ...]:
-    """The non-ignored checks currently holding `ci_state` at PENDING."""
-    return tuple(c for c in _kept(checks, ignore_regex) if _is_pending(c))
+def pending_checks(checks: CIObservation | Iterable[Check]) -> tuple[Check, ...]:
+    """The gating checks currently holding `ci_state` at PENDING."""
+    if isinstance(checks, Observed) and isinstance((result := reduce_ci(checks)), Waiting) and isinstance(result.reason, MissingRequired):
+        return ()
+    return tuple(c for c in gated_checks(checks) if _is_pending(c))
 
 
-def executing_pending_checks(checks: Iterable[Check], ignore_regex: str = "") -> tuple[Check, ...]:
+def executing_pending_checks(checks: CIObservation | Iterable[Check]) -> tuple[Check, ...]:
     """Pending checks that are not QUEUED: the ones a stall deadline may judge.
 
     A QUEUED check has no runner yet. Saturated GitHub-hosted runners held tauri
@@ -72,19 +136,22 @@ def executing_pending_checks(checks: Iterable[Check], ignore_regex: str = "") ->
     cancelled healthy runs, lost their queue position, and escalated them to a
     human. Every other pending state keeps its deadline and ceiling.
     """
-    return tuple(c for c in pending_checks(checks, ignore_regex) if c.state != "QUEUED")
+    return tuple(c for c in pending_checks(checks) if c.state != "QUEUED")
 
 
 def failed_checks(
-    checks: Iterable[Check], ignore_regex: str = ""
+    checks: CIObservation | Iterable[Check]
 ) -> tuple[Check, ...]:
-    """Settled, non-advisory failures covered by the configured CI policy."""
+    """Settled failures covered by the repository CI policy."""
 
-    return tuple(c for c in _kept(checks, ignore_regex) if c.bucket == "fail")
+    if isinstance(checks, (Observed, Unavailable)):
+        result = reduce_ci(checks)
+        return result.checks if isinstance(result, Failed) else ()
+    return tuple(c for c in checks if c.bucket == "fail")
 
 
 def pending_age_seconds(
-    checks: Iterable[Check], now: str, ignore_regex: str = ""
+    checks: CIObservation | Iterable[Check], now: str
 ) -> float | None:
     """Seconds since the NEWEST pending check started, or None when unknowable.
 
@@ -103,7 +170,7 @@ def pending_age_seconds(
     if at is None:
         return None
     starts = [
-        t for c in executing_pending_checks(checks, ignore_regex)
+        t for c in executing_pending_checks(checks)
         if (t := parse_timestamp(c.started_at)) is not None
     ]
     if not starts:
@@ -112,7 +179,7 @@ def pending_age_seconds(
 
 
 def pending_deadline_breached(
-    checks: Iterable[Check], now: str, max_seconds: float, ignore_regex: str = ""
+    checks: CIObservation | Iterable[Check], now: str, max_seconds: float
 ) -> bool:
     """True iff CI has been pending past `max_seconds` (#30).
 
@@ -128,42 +195,22 @@ def pending_deadline_breached(
     """
     if max_seconds <= 0:
         return False
-    age = pending_age_seconds(checks, now, ignore_regex)
+    age = pending_age_seconds(checks, now)
     return age is not None and age >= max_seconds
 
 
-def ci_state(
-    checks: Iterable[Check], ignore_regex: str = "", *, known: bool = True
-) -> CIState:
-    """Settled CI state for a PR's checks.
-
-    Port of watcher-lib.sh:ci_state. CI_IGNORE_CHECKS (an extended-regex of
-    check NAMES) drops environmentally-stuck checks BEFORE deciding, so a job
-    queued forever on a starved runner can't pin us at `pending` and deadlock
-    fix-CI + auto-merge. Real failures on any non-ignored check still count.
-
-    `known=False` (pass `pr.checks_known`) says the checks were never READ this
-    tick — the fetch failed, so `checks` is not an observation. That is UNKNOWN,
-    which matches no gate: not (OK, NONE) so merge-adjacent actions hold, and
-    not FAILURE so no repair leg is dispatched off an unread world (#48).
-
-    Precedence is the whole point:
-      unread fetch → unknown
-      empty (after ignore) → none
-      any pending/QUEUED/IN_PROGRESS → pending   (OUTRANKS failure)
-      any fail bucket → failure
-      else → ok
-    """
-    if not known:
+def ci_state(checks: CIObservation | Iterable[Check]) -> CIState:
+    """Compact telemetry vocabulary for the typed CI reduction."""
+    if not isinstance(checks, (Observed, Unavailable)):
+        checks = Observed("legacy", "legacy", frozenset(), tuple(checks))
+    result = reduce_ci(checks)
+    if isinstance(result, Unavailable):
         return CIState.UNKNOWN
-    kept = _kept(checks, ignore_regex)
-    if not kept:
-        return CIState.NONE
-    if any(_is_pending(c) for c in kept):
+    if isinstance(result, Waiting):
         return CIState.PENDING
-    if any(c.bucket == "fail" for c in kept):
+    if isinstance(result, Failed):
         return CIState.FAILURE
-    return CIState.OK
+    return CIState.OK if checks.reports else CIState.NONE
 
 
 def latest_other_review(reviews: Iterable[Review], fix_bot: str) -> Review | None:

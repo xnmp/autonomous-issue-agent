@@ -26,6 +26,8 @@ controlled replays, not live deployment evidence.
 
 from __future__ import annotations
 
+from tests.domain.builders import observed_pr
+
 from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta, timezone
@@ -153,7 +155,7 @@ def create_review_deployment(root: Path, *, heads: int = 4, ceiling: int = CEILI
     deployment = ReviewDeployment(root, target, base, tuple(shas), ceiling)
     remote = deployment.github()
     remote.seed(IssueView(1, title="Add thing", state="open"))
-    remote.seed_pr(PRView(
+    remote.seed_pr(observed_pr(
         PR, head_ref_name="fix/1-thing", head_ref_oid=shas[0], base_ref_oid=base, title="Add thing",
         body="Adds the thing.", labels=frozenset({Label.AI_PR_OPEN}), state="OPEN", closing_issue=1,
         author=FIX_BOT, base_ref_name="dev",

@@ -7,7 +7,8 @@ import json
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
 
-from ..domain.ci import ci_state, pending_checks
+from ..domain.ci import ci_state, pending_checks, reduce_ci, Waiting, MissingRequired
+from ..domain.checks import Observed, Unavailable
 from ..domain.events import Correlation, JsonValue, MAX_EVENT_LINE_BYTES
 from ..domain.ports import WorldObservationStore
 from ..domain.world import IssueView, PRView, WorldState
@@ -44,7 +45,6 @@ class WorldReporter:
     control: WorldObservationStore
     deployment: str
     log: Callable[[str], None] = _ignore_log
-    ci_ignore_checks: str = ""
 
     def wrap(self, observe: Callable[[], WorldState]) -> Callable[[], WorldState]:
         def reported() -> WorldState:
@@ -152,23 +152,31 @@ class WorldReporter:
                 }
                 for review in pr.reviews[-_MAX_INTERACTIONS:]
             ]
-        if pr.checks_known:
+        if isinstance(pr.ci, Observed):
             # Classification and rerun identity must survive lossy payload compaction.
             facts["ci_summary"] = {
-                "state": ci_state(pr.checks, self.ci_ignore_checks).value,
-                "policy": hashlib.sha256(self.ci_ignore_checks.encode()).hexdigest(),
+                "state": ci_state(pr.ci).value,
+                "basis": "required-checks",
+                "tested_revision": pr.ci.tested_revision,
+                "activity": "pending" if pending_checks(pr.checks) else "settled",
                 "running": _content_hash({"runs": sorted(
                     json.dumps([check.name, check.started_at, check.run_id])
-                    for check in pending_checks(pr.checks, self.ci_ignore_checks)
+                    for check in pending_checks(pr.checks)
                 )}),
             }
-            facts["checks_known"] = True
             facts["checks_total"] = len(pr.checks)
             facts["checks"] = [
                 {key: value for key, value in asdict(check).items()
-                 if key in {"name", "state", "bucket"} or key == "advisory" and value}
+                 if key in {"name", "state", "bucket", "required", "app_id", "kind"}}
                 for check in pr.checks
             ]
+            reduction = reduce_ci(pr.ci)
+            if isinstance(reduction, Waiting) and isinstance(reduction.reason, MissingRequired):
+                facts["missing_required"] = [
+                    f"{r.context} (app {r.app_id})" if r.app_id else r.context
+                    for r in reduction.reason.requirements[:_MAX_PATHS]]
+        elif pr.ci.reason != "checks not requested":
+            facts["ci_unavailable"] = pr.ci.reason
         if pr.mergeable:
             facts["mergeable"] = _bounded_text(pr.mergeable)
         if pr.merge_state:

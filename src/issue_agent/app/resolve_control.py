@@ -103,7 +103,7 @@ def open_resolve_operator(
     control.require_initialized()
     control.bind_active_owner(owner_identity_for_target(cfg.repo, cfg.target_dir, "fix"))
     remote = gateway(cfg, env) if gateway is not None else GitHubGateway(
-        cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None), base_branch=cfg.base_branch,
+        cfg.repo, Identity(static_token=env.get("FIX_BOT_TOKEN") or None),
     )
     checkout = worktrees(cfg) if worktrees is not None else Worktrees(cfg.target_dir, cfg.worktree_root, cfg.base_branch)
     store = Store(cfg.state_dir, runtime=cfg.fixer_runtime.value)

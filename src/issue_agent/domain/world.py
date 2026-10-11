@@ -17,6 +17,7 @@ from .identity import is_bot_login
 from .labels import Label
 from .lifecycle import pr_lifecycle
 from .refs import issue_from_branch
+from .checks import Check, CIObservation, Observed, Unavailable
 
 
 class CIState(str, Enum):
@@ -25,9 +26,9 @@ class CIState(str, Enum):
     others still queued/running is NOT yet a failure. Acting on it would push
     a commit that re-triggers in-flight jobs (the #49 loop)."""
 
-    OK = "ok"            # settled, all (non-ignored) checks passed
-    PENDING = "pending"  # at least one non-ignored check queued/in-progress
-    FAILURE = "failure"  # settled, at least one non-ignored check failed
+    OK = "ok"            # settled, all gating checks passed
+    PENDING = "pending"  # at least one gating check queued/in-progress
+    FAILURE = "failure"  # settled, at least one gating check failed
     NONE = "none"        # no checks configured (nothing to wait on)
     UNKNOWN = "unknown"  # the checks read FAILED this tick — not an answer (#48)
 
@@ -42,31 +43,6 @@ class ReviewDecision(str, Enum):
 REVIEW_APPROVED = "APPROVED"
 REVIEW_CHANGES_REQUESTED = "CHANGES_REQUESTED"
 REVIEW_COMMENTED = "COMMENTED"
-
-
-@dataclass(frozen=True)
-class Check:
-    """One CI check on a PR. `bucket` is gh's roll-up (pass/fail/pending/skipping);
-    `state` is the raw status (QUEUED/IN_PROGRESS/SUCCESS/…)."""
-
-    name: str
-    state: str = ""
-    bucket: str = ""
-    # ISO-8601 start of this check RUN (gh: `pr checks --json startedAt`). Drives
-    # the pending deadline (#30) — a check stuck IN_PROGRESS pins ci_state at
-    # PENDING forever, and this is the only field that says how long it has been
-    # stuck. Empty = unknown (a gh version without the field, a check that has
-    # not started, an unparseable value) → the deadline CANNOT fire on it: a
-    # missing timestamp must never be read as "infinitely old".
-    started_at: str = ""
-    # A failed job inside a workflow run whose overall conclusion is SUCCESS is
-    # GitHub's machine-readable representation of `continue-on-error: true`.
-    # Such a job is visible diagnostic output, not a merge-gating failure (#31).
-    advisory: bool = False
-    # Immutable GitHub Actions workflow-run identity derived from details_url.
-    # None identifies external commit statuses and malformed/unknown evidence;
-    # those failures cannot be safely rerun by a mutable branch lookup.
-    run_id: int | None = None
 
 
 @dataclass(frozen=True)
@@ -159,13 +135,7 @@ class PRView:
     # requiring an incoherent duplicate issue label.
     comments: tuple[Comment, ...] = ()
     reviews: tuple[Review, ...] = ()
-    checks: tuple[Check, ...] = ()
-    # False when the `gh pr checks` read FAILED this tick (non-infra gh error:
-    # rate-limit blip already raises, but a 404/odd answer degrades to ""). Then
-    # `checks=()` means UNREAD, not "no checks configured" — and reading it as
-    # honest NONE armed auto-merge on a PR whose checks were never seen (#48).
-    # `ci_state(..., known=False)` maps it to UNKNOWN, which no gate accepts.
-    checks_known: bool = True
+    ci: CIObservation = Unavailable("checks not observed")
     state: str = "OPEN"            # OPEN | MERGED | CLOSED
     closing_issue: int | None = None  # GitHub closing-reference graph (default-branch only)
     # Files this PR changes (adapter reads `gh pr view --json files`). Feeds the
@@ -195,11 +165,15 @@ class PRView:
     # False when the connection-shaped fields (body, comments, reviews,
     # changed_files) were NOT fetched — the terminal-PR fast path builds a view
     # from the `gh pr list` payload, which carries none of them (#163). Same
-    # contract as `checks_known`: absent ≠ empty. No lifecycle decision reads
+    # absence contract as the CI observation: absent ≠ empty. No lifecycle decision reads
     # them off a non-OPEN PR, but telemetry does, and a metric that cannot tell
     # "no files" from "files unread" reports a false zero (adversarial review
     # F4: the predicted-path hit rate is a primary metric).
     content_known: bool = True
+
+    @property
+    def checks(self) -> tuple[Check, ...]:
+        return self.ci.reports if isinstance(self.ci, Observed) else ()
 
     def has(self, label: Label) -> bool:
         return label in self.labels
@@ -363,13 +337,6 @@ class WorldState:
     # Safe to read only because a world is decided on the tick it was built:
     # WorldProbe raises WorldUnchanged instead of re-serving a cached world.
     now: str = ""
-    # Tip of the configured base branch at observation. "" = NOT COLLECTED (a
-    # hand-built world, a builder that predates this). Needed because GraphQL
-    # baseRefOid is a stale anchor, not the live tip: the advisory-UNSTABLE
-    # branch-refresh re-arms on base advances and this is the only field that
-    # can see one. Consumers must degrade gracefully on "".
-    base_head: str = ""
-
     def open_issues(self) -> tuple[IssueView, ...]:
         return tuple(i for i in self.issues if i.state == "open")
 
@@ -400,7 +367,7 @@ class HeadSignal:
     same source, never equal to the GraphQL world's own encoding of the same
     facts. `failing` is separate from `ci` because a failing check is exactly the
     state whose meaning depends on enrichment the signature does not carry (the
-    advisory-UNSTABLE workflow-conclusion read), so it forces a full build."""
+    repository-required policy read), so it forces a full build."""
 
     number: int
     head_ref_oid: str = ""
@@ -447,7 +414,7 @@ def probe_signal_heads(world: WorldState) -> tuple[HeadRef, ...]:
     * more heads than `PROBE_HEAD_CEILING` — see the constant;
     * a head the last build already saw RED or with checks unread. A red PR is
       one the fixer is about to act on (and whose meaning depends on the
-      advisory enrichment the reading cannot carry), so the reading would be
+      required-policy observation the reading cannot carry), so the reading would be
       bought every tick for a structurally impossible pass."""
     if any(i.has(Label.AI_WORKING) for i in world.issues if i.state == "open"):
         return ()
@@ -455,7 +422,7 @@ def probe_signal_heads(world: WorldState) -> tuple[HeadRef, ...]:
     if not inflight or len(inflight) > PROBE_HEAD_CEILING:
         return ()
     for pr in inflight:
-        if not pr.checks_known:
+        if isinstance(pr.ci, Unavailable):
             return ()
         if any(c.bucket == "fail" for c in pr.checks):
             return ()
@@ -487,7 +454,7 @@ def fix_probe_safe(world: WorldState, signals: ProbeSignals | None = None) -> bo
 
     Fails toward observation at every ambiguity — no reading, a failed reading,
     a head the reading does not cover, a head the reading covers but the world
-    does not, a failing check whose advisory enrichment the reading cannot
+    does not, a failing check whose required-policy observation the reading cannot
     carry, or a world `probe_signal_heads` refuses to plan a reading for — all
     return False, i.e. a full build. A wasted build costs points; a wrongly
     skipped tick costs a stalled PR.

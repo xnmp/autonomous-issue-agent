@@ -10,6 +10,7 @@ from issue_agent.domain.ci import (
     pending_deadline_breached,
 )
 from issue_agent.domain.world import CIState
+from issue_agent.domain.checks import Unavailable
 
 
 def test_no_checks_is_none():
@@ -24,12 +25,6 @@ def test_any_fail_is_failure():
     assert ci_state([Check("a", bucket="pass"), Check("b", bucket="fail")]) is CIState.FAILURE
 
 
-def test_failure_from_a_successful_workflow_run_is_advisory():
-    checks = [
-        Check("build", bucket="pass"),
-        Check("Security Audit", bucket="fail", advisory=True),
-    ]
-    assert ci_state(checks) is CIState.OK
 
 
 def test_advisory_is_not_inferred_without_a_successful_owning_run():
@@ -46,21 +41,10 @@ def test_queued_is_pending():
     assert ci_state([Check("x", state="QUEUED")]) is CIState.PENDING
 
 
-def test_ignore_regex_drops_stuck_check():
-    # A check stuck QUEUED forever on a starved runner must not pin us at pending.
-    checks = [Check("Format Backend", state="QUEUED"), Check("unit", bucket="pass")]
-    assert ci_state(checks, ignore_regex="Format Backend") is CIState.OK
 
 
-def test_ignore_all_checks_yields_none():
-    checks = [Check("Format Backend", state="QUEUED")]
-    assert ci_state(checks, ignore_regex="Format Backend") is CIState.NONE
 
 
-def test_real_failure_on_non_ignored_check_still_counts():
-    checks = [Check("Format Backend", state="QUEUED"), Check("unit", bucket="fail")]
-    # The stuck check is ignored, but the real failure on `unit` still settles.
-    assert ci_state(checks, ignore_regex="Format Backend") is CIState.FAILURE
 
 
 def test_latest_other_review_excludes_fixer():
@@ -225,14 +209,6 @@ def test_a_settled_recent_check_does_not_hold_off_the_deadline():
     assert pending_deadline_breached(checks, _later(3601), 3600)
 
 
-def test_ignored_checks_are_excluded_from_the_deadline():
-    # An operator-ignored check cannot pin ci_state, so it must not escalate
-    # either — the two filters have to agree.
-    checks = [Check("Format Backend", state="QUEUED", started_at=_T0)]
-    assert not pending_deadline_breached(
-        checks, _later(10**6), 3600, ignore_regex="Format Backend"
-    )
-    assert ci_state(checks, ignore_regex="Format Backend") is CIState.NONE
 
 
 def test_deadline_ignores_a_start_in_the_future():
@@ -271,16 +247,16 @@ def test_the_deadline_does_not_change_ci_state_precedence():
 # ── #48: an unread checks fetch is UNKNOWN, never an answer ───────────────────
 def test_unread_checks_are_unknown_not_none():
     # checks=() from a FAILED `gh pr checks` is not "no checks configured".
-    assert ci_state([], known=False) is CIState.UNKNOWN
+    assert ci_state(Unavailable("read failed")) is CIState.UNKNOWN
 
 
 def test_unread_outranks_everything_even_green():
     # Whatever stale tuple rode along, an unread fetch is not an observation.
-    assert ci_state([Check("unit", bucket="pass")], known=False) is CIState.UNKNOWN
-    assert ci_state([Check("unit", bucket="fail")], known=False) is CIState.UNKNOWN
+    assert ci_state(Unavailable("read failed")) is CIState.UNKNOWN
+    assert ci_state(Unavailable("read failed")) is CIState.UNKNOWN
 
 
 def test_honest_empty_read_stays_none():
     # The no-CI-repo path must not regress: a SUCCESSFUL read of zero checks
     # is still NONE (mergeable — nothing to wait on).
-    assert ci_state([], known=True) is CIState.NONE
+    assert ci_state([]) is CIState.NONE

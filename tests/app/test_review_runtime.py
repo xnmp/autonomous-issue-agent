@@ -1,5 +1,7 @@
 """Trusted external holds for review re-arms (ADR 0012 provenance, ADR 0015)."""
 
+from tests.domain.builders import observed_pr
+
 from datetime import datetime, timezone
 from types import SimpleNamespace
 
@@ -23,7 +25,7 @@ def observed(*labels: Label) -> ObservedPullRequest:
 
 
 def view(**fields) -> PRView:
-    return PRView(PR, head_ref_oid=HEAD, **fields)
+    return observed_pr(PR, head_ref_oid=HEAD, **fields)
 
 
 def test_harness_hold_labels_and_a_tripped_breaker_are_holds_but_lifecycle_labels_are_not():
@@ -44,7 +46,7 @@ def test_an_unreadable_counter_or_a_missing_view_is_never_permission_to_clear():
     with pytest.raises(ValueError):
         review_external_holds(lambda _pr: 0, 5)(observed(), None)
     with pytest.raises(ValueError):
-        review_external_holds(lambda _pr: 0, 5)(observed(), PRView(PR + 1))
+        review_external_holds(lambda _pr: 0, 5)(observed(), observed_pr(PR + 1))
 
 
 @pytest.mark.parametrize("key", ["issue", "pr", "recovered"])
@@ -69,7 +71,7 @@ def test_rearm_and_dispatch_read_the_same_current_allowance(rig, tmp_path):
     store = Store(str(tmp_path / "retired-files"))
     for _ in range(20):
         store.bump_infra_deaths(-9)
-    pr = PRView(9, head_ref_oid=HEAD)
+    pr = observed_pr(9, head_ref_oid=HEAD)
     errors = {}
     counts = _review_unproductive_rounds(control, "o/r", SimpleNamespace(prs=[pr]), errors)
     assert counts == {9: 3} and errors == {}

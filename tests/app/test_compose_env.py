@@ -20,7 +20,7 @@ C5(b): nothing exported the composed config into os.environ, so under systemd
 (unit files set only AGENT_ENV + TARGET_DIR) every subprocess spawned
 downstream (bash gate checkers, git, gh, codex — none of which pass `env=`
 explicitly) inherited an empty environment: the ALLOW_UNTESTED escape hatch
-became unreachable and operator knobs like CI_IGNORE_CHECKS were silently
+became unreachable and operator knobs like CI_PENDING_MAX_SECONDS were silently
 ignored. `app/main.py::main()` now calls `os.environ.update(env)` before
 building anything.
 
@@ -193,7 +193,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
 ):
     # review C5: end-to-end — shared.env + overlay -> compose-env.sh ->
     # .active.env -> _load_agent_env -> (simulated main.py) os.environ. Uses
-    # CI_IGNORE_CHECKS (documented, omitted from the old allow-list) and
+    # CI_PENDING_MAX_SECONDS (documented, omitted from the old allow-list) and
     # MAX_INFRA_DEATHS (a brand-new knob no allow-list edit ever added), plus
     # a value with spaces/quotes to prove %q quoting survived the rewrite.
     compose_env_sh = _install_compose_env(tmp_path)
@@ -205,7 +205,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
     repos_dir.mkdir()
     (repos_dir / "demo.env").write_text(
         'REPO="acme/widget"\n'
-        'CI_IGNORE_CHECKS="Format.*"\n'
+        'CI_PENDING_MAX_SECONDS="3600"\n'
         'MAX_INFRA_DEATHS="7"\n'
         # Escaped \$ — a LITERAL dollar sign in the value, not a shell
         # parameter expansion (compose-env.sh sources this as real bash, so
@@ -220,12 +220,12 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
 
     active = tmp_path / "config" / ".active.demo.env"
     active_text = active.read_text()
-    assert "CI_IGNORE_CHECKS=" in active_text
+    assert "CI_PENDING_MAX_SECONDS=" in active_text
     assert "MAX_INFRA_DEATHS=7" in active_text
     assert "REPO=acme/widget" in active_text
 
     env = _load_agent_env({"AGENT_ENV": str(active)})
-    assert env["CI_IGNORE_CHECKS"] == "Format.*"
+    assert env["CI_PENDING_MAX_SECONDS"] == "3600"
     assert env["MAX_INFRA_DEATHS"] == "7"
     assert env["WEIRD_VALUE"] == 'has spaces and "quotes" and $dollar signs'
     assert env["REPO"] == "acme/widget"
@@ -235,7 +235,7 @@ def test_compose_env_pipeline_carries_knobs_outside_old_allow_list_to_os_environ
     # undoes this automatically at teardown.
     for k, v in env.items():
         monkeypatch.setenv(k, v)
-    assert os.environ["CI_IGNORE_CHECKS"] == "Format.*"
+    assert os.environ["CI_PENDING_MAX_SECONDS"] == "3600"
     assert os.environ["MAX_INFRA_DEATHS"] == "7"
     assert os.environ["WEIRD_VALUE"] == 'has spaces and "quotes" and $dollar signs'
 
@@ -389,7 +389,7 @@ def test_compose_env_emitted_key_set_equals_the_names_the_files_assign(tmp_path)
     overlay = (
         'REPO="acme/widget"\n'
         'MERGE_METHOD="squash"\n'
-        'CI_IGNORE_CHECKS="Format.*"\n'
+        'CI_PENDING_MAX_SECONDS="3600"\n'
         'EMPTY_ON_PURPOSE=\n'
     )
     (tmp_path / "config").mkdir(exist_ok=True)
@@ -529,10 +529,10 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
     env_file = tmp_path / "agent.env"
     env_file.write_text(
         'REPO="o/r"\nFIX_BOT="fixer"\n'
-        'CI_IGNORE_CHECKS="Format.*"\nMAX_INFRA_DEATHS="9"\n'
+        'CI_PENDING_MAX_SECONDS="3600"\nMAX_INFRA_DEATHS="9"\n'
     )
     monkeypatch.setenv("AGENT_ENV", str(env_file))
-    monkeypatch.delenv("CI_IGNORE_CHECKS", raising=False)
+    monkeypatch.delenv("CI_PENDING_MAX_SECONDS", raising=False)
     monkeypatch.delenv("MAX_INFRA_DEATHS", raising=False)
     # Avoid a real flock/tempfile side effect — the single-instance guard is
     # not what this test is about.
@@ -555,7 +555,7 @@ def test_main_exports_composed_env_into_os_environ_before_building(tmp_path, mon
     with pytest.raises(RuntimeError):
         main_module.main(["fix"])
 
-    assert os.environ["CI_IGNORE_CHECKS"] == "Format.*"
+    assert os.environ["CI_PENDING_MAX_SECONDS"] == "3600"
     assert os.environ["MAX_INFRA_DEATHS"] == "9"
 
 
@@ -585,7 +585,7 @@ def test_build_role_does_not_reload_env_when_already_provided(
         {
             "REPO": "o/r",
             "FIX_BOT": "fix-bot",
-            "ARM_ON_OPEN": "0",
+
             "STATE_DIR": str(state / "fix"),
             "REVIEW_STATE_DIR": str(state / "review"),
             "STEWARD_STATE_DIR": str(state / "steward"),
@@ -616,7 +616,7 @@ def test_world_probe_preserves_fix_daemon_dispatch_identity(monkeypatch, tmp_pat
     daemon = main_module.build_role("fix", {
         "REPO": "o/r",
         "FIX_BOT": "fix-bot",
-        "ARM_ON_OPEN": "0",
+
         "WORLD_PROBE": "1",
         "STATE_DIR": str(tmp_path),
     })
@@ -670,7 +670,6 @@ def test_build_role_self_loads_env_when_called_standalone_without_one(
     )
     monkeypatch.setenv("REPO", "o/r")
     monkeypatch.setenv("FIX_BOT", "fix-bot")  # required since review P1R-7
-    monkeypatch.setenv("ARM_ON_OPEN", "0")
     state = tmp_path / "state"
     monkeypatch.setenv("STATE_DIR", str(state / "fix"))
     monkeypatch.setenv("REVIEW_STATE_DIR", str(state / "review"))
@@ -956,50 +955,10 @@ def test_doctor_accepts_a_base_branch_whose_prs_do_get_checks(tmp_path):
     assert "PRs into 'trunk' receive checks (1 of the last 1 sampled)" in result.stdout
 
 
-def test_doctor_flags_a_check_red_on_every_pr_and_escapes_the_suggested_regex(tmp_path):
-    """The continue-on-error shape. The suggested CI_IGNORE_CHECKS value must be
-    a usable ERE: real check names contain parentheses ("Test (ubuntu-latest)"),
-    which are regex metacharacters."""
-    always_red = {"name": "Test (ubuntu-latest)", "conclusion": "FAILURE"}
-    result = _ci_doctor(
-        tmp_path, {},
-        workflows=1,
-        prs=[
-            _pr(9, [{"name": "Lint", "conclusion": "SUCCESS"}, always_red]),
-            _pr(8, [{"name": "Lint", "conclusion": "SUCCESS"}, always_red]),
-        ],
-    )
-    assert "FAILED on all 2 sampled PR(s)" in result.stdout
-    assert r"CI_IGNORE_CHECKS='^Test \(ubuntu-latest\)$'" in result.stdout
-    # A check that passed at least once is NOT persistently red.
-    assert "'Lint'" not in result.stdout
 
 
-def test_doctor_does_not_flag_a_check_that_passed_at_least_once(tmp_path):
-    """One flaky red must say nothing — otherwise the check trains operators to
-    add CI_IGNORE_CHECKS entries that mask real breaks."""
-    result = _ci_doctor(
-        tmp_path, {},
-        workflows=1,
-        prs=[
-            _pr(9, [{"name": "Flaky", "conclusion": "FAILURE"}]),
-            _pr(8, [{"name": "Flaky", "conclusion": "SUCCESS"}]),
-        ],
-    )
-    assert "FAILED on all" not in result.stdout
 
 
-def test_doctor_is_quiet_when_ci_ignore_checks_already_covers_the_red_check(tmp_path):
-    result = _ci_doctor(
-        tmp_path, {"CI_IGNORE_CHECKS": "^Security Audit$"},
-        workflows=1,
-        prs=[
-            _pr(9, [{"name": "Security Audit", "conclusion": "FAILURE"}]),
-            _pr(8, [{"name": "Security Audit", "conclusion": "FAILURE"}]),
-        ],
-    )
-    assert "CI_IGNORE_CHECKS already drops it" in result.stdout
-    assert "Suppress it with" not in result.stdout
 
 
 def test_doctor_errors_when_the_repo_forbids_the_configured_merge_method(tmp_path):

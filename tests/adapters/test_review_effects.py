@@ -5,6 +5,8 @@ minted by the pure review policy and committed the way the review control will
 commit them; the executor drains them through its ordinary recovery path.
 """
 
+from tests.domain.builders import observed_pr
+
 from contextlib import closing
 from dataclasses import replace
 from datetime import timedelta
@@ -52,7 +54,7 @@ class Rig:
         self.store.initialize()
         self.remote_path = tmp_path / "remote.sqlite"
         self.remote = PersistentGitHub(self.remote_path, fault=fault, clock=lambda: self.clock[0])
-        self.remote.seed_pr(PRView(PR, head_ref_oid=HEAD, labels=frozenset({Label.NEEDS_HUMAN_REVIEW})))
+        self.remote.seed_pr(observed_pr(PR, head_ref_oid=HEAD, labels=frozenset({Label.NEEDS_HUMAN_REVIEW})))
         for index in range(2):
             self.remote.seed_review(PR, f"r{index}", author=BOT, commit=HEAD,
                                     submitted_at=f"2026-09-25T11:00:0{index}+00:00")

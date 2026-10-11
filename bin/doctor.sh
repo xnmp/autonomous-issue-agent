@@ -474,13 +474,6 @@ echo "== CI on the base branch =="
 #      triggered on `main` while every PR targets `chong-dev`, so `gh run list`
 #      was empty and five merged PRs had received zero checks between them.
 #
-#   D. A check that is red on EVERY PR (a `continue-on-error: true` advisory
-#      job, or one that is simply broken) still reports conclusion FAILURE, and
-#      domain/ci.py:45 turns any `fail` bucket into CIState.FAILURE regardless.
-#      The harness cannot tell it apart from a real break, so it burns fix-ci
-#      legs forever on something no change can clear. CI_IGNORE_CHECKS is the
-#      cure; this finds the pattern and hands over the regex.
-#
 #   E. An auto-merge whose MERGE_METHOD the repo forbids fails at the very last
 #      step, after the whole issue has been paid for.
 #
@@ -534,33 +527,7 @@ else
       else
         ok "PRs into '$_BASE' receive checks ($_WITH of the last $_PRS sampled)"
 
-        # ── D. Checks that are red on EVERY sampled PR ───────────────────────
-        # Only PRs that got checks are considered, and a name must appear on all
-        # of them AND be FAILURE every time. One flaky red therefore says
-        # nothing; a job that cannot pass says it loudly.
-        _RED="$(printf '%s' "$_ROLLUP" | jq -r '
-          [ .[] | select((.statusCheckRollup//[]) | length > 0) ] as $prs
-          | ($prs | length) as $n
-          | [ $prs[].statusCheckRollup[]
-              | {name: .name, c: ((.conclusion // .state // "") | ascii_upcase)} ]
-          | group_by(.name)
-          | map(select((length == $n) and (all(.[]; .c == "FAILURE"))))
-          | map(.[0].name)[]' 2>/dev/null)"
-        if [ -n "$_RED" ]; then
-          while IFS= read -r _name; do
-            [ -n "$_name" ] || continue
-            # Already suppressed? Compare with bash ERE, the closest available
-            # analogue of the Python re.search domain/ci.py runs.
-            if [ -n "${CI_IGNORE_CHECKS:-}" ] && [[ "$_name" =~ $CI_IGNORE_CHECKS ]]; then
-              ok "check '$_name' is red on all $_WITH sampled PR(s) but CI_IGNORE_CHECKS already drops it"
-            else
-              # Escape the ERE metacharacters GitHub check names really contain
-              # ("Test (ubuntu-latest)" has parentheses).
-              _esc="$(printf '%s' "$_name" | sed -e 's/[][(){}.*+?^$|\\]/\\&/g')"
-              warn "check '$_name' FAILED on all $_WITH sampled PR(s) into '$_BASE'. If it is advisory (a continue-on-error job — GitHub still reports its conclusion as FAILURE, and domain/ci.py:45 makes any fail bucket a CIState.FAILURE), the harness cannot tell it from a real break and will burn fix-ci legs on it forever. Suppress it with: CI_IGNORE_CHECKS='^${_esc}\$'"
-            fi
-          done <<< "$_RED"
-        fi
+
       fi
     fi
   fi
@@ -618,7 +585,7 @@ if [ -n "${TARGET_DIR:-}" ] && [ -d "$_WF_DIR" ]; then
     ' "${_WF_FILES[@]}" 2>/dev/null \
       | grep -iE '^(windows|macos)' | sort -u | paste -sd, - | sed 's/,/, /g')"
     if [ -n "$_NONLINUX" ]; then
-      warn "CI matrix includes $_NONLINUX — TEST_CMD runs on Linux only (this box), so failures on those platforms are invisible to preflight AND to the local gate. The harness cannot reproduce or fix them; each one costs a fix-ci leg that cannot converge. Verify those jobs are green before trusting auto-merge, or exclude them with CI_IGNORE_CHECKS."
+      warn "CI matrix includes $_NONLINUX — TEST_CMD runs on Linux only (this box), so failures on those platforms are invisible to preflight AND to the local gate. The harness cannot reproduce or fix them; each one costs a fix-ci leg that cannot converge. Verify those jobs are green before trusting auto-merge."
     fi
   fi
 fi

@@ -72,6 +72,8 @@ def test_approved_green_open_pr_without_automerge_is_merge_ready():
         {"isDraft": True},
         {"mergeable": "CONFLICTING"},
         {"mergeStateStatus": "DIRTY"},
+        {"mergeStateStatus": "HAS_HOOKS"},
+        {"mergeStateStatus": "UNSTABLE"},
     ],
 )
 def test_pr_that_still_has_harness_work_is_not_merge_ready(override):

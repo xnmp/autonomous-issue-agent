@@ -1,5 +1,7 @@
 """Fix-watcher decision behaviour — the poll_once control flow + invariants."""
 
+from tests.domain.builders import with_checks
+
 from dataclasses import replace
 
 import pytest
@@ -76,7 +78,7 @@ from issue_agent.domain.continuation_components import IssueRecoveryState
 from issue_agent.domain import continuation_components as cc
 from issue_agent.domain.contracts import ContinuationAdmission
 
-CFG = FixConfig(fix_bot="fix-bot", arm_on_open=True)
+CFG = FixConfig(fix_bot="fix-bot", )
 
 
 def _workflow(number, *, session=False, failures=0, held=False, error=""):
@@ -1272,7 +1274,7 @@ def test_stale_or_unattributed_approval_never_authorizes_current_head():
 
 
 def test_arm_on_open_never_bypasses_current_head_review():
-    cfg = replace(CFG, arm_on_open=True)
+    cfg = replace(CFG, )
     candidate = pr(
         100,
         "ai-pr-open",
@@ -1323,160 +1325,6 @@ def test_clean_pr_does_not_update_branch():
     actions = decide_fix(world(prs=[_approved_green_pr()]), CFG, FixState(), fixer_busy=False)
     assert not any(isinstance(a, UpdateBranch) for a in actions)
 
-
-# ── advisory-UNSTABLE refresh (keifu #166, 2026-08-01) ───────────────────────
-def _approved_advisory_unstable_pr():
-    """APPROVED, and the only failing check is operator-ignored (advisory) —
-    GitHub reports UNSTABLE (a failing check wins the enum, masking BEHIND),
-    the exact-head merge gate refuses UNSTABLE, and without a refresh the
-    stale check never re-runs against the base that fixed it."""
-    return pr(
-        100, "ai-pr-open",
-        head_ref_oid="head-100",
-        reviews=(
-            Review("APPROVED", "review-bot", "t1", commit_id="head-100"),
-        ),
-        checks=(
-            Check("build", bucket="pass"),
-            Check("Security Audit", bucket="fail", advisory=True),
-        ),
-        mergeable="MERGEABLE", merge_state="UNSTABLE",
-    )
-
-
-def test_approved_advisory_unstable_pr_gets_a_branch_refresh():
-    w = world(prs=[_approved_advisory_unstable_pr()], base_head="base-1")
-    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert UpdateBranch(100, "head-100", "base-1") in actions
-
-
-def test_advisory_unstable_refresh_fires_once_per_head_and_base():
-    """The marker breaks the loop: a refresh already dispatched for this
-    (head, base tip) pair (recorded before the update call) must not re-fire —
-    an already-up-to-date branch keeps both parts unchanged forever, and would
-    otherwise push every poll."""
-    st = FixState(update_branch_head={100: "head-100:base-1"})
-    w = world(prs=[_approved_advisory_unstable_pr()], base_head="base-1")
-    actions = decide_fix(w, CFG, st, fixer_busy=False)
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_behind_refresh_is_bounded_by_exact_head_base_with_independent_base_progress():
-    pr = replace(_approved_advisory_unstable_pr(), merge_state="BEHIND")
-    state = FixState(update_branch_head={100: "head-100:base-1"})
-    assert not any(isinstance(action, UpdateBranch) for action in decide_fix(
-        world(prs=[pr], base_head="base-1"), CFG, state, fixer_busy=False))
-    assert UpdateBranch(100, "head-100", "base-2") in decide_fix(
-        world(prs=[pr], base_head="base-2"), CFG, state, fixer_busy=False)
-
-
-def test_a_base_advance_rearms_the_advisory_refresh():
-    """Adversarial F1 (this arm's whole reason to exist): an attempt made
-    BEFORE the base gained the fix must not permanently disarm the refresh —
-    when the base advances, the key changes and the arm fires again."""
-    st = FixState(update_branch_head={100: "head-100:base-1"})
-    w = world(prs=[_approved_advisory_unstable_pr()], base_head="base-2")
-    actions = decide_fix(w, CFG, st, fixer_busy=False)
-    assert UpdateBranch(100, "head-100", "base-2") in actions
-
-
-def test_an_uncollected_base_head_disables_the_advisory_arm():
-    """base_head "" (hand-built world, older builder, fetch hiccup) must not
-    fire the advisory arm at all: a key that flaps between "H:" and "H:B" on
-    fetch availability would re-fire a no-op update per transition. Without
-    base visibility only the BEHIND arm applies."""
-    w = world(prs=[_approved_advisory_unstable_pr()])  # base_head not collected
-    actions = decide_fix(w, CFG, FixState(), fixer_busy=False)
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_unknown_merge_state_is_not_refreshed():
-    p = replace(_approved_advisory_unstable_pr(), merge_state="UNKNOWN")
-    actions = decide_fix(
-        world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False
-    )
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_unread_checks_do_not_qualify_for_the_advisory_refresh():
-    """checks_known=False means the checks call failed — UNSTABLE with unread
-    checks is not evidence the failures are advisory."""
-    p = replace(_approved_advisory_unstable_pr(), checks=(), checks_known=False)
-    actions = decide_fix(
-        world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False
-    )
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_genuinely_red_unstable_pr_is_not_refreshed():
-    """A NON-advisory failing check means CI is genuinely red — that is the
-    repair path's job, not a branch update's."""
-    p = replace(
-        _approved_advisory_unstable_pr(),
-        checks=(
-            Check("build", bucket="pass"),
-            Check("Security Audit", bucket="fail"),  # NOT advisory
-        ),
-    )
-    actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_operator_regex_ignored_failure_also_qualifies_for_refresh():
-    """CI_IGNORE_CHECKS (regex) is the operator-declared twin of the advisory
-    flag — an UNSTABLE whose failures are all regex-ignored refreshes too."""
-    p = replace(
-        _approved_advisory_unstable_pr(),
-        checks=(
-            Check("build", bucket="pass"),
-            Check("Security Audit", bucket="fail"),  # NOT advisory
-        ),
-    )
-    cfg = replace(CFG, ci_ignore_checks="^Security Audit$")
-    actions = decide_fix(
-        world(prs=[p], base_head="base-1"), cfg, FixState(), fixer_busy=False
-    )
-    assert UpdateBranch(100, "head-100", "base-1") in actions
-
-
-def test_unapproved_advisory_unstable_pr_is_not_refreshed():
-    p = replace(
-        _approved_advisory_unstable_pr(),
-        reviews=(
-            Review(
-                "CHANGES_REQUESTED", "review-bot", "t1", commit_id="head-100"
-            ),
-        ),
-    )
-    actions = decide_fix(world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False)
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_conflicting_unstable_pr_takes_the_rebase_path_not_a_refresh():
-    p = replace(
-        _approved_advisory_unstable_pr(), mergeable="CONFLICTING"
-    )
-    actions = decide_fix(world(prs=[p], base_head="base-1"), CFG, FixState(), fixer_busy=False)
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_behind_without_approval_does_not_update_branch():
-    # BEHIND but not approvable → auto-merge gate fails → no update (nothing to land).
-    p = pr(100, "ai-pr-open", checks=(Check("build", bucket="pass"),),
-           mergeable="MERGEABLE", merge_state="BEHIND")
-    actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-
-
-def test_conflicting_takes_rebase_not_update_branch():
-    # DIRTY/CONFLICTING → the REBASE agent path, never the cheap update-branch.
-    p = pr(100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
-           reviews=(Review("APPROVED", "review-bot", "t1"),),
-           checks=(Check("build", bucket="pass"),),
-           mergeable="CONFLICTING", merge_state="DIRTY")
-    actions = decide_fix(world(prs=[p]), CFG, FixState(), fixer_busy=False)
-    assert not any(isinstance(a, UpdateBranch) for a in actions)
-    assert not p.is_behind()
 
 
 # ── M14: auto-merge is INDEPENDENT of the fixer lock ──────────────────────────
@@ -1640,7 +1488,7 @@ def test_unset_fix_bot_claims_no_pr_at_all():
 # but gh reports the PR author bare as `fix-bot`. Under a raw `==` the authorship
 # filter above matched NOTHING, so address-review / fix-ci / rebase / auto-merge
 # never dispatched — forever, with no error.
-SUFFIXED_CFG = FixConfig(fix_bot="fix-bot[bot]", arm_on_open=True)
+SUFFIXED_CFG = FixConfig(fix_bot="fix-bot[bot]", )
 
 
 def test_c1_suffixed_fix_bot_still_addresses_review_on_its_own_pr():
@@ -2695,10 +2543,6 @@ def test_zero_deadline_disables_the_escalation():
     assert not _escalated(decide_fix(w, cfg, FixState(), fixer_busy=False))
 
 
-def test_ignored_checks_do_not_trigger_the_deadline():
-    cfg = FixConfig(fix_bot="fix-bot", ci_ignore_checks="^Test \\(windows-latest\\)$")
-    w = world(prs=[_wedged_pr()], now=_stall_now(10**6))
-    assert not _escalated(decide_fix(w, cfg, FixState(), fixer_busy=False))
 
 
 def test_a_stalled_pr_is_not_also_dispatched_or_armed_this_tick():
@@ -2922,6 +2766,26 @@ def test_a_cancel_that_never_takes_effect_escalates_within_a_bounded_wait():
     assert escalations and "cancelled" in escalations[0].body
 
 
+def test_a_green_after_our_cancel_escalates_without_a_phantom_pending_check():
+    # #303 review: the post-cancel aftermath is synthesised with no pending
+    # clock and no checks, so the stall preamble invented "pending for 0
+    # minutes (an unnamed check)" on a PR with nothing pending.
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
+    green = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(Check("unit", state="SUCCESS", bucket="pass"),
+                Check("lint", state="SKIPPED", bucket="skipping")),
+    )
+
+    actions = decide_fix(world(prs=[green], now=_stall_now(7200)), CFG, state,
+                         fixer_busy=False)
+
+    [escalation] = [a for a in actions if isinstance(a, EscalateCiPending)]
+    assert escalation.body.startswith("The harness requested cancellation")
+    assert "pending for" not in escalation.body
+
+
 def test_the_wait_is_bounded_even_when_new_jobs_keep_resetting_the_stall_clock():
     # The regression (adversarial review S2): cancelling a wedged run is exactly
     # what lets follow-on jobs start, and one fresh pending check resets
@@ -3035,16 +2899,13 @@ def test_an_already_escalated_head_is_left_alone_entirely():
     assert _cancels(actions) == [] and not _escalated(actions)
 
 
-def test_a_cancelled_run_that_comes_back_green_is_never_treated_as_evidence():
-    """Adversarial review S3. Jobs that had not started when a run is cancelled
-    are reported `skipped`, and `skipped` buckets as PASS — so a run stalled in
-    `queued` can come back with nothing red at all. Auto-merging on that would
-    mean merging on the strength of CI the harness itself cancelled."""
+@pytest.mark.parametrize("verdict", ["SUCCESS", "SKIPPED", "empty"])
+def test_empty_policy_clear_ci_after_cancel_escalates_instead_of_merging(verdict):
     approved = pr(
         100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
         head_ref_oid="sha-aaa", mergeable="MERGEABLE",
         reviews=(Review("APPROVED", "review-bot", "t1", commit_id="sha-aaa"),),
-        checks=(Check("Test (windows-latest)", state="COMPLETED",
+        checks=() if verdict == "empty" else (Check("Test (windows-latest)", state=verdict,
                       bucket="pass", started_at=_STALL_T0, run_id=77),),
     )
     state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
@@ -3053,17 +2914,12 @@ def test_a_cancelled_run_that_comes_back_green_is_never_treated_as_evidence():
                          state, fixer_busy=False)
 
     assert not any(isinstance(a, EnableAutoMerge) for a in actions)
-    escalations = [a for a in actions if isinstance(a, EscalateCiPending)]
-    assert escalations and "unverified" in escalations[0].body
-    # It must NOT assert why the checks are green: a cancel that never landed
-    # leaves the same marker, and the run may simply have finished on its own.
-    body = escalations[0].body
-    assert "every job was skipped" not in body and "artefact" not in body
+    assert any(isinstance(a, EscalateCiPending) for a in actions)
+    assert all(remedy.step is CiStallStep.ESCALATE for remedy in ci_remediations(
+        world(prs=[approved], now=_stall_now(3700)), CFG, state))
 
 
 def test_a_green_head_the_harness_never_cancelled_is_untouched():
-    # Anti-vacuity for the guard above: it keys on the cancel marker, so an
-    # ordinary green PR still arms auto-merge.
     approved = pr(
         100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
         head_ref_oid="sha-aaa", mergeable="MERGEABLE",
@@ -3080,8 +2936,6 @@ def test_a_green_head_the_harness_never_cancelled_is_untouched():
 
 
 def test_a_spent_re_run_hands_the_verdict_back_to_github():
-    # Once the re-run has been spent on this head, the green is GitHub's answer
-    # to a real run, not an artefact of the cancel — the guard must let go.
     approved = pr(
         100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
         head_ref_oid="sha-aaa", mergeable="MERGEABLE",
@@ -3101,7 +2955,7 @@ def test_a_spent_re_run_hands_the_verdict_back_to_github():
     assert not any(isinstance(a, EscalateCiPending) for a in actions)
 
 
-def test_the_green_illusion_escalation_is_one_shot():
+def test_clear_ci_does_not_repeat_a_previous_pending_escalation():
     approved = pr(
         100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
         head_ref_oid="sha-aaa", mergeable="MERGEABLE",
@@ -3431,7 +3285,7 @@ def test_a_tripped_ci_breaker_neither_reruns_nor_escalates_without_capacity(slot
 
 
 def test_an_issueless_pr_is_not_escalated_on_a_busy_tick():
-    stale = replace(
+    stale = with_checks(
         _red_pr(), closing_issue=None, head_ref_name="feat/ACME-2468-x",
         checks=(Check("unit", bucket="pass"),),
         reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old-sha"),),
@@ -3464,7 +3318,7 @@ def test_spent_free_rerun_cannot_launch_paid_repair_without_capacity():
 ])
 def test_zero_capacity_preserves_free_rerun_safety_and_repair_precedence(overrides, state, issues):
     actions = decide_fix(
-        world(prs=[replace(_red_pr(), **overrides)], issues=issues),
+        world(prs=[with_checks(_red_pr(), **overrides)], issues=issues),
         replace(CFG, auto_rebase_conflicts=True), state,
         fixer_busy=False, dispatch_slots=0,
     )

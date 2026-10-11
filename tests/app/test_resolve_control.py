@@ -90,7 +90,6 @@ def test_factory_preserves_configured_fix_owner_credentials_base_host_and_author
     assert isinstance(workflow.worktrees, Worktrees)
     assert workflow.gateway.repo == "o/r"
     assert workflow.gateway.identity.env_token() == "isolated-fix-token"
-    assert workflow.gateway.base_branch == "release"
     assert workflow.worktrees.repo_dir == env["TARGET_DIR"]
     assert workflow.worktrees.base_branch == "release"
     assert workflow.approved_host == "git.example.test"
@@ -216,7 +215,7 @@ def test_ambient_token_role_base_and_agent_env_cannot_replace_snapshot(deploymen
     workflow = _open(deployment)
     assert isinstance(workflow.gateway, GitHubGateway)
     assert workflow.gateway.identity.env_token() == env["FIX_BOT_TOKEN"]
-    assert workflow.gateway.base_branch == env["BASE_BRANCH"]
+    assert workflow.worktrees.base_branch == env["BASE_BRANCH"]
 
 
 def _compose(deployment):

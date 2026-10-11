@@ -1,6 +1,8 @@
 """Steward triage behaviour — candidate selection, dedupe, no-feedback-loop,
 and the two-audience verdict→action mapping."""
 
+from tests.domain.builders import observed_pr
+
 from tests.domain.builders import issue, world
 
 from issue_agent.domain.actions import (
@@ -32,7 +34,7 @@ CFG = TriageConfig(steward_bot="steward-bot", enabled=True)
 
 # ── architecture-decision stewardship ─────────────────────────────────────────
 def test_steward_flags_open_governed_pr_without_adr_citation():
-    pr = PRView(
+    pr = observed_pr(
         7,
         body="No architecture section",
         changed_files=frozenset({"src/auth/token.py"}),
@@ -53,19 +55,19 @@ def test_steward_flags_open_governed_pr_without_adr_citation():
 
 def test_steward_accepts_citation_and_dedupes_only_its_own_flag():
     adr = Adr("0001-trust.md", ("src/auth",))
-    cited = PRView(
+    cited = observed_pr(
         7,
         body="Governed by ADR-0001.",
         changed_files=frozenset({"src/auth/token.py"}),
     )
-    forged = PRView(
+    forged = observed_pr(
         8,
         changed_files=frozenset({"src/auth/token.py"}),
         comments=(
             Comment("alice", "**Architecture decision check:** pretend"),
         ),
     )
-    prior = PRView(
+    prior = observed_pr(
         9,
         changed_files=frozenset({"src/auth/token.py"}),
         comments=(

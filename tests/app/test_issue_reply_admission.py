@@ -1,4 +1,6 @@
 """Issue replies buy paid work only through the selected SQL continuation."""
+
+from tests.domain.builders import observed_pr
 from tests.fakes.workflow_authority import retained_issue_file, seed_retained_issue_file
 
 
@@ -94,7 +96,7 @@ def test_linked_pr_issue_reply_consumes_timestamp_without_no_pr_count_or_branch(
     from issue_agent.adapters.workflow_codec import decode_workflow
     from issue_agent.domain import continuation_components as cc
     workflow, gateway, store, runner = setup_reply()
-    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="head", closing_issue=5)
+    gateway.prs[100] = observed_pr(100, head_ref_name="fix/5-title", head_ref_oid="head", closing_issue=5)
     gateway._pr_for_issue[5] = 100
     from tests.fakes.accounted_workflow import attach_workflow_authority
     attach_workflow_authority(gateway, store, pr_repair=True)
@@ -117,7 +119,7 @@ def test_linked_pr_issue_reply_consumes_timestamp_without_no_pr_count_or_branch(
 def test_linked_pr_budget_refusal_leaves_issue_reply_available(monkeypatch):
     from issue_agent.domain.world import PRView
     workflow, gateway, store, runner = setup_reply()
-    gateway.prs[100] = PRView(100, head_ref_name="fix/5-title", head_ref_oid="head", closing_issue=5)
+    gateway.prs[100] = observed_pr(100, head_ref_name="fix/5-title", head_ref_oid="head", closing_issue=5)
     gateway._pr_for_issue[5] = 100
     from tests.fakes.accounted_workflow import attach_workflow_authority
     attach_workflow_authority(gateway, store, pr_repair=True)

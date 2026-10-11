@@ -1,3 +1,6 @@
+
+from tests.domain.builders import observed_pr
+from issue_agent.domain.checks import Check
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -27,6 +30,7 @@ from issue_agent.domain.actions import (
     UpdateBranch,
 )
 from issue_agent.domain.labels import Label
+from issue_agent.domain.fix import FixConfig
 from issue_agent.domain.eligibility import LifecycleOperation
 from issue_agent.domain.lifecycle import completion_guard
 from issue_agent.domain.world import IssueView, Comment
@@ -39,6 +43,8 @@ class Gateway:
         self.comments = set()
         self.calls = []
         self.head = "head-1"
+        self.ci_state = "clear"
+        self.merge_state = "CLEAN"
         self.issue_revision = "issue-rev-1"
         self.auto_merge = set()
         self.run_attempt = 0
@@ -82,7 +88,12 @@ class Gateway:
 
     def get_pr(self, pr, *, mergeability=True, checks=True):
         del mergeability, checks
-        return SimpleNamespace(head_ref_oid=self.head)
+        reports = () if self.ci_state == "clear" else (Check("unit",
+            "IN_PROGRESS" if self.ci_state == "pending" else "FAILURE",
+            "pending" if self.ci_state == "pending" else "fail", "2000-01-01T00:00:00Z",
+            run_id=43 if self.head == "head-2" else 42),)
+        return observed_pr(pr, head_ref_oid=self.head, checks=reports, merge_state=self.merge_state,
+            author="fix-bot", labels=frozenset({Label.AI_PR_OPEN}))
 
     def get_issue(self, issue):
         closed, reason = self.issue_closure(issue)
@@ -173,23 +184,25 @@ class Gateway:
         return (pr, event, body, head) in self.reviews
 
 
-def _executor(tmp_path, *, ci=False):
-    store = SQLiteControlStore(str(tmp_path / "control.db"))
+def _executor(tmp_path, *, ci=False, legacy_review=False, now=None):
+    store = SQLiteControlStore(str(tmp_path / "control.db"), now=now)
     store.initialize()
     gateway = Gateway()
     if ci:
-        from issue_agent.adapters.store import Store
-        from issue_agent.domain.world import PRView
-        from tests.fakes.accounted_workflow import install_pr_repair_authority
+        gateway.ci_state = "failure"
+    from issue_agent.adapters.store import Store
+    from tests.fakes.accounted_workflow import install_pr_repair_authority
+    if not legacy_review:
         legacy = Store(str(tmp_path / "state"))
         object.__setattr__(legacy, "_workflow_db", store)
-        install_pr_repair_authority(SimpleNamespace(prs={7: PRView(7, head_ref_oid="head-1")}), legacy)
+        install_pr_repair_authority(SimpleNamespace(prs={7: observed_pr(7, head_ref_oid="head-1")}), legacy)
     return (
         GitHubEffectExecutor(
             gateway,
             store,
             repository="o/r",
             identity="o/r:fix",
+            fix_config=FixConfig(fix_bot="fix-bot", ci_free_rerun=False),
         ),
         gateway,
         store,
@@ -575,7 +588,7 @@ def test_legacy_unknown_comment_is_adopted_and_reconciled_without_duplicate(
 def test_new_review_identity_reconciles_matching_legacy_review_before_submit(
     tmp_path,
 ) -> None:
-    _, gateway, store = _executor(tmp_path)
+    _, gateway, store = _executor(tmp_path, legacy_review=True)
     gateway.reviews.add((7, "APPROVE", "looks good", "head-1"))
     adopted = GitHubEffectExecutor(
         gateway,
@@ -800,13 +813,15 @@ def test_ambiguous_auto_merge_is_reconciled_without_duplicate(tmp_path) -> None:
 def test_pr_recovery_receipt_bounds_same_head_after_remote_projection_restoration(tmp_path, escalation):
     from issue_agent.domain.actions import EscalateCiPending
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending" if escalation else "clear"
+    gateway.merge_state = "BEHIND"
     action = EscalateCiPending(7, "head-1", "stalled CI requires a human") if escalation else UpdateBranch(7, "head-1", "base-1")
     assert executor.execute(action)
     before = list(gateway.calls)
     assert before
     gateway.head = "head-1"
     gateway.labels.clear()
-    restarted = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix")
+    restarted = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix", fix_config=executor.fix_config)
     assert restarted.execute(action)
     assert gateway.calls == before
 
@@ -817,6 +832,8 @@ def test_lost_pr_recovery_success_reconciles_once_and_new_identity_remains_eligi
     from issue_agent.domain import continuation_components as cc
     from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending" if escalation else "clear"
+    gateway.merge_state = "BEHIND"
     action = EscalateCiPending(7, "head-1", "stalled") if escalation else UpdateBranch(7, "head-1", "base-1")
     name = "relabel" if escalation else "update_branch"
     original = getattr(gateway, name)
@@ -832,7 +849,7 @@ def test_lost_pr_recovery_success_reconciles_once_and_new_identity_remains_eligi
     assert isinstance(owed, cc.OwedPRRecoveryEffect)
     before = list(gateway.calls)
     setattr(gateway, name, original)
-    restarted = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix")
+    restarted = GitHubEffectExecutor(gateway, store, repository="o/r", identity="o/r:fix", fix_config=executor.fix_config)
     assert restarted.drain_pending_commands() == 1
     completed = getattr(store.read_pr_repair(key).component.state, field)
     assert isinstance(completed, cc.SettledPRRecoveryEffect) and completed.owed == owed
@@ -854,6 +871,8 @@ def test_stale_pr_recovery_receipt_cannot_complete_replacement_head_or_base(tmp_
     from issue_agent.domain.actions import EscalateCiPending
     from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending" if escalation else "clear"
+    gateway.merge_state = "BEHIND"
     action = EscalateCiPending(7, "head-1", "stalled") if escalation else UpdateBranch(7, "head-1", "base-1")
     old_command = executor._command(action)
     store.enqueue_command(old_command)
@@ -871,6 +890,8 @@ def test_stale_pr_recovery_receipt_cannot_complete_replacement_head_or_base(tmp_
 def test_authorized_successor_receipts_original_pr_recovery_without_remote_repeat(tmp_path, escalation):
     from issue_agent.domain.actions import EscalateCiPending
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending" if escalation else "clear"
+    gateway.merge_state = "BEHIND"
     action = EscalateCiPending(7, "head-1", "stalled") if escalation else UpdateBranch(7, "head-1", "base-1")
     name = "relabel" if escalation else "update_branch"
     original = getattr(gateway, name)
@@ -896,7 +917,9 @@ def test_terminal_pr_cleanup_cannot_drop_unsettled_remediation_evidence(tmp_path
     from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
     from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
     from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef, WorkflowWriter
-    executor, _, store = _executor(tmp_path, ci=True)
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "clear" if refresh else "failure"
+    gateway.merge_state = "BEHIND"
     action = UpdateBranch(7, "head-1", "base-1") if refresh else RerunFailedChecks(7, "head-1", (42,))
     store.enqueue_command(executor._command(action))
     key = WorkflowKey("o/r", PullRequestRef(7))
@@ -914,6 +937,8 @@ def test_ambiguous_branch_update_uses_original_revision_to_reconcile(
     tmp_path,
 ) -> None:
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "clear"
+    gateway.merge_state = "BEHIND"
     action = UpdateBranch(7, "head-1")
     original = gateway.update_branch
 
@@ -940,6 +965,7 @@ def test_late_ci_receipt_cannot_replace_new_head_and_changed_run_set_cannot_repl
     from issue_agent.domain import continuation_components as cc
     from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending" if cancel else "failure"
     make = CancelWorkflowRuns if cancel else RerunFailedChecks
     name = "cancel_workflow_runs" if cancel else "rerun_failed_checks"
     field = "ci_cancel" if cancel else "ci_rerun"
@@ -972,6 +998,7 @@ def test_ci_lost_success_adopts_authorized_owner_and_refuses_retired_owner(tmp_p
     from issue_agent.domain import continuation_components as cc
     from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending" if cancel else "failure"
     action = CancelWorkflowRuns(7, "head-1", (42,)) if cancel else RerunFailedChecks(7, "head-1", (42,))
     field = "ci_cancel" if cancel else "ci_rerun"
     name = "cancel_workflow_runs" if cancel else "rerun_failed_checks"
@@ -1009,7 +1036,9 @@ def test_caught_ci_projection_failure_rolls_back_command_or_receipt_with_state(t
     from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
     from issue_agent.domain.contracts import EffectReceipt, EffectStatus
     from datetime import datetime, timezone
-    executor, _, store = _executor(tmp_path, ci=True)
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "clear" if refresh else "failure"
+    gateway.merge_state = "BEHIND"
     command = executor._command(UpdateBranch(7, "head-1", "base-1") if refresh else RerunFailedChecks(7, "head-1", (42,)))
     key = WorkflowKey("o/r", PullRequestRef(7))
     if settling:
@@ -1049,8 +1078,9 @@ def test_actual_review_rearm_preserves_original_ci_obligation_and_receipts_it_on
     rig.gated()
     legacy = Store(str(tmp_path / "state"))
     object.__setattr__(legacy, "_workflow_db", rig.store)
-    install_pr_repair_authority(SimpleNamespace(prs={9: PRView(9, head_ref_oid="head-1")}), legacy)
+    install_pr_repair_authority(SimpleNamespace(prs={9: observed_pr(9, head_ref_oid="head-1")}), legacy)
     gateway = Gateway()
+    gateway.ci_state = "failure"
     executor = GitHubEffectExecutor(gateway, rig.store, repository="o/r", identity="o/r:fix")
     original = gateway.rerun_failed_checks
     def lost(*args):
@@ -1102,6 +1132,8 @@ def test_partially_applied_multi_run_rerun_is_never_blindly_retried(
     tmp_path,
 ) -> None:
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.get_pr = lambda number, **kwargs: observed_pr(number, head_ref_oid="head-1", checks=(
+        Check("unit", bucket="fail", run_id=42), Check("lint", bucket="fail", run_id=43)))
     action = RerunFailedChecks(7, "head-1", (42, 43))
     advanced = False
 
@@ -1228,8 +1260,7 @@ def test_revision_outage_remains_pending_instead_of_permanently_failing(
         executor.execute(RerunFailedChecks(7, "head-1", (42,)))
 
     pending = store.pending_commands()
-    assert len(pending) == 1
-    assert pending[0].state == "pending"
+    assert pending == ()
 
 
 def test_reconcile_outage_blocks_write_and_leaves_command_pending(
@@ -1274,7 +1305,7 @@ def test_ambiguous_dependency_is_reconciled_without_duplicate(tmp_path) -> None:
 def test_ambiguous_review_and_same_body_on_new_head_are_distinct(
     tmp_path,
 ) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, legacy_review=True)
     original = gateway.submit_review
 
     def committed_then_lost(*args):
@@ -1315,6 +1346,8 @@ def test_pr_mutation_server_guard_rejects_check_to_write_head_race(
     race_attribute,
 ) -> None:
     executor, gateway, store = _executor(tmp_path, ci=isinstance(action, UpdateBranch))
+    gateway.ci_state = "clear"
+    gateway.merge_state = "BEHIND" if isinstance(action, UpdateBranch) else "CLEAN"
     setattr(gateway, race_attribute, "head-2")
 
     assert executor.execute(action) is False
@@ -1331,7 +1364,7 @@ def test_pr_mutation_server_guard_rejects_check_to_write_head_race(
 def test_review_server_guard_rejects_check_to_write_head_race(
     tmp_path,
 ) -> None:
-    executor, gateway, store = _executor(tmp_path)
+    executor, gateway, store = _executor(tmp_path, legacy_review=True)
     gateway.advance_before_review = "head-2"
 
     assert executor.submit_review(
@@ -1373,6 +1406,7 @@ def test_boot_drain_rehydrates_legacy_pr_command_head(
     tmp_path, action
 ) -> None:
     executor, gateway, store = _executor(tmp_path)
+    gateway.merge_state = "BEHIND" if isinstance(action, UpdateBranch) else "CLEAN"
     command = command_for_action(
         action,
         repository="o/r",
@@ -1512,6 +1546,7 @@ def test_cancelling_wedged_runs_is_receipted_like_any_other_remote_mutation(
     tmp_path,
 ) -> None:
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
 
     assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
     assert gateway.calls == [("cancel", "head-1", (42,))]
@@ -1524,6 +1559,7 @@ def test_a_lost_cancel_reply_replays_safely_and_settles(tmp_path) -> None:
     # the head SHA and skips runs GitHub has already completed, so the repeat can
     # neither touch a newer push's run nor 409 on a finished one.
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
     action = CancelWorkflowRuns(7, "head-1", (42,))
     original = gateway.cancel_workflow_runs
 
@@ -1552,6 +1588,7 @@ def test_a_run_github_already_completed_needs_no_cancel_at_all(tmp_path) -> None
     # Reconcile-first: the run is already in the state the command wants, so it
     # is receipted without a POST.
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
     gateway.run_states[42] = "completed"
 
     assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
@@ -1565,6 +1602,7 @@ def test_a_cancel_github_has_not_finished_yet_is_still_a_success(tmp_path) -> No
     # the POST failed EVERY successful cancel — re-POSTing it to the retry
     # ceiling and raising an operator alert that pointed at token scopes.
     executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
 
     assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,))) is True
     assert gateway.calls == [("cancel", "head-1", (42,))]
@@ -1578,8 +1616,9 @@ def test_a_cancel_github_has_not_finished_yet_is_still_a_success(tmp_path) -> No
 
 def test_a_run_from_a_newer_head_never_reaches_a_cancel_command(tmp_path) -> None:
     executor, gateway, _store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
 
-    with pytest.raises(UnknownEffectOutcome):
+    with pytest.raises((UnknownEffectOutcome, StaleExpectedRevision)):
         executor.execute(CancelWorkflowRuns(7, "stale-head", (42,)))
 
     assert gateway.calls == []
@@ -1587,8 +1626,9 @@ def test_a_run_from_a_newer_head_never_reaches_a_cancel_command(tmp_path) -> Non
 
 def test_a_cancel_without_run_identities_is_refused(tmp_path) -> None:
     executor, gateway, _store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
 
-    with pytest.raises(UnknownEffectOutcome):
+    with pytest.raises((UnknownEffectOutcome, StaleExpectedRevision)):
         executor.execute(CancelWorkflowRuns(7, "head-1", ()))
 
     assert gateway.calls == []
@@ -1623,3 +1663,309 @@ def test_every_cancel_field_survives_the_command_round_trip(tmp_path) -> None:
         assert getattr(rebuilt, field.name) == getattr(action, field.name), (
             f"{field.name} was dropped in the command round trip"
         )
+
+
+@pytest.mark.parametrize("kind", ["merge", "refresh", "rerun", "cancel"])
+@pytest.mark.parametrize("held_evidence", ["unavailable", "missing"])
+def test_same_head_ci_policy_change_withholds_then_requalifies_existing_command(tmp_path, kind, held_evidence):
+    from issue_agent.domain.checks import Observed, RequiredCheck, Unavailable
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "failure" if kind == "rerun" else "pending" if kind == "cancel" else "clear"
+    gateway.merge_state = "BEHIND" if kind == "refresh" else "CLEAN"
+    action = {"merge": EnableAutoMerge(7, "squash", "head-1"), "refresh": UpdateBranch(7, "head-1"),
+        "rerun": RerunFailedChecks(7, "head-1", (42,)), "cancel": CancelWorkflowRuns(7, "head-1", (42,))}[kind]
+    command = executor._command(action)
+    executor.effects.enqueue(command)
+    original = gateway.get_pr
+    current = original(7)
+    if held_evidence == "unavailable":
+        ci = Unavailable("partial paginated report read")
+    elif held_evidence == "missing":
+        ci = Observed("head-1", "head-1", frozenset({RequiredCheck("never-reported")}), ())
+    else:
+        ci = Observed("head-1", "head-1", frozenset({RequiredCheck("unit")}),
+            (Check("unit", bucket="fail" if kind in {"merge", "refresh"} else "pass", required=True, run_id=43),))
+    gateway.get_pr = lambda number, **kwargs: replace(current, ci=ci)
+    for _ in range(2):
+        with pytest.raises(UnknownEffectOutcome):
+            executor.execute(action)
+        assert not gateway.calls and store.effect_receipt(command.command_id) is None
+    gateway.get_pr = original
+    assert executor.execute(action)
+    assert executor.execute(action)
+    assert len(gateway.calls) == 1
+    assert store.effect_receipt(command.command_id).status.value == "succeeded"
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_policy_narrowed_predeploy_ci_debt_settles_and_releases_repair(tmp_path, cancel):
+    from issue_agent.domain.contracts import EffectStatus
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.checks import Observed, RequiredCheck
+    from issue_agent.domain.fix import FixConfig, FixState, decide_fix
+    from issue_agent.domain.actions import RunAgent
+    from issue_agent.domain.world import Review, WorldState
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    current = gateway.get_pr(7)
+    state, bucket = ("IN_PROGRESS", "pending") if cancel else ("FAILURE", "fail")
+    reports = (Check("unit", state, bucket, run_id=42), Check("advisory", state, bucket, run_id=43))
+    old = replace(current, ci=Observed("head-1", "head-1", frozenset(), reports))
+    gateway.get_pr = lambda *args, **kwargs: old
+    action = CancelWorkflowRuns(7, "head-1", (42, 43)) if cancel else RerunFailedChecks(7, "head-1", (42, 43))
+    command = executor._command(action)
+    executor.effects.enqueue(command)
+    narrowed = replace(old, author="fix-bot", head_ref_name="fix/7-example", closing_issue=7,
+        labels=frozenset({Label.AI_PR_OPEN}), mergeable="MERGEABLE",
+        reviews=(Review("APPROVED", "review-bot", commit_id="head-1"),),
+        ci=Observed("head-1", "head-1", frozenset({RequiredCheck("unit")}),
+            (replace(reports[0], required=True), reports[1])))
+    gateway.get_pr = lambda *args, **kwargs: narrowed
+    for _ in range(3):
+        assert executor.drain_pending_commands() == 0
+        assert not gateway.calls
+        assert store.effect_receipt(command.command_id).status is EffectStatus.PERMANENT_FAILURE
+        assert not store.pending_commands()
+    field = "ci_cancel" if cancel else "ci_rerun"
+    settled = getattr(store.read_pr_repair(WorkflowKey("o/r", PullRequestRef(7))).component.state, field)
+    assert isinstance(settled, cc.SettledCIRemediation)
+    if not cancel:
+        actions = decide_fix(WorldState(prs=(narrowed,)), FixConfig(fix_bot="fix-bot"),
+            FixState(ci_remediations={7: (settled, None)}, ci_rerun_head={7: "head-1"}), fixer_busy=False)
+        assert any(isinstance(item, RunAgent) and item.kind.name == "FIX_CI" for item in actions)
+
+
+@pytest.mark.parametrize("state", ["failed", "executing", "queued", "missing"])
+@pytest.mark.parametrize("delivery", ["direct", "persisted", "legacy"])
+def test_ci_escalation_is_obsolete_without_a_current_domain_escalation(tmp_path, state, delivery):
+    from issue_agent.domain.actions import EscalateCiPending
+    from issue_agent.domain.checks import Observed, RequiredCheck
+    from issue_agent.domain.contracts import EffectStatus
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    action = EscalateCiPending(7, "head-1", "stalled CI requires a human")
+    command = None
+    if delivery != "direct":
+        gateway.ci_state = "pending"
+        command = (executor._command(action) if delivery == "persisted" else
+            command_for_action(action, repository="o/r", executor_identity="o/r:fix"))
+        executor.effects.enqueue(command)
+    current = gateway.get_pr(7)
+    reports = () if state == "missing" else (Check("unit",
+        state={"failed": "FAILURE", "executing": "IN_PROGRESS", "queued": "QUEUED"}[state],
+        bucket="fail" if state == "failed" else "pending", required=True),)
+    ci = Observed("head-1", "head-1", frozenset({RequiredCheck("unit")}), reports)
+    gateway.get_pr = lambda *args, **kwargs: replace(current, ci=ci)
+    if delivery == "direct":
+        with pytest.raises(StaleExpectedRevision):
+            executor.execute(action)
+    else:
+        assert command is not None
+        assert executor.drain_pending_commands() == 0
+        assert store.effect_receipt(command.command_id).status is EffectStatus.PERMANENT_FAILURE
+    assert not gateway.calls
+    assert not store.pending_commands()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_persisted_pending_escalation_is_obsolete_with_clear_ci(tmp_path, legacy):
+    from issue_agent.domain.contracts import EffectStatus
+    from issue_agent.domain.actions import EscalateCiPending
+    from issue_agent.domain.checks import Observed, RequiredCheck, Unavailable
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
+    action = EscalateCiPending(7, "head-1", "old advisory run exceeded deadline")
+    command = (command_for_action(action, repository="o/r", executor_identity="o/r:fix")
+        if legacy else executor._command(action))
+    executor.effects.enqueue(command)
+    current = gateway.get_pr(7)
+    ci = Observed("head-1", "head-1",
+        frozenset({RequiredCheck("unit")}), (Check("unit", "SUCCESS", "pass", required=True),))
+    gateway.get_pr = lambda *args, **kwargs: replace(current, ci=ci)
+    for _ in range(3):
+        assert executor.drain_pending_commands() == 0
+        assert not gateway.calls
+        assert store.effect_receipt(command.command_id).status is EffectStatus.PERMANENT_FAILURE
+        assert not store.pending_commands()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_unavailable_ci_keeps_escalation_owed_until_observation_recovers(tmp_path, legacy):
+    from issue_agent.domain.actions import EscalateCiPending
+    from issue_agent.domain.checks import Unavailable
+    from issue_agent.domain.contracts import EffectStatus
+    from issue_agent.domain import continuation_components as cc
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
+    stalled = gateway.get_pr(7)
+    action = EscalateCiPending(7, "head-1", "external CI stalled")
+    command = (command_for_action(action, repository="o/r", executor_identity="o/r:fix")
+        if legacy else executor._command(action))
+    executor.effects.enqueue(command)
+    gateway.get_pr = lambda *args, **kwargs: replace(stalled, ci=Unavailable("rate limited"))
+    assert executor.drain_pending_commands() == 0
+    assert not gateway.calls
+    assert store.effect_receipt(command.command_id) is None
+    assert any(item.command.command_id == command.command_id for item in store.pending_commands())
+    if not legacy:
+        selected = store.read_pr_repair(WorkflowKey("o/r", PullRequestRef(7)))
+        assert isinstance(selected.component.state.pending_ci_escalation, cc.OwedPRRecoveryEffect)
+    gateway.get_pr = lambda *args, **kwargs: stalled
+    assert executor.drain_pending_commands() == 1
+    assert store.effect_receipt(command.command_id).status is EffectStatus.SUCCEEDED
+    assert gateway.calls == [("comment", "pr", 7, action.body),
+        ("relabel", "pr", 7, "ai-pr-open", "needs-human-review")]
+    assert not store.pending_commands()
+
+
+@pytest.mark.parametrize("verdict", ["SUCCESS", "SKIPPED", "empty"])
+def test_empty_policy_post_cancel_escalation_is_delivered_and_prevents_merge(tmp_path, verdict):
+    from issue_agent.domain.actions import EscalateCiPending
+    from issue_agent.domain.checks import Observed
+    from issue_agent.domain.fix import FixConfig, FixState, decide_fix
+    from issue_agent.domain.world import Review, WorldState
+    from issue_agent.domain.workflow_identity import WorkflowKey, PullRequestRef
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "pending"
+    assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,), "2026-10-12T01:00:00Z"))
+    pr = gateway.get_pr(7)
+    reports = () if verdict == "empty" else (Check("unit", verdict, "pass", run_id=42),)
+    pr = replace(pr, author="fix-bot", head_ref_name="fix/7-example", closing_issue=7,
+        labels=frozenset({Label.AI_PR_OPEN}), mergeable="MERGEABLE", merge_state="CLEAN",
+        reviews=(Review("APPROVED", "review-bot", commit_id="head-1"),),
+        ci=Observed("head-1", "head-1", frozenset(), reports))
+    gateway.get_pr = lambda *args, **kwargs: pr
+    world = WorldState(prs=(pr,), now="2026-10-12T02:00:00Z")
+    cancel = store.read_pr_repair(WorkflowKey("o/r", PullRequestRef(7))).component.state.ci_cancel.owed.capture
+    state = FixState(ci_cancel_head={7: f"{cancel.head}@{cancel.decided_at}"})
+    actions = decide_fix(world, FixConfig(fix_bot="fix-bot"), state, fixer_busy=False)
+    assert len(actions) == 1 and isinstance(actions[0], EscalateCiPending)
+    assert executor.execute(actions[0])
+    assert gateway.calls[-2:] == [("comment", "pr", 7, actions[0].body),
+        ("relabel", "pr", 7, "ai-pr-open", "needs-human-review")]
+    assert not store.pending_commands()
+
+
+def test_pending_auto_merge_is_withheld_by_same_head_cancel_aftermath(tmp_path):
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.ci_state = "clear"
+    action = EnableAutoMerge(7, "squash", "head-1")
+    command = executor._command(action)
+    executor.effects.enqueue(command)
+    gateway.ci_state = "pending"
+    assert executor.execute(CancelWorkflowRuns(7, "head-1", (42,)))
+    gateway.ci_state = "clear"
+    assert executor.drain_pending_commands() == 0
+    assert gateway.calls == [("cancel", "head-1", (42,))]
+    assert store.effect_receipt(command.command_id) is None
+    assert store.pending_commands()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+@pytest.mark.parametrize("run_head", ["head-1", "merge-sha", "unrelated"])
+def test_declared_test_merge_runs_can_be_remediated_with_pr_head_fence(tmp_path, cancel, run_head):
+    from issue_agent.domain.checks import Observed, RequiredCheck
+    from issue_agent.adapters.github import GitHubGateway
+    import json
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    pr = gateway.get_pr(7)
+    state, bucket = ("IN_PROGRESS", "pending") if cancel else ("FAILURE", "fail")
+    pr = replace(pr, ci=Observed("head-1", "merge-sha", frozenset({RequiredCheck("unit")}),
+        (Check("unit", state, bucket, run_id=42, required=True),)))
+    gateway.get_pr = lambda *args, **kwargs: pr
+    calls = []
+    def run(argv, token):
+        calls.append(argv)
+        if "POST" in argv:
+            return ""
+        return json.dumps({"id": 42, "head_sha": run_head, "run_attempt": 1,
+            "status": "in_progress" if cancel else "completed"})
+    api = GitHubGateway("o/r", runner=run)
+    gateway.workflow_run_attempts = api.workflow_run_attempts
+    gateway.workflow_run_states = api.workflow_run_states
+    gateway.rerun_failed_checks = api.rerun_failed_checks
+    gateway.cancel_workflow_runs = api.cancel_workflow_runs
+    action = CancelWorkflowRuns(7, "head-1", (42,)) if cancel else RerunFailedChecks(7, "head-1", (42,))
+    if run_head == "unrelated":
+        with pytest.raises(UnknownEffectOutcome):
+            executor.execute(action)
+        assert not any("POST" in call for call in calls)
+        assert not store.pending_commands()
+        return
+    assert executor.execute(action)
+    assert len([call for call in calls if "POST" in call]) == 1
+    assert not store.pending_commands()
+
+
+@pytest.mark.parametrize("cancel", [False, True])
+def test_changed_test_merge_obsoletes_unstarted_ci_remediation(tmp_path, cancel):
+    from issue_agent.domain.checks import Observed, RequiredCheck
+    from issue_agent.domain.contracts import EffectStatus
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    gateway.workflow_run_states = lambda *args: {42: "in_progress"}
+    gateway.ci_state = "pending" if cancel else "failure"
+    pr = gateway.get_pr(7)
+    ci = Observed("head-1", "merge-old", frozenset({RequiredCheck("unit")}),
+        (replace(pr.checks[0], required=True),))
+    gateway.get_pr = lambda *args, **kwargs: replace(pr, ci=ci)
+    action = CancelWorkflowRuns(7, "head-1", (42,)) if cancel else RerunFailedChecks(7, "head-1", (42,))
+    command = executor._command(action)
+    executor.effects.enqueue(command)
+    ci = replace(ci, tested_revision="merge-new")
+    assert executor.drain_pending_commands() == 0
+    assert not gateway.calls and not store.pending_commands()
+    assert store.effect_receipt(command.command_id).status is EffectStatus.PERMANENT_FAILURE
+
+
+def test_lost_test_merge_rerun_receipt_recovers_against_captured_revision(tmp_path):
+    from issue_agent.domain.checks import Observed, RequiredCheck
+    from issue_agent.adapters.github import GitHubGateway
+    import json
+    executor, gateway, store = _executor(tmp_path, ci=True)
+    pr = gateway.get_pr(7)
+    ci = Observed("head-1", "merge-old", frozenset({RequiredCheck("unit")}),
+        (replace(pr.checks[0], required=True),))
+    gateway.get_pr = lambda *args, **kwargs: replace(pr, ci=ci)
+    posts = []
+    def run(argv, token):
+        if "POST" in argv:
+            posts.append(argv)
+            raise RuntimeError("accepted rerun reply lost")
+        return json.dumps({"id": 42, "head_sha": "merge-old", "run_attempt": 2 if posts else 1})
+    api = GitHubGateway("o/r", runner=run)
+    gateway.workflow_run_attempts = api.workflow_run_attempts
+    gateway.rerun_failed_checks = api.rerun_failed_checks
+    with pytest.raises(RuntimeError, match="reply lost"):
+        executor.execute(RerunFailedChecks(7, "head-1", (42,)))
+    ci = replace(ci, tested_revision="merge-new")
+    assert executor.drain_pending_commands() == 1
+    assert len(posts) == 1 and not store.pending_commands()
+
+
+@pytest.mark.parametrize("merge_state", ["HAS_HOOKS", "UNSTABLE"])
+def test_empty_policy_cannot_capture_new_merge_eligibility(tmp_path, merge_state):
+    executor, gateway, store = _executor(tmp_path)
+    gateway.merge_state = merge_state
+    with pytest.raises(StaleExpectedRevision):
+        executor.execute(EnableAutoMerge(7, "squash", "head-1"))
+    assert not gateway.calls and not store.pending_commands()
+
+
+@pytest.mark.parametrize("refresh", [False, True])
+def test_same_head_transient_red_ci_does_not_permanently_disable_merge_or_refresh(tmp_path, refresh):
+    from issue_agent.domain.contracts import EffectStatus
+    executor, gateway, store = _executor(tmp_path, ci=refresh)
+    gateway.ci_state = "clear"
+    gateway.merge_state = "BEHIND" if refresh else "CLEAN"
+    action = UpdateBranch(7, "head-1") if refresh else EnableAutoMerge(7, "squash", "head-1")
+    command = executor._command(action)
+    executor.effects.enqueue(command)
+    gateway.ci_state = "failure"
+    assert executor.drain_pending_commands() == 0
+    assert not gateway.calls
+    gateway.ci_state = "clear"
+    assert executor.execute(action)
+    assert executor.execute(action)
+    assert len(gateway.calls) == 1
+    assert store.effect_receipt(command.command_id).status is EffectStatus.SUCCEEDED

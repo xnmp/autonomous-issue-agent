@@ -22,18 +22,17 @@ def test_metadata_backed_choices_drive_parsing_and_the_example():
             "REPO": "o/r",
             "FIX_BOT": "fix-bot",
             "MERGE_METHOD": "octopus",
-            "ARM_ON_OPEN": "1",
+
         }
     )
     assert cfg.merge_method == "squash"
-    assert cfg.arm_on_open == "auto"
     assert {error.split()[0] for error in cfg.parse_errors} >= {
         "MERGE_METHOD",
-        "ARM_ON_OPEN",
     }
 
     example = generated_env_reference()
-    assert 'ARM_ON_OPEN="auto"  # choices: auto|0' in example
+    assert "ARM_ON_OPEN" not in example
+    assert "CI_IGNORE_CHECKS" not in example
     assert 'MERGE_METHOD="squash"  # choices: squash|merge|rebase' in example
 
 
@@ -152,7 +151,6 @@ def test_every_operator_field_has_env_and_coercion_metadata():
     from dataclasses import fields
 
     internal = {
-        "arm_on_open_active",
         "agent_md",
         "control_authority_root",
         "repointed_from_deployments",
@@ -314,16 +312,11 @@ def test_empty_fix_model_is_none():
     assert from_env({"REPO": "x", "FIX_MODEL": ""}).fix_model is None
 
 
-def test_ci_ignore_and_method():
-    c = from_env({"REPO": "x", "CI_IGNORE_CHECKS": "Format.*", "MERGE_METHOD": "merge"})
-    assert c.ci_ignore_checks == "Format.*"
+def test_merge_method():
+    c = from_env({"REPO": "x", "MERGE_METHOD": "merge"})
     assert c.merge_method == "merge"
 
 
-def test_invalid_ci_ignore_regex_uses_default_and_reports_config_error():
-    c = from_env({"REPO": "o/r", "CI_IGNORE_CHECKS": "["})
-    assert c.ci_ignore_checks == ""
-    assert any("CI_IGNORE_CHECKS" in error for error in c.validation_errors())
 
 
 def test_edit_check_cmd():

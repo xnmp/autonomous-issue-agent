@@ -7533,7 +7533,7 @@ class SQLiteControlStore:
             proof = decode_self_clear_projection(receipt.remote_revision)
             if (type(proof) is not type(projection) or proof.block != projection.block
                     or isinstance(proof, MachineClearProjection) and (
-                        proof.observed_head != projection.observed_head or proof.ignored_checks != projection.ignored_checks)):
+                        proof.observed_head != projection.observed_head)):
                 raise WorkflowAuthorityError("recovery completion differs from its original cause")
         aggregate, selected = self._selected_self_clear_projection(db, projection, allow_adoption=not legacy_machine)
         if proof.revision != selected.revision or proof.binding != (projection.binding if legacy_machine else selected.binding):
@@ -9063,7 +9063,10 @@ class SQLiteControlStore:
         prior = before.owed.capture if isinstance(before, cc.SettledPRRecoveryEffect) else before.capture if isinstance(before, cc.OwedPRRecoveryEffect) else before
         if isinstance(before, cc.OwedPRRecoveryEffect) and (isinstance(capture, cc.PublicationIdentityEscalationCapture) or isinstance(prior, cc.PublicationIdentityEscalationCapture)):
             raise WorkflowAuthorityError("unfinished PR recovery predecessor must reconcile before replacement")
-        if prior is not None and self._pr_recovery_subject(prior) == self._pr_recovery_subject(capture):
+        if (prior is not None and self._pr_recovery_subject(prior) == self._pr_recovery_subject(capture)
+                and not (isinstance(before, cc.SettledPRRecoveryEffect)
+                    and before.receipt.status is EffectStatus.PERMANENT_FAILURE
+                    and isinstance(capture, cc.PendingCIEscalationCapture))):
             raise WorkflowAuthorityError("this head/base already owns its PR recovery effect")
         state = replace(selected.component.state, **{field: cc.OwedPRRecoveryEffect(command.command_id, capture)})
         persist_workflow_snapshot(db, replace(aggregate, revision=replace(selected.revision, version=selected.revision.version+1),
@@ -9480,6 +9483,8 @@ class SQLiteControlStore:
                 command.executor_identity,
                 command.workflow,
             )
+            if "pr_recovery" in repeated.payload:
+                self._record_pr_recovery(db, repeated)
             db.execute(
                 "INSERT INTO lifecycle_commands(command_id, idempotency_key, "
                 "logical_key, occurrence, kind, target, expected_revision, "

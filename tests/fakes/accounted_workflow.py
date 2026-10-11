@@ -1,5 +1,7 @@
 """Isolated accounting-backed resolve workflow fixtures, never live authority."""
 
+from tests.domain.builders import observed_pr
+
 import contextlib
 import dataclasses
 import hashlib
@@ -203,9 +205,10 @@ def seed_verified_ci_rerun(store, pr, head):
     from issue_agent.adapters.effects import GitHubEffectExecutor
     from issue_agent.domain.actions import RerunFailedChecks
     from issue_agent.domain.world import PRView
-    attach_workflow_authority(SimpleNamespace(issues={}, prs={pr: PRView(pr, head_ref_oid=head)}), store, pr_repair=True)
+    attach_workflow_authority(SimpleNamespace(issues={}, prs={pr: observed_pr(pr, head_ref_oid=head)}), store, pr_repair=True)
     gateway = Gateway()
     gateway.head = head
+    gateway.ci_state = "failure"
     assert GitHubEffectExecutor(gateway, store._workflow_db, repository="o/r", identity="o/r:fix:fixture").execute(
         RerunFailedChecks(pr, head, (42,)))
 
@@ -243,7 +246,7 @@ def attach_workflow_authority(
             )
     if not hasattr(store, "_workflow_db"):
         for number in getattr(gw, "_pr_for_issue", {}).values():
-            gw.prs.setdefault(number, PRView(number, head_ref_oid="head-sha"))
+            gw.prs.setdefault(number, observed_pr(number, head_ref_oid="head-sha"))
         object.__setattr__(store, "_workflow_dir", tempfile.TemporaryDirectory(prefix="workflow-test-"))
         object.__setattr__(store, "_workflow_db", SQLiteControlStore(str(Path(store._workflow_dir.name) / "control.sqlite")))
         store._workflow_db.initialize()

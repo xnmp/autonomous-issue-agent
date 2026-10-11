@@ -5,6 +5,8 @@ body-declared paths overlap an in-flight PR's changed files is held back to avoi
 a guaranteed merge conflict (the #59-vs-#60 collision).
 """
 
+from tests.domain.builders import observed_pr
+
 import pytest
 
 from tests.domain.builders import Check, issue, pr, world
@@ -76,7 +78,7 @@ def test_normalize_predicted_paths_fails_open_for_untrusted_router_output(raw, e
 
 # ── paths_overlap_open_prs ────────────────────────────────────────────────────
 def _pr(number, state, files):
-    return PRView(number=number, state=state, changed_files=frozenset(files))
+    return observed_pr(number=number, state=state, changed_files=frozenset(files))
 
 
 def test_overlap_true_when_declared_hits_open_pr():
@@ -104,7 +106,7 @@ def test_overlap_empty_declared_is_failopen():
 # (keifu #163/#164 deferred behind escalated PR #181, 2026-08-03). A later
 # hand-merge conflict is the REBASE leg's job.
 def test_overlap_ignores_blocked_prs():
-    blocked = PRView(
+    blocked = observed_pr(
         number=1,
         state="OPEN",
         changed_files=frozenset({"a.py"}),
@@ -114,7 +116,7 @@ def test_overlap_ignores_blocked_prs():
 
 
 def test_overlap_ignores_needs_human_review_prs():
-    escalated = PRView(
+    escalated = observed_pr(
         number=1,
         state="OPEN",
         changed_files=frozenset({"a.py"}),
@@ -124,7 +126,7 @@ def test_overlap_ignores_needs_human_review_prs():
 
 
 def test_overlap_still_holds_on_unblocked_labeled_pr():
-    open_pr = PRView(
+    open_pr = observed_pr(
         number=1,
         state="OPEN",
         changed_files=frozenset({"a.py"}),

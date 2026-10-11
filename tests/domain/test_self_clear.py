@@ -1,3 +1,5 @@
+
+from tests.domain.builders import observed_pr
 import pytest
 
 from issue_agent.domain.actions import (
@@ -25,7 +27,7 @@ def _machine(kind=MachineBlocker.PUBLICATION) -> MachineBlock:
 
 
 def _pr(*, checks=(), checks_known=True, head="blocked-head") -> PRView:
-    return PRView(
+    return observed_pr(
         100,
         head_ref_oid=head,
         labels=frozenset({Label.AI_PR_OPEN, Label.AI_BLOCKED}),
@@ -156,7 +158,7 @@ def test_absent_or_unrecognized_machine_marker_never_clears_clarification():
 
 
 def test_observed_manual_unblock_discards_stale_machine_marker_without_counting():
-    pr = PRView(100, head_ref_oid="head", labels=frozenset({Label.AI_PR_OPEN}))
+    pr = observed_pr(100, head_ref_oid="head", labels=frozenset({Label.AI_PR_OPEN}))
 
     assert _decide(WorldState(prs=(pr,)), machine=_machine()) == [
         DiscardSelfClearMarker(7, "machine")

@@ -6,6 +6,9 @@ import hashlib
 import json
 import sqlite3
 import sys
+from ..domain.ci import Clear, Failed, Waiting, Executing, MissingRequired, reduce_ci, cancelled_ci_unverified
+from ..domain.checks import Unavailable
+
 from dataclasses import fields, is_dataclass, replace
 from enum import Enum
 from typing import Any, Callable, Mapping, NoReturn, Protocol, runtime_checkable
@@ -26,6 +29,8 @@ from ..domain.actions import (
     UpdateBranch,
 )
 from ..domain.labels import ADVISORY_LABELS, Label
+from ..domain.fix import FixConfig, FixState, CiStallStep, ci_remediations, ci_remediation_marker, parse_cancel_marker
+from ..domain.world import WorldState
 from ..domain.eligibility import IssueCompletionGuard, IssueHoldGuard, LifecycleOperation
 from ..domain.lifecycle import (
     AllowedEligibility, completion_guard, completion_matches, issue_eligibility,
@@ -174,14 +179,14 @@ class BranchUpdateVerifier(Protocol):
 @runtime_checkable
 class ChecksRerunVerifier(Protocol):
     def workflow_run_attempts(
-        self, head: str, run_ids: tuple[int, ...]
+        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
     ) -> dict[int, int] | None: ...
 
 
 @runtime_checkable
 class WorkflowRunCancelVerifier(Protocol):
     def workflow_run_states(
-        self, head: str, run_ids: tuple[int, ...]
+        self, head: str | tuple[str, ...], run_ids: tuple[int, ...]
     ) -> dict[int, str] | None: ...
 
 
@@ -337,6 +342,7 @@ class GitHubEffectExecutor:
         identity: str,
         config_version: str = "",
         test_configuration=None,
+        fix_config: FixConfig = FixConfig(fix_bot=""),
         repository_cap: Money | None = None,
         global_cap: Money | None = None,
         issue_cap: Money | None = None,
@@ -353,6 +359,7 @@ class GitHubEffectExecutor:
         self.identity = identity
         self.config_version = config_version
         self.test_configuration = test_configuration
+        self.fix_config = fix_config
         self.repository_cap = repository_cap
         self.global_cap = global_cap
         self.issue_cap = issue_cap
@@ -399,6 +406,9 @@ class GitHubEffectExecutor:
                 action.base if isinstance(action, UpdateBranch) else None,
                 action.capture if isinstance(action, EscalatePRRecovery) else None) if isinstance(action, (UpdateBranch, EscalateCiPending))
             else self._pending_for_action(action))
+        if (pending is not None and pending.state == EffectStatus.PERMANENT_FAILURE.value
+                and type(action) is EscalateCiPending and self._ci_action_qualifies(action, self.gateway.get_pr(action.pr))):
+            pending = self.effects.enqueue_occurrence(self._command(action))
         if pending is not None and isinstance(action, EscalatePRRecovery) and action_from_command(pending.command) != action:
             self._execute(action_from_command(pending.command), pending)
             pending = None
@@ -1490,7 +1500,7 @@ class GitHubEffectExecutor:
                 # head, which the free re-run has already spent.
                 return None
             return self.gateway.rerun_failed_checks(
-                action.head, action.run_ids, baseline
+                _ci_run_revisions(command.payload, action.head), action.run_ids, baseline
             )
         elif isinstance(action, CancelWorkflowRuns):
             # `()` is SUCCESS, not a refusal: it means every targeted run was
@@ -1498,7 +1508,7 @@ class GitHubEffectExecutor:
             # Only None (the head-SHA guard, or an untrustworthy read) is a
             # failure. `_reconcile` verifies the real state either way.
             return self.gateway.cancel_workflow_runs(
-                action.head, action.run_ids
+                _ci_run_revisions(command.payload if command is not None else {}, action.head), action.run_ids
             ) is not None
         elif isinstance(action, EscalateCiPending):
             if isinstance(action, EscalatePRRecovery) and command is not None and not self._revision_matches(command):
@@ -1633,7 +1643,7 @@ class GitHubEffectExecutor:
                 return None
             baseline = _run_attempt_baseline(command, action.run_ids)
             current = self.gateway.workflow_run_attempts(
-                action.head, action.run_ids
+                _ci_run_revisions(command.payload, action.head), action.run_ids
             )
             if baseline is None or current is None:
                 return None
@@ -1668,7 +1678,7 @@ class GitHubEffectExecutor:
             if not isinstance(self.gateway, WorkflowRunCancelVerifier):
                 return None
             states = self.gateway.workflow_run_states(
-                action.head, action.run_ids
+                _ci_run_revisions(command.payload if command is not None else {}, action.head), action.run_ids
             )
             if states is None:
                 return None
@@ -1746,6 +1756,12 @@ class GitHubEffectExecutor:
                 raise UnknownEffectOutcome(
                     f"{target}: expected revision is unavailable"
                 )
+        if isinstance(action, (EnableAutoMerge, UpdateBranch, RerunFailedChecks, CancelWorkflowRuns)) or type(action) is EscalateCiPending:
+            current = self.gateway.get_pr(action.pr)
+            if not self._ci_action_qualifies(action, current):
+                raise StaleExpectedRevision("CI policy or report eligibility changed before command capture")
+            if isinstance(action, (RerunFailedChecks, CancelWorkflowRuns)):
+                extra["tested_revision"] = current.ci.tested_revision
         if isinstance(action, RerunFailedChecks):
             if not action.run_ids:
                 raise UnknownEffectOutcome(
@@ -1756,7 +1772,7 @@ class GitHubEffectExecutor:
                     f"pr:{action.pr}: workflow-run verification is unavailable"
                 )
             attempts = self.gateway.workflow_run_attempts(
-                action.head, action.run_ids
+                _ci_run_revisions(extra, action.head), action.run_ids
             )
             if attempts is None:
                 raise UnknownEffectOutcome(
@@ -1777,7 +1793,7 @@ class GitHubEffectExecutor:
                     f"pr:{action.pr}: workflow-run verification is unavailable"
                 )
             states = self.gateway.workflow_run_states(
-                action.head, action.run_ids
+                _ci_run_revisions(extra, action.head), action.run_ids
             )
             if states is None:
                 # Includes the head-SHA guard: a run belonging to a newer push
@@ -1916,7 +1932,7 @@ class GitHubEffectExecutor:
         if action.target is Target.PR:
             current = self.gateway.get_pr(action.number)
             if isinstance(projection, MachineClearProjection) and not machine_clear_evidence(
-                current, projection.block, projection.ignored_checks):
+                current, projection.block):
                 return False
         else:
             current = self.gateway.get_issue(action.number)
@@ -1925,6 +1941,36 @@ class GitHubEffectExecutor:
         if current.state not in {"OPEN", "open"} or current.has(Label.NEEDS_HUMAN_REVIEW):
             return False
         return True
+
+    def _ci_action_qualifies(self, action, current) -> bool:
+        if not current.head_ref_oid:
+            raise UnknownEffectOutcome("current PR revision is unavailable")
+        if current.state != "OPEN" or current.head_ref_oid != action.head:
+            return False
+        result = reduce_ci(current.ci)
+        if isinstance(result, Unavailable):
+            raise UnknownEffectOutcome(result.reason)
+        state = FixState()
+        if isinstance(action, EscalateCiPending) or isinstance(result, Clear) and not current.ci.policy:
+            selected = self.store.read_pr_repair(WorkflowKey(self.repository, PullRequestRef(action.pr)))
+            if isinstance(selected, cc.SelectedPRRepair):
+                state = FixState(ci_cancel_head={action.pr: ci_remediation_marker(selected.component.state.ci_cancel)},
+                    ci_rerun_head={action.pr: ci_remediation_marker(selected.component.state.ci_rerun)})
+        if isinstance(action, EscalateCiPending):
+            world = WorldState(prs=(current,), now=self.store.now().isoformat())
+            return any(remedy.step is CiStallStep.ESCALATE for remedy in ci_remediations(world, self.fix_config, state))
+        unverified = cancelled_ci_unverified(current.ci, parse_cancel_marker(state.ci_cancel_head.get(action.pr, ""))[0],
+            parse_cancel_marker(state.ci_rerun_head.get(action.pr, ""))[0])
+        if isinstance(result, Waiting) and isinstance(result.reason, MissingRequired):
+            raise UnknownEffectOutcome("required reports have not arrived")
+        if isinstance(action, (EnableAutoMerge, UpdateBranch)):
+            return isinstance(result, Clear) and not unverified and (current.is_behind() if isinstance(action, UpdateBranch)
+                else current.merge_state.upper() == "CLEAN" or bool(current.ci.policy) and current.merge_state.upper() in {"HAS_HOOKS", "UNSTABLE"})
+        checks = (result.checks if isinstance(result, Failed) and isinstance(action, RerunFailedChecks)
+            else result.reason.checks if isinstance(result, Waiting) and isinstance(result.reason, Executing)
+            and isinstance(action, CancelWorkflowRuns) else ())
+        runs = {c.run_id for c in checks if c.state != "QUEUED"}
+        return bool(checks) and None not in runs and runs == set(action.run_ids)
 
     def _revision_matches(self, command: LifecycleCommand, *, self_clear_reconciliation: bool = False) -> bool:
         if "pr_recovery" in command.payload:
@@ -1962,6 +2008,17 @@ class GitHubEffectExecutor:
                 self._validate_completion(action, partial=isinstance(action, CloseIssue))
             except StaleExpectedRevision:
                 return False
+        if command.kind in {CommandKind.ENABLE_AUTO_MERGE, CommandKind.UPDATE_BRANCH, CommandKind.RERUN_CHECKS, CommandKind.CANCEL_CHECKS} or (
+                command.kind is CommandKind.RELABEL and type(action_from_command(command)) is EscalateCiPending):
+            action = action_from_command(command)
+            current = self.gateway.get_pr(action.pr)
+            qualifies = self._ci_action_qualifies(action, current)
+            if qualifies and isinstance(action, (RerunFailedChecks, CancelWorkflowRuns)):
+                qualifies = command.payload.get("tested_revision", action.head) == current.ci.tested_revision
+            if (not qualifies and isinstance(action, (EnableAutoMerge, UpdateBranch))
+                    and current.state == "OPEN" and current.head_ref_oid == action.head):
+                raise UnknownEffectOutcome("current CI withholds the pending merge or refresh")
+            return qualifies
         if command.expected_revision is None:
             return True
         number = int(command.target.split(":", 1)[1])
@@ -2363,6 +2420,14 @@ def _relabel_projection_from_payload(
     ):
         raise ValueError("malformed relabel projection comment")
     return tuple(Label(label) for label in raw_adds), raw_comment
+
+
+def _ci_run_revisions(payload: Mapping[str, object], head: str) -> str | tuple[str, ...]:
+    tested = payload.get("tested_revision", head)
+    if not isinstance(tested, str) or not tested:
+        raise UnknownEffectOutcome("captured CI revision is malformed")
+    # Actions runs can bind the PR head even when their check-runs test its merge.
+    return head if tested == head else (head, tested)
 
 
 def _run_attempt_baseline(

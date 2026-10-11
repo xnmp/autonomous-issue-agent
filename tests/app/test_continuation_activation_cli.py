@@ -1,5 +1,7 @@
 """Offline continuation publication through the existing configured CLI."""
 
+from tests.domain.builders import observed_pr
+
 from contextlib import closing
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -168,7 +170,7 @@ def test_review_shadow_retains_episode_and_requires_unique_current_linkage(stopp
     original = continuation_activation.activation_scope
     monkeypatch.setattr(continuation_activation, "activation_scope", lambda *args, **kwargs: replace(original(*args, **kwargs), gateway=LinkedRemote()))
     def read(gateway, key, now, **kwargs):
-        view = PRView(key.target.number, f"fix/7-pr-{key.target.number}", "a"*40, closing_issue=7)
+        view = observed_pr(key.target.number, f"fix/7-pr-{key.target.number}", "a"*40, closing_issue=7)
         return ObservedPullRequest(key, "a"*40, PullRequestState.OPEN, frozenset(), CompleteReviews(()), now), view
     monkeypatch.setattr(continuation_activation, "read_pull_request", read)
     before = dump(control)
@@ -406,7 +408,7 @@ def test_ambiguous_mapping_or_unsupported_handoff_blocks_affected_pr(stopped, ca
     original = continuation_activation.activation_scope
     monkeypatch.setattr(continuation_activation, "activation_scope", lambda *args, **kwargs: replace(original(*args, **kwargs), gateway=LinkedRemote()))
     def read(gateway, key, now, **kwargs):
-        view = PRView(key.target.number, branches[numbers.index(key.target.number)], "a" * 40, closing_issue=closing)
+        view = observed_pr(key.target.number, branches[numbers.index(key.target.number)], "a" * 40, closing_issue=closing)
         observed = ObservedPullRequest(key, "a" * 40, PullRequestState.OPEN, frozenset(), CompleteReviews(()), now)
         return observed, view
     monkeypatch.setattr(continuation_activation, "read_pull_request", read)
@@ -1063,7 +1065,7 @@ def remote_retained_pr(monkeypatch,state):
     def read(gateway,key,now,**kwargs):
         if state=='unreadable':return None,None
         observed=ObservedPullRequest(key,'a'*40,PullRequestState(state),frozenset(),CompleteReviews(()),now)
-        return observed,PRView(key.target.number,'fix/7-retained','a'*40,closing_issue=7)
+        return observed,observed_pr(key.target.number,'fix/7-retained','a'*40,closing_issue=7)
     monkeypatch.setattr(continuation_activation,'read_pull_request',read)
 
 
@@ -1093,7 +1095,7 @@ def test_closed_retained_pr_is_deferred_without_primary_then_discovery_preserves
     with restarted.transaction() as db:
         db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',1,'source','inventory',?)",(datetime.now(timezone.utc).isoformat(),))
     remote=PersistentGitHub(tmp_path/'retained-remote.sqlite')
-    remote.seed_pr(PRView(9,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
+    remote.seed_pr(observed_pr(9,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
     review=SQLiteReviewWorkflowControl(restarted,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,
                                       ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
     discovered=review.ensure_observed_workflow(key)
@@ -1159,7 +1161,7 @@ def test_genuinely_new_pr_after_activation_gets_paid_repair_without_clearing_old
     with control.transaction() as db:
         db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',1,'source','inventory',?)",(control.now().isoformat(),))
     remote=PersistentGitHub(tmp_path/'new-pr-remote.sqlite')
-    remote.seed_pr(PRView(99,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
+    remote.seed_pr(observed_pr(99,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
     review=SQLiteReviewWorkflowControl(control,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,
                                       ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
     discovered=review.ensure_observed_workflow(WorkflowKey('o/r',PullRequestRef(99))).snapshot
@@ -1195,7 +1197,7 @@ def test_changed_publisher_deferred_decision_refuses_primary_discovery(stopped,c
                    (encode_workflow((*receipt[:3],changed,receipt[4])),))
         db.execute("INSERT INTO workflow_authority_epochs VALUES ('o/r','review_rejections',1,'source','inventory',?)",(control.now().isoformat(),))
     remote=PersistentGitHub(tmp_path/'mutated-deferred-remote.sqlite')
-    remote.seed_pr(PRView(9,head_ref_oid='a'*40))
+    remote.seed_pr(observed_pr(9,head_ref_oid='a'*40))
     review=SQLiteReviewWorkflowControl(control,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,
                                       ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
     with pytest.raises(WorkflowAuthorityError,match='deferred PR repair import is unreadable'):
@@ -1323,7 +1325,7 @@ def test_deferred_fix_hold_survives_real_execution_import_primary_creation_and_s
         from issue_agent.domain.review_rejection import CountingRule
         from issue_agent.domain.labels import Label
         remote=PersistentGitHub(tmp_path/'previous-inactive.sqlite')
-        remote.seed_pr(PRView(9,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
+        remote.seed_pr(observed_pr(9,head_ref_oid='a'*40,labels=frozenset({Label.AI_PR_OPEN})))
         observer=SQLiteReviewWorkflowControl(control,WorkflowWriter('o/r','review','o/r:review:test'),gateway=remote,ceiling=3,trigger_label=Label.AI_PR_OPEN,rule=CountingRule('review-bot[bot]'))
         recovered=observer.ensure_observed_workflow(key).snapshot
         assert recovered.pr_repair==original

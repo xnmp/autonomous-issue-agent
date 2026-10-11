@@ -45,6 +45,8 @@ from .self_clear import (
     self_clear_actions,
 )
 from .ci import (
+    cancelled_ci_unverified,
+    repair_evidence_incomplete,
     ci_state,
     executing_pending_checks,
     failed_checks,
@@ -61,6 +63,7 @@ from .exemptions import (
     exemption_status,
 )
 from .identity import login_eq
+from .checks import Observed, Unavailable
 from . import continuation_components as cc
 from .labels import Label, priority_rank
 from .lifecycle import (
@@ -110,7 +113,6 @@ class FixConfig:
     exemption_mac_key: str = ""
     auto_merge: bool = True
     merge_method: str = "squash"
-    ci_ignore_checks: str = ""
     close_issue_on_merge: bool = True
     max_ci_retries: int = 3
     max_review_retries: int = 3
@@ -127,7 +129,6 @@ class FixConfig:
     # itself 403s) that race is the accepted residual — requiring this flag
     # unconditionally silently disabled every merge on such repos (observed
     # 2026-08-01; see residuals.md).
-    arm_on_open: bool = False
     # SEPARATE, HIGHER ceiling for sessions that die BEFORE returning a result
     # (review C3/D2c). "Infra deaths are not attempts" stays true for every
     # retry breaker above (FAILURE-MODES #58) — but a leg whose session keeps
@@ -206,11 +207,6 @@ class FixState:
     # while a second FAILURE on the SAME head is evidence the diff is broken and
     # goes straight to a paid FIX_CI leg. Missing/"" = never re-run.
     ci_rerun_head: dict[int, str] = field(default_factory=dict)
-    # PR → head a branch-refresh was last dispatched for (the advisory-UNSTABLE
-    # arm of should_update_branch). Head-keyed like ci_rerun_head: a successful
-    # update creates a NEW head (fresh key), an already-up-to-date update
-    # changes nothing (marker matches, loop stops).
-    update_branch_head: dict[int, str] = field(default_factory=dict)
     # PR → the head SHA whose wedged workflow runs have already been sent a
     # cancel. Head-keyed for the same reason `ci_rerun_head` is, and separate
     # from it because cancel and re-run are two ticks of ONE remediation: the
@@ -703,7 +699,8 @@ def automerge_in_scope(pr: PRView, cfg: FixConfig) -> bool:
     # first poll after the branch is mergeable again.
     if pr.is_conflicting():
         return False
-    return pr.merge_state.upper() == "CLEAN"
+    return pr.merge_state.upper() == "CLEAN" or (isinstance(pr.ci, Observed) and bool(pr.ci.policy)
+        and pr.merge_state.upper() in {"HAS_HOOKS", "UNSTABLE"})
 
 
 def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
@@ -711,30 +708,9 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
     branch the harness itself authored, three-identity mode, an exact-head
     approval by a distinct actor, and exact-head CI ok|none.
 
-    The boot-verified strict server gate (arm_on_open) is deliberately NOT a
-    precondition: it is defense-in-depth that additionally closes the
-    base-advance race where the base can carry protection. Requiring it
-    unconditionally (2026-07-31 hardening) disabled merging entirely on repos
-    whose base cannot carry verifiable protection — a private free-plan repo
-    403s on the protection API itself — zeroing merges-per-deployment on
-    every current target (observed 2026-08-01). The exact-head preconditions
-    below are the whole client-side gate either way; the executor merges only
-    the observed head (`--match-head-commit`) and never arms persistent
-    GitHub auto-merge (its approval would survive later pushes without
-    last-push protection). Residual on unprotected bases: the base may
-    advance between observation and merge (see residuals.md)."""
+    GitHub independently enforces repository rules at the exact-head merge."""
     if not automerge_in_scope(pr, cfg):
         return False
-    # arm_on_open: branch protection (verified at boot) already refuses the
-    # merge until a review approves and the required checks pass, so waiting
-    # for them HERE only adds daemon latency — a busy fixer (one synchronous
-    # session per tick) left #539 APPROVED+green and unmerged for the length
-    # of an unrelated resolve (2026-07-27). That early-arm optimization is
-    # retired: the executor deliberately performs exact-head merges and never
-    # arms persistent GitHub auto-merge, so firing before approval would 405
-    # against a protected base every poll (#534-class noise). The review/CI
-    # preconditions below are the whole client-side gate; server protection,
-    # where present, independently re-checks them at merge time.
     if not merge_preconditions_met(pr, cfg):
         return False
     # #124/ADR 0014: a PR whose change declares gate exemptions may EXIST
@@ -764,11 +740,8 @@ def merge_preconditions_met(pr: PRView, cfg: FixConfig) -> bool:
         or review.commit_id != pr.head_ref_oid
     ):
         return False
-    # known=False → UNKNOWN, which is deliberately NOT in the allowed pair: an
-    # unread checks fetch must never arm a merge (#48). Honest NONE (a repo with
-    # no CI, successfully read) stays mergeable.
     return ci_state(
-        pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+        pr.ci
     ) in (CIState.OK, CIState.NONE)
 
 
@@ -791,76 +764,12 @@ def exemption_merge_status(
     )
 
 
-def update_branch_marker(pr: PRView, base_head: str) -> str:
-    """The once-per-attempt key for the advisory-UNSTABLE refresh: one attempt
-    per (head, base tip) pair. Head alone is not enough — an attempt made
-    BEFORE the base gained the fix for the advisory check would permanently
-    disarm the refresh for a PR whose head never moves again (keifu #166's
-    exact shape). A no-op update changes neither part, so the loop still
-    terminates; a base advance changes the key, re-arming exactly when the
-    event this arm exists for occurs. Callers gate on a non-empty base_head
-    (an unobserved base disables the arm — see should_update_branch)."""
-    return f"{pr.head_ref_oid}:{base_head}"
-
-
-def should_update_branch(
-    pr: PRView, state: FixState, cfg: FixConfig, base_head: str = ""
-) -> bool:
-    """A merge-ready PR (distinct APPROVED review + CI ok/none) that is BEHIND its
-    base needs its branch brought up to date so an armed auto-merge can land it.
-
-    Deliberately INDEPENDENT of the automerge-enabled marker (unlike
-    should_automerge): a PR armed while CLEAN that LATER goes BEHIND (its base
-    advanced) — or one armed on a poll BEFORE this update-branch logic existed —
-    would otherwise stay stuck forever, armed-but-behind. Only MERGEABLE+BEHIND:
-    a CONFLICTING branch takes the REBASE agent path (§3a). Self-limiting: after
-    an update the branch is no longer BEHIND until the base advances again, so this
-    does not re-fire every poll.
-
-    The second arm covers advisory-UNSTABLE (keifu #166, 2026-08-01): a failing
-    check WINS the mergeStateStatus enum, so a PR whose only failures are
-    operator-ignored/advisory checks reports UNSTABLE, never BEHIND — and when
-    the base advances with the fix for that very check (quick-xml audit fixed
-    by #168), nothing re-runs the stale checks: the exact-head merge gate
-    refuses UNSTABLE forever while decide sees CI as ok. Refreshing the branch
-    re-runs the checks against the fixed base. Head-keyed marker: a successful
-    update makes a new head (checks pending block the tail until they settle),
-    an already-up-to-date one changes nothing and the marker stops the loop —
-    this cannot push-loop."""
-    if not cfg.auto_merge or cfg.identity_mode != IdentityMode.THREE:
-        return False
-    if not pr.head_ref_oid:
-        return False
-    if pr.number in state.ci_remediation_errors or state.update_branch_head.get(pr.number, "") == update_branch_marker(pr, base_head):
-        return False
-    # Same containment as should_automerge: this PUSHES to the PR's branch, which
-    # is not something to do to a PR the harness did not author.
-    if not is_governed_branch(pr.head_ref_name):
-        return False
-    # Requires an OBSERVED base tip: the arm exists to react to base advances,
-    # and without base visibility the marker key would flap between "H:" and
-    # "H:B" on every fetch hiccup, re-firing a no-op update per transition.
-    # No base_head → only the BEHIND arm (which needs no marker) applies.
-    advisory_unstable_refresh = (
-        bool(base_head)
-        and pr.merge_state.upper() == "UNSTABLE"
-        and not pr.is_conflicting()
-        and state.update_branch_head.get(pr.number, "")
-        != update_branch_marker(pr, base_head)
-    )
-    if not pr.is_behind() and not advisory_unstable_refresh:
-        return False
-    review = latest_other_review(pr.reviews, cfg.fix_bot)
-    if (
-        review is None
-        or review.state != REVIEW_APPROVED
-        or not review.commit_id
-        or review.commit_id != pr.head_ref_oid
-    ):
-        return False
-    return ci_state(
-        pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
-    ) in (CIState.OK, CIState.NONE)
+def should_update_branch(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
+    """GitHub's BEHIND verdict owns freshness; ordinary branch updates remain."""
+    return (cfg.auto_merge and cfg.identity_mode == IdentityMode.THREE
+        and bool(pr.head_ref_oid) and is_governed_branch(pr.head_ref_name)
+        and pr.number not in state.ci_remediation_errors and pr.is_behind()
+        and merge_preconditions_met(pr, cfg))
 
 
 def _issues_with_open_prs(world: WorldState) -> frozenset[int]:
@@ -1268,15 +1177,15 @@ def ci_pending_stalls(world: WorldState, cfg: FixConfig) -> tuple[CiPendingStall
             head=pr.head_ref_oid,
             seconds=int(age or 0),
             checks=tuple(
-                c.name for c in pending_checks(pr.checks, cfg.ci_ignore_checks) if c.name
+                c.name for c in pending_checks(pr.ci) if c.name
             ),
         )
         for pr in fixer_prs(world, cfg)
         if not pr_lifecycle(pr).is_blocked
         and pending_deadline_breached(
-            pr.checks, world.now, cfg.ci_pending_max_seconds, cfg.ci_ignore_checks
+            pr.ci, world.now, cfg.ci_pending_max_seconds
         )
-        and (age := pending_age_seconds(pr.checks, world.now, cfg.ci_ignore_checks))
+        and (age := pending_age_seconds(pr.ci, world.now))
         is not None
     )
 
@@ -1292,13 +1201,21 @@ def stalled_run_ids(pr: PRView, cfg: FixConfig) -> tuple[int, ...]:
     cancelling a subset would leave the real pin in place while looking handled.
     """
 
-    pending = executing_pending_checks(pr.checks, cfg.ci_ignore_checks)
+    pending = executing_pending_checks(pr.ci)
     if not pending or any(check.run_id is None for check in pending):
         return ()
     return tuple(sorted({c.run_id for c in pending if c.run_id is not None}))
 
 
 CANCEL_MARKER_SEP = "@"
+
+
+def ci_remediation_marker(item: cc.CIRemediation | None) -> str:
+    if item is None:
+        return ""
+    capture = (item.capture if isinstance(item, cc.OwedCIRemediation)
+        else item.owed.capture if isinstance(item, cc.SettledCIRemediation) else item)
+    return f"{capture.head}@{capture.decided_at}" if capture.decided_at else capture.head
 
 
 def parse_cancel_marker(raw: str) -> tuple[str, str]:
@@ -1493,83 +1410,13 @@ def ci_stall_remedies(
     return tuple(remedies)
 
 
-def ci_cancel_green_illusions(
-    world: WorldState, cfg: FixConfig, state: FixState
-) -> tuple[CiStallRemedy, ...]:
-    """Heads the harness cancelled that came back GREEN BY OMISSION.
-
-    The remediation assumes a cancelled run observes as a settled FAILURE, which
-    is what the re-run then acts on. That holds for a job cancelled mid-flight,
-    but GitHub reports jobs that had NOT STARTED when the run was cancelled as
-    `skipped`, and `skipped` buckets as PASS. A run stalled in `queued` — the
-    starved-runner case — can therefore come back with nothing red at all.
-
-    Left alone, `ci_state` would flip PENDING → OK and an already-approved PR
-    would be auto-merged on the strength of CI the harness itself cancelled
-    (adversarial review S3). So a head with a live cancel marker and no spent
-    re-run is NOT allowed to read as green: it goes to a human, once, with the
-    reason. The re-run spending its budget is what clears the marker's authority
-    — after that the CI result is GitHub's again, not the harness's artefact.
-
-    Deliberately gated on the MARKER alone, not on `ci_pending_max_seconds` or
-    `ci_free_rerun` (adversarial review N3): those switches decide whether a
-    cancel may be ISSUED, and turning one off afterwards does not un-cancel a
-    run already taken down. A live marker means this harness cancelled this
-    head, and that stays true — and stays disqualifying — whatever the config
-    says next.
-    """
-
-    illusions: list[CiStallRemedy] = []
-    for pr in fixer_prs(world, cfg):
-        head = pr.head_ref_oid
-        cancelled_head, _at = parse_cancel_marker(
-            state.ci_cancel_head.get(pr.number, "")
-        )
-        if (
-            not head
-            or cancelled_head != head
-            or state.ci_rerun_head.get(pr.number, "") == head
-            or (pr.number, head) in state.ci_pending_escalated
-            or pr_lifecycle(pr).is_blocked
-        ):
-            continue
-        if ci_state(
-            pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
-        ) not in (CIState.OK, CIState.NONE):
-            continue
-        illusions.append(
-            CiStallRemedy(
-                CiPendingStall(pr.number, head, 0, ()),
-                CiStallStep.ESCALATE,
-                _issue_for_pr(pr) or 0,
-                (),
-                # Says ONLY what is known. The harness cannot tell a run whose
-                # jobs were skipped by the cancellation from one that finished
-                # green on its own (a cancel that never landed — the mint failed
-                # — leaves the same marker), so it must not assert the first:
-                # an escalation that explains itself wrongly sends the human
-                # looking in the wrong place (adversarial review N1).
-                "The harness requested cancellation of this commit's stuck "
-                "workflow run, and CI now reports nothing red. It cannot tell "
-                "whether those checks actually ran or were skipped by the "
-                "cancellation, so this green is unverified — re-run CI before "
-                "merging.",
-                world.now,
-            )
-        )
-    return tuple(illusions)
-
-
 def ci_remediations(
     world: WorldState, cfg: FixConfig, state: FixState
 ) -> tuple[CiStallRemedy, ...]:
-    """Every CI-remediation step this poll: wedged heads, then cancel aftermath.
+    """Every CI-remediation step for stalled reports and cancel aftermath.
 
-    THE single derivation both halves read. `decide_fix` emits exactly this and
-    the wiring journals exactly this, so an escalation can never happen without
-    a record explaining it (adversarial review N5 — the aftermath arm escalated
-    outside the reporter's view, which is the failure
-    `test_the_journal_agrees_with_the_escalation_it_explains` exists to forbid).
+    `decide_fix` and the journal share this derivation so every escalation
+    carries the same current evidence in both outputs.
     """
 
     eligible_prs = {
@@ -1577,10 +1424,21 @@ def ci_remediations(
         if isinstance(pr_eligibility(p, LifecycleOperation.REMEDIATE_CI), AllowedEligibility)
         and breaker_key(p) not in state.control_errors
     }
-    return tuple(remedy for remedy in (
-        *ci_stall_remedies(world, cfg, state),
-        *ci_cancel_green_illusions(world, cfg, state),
-    ) if remedy.pr in eligible_prs)
+    return tuple(remedy for remedy in (*ci_stall_remedies(world, cfg, state),
+        *ci_cancel_green_illusions(world, cfg, state)) if remedy.pr in eligible_prs)
+
+
+def ci_cancel_green_illusions(world: WorldState, cfg: FixConfig, state: FixState) -> tuple[CiStallRemedy, ...]:
+    return tuple(CiStallRemedy(CiPendingStall(pr.number, pr.head_ref_oid, 0, ()),
+        CiStallStep.ESCALATE, _issue_for_pr(pr) or 0, (),
+        "The harness requested cancellation of this commit's stuck workflow run, "
+        "and CI now reports nothing red. It cannot tell whether those checks "
+        "actually ran or were skipped by the cancellation, so this green is "
+        "unverified — re-run CI before merging.", world.now)
+        for pr in fixer_prs(world, cfg)
+        if not pr_lifecycle(pr).is_blocked and (pr.number, pr.head_ref_oid) not in state.ci_pending_escalated
+        and cancelled_ci_unverified(pr.ci, parse_cancel_marker(state.ci_cancel_head.get(pr.number, ""))[0],
+            parse_cancel_marker(state.ci_rerun_head.get(pr.number, ""))[0]))
 
 
 # ── flake-aware CI repair (#38) ──────────────────────────────────────────────
@@ -1617,7 +1475,7 @@ def ci_rerun_run_ids(pr: PRView, cfg: FixConfig) -> tuple[int, ...]:
     the bounded repair leg; rerunning only a subset could hide the real gate.
     """
 
-    failures = failed_checks(pr.checks, cfg.ci_ignore_checks)
+    failures = failed_checks(pr.ci)
     if not failures or any(check.run_id is None for check in failures):
         return ()
     return tuple(sorted({check.run_id for check in failures if check.run_id is not None}))
@@ -1650,7 +1508,7 @@ def ci_flakes(
         for pr in fixer_prs(world, cfg)
         if pr.head_ref_oid
         and state.ci_rerun_head.get(pr.number, "") == pr.head_ref_oid
-        and ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
+        and ci_state(pr.ci)
         == CIState.OK
     )
 
@@ -1751,7 +1609,6 @@ def decide_fix(
         state.budget_worlds,
         state.self_clear_counts,
         state.self_clear_ceiling_reported,
-        cfg.ci_ignore_checks,
         machine_revisions=state.machine_revisions,
         budget_revisions=state.budget_revisions,
         self_clear_bindings=state.self_clear_bindings,
@@ -1928,7 +1785,7 @@ def decide_fix(
             held_issue = _issue_for_pr(pr)
             if held_issue is not None:
                 held_ci = ci_state(
-                    pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+                    pr.ci
                 )
                 if (
                     held_ci == CIState.OK
@@ -1937,6 +1794,8 @@ def decide_fix(
                     actions.append(ResetCiRetries(held_issue, state.ci_resets.get(pr.number)))
             continue
         lifecycle = pr_lifecycle(pr)
+        if repair_evidence_incomplete(pr.ci) and (not lifecycle.is_blocked or isinstance(pr.ci, Unavailable)):
+            continue
         if lifecycle.is_blocked:
             # PR-stage blockers are answered on the PR, while the saved agent
             # transcript belongs to its linked issue. A qualifying reply gets a
@@ -1973,7 +1832,7 @@ def decide_fix(
             needs_fix = (
                 (cfg.auto_rebase_conflicts and pr.is_conflicting())
                 or (_rev is not None and _rev.state == REVIEW_CHANGES_REQUESTED)
-                or ci_state(pr.checks, cfg.ci_ignore_checks, known=pr.checks_known)
+                or ci_state(pr.ci)
                 == CIState.FAILURE
             )
             if needs_fix:
@@ -2056,7 +1915,7 @@ def decide_fix(
         # M22/D9: nothing ever adds ai-working to a PR, so it was
         # permanently true. See decide_fix's docstring for the live lease.)
         current_ci = ci_state(
-            pr.checks, cfg.ci_ignore_checks, known=pr.checks_known
+            pr.ci
         )
         # Settled GREEN closes the red-CI episode: the breaker's text is
         # "without going green", so going green must reset it. The counter
@@ -2240,9 +2099,9 @@ def decide_fix(
                     "changing anything re-escalates immediately — the "
                     "facts have not changed.",
                 ))
-        if should_update_branch(pr, state, cfg, world.base_head):
+        if should_update_branch(pr, state, cfg):
             actions.append(
-                UpdateBranch(pr.number, pr.head_ref_oid, world.base_head)
+                UpdateBranch(pr.number, pr.head_ref_oid)
             )
 
     # 4) Merged/closed PRs → cleanup (lock-free).

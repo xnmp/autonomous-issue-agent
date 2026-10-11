@@ -186,10 +186,7 @@ class UpdateBranch:
 
     pr: int
     head: str
-    # Base tip observed when this refresh was decided ("" = not collected).
-    # Part of the once-per-attempt marker key: the advisory-UNSTABLE arm must
-    # re-arm when the base advances (that is the event it exists for), and
-    # GraphQL's baseRefOid cannot see one.
+    # Retained for replay of branch-refresh commands issued before #303.
     base: str = ""
 
 

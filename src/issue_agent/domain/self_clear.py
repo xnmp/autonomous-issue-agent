@@ -5,7 +5,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
-import re
 from zoneinfo import ZoneInfo
 
 from .actions import (
@@ -131,7 +130,6 @@ class MachineClearProjection:
     revision: WorkflowRevision
     block: MachineBlock
     observed_head: str
-    ignored_checks: str = ""
     binding: WorkflowBinding | None = None
 
     def __post_init__(self) -> None:
@@ -141,11 +139,6 @@ class MachineClearProjection:
         if (not isinstance(self.revision.fence.key.target, IssueRef)
                 or self.revision.fence.key.target.number != self.block.issue or self.observed_head != self.block.blocked_head):
             raise ValueError("machine clear evidence does not match its issue/head")
-        validate_workflow_text(self.ignored_checks, "machine clear ignored check policy", empty=True)
-        try:
-            re.compile(self.ignored_checks)
-        except re.error as exc:
-            raise ValueError("machine clear ignored check policy is malformed") from exc
 
 
 @dataclass(frozen=True)
@@ -171,15 +164,15 @@ def _validate_clear_binding(revision, binding) -> None:
         raise ValueError("recovery projection binding must name its selected issue family and generation")
 
 
-def machine_clear_evidence(pr: PRView, block: MachineBlock, ignored_checks: str) -> bool:
+def machine_clear_evidence(pr: PRView, block: MachineBlock) -> bool:
     if pr.state != "OPEN" or not pr.head_ref_oid or pr.head_ref_oid != block.blocked_head:
         return False
     return block.blocker is MachineBlocker.PUBLICATION or ci_state(
-        pr.checks, ignored_checks, known=pr.checks_known) is CIState.OK
+        pr.ci) is CIState.OK
 
 
 def _machine_clearable(
-    world: WorldState, block: MachineBlock, ignored_checks: str
+    world: WorldState, block: MachineBlock
 ) -> tuple[bool, str]:
     pr = next(
         (
@@ -191,7 +184,7 @@ def _machine_clearable(
     )
     if pr is None or not pr.has(Label.AI_BLOCKED) or not pr.head_ref_oid:
         return False, ""
-    return machine_clear_evidence(pr, block, ignored_checks), pr.head_ref_oid
+    return machine_clear_evidence(pr, block), pr.head_ref_oid
 
 
 def _budget_clearable(
@@ -220,7 +213,6 @@ def self_clear_actions(
     budget_worlds: dict[int, BudgetWorld],
     clear_counts: dict[int, int],
     ceiling_reported: frozenset[int],
-    ignored_checks: str = "",
     ceiling: int = SELF_CLEAR_CEILING,
     machine_revisions: dict[int, WorkflowRevision] | None = None,
     budget_revisions: dict[int, WorkflowRevision] | None = None,
@@ -237,7 +229,7 @@ def self_clear_actions(
         if observed_target is not None and not observed_target.has(Label.AI_BLOCKED):
             actions.append(DiscardSelfClearMarker(issue, "machine", (machine_revisions or {}).get(issue)))
             continue
-        clearable, observed_head = _machine_clearable(world, block, ignored_checks)
+        clearable, observed_head = _machine_clearable(world, block)
         if not clearable:
             continue
         count = max(0, clear_counts.get(issue, 0))
@@ -255,7 +247,7 @@ def self_clear_actions(
                 Label.AI_BLOCKED,
                 Label.AI_PR_OPEN,
                 observed_head,
-                self_clear=MachineClearProjection(selected_revision, block, observed_head, ignored_checks,
+                self_clear=MachineClearProjection(selected_revision, block, observed_head,
                     (self_clear_bindings or {}).get(issue))
                 if selected_revision is not None else None,
             ))

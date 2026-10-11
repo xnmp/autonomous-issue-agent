@@ -25,6 +25,7 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, replace
 
 from ...domain.ci_history import CiAttempt
+from ...domain.ci import gated_checks
 from ...domain.environment import EnvironmentManifest
 from ...domain.world import PRView
 from ...domain.trust import Untrusted, as_untrusted, untrusted_block
@@ -1209,7 +1210,7 @@ def with_pr_repair_context(
     checks = "\n".join(
         f"{check.name}: {check.bucket or 'unknown'}; workflow run "
         f"{check.run_id if type(check.run_id) is int and check.run_id > 0 else 'unknown'}"
-        for check in pr.checks
+        for check in gated_checks(pr.ci)
     )
     sections = (
         "CURRENT PR REPAIR CONTEXT — re-evaluate the prior blocker against these "

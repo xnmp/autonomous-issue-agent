@@ -46,7 +46,7 @@ if (return 0 2>/dev/null); then _CE_ABORT=return; else _CE_ABORT=exit; fi
 [ -f "$_CE_REPO_ENV" ]  || { _ce_fail "missing $_CE_REPO_ENV (create config/repos/$_CE_NAME.env)"; $_CE_ABORT 1; }
 
 # review C5(a): this used to emit a hand-maintained allow-list of ~40 vars that
-# omitted ~18 documented knobs (MAX_CI_RETRIES, CI_IGNORE_CHECKS, WORKTREE_ROOT,
+# omitted ~18 documented knobs (MAX_CI_RETRIES, WORKTREE_ROOT,
 # FIX_MCP_CONFIG, ... — see review C5 for the full list), so an operator setting
 # any of them under systemd was silently ignored. Fix: snapshot the environment
 # before sourcing, snapshot it again after, and emit every var either file

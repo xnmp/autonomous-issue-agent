@@ -1,5 +1,7 @@
 """Configured import source checks use daemon boot's owner ancestry."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 import json
@@ -67,7 +69,7 @@ class OnePRGateway:
 
     def get_review_pull_request(self, number):
         assert number == 9
-        return PRView(9, head_ref_name="work/topic", head_ref_oid="a" * 40)
+        return observed_pr(9, head_ref_name="work/topic", head_ref_oid="a" * 40)
 
 
 @pytest.fixture

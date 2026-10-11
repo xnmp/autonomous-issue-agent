@@ -9,6 +9,10 @@ called — rather than merely that a label moved.
 
 from __future__ import annotations
 
+from issue_agent.domain.checks import Check
+
+from tests.domain.builders import observed_pr
+
 import asyncio
 import json
 import os
@@ -1133,7 +1137,8 @@ def test_dispatcher_tags_the_runtime_with_the_dispatch_context(tmp_path):
     runtime = JournalingRuntime(inner, journal, repo="o/r", role="fix")
     gw = FakeGateway(
         issues={5: IssueView(5, title="t", body="b")},
-        prs={100: PRView(100, head_ref_name="fix/5-context", closing_issue=5)},
+        prs={100: observed_pr(100, head_ref_name="fix/5-context", closing_issue=5,
+            checks=(Check("unit", bucket="fail"),))},
     )
     gw.pr_issues[100] = 5
     control = SQLiteControlStore(str(tmp_path / "control.sqlite"))

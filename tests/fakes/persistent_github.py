@@ -13,6 +13,8 @@ back partial exactly as the real parser makes them, writes return False or
 are silently not applied. They must never read as "absent".
 """
 
+from tests.domain.builders import observed_pr
+
 from collections.abc import Callable
 from dataclasses import asdict
 from datetime import datetime
@@ -26,6 +28,7 @@ from issue_agent.domain.labels import Label
 from issue_agent.domain.review_workflow import (
     CompleteReviews, PartialReviews, SubmittedReviewFact, SubmittedReviewState, body_review_command,
 )
+from issue_agent.domain.checks import Observed, Unavailable, RequiredCheck
 from issue_agent.domain.world import Check, Comment, IssueView, PRView, PullRequestDiff, Review, WorldState
 
 
@@ -86,6 +89,8 @@ class PersistentGitHub:
         body = asdict(pr)
         body["labels"] = sorted(label.value for label in pr.labels)
         body["changed_files"] = sorted(pr.changed_files)
+        if isinstance(pr.ci, Observed):
+            body["ci"]["policy"] = [asdict(r) for r in pr.ci.policy]
         with self._connect() as db:
             db.execute("INSERT INTO prs VALUES (?, ?)", (pr.number, json.dumps(body)))
 
@@ -103,7 +108,7 @@ class PersistentGitHub:
             body = json.loads(db.execute("SELECT body FROM prs WHERE number = ?", (number,)).fetchone()[0])
         body["labels"] = frozenset(Label(value) for value in body["labels"])
         body["changed_files"] = frozenset(body["changed_files"])
-        for key, constructor in (("comments", Comment), ("reviews", Review), ("checks", Check)):
+        for key, constructor in (("comments", Comment), ("reviews", Review)):
             body[key] = tuple(constructor(**entry) for entry in body[key])
         # Reviews live in the reviews table once any exist for this PR, so a
         # submitted or dismissed review is what the next read reports.
@@ -113,6 +118,12 @@ class PersistentGitHub:
         if rows:
             body["reviews"] = tuple(Review(state, author, submitted or "", text, commit or "")
                                     for author, state, commit, submitted, text in rows)
+        raw = body["ci"]
+        body["ci"] = (Unavailable(raw["reason"]) if "reason" in raw else
+            Observed(raw["head"], raw["tested_revision"], frozenset(RequiredCheck(**r) for r in raw["policy"]),
+                     tuple(Check(**c) for c in raw["reports"])))
+        if not checks:
+            body["ci"] = Unavailable("checks not requested")
         return PRView(**body)
 
     def build_world(self) -> WorldState:
@@ -278,6 +289,15 @@ class PersistentGitHub:
         """A remote PR edit (for example a pushed head) outside the harness."""
         with self._connect() as db:
             body = json.loads(db.execute("SELECT body FROM prs WHERE number = ?", (number,)).fetchone()[0])
+            if "checks_known" in fields:
+                known = fields.pop("checks_known")
+                if not known:
+                    fields["ci"] = {"reason": "checks not requested"}
+            if "checks" in fields:
+                reports = tuple(Check(**raw) if isinstance(raw, dict) else raw for raw in fields.pop("checks"))
+                head = fields.get("head_ref_oid", body["head_ref_oid"])
+                fields["ci"] = asdict(Observed(head, head, frozenset(), reports))
+                fields["ci"]["policy"] = []
             body.update(fields)
             db.execute("UPDATE prs SET body = ? WHERE number = ?", (json.dumps(body), number))
 

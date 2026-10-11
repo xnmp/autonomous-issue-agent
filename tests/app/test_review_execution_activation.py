@@ -1,5 +1,7 @@
 """Offline configured activation rederives sources and commits one authority."""
 
+from tests.domain.builders import observed_pr
+
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -47,7 +49,7 @@ class Gateway:
     repo = "o/r"
 
     def __init__(self):
-        self.views = {pr: PRView(pr, head_ref_name=f"work/{pr}", head_ref_oid="a" * 40,
+        self.views = {pr: observed_pr(pr, head_ref_name=f"work/{pr}", head_ref_oid="a" * 40,
                                 labels=frozenset({Label.AI_PR_OPEN})) for pr in (9, 10)}
         self.reviews = {pr: CompleteReviews(()) for pr in self.views}
         self.listed = (9, 10)
@@ -347,7 +349,7 @@ def test_terminal_file_blocker_survives_later_first_discovery(rig):
     key = WorkflowKey(cfg.repo, PullRequestRef(11))
     with control.transaction() as db:
         assert isinstance(load_review_workflow_row(db, key).execution, BlockedReviewExecutionMigration)
-    gateway.views[11] = PRView(11, head_ref_name="work/11", head_ref_oid="b" * 40,
+    gateway.views[11] = observed_pr(11, head_ref_name="work/11", head_ref_oid="b" * 40,
                               labels=frozenset({Label.AI_PR_OPEN}))
     gateway.reviews[11] = CompleteReviews(())
     writer = WorkflowWriter(cfg.repo, "review", owner_identity_for_target(cfg.repo, cfg.target_dir, "review"))

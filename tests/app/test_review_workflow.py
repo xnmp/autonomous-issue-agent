@@ -1,5 +1,7 @@
 """ReviewWorkflow wiring tests."""
 
+from tests.domain.builders import observed_pr
+
 import asyncio
 from copy import deepcopy
 from dataclasses import replace
@@ -104,7 +106,7 @@ def test_another_pull_requests_binding_cannot_authorize_review():
 
 
 def test_authority_covered_head_skips_without_paying_or_submitting():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="abc")})
     store, runner = FakeStore(), FakeRunner(AgentResult(is_error=False))
     review_state(store).set_head(100, "abc")
     asyncio.run(_workflow(gw, store, runner).review(100))
@@ -121,7 +123,7 @@ def test_the_pr_conversation_reaches_every_review_round_as_untrusted_data():
         Comment(author="human", body="please attach a screenshot"),
         Comment(author="fixer[bot]", body="this deployment has no display"),
     )
-    pr = PRView(100, head_ref_oid="new", reviews=(prior,), comments=thread)
+    pr = observed_pr(100, head_ref_oid="new", reviews=(prior,), comments=thread)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     store.pr_sessions[100] = "rs"
@@ -141,7 +143,7 @@ def test_the_pr_conversation_reaches_every_review_round_as_untrusted_data():
 
 
 def test_a_pr_with_no_comments_gets_no_discussion_section():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="new")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="new")})
     runner = FakeRunner(AgentResult(
         is_error=False, structured={"decision": "APPROVE", "body": "ok"},
     ))
@@ -154,7 +156,7 @@ def test_a_pr_with_no_comments_gets_no_discussion_section():
 def test_episode_guidance_reaches_the_review_and_re_review_prompts():
     # Accepted operator guidance belongs to the workflow episode.
     prior = Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old")
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="new", reviews=(prior,))})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="new", reviews=(prior,))})
     store = FakeStore()
     review_state(store).set_guidance(100, "native screenshots are impossible here")
     store.pr_sessions[100] = "rs"
@@ -173,7 +175,7 @@ def test_episode_guidance_reaches_the_review_and_re_review_prompts():
 def test_re_review_skips_same_head_but_reviews_a_genuinely_new_head():
     prior = Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old")
     gw = FakeGateway(prs={
-        100: PRView(100, head_ref_oid="new", reviews=(prior,)),
+        100: observed_pr(100, head_ref_oid="new", reviews=(prior,)),
     })
     store = FakeStore()
     store.pr_sessions[100] = "rs"
@@ -195,7 +197,7 @@ def test_external_review_marker_never_becomes_a_resume_session():
         body="check the null-token contract", commit_id="old",
     )
     gw = FakeGateway(prs={
-        100: PRView(
+        100: observed_pr(
             100, head_ref_oid="old", title="Null token", body="Fixes #7",
             reviews=(prior,),
         ),
@@ -205,7 +207,7 @@ def test_external_review_marker_never_becomes_a_resume_session():
     store.pr_sessions[100] = "github-review"
 
     gw.diff_text = "genuinely changed diff"
-    gw._prs[100] = PRView(
+    gw._prs[100] = observed_pr(
         100, head_ref_oid="new", title="Null token", body="Fixes #7",
         reviews=(prior,),
     )
@@ -228,7 +230,7 @@ def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
     """`codex exec resume` has no sandbox flag, so retaining its session id
     would silently restore danger-full-access on a re-review."""
     prior = Review("CHANGES_REQUESTED", "review-bot", "t1", body="fix it", commit_id="old")
-    old = PRView(100, head_ref_oid="old", title="t", body="b")
+    old = observed_pr(100, head_ref_oid="old", title="t", body="b")
     gw = FakeGateway(prs={100: old})
     store = FakeStore()
     first = FakeRunner(AgentResult(
@@ -239,7 +241,7 @@ def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
     asyncio.run(_workflow(gw, store, first, reviewer_runtime="codex").review(100))
     assert store.pr_sessions.get(100, "") == ""
 
-    gw._prs[100] = PRView(100, head_ref_oid="new", title="t", body="b", reviews=(prior,))
+    gw._prs[100] = observed_pr(100, head_ref_oid="new", title="t", body="b", reviews=(prior,))
     setattr(
         gw,
         "pr_diff",
@@ -258,7 +260,7 @@ def test_codex_reviewer_re_reviews_in_a_fresh_read_only_session():
 
 
 def test_codex_review_installs_its_hook_in_the_explicit_checkout_before_running():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = FakeRunner(AgentResult(
@@ -277,7 +279,7 @@ def test_codex_review_installs_its_hook_in_the_explicit_checkout_before_running(
 
 
 def test_codex_review_refuses_an_implicit_process_cwd():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False))
@@ -292,7 +294,7 @@ def test_codex_review_refuses_an_implicit_process_cwd():
 
 
 def test_single_review_submits_before_persisting_state():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = FakeRunner(AgentResult(
@@ -313,7 +315,7 @@ def test_codex_shaped_review_verdict_submits_with_attributed_usage(tmp_path):
     """The Codex runner's schema-normalised result must travel through the
     ordinary REVIEW_SCHEMA submission seam and leave a queryable review ledger
     receipt; neither assertion is a constructor-level proxy."""
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     journal = Journal(str(tmp_path / "review-journal.jsonl"))
@@ -355,7 +357,7 @@ def test_successful_submit_logs_verdict():
     """A clean review must announce its OUTCOME on stdout — not go silent between
     `dispatch` and the next poll. Regression for the observability gap where only
     the error path logged, so an APPROVE was invisible except on GitHub."""
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = FakeRunner(AgentResult(
@@ -370,7 +372,7 @@ def test_successful_submit_logs_verdict():
 
 
 def test_single_review_failed_submit_does_not_persist_state():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr}, submit_ok=False)
     store = FakeStore()
     runner = FakeRunner(AgentResult(
@@ -387,14 +389,14 @@ def test_single_review_failed_submit_does_not_persist_state():
 
 
 def test_single_review_never_submits_stale_verdict_to_new_head():
-    original = PRView(100, head_ref_oid="head-1", title="t", body="b")
+    original = observed_pr(100, head_ref_oid="head-1", title="t", body="b")
     gw = FakeGateway(prs={100: original})
     store = FakeStore()
 
     class AdvancingRunner(FakeRunner):
         async def run(self, task):
             self.tasks.append(task)
-            gw._prs[100] = PRView(
+            gw._prs[100] = observed_pr(
                 100, head_ref_oid="head-2", title="t", body="b"
             )
             return self.result
@@ -419,7 +421,7 @@ def test_single_review_never_submits_stale_verdict_to_new_head():
 
 
 def test_single_review_error_submits_nothing():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="abc")})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=True))
 
@@ -430,7 +432,7 @@ def test_single_review_error_submits_nothing():
 
 
 def test_delegated_review_uses_scout_backed_task_and_submits():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="sha1")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="sha1")})
     store = FakeStore()
     runner = FakeRunner(AgentResult(
         is_error=False,
@@ -454,7 +456,7 @@ def test_delegated_review_uses_scout_backed_task_and_submits():
 
 
 def test_delegated_re_review_uses_prior_review_without_session_resume():
-    pr = PRView(
+    pr = observed_pr(
         100,
         head_ref_oid="new",
         title="t",
@@ -481,7 +483,7 @@ def test_delegated_re_review_uses_prior_review_without_session_resume():
 
 
 def test_re_review_failed_submit_does_not_advance_round():
-    pr = PRView(100, head_ref_oid="new", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="new", title="t", body="b")
     gw = FakeGateway(prs={100: pr}, submit_ok=False)
     store = FakeStore()
     review_state(store).rounds[100] = 2
@@ -500,7 +502,7 @@ def test_re_review_failed_submit_does_not_advance_round():
 
 def test_re_review_passes_escalation_to_authority_without_relabelling():
     # The authority owns label projection even with a custom trigger label.
-    pr = PRView(815, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(815, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={815: pr})
     store = FakeStore()
     review_state(store).rounds[815] = 5
@@ -529,7 +531,7 @@ def test_review_ceiling_is_reported_to_authority_for_receipt_settlement():
     prior = tuple(
         Review("CHANGES_REQUESTED", "review-bot", f"t{i}", body="fix") for i in range(3)
     )
-    pr = PRView(100, head_ref_oid="new", title="t", body="b", reviews=prior)
+    pr = observed_pr(100, head_ref_oid="new", title="t", body="b", reviews=prior)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 4
@@ -552,7 +554,7 @@ def test_verdict_escalation_reason_names_the_verdict_not_the_ceiling():
     """keifu PR #177 (2026-08-02): sol returned ESCALATE on round 3; the breaker
     comment said "requested changes 3 time(s) ... (ceiling 4)", which reads as a
     fencepost bug and hands the dashboard's escalation_reason the wrong WHY."""
-    pr = PRView(100, head_ref_oid="new", title="t", body="b",
+    pr = observed_pr(100, head_ref_oid="new", title="t", body="b",
                 reviews=(Review("CHANGES_REQUESTED", "review-bot", "t0", body="fix"),))
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
@@ -574,7 +576,7 @@ def test_verdict_escalation_reason_names_the_verdict_not_the_ceiling():
 def test_ordinary_rejection_does_not_escalate():
     """Anti-vacuity twin: below the ceiling the reviewer bounces the PR back to
     the fixer — no label move, no escalation event, nobody paged."""
-    pr = PRView(100, head_ref_oid="new", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="new", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 2
@@ -596,7 +598,7 @@ def test_multi_review_reports_its_ceiling_to_authority_for_receipt_settlement():
     prior = tuple(
         Review("CHANGES_REQUESTED", "review-bot", f"t{i}", body="fix") for i in range(3)
     )
-    pr = PRView(100, head_ref_oid="new", title="t", body="b", reviews=prior)
+    pr = observed_pr(100, head_ref_oid="new", title="t", body="b", reviews=prior)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 4
@@ -621,7 +623,7 @@ def test_failed_authority_submission_never_updates_the_reviewed_baseline():
     class RefusingGateway(FakeGateway):
         def submit_review(self, *args, **kwargs):
             return False
-    gw = RefusingGateway(prs={100: PRView(100, head_ref_oid="head")})
+    gw = RefusingGateway(prs={100: observed_pr(100, head_ref_oid="head")})
     store, runner = FakeStore(), FakeRunner(_approved())
     workflow = _workflow(gw, store, runner)
     async def refuse(*args, **kwargs):
@@ -634,7 +636,7 @@ def test_failed_authority_submission_never_updates_the_reviewed_baseline():
 
 
 def test_multi_review_confirmed_blocking_finding_requests_changes_and_persists():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = SchemaRunner(
@@ -654,7 +656,7 @@ def test_multi_review_carries_the_operator_guidance_to_gate_and_dimensions():
     # MULTI returns into its own dispatcher before the single-pass path, so the
     # note has to be read there too — otherwise an unblock journals a scope it
     # never delivered.
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).set_guidance(100, "accept the recorded log as visual evidence")
@@ -680,7 +682,7 @@ def test_multi_review_carries_the_pr_conversation_to_the_dimensions_only():
     # excluded — its only failure direction ends the review in an APPROVE, and a
     # comment is the wrong evidence for "is this diff behavioural?". Validators
     # adjudicate one claim on its merits and stay unscoped too.
-    pr = PRView(
+    pr = observed_pr(
         100, head_ref_oid="abc", title="t", body="b",
         comments=(Comment(author="fixer[bot]", body="no display in this deployment"),),
     )
@@ -704,7 +706,7 @@ def test_multi_review_carries_the_pr_conversation_to_the_dimensions_only():
 
 
 def test_multi_review_gate_short_circuits_non_reviewable_diff_to_approve():
-    pr = PRView(100, head_ref_oid="abc", title="Docs", body="typo fix")
+    pr = observed_pr(100, head_ref_oid="abc", title="Docs", body="typo fix")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = SchemaRunner(gate=_gate(reviewable=False, reason="docs only"))
@@ -717,7 +719,7 @@ def test_multi_review_gate_short_circuits_non_reviewable_diff_to_approve():
 
 
 def test_multi_review_degenerate_gate_runs_full_review_not_approve():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = SchemaRunner(
@@ -733,7 +735,7 @@ def test_multi_review_degenerate_gate_runs_full_review_not_approve():
 
 
 def test_multi_review_all_findings_refuted_approves():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = SchemaRunner(
@@ -752,7 +754,7 @@ def test_multi_review_all_findings_refuted_approves():
 
 
 def test_multi_review_no_findings_approves_without_validation():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = SchemaRunner(
@@ -768,7 +770,7 @@ def test_multi_review_no_findings_approves_without_validation():
 
 
 def test_multi_review_gate_error_persists_nothing():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     runner = SchemaRunner(gate=AgentResult(is_error=True))
@@ -780,7 +782,7 @@ def test_multi_review_gate_error_persists_nothing():
 
 
 def test_multi_review_failed_submit_does_not_persist():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr}, submit_ok=False)
     store = FakeStore()
     runner = SchemaRunner(
@@ -796,7 +798,7 @@ def test_multi_review_failed_submit_does_not_persist():
 
 
 def test_multi_review_incomplete_no_finding_submits_nothing():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     calls = {"n": 0}
@@ -816,7 +818,7 @@ def test_multi_review_incomplete_no_finding_submits_nothing():
 
 
 def test_multi_review_incomplete_but_blocking_still_requests_changes():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     calls = {"n": 0}
@@ -835,7 +837,7 @@ def test_multi_review_incomplete_but_blocking_still_requests_changes():
 
 
 def test_multi_review_validator_error_marks_incomplete():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     seen = []
@@ -859,7 +861,7 @@ def test_multi_review_validator_error_marks_incomplete():
 
 
 def test_multi_review_leg_that_raises_does_not_abort_review():
-    pr = PRView(100, head_ref_oid="abc", title="t", body="b")
+    pr = observed_pr(100, head_ref_oid="abc", title="t", body="b")
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     calls = {"n": 0}
@@ -885,7 +887,7 @@ def test_multi_re_review_at_ceiling_escalates():
     prior = tuple(
         Review("CHANGES_REQUESTED", "review-bot", f"t{i}", body="fix") for i in range(3)
     )
-    pr = PRView(100, head_ref_oid="new", title="t", body="b", reviews=prior)
+    pr = observed_pr(100, head_ref_oid="new", title="t", body="b", reviews=prior)
     gw = FakeGateway(prs={100: pr})
     store = FakeStore()
     review_state(store).rounds[100] = 4
@@ -925,7 +927,7 @@ def _bumps(store) -> int:
 def test_a_healthy_review_counts_no_unproductive_round():
     """Anti-vacuity, and the one that matters most: a counter that ticks on the
     happy path escalates every PR the reviewer ever succeeds on."""
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", title="t", body="b")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="abc", title="t", body="b")})
     store = FakeStore()
     runner = FakeRunner(AgentResult(is_error=False, session_id="rs",
                                     structured={"decision": "APPROVE", "body": "lgtm"}))
@@ -936,7 +938,7 @@ def test_a_healthy_review_counts_no_unproductive_round():
 
 
 def test_a_healthy_multi_review_counts_no_unproductive_round():
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", title="t", body="b")})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="abc", title="t", body="b")})
     store = FakeStore()
     runner = SchemaRunner(gate=_gate(), dimension=lambda t: _dim([]),
                           validation=lambda t: _val(True))
@@ -1016,7 +1018,7 @@ def _reviewed_pr(store, diff, head="old-sha"):
 
 
 def _rebased_pr(head: str = "new-sha", prior_head: str = "old-sha"):
-    return PRView(
+    return observed_pr(
         100,
         head_ref_oid=head,
         base_ref_oid="base-sha",
@@ -1060,7 +1062,7 @@ def test_revision_mismatched_diff_never_runs_or_submits_review():
     gw = MovingDiffGateway(
         _REVIEWED,
         prs={
-            100: PRView(
+            100: observed_pr(
                 100,
                 head_ref_oid="h1",
                 base_ref_oid="base-sha",
@@ -1105,7 +1107,7 @@ def test_a_rebase_that_changes_the_patch_still_runs_the_review_agent():
     """The anti-vacuity twin: real work pushed on top of a rebase is reviewed."""
     store = PatchStore()
     _reviewed_pr(store, _REVIEWED)
-    gw = DiffGateway(_REVISED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REVISED, prs={100: observed_pr(100, head_ref_oid="new-sha")})
     runner = FakeRunner(_approved())
 
     asyncio.run(_workflow(gw, store, runner).re_review(100))
@@ -1134,7 +1136,7 @@ def test_unchanged_patch_does_not_copy_verdict_from_unrelated_revision():
 
 def _downgraded_pr(head: str = "new-sha", prior_head: str = "old-sha",
                    body: str = "fix this"):
-    return PRView(
+    return observed_pr(
         100,
         head_ref_oid=head,
         base_ref_oid="base-sha",
@@ -1191,7 +1193,7 @@ def test_a_pr_with_no_recorded_patch_is_always_reviewed():
     store.pr_sessions[100] = "rs"
     review_state(store).set_head(100, "old-sha")
     review_state(store).rounds[100] = 1
-    gw = DiffGateway(_REBASED, prs={100: PRView(100, head_ref_oid="new-sha")})
+    gw = DiffGateway(_REBASED, prs={100: observed_pr(100, head_ref_oid="new-sha")})
     runner = FakeRunner(_approved())
 
     asyncio.run(_workflow(gw, store, runner).re_review(100))
@@ -1204,7 +1206,7 @@ def test_an_initial_review_records_the_patch_it_reviewed():
     """So the FIRST rebase after the initial review is already skippable — the
     exact shape that cost three paid rounds on the live deployment."""
     store = PatchStore()
-    gw = DiffGateway(_REVIEWED, prs={100: PRView(100, head_ref_oid="sha1")})
+    gw = DiffGateway(_REVIEWED, prs={100: observed_pr(100, head_ref_oid="sha1")})
 
     asyncio.run(_workflow(gw, store, FakeRunner(_approved())).review(100))
 
@@ -1224,7 +1226,7 @@ def test_a_review_that_never_submitted_records_no_patch_baseline():
     """State advances only on a confirmed submit — otherwise a failed POST would
     make the un-reviewed patch look reviewed and skip forever."""
     store = PatchStore()
-    gw = DiffGateway(_REVIEWED, prs={100: PRView(100, head_ref_oid="sha1")},
+    gw = DiffGateway(_REVIEWED, prs={100: observed_pr(100, head_ref_oid="sha1")},
                      submit_ok=False)
 
     asyncio.run(_workflow(gw, store, FakeRunner(_approved())).review(100))
@@ -1251,7 +1253,7 @@ def test_a_multi_agent_re_review_also_skips_an_unchanged_patch():
 
 def test_a_multi_agent_review_records_the_patch_it_reviewed():
     store = PatchStore()
-    gw = DiffGateway(_REVIEWED, prs={100: PRView(100, head_ref_oid="abc")})
+    gw = DiffGateway(_REVIEWED, prs={100: observed_pr(100, head_ref_oid="abc")})
     runner = SchemaRunner(gate=_gate(), dimension=lambda t: _dim([]),
                           validation=lambda t: _val(True))
 
@@ -1324,7 +1326,7 @@ def test_claim_target_changed_defers_and_journals_dispatch_deferred(tmp_path):
     TelemetryWarning('dispatch_deferred', ...) with Correlation(pr=N) so a
     persistent linkage flap is visible in the dashboard per-issue event view, not just
     the log."""
-    pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6)
+    pr = observed_pr(100, head_ref_name="fix/6-moved", closing_issue=6)
     gw = FakeGateway(prs={100: pr})
     runner = FakeRunner(AgentResult(is_error=False))
     journal = RecordingJournal()
@@ -1351,7 +1353,7 @@ def test_claim_target_changed_defers_even_when_journalling_raises():
         def emit(self, event):
             raise OSError("journal disk full")
 
-    pr = PRView(100, head_ref_name="fix/6-moved", closing_issue=6)
+    pr = observed_pr(100, head_ref_name="fix/6-moved", closing_issue=6)
     gw = FakeGateway(prs={100: pr})
     runner = FakeRunner(AgentResult(is_error=False))
 
@@ -1370,7 +1372,7 @@ def test_review_runs_in_the_pinned_checkout_for_the_reviewed_head():
     """The verdict binds a head SHA; the leg's cwd must be a checkout OF that
     SHA, never the operator's live checkout (three phantom REQUEST_CHANGES
     rounds quoted stale chong-dev code under fresh SHAs)."""
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", reviews=())})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="abc", reviews=())})
     store = FakeStore()
     runner = FakeRunner(
         AgentResult(is_error=False, status="APPROVE", summary="ok")
@@ -1398,7 +1400,7 @@ def test_review_runs_in_the_pinned_checkout_for_the_reviewed_head():
 def test_review_defers_when_the_pinned_checkout_is_unavailable():
     """Reviewing unpinned code is worse than waiting a poll: no leg runs, no
     verdict is posted, and no reviewed-state advances."""
-    gw = FakeGateway(prs={100: PRView(100, head_ref_oid="abc", reviews=())})
+    gw = FakeGateway(prs={100: observed_pr(100, head_ref_oid="abc", reviews=())})
     store = FakeStore()
     runner = FakeRunner(
         AgentResult(is_error=False, status="APPROVE", summary="ok")
@@ -1425,7 +1427,7 @@ def test_re_review_pin_deferral_is_not_an_unproductive_round():
         "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
     )
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="new", reviews=(review,))}
+        prs={100: observed_pr(100, head_ref_oid="new", reviews=(review,))}
     )
     store = FakeStore()
     runner = FakeRunner(
@@ -1452,7 +1454,7 @@ def test_pin_deferrals_are_journalled_without_a_second_file_counter():
         "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
     )
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="new", reviews=(review,))}
+        prs={100: observed_pr(100, head_ref_oid="new", reviews=(review,))}
     )
     store = FakeStore()
     runner = FakeRunner(
@@ -1490,7 +1492,7 @@ def test_a_progressed_round_resets_the_deferral_streak():
         "CHANGES_REQUESTED", "review-bot[bot]", "t1", commit_id="old",
     )
     gw = FakeGateway(
-        prs={100: PRView(100, head_ref_oid="new", reviews=(review,))}
+        prs={100: observed_pr(100, head_ref_oid="new", reviews=(review,))}
     )
     store = FakeStore()
     runner = FakeRunner(
@@ -1598,7 +1600,7 @@ class _DeclaringGateway(FakeGateway):
 
 
 def _declaring_pr():
-    return PRView(
+    return observed_pr(
         100,
         head_ref_name="fix/5-x",
         head_ref_oid="head-1",
