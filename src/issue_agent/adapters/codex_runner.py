@@ -501,7 +501,19 @@ def discover_rollout_session(
     return max(candidates)[1] if candidates else ""
 
 
-def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict | None:
+def _rollout_event_time(event: dict) -> float:
+    raw = event.get("timestamp")
+    if not isinstance(raw, str):
+        raise ValueError("rollout event lacks a timestamp")
+    stamp = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    if stamp.tzinfo is None:
+        raise ValueError("rollout timestamp is not timezone-aware")
+    return stamp.timestamp()
+
+
+def read_rollout_usage(
+    session_id: str, codex_home: str | None = None, *, until: float | None = None
+) -> dict | None:
     """Exact token counters from codex's own session rollout file, or None.
 
     codex-cli persists `token_count` events (with a cumulative
@@ -517,6 +529,12 @@ def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict |
     convention as the stderr line (see parse_codex_usage). Any failure — no
     session id, no file, unparseable lines — reads as None so the caller falls
     back to stderr parsing; losing precision must never lose the run.
+
+    `until` (epoch seconds) ignores token_counts stamped after it, so recovery of
+    a finished run cannot absorb a later leg that resumed the session; a
+    token_count without a parseable timestamp, or any token_count after it,
+    reads as None (fail closed): the run's end is not corroborated by a clean
+    stop in the root rollout.
     """
     if not session_id:
         return None
@@ -540,6 +558,8 @@ def read_rollout_usage(session_id: str, codex_home: str | None = None) -> dict |
                 payload = event.get("payload") or {}
                 if payload.get("type") != "token_count":
                     continue
+                if until is not None and _rollout_event_time(event) > until:
+                    return None
                 total = (payload.get("info") or {}).get("total_token_usage") or {}
                 if total:
                     found = total

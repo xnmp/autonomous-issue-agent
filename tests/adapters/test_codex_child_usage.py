@@ -193,7 +193,87 @@ def test_missing_or_untrusted_parent_usage_cannot_become_rollout_authority(prepa
 def test_same_turn_missing_response_receipt_is_detected_by_another_token_count(prepared):
     home, meter = prepared
     records = child_records(home.parent)
-    records.insert(-1, records[4])
+    first = records[4]["payload"]["info"]["last_token_usage"]
+    doubled = {k: v * 2 for k, v in first.items()}
+    # A genuine second response advances the cumulative total; it has no receipt.
+    records.insert(-1, event("event_msg", {"type": "token_count", "info": {
+        "last_token_usage": first, "total_token_usage": doubled}}))
+    write(home, CHILD, records)
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+def _count(last, total, *, rate_limit=0):
+    info = {"last_token_usage": last, "total_token_usage": total}
+    return event("event_msg", {"type": "token_count", "info": info, "rate_limits": {"used": rate_limit}})
+
+
+def _settled_tokens(meter):
+    observed = meter.sample(ROOT, "sol", PARENT_USAGE, final=True)
+    return observed, (total_usage(observed.samples) if isinstance(observed, MeasuredRunUsage) else None)
+
+
+def test_reemitted_token_count_with_identical_totals_is_not_double_counted(prepared):
+    home, meter = prepared
+    records = child_records(home.parent)
+    records.insert(-1, _count(records[4]["payload"]["info"]["last_token_usage"],
+                              records[4]["payload"]["info"]["total_token_usage"], rate_limit=7))
+    write(home, CHILD, records)
+    observed, usage = _settled_tokens(meter)
+    assert isinstance(observed, MeasuredRunUsage)
+    assert price_run_usage(observed, RATES).micros == 1224
+    assert (usage.input_tokens, usage.output_tokens) == (1100, 30)
+
+
+def test_reemission_split_across_incremental_samples_is_still_recognised(prepared):
+    home, meter = prepared
+    records = child_records(home.parent, complete=False)
+    write(home, CHILD, records)
+    assert not isinstance(meter.sample(ROOT, "sol", PARENT_USAGE), UnavailableRunUsage)
+    tokens = records[4]["payload"]["info"]
+    records += [_count(tokens["last_token_usage"], tokens["total_token_usage"]),
+                event("event_msg", {"type": "task_complete", "turn_id": "turn:" + CHILD})]
+    write(home, CHILD, records)
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), MeasuredRunUsage)
+
+
+def test_many_reemissions_do_not_consume_the_token_count_bound(prepared):
+    home, _ = prepared
+    meter = CodexChildUsageMeter(str(home), START, RATES, str(home.parent), max_responses=8)
+    records = child_records(home.parent)
+    info = records[4]["payload"]["info"]
+    records[5:5] = [_count(info["last_token_usage"], info["total_token_usage"], rate_limit=i) for i in range(500)]
+    write(home, CHILD, records)
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), MeasuredRunUsage)
+
+
+def test_distinct_token_counts_still_respect_the_bound(prepared):
+    home, _ = prepared
+    meter = CodexChildUsageMeter(str(home), START, RATES, str(home.parent), max_responses=8)
+    records = child_records(home.parent)
+    base = records[4]["payload"]["info"]["last_token_usage"]
+    records[5:5] = [_count(base, {k: v * (i + 2) for k, v in base.items()}) for i in range(50)]
+    write(home, CHILD, records)
+    assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
+
+
+@pytest.mark.parametrize("second", ["different_last", "different_total", "decreasing_total",
+                                    "missing_total", "malformed_total", "missing_last", "empty_total"])
+def test_ambiguous_second_token_count_keeps_strict_failure(prepared, second):
+    home, meter = prepared
+    records = child_records(home.parent)
+    info = records[4]["payload"]["info"]
+    last, total = info["last_token_usage"], info["total_token_usage"]
+    bumped = {**last, "output_tokens": last["output_tokens"] + 1}
+    extra = {
+        "different_last": _count(bumped, total),
+        "different_total": _count(last, bumped),
+        "decreasing_total": _count(last, {**total, "output_tokens": total["output_tokens"] - 1}),
+        "missing_total": event("event_msg", {"type": "token_count", "info": {"last_token_usage": last}}),
+        "malformed_total": _count(last, "garbage"),
+        "missing_last": event("event_msg", {"type": "token_count", "info": {"total_token_usage": total}}),
+        "empty_total": _count(last, {}),
+    }[second]
+    records.insert(-1, extra)
     write(home, CHILD, records)
     assert isinstance(meter.sample(ROOT, "sol", PARENT_USAGE, final=True), UnavailableRunUsage)
 

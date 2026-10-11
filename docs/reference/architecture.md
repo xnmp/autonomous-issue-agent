@@ -409,7 +409,24 @@ using the same captured card as the parent. Copied fork prefixes and referenced
 ancestor history are excluded. The configured card also prices root-only work;
 legacy scalar rates cannot override its cap decision. Missing lineage, model,
 usage or completion returns `ACCOUNTING_UNAVAILABLE` and retains the full
-obligation. Recovery requires the complete version-2 invocation/card evidence.
+obligation.
+A rollout `token_count` whose cumulative `total_token_usage` and `last_token_usage`
+both equal the previous one in the same rollout is an idempotent Codex
+re-emission (for example after a rate-limit refresh) that adds no tokens, so it
+is not counted against the response receipts. Equal totals with different last
+usage, decreasing totals, or a missing or malformed total stay ambiguous and
+fail closed; the receipt equality check is unchanged.
+Spend evidence freezes the meter's failure text. Recovery parses it once into
+`NativeFailure`; for the ambiguous-token-count class (fully determined by the
+retained rollouts) it re-runs the meter over `codex_home` and, when that now
+measures, settles through the normal reconcile path and journals
+`accounting.native_usage.remetered.v1` (once per run and class, in the settlement transaction). Every recovery read
+(root cumulative usage and all child events) is bounded by the harness-owned
+`runs.completed_at`, so a later leg resuming the same session is never billed to
+the ended run; an event without a parseable timestamp fails closed, and a run
+with no `completed_at` is not re-metered; a root token_count after the end also fails closed. A still-failing, missing or malformed
+re-read keeps the unavailable result and its retained obligation, and every
+other frozen failure class stays final without reading rollouts. Recovery requires the complete version-2 invocation/card evidence.
 Unsettled legacy version-1 recovery evidence stays reserved because it cannot establish child
 accounting. JSONL remains evidence for the authoritative SQLite settlement.
 Native accounting uncertainty cannot expire through the legacy completed-run

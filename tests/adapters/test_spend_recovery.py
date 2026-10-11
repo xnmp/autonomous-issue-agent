@@ -12,7 +12,9 @@ from issue_agent.adapters.control_store import (
     SQLiteControlStore,
     AccountingDisposition,
 )
+from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.spend_recovery import CodexSpendReconciler
+from issue_agent.domain.events import NativeUsageRemetered, Producer, decode_event_line
 from issue_agent.domain.contracts import (
     BudgetScope,
     Money,
@@ -171,4 +173,236 @@ def test_running_codex_uncertainty_survives_generic_completion_and_grace(tmp_pat
     store.record_reservation_retained(run_id, "generic post-run retention")
     assert store.release_retained(run_id, "completed unmeasured grace elapsed",
                                   NOW + timedelta(days=365)).disposition is AccountingDisposition.CONFLICT
+    assert store.active_reservation_runs() == (run_id,)
+
+
+ROOT = "019fa244-0000-7de0-8e18-e56f423bbbcc"
+CHILD = "019fa244-0000-7de0-8e18-e56f423bbbcd"
+AMBIGUOUS = "native response usage is missing or token counts are ambiguous"
+CHILD_TOKENS = {"input_tokens": 1000, "cached_input_tokens": 400, "cache_write_input_tokens": 0, "output_tokens": 20}
+
+
+def _ev(kind, payload):
+    return {"timestamp": NOW.isoformat(), "type": kind, "payload": payload}
+
+
+def _count(last, total):
+    return _ev("event_msg", {"type": "token_count", "info": {"last_token_usage": last, "total_token_usage": total},
+                              "rate_limits": {"used": 1}})
+
+
+def _write_rollout(home, sid, records):
+    directory = home / "sessions" / NOW.strftime("%Y/%m/%d")
+    directory.mkdir(parents=True, exist_ok=True)
+    (directory / f"rollout-now-{sid}.jsonl").write_text(
+        "".join(json.dumps({**e, "ordinal": i}) + "\n" for i, e in enumerate(records)))
+
+
+def _meta(sid, cwd, parent=None):
+    source = ({"subagent": {"thread_spawn": {"parent_thread_id": parent, "agent_path": "/root/review"}}}
+              if parent else "exec")
+    return _ev("session_meta", {"id": sid, "session_id": parent or sid, "source": source, "originator": "codex_exec",
+                                "cwd": str(cwd), "cli_version": "0.160.0", "subagent_history_start_ordinal": None})
+
+
+def _native_home(tmp_path, extra_counts=()):
+    home = tmp_path / "codex-home"
+    root_total = {"input_tokens": 1000, "output_tokens": 10, "cached_input_tokens": 500}
+    _write_rollout(home, ROOT, [
+        _meta(ROOT, tmp_path),
+        _ev("response_item", {"type": "function_call", "name": "spawn_agent", "call_id": "c1",
+                              "arguments": json.dumps({"task_name": "review", "message": "go"})}),
+        _ev("response_item", {"type": "function_call_output", "call_id": "c1",
+                              "output": json.dumps({"task_name": "/root/review", "nickname": None})}),
+        _count(root_total, root_total)])
+    turn = "turn:child"
+    child = [_meta(CHILD, tmp_path, ROOT),
+             _ev("event_msg", {"type": "task_started", "turn_id": turn}),
+             _ev("turn_context", {"turn_id": turn, "model": "gpt"}),
+             _ev("token_usage_record", {"thread_id": CHILD, "turn_id": turn, "response_id": "r1",
+                                        "usage": CHILD_TOKENS, "thread_token_usage": CHILD_TOKENS}),
+             _count(CHILD_TOKENS, CHILD_TOKENS), *extra_counts,
+             _ev("event_msg", {"type": "task_complete", "turn_id": turn})]
+    _write_rollout(home, CHILD, child)
+    return home
+
+
+def _frozen_evidence(tmp_path, home, failure):
+    evidence_dir = tmp_path / "state" / "spend-evidence"
+    write_spend_evidence(str(evidence_dir), "crashed-run", {
+        "cwd": str(tmp_path), "rollout_started_at": NOW.timestamp() - 5, "session_id": ROOT,
+        "baseline_session_id": "", "baseline_usage": None, "model": "gpt",
+        "cost_per_mtok_in": 10, "cost_per_mtok_out": 20, "cost_per_mtok_cached_in": 1,
+        "codex_home": str(home), "config_version": "cfg", "native_usage_started_at": NOW.timestamp() - 5,
+        "native_root_sessions": {ROOT: "gpt"},
+        "native_rate_table": rate_table_evidence(RateTable(
+            "card", "v1", "USD", {"gpt": ModelRates(10000000, 20000000, 1000000, 10000000)})),
+        "native_usage_failure": failure})
+    return evidence_dir
+
+
+def _end_run_at(store, run_id, at):
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET state='completed', completed_at=? WHERE run_id=?",
+                   (at.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z"), str(run_id)))
+
+
+def _later(seconds):
+    return (NOW + timedelta(seconds=seconds)).isoformat()
+
+
+END = NOW.replace(microsecond=0) + timedelta(seconds=10)
+
+
+def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settles(tmp_path):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
+    store.bind_event_outbox(log.prepare, log.append_committed)
+    assert store.record_accounting_unavailable(run_id, AMBIGUOUS)
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.active_reservation_runs() == ()
+    # root 500 uncached in/10 out/500 cached + child 600/20/400 counted once.
+    assert store.snapshot(scope).settled == Money("USD", 12_500)
+    assert not any(evidence_dir.iterdir())
+    payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
+    assert NativeUsageRemetered(str(run_id), "AMBIGUOUS_TOKEN_COUNTS", "measured") in payloads
+
+
+def test_frozen_ambiguous_failure_with_genuinely_conflicting_rollout_stays_unavailable(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    doubled = {k: v * 2 for k, v in CHILD_TOKENS.items()}
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, doubled)])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,) and any(evidence_dir.iterdir())
+
+
+@pytest.mark.parametrize("failure", ["native child has no corroborating rollout", "something unclassified"])
+def test_other_frozen_failures_are_final_without_reading_rollouts(tmp_path, failure):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    home = _native_home(tmp_path)  # would meter cleanly if it were read
+    evidence_dir = _frozen_evidence(tmp_path, home, failure)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+@pytest.mark.parametrize("damage", ["missing_home", "missing_child_rollout", "malformed_rollout"])
+def test_frozen_ambiguous_failure_fails_closed_when_rollouts_are_unusable(tmp_path, damage):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    home = _native_home(tmp_path)
+    if damage == "missing_home":
+        home = tmp_path / "nowhere"
+    elif damage == "missing_child_rollout":
+        next(home.rglob(f"*{CHILD}.jsonl")).unlink()
+    else:
+        next(home.rglob(f"*{CHILD}.jsonl")).write_text("{not json\n")
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def _append(path, records):
+    with path.open("a") as stream:
+        stream.write("".join(json.dumps(e) + "\n" for e in records))
+
+
+def test_later_leg_children_after_the_end_are_not_billed_to_the_ended_run(tmp_path):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    other = "019fa244-0000-7de0-8e18-e56f423bbbcf"
+    at = {"timestamp": _later(60)}
+    _append(next(home.rglob(f"*{ROOT}.jsonl")), [
+        {**at, "type": "response_item", "payload": {
+            "type": "function_call", "name": "spawn_agent", "call_id": "c2",
+            "arguments": json.dumps({"task_name": "again", "message": "go"})}},
+        {**at, "type": "response_item", "payload": {
+            "type": "function_call_output", "call_id": "c2",
+            "output": json.dumps({"task_name": "/root/again", "nickname": None})}}])
+    turn = "turn:later"
+    _write_rollout(home, other, [
+        {**_meta(other, tmp_path, ROOT), **at},
+        {**_ev("event_msg", {"type": "task_started", "turn_id": turn}), **at},
+        {**_ev("turn_context", {"turn_id": turn, "model": "gpt"}), **at},
+        {**_ev("token_usage_record", {"thread_id": other, "turn_id": turn, "response_id": "x",
+                                      "usage": CHILD_TOKENS, "thread_token_usage": CHILD_TOKENS}), **at}])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.snapshot(scope).settled == Money("USD", 12_500)
+
+
+def _root_count_at(tmp_path, store, run_id, at):
+    _end_run_at(store, run_id, END)
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    total = {"input_tokens": 2000, "output_tokens": 10, "cached_input_tokens": 500}
+    _append(next(home.rglob(f"*{ROOT}.jsonl")), [{**_count(total, total), "timestamp": at.isoformat()}])
+    return _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+
+def test_root_token_count_exactly_at_the_end_is_counted(tmp_path):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    evidence_dir = _root_count_at(tmp_path, store, run_id, END)
+
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.snapshot(scope).settled == Money("USD", 22_500)
+
+
+def test_root_token_count_one_millisecond_after_the_end_fails_closed(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    evidence_dir = _root_count_at(tmp_path, store, run_id, END + timedelta(milliseconds=1))
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_ambiguous_remeter_requires_the_runs_recorded_end(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    assert store.run_completed_at(run_id) is None
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+    assert store.active_reservation_runs() == (run_id,)
+
+
+def test_remeter_journal_is_emitted_once_across_sweeps(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    log = EventLog(str(tmp_path / "events-v2.jsonl"), Producer("deployment", "o/r", "fix", 100, "boot"))
+    store.bind_event_outbox(log.prepare, log.append_committed)
+    _end_run_at(store, run_id, END)
+    home = _native_home(tmp_path, extra_counts=[_count(CHILD_TOKENS, CHILD_TOKENS)])
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+    reconciler = CodexSpendReconciler(store, (str(evidence_dir),))
+
+    assert reconciler.reconcile(run_id)
+    reconciler.reconcile(run_id)
+
+    payloads = [decode_event_line(line).payload for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()]
+    assert sum(isinstance(p, NativeUsageRemetered) for p in payloads) == 1
+
+
+def test_untimestamped_root_usage_inside_the_bounded_window_fails_closed(tmp_path):
+    store, _scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, NOW + timedelta(seconds=10))
+    home = _native_home(tmp_path)
+    rollout = next(home.rglob(f"*{ROOT}.jsonl"))
+    with rollout.open("a") as stream:
+        stream.write(json.dumps({"type": "event_msg", "payload": {"type": "token_count", "info": {
+            "total_token_usage": {"input_tokens": 1, "output_tokens": 1}}}}) + "\n")
+    evidence_dir = _frozen_evidence(tmp_path, home, AMBIGUOUS)
+
+    assert not CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
     assert store.active_reservation_runs() == (run_id,)

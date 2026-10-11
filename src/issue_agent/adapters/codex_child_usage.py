@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 import json
 import os
 import uuid
@@ -17,6 +18,25 @@ from pathlib import Path
 from ..domain.contracts import TokenUsage, UsageSource
 from ..domain.pricing import ModelRates, RateTable, UnknownModelPolicy
 from ..domain.run_usage import MeasuredRunUsage, ModelUsage, RunUsage, UnavailableRunUsage
+
+
+class NativeFailure(str, Enum):
+    """Meter failure classes recovery may act on; the value is the persisted text.
+
+    Failures are frozen into spend evidence as prose. Only a class whose cause is
+    fully determined by the retained rollouts may be re-metered, so recovery
+    parses the persisted text here once instead of matching strings itself.
+    """
+
+    AMBIGUOUS_TOKEN_COUNTS = "native response usage is missing or token counts are ambiguous"
+
+    @classmethod
+    def parse(cls, raw: object) -> "NativeFailure | None":
+        return next((member for member in cls if raw == member.value), None)
+
+
+class RemeterOutcome(str, Enum):
+    MEASURED = "measured"
 
 
 def normalize_usage(raw: dict) -> TokenUsage:
@@ -96,6 +116,8 @@ class _Rollout:
     completed_turns: set[str] = field(default_factory=set)
     started_turns: set[str] = field(default_factory=set)
     token_counts: dict[str, list[TokenUsage | None]] = field(default_factory=dict)
+    # Raw (total, last) of the previous token_count, kept across incremental reads.
+    last_count: tuple[dict, dict] | None = None
 
 
 @dataclass
@@ -109,6 +131,9 @@ class CodexChildUsageMeter:
     max_bytes: int = 256 * 1024 * 1024
     max_record_bytes: int = 16 * 1024 * 1024
     max_responses: int = 4096
+    # Recovery bound: events after the run's harness-owned end belong to a later
+    # leg that may resume the same sessions. A missing timestamp fails closed.
+    ended_at: float | None = None
     roots: dict[str, ModelUsage] = field(default_factory=dict, init=False)
     rollouts: dict[str, _Rollout] = field(default_factory=dict, init=False)
     children: dict[str, tuple[str, str | None]] = field(default_factory=dict, init=False)
@@ -200,6 +225,8 @@ class CodexChildUsageMeter:
                 self._locate(sid)
 
     def _event(self, rollout: _Rollout, event: dict) -> None:
+        if self.ended_at is not None and _timestamp(event.get("timestamp")) > self.ended_at:
+            return
         kind, payload = event.get("type"), event.get("payload") or {}
         if not isinstance(payload, dict):
             raise ValueError("native rollout payload is malformed")
@@ -333,6 +360,15 @@ class CodexChildUsageMeter:
         elif event_kind == "token_count":
             info = payload.get("info") or {}
             raw = info.get("last_token_usage")
+            total = info.get("total_token_usage")
+            # Codex re-emits a token_count (e.g. after a rate-limit refresh) with
+            # an unchanged cumulative total and last usage: no tokens were added,
+            # so it is not a further response. Only exact equality of both
+            # well-formed counters qualifies; anything else stays ambiguous.
+            counters = (total, raw) if isinstance(total, dict) and total and isinstance(raw, dict) else None
+            if counters is not None and counters == rollout.last_count:
+                return
+            rollout.last_count = counters
             normalized = normalize_usage(raw) if isinstance(raw, dict) else None
             if sum(len(v) for r in self.rollouts.values() for v in r.token_counts.values()) >= self.max_responses:
                 raise ValueError("native observer exceeded its token-count bound")
@@ -478,7 +514,7 @@ class CodexChildUsageMeter:
                 for turn in own_turns:
                     receipts = [tokens for record_turn, tokens in rollout.usage.values() if record_turn == turn]
                     if final and rollout.token_counts.get(turn, []) != receipts:
-                        raise ValueError("native response usage is missing or token counts are ambiguous")
+                        raise ValueError(NativeFailure.AMBIGUOUS_TOKEN_COUNTS.value)
                     actual_model = rollout.models.get(turn)
                     # Native task_started can precede turn_context. Only an
                     # unfinished turn without usage evidence can await it;

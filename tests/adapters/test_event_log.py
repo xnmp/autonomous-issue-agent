@@ -501,6 +501,8 @@ _SAMPLE = {
     "summary": None,
     "corrects": "event-id",
     "reason": "reason",
+    "failure_class": "AMBIGUOUS_TOKEN_COUNTS",
+    "outcome": "measured",
     "stall_id": "stall-id",
     "infra_deaths": 1,
     "suspended_ms": 1,
