@@ -135,6 +135,9 @@ class Daemon:
     # Total application deadline, including forced teardown and reconciliation.
     # The systemd hard stop is 90s, leaving 10s for interpreter/supervisor exit.
     shutdown_timeout_seconds: float = DEFAULT_SHUTDOWN_TIMEOUT_SECONDS
+    # Clock for the shutdown deadline. Tests inject a controlled clock so
+    # deadline expiry is a decision, not a race against thread scheduling.
+    monotonic: Callable[[], float] = time.monotonic
     # ADR 0006: callers emit semantic triggers; the coordinator selects arms.
     reconcile: Callable[[RecoveryTrigger], object] | None = None
     reservation_sweep_ticks: int = DEFAULT_RESERVATION_SWEEP_TICKS
