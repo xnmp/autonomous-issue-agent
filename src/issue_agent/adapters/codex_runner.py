@@ -37,10 +37,11 @@ from ..domain.pricing import (
     usd_per_million_to_micros,
     with_default_model_rates,
     default_cache_read_rate,
+    default_cache_write_rate,
     RateTable,
 )
-from ..domain.run_usage import RunUsage, MeasuredRunUsage, UnavailableRunUsage, price_run_usage
-from .codex_child_usage import CodexChildUsageMeter, rate_table_evidence
+from ..domain.run_usage import RunUsage, MeasuredRunUsage, EstimatedRunUsage, price_run_usage
+from .codex_child_usage import CodexChildUsageMeter, rate_table_evidence, normalize_usage
 from ..domain.outcome import (
     AgentResult,
     ExitReason,
@@ -530,11 +531,8 @@ def read_rollout_usage(
     session id, no file, unparseable lines — reads as None so the caller falls
     back to stderr parsing; losing precision must never lose the run.
 
-    `until` (epoch seconds) ignores token_counts stamped after it, so recovery of
-    a finished run cannot absorb a later leg that resumed the session; a
-    token_count without a parseable timestamp, or any token_count after it,
-    reads as None (fail closed): the run's end is not corroborated by a clean
-    stop in the root rollout.
+    `until` excludes counters after the recorded end without erasing earlier
+    usage. Untimestamped counters cannot establish this run's invocation window.
     """
     if not session_id:
         return None
@@ -553,25 +551,24 @@ def read_rollout_usage(
                     continue
                 try:
                     event = json.loads(line)
-                except (json.JSONDecodeError, ValueError):
+                    payload = event.get("payload") or {}
+                    if payload.get("type") != "token_count":
+                        continue
+                    observed_at = _rollout_event_time(event)
+                    if until is not None and observed_at > until:
+                        continue
+                    total = (payload.get("info") or {}).get("total_token_usage")
+                    normalize_usage(total)
+                except (ValueError, TypeError, AttributeError):
                     continue
-                payload = event.get("payload") or {}
-                if payload.get("type") != "token_count":
-                    continue
-                if until is not None and _rollout_event_time(event) > until:
-                    return None
-                total = (payload.get("info") or {}).get("total_token_usage") or {}
-                if total:
-                    found = total
+                found = total
         if not found:
             return None
         return {
-            "input_tokens": int(found.get("input_tokens", 0) or 0),
-            "output_tokens": int(found.get("output_tokens", 0) or 0),
-            "cache_read_input_tokens": int(found.get("cached_input_tokens", 0) or 0),
-            "cache_creation_input_tokens": int(
-                found.get("cache_write_input_tokens", 0) or 0
-            ),
+            "input_tokens": found["input_tokens"],
+            "output_tokens": found["output_tokens"],
+            "cache_read_input_tokens": found.get("cached_input_tokens", 0),
+            "cache_creation_input_tokens": found.get("cache_write_input_tokens", 0),
             "source": UsageSource.ROLLOUT.value,
         }
     except Exception:  # noqa: BLE001 — accounting fallback must never kill a run
@@ -714,52 +711,6 @@ def codex_cost_usd(
         ) / 1_000_000.0
     total = int(usage.get("total_tokens", 0) or 0)
     return total * max(rate_in, rate_out) / 1_000_000.0
-
-
-_PLAUSIBILITY_FLOOR_SECONDS = 120.0
-_MAX_PLAUSIBLE_COST_PER_MINUTE_USD = 50.0
-
-
-def implausible_codex_usage_warning(
-    usage: dict | None,
-    *,
-    elapsed_s: float,
-    has_baseline: bool,
-    cost_per_mtok_in: float,
-    cost_per_mtok_out: float,
-    cost_per_mtok_cached_in: float | None = None,
-) -> str:
-    """Explain an impossible-looking fresh-session counter, else blank.
-
-    This is a circuit breaker around identity/accounting drift, not a spend
-    estimate. A resumed session legitimately has a large cumulative counter and
-    is protected by its baseline delta. A fresh leg claiming more than $100
-    inside two minutes instead matches the live failure where usage-shaped test
-    output was mistaken for the run's own receipt; acting on it is more
-    dangerous than temporarily declining to price it.
-    """
-    if not isinstance(usage, dict):
-        return ""
-    cost = codex_cost_usd(
-        usage,
-        cost_per_mtok_in=cost_per_mtok_in,
-        cost_per_mtok_out=cost_per_mtok_out,
-        cost_per_mtok_cached_in=cost_per_mtok_cached_in,
-    )
-    elapsed_for_ceiling = max(elapsed_s, _PLAUSIBILITY_FLOOR_SECONDS)
-    ceiling = (
-        elapsed_for_ceiling
-        * _MAX_PLAUSIBLE_COST_PER_MINUTE_USD
-        / 60.0
-    )
-    if cost <= ceiling:
-        return ""
-    return (
-        f"fresh Codex usage implies ${cost:.2f} after {elapsed_s:.1f}s "
-        f"(>${ceiling:.2f} at the "
-        f"${_MAX_PLAUSIBLE_COST_PER_MINUTE_USD:.2f}/minute plausibility ceiling"
-        f"{' after a resumed-session delta' if has_baseline else ''})"
-    )
 
 
 def budget_overrun_usd(
@@ -1339,6 +1290,18 @@ class CodexRunner(AgentRuntime):
         and get None (#43)."""
         return task.model or self.default_model
 
+    def _native_rates(self, model: str) -> RateTable | None:
+        if self.rate_table is not None:
+            return self.rate_table
+        rates = {}
+        for name in {model.strip().casefold() or "<runtime-default>"} | {row[0].strip().casefold() for row in with_default_model_rates(self.cost_per_mtok)}:
+            inputs, outputs, cached = rates_with_cache_for_model(name, self.cost_per_mtok, self.cost_per_mtok_cached_in,
+                fallback_in=self.cost_per_mtok_in, fallback_out=self.cost_per_mtok_out)
+            if min(inputs, outputs, cached) > 0:
+                rates[name] = ModelRates(*(usd_per_million_to_micros(value) for value in
+                    (inputs, outputs, cached, default_cache_write_rate(name, inputs))))
+        return RateTable("codex-config", "legacy", "USD", rates) if rates else None
+
     def _child_environment(self, task: RuntimePlan) -> dict[str, str]:
         return child_process_env(
             os.environ,
@@ -1581,8 +1544,9 @@ class CodexRunner(AgentRuntime):
         rl_attempts = 0
         native_meter = CodexChildUsageMeter(
             codex_home or os.path.expanduser("~/.codex"), time.time(),
-            self.rate_table, task.cwd or os.getcwd(),
+            self._native_rates(self._resolved_model(task)), task.cwd or os.getcwd(),
         )
+        native_meter.seed_baseline(baseline_sid, baseline_usage)
         # An attached review child has one immutable launch receipt per run.
         # A second supervised exec under that run cannot register a process.
         attached_review_child = task.env.get("ISSUE_AGENT_REVIEW_CHILD") == "1"
@@ -1639,27 +1603,17 @@ class CodexRunner(AgentRuntime):
                 native_meter=native_meter,
             )
             observed = native_meter.sample(
-                result.session_id, self._resolved_model(task),
+                result.session_id, self._resolved_model(task) or "<runtime-default>",
                 (result.usage if isinstance(result.usage, dict)
                  and result.usage.get("source") == UsageSource.ROLLOUT.value else None),
                 final=True,
             )
-            if isinstance(observed, UnavailableRunUsage):
-                result = replace(
-                    result, is_error=True, status="blocked", run_usage=observed,
-                    exit_reason=(result.exit_reason if result.exit_reason is ExitReason.BUDGET_EXHAUSTED
-                                 else ExitReason.ACCOUNTING_UNAVAILABLE),
-                    telemetry_warning=observed.detail,
-                    summary="Native Codex accounting unavailable: " + observed.detail,
-                )
-                return result
-            if isinstance(observed, MeasuredRunUsage) and self.rate_table is not None:
-                amount = price_run_usage(observed, self.rate_table)
-                result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000)
-                if (self.enforce_budget and task.max_budget_usd > 0
-                        and amount.micros >= Money.from_major("USD", task.max_budget_usd).micros):
-                    result = replace(result, is_error=True, status=MAX_BUDGET_STATUS,
-                                     envelope_subtype=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
+            amount = price_run_usage(observed, native_meter.rates)
+            result = replace(result, run_usage=observed, cost_usd=amount.micros / 1_000_000,
+                             telemetry_warning=result.telemetry_warning or (observed.detail if isinstance(observed, EstimatedRunUsage) else ""))
+            if self.enforce_budget and task.max_budget_usd > 0 and amount.micros >= Money.from_major("USD", task.max_budget_usd).micros:
+                result = replace(result, is_error=True, status=MAX_BUDGET_STATUS,
+                                 envelope_subtype=MAX_BUDGET_STATUS, exit_reason=ExitReason.BUDGET_EXHAUSTED)
             if result.exit_reason is ExitReason.BUDGET_EXHAUSTED:
                 return result
             if hung:
@@ -1769,14 +1723,12 @@ class CodexRunner(AgentRuntime):
         loop above owns only retry policy."""
         import asyncio
 
-        model = self._resolved_model(task)
+        model = self._resolved_model(task) or "<runtime-default>"
         proc_env = self._child_environment(task)
         codex_home = self._accounting_home(proc_env, task.cwd)
         self._log(f"codex: exec model={model} cwd={task.cwd or '.'}")
-        # Rollout metadata uses wall-clock UTC while the plausibility guard only
-        # needs elapsed process time. Keep the two clocks separate: wall time
-        # identifies post-start files; monotonic time cannot jump and does not
-        # perturb the injectable watchdog clock's call sequence.
+        # Rollout ownership needs wall time; elapsed telemetry uses monotonic
+        # time without perturbing the injectable watchdog clock.
         rollout_started_at = time.time()
         attempt_started_at = time.monotonic()
         execution_cwd = task.cwd or os.getcwd()
@@ -1787,7 +1739,7 @@ class CodexRunner(AgentRuntime):
         accounting_run_id = proc_env.get("ISSUE_AGENT_RUN_ID", "")
         native_meter = native_meter or CodexChildUsageMeter(
             codex_home or os.path.expanduser("~/.codex"), rollout_started_at,
-            self.rate_table, execution_cwd,
+            self._native_rates(model), execution_cwd,
         )
         evidence = {
             "cwd": os.path.realpath(execution_cwd),
@@ -1805,7 +1757,7 @@ class CodexRunner(AgentRuntime):
             "rate_card_version": proc_env.get("ISSUE_AGENT_RATE_CARD_VERSION", ""),
             "native_usage_started_at": native_meter.started_at,
             "native_root_sessions": {sid: sample.model for sid, sample in native_meter.roots.items()},
-            "native_rate_table": rate_table_evidence(self.rate_table),
+            "native_rate_table": rate_table_evidence(native_meter.rates),
             "native_usage_failure": native_meter.failure,
         }
         if task.resume:
@@ -1884,9 +1836,7 @@ class CodexRunner(AgentRuntime):
         err_chunks: list[str] = []
         hung = False
         wall_tripped = False
-        budget_tripped = False
-        budget_spend = 0.0
-        accounting_fault: UnavailableRunUsage | None = None
+        budget_stop: float | EstimatedRunUsage | None = None
         # Wall-cap baseline, read ONLY when the cap is armed (the clock is injectable
         # and a spurious read would shift a test's fake sequence).
         started_at = self._wall_clock() if self.max_runtime is not None else 0.0
@@ -1909,7 +1859,7 @@ class CodexRunner(AgentRuntime):
         last_budget_check = self._wall_clock() if budget_armed else 0.0
         session_id = task.resume or ""
         evidence_session_id = session_id
-        implausible_usage_logged = False
+        stderr_usage_logged = False
         stderr_pending = b""
 
         def _current_session_id(
@@ -1953,40 +1903,21 @@ class CodexRunner(AgentRuntime):
                 )
             return legacy
 
-        def _trusted_usage(usage: dict | None, sid: str) -> dict | None:
-            """Accept only provider-owned, plausible usage evidence."""
-            nonlocal implausible_usage_logged
+        def _trusted_usage(usage: dict | None) -> dict | None:
+            """Accept only provider-owned usage evidence."""
+            nonlocal stderr_usage_logged
             if (
                 isinstance(usage, dict)
                 and usage.get("source") == UsageSource.STDERR.value
             ):
-                if not implausible_usage_logged:
+                if not stderr_usage_logged:
                     self._log(
                         "codex: UNTRUSTED USAGE — stderr counter retained only "
                         "as telemetry, never priced or budget-enforced"
                     )
-                    implausible_usage_logged = True
+                    stderr_usage_logged = True
                 return None
-            has_baseline = (
-                usage_baseline is not None and sid == usage_baseline[0]
-            )
-            warning = implausible_codex_usage_warning(
-                usage,
-                elapsed_s=time.monotonic() - attempt_started_at,
-                has_baseline=has_baseline,
-                cost_per_mtok_in=rate_in,
-                cost_per_mtok_out=rate_out,
-                cost_per_mtok_cached_in=rate_cached_in,
-            )
-            if not warning:
-                return usage
-            if not implausible_usage_logged:
-                self._log(
-                    "codex: IMPLAUSIBLE USAGE — rejecting counter instead of "
-                    f"pricing or enforcing it: {warning}"
-                )
-                implausible_usage_logged = True
-            return None
+            return usage
 
         def _native_usage(usage: dict | None, sid: str, *, final: bool = False) -> RunUsage | None:
             observed = native_meter.sample(sid, model, usage, final=final)
@@ -2000,7 +1931,7 @@ class CodexRunner(AgentRuntime):
                                      {**evidence, "session_id": sid or session_id})
             return observed
 
-        def _budget_overrun(now: float) -> float | UnavailableRunUsage | None:
+        def _budget_overrun(now: float) -> float | EstimatedRunUsage | None:
             """This leg's spend if it has crossed the budget, else None.
 
             Sampled at most once per poll slice: each call globs and reads the
@@ -2021,34 +1952,21 @@ class CodexRunner(AgentRuntime):
                 sid,
                 codex_home,
             )
-            trusted = _trusted_usage(usage, sid)
+            trusted = _trusted_usage(usage)
             observed = _native_usage(trusted, sid)
-            if isinstance(observed, UnavailableRunUsage):
-                return observed
-            if isinstance(observed, MeasuredRunUsage) and self.rate_table is not None:
-                spent = price_run_usage(observed, self.rate_table)
-                return spent.micros / 1_000_000 if spent.micros >= Money.from_major("USD", budget_usd).micros else None
-            return budget_overrun_usd(
-                trusted,
-                cost_per_mtok_in=rate_in,
-                cost_per_mtok_out=rate_out,
-                cost_per_mtok_cached_in=rate_cached_in,
-                max_budget_usd=budget_usd,
-            )
+            spent = price_run_usage(observed, native_meter.rates)
+            over = spent.micros / 1_000_000 if spent.micros >= Money.from_major("USD", budget_usd).micros else None
+            if over is not None:
+                return over
+            return EstimatedRunUsage(native_meter.failure) if native_meter.failure else None
 
-        def _trip_budget(over: float | UnavailableRunUsage) -> None:
+        def _trip_budget(over: float | EstimatedRunUsage) -> None:
             """Shared teardown for both sample points: same killpg as the
             watchdogs (the whole process GROUP, or a leaked TEST_CMD server
             holds the pipe open forever)."""
-            nonlocal budget_tripped, budget_spend, accounting_fault
-            if isinstance(over, UnavailableRunUsage):
-                accounting_fault = over
-                self._log(f"codex: ACCOUNTING — {over.detail}; killing subprocess")
-                _kill_quietly(proc)
-                return
-            budget_tripped = True
-            budget_spend = over
-            self._log(
+            nonlocal budget_stop
+            budget_stop = over
+            self._log(f"codex: ACCOUNTING — {over.detail}; killing subprocess" if isinstance(over, EstimatedRunUsage) else
                 f"codex: BUDGET — this leg has spent ${over:.2f}, crossing "
                 f"MAX_BUDGET_USD=${budget_usd:.2f}; killing subprocess"
             )
@@ -2252,7 +2170,7 @@ class CodexRunner(AgentRuntime):
                     stdout_task,
                     timeout=(
                         self.post_hang_drain_timeout
-                        if (self.idle_timeout or self.max_runtime or budget_tripped)
+                        if (self.idle_timeout or self.max_runtime or budget_stop is not None)
                         else None
                     ),
                 )
@@ -2301,7 +2219,7 @@ class CodexRunner(AgentRuntime):
             final_sid = _current_session_id()
             _native_usage(_trusted_usage(self._usage_so_far(
                 err_chunks, usage_baseline, final_sid, codex_home,
-            ), final_sid), final_sid, final=True)
+            )), final_sid, final=True)
         exit_code = proc.returncode if proc.returncode is not None else 124
         stderr = "\n".join(err_chunks)
         self._log(f"codex: exit {exit_code} (stderr {len(stderr)}B, out {len(stdout)}B)")
@@ -2312,7 +2230,13 @@ class CodexRunner(AgentRuntime):
             # tail IS the reason, so log it.
             self._log(f"codex: stderr tail: {_stderr_tail(stderr, 3)[:500]}")
 
-        if budget_tripped:
+        if isinstance(budget_stop, EstimatedRunUsage):
+            return (AgentResult(True, status="accounting_unavailable",
+                                exit_reason=ExitReason.ACCOUNTING_UNAVAILABLE,
+                                summary=f"live budget usage unavailable: {budget_stop.detail}; killed",
+                                session_id=_current_session_id(stdout, allow_legacy_header=True)),
+                    exit_code, stderr, stdout, False)
+        if budget_stop is not None:
             # Checked BEFORE `hung`: the residual-stdout drain above sets `hung`
             # when a descendant that survived our killpg still holds the pipe,
             # and reporting that as an idle timeout would bury the real reason
@@ -2325,7 +2249,6 @@ class CodexRunner(AgentRuntime):
                     session_id,
                     codex_home,
                 ),
-                session_id,
             )
             final_turns = read_rollout_turns(
                 session_id, codex_home=codex_home
@@ -2342,7 +2265,7 @@ class CodexRunner(AgentRuntime):
             # rollout that lost the last turn can never report LESS than what we
             # already observed and killed on.
             spend = max(
-                budget_spend,
+                budget_stop,
                 codex_cost_usd(
                     final_usage,
                     cost_per_mtok_in=rate_in,
@@ -2392,7 +2315,7 @@ class CodexRunner(AgentRuntime):
                     session_id=_current_session_id(stdout, allow_legacy_header=True),
                     usage=_trusted_usage(self._usage_so_far(
                         err_chunks, usage_baseline, _current_session_id(), codex_home,
-                    ), _current_session_id()),
+                    )),
                 ),
                 exit_code, stderr, stdout, True,
             )
@@ -2420,7 +2343,7 @@ class CodexRunner(AgentRuntime):
         # session has nothing pre-paid in its counter.
         if usage_baseline is not None and session_id == usage_baseline[0]:
             rollout_usage = usage_delta(rollout_usage, usage_baseline[1])
-        rollout_usage = _trusted_usage(rollout_usage, session_id)
+        rollout_usage = _trusted_usage(rollout_usage)
         rollout_turns = read_rollout_turns(
             session_id, codex_home=codex_home
         )
@@ -2431,45 +2354,6 @@ class CodexRunner(AgentRuntime):
             and usage_baseline[2] is not None
         ):
             rollout_turns = max(0, rollout_turns - usage_baseline[2])
-        # A final token_count can land immediately before EOF, inside one poll
-        # slice. Recheck completed counters so clean exit cannot turn an
-        # over-budget leg into status=pr_opened.
-        final_overrun = (
-            budget_overrun_usd(
-                rollout_usage,
-                cost_per_mtok_in=rate_in,
-                cost_per_mtok_out=rate_out,
-                cost_per_mtok_cached_in=rate_cached_in,
-                max_budget_usd=budget_usd,
-            )
-            if budget_armed and self.rate_table is None
-            else None
-        )
-        if final_overrun is not None:
-            self._log(
-                f"codex: BUDGET — final usage spent ${final_overrun:.2f}, "
-                f"crossing MAX_BUDGET_USD=${budget_usd:.2f}"
-            )
-            return (
-                AgentResult(
-                    is_error=True,
-                    status=MAX_BUDGET_STATUS,
-                    envelope_subtype=MAX_BUDGET_STATUS,
-                    exit_reason=ExitReason.BUDGET_EXHAUSTED,
-                    summary=(
-                        f"codex final spend ${final_overrun:.2f} crossed "
-                        f"MAX_BUDGET_USD=${budget_usd:.2f}"
-                    ),
-                    cost_usd=final_overrun,
-                    usage=rollout_usage,
-                    num_turns=rollout_turns,
-                    session_id=session_id,
-                ),
-                exit_code,
-                stderr,
-                stdout,
-                False,
-            )
         # rate_in/rate_out come from the single rates_for_model lookup hoisted
         # above the pump, so this leg is priced identically whether it finished
         # or was killed on budget (#29/#43).

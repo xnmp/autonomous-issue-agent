@@ -39,7 +39,7 @@ def _money(store):
             for table in ('charges', 'budget_reservations', 'reservation_recovery', 'runs')}
 
 
-def test_settled_recovery_preserves_prior_session_and_money_and_refuses_late_capture(monkeypatch):
+def test_settled_recovery_preserves_prior_session_and_money_and_accepts_late_capture(monkeypatch):
     workflow, files, inner, key = _workflow('rebase')
     store, control = files._workflow_db, files._workflow_authority
     _repair(workflow, 'rebase')
@@ -52,10 +52,11 @@ def test_settled_recovery_preserves_prior_session_and_money_and_refuses_late_cap
     assert issue_ci_state(files).pending_rebase is None
     assert issue_ci_state(files).rebase_failures == 2
     assert _money(store) == money
-    recovered = _dump(store)
-    with pytest.raises(WorkflowAuthorityError, match='acknowledgment'):
-        store.capture_pr_repair_result(result, control.writer)
-    assert _dump(store) == recovered
+    assert store.settle_pr_repair_result(result, control.writer).idempotent
+    assert control.read_pr_repair(key).component.state == prior
+    assert issue_ci_state(files).rebase_failures == 2
+    assert _money(store) == money
+    assert control.reconcile_pr_repair_returns() == 0
 
 
 def test_disposed_money_with_retained_dispatch_claim_waits_for_claim_release(monkeypatch):

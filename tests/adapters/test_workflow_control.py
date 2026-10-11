@@ -228,10 +228,12 @@ def unsettled_return(control, before):
     return returned, request
 
 
-def test_settlement_and_paid_return_gate_commit_and_replay_as_one_authority(control):
+@pytest.mark.parametrize("basis", [PricingBasis.PROVIDER_REPORTED, PricingBasis.ESTIMATE])
+def test_settlement_and_paid_return_gate_commit_and_replay_as_one_authority(control, basis):
     before = initial_snapshot()
     install_workflow(control, before)
     returned, request = unsettled_return(control, before)
+    request = replace(request, basis=basis)
     workflow = adapter(control)
     assert workflow.returned_result(returned.attempt) is None
     settled = workflow.settle_return(request, returned)
@@ -266,6 +268,27 @@ def test_capture_failure_rolls_back_charge_reservation_receipt_and_gate(control,
     assert adapter(control).settle_return(request, returned).disposition is AccountingDisposition.AVAILABLE
 
 
+def test_late_return_capture_failure_rolls_back_recovery_correction(control):
+    before = initial_snapshot()
+    install_workflow(control, before)
+    returned, request = unsettled_return(control, before)
+    with control.transaction() as db:
+        db.execute("UPDATE runs SET state='abandoned',outcome='dead_lease',completed_at=? WHERE run_id=?",
+                   (NOW.isoformat(), str(request.run_id)))
+    assert control.settle_terminal_estimate(request.run_id, "return not yet captured")
+    with control.transaction() as db:
+        db.execute("CREATE TRIGGER reject_capture BEFORE INSERT ON dedupe_keys WHEN NEW.namespace='workflow-return' "
+                   "BEGIN SELECT RAISE(ABORT,'capture failed'); END")
+    with pytest.raises(sqlite3.IntegrityError, match="capture failed"):
+        adapter(control).settle_return(request, returned)
+    with control.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,provider_receipt_id FROM charges").fetchone()) == (0, f"terminal-estimate:{request.run_id}")
+        assert tuple(db.execute("SELECT state,outcome FROM runs").fetchone()) == ("abandoned", "dead_lease")
+        db.execute("DROP TRIGGER reject_capture")
+    assert adapter(control).settle_return(request, returned).disposition is AccountingDisposition.AVAILABLE
+    assert adapter(control).returned_result(returned.attempt) == returned
+
+
 def test_atomic_return_rejects_conflicting_content_and_foreign_lookup_leg(control):
     before = initial_snapshot()
     install_workflow(control, before)
@@ -295,8 +318,11 @@ def test_reconciled_charge_cannot_mint_normal_returned_continuation(control, bas
     install_workflow(control, before)
     returned, request = unsettled_return(control, before)
     control.settle(replace(request, basis=PricingBasis.RECONCILED))
-    with pytest.raises(WorkflowAuthorityError, match="settlement"):
-        adapter(control).settle_return(replace(request, basis=basis), returned)
+    if basis is PricingBasis.RECONCILED:
+        with pytest.raises(WorkflowAuthorityError, match="settlement"):
+            adapter(control).settle_return(replace(request, basis=basis), returned)
+    else:
+        assert adapter(control).settle_return(replace(request, basis=basis), returned).disposition is AccountingDisposition.CONFLICT
     assert adapter(control).returned_result(returned.attempt) is None
     assert not adapter(control).load_workflow(before.revision.fence.key).gates
 

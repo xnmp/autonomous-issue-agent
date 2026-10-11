@@ -6,6 +6,8 @@ import asyncio
 import json
 import os
 import stat
+import shlex
+import sys
 import time
 from datetime import datetime, timezone
 
@@ -53,6 +55,7 @@ def _write_rollout(
         "output_tokens": output_tokens,
     }
     event = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "payload": {
             "type": "token_count",
             "info": {"last_token_usage": usage, "total_token_usage": usage},
@@ -193,6 +196,7 @@ def test_final_rollout_crossing_cannot_escape_on_clean_exit(tmp_path, monkeypatc
         "output_tokens": 100_000,
     }
     event = json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "payload": {
             "type": "token_count",
             "info": {"last_token_usage": usage, "total_token_usage": usage},
@@ -319,58 +323,33 @@ def test_echoed_usage_fixture_does_not_price_or_kill_inflight_run(
     assert result.cost_usd == 0.0
 
 
-def test_implausible_early_rollout_usage_is_rejected_not_budget_killed(
-    tmp_path, monkeypatch
-):
-    worktree = tmp_path / "worktree"
-    worktree.mkdir()
+def _live_owned_rollout_command(tmp_path, *, input_tokens: int, output_tokens: int) -> str:
+    script = tmp_path / "write-live-rollout.py"
+    script.write_text(f"""import json
+from datetime import datetime, timezone
+from pathlib import Path
+stamp = datetime.now(timezone.utc).isoformat()
+usage = {{"input_tokens": {input_tokens}, "output_tokens": {output_tokens}}}
+records = [{{"timestamp": stamp, "type": "session_meta", "payload": {{
+    "id": {SID!r}, "originator": "codex_exec", "source": "exec", "cwd": {os.getcwd()!r}}}}},
+    {{"timestamp": stamp, "type": "event_msg", "payload": {{"type": "token_count",
+      "info": {{"last_token_usage": usage, "total_token_usage": usage}}}}}}]
+Path({str(_rollout_path(tmp_path))!r}).write_text("".join(json.dumps(r) + "\\n" for r in records))
+""")
+    return f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}\n"
+
+
+def test_large_owned_rollout_usage_still_enforces_the_budget(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    usage = {
-        "input_tokens": 0,
-        "cached_input_tokens": 0,
-        "cache_write_input_tokens": 0,
-        "output_tokens": 5_100_000,
-    }
-    session_meta = {
-        "timestamp": "2099-07-29T00:00:00Z",
-        "type": "session_meta",
-        "payload": {
-            "id": SID,
-            "originator": "codex_exec",
-            "source": "exec",
-            "cwd": str(worktree),
-        },
-    }
-    token_count = {
-        "timestamp": "2099-07-29T00:00:01Z",
-        "type": "event_msg",
-        "payload": {
-            "type": "token_count",
-            "info": {"last_token_usage": usage, "total_token_usage": usage},
-        }
-    }
-    _rollout_path(tmp_path).write_text(
-        json.dumps(session_meta) + "\n" + json.dumps(token_count) + "\n"
-    )
-    logs = []
-    body = (
+    body = _live_owned_rollout_command(tmp_path, input_tokens=0, output_tokens=5_100_000)
+    body += (
         'out=""; prev=""\n'
         'for a in "$@"; do if [ "$prev" = "-o" ]; then out="$a"; fi; prev="$a"; done\n'
-        'echo "exec finished" >&2\n'
-        "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\","
-        "\"needs\":\"\"}' > \"$out\"\n"
+        "printf '%s' '{\"status\":\"pr_opened\",\"summary\":\"done\",\"needs\":\"\"}' > \"$out\"\n"
     )
-
-    result = asyncio.run(
-        _runner(tmp_path, body, log=logs.append).run(
-            RuntimePlan(prompt="x", cwd=str(worktree), max_budget_usd=20.0)
-        )
-    )
-
-    assert result.status == "pr_opened"
-    assert result.exit_reason is ExitReason.OK
-    assert result.cost_usd == 0.0
-    assert any("IMPLAUSIBLE" in line for line in logs)
+    result = asyncio.run(_runner(tmp_path, body).run(RuntimePlan("x", max_budget_usd=20.0)))
+    assert result.exit_reason is ExitReason.BUDGET_EXHAUSTED
+    assert result.cost_usd == pytest.approx(153.0)
 
 
 def test_under_budget_run_completes_normally(tmp_path, monkeypatch):
@@ -434,6 +413,7 @@ def test_a_resumed_leg_subtracts_the_baselines_cached_tokens_too(tmp_path, monke
         tmp_path, input_tokens=1_000_000, cached_input_tokens=800_000, output_tokens=10_000
     )
     grown = json.dumps({
+        "timestamp": datetime.now(timezone.utc).isoformat(),
         "payload": {
             "type": "token_count",
             "info": {
@@ -466,14 +446,10 @@ def test_a_resumed_leg_subtracts_the_baselines_cached_tokens_too(tmp_path, monke
 
 def test_budget_only_watchdog_samples_a_silent_generation(tmp_path, monkeypatch):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path))
-    _write_rollout(tmp_path, input_tokens=5_000_000, output_tokens=100_000)
+    body = _live_owned_rollout_command(tmp_path, input_tokens=5_000_000, output_tokens=100_000)
     runner = _runner(
         tmp_path,
-        (
-            f'echo "session id: {SID}" >&2\n'
-            f"touch '{_rollout_path(tmp_path)}'\n"
-            "sleep 3\n"
-        ),
+        body + "sleep 3\n",
         idle_timeout=None,
         max_runtime=None,
     )

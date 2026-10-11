@@ -2167,20 +2167,21 @@ def test_selected_fix_infra_impossible_contribution_is_refused_before_purchase()
     assert len(inner.tasks) == 1
 
 
-def test_actual_normal_return_resets_episode_without_releasing_unreadable_spend():
+def test_actual_normal_return_resets_episode_and_settles_unreadable_spend_as_estimate():
     from tests.fakes.accounted_workflow import seed_infra_outcome
     workflow, files, inner, _ = active_ci_workflow(AgentResult(is_error=False, status="pushed",
         usage={"input_tokens":"malformed"}))
     seed_infra_outcome(files._workflow_db, 5, cc.FixInfraOutcome.RETURNED_INFRA)
     assert issue_ci_state(files).infra_failures == 1
-    with pytest.raises(ValueError):
-        asyncio.run(workflow.fix_ci(100))
+    asyncio.run(workflow.fix_ci(100))
     assert len(inner.tasks) == 1
     assert issue_ci_state(files).infra_failures == 0
     with files._workflow_db.transaction() as db:
         assert db.execute("SELECT COUNT(*) FROM charges WHERE amount_micros>0").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM budget_reservations WHERE state='active'").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM budget_reservations WHERE state='active'").fetchone()[0] == 0
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges WHERE run_id=?",
+                                (inner.tasks[0].env["ISSUE_AGENT_RUN_ID"],)).fetchone()) == (0, "estimate")
+        assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='pr-repair-result'").fetchone()[0] == 1
 
 
 def test_machine_retirement_is_selected_and_preserves_budget_hold(tmp_path):

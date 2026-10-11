@@ -17,7 +17,7 @@ import tempfile
 import uuid
 from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, closing, contextmanager
-from dataclasses import dataclass, replace
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from enum import Enum
@@ -25,7 +25,7 @@ from pathlib import Path
 from types import MappingProxyType
 from typing import Any
 from ..domain import continuation_components as cc
-from .codex_child_usage import NativeFailure, RemeterOutcome
+from .codex_child_usage import NativeFailure
 from ..domain.contracts import ContinuationAdmission
 
 from ..domain.contracts import (
@@ -38,6 +38,7 @@ from ..domain.contracts import (
     Money,
     PriceQuote,
     PricingBasis,
+    ChargeOrigin,
     ReservationId,
     SettlementRequest,
     RunId,
@@ -110,7 +111,7 @@ from .review_execution_claims import load_review_preflight_record, require_revie
 from .workflow_codec import MAX_WORKFLOW_PAYLOAD_BYTES, WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_rows import WorkflowAuthorityError, active_families, linked_issue_workflow_holds, load_family_authority, load_resolve_workflow_row, load_review_workflow_row, load_workflow_row, load_workspace_ack, read_review_submission_registration, require_resolve_binding, require_review_binding, require_workflow_binding, verified_review_completed_seal, workflow_scope, workflow_run_scope_bounds as workflow_run_scope_bounds
 
-SCHEMA_VERSION = 40
+SCHEMA_VERSION = 41
 
 
 def workflow_episode_key(binding: WorkflowBinding) -> str:
@@ -2378,6 +2379,14 @@ WHERE emitted_at IS NULL AND failed_at IS NULL;
 CREATE INDEX lifecycle_review_generation_candidates ON lifecycle_commands(repository,target)
 WHERE workflow_binding_json IS NOT NULL AND {_REVIEW_GENERATION_CANDIDATE};
 """),
+    SchemaMigration(41, """
+ALTER TABLE charges ADD COLUMN origin TEXT NOT NULL DEFAULT 'normal_return'
+CHECK (origin IN ('normal_return','recovery_estimate'));
+UPDATE charges SET origin='recovery_estimate'
+WHERE provider_receipt_id='terminal-estimate:' || run_id
+    OR (basis IN ('estimate','reconciled') AND provider_receipt_id LIKE 'codex-recovered:%'
+        AND substr(provider_receipt_id,-length(run_id)-1)=':' || run_id);
+"""),
 )
 
 if tuple(migration.version for migration in _SCHEMA_MIGRATIONS) != tuple(
@@ -3990,7 +3999,7 @@ class SQLiteControlStore:
         owner_id: str,
         created_before: datetime,
     ) -> tuple[RunId, ...]:
-        """Return active reservations old enough to be outside spawn grace."""
+        """Terminal work needs settlement immediately; spawn grace protects other work."""
 
         cutoff = _stamp(created_before)
         with closing(self._connect()) as db, db:
@@ -3998,7 +4007,8 @@ class SQLiteControlStore:
             rows = db.execute(
                 "SELECT b.run_id FROM budget_reservations b JOIN runs r "
                 "ON r.run_id=b.run_id WHERE b.state='active' "
-                f"AND r.owner_id IN ({','.join('?' for _ in owners)}) AND b.created_at<=? ORDER BY b.created_at",
+                f"AND r.owner_id IN ({','.join('?' for _ in owners)}) "
+                "AND (b.created_at<=? OR r.state IN ('completed','cancelled','abandoned')) ORDER BY b.created_at",
                 (*owners, cutoff),
             ).fetchall()
         return tuple(RunId(row["run_id"]) for row in rows)
@@ -4009,14 +4019,11 @@ class SQLiteControlStore:
         reason: str,
         *,
         returned_review: ReturnedReviewChild | None = None,
-        accounting_failure: ExitReason | None = None,
     ) -> bool:
         """Retain uncertain spend, or capture its return after reconciliation wins."""
 
         if not reason:
             raise ValueError("reservation retention reason is required")
-        if accounting_failure is not None and accounting_failure is not ExitReason.ACCOUNTING_UNAVAILABLE:
-            raise ValueError("retention requires an unavailable-accounting reason")
         if returned_review is not None and (
             not isinstance(returned_review, ReturnedReviewChild)
             or returned_review.run_id != str(run_id)
@@ -4072,15 +4079,12 @@ class SQLiteControlStore:
                 "state=CASE WHEN state IN ('completed','cancelled','abandoned') "
                 "THEN state ELSE 'completed' END, "
                 "outcome=CASE WHEN state IN ('cancelled','abandoned') THEN outcome "
-                "WHEN ?='accounting_unavailable' OR outcome='accounting_unavailable' THEN 'accounting_unavailable' "
                 "WHEN state IN ('completed','cancelled','abandoned') "
                 "THEN outcome ELSE 'spend_unreconciled' END, "
                 "completed_at=COALESCE(completed_at, ?) WHERE run_id=? "
                 "AND (state NOT IN ('completed','cancelled','abandoned') "
-                "OR completed_at IS NULL OR (?='accounting_unavailable' AND state NOT IN ('cancelled','abandoned') "
-                "AND outcome IS NOT 'accounting_unavailable'))",
-                (accounting_failure.value if accounting_failure else None, now, str(run_id),
-                 accounting_failure.value if accounting_failure else None),
+                "OR completed_at IS NULL)",
+                (now, str(run_id)),
             ).rowcount
             lease_removed = db.execute("DELETE FROM leases WHERE run_id=?", (str(run_id),)).rowcount
             if review_return is not None and not review_return[1]:
@@ -4093,20 +4097,31 @@ class SQLiteControlStore:
                 )
             return True
 
-    def record_accounting_unavailable(self, run_id: RunId, reason: str) -> bool:
-        """Fence unknown billing without changing proof that work never launched."""
-        if not reason:
-            raise ValueError("unavailable accounting requires a reason")
+    def settle_terminal_estimate(self, run_id: RunId, reason: str) -> bool:
+        """Adopt legacy terminal holds through normal settlement, never a row rewrite.
+
+        The lease and terminal-state checks are repeated in the settlement
+        transaction so recovery cannot release money belonging to live work.
+        """
         with self.transaction() as db:
-            changed = db.execute(
-                "UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=? "
-                "AND outcome IS NOT 'accounting_unavailable' AND state NOT IN ('cancelled','abandoned') "
-                "AND EXISTS(SELECT 1 FROM budget_reservations b WHERE b.run_id=runs.run_id AND b.state='active')",
+            row = db.execute(
+                "SELECT b.state,b.currency,r.state AS run_state FROM budget_reservations b "
+                "JOIN runs r USING(run_id) WHERE b.run_id=? "
+                "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id)",
                 (str(run_id),),
-            ).rowcount
-            if changed:
-                self._event(db, ReservationRetained(str(run_id), reason), correlation=Correlation(run_id=str(run_id)))
-            return bool(changed)
+            ).fetchone()
+            if row is None or row["run_state"] not in ("completed", "cancelled", "abandoned"):
+                return False
+            if row["state"] == "settled":
+                return True
+            if row["state"] != "active":
+                return False
+            result = self._settle(db, SettlementRequest(
+                run_id, Money.zero(row["currency"]), PricingBasis.ESTIMATE,
+                f"terminal-estimate:{run_id}", None, None, None, reason[:2048],
+                ChargeOrigin.RECOVERY_ESTIMATE,
+            ))
+            return result.disposition is AccountingDisposition.AVAILABLE
 
     def run_completed_at(self, run_id: RunId) -> float | None:
         """Harness-owned end of a run (epoch seconds), or None while it has none."""
@@ -4114,9 +4129,10 @@ class SQLiteControlStore:
             row = db.execute("SELECT completed_at FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
         return _parse_stamp(row["completed_at"]).timestamp() if row is not None and row["completed_at"] else None
 
-    def settle_remetered(self, request: SettlementRequest, failure: NativeFailure,
-                         outcome: RemeterOutcome) -> SettlementResult:
+    def settle_remetered(self, request: SettlementRequest, failure: NativeFailure) -> SettlementResult:
         """Settle a re-metered run and journal it in the same transaction, at most once."""
+        if request.basis is not PricingBasis.RECONCILED or request.origin is not ChargeOrigin.RECOVERY_ESTIMATE:
+            raise ValueError("measured recovery requires reconciled request evidence")
         with self.transaction() as db:
             result = self._settle(db, request)
             if result.disposition is AccountingDisposition.AVAILABLE:
@@ -4124,10 +4140,10 @@ class SQLiteControlStore:
                     "INSERT OR IGNORE INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) "
                     "VALUES ('native-remetered',?,?,?,?)",
                     (str(request.run_id), failure.name, _stamp(self._now()),
-                     json.dumps({"outcome": outcome.value})),
+                     json.dumps({"outcome": "measured"})),
                 ).rowcount
                 if claimed:
-                    self._event(db, NativeUsageRemetered(str(request.run_id), failure.name, outcome.value),
+                    self._event(db, NativeUsageRemetered(str(request.run_id), failure.name, "measured"),
                                 correlation=Correlation(run_id=str(request.run_id)))
             return result
 
@@ -6481,15 +6497,8 @@ class SQLiteControlStore:
         with self.transaction() as db:
             purchase, run = self._continuation_return_admission(db, admission, WorkflowFamily.PR_REPAIR)
             self._require_repair_writer(db, writer, admission, run["owner_id"])
-            if run["reservation_state"] == "released":
-                raise WorkflowAuthorityError("released repair reservation cannot produce paid output")
-            acknowledged = db.execute(
-                "SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
-                (key.repository, receipt_key)).fetchone()
-            if acknowledged is not None:
-                payload = decode_workflow(acknowledged[0], tuple)
-                if len(payload) == 2 and isinstance(payload[1], cc.PRRepairUnreturned):
-                    raise WorkflowAuthorityError("unreturned repair acknowledgment cannot become a normal return")
+            if run["reservation_state"] == "released" and run["started_at"] is None:
+                raise WorkflowAuthorityError("unlaunched repair cannot produce paid output")
             dispatch = json.loads(run['dispatch_id'])
             linked_reply = self._linked_issue_reply_admission(db, admission.attempt, run)
             ci_purchases = [item for item in decode_workflow(run["continuations_json"], tuple) if isinstance(item, cc.IssueCIPurchase)]
@@ -6515,6 +6524,15 @@ class SQLiteControlStore:
                 return
             db.execute("INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES ('pr-repair-result',?,?,?,?)",
                 (key.repository, receipt_key, _stamp(self._now()), encoded))
+            acknowledged = db.execute(
+                "SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
+                (key.repository, receipt_key)).fetchone()
+            if acknowledged is not None and decode_workflow(acknowledged[0], tuple) == (admission, cc.PRRepairUnreturned(admission)):
+                # Recovery already consumed the workflow effects. Capture and
+                # money must commit together; no pending workflow selects this run.
+                settled = self._settle(db, returned.settlement)
+                if settled.disposition is not AccountingDisposition.AVAILABLE:
+                    raise WorkflowAuthorityError(settled.detail)
 
     def settle_pr_repair_result(self, returned: cc.PRRepairResult, writer) -> SettlementResult:
         # Capture survives an interrupted money/continuity transaction. Restart
@@ -6616,18 +6634,7 @@ class SQLiteControlStore:
         return completed
 
     def _pr_repair_unreturned(self, db, run_id: RunId, lineage: tuple[str, ...]) -> bool:
-        """A launched repair run is terminal, quiescent and money-accounted, with no return.
-
-        Money is accounted when released/settled, or when it is retained as
-        unknown spend: an active reservation whose recovery policy is
-        reconcile_only and whose outcome is accounting_unavailable (operator
-        decision 2026-10-11, Tauri PR #1019). Retention keeps counting against
-        the caps; only the workflow hold lifts. Any other active reservation
-        still owns its accounting disposition. A lease or dispatch claim means
-        a process may yet return and keeps the hold. Retention can mark an
-        unlaunched preflight as reconcile_only, so the process registration's
-        persisted start timestamp is also required.
-        """
+        """A launched repair is terminal, quiescent and settled/released, with no return."""
         owners = ",".join("?" for _ in lineage)
         repair_key = self._continuation_receipt_key(run_id, WorkflowFamily.PR_REPAIR)
         return db.execute(
@@ -6635,8 +6642,7 @@ class SQLiteControlStore:
             f"WHERE r.run_id=? AND r.owner_id IN ({owners}) AND r.state IN ('completed','cancelled','abandoned') "
             "AND r.started_at IS NOT NULL "
             "AND r.outcome IS NOT 'unlaunched_released' AND rr.policy IN ('running','reconcile_only') "
-            "AND (b.state IN ('released','settled') OR (b.state='active' "
-            "AND rr.policy='reconcile_only' AND r.outcome='accounting_unavailable')) "
+            "AND b.state IN ('released','settled') "
             "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id) "
             "AND NOT EXISTS(SELECT 1 FROM dispatch_claim_runs d WHERE d.run_id=r.run_id) "
             "AND NOT EXISTS(SELECT 1 FROM lifecycle_commands c WHERE "
@@ -6662,12 +6668,9 @@ class SQLiteControlStore:
             purchase = purchases[0]
             admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
             self._require_repair_writer(db, writer, admission, run["owner_id"])
-            retained = db.execute("SELECT state FROM budget_reservations WHERE run_id=?", (str(run_id),)).fetchone()[0] == "active"
             self._finish_pr_repair_without_return(db, run_id, launched=True)
-            # Distinct state: the PR proceeds while this run's unknown spend
-            # stays reserved against the caps until reconciled.
             self._transition(db, "pr_repair", str(run_id),
-                "unreturned_acknowledged_money_retained" if retained else "unreturned_acknowledged",
+                "unreturned_acknowledged",
                 {"pr": admission.attempt.binding.fence.key.target.number,
                  "admission_version": admission.admission_version},
                 correlation=Correlation(run_id=str(run_id)))
@@ -7304,7 +7307,7 @@ class SQLiteControlStore:
         key = admission.attempt.binding.fence.key
         receipt_key = self._continuation_receipt_key(admission.attempt.run_id, family)
         row = db.execute(
-            "SELECT d.payload_json,r.owner_id,r.dispatch_id,r.continuations_json,r.workflow_binding_json,b.state AS reservation_state FROM dedupe_keys d JOIN runs r ON r.run_id=? "
+            "SELECT d.payload_json,r.owner_id,r.dispatch_id,r.continuations_json,r.workflow_binding_json,r.started_at,b.state AS reservation_state FROM dedupe_keys d JOIN runs r ON r.run_id=? "
             "JOIN budget_reservations b USING(run_id) WHERE d.namespace='continuation-admission' "
             "AND d.scope=? AND d.key=? AND b.workload_repository=?",
             (str(admission.attempt.run_id), key.repository, receipt_key, key.repository),
@@ -7765,6 +7768,12 @@ class SQLiteControlStore:
             prior = db.execute("SELECT payload_json FROM dedupe_keys WHERE namespace='continuation-return' AND scope=? AND key=?",
                                (key.repository, receipt_key)).fetchone()
             encoded = encode_workflow((admission, state))
+            if prior is not None and family is WorkflowFamily.PR_REPAIR:
+                acknowledged = decode_workflow(prior["payload_json"], tuple)
+                if acknowledged == (admission, cc.PRRepairUnreturned(admission)):
+                    # Attempt debt was already applied. Capture the real output
+                    # and correct money without replaying paired workflow effects.
+                    return self._settle(db, request)
             if prior is not None and prior["payload_json"] != encoded:
                 raise WorkflowAuthorityError("continuation return conflicts with its immutable result")
             if linked_reply is not None and prior is not None:
@@ -8462,8 +8471,9 @@ class SQLiteControlStore:
                 AccountingDisposition.CONFLICT, request.amount,
                 detail="review preflight stop requires its atomic zero settlement",
             )
+        recovery_receipt = request.origin is ChargeOrigin.RECOVERY_ESTIMATE
         reservation = db.execute(
-            "SELECT b.state, b.maximum_micros, b.currency, r.dispatch_id "
+            "SELECT b.state, b.maximum_micros, b.currency, r.dispatch_id, r.started_at "
             "FROM budget_reservations b JOIN runs r ON r.run_id=b.run_id "
             "WHERE b.run_id=?",
             (str(request.run_id),),
@@ -8484,19 +8494,7 @@ class SQLiteControlStore:
             "SELECT * FROM charges WHERE run_id=? OR provider_receipt_id=?",
             (str(request.run_id), request.provider_receipt_id),
         ).fetchone()
-        encoded_usage = (
-            _json(
-                {
-                    "input_tokens": request.usage.input_tokens,
-                    "output_tokens": request.usage.output_tokens,
-                    "cache_read_tokens": request.usage.cache_read_tokens,
-                    "cache_write_tokens": request.usage.cache_write_tokens,
-                    "source": request.usage.source.value,
-                }
-            )
-            if request.usage is not None
-            else None
-        )
+        encoded_usage = _json(asdict(request.usage)) if request.usage is not None else None
         if existing is not None:
             identical = (
                 existing["run_id"] == str(request.run_id)
@@ -8504,83 +8502,25 @@ class SQLiteControlStore:
                 and existing["amount_micros"] == request.amount.micros
                 and existing["currency"] == request.amount.currency
                 and existing["basis"] == request.basis.value
+                and existing["origin"] == request.origin.value
                 and existing["usage_json"] == encoded_usage
                 and existing["rate_card_id"] == request.rate_card_id
                 and existing["rate_card_version"] == request.rate_card_version
             )
-            recovered_confirmation = (
+            if identical:
+                return SettlementResult(AccountingDisposition.AVAILABLE, request.amount, idempotent=True)
+            recovered_correction = (
                 existing["run_id"] == str(request.run_id)
-                and existing["basis"] == PricingBasis.RECONCILED.value
-                and request.basis is not PricingBasis.RECONCILED
-                and existing["amount_micros"] == request.amount.micros
+                and existing["origin"] == ChargeOrigin.RECOVERY_ESTIMATE.value
+                and not recovery_receipt
                 and existing["currency"] == request.amount.currency
             )
-            if recovered_confirmation:
-                # A dead-child sweep may settle the same final Codex
-                # evidence while the live caller is normalizing its
-                # already-returned result. Equal monetary authority must
-                # converge without duplicating or rewriting the charge.
-                run = db.execute(
-                    "SELECT state, outcome FROM runs WHERE run_id=?",
-                    (str(request.run_id),),
-                ).fetchone()
-                corrected = (
-                    run is not None
-                    and run["state"] == "abandoned"
-                    and run["outcome"] == "dead_lease"
-                )
-                already_corrected = (
-                    run is not None
-                    and run["state"] == "completed"
-                    and run["outcome"] == "settled"
-                )
-                if corrected:
-                    db.execute(
-                        "UPDATE runs SET state='completed', "
-                        "outcome='settled', completed_at=? "
-                        "WHERE run_id=?",
-                        (_stamp(self._now()), str(request.run_id)),
-                    )
-                    db.execute(
-                        "UPDATE reservation_recovery SET "
-                        "reason='normal completion confirmed recovered "
-                        "settlement', updated_at=? WHERE run_id=?",
-                        (_stamp(self._now()), str(request.run_id)),
-                    )
-                    self._transition(
-                        db,
-                        "run",
-                        str(request.run_id),
-                        "completed",
-                        {
-                            "outcome": "settled",
-                            "settlement": "recovery_confirmed",
-                        },
-                        correlation=_run_correlation(
-                            request.run_id,
-                            reservation["dispatch_id"],
-                        ),
-                    )
-                if corrected or already_corrected:
-                    return SettlementResult(
-                        AccountingDisposition.AVAILABLE,
-                        request.amount,
-                        idempotent=True,
-                        detail=(
-                            "normal completion matched recovered settlement"
-                        ),
-                    )
-            return SettlementResult(
-                (
-                    AccountingDisposition.AVAILABLE
-                    if identical
-                    else AccountingDisposition.CONFLICT
-                ),
-                request.amount,
-                idempotent=identical,
-                detail="" if identical else "conflicting settlement receipt",
-            )
-        if reservation["state"] != "active":
+            if not recovered_correction:
+                return SettlementResult(AccountingDisposition.CONFLICT, request.amount,
+                                        detail="conflicting settlement receipt")
+        if existing is None and reservation["state"] != "active" and not (
+            reservation["state"] == "released" and reservation["started_at"] is not None and not recovery_receipt
+        ):
             return SettlementResult(
                 AccountingDisposition.CONFLICT,
                 request.amount,
@@ -8602,7 +8542,11 @@ class SQLiteControlStore:
         db.execute(
             "INSERT INTO charges(run_id, provider_receipt_id, amount_micros, "
             "currency, basis, usage_json, rate_card_id, rate_card_version, "
-            "settled_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "settled_at, origin) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(run_id) DO UPDATE SET provider_receipt_id=excluded.provider_receipt_id, "
+            "amount_micros=excluded.amount_micros,basis=excluded.basis,usage_json=excluded.usage_json, "
+            "rate_card_id=excluded.rate_card_id,rate_card_version=excluded.rate_card_version, "
+            "settled_at=excluded.settled_at,origin=excluded.origin",
             (
                 str(request.run_id),
                 request.provider_receipt_id,
@@ -8613,6 +8557,7 @@ class SQLiteControlStore:
                 request.rate_card_id,
                 request.rate_card_version,
                 settled_at,
+                request.origin.value,
             ),
         )
         db.execute(
@@ -8636,7 +8581,7 @@ class SQLiteControlStore:
             ),
         )
         corrected_dead_lease = False
-        if request.basis is not PricingBasis.RECONCILED:
+        if not recovery_receipt:
             # The normal caller can win after lease reclamation but before
             # the recovery reconciler. Its successful settlement proves
             # the accounting owner survived the child, so dead_lease is a
@@ -8657,6 +8602,21 @@ class SQLiteControlStore:
                     (settled_at, str(request.run_id)),
                 )
         db.execute("DELETE FROM leases WHERE run_id=?", (str(request.run_id),))
+        if request.accounting_gap or request.basis is PricingBasis.ESTIMATE:
+            self._transition(db, "accounting", str(request.run_id), "estimated",
+                             {"gap": request.accounting_gap or "request receipts or usable usage incomplete; settled best evidence"},
+                             correlation=correlation)
+        if existing is not None:
+            # Reverse the prior projection contribution in the same transaction
+            # as its replacement and any return capture; SQLite keeps one charge.
+            self._event(db, SpendRecorded(str(request.run_id), -existing["amount_micros"],
+                        existing["currency"], existing["basis"], existing["rate_card_id"], existing["rate_card_version"]),
+                        correlation=correlation)
+            self._transition(db, "accounting", str(request.run_id), "corrected",
+                             {"previous_receipt": existing["provider_receipt_id"],
+                              "previous_amount_micros": existing["amount_micros"],
+                              "provider_receipt_id": request.provider_receipt_id, "amount_micros": request.amount.micros},
+                             correlation=correlation)
         self._event(
             db,
             SpendRecorded(

@@ -13,14 +13,16 @@ from .codex_runner import (
     spend_evidence_path,
     usage_delta,
 )
-from .codex_child_usage import CodexChildUsageMeter, NativeFailure, RemeterOutcome, recovered_rate_table
-from ..domain.run_usage import MeasuredRunUsage, RunUsage, UnavailableRunUsage, price_run_usage, total_usage
+from .codex_child_usage import CodexChildUsageMeter, NativeFailure, recovered_rate_table
+from ..domain.pricing import ModelRates, RateTable, UnknownModelPolicy, usd_per_million_to_micros
+from ..domain.run_usage import MeasuredRunUsage, RunUsage, EstimatedRunUsage, price_run_usage, total_usage
 from .control_store import (
     AccountingDisposition,
     SQLiteControlStore,
     SettlementRequest,
 )
 from ..domain.contracts import (
+    ChargeOrigin,
     PricingBasis,
     RunId,
 )
@@ -40,34 +42,36 @@ class CodexSpendReconciler:
             return True
         if not self._belongs_to_codex(run_id):
             return False
+        ended_at = self.store.run_completed_at(run_id)
+        if ended_at is None:
+            return False
         for directory in self.evidence_dirs:
             evidence = self._read(directory, run_id)
             if evidence is None:
                 continue
             try:
                 session_id = self._session_id(evidence)
-                ended_at = self.store.run_completed_at(run_id)
                 native = self._native_usage(evidence, session_id, ended_at)
-                if not isinstance(native, MeasuredRunUsage):
-                    return self._unavailable(run_id, "Codex recovery cannot establish complete run usage")
-                rates = recovered_rate_table(evidence["native_rate_table"])
-                if rates is None:
-                    return self._unavailable(run_id, "Codex recovery has no captured price card")
+                rates = self._rates(evidence)
                 amount = price_run_usage(native, rates)
-                remetered = NativeFailure.parse(evidence.get("native_usage_failure"))
+                if amount.micros > 2**63 - 1:
+                    return self._unavailable(run_id, "request prices exceed SQLite's money bound; unusable requests charged zero")
+                remetered = NativeFailure.parse(evidence.get("native_usage_failure")) if isinstance(native, MeasuredRunUsage) else None
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 return self._unavailable(run_id, "Codex recovery evidence is malformed or unpriceable")
             request = SettlementRequest(
                 run_id,
                 amount,
-                PricingBasis.RECONCILED,
+                PricingBasis.ESTIMATE if isinstance(native, EstimatedRunUsage) else PricingBasis.RECONCILED,
                 f"codex-recovered:{session_id}:{run_id}",
                 total_usage(native.samples),
-                rates.rate_card_id,
-                rates.version,
+                rates.rate_card_id if rates is not None else None,
+                rates.version if rates is not None else None,
+                native.detail if isinstance(native, EstimatedRunUsage) else "",
+                ChargeOrigin.RECOVERY_ESTIMATE,
             )
             result = (self.store.settle(request) if remetered is None
-                      else self.store.settle_remetered(request, remetered, RemeterOutcome.MEASURED))
+                      else self.store.settle_remetered(request, remetered))
             if result.disposition is not AccountingDisposition.AVAILABLE:
                 return self._unavailable(run_id, "Codex measured recovery settlement was refused")
             remove_spend_evidence(directory, run_id)
@@ -75,8 +79,7 @@ class CodexSpendReconciler:
         return self._unavailable(run_id, "Codex recovery evidence is missing or invalid")
 
     def _unavailable(self, run_id: RunId, reason: str) -> bool:
-        self.store.record_accounting_unavailable(run_id, reason)
-        return False
+        return self.store.settle_terminal_estimate(run_id, reason)
 
     def _belongs_to_codex(self, run_id: RunId) -> bool:
         with self.store.transaction() as db:
@@ -168,42 +171,44 @@ class CodexSpendReconciler:
         return usage_delta(usage, baseline if isinstance(baseline, dict)
                            and session_id == evidence.get("baseline_session_id") else None)
 
-    def _native_usage(self, evidence: dict, session_id: str, ended_at: float | None = None) -> RunUsage | None:
-        if evidence["version"] == 1:
-            return UnavailableRunUsage("legacy evidence lacks native child rates and invocation baselines")
-        frozen = evidence.get("native_usage_failure")
-        # Ambiguous token counts are determined by the retained rollouts alone,
-        # so a meter fix can resolve them; any other frozen failure stays final.
-        if frozen and NativeFailure.parse(frozen) is not None and ended_at is None:
-            # That class always belongs to a completed run; without the
-            # harness-owned end an unbounded re-read could absorb a later leg.
-            return UnavailableRunUsage("native re-meter requires the run's recorded end")
-        if frozen and NativeFailure.parse(frozen) is None:
-            return UnavailableRunUsage(str(evidence["native_usage_failure"])[:2048])
-        roots = evidence.get("native_root_sessions")
+    def _native_usage(self, evidence: dict, session_id: str, ended_at: float | None = None) -> RunUsage:
+        roots = evidence.get("native_root_sessions", {})
         if not isinstance(roots, dict) or len(roots) > 65:
             raise ValueError("native recovery roots are malformed")
-        if session_id in roots and roots[session_id] != evidence["model"]:
-            return UnavailableRunUsage("native recovery root disagrees with its captured model")
-        roots = {**roots, session_id: str(evidence.get("model") or "")}
-        rates = recovered_rate_table(evidence.get("native_rate_table"))
-        if rates is None:
-            return UnavailableRunUsage("native recovery lacks its frozen price card")
+        if session_id in roots and roots[session_id] != evidence.get("model", ""):
+            return EstimatedRunUsage("native recovery root disagrees with its captured model")
+        roots = {**roots, session_id: str(evidence.get("model") or "<legacy-parent>")}
+        rates = self._rates(evidence)
         meter = CodexChildUsageMeter(str(evidence.get("codex_home") or os.path.expanduser("~/.codex")),
-                                    float(evidence["native_usage_started_at"]),
+                                    float(evidence.get("native_usage_started_at", evidence["rollout_started_at"])),
                                     rates, str(evidence["cwd"]), ended_at=ended_at)
+        meter.seed_baseline(evidence.get("baseline_session_id", ""), evidence.get("baseline_usage"))
+        def usage(root: str) -> dict | None:
+            try:
+                return self._usage(evidence, root, ended_at)
+            except (ValueError, TypeError, ArithmeticError):
+                meter.failure = "root counter delta malformed; using in-window request evidence"
+                return None
+
         for root, model in roots.items():
             if not isinstance(root, str) or not isinstance(model, str):
                 raise ValueError("native recovery identity is malformed")
-            usage = self._usage(evidence, root, ended_at)
-            observed = meter.sample(root, model, usage)
-            if isinstance(observed, UnavailableRunUsage):
-                return observed
-            # A receipted root needs no counter; the meter records it in `roots` when it is priced.
-            if not model or root not in meter.roots:
-                return UnavailableRunUsage("native recovery root usage or model is missing")
-        observed = meter.sample(session_id, roots[session_id], self._usage(evidence, session_id, ended_at), final=True)
+            meter.sample(root, model, usage(root))
+        observed = meter.sample(session_id, roots[session_id], usage(session_id), final=True)
         if ended_at is None and any(r.usage for r in meter.rollouts.values()):
             # An unbounded receipt window could absorb a later leg's responses.
-            return UnavailableRunUsage("native re-meter requires the run's recorded end")
-        return observed if observed is not None else MeasuredRunUsage(tuple(meter.roots.values()))
+            return EstimatedRunUsage("native re-meter requires the run's recorded end")
+        return (EstimatedRunUsage("legacy evidence lacks native child metadata; pricing usable parent usage",
+                    tuple(sample for sample in observed.samples if sample.session_id in roots))
+                if evidence["version"] == 1 else observed)
+
+    @staticmethod
+    def _rates(evidence: dict) -> RateTable | None:
+        if evidence["version"] == 2 and evidence["native_rate_table"] is not None:
+            return recovered_rate_table(evidence["native_rate_table"])
+        inputs, outputs, cached = (usd_per_million_to_micros(evidence[key]) for key in (
+            "cost_per_mtok_in", "cost_per_mtok_out", "cost_per_mtok_cached_in"))
+        rates = ModelRates(inputs, outputs, cached, inputs)
+        return RateTable(evidence.get("rate_card_id") or "codex-config",
+            evidence.get("rate_card_version") or evidence.get("config_version") or "legacy",
+            "USD", {}, UnknownModelPolicy.USE_FALLBACK, rates)

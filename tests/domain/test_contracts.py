@@ -12,6 +12,10 @@ from issue_agent.domain.contracts import (
     LifecycleCommand,
     Money,
     PriceQuote,
+    PricingBasis,
+    ChargeOrigin,
+    RunId,
+    SettlementRequest,
     TestExecution as ExecutionReceipt,
     TestExecutionStatus as ExecutionStatus,
     TokenUsage,
@@ -27,6 +31,25 @@ def test_money_is_integer_currency_safe_arithmetic():
         Money("USD", 7) + Money("AUD", 5)
     with pytest.raises(ValueError, match="negative"):
         Money("USD", -1)
+
+
+@pytest.mark.parametrize("origin", [None, True, "normal_return", "recovery_estimate"])
+def test_charge_origin_must_be_validated_before_constructing_a_settlement(origin):
+    with pytest.raises(ValueError, match="charge origin"):
+        SettlementRequest(RunId("r"), Money.zero(), PricingBasis.ESTIMATE, "receipt", None, None, None,
+                          origin=origin)
+
+
+@pytest.mark.parametrize("gap", [None, 1, "x" * 2049])
+def test_settlement_gap_rejects_malformed_or_unbounded_evidence(gap):
+    with pytest.raises(ValueError, match="accounting gap"):
+        SettlementRequest(RunId("r"), Money.zero(), PricingBasis.ESTIMATE, "provider:r", None, None, None, gap)
+
+
+def test_settlement_gap_accepts_absence_and_boundary_text():
+    for gap in ("", "x" * 2048):
+        assert SettlementRequest(RunId("r"), Money.zero(), PricingBasis.ESTIMATE,
+                                 "provider:r", None, None, None, gap).accounting_gap == gap
 
 
 @pytest.mark.parametrize(

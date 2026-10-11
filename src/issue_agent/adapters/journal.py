@@ -59,7 +59,7 @@ from ..domain.events import (
     Correlation,
 )
 from ..domain.outcome import pre_admission_refusal, AgentResult, ExitReason, deterministic_death
-from ..domain.run_usage import MeasuredRunUsage, UnavailableRunUsage
+from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage
 from ..domain.ports import EventSink
 from .handover import (
     HandoverScope,
@@ -819,7 +819,6 @@ class JournalingRuntime:
             )
             # Admission and settlement use the control store's configured rate
             # table. A telemetry stream must never become a pricing authority.
-            estimated = 0.0
             attributes = {
                 "role": ctx.role,
                 "number": ctx.number,
@@ -838,7 +837,7 @@ class JournalingRuntime:
                     else None
                 ),
             }
-            if isinstance(result.run_usage, (MeasuredRunUsage, UnavailableRunUsage)):
+            if isinstance(result.run_usage, (MeasuredRunUsage, EstimatedRunUsage)):
                 attributes["usage_by_session"] = [
                     {"session_id": sample.session_id, "model": sample.model,
                      "input_tokens": sample.usage.input_tokens,
@@ -848,8 +847,8 @@ class JournalingRuntime:
                      "source": sample.usage.source.value}
                     for sample in result.run_usage.samples
                 ]
-                if isinstance(result.run_usage, UnavailableRunUsage):
-                    attributes["usage_unavailable"] = result.run_usage.detail
+                if isinstance(result.run_usage, EstimatedRunUsage):
+                    attributes["usage_estimate_gap"] = result.run_usage.detail
             attributes = {
                 key: value
                 for key, value in attributes.items()
@@ -874,7 +873,9 @@ class JournalingRuntime:
                         Money.from_major("USD", max(0.0, cost)).micros,
                         "USD",
                         (
-                            "configured_rate_card"
+                            result.pricing_basis.value
+                            if result.pricing_basis is not None
+                            else "configured_rate_card"
                             if actual_runtime == "codex"
                             else "provider_reported"
                         ),

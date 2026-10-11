@@ -15,9 +15,9 @@ import os
 import uuid
 from pathlib import Path
 
-from ..domain.contracts import TokenUsage, UsageSource
+from ..domain.contracts import Money, TokenUsage, UsageSource
 from ..domain.pricing import ModelRates, RateTable, UnknownModelPolicy
-from ..domain.run_usage import MeasuredRunUsage, ModelUsage, RunUsage, UnavailableRunUsage
+from ..domain.run_usage import MeasuredRunUsage, ModelUsage, RunUsage, EstimatedRunUsage, usage_lower_bound
 
 
 class NativeFailure(str, Enum):
@@ -34,10 +34,6 @@ class NativeFailure(str, Enum):
     @classmethod
     def parse(cls, raw: object) -> "NativeFailure | None":
         return next((member for member in cls if raw == member.value), None)
-
-
-class RemeterOutcome(str, Enum):
-    MEASURED = "measured"
 
 
 def normalize_usage(raw: dict) -> TokenUsage:
@@ -69,6 +65,21 @@ def root_usage(raw: dict) -> TokenUsage:
         "cached_input_tokens": raw.get("cache_read_input_tokens", 0),
         "cache_write_input_tokens": raw.get("cache_creation_input_tokens", 0),
     })
+
+
+def _counter_delta(current: tuple[int, ...], baseline: tuple[int, ...]) -> TokenUsage:
+    values = tuple(max(0, a - b) for a, b in zip(current, baseline))
+    return TokenUsage(values[0], values[1], values[2], values[3], UsageSource.ROLLOUT)
+
+
+def _counters(usage: TokenUsage) -> tuple[int, ...]:
+    return usage.input_tokens, usage.output_tokens, usage.cache_read_tokens, usage.cache_write_tokens
+
+
+def _thread_spawn(source: object) -> dict:
+    subagent = source.get("subagent") if isinstance(source, dict) else None
+    spawn = subagent.get("thread_spawn") if isinstance(subagent, dict) else None
+    return spawn if isinstance(spawn, dict) else {}
 
 
 def _timestamp(raw: object) -> float:
@@ -118,10 +129,11 @@ class _Rollout:
     created_at: float | None = None
     own_start: int = 0
     active_turn: str = ""
-    models: dict[str, str] = field(default_factory=dict)
-    usage: dict[str, tuple[str, TokenUsage]] = field(default_factory=dict)
-    completed_turns: set[str] = field(default_factory=set)
-    started_turns: set[str] = field(default_factory=set)
+    models: dict[str, tuple[str, float]] = field(default_factory=dict)
+    usage: dict[str, tuple[str, TokenUsage, float, Money | None]] = field(default_factory=dict)
+    cumulative: TokenUsage = field(default_factory=lambda: TokenUsage(0, 0, source=UsageSource.ROLLOUT))
+    baseline_counter: tuple[int, ...] | None = None
+    snapshot_baseline: tuple[int, ...] = (0, 0, 0, 0)
 
 
 @dataclass
@@ -148,16 +160,29 @@ class CodexChildUsageMeter:
     _bytes: int = field(default=0, init=False)
     _metadata_headers: dict[Path, dict] = field(default_factory=dict, init=False)
 
+    def seed_baseline(self, session_id: str, usage: dict | None) -> None:
+        """The harness's pre-launch snapshot overrides copied history counters."""
+        if usage is None:
+            return
+        try:
+            rollout = self._locate(session_id)
+            tokens = root_usage(usage)
+            if rollout is not None and rollout.offset == 0:
+                rollout.baseline_counter = rollout.snapshot_baseline = _counters(tokens)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            self.failure = str(exc)[:2048]
+
     def _directories(self, session_id: str = "") -> set[Path]:
         start = datetime.fromtimestamp(self.started_at, timezone.utc).date()
         today = datetime.now(timezone.utc).date()
+        if self.ended_at is not None:
+            today = min(today, datetime.fromtimestamp(self.ended_at, timezone.utc).date())
         if not 0 <= (today - start).days <= 7:
             raise ValueError("native rollout discovery exceeded its invocation date bound")
         # Codex filenames use local dates, while metadata uses UTC. Adjacent
         # days cover UTC offsets without enumerating the lifetime archive.
         dates = {start + timedelta(days=i) for i in range(-1, (today - start).days + 2)}
         if session_id:
-            import uuid
             identity = uuid.UUID(session_id)
             if identity.version != 7:
                 raise ValueError("native session identity does not provide its creation date")
@@ -187,7 +212,6 @@ class CodexChildUsageMeter:
         if session_id in self.rollouts:
             return self.rollouts[session_id]
         # Native identities are UUIDs, never agent-supplied glob/path fragments.
-        import uuid
         try:
             uuid.UUID(session_id)
         except (ValueError, AttributeError):
@@ -211,13 +235,16 @@ class CodexChildUsageMeter:
         for path in self._paths(self._directories()):
             meta = self._metadata_headers.get(path)
             if meta is None:
-                with path.open("rb") as stream:
-                    line = stream.readline(65537)
+                try:
+                    with path.open("rb") as stream:
+                        line = stream.readline(65537)
+                except OSError:
+                    continue
                 self._bytes += len(line)
                 if self._bytes > self.max_bytes:
                     raise ValueError("native observer exceeded its byte bound")
                 if len(line) > 65536:
-                    raise ValueError("native metadata exceeds its read bound")
+                    continue
                 try:
                     event = json.loads(line)
                 except (ValueError, UnicodeError):
@@ -226,13 +253,24 @@ class CodexChildUsageMeter:
                     continue
                 meta = event.get("payload") or {}
                 if not isinstance(meta, dict):
-                    raise ValueError("native metadata is malformed")
+                    continue
                 self._metadata_headers[path] = meta
             source = meta.get("source")
-            parent = ((source.get("subagent") or {}).get("thread_spawn") or {}).get("parent_thread_id") if isinstance(source, dict) else None
+            parent = _thread_spawn(source).get("parent_thread_id")
             sid = meta.get("id") or meta.get("session_id")
             if parent in self.rollouts and isinstance(sid, str) and sid not in self.rollouts:
                 self._locate(sid)
+
+    def _ancestor_turns(self, rollout: _Rollout) -> set[str]:
+        turns: set[str] = set()
+        visited = {rollout.session_id}
+        parent = _thread_spawn((rollout.metadata or {}).get("source")).get("parent_thread_id")
+        while parent in self.rollouts and parent not in visited:
+            visited.add(parent)
+            ancestor = self.rollouts[parent]
+            turns.update(ancestor.models)
+            parent = _thread_spawn((ancestor.metadata or {}).get("source")).get("parent_thread_id")
+        return turns
 
     def _event(self, rollout: _Rollout, event: dict) -> None:
         if self.ended_at is not None and _timestamp(event.get("timestamp")) > self.ended_at:
@@ -261,18 +299,43 @@ class CodexChildUsageMeter:
                 return
         if kind == "session_meta":
             raise ValueError("native canonical metadata was replaced outside inherited context")
+        observed_at = _timestamp(event.get("timestamp"))
         if kind == "turn_context":
             turn, model = payload.get("turn_id"), payload.get("model")
             if isinstance(turn, str) and isinstance(model, str) and turn and model:
                 prior = rollout.models.get(turn)
-                if prior is not None and prior != model:
+                if prior and prior[0] and prior[0] != model:
                     raise ValueError("native model changed within an observed turn")
                 if prior is None and sum(len(r.models) for r in self.rollouts.values()) >= self.max_responses:
                     raise ValueError("native observer exceeded its turn bound")
-                rollout.models[turn] = model
+                rollout.models[turn] = (model, observed_at)
                 rollout.active_turn = turn
             return
-        if _timestamp(event.get("timestamp")) < self.started_at:
+        if kind == "event_msg" and payload.get("type") in {"task_started", "turn_started", "task_complete", "turn_complete"}:
+            turn = payload.get("turn_id")
+            if isinstance(turn, str) and turn:
+                if turn not in rollout.models and sum(len(r.models) for r in self.rollouts.values()) >= self.max_responses:
+                    raise ValueError("native observer exceeded its turn bound")
+                rollout.models[turn] = (rollout.models.get(turn, ("", 0))[0], observed_at)
+                rollout.active_turn = turn
+            return
+        # Forks without ordinal boundaries retain ancestor event messages.
+        # Exclude them before they can seed the child's cumulative baseline.
+        if payload.get("turn_id", rollout.active_turn) in self._ancestor_turns(rollout):
+            return
+        before_start = observed_at < self.started_at
+        if kind == "event_msg" and payload.get("type") == "token_count":
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                return
+            total = normalize_usage(info.get("total_token_usage"))
+            if before_start:
+                rollout.baseline_counter = _counters(usage_lower_bound(total,
+                    _counter_delta(rollout.baseline_counter or (0, 0, 0, 0), (0, 0, 0, 0))))
+            else:
+                rollout.cumulative = usage_lower_bound(rollout.cumulative, total)
+            return
+        if before_start and kind != "token_usage_record":
             return
         if kind == "response_item":
             item_kind, call_id = payload.get("type"), payload.get("call_id")
@@ -285,8 +348,7 @@ class CodexChildUsageMeter:
                     uuid.UUID(target)
                 except ValueError:
                     source = (rollout.metadata or {}).get("source") or {}
-                    sender = (((source.get("subagent") or {}).get("thread_spawn") or {}).get("agent_path")
-                              if isinstance(source, dict) else None) or "/root"
+                    sender = _thread_spawn(source).get("agent_path") or "/root"
                     target = target if target.startswith("/") else sender + "/" + target
                 self.followups.add((rollout.session_id, target, payload["name"]))
             if item_kind == "function_call" and payload.get("name") == "spawn_agent":
@@ -325,8 +387,7 @@ class CodexChildUsageMeter:
                 elif path is not None:
                     requested = self.spawn_calls[key]
                     parent_source = (rollout.metadata or {}).get("source") or {}
-                    parent_path = (((parent_source.get("subagent") or {}).get("thread_spawn") or {}).get("agent_path")
-                                   if isinstance(parent_source, dict) else None) or "/root"
+                    parent_path = _thread_spawn(parent_source).get("agent_path") or "/root"
                     if (not isinstance(path, str) or not path.startswith("/")
                             or requested is None or path != parent_path + "/" + requested):
                         raise ValueError("native spawn output disagrees with requested task")
@@ -346,27 +407,41 @@ class CodexChildUsageMeter:
             response, turn = payload.get("response_id"), payload.get("turn_id")
             if not isinstance(response, str) or not response or not isinstance(turn, str) or not turn:
                 raise ValueError("native usage lacks response or turn identity")
-            value = (turn, normalize_usage(payload.get("usage") or {}))
-            if response in rollout.usage and rollout.usage[response] != value:
-                raise ValueError("native response has conflicting usage")
-            if sum(len(r.usage) for r in self.rollouts.values()) >= self.max_responses and response not in rollout.usage:
+            try:
+                tokens = normalize_usage(payload.get("usage") or {})
+            except ValueError:
+                tokens = TokenUsage(0, 0, source=UsageSource.ROLLOUT)
+                self.failure = "receipt token usage unavailable; using its reported cost"
+            counter = payload.get("thread_token_usage")
+            try:
+                cumulative = normalize_usage(counter) if counter is not None else None
+            except ValueError:
+                cumulative = None
+                self.failure = "receipt cumulative counters malformed; using its request usage"
+            if cumulative is not None:
+                if before_start:
+                    rollout.baseline_counter = _counters(usage_lower_bound(cumulative,
+                        _counter_delta(rollout.baseline_counter or (0, 0, 0, 0), (0, 0, 0, 0))))
+                else:
+                    rollout.cumulative = usage_lower_bound(rollout.cumulative, cumulative)
+            cost = payload.get("cost_usd")
+            try:
+                reported = Money.from_major("USD", cost) if cost is not None else None
+                if reported is not None and reported.micros > 2**63 - 1:
+                    raise ValueError("receipt cost exceeds SQLite's money bound")
+            except (ValueError, TypeError, ArithmeticError):
+                reported = None
+                self.failure = "receipt cost malformed; using its token usage"
+            value = (turn, tokens, observed_at, reported)
+            if response in rollout.usage:
+                prior = rollout.usage[response]
+                if (prior[0], prior[1], prior[3]) != (turn, tokens, reported):
+                    raise ValueError("native response has conflicting usage")
+                return
+            if sum(len(r.usage) for r in self.rollouts.values()) >= self.max_responses:
                 raise ValueError("native observer exceeded its response bound")
             rollout.usage[response] = value
             return
-        if kind != "event_msg":
-            return
-        event_kind = payload.get("type")
-        if event_kind in ("task_complete", "turn_complete"):
-            turn = payload.get("turn_id")
-            if isinstance(turn, str):
-                rollout.completed_turns.add(turn)
-        elif event_kind in ("task_started", "turn_started"):
-            turn = payload.get("turn_id")
-            if isinstance(turn, str):
-                if sum(len(r.started_turns) for r in self.rollouts.values()) >= self.max_responses and turn not in rollout.started_turns:
-                    raise ValueError("native observer exceeded its turn bound")
-                rollout.started_turns.add(turn)
-                rollout.active_turn = turn
 
     def _resolve_spawn_outputs(self, *, final: bool) -> None:
         for (parent, _), (sid, path) in self.spawn_outputs.items():
@@ -374,7 +449,7 @@ class CodexChildUsageMeter:
                 matches = []
                 for rollout in self.rollouts.values():
                     source = (rollout.metadata or {}).get("source") or {}
-                    spawn = ((source.get("subagent") or {}).get("thread_spawn") or {}) if isinstance(source, dict) else {}
+                    spawn = _thread_spawn(source)
                     if spawn.get("parent_thread_id") == parent and spawn.get("agent_path") == path:
                         matches.append(rollout.session_id)
                 if len(matches) > 1:
@@ -391,7 +466,7 @@ class CodexChildUsageMeter:
                 raise ValueError("native child has conflicting lineage")
             self.children[sid] = identity
 
-    def _read(self, rollout: _Rollout) -> None:
+    def _read(self, rollout: _Rollout, *, final: bool) -> None:
         info = rollout.path.stat()
         identity = (info.st_dev, info.st_ino)
         if rollout.inode is not None and (rollout.inode != identity or info.st_size < rollout.offset):
@@ -409,146 +484,138 @@ class CodexChildUsageMeter:
         rollout.tail = records.pop()
         if len(rollout.tail) > self.max_record_bytes:
             raise ValueError("native usage record exceeds its size bound")
+        if final and rollout.tail:
+            try:
+                json.loads(rollout.tail)
+            except ValueError:
+                pass
+            else:
+                records.append(rollout.tail)
+                rollout.tail = b""
         for raw in records:
             if not raw:
                 continue
             if len(raw) > self.max_record_bytes:
                 raise ValueError("native usage record exceeds its size bound")
-            event = json.loads(raw)
-            if not isinstance(event, dict):
-                raise ValueError("native usage event is malformed")
-            self._event(rollout, event)
-
-    def _blocking_tail(self, rollout: _Rollout) -> bool:
-        """An unterminated record blocks final settlement, except a receipted session's killed write
-        (a truncated prefix of one record: its in-flight request has no receipt, so it prices at zero)."""
-        if rollout.tail and rollout.usage:
-            tail = rollout.tail
             try:
-                tail = tail.decode()
-            except UnicodeDecodeError as exc:
-                # Only a multibyte character cut off at the very end is a killed write.
-                if exc.reason != "unexpected end of data" or exc.end != len(tail):
-                    return True
-                tail = tail[:exc.start].decode()
-            if not tail.lstrip().startswith("{"):
-                return True
-            try:
-                json.loads(tail)
-            except json.JSONDecodeError as exc:
-                return not (exc.msg.startswith("Unterminated string") or exc.pos >= len(tail.rstrip()))
-        return bool(rollout.tail)
+                event = json.loads(raw)
+                if not isinstance(event, dict):
+                    raise ValueError("native usage event is malformed")
+                self._event(rollout, event)
+            except (ValueError, TypeError, AttributeError) as exc:
+                self.failure = str(exc)[:2048] or "native usage record is malformed"
 
-    def sample(self, session_id: str, model: str, usage: dict | None, *, final: bool = False) -> RunUsage | None:
-        """A session with receipts is priced as exactly the sum of its receipts in this run's window
-        [started_at, ended_at]; the counter prices only sessions without any. An in-flight request
-        has no receipt and so costs zero (operator, 2026-10-11)."""
-        samples: list[ModelUsage] = []
-        if self.failure:
-            return UnavailableRunUsage(self.failure, tuple(self.roots.values()))
+    def sample(self, session_id: str, model: str, usage: dict | None, *, final: bool = False) -> RunUsage:
+        """Price each request's best evidence plus per-category counter remainders.
+
+        The same lower bound drives live caps and terminal settlement. Copied
+        ancestor history and pre-launch usage cannot become this leg's spend.
+        """
         try:
-            if session_id and usage is not None:
-                normalized = root_usage(usage)
-                if model:
-                    self.roots[session_id] = ModelUsage(session_id, model, normalized)
+            if session_id and model and (usage is not None or session_id not in self.roots):
+                try:
+                    self.roots[session_id] = ModelUsage(session_id, model,
+                        root_usage(usage) if usage is not None else TokenUsage(0, 0, source=UsageSource.ROLLOUT))
+                except (ValueError, TypeError) as exc:
+                    self.failure = str(exc)[:2048]
             if session_id:
                 self._locate(session_id)
             for _ in range(self.max_children + 1):
                 before = len(self.rollouts)
                 for rollout in tuple(self.rollouts.values()):
-                    self._read(rollout)
+                    self._read(rollout, final=final)
                 self._candidate_children()
                 self._resolve_spawn_outputs(final=False)
                 if len(self.rollouts) == before:
                     break
             self._resolve_spawn_outputs(final=final)
-            receipted: set[str] = set()
-            for sid in {*self.roots, session_id} - {""}:
-                rollout = self.rollouts.get(sid)
-                root_model = self.roots[sid].model if sid in self.roots else (model if sid == session_id else "")
-                if rollout is not None and rollout.usage and root_model:
-                    self.roots[sid] = ModelUsage(sid, root_model, total_usage_of([u for _, u in rollout.usage.values()]))
-                    receipted.add(sid)
-                    if final and rollout.completed_turns - {turn for turn, _ in rollout.usage.values()}:
-                        raise ValueError(NativeFailure.UNFINISHED_TURNS.value)
-            participants = set(self.roots) | set(self.children)
-            message_targets = participants | {path for _, path in self.children.values() if path}
-            if self.roots:
-                message_targets.add("/root")
-            for parent, target, operation in self.followups:
-                # Notifications cannot activate another turn; every participant
-                # still needs its own corroborated baseline and complete usage.
-                if operation == "send_message":
-                    if parent in participants and target in message_targets:
-                        continue
-                    raise ValueError("native message lacks this reservation's participant baseline")
-                if not any(owner == parent and target in {sid, path}
-                           for sid, (owner, path) in self.children.items()):
-                    raise ValueError("native follow-up lacks this reservation's child baseline")
-            if final and any(r.session_id not in self.children and r.created_at is not None
-                             and r.created_at >= self.started_at
-                             and isinstance((r.metadata or {}).get("source"), dict)
-                             for r in self.rollouts.values()):
-                raise ValueError("native child lacks its parent's durable spawn receipt")
-            if not self.children:
-                if self.rates is not None and self.roots:
-                    if final and (session_id not in self.roots or usage is None and session_id not in receipted
-                                  or any(self._blocking_tail(r) for r in self.rollouts.values())):
-                        raise ValueError("parent native usage is missing or incomplete")
-                    if any(not self.rates.priceable(root.model) for root in self.roots.values()):
-                        raise ValueError("native parent model has no configured rates")
-                    return MeasuredRunUsage(tuple(self.roots.values()))
-                return None
-            if final and session_id not in self.roots:
-                raise ValueError("native parent model or usage is unavailable")
-            if final and (usage is None and session_id not in receipted or session_id not in self.roots
-                          or any(self._blocking_tail(r) for r in self.rollouts.values())):
-                raise ValueError("parent native usage is missing or incomplete")
-            samples.extend(self.roots.values())
-            if self.rates is None or any(not self.rates.priceable(root.model) for root in self.roots.values()):
-                raise ValueError("native parent model has no configured rates")
-            for sid, (parent, path) in sorted(self.children.items()):
-                rollout = self.rollouts.get(sid)
-                if rollout is None or rollout.metadata is None:
-                    if final:
-                        raise ValueError("native child has no corroborating rollout")
-                    continue
-                meta = rollout.metadata
-                if meta.get("cli_version") != "0.160.0":
-                    raise ValueError("native child protocol is unqualified for this CLI version")
-                source = meta.get("source") or {}
-                spawn = ((source.get("subagent") or {}).get("thread_spawn") or {}) if isinstance(source, dict) else {}
-                if (spawn.get("parent_thread_id") != parent
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            self.failure = str(exc)[:2048] or "native child usage unavailable"
+        samples: list[ModelUsage] = []
+        gap = self.failure
+        for sid in sorted(set(self.roots) | set(self.children) | ({session_id} if session_id else set())):
+            rollout = self.rollouts.get(sid)
+            root_model = self.roots[sid].model if sid in self.roots else model if sid == session_id else ""
+            if sid in self.children:
+                parent, path = self.children[sid]
+                meta = rollout.metadata if rollout else None
+                source = meta.get("source") if meta else None
+                spawn = _thread_spawn(source)
+                if (not meta or meta.get("cli_version") != "0.160.0"
+                        or spawn.get("parent_thread_id") != parent
                         or path is not None and spawn.get("agent_path") != path
                         or not isinstance(meta.get("cwd"), str)
                         or os.path.realpath(meta["cwd"]) != os.path.realpath(self.cwd)):
-                    raise ValueError("native child disagrees with captured lineage, path or cwd")
-                ancestor_turns: set[str] = set()
-                ancestor = parent
-                while ancestor in self.rollouts:
-                    ancestor_turns.update(self.rollouts[ancestor].models)
-                    ancestor_turns.update(self.rollouts[ancestor].started_turns)
-                    if ancestor not in self.children:
-                        break
-                    ancestor = self.children[ancestor][0]
-                own_turns = rollout.started_turns - ancestor_turns
-                if not own_turns:
-                    own_turns = {turn for turn, _ in rollout.usage.values()} - ancestor_turns
-                usage_turns = {turn for turn, _ in rollout.usage.values()}
-                if final and (not own_turns or not own_turns & rollout.completed_turns <= usage_turns):
-                    raise ValueError(NativeFailure.UNFINISHED_TURNS.value)
-                grouped: dict[str, list[TokenUsage]] = {}
-                for turn in own_turns:
-                    receipts = [tokens for record_turn, tokens in rollout.usage.values() if record_turn == turn]
-                    actual_model = rollout.models.get(turn)
-                    # Native task_started can precede turn_context; a turn with no receipt has cost nothing yet.
-                    if actual_model is None and not receipts:
-                        continue
-                    if not actual_model or self.rates is None or actual_model.strip().casefold() not in self.rates.rates:
-                        raise ValueError("native child turn model has no explicit configured rates")
-                    grouped.setdefault(actual_model, []).extend(receipts)
-                samples.extend(ModelUsage(sid, m, total_usage_of(c)) for m, c in grouped.items() if c)
-            return MeasuredRunUsage(tuple(samples)) if samples else None
-        except (OSError, ValueError, TypeError, AttributeError) as exc:
-            self.failure = str(exc)[:2048] or "native child usage unavailable"
-            return UnavailableRunUsage(self.failure, tuple(samples))
+                    self.failure = self.failure or "native child lacks corroborated lineage, protocol or cwd"
+                    continue
+            grouped: dict[str, list[TokenUsage]] = {}
+            inherited = self._ancestor_turns(rollout) if rollout else set()
+            receipts = {response: value for response, value in rollout.usage.items()
+                        if value[0] not in inherited and value[2] >= self.started_at} if rollout else {}
+            prior = total_usage_of([tokens for turn, tokens, at, _ in rollout.usage.values()
+                                   if turn not in inherited and at < self.started_at]) if rollout else TokenUsage(0, 0)
+            baseline = usage_lower_bound(prior, _counter_delta(
+                rollout.baseline_counter or (0, 0, 0, 0), (0, 0, 0, 0))) if rollout else prior
+            cumulative = _counter_delta(_counters(rollout.cumulative), _counters(baseline)) if rollout else TokenUsage(0, 0)
+            if sid in self.roots:
+                # Parent deltas use the frozen snapshot, not subsequently observed
+                # pre-launch totals; receipt lag must be subtracted from that base.
+                lag = _counter_delta(_counters(baseline), rollout.snapshot_baseline) if rollout else TokenUsage(0, 0)
+                cumulative = usage_lower_bound(cumulative, _counter_delta(_counters(self.roots[sid].usage), _counters(lag)))
+            receipt_total = total_usage_of([tokens for _, tokens, _, _ in receipts.values()])
+            remainder = _counter_delta(_counters(cumulative), _counters(receipt_total))
+            for response, (turn, tokens, _, cost) in receipts.items():
+                actual = (rollout.models.get(turn, ("", 0))[0] or root_model) if rollout else root_model
+                actual = actual.strip().casefold() or "<unreported-model>"
+                if cost is None and (self.rates is None or not self.rates.priceable(actual)):
+                    self.failure = self.failure or "request model has no configured rates; request charged zero"
+                else:
+                    try:
+                        samples.append(ModelUsage(sid, actual, tokens, cost, response))
+                    except ValueError:
+                        self.failure = self.failure or "request identity or counters malformed; request charged zero"
+            if remainder.total_tokens:
+                gap = gap or "request receipts unavailable; cumulative usage priced at configured rates"
+                possible = {(actual or root_model).strip().casefold() for turn, (actual, at) in rollout.models.items()
+                            if at >= self.started_at and turn not in inherited} if rollout else set()
+                possible |= {root_model.strip().casefold()} if root_model else set()
+                priced = {name: self.rates.rates_for(name) for name in sorted(possible)
+                          if self.rates is not None and self.rates.priceable(name)}
+                if len(priced) != len(possible) or not priced:
+                    self.failure = self.failure or "cumulative usage has an unpriced possible model"
+                # Counters are lower bounds, never complete model boundaries.
+                # Missing receipts cannot justify choosing a cheaper model.
+                for i, count in enumerate(_counters(remainder)):
+                    if count and priced:
+                        field = ("input_micros", "output_micros", "cache_read_micros", "cache_write_micros")[i]
+                        chosen = max(priced, key=lambda name: getattr(priced[name], field))
+                        grouped.setdefault(chosen, []).append(TokenUsage(*(count if j == i else 0 for j in range(4)), source=UsageSource.ROLLOUT))
+            if final and rollout and {turn for turn, (_, at) in rollout.models.items() if at >= self.started_at} - inherited - {turn for turn, _, _, _ in receipts.values()}:
+                gap = gap or "request receipts absent; usable cumulative usage estimated, otherwise charged zero"
+            if rollout and rollout.tail:
+                gap = gap or "truncated or malformed request tail; unusable request charged zero"
+            if final and not grouped and not receipts:
+                gap = gap or "participant request receipts and usage absent; unusable requests charged zero"
+            for actual, tokens in grouped.items():
+                try:
+                    samples.append(ModelUsage(sid, actual, total_usage_of(tokens)))
+                except ValueError:
+                    self.failure = self.failure or "request identity or counters malformed; request charged zero"
+        if any(r.session_id not in self.children and r.created_at is not None
+                         and r.created_at >= self.started_at
+                         and isinstance((r.metadata or {}).get("source"), dict)
+                         for r in self.rollouts.values()):
+            self.failure = self.failure or "native child lacks its parent's durable spawn receipt"
+        participants = set(self.roots) | set(self.children)
+        paths = {path for _, path in self.children.values() if path} | {"/root"}
+        for parent, target, operation in self.followups:
+            if (parent not in participants or target not in participants | paths
+                    or operation != "send_message" and not any(owner == parent and target in {sid, path}
+                         for sid, (owner, path) in self.children.items())):
+                self.failure = self.failure or "native follow-up lacks this reservation's participant baseline"
+        if not samples:
+            gap = gap or "request receipts and usable streamed usage absent; interrupted requests charged zero"
+        gap = self.failure or gap
+        if gap:
+            return EstimatedRunUsage(gap, tuple(samples), self.rates)
+        return MeasuredRunUsage(tuple(samples), self.rates)

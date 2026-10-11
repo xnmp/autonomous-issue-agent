@@ -17,12 +17,17 @@ from pathlib import Path
 import pytest
 
 from issue_agent.adapters.store import Store
+from issue_agent.adapters.workflow_codec import decode_workflow
 from issue_agent.adapters.workflow_rows import WorkflowAuthorityError
 from issue_agent.domain.labels import Label
 from issue_agent.domain.review import ReviewConfig
 from issue_agent.domain.review import ReviewMode
 from issue_agent.domain.outcome import AgentResult, ExitReason
 from issue_agent.domain.review_dispatch_record import ReviewNotAdmitted
+from issue_agent.domain.review_execution import PaidReviewProgress, ReviewRoundOutcome
+from issue_agent.domain.review_rounds import (
+    ReviewChildReturned, ReviewParentAbandoned, ReviewRoundFacts, ReviewSubmissionConfirmed,
+)
 from issue_agent.domain.world import IssueView
 from issue_agent.domain.review_workflow import (
     CompletedReviewRearm, FreshReviewRequired, PendingReviewRearm, ReviewedBaseline, ReviewRejectionCeiling,
@@ -1391,36 +1396,67 @@ def _die_at_review_execution_boundary(deployment, boundary):
 def test_process_loss_before_submission_recovers_without_duplicate_money_or_debit(deployment, boundary):
     run_until_exit(_die_at_review_execution_boundary, deployment, boundary, code=96)
     client = compose_review(deployment, provider=ScriptedProvider(verdicts(OK)))
+    before = client.state().execution
+    with client.review.control.transaction() as db:
+        interrupted_runs = tuple(row["run_id"] for row in db.execute("SELECT run_id FROM runs"))
     if boundary != "launch":
         client.remote.external_pr_change(PR, labels=[Label.AI_PARKED.value])
     client.boot()
     client.tick(10)
-    assert client.provider.tasks == [] and client.submissions() == []
+    if boundary == "launch":
+        assert len(client.provider.tasks) == len(client.submissions()) == 1
+        assert len(client.bot_reviews()) == 1 and client.bot_reviews()[0].state == "APPROVED"
+    else:
+        assert client.provider.tasks == [] and client.submissions() == []
+    tasks, submissions = tuple(client.provider.tasks), client.submissions()
     money = client.charges()
     state = client.state()
     with client.review.control.transaction() as db:
         rounds = tuple(tuple(row) for row in db.execute(
-            "SELECT round_id,planning_json,closure_json,outcome_json FROM review_execution_rounds"))
+            "SELECT round_id,planning_json,closure_json,outcome_json FROM review_execution_rounds ORDER BY sequence"))
         reservations = tuple(tuple(row) for row in db.execute("SELECT run_id,state FROM budget_reservations"))
         commands = tuple(tuple(row) for row in db.execute("SELECT * FROM lifecycle_commands"))
+        charges = tuple(tuple(row) for row in db.execute("SELECT run_id,amount_micros,basis FROM charges ORDER BY run_id"))
+        runs = tuple(tuple(row) for row in db.execute("SELECT run_id,state,outcome FROM runs ORDER BY run_id"))
     client.boot()
     client.tick(3)
     assert client.charges() == money and client.state() == state
+    assert tuple(client.provider.tasks) == tasks and client.submissions() == submissions
     with client.review.control.transaction() as db:
         assert tuple(tuple(row) for row in db.execute(
-            "SELECT round_id,planning_json,closure_json,outcome_json FROM review_execution_rounds")) == rounds
+            "SELECT round_id,planning_json,closure_json,outcome_json FROM review_execution_rounds ORDER BY sequence")) == rounds
         assert tuple(tuple(row) for row in db.execute("SELECT run_id,state FROM budget_reservations")) == reservations
         assert tuple(tuple(row) for row in db.execute("SELECT * FROM lifecycle_commands")) == commands
+        assert tuple(tuple(row) for row in db.execute("SELECT run_id,amount_micros,basis FROM charges ORDER BY run_id")) == charges
+        assert tuple(tuple(row) for row in db.execute("SELECT run_id,state,outcome FROM runs ORDER BY run_id")) == runs
         assert db.execute("SELECT count(*) FROM dispatch_claims").fetchone()[0] == 0
     if boundary == "return":
         assert len(money) == 1 and money[0][1] == 100_000
         assert state.execution.state.failures == 1
         assert rounds[0][3] is not None
     elif boundary == "launch":
-        assert money == [] and state.execution.state.failures == 0
-        assert rounds[0][3] is None
-        assert journal(client, "evidence_wait") == 2
-        assert any("round evidence remains pending after bounded recovery observations" in line for line in client.log)
+        (interrupted,) = interrupted_runs
+        completed = tasks[0].env["ISSUE_AGENT_RUN_ID"]
+        assert set(charges) == {(interrupted, 0, "estimate"), (completed, 100_000, "provider_reported")}
+        assert set(reservations) == {(interrupted, "settled"), (completed, "settled")}
+        assert set(runs) == {(interrupted, "abandoned", "dead_lease"), (completed, "completed", "settled")}
+        assert state.execution.binding == before.binding
+        assert state.execution.state.failures == state.execution.state.pin_deferrals == 0
+        assert state.execution.state.displayed_round == 1
+        assert isinstance(state.episode.continuation, ReviewedBaseline)
+        assert state.episode.continuation.head_sha == deployment.heads[0]
+        assert client.gates() == [] and NHR not in client.labels()
+        assert len(rounds) == 2
+        assert isinstance(decode_workflow(rounds[0][1], ReviewParentAbandoned), ReviewParentAbandoned)
+        assert rounds[0][2:] == (None, None)
+        facts = decode_workflow(rounds[1][2], ReviewRoundFacts)
+        outcome = decode_workflow(rounds[1][3], ReviewRoundOutcome)
+        assert isinstance(outcome.disposition, PaidReviewProgress)
+        assert tuple(child.run_id for child in outcome.disposition.launched) == (completed,)
+        assert len(facts.children) == 1 and isinstance(facts.children[0], ReviewChildReturned)
+        assert facts.children[0].launched.run_id == completed
+        assert len(facts.submissions) == 1 and isinstance(facts.submissions[0].result, ReviewSubmissionConfirmed)
+        assert facts.submissions[0].result.receipt_id == outcome.disposition.submission_receipt
     else:
         assert money == [] and state.execution.state.failures == 0
         assert rounds[0][3] is not None

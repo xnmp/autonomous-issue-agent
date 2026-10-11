@@ -29,7 +29,6 @@ from issue_agent.adapters.codex_runner import (
     codex_budget_not_enforced_warning,
     codex_cost_blindspot_warning,
     codex_cost_usd,
-    implausible_codex_usage_warning,
     rates_for_model,
     spend_evidence_path,
     parse_codex_envelope,
@@ -752,6 +751,7 @@ def _write_session_rollout(
         },
         *[
             {
+                "timestamp": timestamp.isoformat(),
                 "type": "event_msg",
                 "payload": {
                     "type": "token_count",
@@ -1788,11 +1788,11 @@ def test_read_rollout_usage_prefers_last_cumulative_token_count(tmp_path):
     day.mkdir(parents=True)
     lines = [
         {"type": "session_meta", "payload": {"type": "session_meta"}},
-        {"payload": {"type": "token_count", "info": {"total_token_usage": {
+        {"timestamp": datetime.now(timezone.utc).isoformat(), "payload": {"type": "token_count", "info": {"total_token_usage": {
             "input_tokens": 100, "cached_input_tokens": 50,
             "cache_write_input_tokens": 0, "output_tokens": 10,
             "total_tokens": 110}}}},
-        {"payload": {"type": "token_count", "info": {"total_token_usage": {
+        {"timestamp": datetime.now(timezone.utc).isoformat(), "payload": {"type": "token_count", "info": {"total_token_usage": {
             "input_tokens": 54019, "cached_input_tokens": 35328,
             "cache_write_input_tokens": 7, "output_tokens": 604,
             "total_tokens": 54623}}}},
@@ -1906,32 +1906,6 @@ def test_stderr_usage_is_never_a_pricing_receipt():
     ) == 0
 
 
-def test_plausibility_rate_ceiling_remains_armed_after_two_minutes():
-    usage = {
-        "input_tokens": 0,
-        "output_tokens": 20_000_000,
-        "source": "rollout",
-    }
-    warning = implausible_codex_usage_warning(
-        usage,
-        elapsed_s=600,
-        has_baseline=False,
-        cost_per_mtok_in=5,
-        cost_per_mtok_out=30,
-    )
-    assert "$50.00/minute" in warning
-    assert (
-        implausible_codex_usage_warning(
-            usage,
-            elapsed_s=720,
-            has_baseline=False,
-            cost_per_mtok_in=5,
-            cost_per_mtok_out=30,
-        )
-        == ""
-    )
-
-
 def test_total_only_usage_is_priced_at_the_higher_rate():
     # A cap that under-counts is a cap that never fires, so an unsplit total
     # rounds toward over-estimation.
@@ -1980,6 +1954,7 @@ def _costed_codex(tmp) -> str:
     """A stub that writes provider-owned rollout usage and an envelope."""
     usage_event = json.dumps(
         {
+            "timestamp": datetime.now(timezone.utc).isoformat(),
             "payload": {
                 "type": "token_count",
                 "info": {

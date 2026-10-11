@@ -1,7 +1,6 @@
 """A terminal, quiescent repair with unknown cost no longer freezes its PR.
 
-Operator decision 2026-10-11 (Tauri PR #1019): the retained reservation keeps
-counting against the caps as unknown spend; only the workflow hold is lifted.
+Tauri PRs #1019/#1001/#999: legacy accounting holds settle before acknowledgment.
 """
 import hashlib
 import json
@@ -31,10 +30,12 @@ def _lose_with_unknown_cost(monkeypatch, lane="review", during=None):
     workflow, files, inner, key = _workflow(lane)
     store = files._workflow_db
     run_id = _launch_and_lose_return(monkeypatch, workflow, files, inner, lane, during=during)
-    assert store.record_accounting_unavailable(run_id, "native child has unfinished turns or turns without usage")
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     with store.transaction() as db:
         # Incident disposition: terminal, process gone, retained as reconcile_only.
         db.execute("UPDATE reservation_recovery SET policy='reconcile_only' WHERE run_id=?", (str(run_id),))
+    assert store.settle_terminal_estimate(run_id, "legacy request evidence unavailable")
     return workflow, files, inner, key, run_id
 
 
@@ -46,12 +47,12 @@ def _receipt(store, control, key, run_id):
 
 
 @pytest.mark.parametrize("lane", ["review", "rebase", "ci"])
-def test_unknown_cost_run_is_acknowledged_and_next_repair_proceeds_with_money_retained(monkeypatch, lane):
+def test_unknown_cost_run_is_acknowledged_and_next_repair_proceeds_after_settlement(monkeypatch, lane):
     workflow, files, inner, key, run_id = _lose_with_unknown_cost(monkeypatch, lane)
     store, control = files._workflow_db, files._workflow_authority
     before_money, reserved = _money(store, run_id), _active_reserved(store)
     with store.transaction() as db:
-        assert db.execute("SELECT state FROM budget_reservations WHERE run_id=?", (str(run_id),)).fetchone()[0] == "active"
+        assert db.execute("SELECT state FROM budget_reservations WHERE run_id=?", (str(run_id),)).fetchone()[0] == "settled"
     failures = _failures(issue_ci_state(files), lane)
 
     assert control.reconcile_pr_repair_returns() == 1
@@ -77,7 +78,7 @@ def test_later_release_of_retained_run_keeps_pr_consistent(monkeypatch):
     store, control = files._workflow_db, files._workflow_authority
     assert control.reconcile_pr_repair_returns() == 1
     state, repair = issue_ci_state(files), control.read_pr_repair(key)
-    assert store.release(run_id, "operator disposition").disposition.value == "available"
+    assert store.settle_terminal_estimate(run_id, "repeat recovery")
     assert control.reconcile_pr_repair_returns() == 0
     assert issue_ci_state(files) == state and control.read_pr_repair(key) == repair
     _repair(workflow, "review")
@@ -94,14 +95,17 @@ def test_retained_run_with_live_lease_still_holds(monkeypatch):
             leases.append(tuple(db.execute("SELECT * FROM leases WHERE run_id=?", (str(rid),)).fetchone()))
 
     run_id = _launch_and_lose_return(monkeypatch, workflow, files, inner, "review", during=capture)
-    assert store.record_accounting_unavailable(run_id, "unfinished turns")
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     with store.transaction() as db:
         db.execute("UPDATE reservation_recovery SET policy='reconcile_only' WHERE run_id=?", (str(run_id),))
         db.execute("INSERT INTO leases VALUES (" + ",".join("?" for _ in leases[0]) + ")", leases[0])
     held = _dump(store)
     assert control.reconcile_pr_repair_returns() == 0
     assert _dump(store) == held
+    assert not store.settle_terminal_estimate(run_id, "process may be live")
     store.release_lease(run_id)
+    assert store.settle_terminal_estimate(run_id, "process reaped")
     assert control.reconcile_pr_repair_returns() == 1
 
 
@@ -114,13 +118,15 @@ def test_retained_run_with_dispatch_claim_still_holds(monkeypatch):
         assert store.bind_dispatch_claim("o/r", "fix", 5, OWNER, rid)
 
     run_id = _launch_and_lose_return(monkeypatch, workflow, files, inner, "review", during=bind)
-    assert store.record_accounting_unavailable(run_id, "unfinished turns")
+    with store.transaction() as db:
+        db.execute("UPDATE runs SET outcome='accounting_unavailable' WHERE run_id=?", (str(run_id),))
     with store.transaction() as db:
         db.execute("UPDATE reservation_recovery SET policy='reconcile_only' WHERE run_id=?", (str(run_id),))
     held = _dump(store)
     assert control.reconcile_pr_repair_returns() == 0
     assert _dump(store) == held
     assert store.release_dispatch_claim("o/r", "fix", 5, OWNER)
+    assert store.settle_terminal_estimate(run_id, "request evidence unavailable")
     assert control.reconcile_pr_repair_returns() == 1
 
 
@@ -155,9 +161,6 @@ def test_retained_run_with_captured_result_is_left_to_the_ordinary_path(monkeypa
 @pytest.mark.parametrize("mutation", [
     "UPDATE runs SET started_at=NULL WHERE run_id=?",
     "UPDATE runs SET outcome='unlaunched_released' WHERE run_id=?",
-    "UPDATE runs SET outcome='failed' WHERE run_id=?",
-    "UPDATE runs SET outcome=NULL WHERE run_id=?",
-    "UPDATE reservation_recovery SET policy='running' WHERE run_id=?",
     "UPDATE reservation_recovery SET policy='spawn_pending' WHERE run_id=?",
     "DELETE FROM reservation_recovery WHERE run_id=?",
     "UPDATE runs SET state='running' WHERE run_id=?",
@@ -179,7 +182,7 @@ def test_acknowledgment_journals_whether_money_is_still_retained(monkeypatch, re
     workflow, files, inner, key, run_id = _lose_with_unknown_cost(monkeypatch)
     store, control = files._workflow_db, files._workflow_authority
     if not retained:
-        assert store.release(run_id, "operator disposition").disposition.value == "available"
+        assert store.settle_terminal_estimate(run_id, "repeat recovery")
     journal = []
     original = store._transition
 
@@ -189,5 +192,5 @@ def test_acknowledgment_journals_whether_money_is_still_retained(monkeypatch, re
 
     monkeypatch.setattr(store, "_transition", record)
     assert control.reconcile_pr_repair_returns() == 1
-    expected = "unreturned_acknowledged_money_retained" if retained else "unreturned_acknowledged"
+    expected = "unreturned_acknowledged"
     assert journal == [("pr_repair", str(run_id), expected)]

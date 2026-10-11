@@ -121,7 +121,7 @@ class _Commands:
 
 
 class _NoTrustedUsage:
-    """The provider died before emitting usage, so spend stays indeterminate."""
+    """No request evidence remains, so terminal recovery uses a zero estimate."""
 
     def reconcile(self, _run_id) -> bool:
         return False
@@ -373,10 +373,8 @@ def test_a_genuine_cap_exhaustion_still_escalates_to_a_human(tmp_path):
     store, published = _store(tmp_path, now)
     scope = _scope(now)
     cap = Money("USD", 4_000_000)
-    # Retained just now: inside the reconciliation grace, so recovery still
-    # refuses to release them and admission must concede.
-    _dead_leg(store, scope, "just-died-a", cap, now)
-    _dead_leg(store, scope, "just-died-b", cap, now)
+    _live_leg(store, scope, "running-a", cap, now)
+    _live_leg(store, scope, "running-b", cap, now)
 
     runtime = _Runtime()
     reconciler = _CountingReconciler(_sweeper(store, now))
@@ -400,7 +398,7 @@ def test_admission_reconciles_at_most_once_per_dispatch(tmp_path):
     store, _published = _store(tmp_path, now)
     scope = _scope(now)
     cap = Money("USD", 2_000_000)
-    _dead_leg(store, scope, "just-died", cap, now)
+    _live_leg(store, scope, "running", cap, now)
 
     runtime = _Runtime()
     reconciler = _CountingReconciler(_sweeper(store, now))
@@ -531,7 +529,7 @@ def test_the_journalled_scope_names_the_cap_that_actually_tripped(tmp_path):
     now = datetime.now(timezone.utc)
     store, published = _store(tmp_path, now)
     issue_cap = Money("USD", 2_000_000)
-    _dead_leg(store, _scope(now), "just-died", issue_cap, now)
+    _live_leg(store, _scope(now), "running", issue_cap, now)
 
     runtime = _Runtime()
     late = _LateReservationReconciler()
@@ -561,3 +559,23 @@ def test_the_journalled_scope_names_the_cap_that_actually_tripped(tmp_path):
     (event,) = _reconciled(published)
     assert event.scope == f"issue:{ISSUE}", "not the primary repository scope"
     assert event.admitted is False
+
+
+def test_recent_completed_accounting_gap_settles_before_admission_without_grace(tmp_path):
+    now = datetime.now(timezone.utc)
+    store, published = _store(tmp_path, now)
+    cap = Money("USD", 2_000_000)
+    dead = _dead_leg(store, _scope(now), "just-completed", cap, now)
+    runtime = _Runtime()
+
+    result = _resolve(_admission(store, runtime, cap, _sweeper(store, now)))
+
+    assert result.status == "ok"
+    assert runtime.calls == 1
+    assert store.active_reservation_runs(OWNER) == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges WHERE run_id=?",
+                                (str(dead),)).fetchone()) == (0, "estimate")
+    (event,) = _reconciled(published)
+    assert event.admitted is True
+    assert event.released_runs == 1

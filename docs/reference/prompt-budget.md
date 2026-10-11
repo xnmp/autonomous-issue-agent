@@ -28,3 +28,6 @@ UTF-8 bytes and 959 whitespace-delimited words.
 
 Re-measured 2026-10-11 after the surface-area rule: 8,126
 UTF-8 bytes and 1,082 whitespace-delimited words.
+
+Re-measured 2026-10-12 after the estimated-settlement rule: 8,260
+UTF-8 bytes and 1,099 whitespace-delimited words.

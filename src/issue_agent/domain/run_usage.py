@@ -11,6 +11,8 @@ class ModelUsage:
     session_id: str
     model: str
     usage: TokenUsage
+    reported_cost: Money | None = None
+    request_id: str = ""
 
     def __post_init__(self) -> None:
         if any(not isinstance(v, str) or not v.strip() or len(v) > 256
@@ -23,37 +25,48 @@ class ModelUsage:
                     self.usage.input_tokens, self.usage.output_tokens,
                     self.usage.cache_read_tokens, self.usage.cache_write_tokens))):
             raise ValueError("model usage requires integer counters and typed provenance")
+        if self.reported_cost is not None and not isinstance(self.reported_cost, Money):
+            raise ValueError("reported request cost requires typed money")
+        if not isinstance(self.request_id, str) or len(self.request_id) > 256:
+            raise ValueError("request identity must be bounded text")
 
 
 def _validate_samples(samples: tuple[ModelUsage, ...]) -> None:
-    if (not isinstance(samples, tuple) or len(samples) > 65
+    if (not isinstance(samples, tuple) or len(samples) > 4096 + 4 * 65
             or any(not isinstance(s, ModelUsage) for s in samples)
-            or len({(s.session_id, s.model.strip().casefold()) for s in samples}) != len(samples)):
-        raise ValueError("run usage requires unique bounded model samples")
+            or len({(s.session_id, bool(s.request_id), s.request_id or s.model.strip().casefold())
+                    for s in samples}) != len(samples)):
+        raise ValueError("run usage requires unique bounded request or model samples")
 
 
 @dataclass(frozen=True)
 class MeasuredRunUsage:
     samples: tuple[ModelUsage, ...]
+    rates: RateTable | None = None
 
     def __post_init__(self) -> None:
         _validate_samples(self.samples)
         if not self.samples:
             raise ValueError("measured run usage cannot infer a free run from no evidence")
+        if self.rates is not None and not isinstance(self.rates, RateTable):
+            raise ValueError("run pricing requires a frozen rate table")
 
 
 @dataclass(frozen=True)
-class UnavailableRunUsage:
+class EstimatedRunUsage:
     detail: str
     samples: tuple[ModelUsage, ...] = ()
+    rates: RateTable | None = None
 
     def __post_init__(self) -> None:
         _validate_samples(self.samples)
         if not isinstance(self.detail, str) or not self.detail or len(self.detail) > 2048:
-            raise ValueError("unavailable usage requires a bounded reason")
+            raise ValueError("estimated usage requires a bounded gap")
+        if self.rates is not None and not isinstance(self.rates, RateTable):
+            raise ValueError("run pricing requires a frozen rate table")
 
 
-RunUsage = MeasuredRunUsage | UnavailableRunUsage
+RunUsage = MeasuredRunUsage | EstimatedRunUsage
 
 
 def total_usage(samples: tuple[ModelUsage, ...]) -> TokenUsage:
@@ -67,10 +80,24 @@ def total_usage(samples: tuple[ModelUsage, ...]) -> TokenUsage:
     )
 
 
-def price_run_usage(observed: MeasuredRunUsage, table: RateTable) -> Money:
-    if not isinstance(observed, MeasuredRunUsage):
-        raise ValueError("unavailable usage cannot settle a reservation")
-    return Money(table.currency, sum(
-        price(s.usage, table.rates_for(s.model), table.currency).micros
-        for s in observed.samples
+def price_run_usage(observed: RunUsage, table: RateTable | None) -> Money:
+    table = observed.rates or table
+    currency = table.currency if table is not None else "USD"
+    if any(s.reported_cost is not None and s.reported_cost.currency != currency for s in observed.samples):
+        raise ValueError("reported request cost currency differs from the rate card")
+    return Money(currency, sum(
+        (s.reported_cost if s.reported_cost is not None else
+         price(s.usage, table.rates_for(s.model), currency)).micros
+        for s in observed.samples if s.reported_cost is not None or table is not None and table.priceable(s.model)
     ))
+
+
+def usage_lower_bound(first: TokenUsage, second: TokenUsage) -> TokenUsage:
+    """Cumulative counters and deduplicated receipts overlap; neither erases the other."""
+    return TokenUsage(
+        max(first.input_tokens, second.input_tokens),
+        max(first.output_tokens, second.output_tokens),
+        max(first.cache_read_tokens, second.cache_read_tokens),
+        max(first.cache_write_tokens, second.cache_write_tokens),
+        UsageSource.ROLLOUT,
+    )

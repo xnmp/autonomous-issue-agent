@@ -15,6 +15,7 @@ from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain.contracts import Money, RunId
 from issue_agent.domain.outcome import AgentResult, ExitReason, MAX_BUDGET_STATUS
 from issue_agent.domain.pricing import BudgetPolicy
+from issue_agent.domain.review_rounds import ReviewChildReturned
 from tests.adapters.test_review_execution_admission import planned, refusal_receipt
 from tests.adapters.test_review_execution_control import OWNER, rig
 from tests.adapters.test_review_preflight_stop import codex_planned
@@ -128,7 +129,7 @@ def test_launched_review_result_settles_charge_and_retains_raw_return(planned_ch
     assert captured.result.structured_json == '{"findings":["one"]}'
 
 
-def test_launched_review_without_trusted_usage_retains_raw_output_and_reservation(planned_child, tmp_path):
+def test_launched_review_without_usage_settles_zero_and_retains_raw_output(planned_child, tmp_path):
     store, child = planned_child
     journal, inner = runtime(store, child, AgentResult(True, status="runtime_unavailable",
                                                        summary="transport failed",
@@ -140,32 +141,37 @@ def test_launched_review_without_trusted_usage_retains_raw_output_and_reservatio
     assert inner.called and returned.status == "runtime_unavailable", returned
     with store.transaction() as db:
         run = db.execute("SELECT run_id,state,outcome FROM runs").fetchone()
-        assert tuple(run)[1:] == ("completed", "spend_unreconciled")
-        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+        assert tuple(run)[1:] == ("completed", "settled")
+        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "settled"
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
     captured = store.returned_review_child("o/r", RunId(run["run_id"]))
     assert captured is not None and captured.result.exit_reason is ExitReason.RUNTIME_UNAVAILABLE
     assert captured.result.summary == "transport failed"
+    (evidence,) = store.read_review_child_evidence("o/r", OWNER, child.round.round_id)
+    assert isinstance(evidence, ReviewChildReturned)
 
 
-def test_invalid_provider_cost_still_retains_launched_review_output(planned_child, tmp_path):
+def test_invalid_provider_cost_settles_zero_and_retains_launched_review_output(planned_child, tmp_path):
     store, child = planned_child
     journal, inner = runtime(store, child, AgentResult(False, status="reviewed", summary="finding",
-                                                       structured={"decision": "changes"}, cost_usd=float("nan")),
+                                                       structured={"decision": "changes"}, cost_usd=float("nan"),
+                                                       exit_reason=ExitReason.OK),
                              tmp_path / "journal.jsonl")
 
-    with pytest.raises(ValueError, match="finite"):
-        asyncio.run(journal.run(RuntimePlan("review", model="model-a", max_budget_usd=2)))
+    result = asyncio.run(journal.run(RuntimePlan("review", model="model-a", max_budget_usd=2)))
+    assert result.status == "reviewed" and not result.is_error
 
     assert inner.called
     with store.transaction() as db:
         run = db.execute("SELECT run_id,state,outcome FROM runs").fetchone()
-        assert tuple(run)[1:] == ("completed", "spend_unreconciled")
-        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
-        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+        assert tuple(run)[1:] == ("completed", "settled")
+        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "settled"
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
     captured = store.returned_review_child("o/r", RunId(run["run_id"]))
     assert captured is not None and captured.result.summary == "finding"
     assert captured.result.structured_json == '{"decision":"changes"}'
+    (evidence,) = store.read_review_child_evidence("o/r", OWNER, child.round.round_id)
+    assert isinstance(evidence, ReviewChildReturned)
 
 
 @pytest.mark.parametrize("failure", ["stream_drop", "rate_limit"])
@@ -208,10 +214,12 @@ def test_codex_transport_failure_keeps_one_review_launch_and_raw_return(codex_pl
     assert attempts.read_text().splitlines() == ["attempt"]
     with store.transaction() as db:
         run = db.execute("SELECT run_id,state,outcome FROM runs").fetchone()
-        assert run is not None and tuple(run)[1:] == ("completed", "spend_unreconciled")
+        assert run is not None and tuple(run)[1:] == ("completed", "settled")
         assert db.execute("SELECT COUNT(*) FROM dedupe_keys WHERE namespace='review-execution-launch'").fetchone()[0] == 1
-        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
-        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "active"
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
+        assert db.execute("SELECT state FROM budget_reservations").fetchone()[0] == "settled"
     captured = store.returned_review_child("o/r", RunId(run["run_id"]))
     assert captured is not None and captured.child == child
     assert captured.result.exit_reason is ExitReason.TRANSPORT_DEATH
+    (evidence,) = store.read_review_child_evidence("o/r", OWNER, child.round.round_id)
+    assert isinstance(evidence, ReviewChildReturned)

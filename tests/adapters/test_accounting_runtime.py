@@ -3,6 +3,7 @@ import base64
 import dataclasses
 import json
 import os
+from datetime import datetime, timezone
 from pathlib import Path
 
 import pytest
@@ -14,12 +15,14 @@ from issue_agent.adapters.codex_runner import (
     write_spend_evidence,
 )
 from issue_agent.adapters.control_store import AccountingDisposition, Lease, ReservationResult, SQLiteControlStore
+from issue_agent.adapters.workflow_control import SQLiteWorkflowControl
 from issue_agent.adapters.event_log import EventLog
 from issue_agent.adapters.journal import JournalingRuntime
 from issue_agent.adapters.runtime_plan import RuntimePlan
 from issue_agent.domain import continuation_components as cc
 from issue_agent.domain.agent_task import run_input_fingerprint
 from issue_agent.domain.contracts import Money, RunId, WorkflowAttemptIdentity
+from issue_agent.domain.workflow_identity import WorkflowWriter
 from issue_agent.domain.workflow_identity import (
     FamilyAuthority,
     IssueRef,
@@ -143,6 +146,39 @@ def test_paid_run_has_reservation_before_runtime_and_settles(tmp_path) -> None:
     blocked = asyncio.run(wrapper.run(RuntimePlan("more", max_budget_usd=4)))
     assert blocked.exit_reason is ExitReason.BUDGET_EXHAUSTED
     assert runtime.calls == 1
+
+
+def test_real_return_corrects_zero_recovery_and_captures_output(tmp_path):
+    wrapper, store = _wrapper(tmp_path, Runtime(None), runtime_name="claude")
+    events = EventLog(str(tmp_path / "events.jsonl"), Producer("deployment", "o/r", "fix", 123, "boot"))
+    store.bind_event_outbox(events.prepare, events.append_committed)
+
+    class LateReturn:
+        async def run(self, _task):
+            run_id = store.active_reservation_runs()[0]
+            with store.transaction() as db:
+                row = db.execute("SELECT dispatch_id,owner_id FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
+            store.register_lease(Lease(run_id, row["dispatch_id"], row["owner_id"], 123, 123,
+                                       datetime.now(timezone.utc), 99))
+            assert store.reclaim_dead_leases(row["owner_id"], lambda _pid, _start: False) == (run_id,)
+            assert store.settle_terminal_estimate(run_id, "provider exited before return capture")
+            return AgentResult(False, status="pushed", summary="real output", cost_usd=1.25, session_id="late")
+
+    wrapper = dataclasses.replace(wrapper, inner=LateReturn())
+    wrapper.set_context("fix", "RESOLVE", 1, 1, workflow=resolve_snapshot().binding)
+    result = asyncio.run(wrapper.run(RuntimePlan("work", model="claude", max_budget_usd=2,
+                                                resolve_inputs=ResolveInputs("title", "body", "alice"))))
+    assert result.summary == "real output" and result.cost_usd == 1.25
+    with store.transaction() as db:
+        run = db.execute("SELECT run_id,state,outcome FROM runs").fetchone()
+        assert (run["state"], run["outcome"]) == ("completed", "settled")
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (1_250_000, "provider_reported")
+    workflow = SQLiteWorkflowControl(store, WorkflowWriter("o/r", "fix", "o/r:fix"), resolve_ceiling=0)
+    pending = workflow.pending_returns()
+    assert len(pending) == 1 and pending[0].returned.summary == "real output"
+    assert store.active_reservation_runs() == ()
+    emitted = tuple(decode_event_line(line) for line in (tmp_path / "events.jsonl").read_text().splitlines())
+    assert sum(e.payload.amount_micros for e in emitted if isinstance(e.payload, SpendRecorded)) == 1_250_000
 
 
 @pytest.mark.parametrize("reclaim", [False, True])
@@ -359,7 +395,7 @@ def test_unpinned_codex_run_without_reported_model_uses_reserved_fallback(
             "SELECT amount_micros, basis FROM charges"
         ).fetchone()
     assert reservation_model == "<runtime-default>"
-    assert (amount, basis) == (800, "configured_rate_card")
+    assert (amount, basis) == (800, "estimate")
 
 
 def test_global_only_cap_keeps_workload_repository(tmp_path) -> None:
@@ -889,24 +925,12 @@ def test_codex_missing_usage_never_settles_productive_run_as_free(
     )
 
     assert result.status == "pushed"
-    assert len(store.active_reservation_runs()) == 1
-    with store._connect() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
-    events = tuple(
-        decode_event_line(line)
-        for line in (tmp_path / "events-v2.jsonl").read_text().splitlines()
-    )
-    retained = [
-        event.payload
-        for event in events
-        if isinstance(event.payload, ReservationRetained)
-    ]
-    assert retained == [
-        ReservationRetained(
-            str(store.active_reservation_runs()[0]),
-            "trusted usage and provider charge unavailable",
-        )
-    ]
+    assert store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
+    events = tuple(decode_event_line(line) for line in (tmp_path / "events-v2.jsonl").read_text().splitlines())
+    assert not any(isinstance(event.payload, ReservationRetained) for event in events)
+    assert "interrupted requests charged zero" in (tmp_path / "events-v2.jsonl").read_text()
 
 
 def test_stderr_codex_usage_cannot_release_a_paid_reservation(
@@ -934,9 +958,9 @@ def test_stderr_codex_usage_cannot_release_a_paid_reservation(
         wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2))
     )
 
-    assert len(store.active_reservation_runs()) == 1
-    with store._connect() as db:
-        assert db.execute("SELECT COUNT(*) FROM charges").fetchone()[0] == 0
+    assert store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
 
 
 def test_exhausted_cap_blocks_before_runtime(tmp_path) -> None:
@@ -1023,7 +1047,7 @@ def test_disabled_caps_still_price_observed_subscription_stream_usage(
             "FROM charges"
         ).fetchone()
     assert amount == 8_000_000
-    assert basis == "synthetic"
+    assert basis == "estimate"
     assert json.loads(usage_json)["input_tokens"] == 1_000_000
     assert rate_card == "test"
 
@@ -1063,7 +1087,7 @@ def test_disabled_caps_honor_explicit_unpriced_codex_opt_out(
         amount, basis = db.execute(
             "SELECT amount_micros, basis FROM charges"
         ).fetchone()
-    assert (amount, basis) == (0, "synthetic")
+    assert (amount, basis) == (0, "estimate")
 
 
 def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
@@ -1116,7 +1140,7 @@ def test_subscription_usage_is_synthetically_priced_and_consumes_cap(
         charge = db.execute(
             "SELECT amount_micros, basis, rate_card_id FROM charges"
         ).fetchone()
-    assert tuple(charge) == (8_000_000, "synthetic", "test")
+    assert tuple(charge) == (8_000_000, "estimate", "test")
 
 
 def test_armed_subscription_cap_prices_stream_usage_when_final_usage_is_missing(
@@ -1161,11 +1185,11 @@ def test_armed_subscription_cap_prices_stream_usage_when_final_usage_is_missing(
             "SELECT amount_micros, basis, usage_json FROM charges"
         ).fetchone()
     assert amount == 5_500_000
-    assert basis == "synthetic"
+    assert basis == "estimate"
     assert json.loads(usage_json)["input_tokens"] == 1_100_000
 
 
-def test_armed_non_codex_run_without_any_usage_retains_reservation(
+def test_armed_non_codex_run_without_any_usage_settles_zero_estimate(
     tmp_path,
 ) -> None:
     wrapper, store = _wrapper(
@@ -1189,9 +1213,9 @@ def test_armed_non_codex_run_without_any_usage_retains_reservation(
     )
 
     assert result.status == "usage-blind"
-    assert len(store.active_reservation_runs()) == 1
-    with store._connect() as db:
-        assert db.execute("SELECT count(*) FROM charges").fetchone()[0] == 0
+    assert store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
 
 
 def test_codex_runtime_exception_releases_after_completed_teardown(
@@ -1222,7 +1246,7 @@ def test_codex_runtime_exception_releases_after_completed_teardown(
     assert selected.component.state.infra_episode is None
 
 
-def test_result_normalization_failure_retains_reservation_fail_closed(
+def test_malformed_usage_settles_zero_estimate_without_changing_work_result(
     tmp_path,
 ) -> None:
     wrapper, store = _wrapper(
@@ -1236,10 +1260,11 @@ def test_result_normalization_failure_retains_reservation_fail_closed(
         ),
     )
 
-    with pytest.raises(ValueError):
-        asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
-
-    assert len(store.active_reservation_runs()) == 1
+    result = asyncio.run(wrapper.run(RuntimePlan("work", max_budget_usd=2)))
+    assert result.status == "ok"
+    assert store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (0, "estimate")
 
 
 def test_forced_codex_shutdown_intent_preserves_reservation_for_recovery(
@@ -1588,3 +1613,33 @@ def test_fix_refusal_receipt_failure_rolls_back_even_when_caught_by_outer_transa
     with store.transaction() as db:
         assert db.execute("SELECT count(*) FROM runs").fetchone()[0] == 0
         assert db.execute("SELECT count(*) FROM dedupe_keys WHERE namespace='fix-budget-refusal'").fetchone()[0] == 0
+
+
+@pytest.mark.parametrize("invalid", [None, True, -1, 1.5, "12", 10**100])
+def test_malformed_primary_usage_preserves_valid_stream_estimate(tmp_path, invalid):
+    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="done",
+        usage={"input_tokens": invalid, "output_tokens": 1},
+        stream_usage={"input_tokens": 100, "output_tokens": 10})), runtime_name="claude")
+    result = asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert result.status == "done" and store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (800, "estimate")
+
+
+def test_valid_provider_dollars_survive_malformed_token_telemetry(tmp_path):
+    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="done", cost_usd=1.25,
+        usage={"input_tokens": "bad"})), runtime_name="claude")
+    asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (1_250_000, "provider_reported")
+
+
+@pytest.mark.parametrize("invalid_cost", [float("nan"), float("inf"), -1, 10**100])
+def test_unusable_provider_dollars_preserve_valid_stream_estimate(tmp_path, invalid_cost):
+    wrapper, store = _wrapper(tmp_path, Runtime(AgentResult(False, status="done", cost_usd=invalid_cost,
+        stream_usage={"input_tokens": 100, "output_tokens": 10})), runtime_name="claude")
+    asyncio.run(wrapper.run(RuntimePlan("work", model="gpt-test", max_budget_usd=2)))
+    assert store.active_reservation_runs() == ()
+    with store.transaction() as db:
+        assert tuple(db.execute("SELECT amount_micros,basis FROM charges").fetchone()) == (800, "estimate")

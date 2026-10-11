@@ -19,7 +19,7 @@ from unittest.mock import patch
 
 import pytest
 
-from issue_agent.adapters.control_store import SQLiteControlStore, RetiredOwnerError
+from issue_agent.adapters.control_store import SCHEMA_VERSION, SQLiteControlStore, RetiredOwnerError
 from issue_agent.adapters import accounting_runtime
 from issue_agent.adapters.accounting_runtime import AccountingRuntime
 from issue_agent.adapters.effects import GitHubEffectExecutor
@@ -210,12 +210,20 @@ def _copied_authoritative_rows(path: Path) -> dict[str, tuple[str, ...]]:
 
 
 def _stopped_copy_index_rollback(path: Path) -> None:
-    """Explicit fixture-only schema40→38 rollback; every authority row survives."""
+    """Explicit fixture-only schema41→38 rollback; every authority row survives."""
     from issue_agent.adapters.control_store import _SCHEMA_MIGRATIONS, _sql_statements
     index_migrations = {
         40: ("event_outbox_pending", "event_outbox_pending_destination", "lifecycle_review_generation_candidates"),
         39: ("workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"),
     }
+    charge_origin = next(item for item in _SCHEMA_MIGRATIONS if item.version == 41)
+    with sqlite3.connect(path) as db:
+        db.execute("BEGIN IMMEDIATE")
+        assert db.execute("SELECT version,source_digest FROM schema_migrations ORDER BY version DESC LIMIT 1").fetchone() == (41, charge_origin.digest)
+        # The schema-38 build has no charge origin; every copied charge carries the default, so nothing is lost.
+        assert db.execute("SELECT count(*) FROM charges WHERE origin<>'normal_return'").fetchone()[0] == 0
+        db.execute("ALTER TABLE charges DROP COLUMN origin")
+        assert db.execute("DELETE FROM schema_migrations WHERE version=41").rowcount == 1
     before = _copied_authoritative_rows(path)
     with sqlite3.connect(path) as db:
         db.execute("BEGIN IMMEDIATE")
@@ -238,7 +246,7 @@ def _forward_copy_indexes(path: Path, expected_rows: dict[str, tuple[str, ...]])
     SQLiteControlStore(str(path)).initialize()
     assert _copied_authoritative_rows(path) == expected_rows
     with sqlite3.connect(path) as db:
-        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == 40
+        assert db.execute("SELECT MAX(version) FROM schema_migrations").fetchone()[0] == SCHEMA_VERSION
         assert {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE name IN "
             "('workflow_repair_owed','continuation_pr_admission_identity','reservations_active_workload')")} == {
                 "workflow_repair_owed", "continuation_pr_admission_identity", "reservations_active_workload"}
@@ -368,7 +376,7 @@ print(json.dumps({str(number): encode_workflow((value.binding, value.revision, v
     later_rows = _copied_authoritative_rows(copied_control)
     newer_sql = dump(blocked.control)
     refused = read_old_build()
-    assert refused.returncode != 0 and "40" in refused.stderr and "38" in refused.stderr
+    assert refused.returncode != 0 and str(SCHEMA_VERSION) in refused.stderr and "38" in refused.stderr
     assert dump(blocked.control) == newer_sql
     _stopped_copy_index_rollback(copied_control)
     later_sql = dump(blocked.control)
@@ -483,7 +491,7 @@ print(json.dumps(encode_workflow((selected.binding, selected.revision, selected.
     later_rows = _copied_authoritative_rows(copied_control)
     newer_sql = dump(current)
     refused = read_old_build()
-    assert refused.returncode != 0 and "40" in refused.stderr and "38" in refused.stderr
+    assert refused.returncode != 0 and str(SCHEMA_VERSION) in refused.stderr and "38" in refused.stderr
     assert dump(current) == newer_sql
     _stopped_copy_index_rollback(copied_control)
     later_sql = dump(current)

@@ -48,7 +48,7 @@ from ..domain.outcome import (
 )
 from ..domain.ports import StaleReservationReconciler
 from ..domain.pricing import BudgetPolicy, RateTable, price
-from ..domain.run_usage import MeasuredRunUsage, UnavailableRunUsage, price_run_usage, total_usage
+from ..domain.run_usage import MeasuredRunUsage, EstimatedRunUsage, price_run_usage, total_usage
 from ..domain.refs import is_governed_branch
 from ..domain.workflow_identity import IssueRef, WorkflowBinding, WorkflowFamily, WorkflowKey, WorkflowWriter
 from ..domain.workflow import ResolveSession, ResolveStage
@@ -205,37 +205,11 @@ class AccountingRuntime(AgentRuntime):
         self,
         request: ReservationRequest,
     ) -> ReservationResult:
-        """Reserve, reclaiming provably dead headroom before conceding a trip.
+        """Recover terminal reservations before conceding a cap denial.
 
-        keifu #34 (2026-08-02): three fix legs died on a broken provider binary
-        having spent nothing. Each retained its reservation because trusted
-        usage was unavailable -- correct conservatism -- but the next resolve
-        was then denied against that phantom headroom and escalated to a human
-        at $0 real spend. `needs-budget-review` is human-terminal, so the issue
-        stayed blocked even after a later sweep released every reservation.
-
-        Exhaustion therefore runs the standing recovery sweep once and retries
-        admission once. The sweep is the same pass boot, wake, and periodic
-        recovery run, so this grants no new release authority: only runs that
-        recovery already deems dead and usage-blind lose their reservation.
-
-        Scope of the fix, stated precisely. Reclaimable headroom is reclaimed
-        at dispatch instead of at the next periodic sweep, which closes the
-        window in which a trip escalates something reconciliation was about to
-        free. It does NOT rescue a leg that dies inside the reconciliation
-        grace: those reservations are not yet releasable by anyone, so the very
-        next dispatch still escalates exactly as before. Shortening that grace,
-        or proving an exec failure is $0, is a retention-policy change and does
-        not belong on the admission path.
-
-        Only EXHAUSTED qualifies. UNAVAILABLE, CORRUPT, and CONFLICT report
-        accounting that cannot be trusted or an identity clash, and neither is
-        repairable by reconciliation -- retrying them would trade conservatism
-        for nothing.
-
-        ADR 0012 ceiling: exactly one reconcile and one retry per dispatch
-        attempt, expressed as straight-line code so no loop can form. A second
-        exhaustion in the same tick escalates immediately.
+        Boot and admission share settlement authority. ADR 0012 allows one
+        sweep/retry for exhaustion; it cannot bypass live leases or repair
+        unavailable/corrupt SQLite authority and identity conflicts.
         """
 
         admit = self.admit or self.store.reserve
@@ -767,9 +741,6 @@ class AccountingRuntime(AgentRuntime):
                 if workflow is not None else None
             ),
         )
-        # Settlement/normalization failures retain the reservation. Releasing
-        # here would turn an unavailable accounting authority into new budget
-        # headroom even though the paid runtime already completed.
         returned = None
         if task.resolve_inputs is not None:
             result = _normalize_resolve_result(result)
@@ -830,185 +801,68 @@ class AccountingRuntime(AgentRuntime):
                 if stopped.disposition is not AccountingDisposition.AVAILABLE:
                     raise RuntimeError("review preflight stop settlement failed closed")
                 return result
-        def retain_invalid_accounting() -> None:
-            if returned_review is not None:
-                self.store.record_reservation_retained(
-                    run_id, "review accounting calculation unavailable",
-                    returned_review=returned_review,
-                    accounting_failure=(ExitReason.ACCOUNTING_UNAVAILABLE if result.run_usage is not None else None),
-                )
-
         observed = result.run_usage
-        if isinstance(observed, UnavailableRunUsage):
-            self.store.record_reservation_retained(
-                run_id, "native run usage unavailable: " + observed.detail,
-                returned_review=returned_review,
-                accounting_failure=ExitReason.ACCOUNTING_UNAVAILABLE,
-            )
-            return result
-        if observed is not None and (not isinstance(observed, MeasuredRunUsage)
-                                     or self.runtime_name != "codex" or self.rate_table is None):
-            self.store.record_reservation_retained(
-                run_id, "native run usage lacks valid pricing authority",
-                returned_review=returned_review,
-                accounting_failure=ExitReason.ACCOUNTING_UNAVAILABLE,
-            )
-            return result
+        gap = observed.detail if isinstance(observed, EstimatedRunUsage) else ""
+        usage = None
+        amount = Money.zero("USD")
+        basis = PricingBasis.ESTIMATE
+        card = None
         try:
-            usage = (total_usage(observed.samples) if isinstance(observed, MeasuredRunUsage)
-                     else _token_usage(result.usage, self.runtime_name))
-            provider_amount = Money.from_major("USD", result.cost_usd)
-        except (ValueError, TypeError, OverflowError, InvalidOperation):
-            retain_invalid_accounting()
-            raise
-        codex_source = (
-            str(result.usage.get("source") or "")
-            if isinstance(result.usage, dict)
-            else ""
+            if isinstance(observed, (MeasuredRunUsage, EstimatedRunUsage)):
+                usage = total_usage(observed.samples)
+                card = observed.rates or self.rate_table
+                amount = price_run_usage(observed, card)
+                if isinstance(observed, MeasuredRunUsage) and all(s.reported_cost is not None for s in observed.samples):
+                    basis = PricingBasis.PROVIDER_REPORTED
+                elif isinstance(observed, MeasuredRunUsage) and card is not None and all(
+                    card.priceable(s.model) for s in observed.samples
+                ):
+                    basis = PricingBasis.CONFIGURED_RATE_CARD
+                else:
+                    gap = gap or "some request models have no configured rates"
+            else:
+                try:
+                    provider_amount = Money.from_major("USD", result.cost_usd)
+                    if provider_amount.micros > 2**63 - 1:
+                        raise ValueError("provider dollars exceed SQLite's money bound")
+                except (ValueError, TypeError, ArithmeticError):
+                    provider_amount = Money.zero()
+                    gap = "provider dollars malformed; using usable token evidence"
+                for raw in (result.usage, result.stream_usage):
+                    try:
+                        candidate = _token_usage(raw, self.runtime_name)
+                    except (ValueError, TypeError, ArithmeticError):
+                        candidate = None
+                        gap = "some token evidence malformed; using the remaining evidence"
+                    if candidate is not None and candidate.trusted_for_accounting:
+                        usage = candidate
+                        if usage.total_tokens:
+                            break
+                if self.runtime_name != "codex" and provider_amount.micros > 0:
+                    amount = provider_amount
+                    basis = PricingBasis.PROVIDER_REPORTED
+                elif usage is not None and usage.trusted_for_accounting and self.rate_table is not None and model:
+                    amount = price(usage, self.rate_table.rates_for(model), self.rate_table.currency)
+                    card = self.rate_table
+                    gap = "request receipts unavailable; streamed usage priced at configured rates"
+                elif provider_amount.micros > 0 and not (isinstance(result.usage, dict) and result.usage.get("source") not in {"provider", "rollout", "reconciled"}):
+                    amount = provider_amount
+                    gap = "only the runtime's priced usage estimate is available"
+                else:
+                    usage = None
+                    gap = "request receipts and priceable usage unavailable; interrupted requests charged zero"
+        except (ValueError, TypeError, KeyError, ArithmeticError):
+            gap = "request accounting evidence is malformed or unpriceable; unusable requests charged zero"
+        if amount.micros > 2**63 - 1:
+            amount = Money.zero("USD")
+            basis = PricingBasis.ESTIMATE
+            gap = "request prices exceed SQLite's money bound; unusable requests charged zero"
+        request = SettlementRequest(
+            run_id, amount, basis,
+            f"{self.runtime_name}:{result.session_id or 'no-session'}:{run_id}",
+            usage, card.rate_card_id if card else None, card.version if card else None,
+            gap,
         )
-        untrusted_codex_usage = (
-            self.runtime_name == "codex"
-            and isinstance(result.usage, dict)
-            and codex_source
-            not in {
-                UsageSource.PROVIDER.value,
-                UsageSource.ROLLOUT.value,
-                UsageSource.RECONCILED.value,
-            }
-        )
-        if untrusted_codex_usage:
-            # Codex stderr is agent-controlled output, not a provider receipt.
-            # Preserve it in telemetry, but do not let either its counters or
-            # a legacy cost derived from them release budget authority.
-            usage = None
-            provider_amount = Money.zero("USD")
-        used_stream_fallback = False
-        if (
-            (usage is None or usage.total_tokens == 0)
-            and provider_amount.micros <= 0
-        ):
-            # A dropped final provider envelope is not evidence of a free run.
-            # The stream accumulator can over-count repeated cache counters, but
-            # it is observed adapter telemetry and therefore a conservative
-            # fail-closed fallback while a monetary cap is armed.
-            try:
-                stream_usage = _token_usage(
-                    result.stream_usage, self.runtime_name
-                )
-            except (ValueError, TypeError, OverflowError, InvalidOperation):
-                retain_invalid_accounting()
-                raise
-            if stream_usage is not None and stream_usage.total_tokens > 0:
-                usage = stream_usage
-                used_stream_fallback = True
-        if (
-            usage is None
-            and provider_amount.micros <= 0
-            and self._caps_armed()
-        ):
-            if self.runtime_name == "codex" and self.spend_evidence_dir:
-                from .spend_recovery import CodexSpendReconciler
-
-                CodexSpendReconciler(
-                    self.store, (self.spend_evidence_dir,)
-                ).reconcile(run_id)
-            # Retain the full reservation when an armed rollout has neither a
-            # provider charge nor trusted usage. Recovery can reconcile Codex
-            # evidence; every other runtime stays visibly fail-closed instead
-            # of silently admitting unlimited zero-dollar work.
-            self.store.record_reservation_retained(
-                run_id, "trusted usage and provider charge unavailable",
-                returned_review=returned_review,
-            )
-            return result
-        if (
-            usage is not None
-            and usage.total_tokens > 0
-            and provider_amount.micros <= 0
-            and self._caps_armed()
-            and (self.rate_table is None or not model)
-        ):
-            # Observed work with no usable pricing authority cannot safely
-            # become a zero-dollar charge. Keep the maximum reservation.
-            self.store.record_reservation_retained(
-                run_id, "pricing authority unavailable",
-                returned_review=returned_review,
-            )
-            return result
-        priced_by_rate_card = (
-            self.rate_table is not None
-            and usage is not None
-            and usage.trusted_for_accounting
-            and not (
-                self.runtime_name != "codex"
-                and provider_amount.micros > 0
-            )
-        )
-        if priced_by_rate_card:
-            if not model:
-                retain_invalid_accounting()
-                raise RuntimeError("configured-rate settlement needs a model")
-            try:
-                amount = (price_run_usage(observed, self.rate_table)
-                          if isinstance(observed, MeasuredRunUsage) else price(
-                              usage, self.rate_table.rates_for(model), self.rate_table.currency))
-            except (ValueError, TypeError, KeyError, OverflowError, InvalidOperation):
-                retain_invalid_accounting()
-                raise
-            basis = (
-                PricingBasis.CONFIGURED_RATE_CARD
-                if self.runtime_name == "codex"
-                else PricingBasis.SYNTHETIC
-            )
-            if used_stream_fallback and self.runtime_name == "codex":
-                basis = PricingBasis.CONFIGURED_RATE_CARD
-        elif (
-            self.runtime_name == "codex"
-            and self.rate_table is not None
-            and provider_amount.micros > 0
-        ):
-            # Older Codex stderr exposes only ``total_tokens``. CodexRunner has
-            # already conservatively priced that total at the configured higher
-            # rate, but TokenUsage cannot represent an unsplit total. Preserve
-            # the configured-price receipt instead of converting an observable
-            # non-zero run into a zero charge.
-            amount = provider_amount
-            basis = PricingBasis.CONFIGURED_RATE_CARD
-        else:
-            amount = provider_amount
-            basis = (
-                PricingBasis.SYNTHETIC
-                if provider_amount.micros <= 0
-                else PricingBasis.PROVIDER_REPORTED
-            )
-        try:
-            request = SettlementRequest(
-                run_id,
-                amount,
-                basis,
-                (
-                    f"{self.runtime_name}:"
-                    f"{result.session_id or 'no-session'}:{run_id}"
-                ),
-                usage,
-                self.rate_table.rate_card_id
-                if (
-                    priced_by_rate_card
-                    or basis is PricingBasis.CONFIGURED_RATE_CARD
-                )
-                and self.rate_table is not None
-                else None,
-                self.rate_table.version
-                if (
-                    priced_by_rate_card
-                    or basis is PricingBasis.CONFIGURED_RATE_CARD
-                )
-                and self.rate_table is not None
-                else None,
-            )
-        except (ValueError, TypeError, OverflowError):
-            retain_invalid_accounting()
-            raise
         if repair_input is not None:
             assert attempt is not None
             admission = self.store.pr_repair_admission(attempt)
@@ -1058,7 +912,7 @@ class AccountingRuntime(AgentRuntime):
             from .codex_runner import remove_spend_evidence
 
             remove_spend_evidence(self.spend_evidence_dir, run_id)
-        return result
+        return replace(result, cost_usd=amount.micros / 1_000_000, pricing_basis=basis)
 
     def _caps_armed(self) -> bool:
         return any(
@@ -1272,16 +1126,19 @@ def _token_usage(raw: object, runtime: str) -> TokenUsage | None:
     }
     if not usage_keys.intersection(raw):
         return None
-    input_total = int(raw.get("input_tokens", 0) or 0)
-    cache_read = int(raw.get("cache_read_input_tokens", 0) or 0)
-    cache_write = int(raw.get("cache_creation_input_tokens", 0) or 0)
-    if min(input_total, cache_read, cache_write) < 0:
-        return None
-    total_only = int(raw.get("total_tokens", 0) or 0)
+    counters = tuple(raw.get(key, 0) for key in (
+        "input_tokens", "output_tokens", "cache_read_input_tokens",
+        "cache_creation_input_tokens", "total_tokens",
+    ))
+    if any(type(value) is not int or not 0 <= value <= 10**12 for value in counters):
+        raise ValueError("token counters are malformed or outside the supported bound")
+    input_total, output, cache_read, cache_write, total_only = counters
+    if runtime == "codex" and cache_read + cache_write > input_total:
+        raise ValueError("cache counters exceed inclusive input")
     if total_only > 0 and not any(
         (
             input_total,
-            int(raw.get("output_tokens", 0) or 0),
+            output,
             cache_read,
             cache_write,
         )
@@ -1303,7 +1160,7 @@ def _token_usage(raw: object, runtime: str) -> TokenUsage | None:
         source = UsageSource.PROVIDER
     return TokenUsage(
         disjoint_input,
-        int(raw.get("output_tokens", 0) or 0),
+        output,
         cache_read,
         cache_write,
         source,
