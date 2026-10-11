@@ -25,7 +25,7 @@ credentials remain in its private home, never in the repository.
 
 ```bash
 sudo -v
-bash bin/install-ci-runner.sh
+bash bin/install-ci-runner.sh [default|ballast]
 gh api repos/xnmp/autonomous-issue-agent/actions/runners \
   --jq '.runners[] | {name,status,busy,labels:[.labels[].name]}'
 ```
@@ -41,6 +41,51 @@ An interrupted installation resumes on rerun: an existing matching account and
 download scratch honours `TMPDIR`; point it at disk-backed storage when the
 operator's `/tmp` is small or quota-limited, as the first installation needed
 after `curl: (23)` from a full `/tmp`.
+
+## Ballast profile
+
+`bin/install-ci-runner.sh ballast` installs a second, independent runner for the
+private repository `xnmp/ballast`, whose hosted Actions minutes are exhausted.
+Omitting the argument (or `default`) installs the runner above, unchanged. The
+two profiles share no account, home, `_work` directory, registration, runner
+name, label, service or unit, so caches and credentials do not cross repositories through the filesystem.
+Accepted residual: the runners still share `/dev/shm`, abstract sockets, loopback
+and `/proc` visibility, since neither unit sets `PrivateIPC` or `ProtectProc`;
+that is acceptable for trusted private repositories.
+
+| | default | ballast |
+| --- | --- | --- |
+| Repository | `xnmp/autonomous-issue-agent` | `xnmp/ballast` |
+| Account / home | `issue-agent-ci`, `/var/lib/issue-agent-ci` | `ballast-ci`, `/var/lib/ballast-ci` |
+| Runner name / label | `issue-agent-ci` | `ballast-ci` |
+| Service | `issue-agent-ci-runner.service` | `ballast-ci-runner.service` |
+| Unit | `github-actions-runner.service` | `github-actions-runner-ballast.service` |
+| Limits | 6 CPU, 12 GB, 512 tasks | `CPUQuota=1200%`, `MemoryMax=24G`, `TasksMax=2048` |
+
+The Ballast unit is the hardened template with only those limits raised (Android
+builds plus an x86_64 emulator). It grants no supplementary groups, and the
+installer asserts the installed unit has none. Upstream systemd's udev rules
+(`50-udev-default.rules`) make `/dev/kvm` mode `0666`, as on Arch, so the `kvm`
+group adds nothing for KVM and would also expose `/dev/udmabuf` (`0660
+root:kvm`). Some distributions build systemd with `0660`; there the runner has
+no KVM unless the operator explicitly decides to grant it, and the installer
+never does. Every identity,
+public-repository and foreign-registration refusal applies per profile. On a reinstall the installer stops a loaded runner service before any step
+running as the runner uid, so a live job cannot ptrace those steps. Root
+operates only on the runner home; the runner tree is extracted and inspected as
+the runner user, since jobs can write there.
+
+Trust: the runner executes workflow code as `ballast-ci` with no sandbox. Use it
+only for the private repository and trusted pull requests; never route fork PRs
+to it. Recheck this if Ballast's visibility or contributor model changes.
+
+Ballast's `native-test` needs host packages the operator installs; the runner
+never installs them. On Debian/Ubuntu: `libwebkit2gtk-4.1-dev`,
+`libayatana-appindicator3-dev`, `librsvg2-dev`, `patchelf`. On Arch:
+`webkit2gtk-4.1`, `libayatana-appindicator`, `librsvg`, `patchelf`.
+
+Pointing Ballast's PR jobs at the runner (`runs-on: [self-hosted, linux, x64,
+ballast-ci]`) is a change in that repository.
 
 ## Workflow and operation
 

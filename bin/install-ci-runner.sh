@@ -1,14 +1,45 @@
 #!/usr/bin/env bash
-# One native runner for this private repository; registration stays in GitHub.
+# One native runner per private repository profile; registration stays in GitHub.
+# Usage: install-ci-runner.sh [default|ballast]
 set -euo pipefail
 
-repository=xnmp/autonomous-issue-agent
-runner_user=issue-agent-ci
-runner_home=/var/lib/issue-agent-ci
-runner_dir=$runner_home/runner
-runner_name=issue-agent-ci
-service=issue-agent-ci-runner.service
-root=$(cd "$(dirname "$0")/.." && pwd)
+# BEGIN PROFILES (pure data; tests source this block to compare profiles)
+# No profile grants supplementary groups: /dev/kvm is world-rw under upstream
+# systemd udev rules, and the kvm group would also expose /dev/udmabuf.
+load_profile() {
+    case $1 in
+        default)
+            repository=xnmp/autonomous-issue-agent
+            runner_user=issue-agent-ci
+            runner_home=/var/lib/issue-agent-ci
+            runner_name=issue-agent-ci
+            runner_label=issue-agent-ci
+            service=issue-agent-ci-runner.service
+            unit_file=github-actions-runner.service
+            ;;
+        ballast)
+            repository=xnmp/ballast
+            runner_user=ballast-ci
+            runner_home=/var/lib/ballast-ci
+            runner_name=ballast-ci
+            runner_label=ballast-ci
+            service=ballast-ci-runner.service
+            unit_file=github-actions-runner-ballast.service
+            ;;
+        *) return 1 ;;
+    esac
+    runner_dir=$runner_home/runner
+}
+# END PROFILES
+
+[[ $# -le 1 ]] || { echo "Usage: $0 [default|ballast]" >&2; exit 2; }
+load_profile "${1-default}" || { echo "Unknown profile: ${1-} (expected default or ballast)" >&2; exit 2; }
+root=$(cd "$(dirname "$0")/.." && pwd -P)
+# Root installs the unit from this checkout; one inside the runner home (such as
+# a CI workspace) is runner-writable, so root would install a file the runner chose.
+case "$root/" in
+    "$runner_home"/*) echo "Refusing to install from a checkout inside $runner_home; use the operator's checkout." >&2; exit 2 ;;
+esac
 
 for tool in awk bash curl gh git jq make sha256sum sudo tar xz; do
     command -v "$tool" >/dev/null || { echo "Missing prerequisite: $tool" >&2; exit 2; }
@@ -32,6 +63,7 @@ if getent passwd "$runner_user" >/dev/null; then
        $(awk -F: -v name="$runner_user" '$1 == name {print $3}' <<< "$passwd_records") == "$runner_uid" &&
        $(awk -F: -v id="$runner_gid" '$3 == id {print $1}' <<< "$group_records") == "$runner_user" &&
        $(awk -F: -v name="$runner_user" '$1 == name {print $3}' <<< "$group_records") == "$runner_gid" &&
+       $(awk -F: -v name="$runner_user" '$1 == name {print $4}' <<< "$group_records") == "" &&
        $(cut -d: -f6 <<< "$account") == "$runner_home" &&
        $(cut -d: -f7 <<< "$account") == /usr/bin/nologin &&
        $(id -G "$runner_user") == "$runner_gid" ]] || {
@@ -40,21 +72,29 @@ if getent passwd "$runner_user" >/dev/null; then
 else
     sudo -n useradd --system --user-group --home-dir "$runner_home" --shell /usr/bin/nologin "$runner_user"
 fi
-for path in "$runner_home" "$runner_dir"; do
-    sudo -n test ! -L "$path" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
-    if sudo -n test -e "$path"; then
-        sudo -n test -d "$path" || exit 2
-    fi
-done
-sudo -n install -d -m 0700 -o "$runner_user" -g "$runner_user" "$runner_home" "$runner_dir"
+# Root touches only $runner_home, whose parent is root-owned, so the check
+# below cannot race. Everything inside it is runner-writable: root never
+# names a path beneath it (a job could swap runner/ for a symlink).
+sudo -n test ! -L "$runner_home" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
+if sudo -n test -e "$runner_home"; then
+    sudo -n test -d "$runner_home" || exit 2
+fi
+sudo -n install -d -m 0700 -o "$runner_user" -g "$runner_user" "$runner_home"
+# A live job shares the runner uid and, where Yama ptrace_scope is 0, could
+# ptrace the unsandboxed sudo children below. The install restarts it at the end.
+if [[ $(systemctl show "$service" -p LoadState --value) == loaded ]]; then
+    sudo -n systemctl stop "$service"
+fi
+sudo -n -u "$runner_user" test ! -L "$runner_dir" || { echo "Refusing a symlinked runner directory." >&2; exit 2; }
+sudo -n -u "$runner_user" install -d -m 0700 "$runner_dir"
 
 scratch=$(mktemp -d)
 trap 'rm -rf -- "$scratch"' EXIT
-if ! sudo -n test -f "$runner_dir/.runner"; then
-    [[ $(sudo -n find "$runner_dir" -mindepth 1 -maxdepth 1 -print -quit) == "" ]] || {
+if ! sudo -n -u "$runner_user" test -f "$runner_dir/.runner"; then
+    [[ $(sudo -n -u "$runner_user" find "$runner_dir" -mindepth 1 -maxdepth 1 -print -quit) == "" ]] || {
         echo "Unconfigured runner directory is not empty; inspect it before installing." >&2; exit 2;
     }
-    [[ $(gh api "repos/$repository/actions/runners" --jq "[.runners[] | select(.name==\"$runner_name\")] | length") == 0 ]] || {
+    [[ $(gh api "repos/$repository/actions/runners" | jq --arg name "$runner_name" '[.runners[] | select(.name == $name)] | length') == 0 ]] || {
         echo "An existing GitHub runner uses this name; inspect it before replacing." >&2; exit 2;
     }
     package=$(gh api "repos/$repository/actions/runners/downloads" --jq '.[] | select(.os=="linux" and .architecture=="x64")')
@@ -63,8 +103,9 @@ if ! sudo -n test -f "$runner_dir/.runner"; then
     [[ $url == https://github.com/actions/runner/releases/download/* && $checksum =~ ^[a-f0-9]{64}$ ]] || exit 2
     curl --fail --location --silent --show-error "$url" -o "$scratch/runner.tgz"
     printf '%s  %s\n' "$checksum" "$scratch/runner.tgz" | sha256sum --check --status
-    sudo -n tar -xzf "$scratch/runner.tgz" -C "$runner_dir"
-    sudo -n chown -R "$runner_user:$runner_user" "$runner_dir"
+    # The verified tarball is streamed so the runner user, not root, writes the tree.
+    # shellcheck disable=SC2024 # the operator, not the runner, reads the scratch file
+    sudo -n -u "$runner_user" tar -xzf - -C "$runner_dir" < "$scratch/runner.tgz"
     token=$(gh api --method POST "repos/$repository/actions/runners/registration-token" --jq .token)
     # Official input transport removes this environment value after reading
     # it. stdin keeps the one-hour credential out of argv and shell traces.
@@ -72,13 +113,13 @@ if ! sudo -n test -f "$runner_dir/.runner"; then
     printf '%s\n' "$token" | sudo -n -u "$runner_user" /usr/bin/env PATH=/usr/local/bin:/usr/bin:/bin /usr/bin/bash -euc '
         IFS= read -r ACTIONS_RUNNER_INPUT_TOKEN
         export ACTIONS_RUNNER_INPUT_TOKEN
-        cd /var/lib/issue-agent-ci/runner
-        ./config.sh --unattended --url https://github.com/xnmp/autonomous-issue-agent --name issue-agent-ci --labels issue-agent-ci --work _work
-    '
+        cd "$1"
+        ./config.sh --unattended --url "$2" --name "$3" --labels "$4" --work _work
+    ' _ "$runner_dir" "https://github.com/$repository" "$runner_name" "$runner_label"
     unset token
 else
-    sudo -n test ! -L "$runner_dir/.runner" || exit 2
-    [[ $(sudo -n jq -er .gitHubUrl "$runner_dir/.runner") == "https://github.com/$repository" ]] || exit 2
+    sudo -n -u "$runner_user" test ! -L "$runner_dir/.runner" || exit 2
+    [[ $(sudo -n -u "$runner_user" jq -er .gitHubUrl "$runner_dir/.runner") == "https://github.com/$repository" ]] || exit 2
 fi
 
 if ! command -v shellcheck >/dev/null; then
@@ -95,19 +136,20 @@ fi
 # Official svc.sh install copies bin/runsvc.sh to the root of the runner; do
 # that copy as the runner user instead of running runner-writable svc.sh as root.
 sudo -n -u "$runner_user" /usr/bin/bash -euc '
-    cd /var/lib/issue-agent-ci/runner
+    cd "$1"
     [[ ! -L bin && -f bin/runsvc.sh && ! -L bin/runsvc.sh ]] || exit 1
     [[ ! -L runsvc.sh && ( ! -e runsvc.sh || -f runsvc.sh ) ]] || exit 1
     install -m 0755 bin/runsvc.sh runsvc.sh
     [[ -f runsvc.sh && ! -L runsvc.sh && -x runsvc.sh ]] || exit 1
-' || { echo "Refusing an unsafe runner service entrypoint." >&2; exit 2; }
+' _ "$runner_dir" || { echo "Refusing an unsafe runner service entrypoint." >&2; exit 2; }
 
 # Root installs the operator-owned unit; runner-owned scripts never run as root.
 sudo -n test ! -L "/etc/systemd/system/$service" || exit 2
-sudo -n install -m 0644 "$root/ops/systemd/github-actions-runner.service" "/etc/systemd/system/$service"
+sudo -n install -m 0644 "$root/ops/systemd/$unit_file" "/etc/systemd/system/$service"
 sudo -n systemctl daemon-reload
 [[ $(systemctl show "$service" -p User --value) == "$runner_user" &&
    $(systemctl show "$service" -p Group --value) == "$runner_user" &&
+   $(systemctl show "$service" -p SupplementaryGroups --value) == "" &&
    $(systemctl show "$service" -p DropInPaths --value) == "" &&
    $(systemctl show "$service" -p FragmentPath --value) == "/etc/systemd/system/$service" &&
    $(systemctl show "$service" -p WorkingDirectory --value) == "$runner_dir" ]] || exit 2
