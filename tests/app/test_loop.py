@@ -274,13 +274,14 @@ def test_submit_exception_releases_decision_lease():
 
 def test_hot_reload_drains_paid_work_while_observation_continues():
     from issue_agent.adapters.reload import RELOAD_EXIT_CODE
-    from issue_agent.domain.actions import AgentKind, RunAgent
+    from issue_agent.domain.actions import AgentKind, RerunFailedChecks, RunAgent
 
     started = threading.Event()
     release = threading.Event()
     finished = threading.Event()
     observations = []
     sleeps = 0
+    gateway = FakeGateway()
 
     def run_agent(_action):
         started.set()
@@ -291,14 +292,19 @@ def test_hot_reload_drains_paid_work_while_observation_continues():
         nonlocal sleeps
         sleeps += 1
         if sleeps == 2:
+            assert daemon.available_dispatch_slots == 0
+            assert gateway.calls == [("rerun", "sha-1", (4242,))]
             release.set()
             assert finished.wait(timeout=1)
 
     daemon = Daemon(
         "fix",
         lambda: observations.append(len(observations) + 1) or WorldState(),
-        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)],
-        Executor(FakeGateway(), run_agent=run_agent),
+        lambda _world: [RunAgent(AgentKind.RESOLVE, 7)] + (
+            [RerunFailedChecks(100, "sha-1", (4242,))]
+            if len(observations) == 2 else []
+        ),
+        Executor(gateway, run_agent=run_agent),
         poll_seconds=1,
         dispatch_capacity=1,
     )

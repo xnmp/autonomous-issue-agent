@@ -3366,14 +3366,111 @@ def test_an_unknown_head_sha_never_re_runs():
     assert RunAgent(AgentKind.FIX_CI, 100) in _run_agents(actions)
 
 
-def test_the_re_run_consumes_no_fixer_so_another_pr_can_still_dispatch():
+@pytest.mark.parametrize("paid_first", [False, True])
+def test_the_re_run_consumes_no_fixer_so_another_pr_can_still_dispatch(paid_first):
     red = _red_pr()
     other = pr(101, "ai-pr-open", head_ref_oid="sha-9",
                checks=(Check("unit", bucket="fail"),))
     state = FixState(ci_rerun_head={101: "sha-9"})    # #101's re-run is spent
-    actions = decide_fix(world(prs=[red, other]), CFG, state, fixer_busy=False)
+    actions = decide_fix(world(prs=[other, red] if paid_first else [red, other]),
+                         CFG, state, fixer_busy=False)
     assert _reruns(actions) == [RerunFailedChecks(100, "sha-1", (9001,))]
     assert RunAgent(AgentKind.FIX_CI, 101) in _run_agents(actions)
+
+
+@pytest.mark.parametrize(("slots", "inflight"), [
+    (1, ()),
+    (0, (InFlightFix(7, frozenset({"src/other.py"})),)),
+    (0, ()),  # Reload draining closes admission even with no occupied slot.
+    (0, (InFlightFix(7, frozenset(), exclusive=True),)),
+    (1, (InFlightFix(7, frozenset({"src/shared.py"})),)),
+])
+def test_free_rerun_is_independent_of_paid_capacity_and_path_reservations(slots, inflight):
+    red = replace(
+        _red_pr(), merge_state="UNSTABLE", closing_issue=5,
+        reviews=(Review("APPROVED", "review-bot", "t1"),),
+        changed_files=frozenset({"src/shared.py"}),
+    )
+
+    actions = decide_fix(
+        world(prs=[red]), CFG, FixState(inflight=inflight),
+        fixer_busy=bool(inflight), dispatch_slots=slots,
+    )
+
+    assert _reruns(actions) == [RerunFailedChecks(100, "sha-1", (9001,))]
+    assert _run_agents(actions) == []
+
+
+@pytest.mark.parametrize("slots", [0, 1])
+def test_free_rerun_still_excludes_active_work_on_its_linked_issue(slots):
+    red = replace(_red_pr(), closing_issue=5)
+    state = FixState(inflight=(InFlightFix(5, frozenset({"src/other.py"})),))
+
+    actions = decide_fix(
+        world(prs=[red]), CFG, state, fixer_busy=True, dispatch_slots=slots,
+    )
+
+    assert _reruns(actions) == []
+    assert _run_agents(actions) == []
+
+
+@pytest.mark.parametrize(("slots", "inflight"), [
+    (0, ()),
+    (1, (InFlightFix(7, frozenset({"src/shared.py"})),)),
+])
+def test_a_tripped_ci_breaker_neither_reruns_nor_escalates_without_capacity(slots, inflight):
+    # Only the free rerun ignores capacity: the breaker's handover keeps the
+    # paid path's capacity and path gates and waits for them.
+    red = replace(_red_pr(), changed_files=frozenset({"src/shared.py"}))
+    cfg = FixConfig(fix_bot="fix-bot", max_ci_retries=1)
+    actions = decide_fix(world(prs=[red]), cfg, FixState(ci_retries={100: 1}, inflight=inflight),
+                         fixer_busy=bool(inflight), dispatch_slots=slots)
+    assert _reruns(actions) == []
+    assert _run_agents(actions) == []
+    assert not any(isinstance(a, Relabel) for a in actions)
+
+
+def test_an_issueless_pr_is_not_escalated_on_a_busy_tick():
+    stale = replace(
+        _red_pr(), closing_issue=None, head_ref_name="feat/ACME-2468-x",
+        checks=(Check("unit", bucket="pass"),),
+        reviews=(Review("CHANGES_REQUESTED", "review-bot", "t1", commit_id="old-sha"),),
+    )
+    actions = decide_fix(world(prs=[stale]), CFG, FixState(), fixer_busy=True, dispatch_slots=0)
+    assert not any(isinstance(a, Relabel) for a in actions)
+
+
+def test_spent_free_rerun_cannot_launch_paid_repair_without_capacity():
+    actions = decide_fix(
+        world(prs=[_red_pr()]), CFG, FixState(ci_rerun_head={100: "sha-1"}),
+        fixer_busy=False, dispatch_slots=0,
+    )
+
+    assert _reruns(actions) == []
+    assert _run_agents(actions) == []
+
+
+@pytest.mark.parametrize(("overrides", "state", "issues"), [
+    ({"labels": frozenset({Label.AI_PR_OPEN, Label.NEEDS_HUMAN_REVIEW})}, FixState(), ()),
+    ({}, FixState(), (issue(100, "ai-pr-open", blocked_by_open=True),)),
+    ({"mergeable": "CONFLICTING", "merge_state": "DIRTY"}, FixState(), ()),
+    ({"reviews": (Review("CHANGES_REQUESTED", "review-bot", "t1"),)}, FixState(), ()),
+    ({}, FixState(ci_remediation_errors={100: "unreadable remediation"}), ()),
+    ({}, FixState(infra_control_errors={100: "unreadable recovery"}), ()),
+    ({}, FixState(machine_control_errors={100: "unreadable machine block"}), ()),
+    ({}, FixState(budget_control_errors={100: "unreadable budget block"}), ()),
+    ({"head_ref_oid": ""}, FixState(), ()),
+    ({"checks": (Check("unit", bucket="fail"),)}, FixState(), ()),
+])
+def test_zero_capacity_preserves_free_rerun_safety_and_repair_precedence(overrides, state, issues):
+    actions = decide_fix(
+        world(prs=[replace(_red_pr(), **overrides)], issues=issues),
+        replace(CFG, auto_rebase_conflicts=True), state,
+        fixer_busy=False, dispatch_slots=0,
+    )
+
+    assert _reruns(actions) == []
+    assert _run_agents(actions) == []
 
 
 def test_the_ci_breaker_still_escalates_before_a_free_re_run():
