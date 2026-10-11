@@ -23,6 +23,12 @@ Non-negotiables when working on this repo:
   tested states; never commit a half-edit "to save it".
 - Tests assert behavior and contracts, not implementation details. New
   business logic gets unit tests, including malformed/absent input edges.
+- **Fixes must not grow the surface.** A fix removes a mechanism, state,
+  knob, or operator intervention, or at worst leaves the count unchanged.
+  New counters, holds, flags, labels, retry loops, or one-state special cases
+  are presumptively wrong. Prefer an earlier check to later recovery, and one
+  unified rule to parallel ones. Report net `src/` lines and the mechanisms
+  removed or added. See `CLAUDE.md` "Fixes must not grow the surface".
 - Comments state constraints and reasons the code can't show — never
   narration of what the next line does.
 

@@ -17,8 +17,11 @@ operational quickstart layered on top.
 
 - Resolve harness gaps as they arise, with unbiased adversarial review for
   medium-high-risk diffs (fresh-eyes subagent; do not seed it with your
-  hypothesis). Reduce surface area: prefer subtractive fixes, never
-  per-incident knobs.
+  hypothesis). **Fixes must not grow the surface** (manager.md surface-area
+  test): name what each fix removes before briefing it, never brief a new
+  counter/hold/flag/loop, require a net-`src/` + mechanisms-removed/added
+  report from every fix agent, and have the reviewer reject unjustified
+  additions.
 - **Judgment-vs-gap test on every operator action** (manager.md "Direction"):
   an action is a gap unless its irreducible core is a judgment call (budget
   grant, policy/permission, dispute, repo governance). Name the judgment

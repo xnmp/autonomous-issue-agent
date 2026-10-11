@@ -42,6 +42,22 @@ Every incident adds a behavioral regression test. Fix the generator/class, not
 only the observed instance. A temporary workaround names the issue or condition
 that removes it.
 
+## Fixes must not grow the surface
+
+The rule most often broken, and how fix cycles spiral. A fix removes a
+mechanism, state, knob, or operator intervention, or at worst leaves the count
+unchanged; name what it removes before writing it.
+
+- A new counter, hold, ledger, flag, knob, status, label, retry/defer loop, or
+  one-state special case is presumptively wrong. If unavoidable, the PR says
+  why no existing mechanism can carry it, and gives its owner, ceiling, and
+  exit (automatic or typed operator re-arm).
+- Check earlier rather than recover later; unify parallel mechanisms instead
+  of adding another.
+- Fix PRs and agent reports state net `src/` lines and mechanisms removed and
+  added; reviewers reject unjustified additions. Incident history:
+  [manager reference](docs/reference/manager.md) surface-area test.
+
 ## Architecture rules
 
 - `domain/` is pure: no I/O, ambient environment, wall clock, or adapter/app
