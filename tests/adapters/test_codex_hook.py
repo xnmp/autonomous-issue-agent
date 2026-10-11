@@ -262,7 +262,6 @@ def test_codex_cannot_mint_trusted_screenshot_receipts(tmp_path) -> None:
 
     assert not os.path.exists(os.path.join(hooks, "read_record.sh"))
     assert "PostToolUse" not in rendered
-    assert "unset HARNESS_SCREENSHOTS_READ" in governor
     assert "export HARNESS_SCREENSHOTS_READ" not in governor
     assert str(state / "evidence") not in governor
 

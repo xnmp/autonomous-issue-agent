@@ -561,11 +561,13 @@ do not constitute credential isolation. All runtimes therefore remain
 trusted-inbound-only until the trigger-gated separately privileged artifact
 publisher is deployed.
 
-Visual evidence read by the Claude SDK is recorded as a daemon-signed receipt
-bound to the exact Git HEAD and image digest. Agent-written or stale records
-have no authority. Codex PostToolUse hooks execute inside the untrusted child,
-so Codex cannot mint a trusted receipt and visual-acceptance publication fails
-closed on that runtime. Service upgrades likewise stage complete
+Visual screenshot evidence is judged by the independent reviewer (#327); image
+size remains capped at 700KB. The publication broker supplies missing issue
+linkage and acceptance criteria before capturing each new create/body-update
+command. Historical commands replay their captured bodies unchanged. Agent
+children still inherit direct publication capability, so direct `gh pr create`
+can bypass broker completion in the current advisory posture.
+Service upgrades likewise stage complete
 unit/plist-plus-private-config pairs; both systemd and launchd restore the
 previous pair if activation fails. Partial-role service upgrades are rejected:
 all unsuffixed, target-basename, repository-derived, and current-name legacy
@@ -619,6 +621,8 @@ exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/labels.py`, `domain/leg.py`, `domain/lifecycle.py`,
 `domain/liveness.py`,
 `domain/outcome.py`, `domain/ports.py`, `domain/pricing.py`,
+`domain/pr_body.py` (completes a fixer's PR body with the issue's acceptance
+criteria and closing link when absent, instead of denying the publication),
 `domain/run_usage.py` (immutable measured/unavailable per-model run usage),
 `domain/projection.py`, `domain/refs.py`, `domain/repository.py`,
 `domain/recovery.py`, `domain/reservation_recovery.py`,

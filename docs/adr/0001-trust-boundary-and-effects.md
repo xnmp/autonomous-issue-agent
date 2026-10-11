@@ -28,3 +28,6 @@ repositories remain trusted-inbound only.
 - Screenshot reads are recorded in a harness-owned, worktree-keyed state
   receipt; a `.harness/screenshots-read` file has no gate authority.
 - A later separate effect-broker process can implement the same command port.
+
+Screenshot-read receipts and visual-evidence bookkeeping were superseded by #327
+(2026-10-12): the reviewer judges screenshot evidence; the 700KB image limit remains.

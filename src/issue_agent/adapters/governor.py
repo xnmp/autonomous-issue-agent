@@ -22,15 +22,13 @@ The bypass core is REUSED, never re-transcribed, so the (subtle, well-tested)
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import os
 import re
 import signal
 import subprocess
 import sys
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field, replace
 from typing import Any
 
@@ -138,14 +136,6 @@ class GateContext:
     # POLICY is pure/domain; the actual sleeping is the adapter's business, so it
     # is injected and defaults to a no-op (tests never wait).
     open_pr_retry_sleep: Callable[[], None] = lambda: None
-    visual_ac: bool = False                  # agent declared a visual criterion
-    screenshots_read: tuple[str, ...] = ()   # evidence images the agent actually read
-    screenshots_receipt_available: bool = True
-    screenshots_receipt_unreadable: bool = False
-    # path → sha256 of committed evidence images, digested by the harness from
-    # the worktree (never agent-reported). None = digesting failed; the
-    # byte-identical rule is skipped rather than guessed (#153 reuse gaming).
-    image_digests: Mapping[str, str] | None = None
     harness_test_cmd: str | None = None
     env_test_cmd: str | None = None
     # Operator opt-out for a genuinely test-less repo (ALLOW_UNTESTED=1 in the
@@ -426,13 +416,9 @@ def _argv_has(argv: list[str], flag: str) -> bool:
 def _pr_body(argv: list[str], ctx: GateContext) -> str:
     """The PR body `gh pr create` will post, from either spelling.
 
-    `--body-file`/`-F` support exists because without it the two stacks
-    disagreed on every `gh pr create --body-file …`: check-pr.sh reads the file,
-    the Python gate saw an empty body and denied "missing '## Acceptance
-    Criteria'" on a PR whose body has one. Fail-closed, so never a hole — but a
-    denial whose reason is false is one the agent cannot act on. The path is
-    resolved against the worktree (the agent's cwd), and an unreadable file
-    yields "" exactly like the bash's `cat … || true`."""
+    ADR-reference checks need the body even when passed as a file. Resolve the
+    path against the worktree; an unreadable file supplies no reference evidence.
+    """
     inline = _extract_after_flag(argv, "--body", "-b")
     if inline:
         return inline
@@ -467,23 +453,13 @@ def _pr_gate(argv: list[str], ctx: GateContext) -> list[str]:
     pr_base = _extract_after_flag(argv, "--base", "-B")
 
     # The tuple order IS the contract check-pr.sh mirrors, section for section
-    # (§0, §0b, §2/§3, §7d, §5, §6, §7, §7b, §9, then §1 and §7c).
+    # (§0, §0b, §5, §6, §7, §7b, §9, then §1 and §7c).
     # tests/test_gate_parity.py runs golden cases through both and compares the
     # first denial, so a reorder on one side without the other fails loudly.
     cheap_checks: tuple[Callable[[], gate.GateResult], ...] = (
         lambda: gate.check_no_web(argv),
         lambda: gate.check_pr_base(pr_base, ctx.base_branch),
-        lambda: gate.check_pr_body(body),
         lambda: gate.ALLOW if ctx.history_available and ctx.branch_diff_available else gate.deny("required Git history/diff facts are unavailable"),
-        lambda: gate.check_visual_evidence(
-            ctx.visual_ac,
-            ctx.changed_files,
-            ctx.screenshots_read,
-            body,
-            receipt_available=ctx.screenshots_receipt_available,
-            receipt_unreadable=ctx.screenshots_receipt_unreadable,
-            image_digests=ctx.image_digests,
-        ),
         lambda: _hint_malformed_declarations(
             gate.check_required_test(
                 ctx.branch,
@@ -859,102 +835,6 @@ def make_posttooluse_hook(
     return hook
 
 
-_IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
-
-
-def _record_screenshot_read(
-    state_dir: str,
-    cwd: str,
-    image_path: str,
-    signing_key: bytes,
-) -> None:
-    """Append a revision/content-bound receipt signed by the daemon."""
-
-    from .codex_hook import evidence_receipt_path
-
-    resolved_cwd = os.path.realpath(cwd)
-    resolved_image = os.path.realpath(
-        image_path
-        if os.path.isabs(image_path)
-        else os.path.join(resolved_cwd, image_path)
-    )
-    evidence_root = os.path.join(resolved_cwd, "evidence")
-    if (
-        not signing_key
-        or os.path.commonpath((resolved_image, evidence_root))
-        != evidence_root
-    ):
-        return
-    relative_path = os.path.relpath(resolved_image, resolved_cwd)
-    head = subprocess.run(
-        ("git", "rev-parse", "HEAD"),
-        cwd=resolved_cwd,
-        text=True,
-        capture_output=True,
-        timeout=5,
-    )
-    if head.returncode != 0 or not head.stdout.strip():
-        return
-    with open(resolved_image, "rb") as image:
-        digest = hashlib.sha256(image.read()).hexdigest()
-    payload = {
-        "v": 1,
-        "head": head.stdout.strip(),
-        "path": relative_path,
-        "digest": digest,
-    }
-    encoded = json.dumps(
-        payload,
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    record = {
-        **payload,
-        "signature": hmac.new(
-            signing_key,
-            encoded.encode(),
-            hashlib.sha256,
-        ).hexdigest(),
-    }
-    path = evidence_receipt_path(state_dir, cwd)
-    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
-    with open(path, "a") as f:
-        f.write(
-            json.dumps(
-                record,
-                sort_keys=True,
-                separators=(",", ":"),
-            )
-            + "\n"
-        )
-    os.chmod(path, 0o600)
-
-
-def make_read_record_hook(
-    record: Callable[[str, str], None] = lambda _cwd, _name: None,
-):
-    """Build the PostToolUse(Read) HookCallback. When the agent Reads an evidence
-    screenshot (an image under `evidence/`), it has loaded the pixels into its own
-    vision context — record that so the PR gate can require captured screenshots were
-    actually LOOKED AT (check_visual_evidence). Observe-only: never blocks, fail-open.
-    The record side-effect is injected so it's faked in tests."""
-
-    async def hook(input_data: Any, tool_use_id: Any, context: Any) -> dict:
-        try:
-            tool_input = input_data.get("tool_input") or {}
-            path = tool_input.get("file_path", "") or ""
-            low = path.lower()
-            # Only evidence images count as screenshot-verification.
-            if "evidence/" in low.replace(os.sep, "/") and low.endswith(_IMAGE_EXTS):
-                cwd = input_data.get("cwd", "") or os.getcwd()
-                record(cwd, path)
-        except Exception:
-            return {}  # observe-only, never wedge the agent
-        return {}
-
-    return hook
-
-
 _ISSUE_IN_CWD = re.compile(r"issue-(\d+)")
 
 
@@ -1077,32 +957,16 @@ def build_hooks(
     edit_check_cmd: str | None = None,
     log: Callable[[str], None] = lambda _m: None,
     debug: bool = False,
-    trusted_state_dir: str = "",
-    screenshot_receipt_key: bytes = b"",
 ) -> dict:
     """Convenience: the hooks dict AgentRunner wants. Always registers the
-    PreToolUse(Bash) governor and a PostToolUse(Read) screenshot-read recorder;
+    PreToolUse(Bash) governor;
     additionally registers a PostToolUse(Edit|Write|…) typecheck hook when
     `edit_check_cmd` is set (deterministic edit-time gate). `log` receives a live
     breadcrumb per allowed commit (red:/green:/docs:); `debug` additionally traces
     every command + verdict. Imports the SDK lazily."""
     from claude_agent_sdk import HookMatcher
 
-    record = (
-        (
-            lambda cwd, name: _record_screenshot_read(
-                trusted_state_dir,
-                cwd,
-                name,
-                screenshot_receipt_key,
-            )
-        )
-        if trusted_state_dir and screenshot_receipt_key
-        else (lambda _cwd, _name: None)
-    )
-    post: list = [HookMatcher(
-        matcher="Read", hooks=[make_read_record_hook(record=record)]
-    )]
+    post: list = []
     if edit_check_cmd:
         post.append(
             HookMatcher(

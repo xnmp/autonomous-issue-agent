@@ -39,16 +39,6 @@ _GENERATED_INSTRUCTIONS_START = "<!-- issue-agent generated instructions: start 
 _GENERATED_INSTRUCTIONS_END = "<!-- issue-agent generated instructions: end -->"
 
 
-def evidence_receipt_path(state_dir: str, cwd: str) -> str:
-    """Harness-owned screenshot-read receipt for one exact worktree."""
-
-    resolved = os.path.realpath(cwd)
-    key = Path(resolved).name + "-" + hashlib.sha256(
-        resolved.encode()
-    ).hexdigest()[:12]
-    return os.path.join(state_dir, "evidence", key, "screenshots-read")
-
-
 def _hook_key(cwd: str) -> str:
     resolved = os.path.realpath(cwd)
     return Path(resolved).name + "-" + hashlib.sha256(
@@ -118,9 +108,6 @@ fi
 # Freeze operator test authority here; the paid child's environment cannot
 # replace it. Target markers retain their existing no-operator fallback.
 export TEST_CMD={shlex.quote(test_cmd)}
-# Codex PostToolUse executes inside the paid child and cannot mint trusted
-# visual evidence. Remove an ambient/exported path on every governed command.
-unset HARNESS_SCREENSHOTS_READ
 exec uv run --quiet "{governor_path}"
 """
 

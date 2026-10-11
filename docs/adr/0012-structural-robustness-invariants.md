@@ -77,3 +77,6 @@ are ignored noise after a month; the discard-check goes if it blocks
 legitimate agent flows the resume rail cannot absorb; tracked-marker
 distrust has no rollback (it is a channel removal); the capability flag
 dissolves into a manifest or stays a boolean forever, both fine.
+
+Screenshot-read receipts and visual-evidence bookkeeping were superseded by #327
+(2026-10-12): the reviewer judges screenshot evidence; the 700KB image limit remains.

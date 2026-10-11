@@ -51,7 +51,6 @@ def test_full_resolve_purchases_configured_model_and_preserves_provider(tier, ru
     probe, implementation = runner.tasks
     assert (probe.runtime, probe.model) == (RuntimeName.CODEX, "gpt-6-luna")
     assert (implementation.runtime, implementation.model) == (runtime, model)
-    assert ("cannot record trusted" in implementation.append_system_prompt) == (runtime is RuntimeName.CODEX)
     session = resolve_state(store).episode.continuation.session
     assert (session.runtime, session.model, session.session_id) == (runtime.value, model, "paid-transcript")
 

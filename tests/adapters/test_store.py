@@ -406,18 +406,6 @@ def test_harness_test_cmd_none_when_absent():
     with tempfile.TemporaryDirectory() as root:
         assert HarnessMarkers(root).test_cmd() is None
 
-def test_visual_ac_is_a_claim_but_read_receipts_are_not_worktree_markers():
-    with tempfile.TemporaryDirectory() as root:
-        hd = os.path.join(root, ".harness")
-        os.makedirs(hd)
-        m = HarnessMarkers(root)
-        assert m.visual_ac() is False
-        open(os.path.join(hd, "visual-ac"), "w").close()
-        with open(os.path.join(hd, "screenshots-read"), "w") as f:
-            f.write("tab-title.png\n\nchart.png\n")
-        assert m.visual_ac() is True
-        assert not hasattr(m, "screenshots_read")
-
 def test_predicted_paths_are_round_tripped_and_malformed_predictions_fail_open():
     s, _ = _store()
     s.save_predicted_paths(5, ["src/action.rs", "./src/help.rs"])

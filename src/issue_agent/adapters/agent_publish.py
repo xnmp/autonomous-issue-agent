@@ -32,7 +32,7 @@ from .deployment_authority import DeploymentAuthority, deployment_role
 from .durable_effects import DurableEffectRunner, EffectOutcome
 from .event_log import EventLog
 from ..domain.events import Producer
-from ..domain import gate
+from ..domain.pr_body import complete_pr_body, has_acceptance_criteria, issue_acceptance_criteria
 from ..domain.refs import is_governed_branch, issue_from_branch
 from ..domain.repository import canonical_repository
 from ..domain.git_remote import require_repository_remote as _require_repository_remote
@@ -258,6 +258,41 @@ class AgentPublicationBroker:
         command = self._command(argv, cwd)
         pending = self.effects.enqueue(command)
         return self._run_pending(pending)
+
+    def _complete_body(self, body: str, branch: str, cwd: str) -> str:
+        issue = issue_from_branch(branch)
+        if issue is None:
+            raise ValueError("pull-request publication requires an issue branch")
+        criteria = ""
+        if not has_acceptance_criteria(body):
+            result = self._execute(
+                ("gh", "issue", "view", str(issue), "--repo",
+                 f"{self.host}/{self.repository}", "--json", "body,comments"), cwd,
+            )
+            if result.code != 0:
+                raise RuntimeError("cannot read issue acceptance criteria before publication")
+            try:
+                data = json.loads(result.stdout)
+                issue_body = data.get("body", "")
+                issue_body = "" if issue_body is None else issue_body
+                comments = data.get("comments", [])
+                comments = [] if comments is None else comments
+                if not isinstance(issue_body, str) or not isinstance(comments, list):
+                    raise ValueError("malformed issue")
+                comment_bodies = []
+                for comment in comments:
+                    value = comment.get("body", "")
+                    value = "" if value is None else value
+                    if not isinstance(value, str):
+                        raise ValueError("malformed comment")
+                    comment_bodies.append(value)
+                criteria = issue_acceptance_criteria(issue_body, comment_bodies)
+            except (AttributeError, TypeError, ValueError) as exc:
+                raise RuntimeError("malformed issue acceptance criteria response") from exc
+        completed = complete_pr_body(body, issue, self.repository, criteria)
+        if len(completed.encode()) > MAX_PR_BODY_BYTES:
+            raise ValueError("pull-request body exceeds the durable limit")
+        return completed
 
     def drain_pending_commands(self) -> int:
         completed = 0
@@ -617,6 +652,7 @@ class AgentPublicationBroker:
                 host=self.host,
                 branch=branch,
                 base_branch=self.base_branch,
+                complete_body=lambda body: self._complete_body(body, branch, resolved_cwd),
             )
             remote = "origin"
             remote_url = self._required_output(
@@ -686,18 +722,6 @@ class AgentPublicationBroker:
             # run already owns — the number is adjudicated against GitHub's own
             # list of open PRs for the authorized branch, not against a claim
             # the child makes.
-            # The create gate (`gate.check_pr_body`, via check-pr.sh) is what
-            # makes a PR body carry its acceptance criteria and its closing
-            # keyword. Making the body MUTABLE would demote that from an
-            # invariant to a create-time formality — an edit could strip
-            # `Fixes #N`, and the merged PR would leave its issue open for the
-            # steward to re-triage into fresh paid legs. Re-run the check on
-            # every replacement so the property survives the edit.
-            verdict = gate.check_pr_body(body)
-            if not verdict.ok:
-                raise ValueError(
-                    f"pull-request body update rejected: {verdict.reason}"
-                )
             rows = self._open_pull_requests(branch, resolved_cwd)
             if rows is None:
                 raise RuntimeError(
@@ -720,6 +744,7 @@ class AgentPublicationBroker:
                     f"for branch {branch} onto {self.base_branch}; the broker "
                     "edits only this run's own PR"
                 )
+            body = self._complete_body(body, branch, resolved_cwd)
             prior_body = self._pull_request_body(number, resolved_cwd)
             if prior_body is None:
                 raise RuntimeError(
@@ -1345,6 +1370,7 @@ def _normalized_pr_create(
     host: str,
     branch: str,
     base_branch: str,
+    complete_body: Callable[[str], str],
 ) -> tuple[str, ...]:
     del cwd
     snapshotted = _validated_pr_arguments(argv)
@@ -1353,6 +1379,19 @@ def _normalized_pr_create(
     index = 3
     while index < len(snapshotted):
         arg = snapshotted[index]
+        if arg in {"--title", "-t", "--body", "-b"}:
+            value = snapshotted[index + 1]
+            normalized.extend(("--body" if arg in {"--body", "-b"} else "--title",
+                               complete_body(value) if arg in {"--body", "-b"} else value))
+            index += 2
+            continue
+        if arg.startswith(("--body=", "-b", "--title=", "-t")):
+            is_body = arg.startswith(("--body=", "-b"))
+            value = arg.split("=", 1)[1] if arg.startswith("--") else arg[2:]
+            normalized.extend(("--body" if is_body else "--title",
+                               complete_body(value) if is_body else value))
+            index += 1
+            continue
         if (
             arg in forbidden
             or arg.startswith("--repo=")

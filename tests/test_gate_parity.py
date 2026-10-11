@@ -297,9 +297,6 @@ def python_verdict(
     command = shlex.join([tool, *argv])
 
     def build_ctx(cwd: str):
-        receipt = env.get("HARNESS_SCREENSHOTS_READ", "")
-        if receipt and not os.path.isabs(receipt):
-            receipt = os.path.abspath(os.path.join(cwd, receipt))
         return build_gate_context(
             cwd,
             base_branch=env.get("BASE_BRANCH", "dev"),
@@ -309,7 +306,6 @@ def python_verdict(
             verify_red_at_commit=env.get("VERIFY_RED_AT_COMMIT", "1") != "0",
             allow_untested=env.get("ALLOW_UNTESTED", "") == "1",
             gh=fake_gh_runner(open_pr),
-            screenshots_read_path=receipt,
         )
 
     if not complete:
@@ -691,10 +687,8 @@ GOLDEN: tuple[Case, ...] = (
     Case("no_base", "pr", compliant_pr_repo,
          ["pr", "create", "--title", "t", "--body", BODY_OK], False,
          reason_contains="no --base"),
-    Case("missing_ac", "pr", compliant_pr_repo, _pr_argv(body=BODY_NO_AC), False,
-         reason_contains="Acceptance Criteria"),
-    Case("missing_issue_link", "pr", compliant_pr_repo, _pr_argv(body=BODY_NO_LINK), False,
-         reason_contains="Fixes #"),
+    Case("missing_ac", "pr", compliant_pr_repo, _pr_argv(body=BODY_NO_AC), True),
+    Case("missing_issue_link", "pr", compliant_pr_repo, _pr_argv(body=BODY_NO_LINK), True),
     Case("web_flag", "pr", compliant_pr_repo, _pr_argv(extra=["--web"]), False,
          reason_contains="--web"),
     # ── M6 [repro]: the base branch moved on. The ONLY difference from
@@ -711,16 +705,11 @@ GOLDEN: tuple[Case, ...] = (
          reason_contains="evidence/"),
     Case("committed_harness_state", "pr", _committed_harness_state_repo,
          _pr_argv(), False, reason_contains=".harness/"),
-    Case("visual_ac_without_screenshot", "pr", _visual_repo, _pr_argv(), False,
-         reason_contains="no screenshot is committed"),
+    Case("visual_ac_without_screenshot", "pr", _visual_repo, _pr_argv(), True),
     Case("visual_ac_receipt_unreadable", "pr", _unread_receipt_repo,
-         _pr_argv(), False,
-         # A CONFIGURED-but-unreadable receipt is a recoverable I/O condition:
-         # both stacks must say "read the images again", never the capability
-         # dead-end advice (which tells the agent to delete committed
-         # evidence) — adversarial P2-3/P2-A.
-         env={"HARNESS_SCREENSHOTS_READ": "/nonexistent/screenshots-read"},
-         reason_contains="with the Read tool"),
+         _pr_argv(), True,
+         # Retired receipt configuration is ignored, even when its path is invalid.
+         env={"HARNESS_SCREENSHOTS_READ": "/nonexistent/screenshots-read"}),
     Case(
         "visual_ac_with_read_screenshot",
         "pr",
@@ -729,11 +718,7 @@ GOLDEN: tuple[Case, ...] = (
         True,
         env={"HARNESS_SCREENSHOTS_READ": "../screenshots-read"},
     ),
-    # Receipt-less runtime (no HARNESS_SCREENSHOTS_READ — codex, #153): the
-    # read check is skipped and committed evidence passes through to the
-    # independent reviewer, the sole content verifier (keifu #142/#156). The
-    # agent-authored worktree marker is irrelevant either way — it proves the
-    # forgery grants nothing, not that it is punished.
+    # Legacy worktree claims and receipts no longer decide visual outcomes.
     Case(
         "visual_ac_receiptless_passes_through",
         "pr",
@@ -741,20 +726,14 @@ GOLDEN: tuple[Case, ...] = (
         _pr_argv(),
         True,
     ),
-    # Byte-identical evidence images deny on EVERY runtime (#153 reuse gaming),
-    # receipts or none.
+    # Duplicate images and short captions are reviewer judgment.
     Case(
         "visual_ac_byte_identical_evidence",
         "pr",
         _duplicate_evidence_repo,
         _pr_argv(),
-        False,
-        reason_contains="byte-identical",
+        True,
     ),
-    # Each AC checklist item must embed its evidence with a CLAIM (alt text
-    # ≥ 12 chars stating what the image shows). 2026-08-09 tauri batch: 6 of
-    # 23 review rejections were evidence that existed but demonstrated
-    # nothing — the claim moves that self-audit to commit time.
     Case(
         "visual_ac_item_without_claim",
         "pr",
@@ -763,8 +742,7 @@ GOLDEN: tuple[Case, ...] = (
             body="## Acceptance Criteria\n- [ ] token works\n"
             "![AC 1](evidence/ac-1.png)\n\nFixes #7"
         ),
-        False,
-        reason_contains="carries no evidence claim",
+        True,
     ),
     Case(
         "visual_ac_item_with_claim",
@@ -921,10 +899,7 @@ GOLDEN: tuple[Case, ...] = (
          lambda p: _switch(fresh_repo(p), "scratch-branch"), ["push"], True,
          env={"TEST_CMD": "false"}, open_pr="7"),
 
-    # ── --body-file. Both stacks must read the file: the Python side used to
-    #    see an EMPTY body and deny "missing '## Acceptance Criteria'" on a PR
-    #    whose body has one — fail-closed, but with a reason the agent could
-    #    not act on. ────────────────────────────────────────────────────────
+    # Body-file content remains available for ADR checks; format is broker-owned.
     Case("body_file", "pr",
          lambda p: _write(compliant_pr_repo(p), "pr-body.md", BODY_OK),
          ["pr", "create", "--base", "dev", "--title", "t", "--body-file", "pr-body.md"],
@@ -932,7 +907,7 @@ GOLDEN: tuple[Case, ...] = (
     Case("body_file_missing_ac", "pr",
          lambda p: _write(compliant_pr_repo(p), "pr-body.md", BODY_NO_AC),
          ["pr", "create", "--base", "dev", "--title", "t", "--body-file", "pr-body.md"],
-         False, reason_contains="Acceptance Criteria"),
+         True),
 )
 
 
@@ -1005,7 +980,7 @@ def test_golden_covers_every_rule_family() -> None:
     quietly stop being compared."""
     expected_families = {
         "pr-shape", "base-range", "evidence", "adr", "project-commands",
-        "commit-hygiene", "test-cmd-precedence", "untested", "push", "body-file",
+        "commit-hygiene", "test-cmd-precedence", "untested", "push",
         "exemptions",
     }
     family_of = {
@@ -1047,7 +1022,7 @@ def test_golden_covers_every_rule_family() -> None:
         "no_test_command": "untested", "no_test_command_with_opt_out": "untested",
         "push_without_open_pr": "push", "push_with_open_pr_failing_tests": "push",
         "push_with_open_pr_green": "push", "push_on_ungoverned_branch": "push",
-        "body_file": "body-file", "body_file_missing_ac": "body-file",
+        "body_file": "pr-shape", "body_file_missing_ac": "pr-shape",
     }
     assert {c.name for c in GOLDEN} == set(family_of), (
         "a golden case was added or removed without updating the coverage map — "

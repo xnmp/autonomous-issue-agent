@@ -53,11 +53,10 @@ The PR gate no longer reads `.harness/ac-posted`, `test-plan-posted`, or
 test results come from the trusted executor, and adversarial review is process
 discipline rather than self-attestation.
 
-The remaining `.harness/visual-ac` claim is agent-writable
-(`CLAIM-VISUAL-AC`) but can only make the gate stricter by scheduling
-committed-screenshot verification. `.harness/test-cmd` remains an agent-selected
+Visual-evidence marker/receipt bookkeeping was removed in #327; reviewers judge
+screenshot outcomes. `.harness/test-cmd` remains an agent-selected
 fallback when the operator supplies no `TEST_CMD` (`CLAIM-TEST-CMD`), but it
-never supplies the execution result. Neither claim alone authorizes
+never supplies the execution result. That claim alone does not authorize
 publication.
 
 ### 1.3 The first real GitHub canary is complete

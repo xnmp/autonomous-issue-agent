@@ -307,13 +307,6 @@ class HarnessMarkers:
         self._tracked_cache[name] = tracked
         return tracked
 
-    def visual_ac(self) -> bool:
-        """The agent declared a visual acceptance criterion (touched .harness/visual-ac),
-        so the PR gate requires a committed + read screenshot."""
-        return os.path.exists(self._path("visual-ac")) and not self._tracked(
-            "visual-ac"
-        )
-
     def test_cmd(self) -> str | None:
         """First non-blank line of .harness/test-cmd (prc_resolve_test_cmd's
         marker side). None when absent so the resolver falls back to env."""

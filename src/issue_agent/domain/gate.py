@@ -1,7 +1,7 @@
 """ADR 0011 PR/commit/push gate policy.
 
 Every rule returns a `GateResult` (Allow | Deny(reason)). The rules that derive
-truth from data — branch name, commit prefixes + TDD ordering, PR body, required
+truth from data — branch name, commit prefixes + TDD ordering, required
 test in the diff, evidence, test-immutability, ADR references, the adversarial
 verdict — are PURE functions of their inputs and fully unit-tested here.
 
@@ -17,9 +17,8 @@ there is no shell policy copy.
 
 from __future__ import annotations
 
-import os
 import re
-from collections.abc import Callable, Collection, Iterable, Mapping
+from collections.abc import Callable, Collection, Iterable
 from dataclasses import dataclass
 from enum import Enum
 
@@ -116,10 +115,6 @@ def is_red(msg: str) -> bool:
 def is_green(msg: str) -> bool:
     return commit_phase(msg) == "green"
 
-CLOSING_KEYWORD_RE = re.compile(
-    r"(fix(es|ed)?|close[sd]?|resolve[sd]?) +#[0-9]+", re.IGNORECASE
-)
-
 _BRANCH_NAME_RE = re.compile(ISSUE_BRANCH_PATTERN)
 
 
@@ -135,98 +130,6 @@ IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".gif", ".webp")
 
 def is_evidence_image(path: str) -> bool:
     return path.startswith("evidence/") and path.lower().endswith(IMAGE_EXTS)
-
-
-# ── Acceptance-Criteria checklist parsing (PR body) ───────────────────────────
-# The contract, mirrored line-for-line by check-pr.sh:count_ac_items():
-#   * the AC SECTION starts at a heading line whose text begins "Acceptance
-#     Criteria" (any heading level, any case) and ends at the next heading line
-#     (or EOF);
-#   * an AC ITEM is a markdown task-list line inside that section: `- [ ]` /
-#     `- [x]` (`*` and `+` bullets too), any indentation.
-# A prose bullet ("- the tab title is right") is deliberately NOT an item, so a
-# body written without a checklist counts 0. ZERO IS NOT A DENIAL: callers treat
-# an unparseable section as "fall back to the one-screenshot floor" — a parse
-# miss must never block a PR on its own.
-_AC_HEADING_RE = re.compile(r"^\s*#+\s*acceptance criteria", re.IGNORECASE)
-_ANY_HEADING_RE = re.compile(r"^\s*#+\s")
-_AC_ITEM_RE = re.compile(r"^\s*[-*+]\s+\[[ xX]\]")
-
-# An evidence image path REFERENCED in the PR body — markdown image/link or a
-# bare path; the reviewer needs the link to know which shot proves which AC.
-# Keep in sync with check-pr.sh (PR_EVIDENCE_REF_RE).
-_EVIDENCE_REF_RE = re.compile(r"evidence/[\w./-]+\.(?:png|jpe?g|gif|webp)", re.IGNORECASE)
-
-
-def count_ac_items(body: str) -> int:
-    """How many acceptance-criteria checklist items the PR body declares.
-    0 when the section is absent or holds no checklist (see the contract above)."""
-    count = 0
-    in_ac = False
-    for line in (body or "").splitlines():
-        if _AC_HEADING_RE.match(line):
-            in_ac = True
-            continue
-        if in_ac and _ANY_HEADING_RE.match(line):
-            in_ac = False
-            continue
-        if in_ac and _AC_ITEM_RE.match(line):
-            count += 1
-    return count
-
-
-def referenced_evidence_images(body: str) -> tuple[str, ...]:
-    """Distinct evidence/ image paths referenced anywhere in the PR body
-    (deduped case-insensitively, first spelling kept, order preserved)."""
-    seen: dict[str, str] = {}
-    for m in _EVIDENCE_REF_RE.finditer(body or ""):
-        seen.setdefault(m.group(0).lower(), m.group(0))
-    return tuple(seen.values())
-
-
-# An embedded evidence image WITH a claim: markdown image syntax whose alt text
-# is at least 12 characters — the fixer's own statement of what the shot shows.
-# 2026-08-09 tauri batch: 6 of 23 review rejections were evidence that existed
-# but demonstrated nothing (#627 wrong zoom, #632/#639 unmapped ACs). Forcing
-# the claim moves that self-audit to commit time, where it is free.
-# Keep in sync with check-pr.sh (AC claim awk).
-_AC_CLAIM_RE = re.compile(
-    r"!\[[^\]]{12,}\]\([^)]*evidence/[\w./-]+\.(?:png|jpe?g|gif|webp)\)",
-    re.IGNORECASE,
-)
-
-
-def ac_items_without_claimed_evidence(body: str) -> tuple[int, ...]:
-    """1-based indexes of AC checklist items whose block (the item line plus
-    the lines under it, up to the next item or heading) embeds no evidence
-    image with a claim (alt text ≥ 12 chars). Section/item grammar is exactly
-    `count_ac_items`'s."""
-    missing: list[int] = []
-    in_ac = False
-    item = 0
-    claimed = True  # vacuously true before the first item
-    def _close() -> None:
-        if item and not claimed:
-            missing.append(item)
-    for line in (body or "").splitlines():
-        if _AC_HEADING_RE.match(line):
-            in_ac = True
-            continue
-        if in_ac and _ANY_HEADING_RE.match(line):
-            _close()
-            in_ac = False
-            item = 0
-            claimed = True
-            continue
-        if in_ac and _AC_ITEM_RE.match(line):
-            _close()
-            item += 1
-            claimed = bool(_AC_CLAIM_RE.search(line))
-            continue
-        if in_ac and item and not claimed and _AC_CLAIM_RE.search(line):
-            claimed = True
-    _close()
-    return tuple(missing)
 
 
 # ── branch name (check-branch-name.sh) ────────────────────────────────────────
@@ -336,38 +239,6 @@ def check_pr_base(pr_base: str, base_branch: str) -> GateResult:
         return deny(
             f"PR base is '{pr_base}' but must be '{base_branch}' (BASE_BRANCH). "
             f"Re-create with '--base {base_branch}'."
-        )
-    return ALLOW
-
-
-# Denials that include the full required skeleton, so ONE retry fixes the body.
-# Both #517 and #530 (2026-07-27) hit this gate twice each: the agent drafts
-# the AC as an issue comment in minute 2, then forgets the PR-body section in
-# minute 35 — and a message naming only the missing header invited a second
-# failure on the next requirement. Cost per issue: ~1.5 min + 2 gate bounces.
-_PR_BODY_SKELETON = (
-    " Required body shape:\n"
-    "  ## Acceptance Criteria\n"
-    "  - [ ] <criterion 1>\n"
-    "    ![AC 1](evidence/ac-1-<slug>.png)   <- one image per VISUAL criterion\n"
-    "  - [ ] <criterion 2>\n"
-    "  ...\n"
-    "  Fixes #<issue-number>\n"
-    "Reuse the criteria you already posted as the issue's AC comment."
-)
-
-
-def check_pr_body(body: str) -> GateResult:
-    """AC section + a closing keyword linking the issue. Port of §2/§3."""
-    if "## Acceptance Criteria" not in body:
-        return deny(
-            "PR body is missing the '## Acceptance Criteria' section."
-            + _PR_BODY_SKELETON
-        )
-    if not CLOSING_KEYWORD_RE.search(body):
-        return deny(
-            "PR body must link the issue with a closing keyword, e.g. "
-            "'Fixes #<issue>'." + _PR_BODY_SKELETON
         )
     return ALLOW
 
@@ -508,119 +379,6 @@ def check_image_sizes(images: tuple[tuple[str, int], ...] | None, limit_bytes: i
 class PushLookupPolicy(Enum):
     REQUIRE_VERIFIED = "require_verified"
     CHECK_AVAILABLE_FACTS = "check_available_facts"
-
-
-def check_visual_evidence(
-    visual_ac: bool,
-    changed: Iterable[str],
-    screenshots_read: Iterable[str],
-    pr_body: str = "",
-    *,
-    receipt_available: bool = True,
-    receipt_unreadable: bool = False,
-    image_digests: Mapping[str, str] | None = None,
-) -> GateResult:
-    """When the agent declared a visual acceptance criterion (.harness/visual-ac),
-    the PR must commit screenshots under evidence/ — and where the runtime can
-    mint trusted read receipts, prove the agent actually READ each one (loaded
-    it into its vision context, recorded by the PostToolUse(Read) hook in a
-    harness-owned receipt). Non-visual issues (the common case) → ALLOW.
-
-    On a runtime that CANNOT mint receipts (codex — its hooks run inside the
-    paid child, so a receipt would be the agent reporting on itself), the read
-    check is skipped and the INDEPENDENT REVIEWER is the sole content verifier:
-    the review prompt directs it to open every evidence image and reject any
-    that fail to show the criterion met. Closing the path outright here
-    manufactured deterministic dead-ends and operator questions out of a gap a
-    later, stronger checkpoint already covers (#153; keifu #142/#156). The
-    receipt, where available, remains a cheap pre-publication floor that spares
-    a paid review round.
-
-    ONE SCREENSHOT PER AC ITEM (P3.6-lite). One screenshot for a five-criterion PR
-    proves one criterion, so when the body's `## Acceptance Criteria` section parses
-    into N checklist items the PR must carry N committed images AND reference N
-    distinct evidence/ paths in the body — an image nobody links is invisible to the
-    reviewer, who verifies each shot against its criterion. `image_digests`
-    (path → content digest, from the caller's filesystem read) additionally
-    rejects byte-identical images wearing different names on every runtime.
-    That catches only the LAZIEST form of the reuse gaming #153 documented —
-    a 1-bit edit defeats it — so the reviewer prompt, not this rule, is the
-    content guard. None/missing digests mean the caller could not digest
-    (the rule is skipped, never guessed).
-
-    The floor is unconditional and comes FIRST: ≥1 committed image. The per-AC
-    rule is additive and only fires when the section actually parses (N ≥ 1);
-    an unparseable/prose AC section (N = 0) leaves exactly today's behaviour,
-    so a parsing miss can never deny by itself. `pr_body` defaults to ""
-    (⇒ N = 0) so a caller that has no body in hand still gets the floor."""
-    if not visual_ac:
-        return ALLOW
-    images = [f for f in changed if is_evidence_image(f)]
-    if not images:
-        return deny(
-            "a visual acceptance criterion was declared (.harness/visual-ac) but no "
-            "screenshot is committed under evidence/ — capture one with agent-browser"
-        )
-    if receipt_available and receipt_unreadable:
-        # The runtime mints receipts; THIS read failed. Recoverable — never
-        # capability advice.
-        return deny(
-            "trusted screenshot-read receipt is unavailable — open each "
-            "evidence image with the Read tool before opening the PR"
-        )
-    if receipt_available:
-        read = set(screenshots_read)
-        unread = [
-            os.path.basename(f) for f in images if os.path.basename(f) not in read
-        ]
-        if unread:
-            return deny(
-                "committed screenshot(s) were never read/verified by the agent: "
-                f"{', '.join(unread)} — open each with the Read tool and confirm "
-                "it shows the criterion met before opening the PR"
-            )
-    if image_digests:
-        seen: dict[str, str] = {}
-        for image in images:
-            digest = image_digests.get(image, "")
-            if not digest:
-                continue
-            if digest in seen:
-                return deny(
-                    f"evidence images '{seen[digest]}' and '{image}' are "
-                    "byte-identical — one screenshot proves one criterion; "
-                    "capture a distinct screenshot for each AC item"
-                )
-            seen[digest] = image
-    ac_items = count_ac_items(pr_body)
-    if ac_items == 0:
-        return ALLOW  # no parsable checklist → the ≥1 floor above is the whole rule
-    if len(images) < ac_items:
-        return deny(
-            f"{ac_items} AC items but only {len(images)} committed screenshots — "
-            "capture one per AC item and reference each in the PR body (name the file "
-            "after the criterion it proves, e.g. evidence/ac-2-empty-state.png)"
-        )
-    refs = referenced_evidence_images(pr_body)
-    if len(refs) < ac_items:
-        return deny(
-            f"{ac_items} AC items but the PR body references only {len(refs)} "
-            "evidence/ image path(s) — embed each screenshot next to its AC item "
-            "(e.g. '![AC 2](evidence/ac-2-empty-state.png)' under that checklist "
-            "item); a screenshot nobody links is invisible to the reviewer"
-        )
-    unclaimed = ac_items_without_claimed_evidence(pr_body)
-    if unclaimed:
-        return deny(
-            f"AC item {unclaimed[0]} carries no evidence claim — embed its "
-            "screenshot UNDER that checklist item with alt text stating what "
-            "the image shows (12+ characters), e.g. '![context menu beside "
-            "cursor at 200% zoom](evidence/ac-2-menu-zoom.png)'. The reviewer "
-            "verifies each image against exactly its claim; before committing, "
-            "re-open the image and confirm the claim is true at the asserted "
-            "state (zoom level, data, theme)"
-        )
-    return ALLOW
 
 
 def modified_existing_tests(
