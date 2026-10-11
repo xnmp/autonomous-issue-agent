@@ -6616,12 +6616,17 @@ class SQLiteControlStore:
         return completed
 
     def _pr_repair_unreturned(self, db, run_id: RunId, lineage: tuple[str, ...]) -> bool:
-        """A launched repair run is terminal, quiescent and money-disposed, with no return.
+        """A launched repair run is terminal, quiescent and money-accounted, with no return.
 
-        An active reservation still owns its accounting disposition, and a lease
-        or dispatch claim means a process may yet return; both keep the hold.
-        Retention can mark an unlaunched preflight as reconcile_only, so the
-        process registration's persisted start timestamp is also required.
+        Money is accounted when released/settled, or when it is retained as
+        unknown spend: an active reservation whose recovery policy is
+        reconcile_only and whose outcome is accounting_unavailable (operator
+        decision 2026-10-11, Tauri PR #1019). Retention keeps counting against
+        the caps; only the workflow hold lifts. Any other active reservation
+        still owns its accounting disposition. A lease or dispatch claim means
+        a process may yet return and keeps the hold. Retention can mark an
+        unlaunched preflight as reconcile_only, so the process registration's
+        persisted start timestamp is also required.
         """
         owners = ",".join("?" for _ in lineage)
         repair_key = self._continuation_receipt_key(run_id, WorkflowFamily.PR_REPAIR)
@@ -6630,7 +6635,8 @@ class SQLiteControlStore:
             f"WHERE r.run_id=? AND r.owner_id IN ({owners}) AND r.state IN ('completed','cancelled','abandoned') "
             "AND r.started_at IS NOT NULL "
             "AND r.outcome IS NOT 'unlaunched_released' AND rr.policy IN ('running','reconcile_only') "
-            "AND b.state IN ('released','settled') "
+            "AND (b.state IN ('released','settled') OR (b.state='active' "
+            "AND rr.policy='reconcile_only' AND r.outcome='accounting_unavailable')) "
             "AND NOT EXISTS(SELECT 1 FROM leases l WHERE l.run_id=r.run_id) "
             "AND NOT EXISTS(SELECT 1 FROM dispatch_claim_runs d WHERE d.run_id=r.run_id) "
             "AND NOT EXISTS(SELECT 1 FROM lifecycle_commands c WHERE "
@@ -6656,8 +6662,12 @@ class SQLiteControlStore:
             purchase = purchases[0]
             admission = self._pr_repair_admission(db, WorkflowAttemptIdentity(purchase.capture.binding, run_id, purchase.capture.leg_id))
             self._require_repair_writer(db, writer, admission, run["owner_id"])
+            retained = db.execute("SELECT state FROM budget_reservations WHERE run_id=?", (str(run_id),)).fetchone()[0] == "active"
             self._finish_pr_repair_without_return(db, run_id, launched=True)
-            self._transition(db, "pr_repair", str(run_id), "unreturned_acknowledged",
+            # Distinct state: the PR proceeds while this run's unknown spend
+            # stays reserved against the caps until reconciled.
+            self._transition(db, "pr_repair", str(run_id),
+                "unreturned_acknowledged_money_retained" if retained else "unreturned_acknowledged",
                 {"pr": admission.attempt.binding.fence.key.target.number,
                  "admission_version": admission.admission_version},
                 correlation=Correlation(run_id=str(run_id)))

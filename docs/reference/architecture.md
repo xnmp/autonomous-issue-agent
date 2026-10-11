@@ -218,10 +218,18 @@ strict never-launched release carries a distinct terminal proof, while ambiguous
 execution continues counting. A launched PR repair (REBASE, ADDRESS_REVIEW,
 FIX_CI, linked reply) that ends without a captured `pr-repair-result` is
 acknowledged by `reconcile_pr_repair_returns` only once its run is terminal,
-lease- and claim-free, has no unresolved publication command, and its reservation
-is already released or settled; an
-active reservation keeps the hold until an explicit accounting disposition. The
-acknowledgment writes a `PRRepairUnreturned` receipt (no output, session, model
+lease- and claim-free, has no unresolved publication command, and its money is
+accounted for: the reservation is released or settled, or it is retained as
+unknown spend (active, recovery policy `reconcile_only`, run outcome
+`accounting_unavailable`; operator decision 2026-10-11, Tauri PR #1019). Any
+other active reservation keeps the hold until an explicit accounting
+disposition. Acknowledging a retained run never releases, settles or
+reclassifies its reservation: it keeps counting against the caps as unknown
+spend alongside the next repair's own reservation (deliberately conservative,
+so both count), and a later release or settle works normally without a second
+acknowledgment or a renewed hold. The journal records this as
+`unreturned_acknowledged_money_retained` instead of `unreturned_acknowledged`.
+The acknowledgment writes a `PRRepairUnreturned` receipt (no output, session, model
 or settlement), charges the paired issue allowance one attempt so existing
 breakers still bound retries, and changes only the exact current admissions.
 Existing session/model provenance and financial evidence remain unchanged; a
@@ -241,6 +249,7 @@ writes. No process or network operation runs inside either transaction.
 | Commit succeeds but the caller never receives the return | Both components and the distinct acknowledgment remain committed; retry adds no debt or receipt. | `test_pr_repair_recovery_interleavings.py::test_interrupted_acknowledgment_retries_without_duplicate_debt[after-commit]` |
 | Normal result captured after selection, before acknowledgment's recheck | Capture wins; acknowledgment returns false without mutation. The next ordinary pass applies the real result/session exactly once. | `test_pr_repair_recovery_interleavings.py::test_capture_between_selection_and_acknowledgment_wins` |
 | Acknowledgment commits before normal capture | The late capture is refused, retaining prior genuine session/model and financial records. | `test_pr_repair_terminal_recovery_guards.py::test_settled_recovery_preserves_prior_session_and_money_and_refuses_late_capture` |
+| Retained (unknown-cost) run acknowledged, then later released or settled | Money is untouched by the acknowledgment; the later disposition finds the existing receipt and neither re-acknowledges nor re-holds the PR. | `test_pr_repair_retained_money_proceeds.py::test_later_release_of_retained_run_keeps_pr_consistent` |
 | Newer generation or admission supersedes the selected run | Exact admission guards preserve the newer components. | `test_pr_repair_terminal_recovery.py::test_stale_unreturned_repair_cannot_rewrite_a_newer_generation`; `test_pr_repair_terminal_recovery_guards.py::test_recovered_run_cannot_clear_newer_pending_admission` |
 
 Migration validates immutable run/admission/budget

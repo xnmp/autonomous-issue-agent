@@ -79,10 +79,6 @@ def test_terminal_launched_repair_without_return_is_acknowledged_after_money_dis
     run_id = _launch_and_lose_return(monkeypatch, workflow, files, inner, lane)
     stuck = issue_ci_state(files)
     assert _pending(stuck, lane) is not None and _pending(stuck, lane).attempt.run_id == run_id
-    if lane == "review":
-        # Ballast: launched return lost with billing unknown.
-        assert store.record_accounting_unavailable(run_id, "provider usage ambiguous")
-
     # Money is still active: operational recovery must keep refusing.
     held = _dump(store)
     assert control.reconcile_pr_repair_returns() == 0
