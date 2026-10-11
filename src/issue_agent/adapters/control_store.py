@@ -93,6 +93,7 @@ from ..domain.events import (
     NativeUsageRemetered,
     ReservationRetained,
     SpendRecorded,
+    TelemetryWarning,
     WorldFeedRetired,
     WorldObserved,
     decode_event_line,
@@ -2425,6 +2426,7 @@ class SQLiteControlStore:
         self._flushing_outbox = False
         self._bound_owner_id: str | None = None
         self._telemetry_enqueue_failures = 0
+        self._unrecorded_refusals: set[tuple[str, int]] = set()
 
     @property
     def telemetry_enqueue_failures(self) -> int:
@@ -4816,6 +4818,83 @@ class SQLiteControlStore:
                     (namespace, scope, key, _json(payload), updated_at)
                     for key, payload in sorted(values.items())
                 ),
+            )
+
+    # Pre-admission refusals (accounting_runtime._return_refused) mint no run,
+    # so the infra episode's receipt-driven charge never sees them (#262). This
+    # level ledger is their ceiling input: the fix role adds it to the episode's
+    # infra_failures, and any admitted run on the issue clears it.
+    _REFUSAL_NAMESPACE = "fix-admission-refusals"
+
+    # One row per issue, each mutated in its own BEGIN IMMEDIATE transaction:
+    # fix legs dispatch from a thread pool, so a whole-scope read-modify-write
+    # would lose a concurrent refusal or clear. `episode` scopes a count to one
+    # issue-recovery episode/generation; a count from another episode reads 0.
+    def fix_admission_refusals(self, repository: str, issue: int, episode: str) -> int:
+        with closing(self._connect()) as db, db:
+            row = db.execute(
+                "SELECT payload_json FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                (self._REFUSAL_NAMESPACE, repository, str(issue)),
+            ).fetchone()
+        return self._refusal_count(row, episode)
+
+    @staticmethod
+    def _refusal_count(row, episode: str) -> int:
+        if row is None:
+            return 0
+        try:
+            payload = json.loads(row["payload_json"])
+            count, stored = payload["count"], payload["episode"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            raise CorruptControlStore("invalid fix admission refusal row") from exc
+        if not isinstance(count, int) or isinstance(count, bool) or count < 0 or not isinstance(stored, str):
+            raise CorruptControlStore("invalid fix admission refusal row")
+        return count if stored == episode else 0
+
+    # In memory by necessity: it records that the DURABLE write failed, so it
+    # cannot itself be durable. Bounded residual: a restart forgets it, costing
+    # at most one uncounted refusal per lost write (architecture.md).
+    def fix_refusal_unrecorded(self, repository: str, issue: int) -> bool:
+        """True while a refusal for this issue could not be written: its ceiling
+        position is unknown, so callers must not admit paid work (ADR 0012)."""
+        return (repository, issue) in self._unrecorded_refusals
+
+    def record_fix_admission_refusal(self, repository: str, issue: int, episode: str, detail: str) -> int:
+        try:
+            with self.transaction() as db:
+                row = db.execute(
+                    "SELECT payload_json FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                    (self._REFUSAL_NAMESPACE, repository, str(issue)),
+                ).fetchone()
+                count = self._refusal_count(row, episode) + 1
+                db.execute(
+                    "INSERT INTO level_state(namespace, scope, key, payload_json, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?) ON CONFLICT(namespace, scope, key) DO UPDATE SET "
+                    "payload_json=excluded.payload_json, updated_at=excluded.updated_at",
+                    (self._REFUSAL_NAMESPACE, repository, str(issue),
+                     _json({"count": count, "episode": episode, "detail": detail[:500]}),
+                     _stamp(self._now())),
+                )
+        except Exception:
+            self._unrecorded_refusals.add((repository, issue))
+            raise
+        self._unrecorded_refusals.discard((repository, issue))
+        return count
+
+    def clear_fix_admission_refusals(self, repository: str, issue: int) -> None:
+        with self.transaction() as db:
+            db.execute(
+                "DELETE FROM level_state WHERE namespace=? AND scope=? AND key=?",
+                (self._REFUSAL_NAMESPACE, repository, str(issue)),
+            )
+
+    def record_fix_refusal_ledger_fault(self, issue: int, operation: str, detail: str) -> None:
+        """Journal a ledger read/write/clear that failed (ADR 0012: no silent swallow)."""
+        with self.transaction() as db:
+            self._event(
+                db,
+                TelemetryWarning("fix_admission_refusal_ledger_fault", detail[:500], {"operation": operation}),
+                correlation=Correlation(issue=issue),
             )
 
     def record_world_observation(

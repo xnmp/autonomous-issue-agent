@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 from pathlib import Path
 import shutil
 import subprocess
@@ -39,6 +40,8 @@ from ..domain.outcome import (
     AgentResult,
     ExitReason,
     MAX_BUDGET_STATUS,
+    RETURN_REFUSED_STATUS,
+    pre_admission_refusal,
     budget_exhausted,
     infra_class_failure,
     address_review_actions,
@@ -293,6 +296,40 @@ class AccountingRuntime(AgentRuntime):
         self._identity.set((run_id, leg_id))
 
     async def run(self, task: RuntimePlan) -> AgentResult:
+        issue = self._context.get()[0]
+        track = self.role == "fix" and issue is not None
+        if track and self.store.fix_refusal_unrecorded(self.repository, issue):
+            # The ledger could not record an earlier refusal for this issue, so
+            # its ceiling position is unknown: no paid admission until a write
+            # succeeds again (ADR 0012: fail closed, never proceed blind).
+            result = _return_refused("refusal ledger unwritable; admission failed closed until it records")
+        else:
+            result = await self._admit_and_run(task)
+        if track and pre_admission_refusal(result):
+            # Refused before any run exists, so the episode's receipt-driven
+            # infra charge can never see it (#262). Count it durably here;
+            # the fix role folds the ledger into the infra-death ceiling.
+            try:
+                selected = self.store.read_issue_recovery(WorkflowKey(self.repository, IssueRef(issue)))
+                if not isinstance(selected, cc.SelectedIssueRecovery):
+                    raise ValueError("issue recovery episode is unavailable to scope the refusal")
+                self.store.record_fix_admission_refusal(
+                    self.repository, issue, selected.episode_scope, result.summary
+                )
+            except Exception as exc:  # noqa: BLE001 - the store now fails this issue closed
+                self._ledger_fault(issue, "record", exc)
+                result = replace(result, summary=f"{result.summary} [refusal not recorded: {exc}]")
+        return result
+
+    def _ledger_fault(self, issue: int, operation: str, exc: Exception) -> None:
+        """A ledger fault is never silent (ADR 0012): journal it, and fall back
+        to stderr when the store that failed cannot take the event either."""
+        try:
+            self.store.record_fix_refusal_ledger_fault(issue, operation, f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 - last resort, the daemon log captures stderr
+            print(f"fix admission refusal ledger {operation} failed for #{issue}: {exc}", file=sys.stderr)
+
+    async def _admit_and_run(self, task: RuntimePlan) -> AgentResult:
         if task.runtime is not None and task.runtime.value != self.runtime_name:
             return _return_refused("selected provider differs from accounting runtime")
         now = datetime.now(timezone.utc)
@@ -618,6 +655,12 @@ class AccountingRuntime(AgentRuntime):
                 ),
                 exit_reason=ExitReason.AGENT_ERROR,
             )
+        if self.role == "fix" and issue is not None:
+            # Admission succeeded: whatever authority was missing is back.
+            try:
+                self.store.clear_fix_admission_refusals(self.repository, issue)
+            except Exception as exc:  # noqa: BLE001 - a stale count only brings the ceiling nearer
+                self._ledger_fault(issue, "clear", exc)
         publication_owner = (
             self.owner_id or f"{self.repository}:{self.role}"
         )
@@ -1183,11 +1226,14 @@ def _issue_scope(
 
 def _return_refused(detail: str) -> AgentResult:
     # Receipt authority is a harness precondition, not evidence of exhausted
-    # money or a failed issue implementation. Existing infra ceilings own it.
+    # money or a failed issue implementation. `AccountingRuntime.run` counts
+    # every such refusal toward its issue's infra ceiling (it mints no run, so
+    # no receipt would); being infra-class it also feeds the deployment-wide
+    # InfraBreaker through the fix workflow, which gates dispatch on an outage.
     return AgentResult(
         is_error=True,
-        status="return_authority_unavailable",
-        envelope_subtype="return_authority_unavailable",
+        status=RETURN_REFUSED_STATUS,
+        envelope_subtype=RETURN_REFUSED_STATUS,
         summary=f"paid admission refused: {detail}",
         exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
     )

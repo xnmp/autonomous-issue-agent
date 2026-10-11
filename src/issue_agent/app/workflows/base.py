@@ -8,7 +8,7 @@ from contextlib import AbstractContextManager
 
 from ...adapters.runtime_plan import AgentRuntime, RunTelemetryRuntime
 from ...domain.leg import Leg
-from ...domain.outcome import AgentResult
+from ...domain.outcome import AgentResult, pre_admission_refusal
 from ..planners.run import PlannedRun, compose_runtime_plan
 
 
@@ -33,6 +33,8 @@ async def run_leg(
     status = result.status or ("error" if result.is_error else "ok")
     log(
         f"agent #{target}: {label} — done "
-        f"(status={status}{f', ${result.cost_usd:.2f}' if result.cost_usd else ''})"
+        f"(status={status}{f', ${result.cost_usd:.2f}' if result.cost_usd else ''}"
+        # The refusal's summary names the missing authority (#262).
+        f"{f', {result.summary[:300]}' if pre_admission_refusal(result) else ''})"
     )
     return result

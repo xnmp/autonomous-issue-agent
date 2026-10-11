@@ -1938,6 +1938,9 @@ def _fix_state(
             errors[number] = str(exc)
     infra_deaths = {}
     infra_errors = {}
+    # No ledger pruning here: a partial observation (timed-out fetch, stale
+    # label search) would wrongly reset a live issue's ceiling. Episode scoping
+    # already keeps a reopened or re-armed issue from inheriting old refusals.
     for number in {issue.number for issue in world.issues} | pr_issues:
         try:
             if workflow_control is None:
@@ -1945,8 +1948,15 @@ def _fix_state(
             selected_infra = workflow_control.read_issue_recovery(WorkflowKey(workflow_control.writer.repository, IssueRef(number)))
             if not isinstance(selected_infra, cc.SelectedIssueRecovery):
                 raise ValueError("fix infrastructure episode is inactive or migration blocked")
-            infra_deaths[number] = selected_infra.component.state.infra_failures
-        except (ValueError, sqlite3.Error) as exc:
+            # Refusals before admission mint no run, hence no episode receipt;
+            # they spend the same ceiling (#262).
+            infra_deaths[number] = (
+                selected_infra.component.state.infra_failures
+                + workflow_control.fix_admission_refusals(selected_infra)
+            )
+        except (ValueError, sqlite3.Error, ControlStoreError) as exc:
+            # A corrupt ledger row holds THIS issue only (fail closed); the
+            # tick logs it as "fix infrastructure <n> held".
             infra_errors[number] = str(exc)
     # #38: the head SHA each PR's ONE free CI re-run was spent on. PR-keyed (not
     # breaker-keyed) because a re-run is an act on a PR's check runs, and a PR

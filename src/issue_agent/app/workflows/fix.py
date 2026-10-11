@@ -1379,7 +1379,7 @@ class FixWorkflow:
             selected = self.workflow_control.read_issue_recovery(WorkflowKey(self.workflow_control.writer.repository, IssueRef(issue))) if self.workflow_control is not None else None
             if not isinstance(selected, cc.SelectedIssueRecovery):
                 raise WorkflowAuthorityError("fix infrastructure episode is unavailable")
-            deaths = selected.component.state.infra_failures
+            deaths = selected.component.state.infra_failures + self.workflow_control.fix_admission_refusals(selected)
         except Exception as exc:  # noqa: BLE001 — reporting preserves the original fault
             self.cfg.log(f"agent #{issue}: infra episode unavailable ({exc})")
             return
