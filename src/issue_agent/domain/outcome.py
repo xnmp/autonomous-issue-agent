@@ -199,6 +199,11 @@ ADMISSION_REFUSAL_SUBTYPES: frozenset[str] = frozenset(
 )
 
 
+# Minted by the accounting runtime when a paid leg is refused BEFORE any run
+# exists (#262); its summary names the missing authority.
+RETURN_REFUSED_STATUS = "return_authority_unavailable"
+
+
 def no_session_evidence(
     *,
     session_id: str = "",
@@ -307,9 +312,9 @@ def infra_class_reason(result: AgentResult) -> str:
     """
     if result.envelope_subtype in ADMISSION_REFUSAL_SUBTYPES:
         return result.envelope_subtype
-    if result.envelope_subtype == "return_authority_unavailable":
+    if result.envelope_subtype == RETURN_REFUSED_STATUS:
         # Harness-minted summary names the authority that was missing (#262).
-        return f"return_authority_unavailable: {result.summary}"[:300]
+        return f"{RETURN_REFUSED_STATUS}: {result.summary}"[:300]
     if (infra_death(result.exit_reason) or runtime_unavailable(result.exit_reason)
             or result.exit_reason in _INFRA_CLASS_EXTRA):
         return result.exit_reason.value if result.exit_reason else ""

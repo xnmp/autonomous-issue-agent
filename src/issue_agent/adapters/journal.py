@@ -58,7 +58,7 @@ from ..domain.events import (
     TriageDispositionRecorded,
     Correlation,
 )
-from ..domain.outcome import AgentResult, ExitReason, deterministic_death
+from ..domain.outcome import RETURN_REFUSED_STATUS, AgentResult, ExitReason, deterministic_death
 from ..domain.run_usage import MeasuredRunUsage, UnavailableRunUsage
 from ..domain.ports import EventSink
 from .handover import (
@@ -881,7 +881,7 @@ class JournalingRuntime:
                         usage,
                         (
                             _bounded_blocked_text(result.summary)
-                            if result.status == "blocked"
+                            if result.status in ("blocked", RETURN_REFUSED_STATUS)
                             else None
                         ),
                         ctx.kind,

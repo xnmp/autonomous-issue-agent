@@ -89,3 +89,96 @@ def test_a_later_admitted_run_resets_the_refusal_count():
 
     assert healthy.workflow_control.fix_admission_refusals(ISSUE) == 0
     assert [a for a in decide_after(store, healthy) if isinstance(a, RunAgent)]
+
+
+# ── the incident shape: ADDRESS_REVIEW on a PR whose repair purchase is refused ──
+def _pr_repair_refusing_review(monkeypatch):
+    """A PR repair whose previous admitted run left its repair hold in place, so
+    reserve_pr_repair refuses at the reservation branch (accounting_runtime
+    `_return_refused(reservation.detail)`), exactly as live PR #1019."""
+    from dataclasses import replace
+    from issue_agent.domain import continuation_components as cc
+    from tests.app.test_pr_repair_workflow import review_workflow
+    from tests.domain.builders import labels
+
+    workflow, files, inner, key = review_workflow(ran_and_failed())
+
+    def held_purchase(*_args, **_kwargs):
+        raise ValueError("PR repair purchase is held, consumed or exhausted")
+
+    monkeypatch.setattr(cc, "consume_pr_repair", held_purchase)
+    workflow.gateway.prs[100] = replace(
+        workflow.gateway.prs[100], author="fix-bot", state="OPEN", labels=labels("ai-pr-open"),
+    )
+    return workflow, files, inner
+
+
+def _decide_pr(files, workflow):
+    view = world(
+        issues=[build_issue(5, "ai-pr-open")], prs=[workflow.gateway.prs[100]],
+    )
+    state = _fix_state(files, view, workflow_control=workflow.workflow_control,
+                       available_runtimes=frozenset({"claude"}))
+    return decide_fix(view, CFG, state, fixer_busy=False)
+
+
+def test_repeated_pr_repair_refusals_stop_address_review_at_the_ceiling_with_one_escalation(monkeypatch):
+    workflow, files, inner = _pr_repair_refusing_review(monkeypatch)
+    dispatched = 0
+    escalated = 0
+    for _ in range(CFG.max_infra_deaths + 3):
+        actions = _decide_pr(files, workflow)
+        if any(isinstance(a, RunAgent) and a.kind is AgentKind.ADDRESS_REVIEW for a in actions):
+            dispatched += 1
+            asyncio.run(workflow.address_review(100))
+        else:
+            escalated += sum(
+                isinstance(a, Relabel) and a.add is Label.NEEDS_HUMAN_REVIEW for a in actions
+            )
+            break
+
+    assert inner.tasks == []
+    assert dispatched == CFG.max_infra_deaths
+    assert escalated == 1
+
+
+def test_an_unwritable_refusal_ledger_fails_the_issue_closed_instead_of_proceeding_blind(monkeypatch):
+    store = FakeStore()
+    gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
+    runner = FakeRunner(ran_and_failed())
+    refusing = FixTaskConfig("o/r", agent_md="AM", model="m", runtime=RuntimeName.CODEX)
+    wf = workflow(gateway, store, runner, fix=refusing)
+
+    def unwritable(*_args, **_kwargs):
+        raise OSError("disk I/O error")
+
+    monkeypatch.setattr(store._workflow_db, "replace_level_state", unwritable)
+    asyncio.run(wf.resolve(ISSUE))
+    assert store._workflow_db.fix_refusal_unrecorded("o/r", ISSUE)
+
+    # The provider is now fine, so absent the guard this leg would be admitted.
+    healthy = workflow(gateway, store, runner)
+    asyncio.run(healthy.resolve(ISSUE))
+    assert runner.tasks == []
+
+    monkeypatch.undo()
+    asyncio.run(healthy.resolve(ISSUE))  # still closed: this attempt re-records the refusal
+    assert not store._workflow_db.fix_refusal_unrecorded("o/r", ISSUE)
+    asyncio.run(healthy.resolve(ISSUE))  # ledger healthy again: admitted
+    assert len(runner.tasks) == 1
+
+
+def test_refusal_detail_reaches_the_done_log_line():
+
+    store = FakeStore()
+    lines = []
+    gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
+    wf = workflow(
+        gateway, store, FakeRunner(ran_and_failed()), log=lines.append,
+        fix=FixTaskConfig("o/r", agent_md="AM", model="m", runtime=RuntimeName.CODEX),
+    )
+    asyncio.run(wf.resolve(ISSUE))
+
+    assert any(
+        "done" in line and "selected provider differs from accounting runtime" in line for line in lines
+    ), lines

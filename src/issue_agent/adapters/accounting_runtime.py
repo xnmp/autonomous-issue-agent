@@ -39,6 +39,7 @@ from ..domain.outcome import (
     AgentResult,
     ExitReason,
     MAX_BUDGET_STATUS,
+    RETURN_REFUSED_STATUS,
     budget_exhausted,
     infra_class_failure,
     address_review_actions,
@@ -293,17 +294,23 @@ class AccountingRuntime(AgentRuntime):
         self._identity.set((run_id, leg_id))
 
     async def run(self, task: RuntimePlan) -> AgentResult:
-        result = await self._admit_and_run(task)
-        if self.role == "fix" and result.status == RETURN_REFUSED_STATUS:
+        issue = self._context.get()[0]
+        track = self.role == "fix" and issue is not None
+        if track and self.store.fix_refusal_unrecorded(self.repository, issue):
+            # The ledger could not record an earlier refusal for this issue, so
+            # its ceiling position is unknown: no paid admission until a write
+            # succeeds again (ADR 0012: fail closed, never proceed blind).
+            result = _return_refused("refusal ledger unwritable; admission failed closed until it records")
+        else:
+            result = await self._admit_and_run(task)
+        if track and result.status == RETURN_REFUSED_STATUS:
             # Refused before any run exists, so the episode's receipt-driven
             # infra charge can never see it (#262). Count it durably here;
             # the fix role folds the ledger into the infra-death ceiling.
-            issue = self._context.get()[0]
-            if issue is not None:
-                try:
-                    self.store.record_fix_admission_refusal(self.repository, issue, result.summary)
-                except Exception:  # noqa: BLE001 - the refusal itself is still returned
-                    pass
+            try:
+                self.store.record_fix_admission_refusal(self.repository, issue, result.summary)
+            except Exception as exc:  # noqa: BLE001 - the store now fails this issue closed
+                result = replace(result, summary=f"{result.summary} [refusal not recorded: {exc}]")
         return result
 
     async def _admit_and_run(self, task: RuntimePlan) -> AgentResult:
@@ -1199,9 +1206,6 @@ def _issue_scope(
         datetime.max.replace(tzinfo=timezone.utc),
         ZoneInfo("UTC"),
     )
-
-
-RETURN_REFUSED_STATUS = "return_authority_unavailable"
 
 
 def _return_refused(detail: str) -> AgentResult:

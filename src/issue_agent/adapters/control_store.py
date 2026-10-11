@@ -2425,6 +2425,7 @@ class SQLiteControlStore:
         self._flushing_outbox = False
         self._bound_owner_id: str | None = None
         self._telemetry_enqueue_failures = 0
+        self._unrecorded_refusals: set[tuple[str, int]] = set()
 
     @property
     def telemetry_enqueue_failures(self) -> int:
@@ -4829,11 +4830,21 @@ class SQLiteControlStore:
         count = entry.get("count") if entry else 0
         return count if isinstance(count, int) and not isinstance(count, bool) and count > 0 else 0
 
+    def fix_refusal_unrecorded(self, repository: str, issue: int) -> bool:
+        """True while a refusal for this issue could not be written: its ceiling
+        position is unknown, so callers must not admit paid work (ADR 0012)."""
+        return (repository, issue) in self._unrecorded_refusals
+
     def record_fix_admission_refusal(self, repository: str, issue: int, detail: str) -> int:
-        entries = {k: dict(v) for k, v in self.load_level_state(self._REFUSAL_NAMESPACE, repository).items()}
-        count = self.fix_admission_refusals(repository, issue) + 1
-        entries[str(issue)] = {"count": count, "detail": detail[:500]}
-        self.replace_level_state(self._REFUSAL_NAMESPACE, repository, entries)
+        try:
+            entries = {k: dict(v) for k, v in self.load_level_state(self._REFUSAL_NAMESPACE, repository).items()}
+            count = self.fix_admission_refusals(repository, issue) + 1
+            entries[str(issue)] = {"count": count, "detail": detail[:500]}
+            self.replace_level_state(self._REFUSAL_NAMESPACE, repository, entries)
+        except Exception:
+            self._unrecorded_refusals.add((repository, issue))
+            raise
+        self._unrecorded_refusals.discard((repository, issue))
         return count
 
     def clear_fix_admission_refusals(self, repository: str, issue: int) -> None:
