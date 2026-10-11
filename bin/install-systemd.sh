@@ -23,7 +23,6 @@
 # THAT path in, so each repo's unit keeps reading its own config.
 set -euo pipefail
 HARNESS_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-CONFIG="${AGENT_ENV:-$HARNESS_ROOT/config/agent.env}"
 UD="$HOME/.config/systemd/user"
 mkdir -p "$UD"
 
@@ -72,7 +71,8 @@ if [ "${1:-}" = "uninstall" ]; then
   exit 0
 fi
 
-[ -f "$CONFIG" ] || { echo "config not found: $CONFIG"; exit 1; }
+CONFIG="${AGENT_ENV:?AGENT_ENV is unset or empty; use issue-agent install-service or source bin/compose-env.sh <name>}"
+[ -f "$CONFIG" ] || { echo "config not found: $CONFIG (run issue-agent install-service or source bin/compose-env.sh <name>)"; exit 1; }
 UV_BIN="$(command -v uv || true)"
 [ -n "$UV_BIN" ] || { echo "uv executable not found"; exit 1; }
 SYSTEMD_ANALYZE="$(command -v systemd-analyze || true)"

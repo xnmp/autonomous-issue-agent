@@ -2903,29 +2903,15 @@ def cmd_doctor(args) -> int:
     overlay = os.path.join(REPOS_DIR, f"{name}.env")
     if os.path.isfile(SHARED_ENV) and os.path.isfile(overlay):
         r = subprocess.run([_BASH, _bin("compose-env.sh"), name])
-        if r.returncode == 0:
-            env["AGENT_ENV"] = _active_env_path(name)
-        else:
-            # P0R-2 adjacency: a FAILED compose used to leave any AGENT_ENV
-            # inherited from the operator's shell in place, so doctor would
-            # preflight whatever snapshot that pointed at — possibly another
-            # deployment's — while reporting on this one. Dropping it makes the
-            # failure visible instead (doctor.sh falls back and complains).
-            env.pop("AGENT_ENV", None)
-            err(f"compose-env.sh failed for '{name}' — checks below run WITHOUT a "
-                f"composed env snapshot.")
+        if r.returncode != 0:
+            err(f"compose-env.sh failed for '{name}' — refusing to check a stale "
+                f"or missing composed env snapshot.")
+            return r.returncode
+        env["AGENT_ENV"] = _active_env_path(name)
     elif os.path.isfile(SHARED_ENV):
-        # shared.env exists but this repo has no overlay yet — the normal state
-        # before the first `issue-agent start`. compose-env.sh needs both files,
-        # so without this branch AGENT_ENV stayed unset and doctor.sh fell back
-        # to its `${AGENT_ENV:-config/agent.env}` default: the LEGACY
-        # single-repo file, which is a gitignored copy of agent.env.example full
-        # of dummy values. Doctor then validated a config the operator never
-        # wrote and printed "✓ three distinct identities (fix-bot / review-bot /
-        # steward-bot)" — a false green on the exact thing being preflighted.
-        # Point it at shared.env instead, and inject the DETECTED repo/dir the
-        # overlay would have supplied (shared.env deliberately holds neither),
-        # so the identity and access checks are about the real target.
+        # Before the first start there is no overlay to compose. shared.env
+        # holds identities but no repo/dir, so check it against the detected
+        # target until start writes the overlay.
         env["AGENT_ENV"] = SHARED_ENV
         if repo:
             env["REPO"] = repo

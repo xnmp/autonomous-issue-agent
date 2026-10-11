@@ -15,7 +15,7 @@ end-to-end. Keep it tiny: the point is to watch the issue → branch → red →
   after (red → green; the commit-order hook enforces it).
 - Do not modify or delete `test_operations.py`.
 
-## Commands (also set in config/agent.env for this target)
+## Commands (also set in config/repos/<name>.env for this target)
 - Tests:     `pytest -q`
 - Lint:      `python -m pyflakes src tests`  (if installed; else a no-op)
 - Typecheck: (none configured for the demo)

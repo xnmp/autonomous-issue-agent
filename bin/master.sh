@@ -6,13 +6,10 @@
 #   bin/master.sh                 # "what happened in the last 24h?"
 #   bin/master.sh "what's stuck?" # ad-hoc question
 set -uo pipefail
-_MDIR="$(cd "$(dirname "$0")" && pwd)"
-_MREPO_ROOT="$(cd "$_MDIR/.." && pwd)"
-_AGENT_ENV="${AGENT_ENV:-$_MREPO_ROOT/config/agent.env}"
-if [ -f "$_AGENT_ENV" ]; then
-  # shellcheck disable=SC1091
-  set -a; . "$_AGENT_ENV"; set +a
-fi
+# shellcheck disable=SC1090
+set -a
+. "${AGENT_ENV:?AGENT_ENV is unset or empty; source bin/compose-env.sh <name> (config/shared.env + config/repos/<name>.env)}" || exit
+set +a
 REPO="${REPO:?set REPO=owner/repo}"
 PERMISSION_MODE="${PERMISSION_MODE:-auto}"
 
