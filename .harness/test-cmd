@@ -1,1 +1,1 @@
-uv run pytest -q tests/adapters/test_background_child_pending.py tests/domain/test_background_child_block.py
+uv run pytest tests/app/test_dashweb_snapshots.py
