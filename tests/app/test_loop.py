@@ -560,6 +560,7 @@ def test_timed_out_finalizer_never_overlaps_terminalization():
 
 
 def test_concurrent_shutdown_retry_cannot_pass_running_finalizer():
+    clock = ManualClock()
     finalizer_started = threading.Event()
     release_finalizer = threading.Event()
     terminalized = threading.Event()
@@ -577,7 +578,11 @@ def test_concurrent_shutdown_retry_cannot_pass_running_finalizer():
         lambda _world: [],
         Executor(FakeGateway()),
         dispatch_capacity=1,
-        shutdown_timeout_seconds=0.1,
+        shutdown_timeout_seconds=_SHUTDOWN_TIMEOUT,
+        monotonic=clock,
+        # Leaves the finalizer a 2 s budget: the first call holds the shutdown
+        # lock for that long, far longer than the second thread needs to queue.
+        cancel_active_dispatches=lambda: clock.advance(_SHUTDOWN_TIMEOUT - 2),
         finalize=finalize,
         terminalize=terminalized.set,
     )
@@ -593,8 +598,8 @@ def test_concurrent_shutdown_retry_cannot_pass_running_finalizer():
     second.start()
 
     assert not second_done.wait(timeout=0.02)
-    assert first_done.wait(timeout=1)
-    assert second_done.wait(timeout=1)
+    assert first_done.wait(timeout=10)
+    assert second_done.wait(timeout=10)
     assert results == [False, False]
     assert not terminalized.is_set()
 
