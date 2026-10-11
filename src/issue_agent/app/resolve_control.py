@@ -41,7 +41,8 @@ def compose_resolve_rearm(
         selected = control.read_issue_recovery(observed.key)
         if not isinstance(selected, SelectedIssueRecovery):
             raise ValueError("fix infrastructure episode is inactive or migration blocked")
-        deaths = selected.component.state.infra_failures
+        deaths = (selected.component.state.infra_failures
+                  + control.fix_admission_refusals(cfg.repo, issue, selected.episode_scope))
         if breaker_tripped(deaths, cfg.max_infra_deaths):
             holds += ("infrastructure failure ceiling",)
         if selected.component.state.machine_block is not None:

@@ -15,7 +15,7 @@ import sqlite3
 import stat
 import tempfile
 import uuid
-from collections.abc import Callable, Collection, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import ExitStack, closing, contextmanager
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
@@ -93,6 +93,7 @@ from ..domain.events import (
     NativeUsageRemetered,
     ReservationRetained,
     SpendRecorded,
+    TelemetryWarning,
     WorldFeedRetired,
     WorldObserved,
     decode_event_line,
@@ -720,6 +721,11 @@ class ReservationResult:
     # The limit that actually tripped, which is not always the primary scope
     # when a leg carries repository, global, and issue caps at once.
     tripped_dimension: str = ""
+    # True only when the refusal is about THIS workflow (a held or stale
+    # purchase, a disagreeing receipt), never a deployment state (database,
+    # owner, filesystem). Per-issue ceilings may count the former; the latter
+    # belongs to the deployment-wide infra breaker (#262).
+    workflow_scoped: bool = False
 
     @property
     def admitted(self) -> bool:
@@ -4887,21 +4893,14 @@ class SQLiteControlStore:
                 (self._REFUSAL_NAMESPACE, repository, str(issue)),
             )
 
-    def prune_fix_admission_refusals(self, repository: str, open_issues: Collection[int]) -> int:
-        """Drop counts for issues no longer open, so a reopened issue starts clean."""
-        keep = {str(n) for n in open_issues}
+    def record_fix_refusal_ledger_fault(self, issue: int, operation: str, detail: str) -> None:
+        """Journal a ledger read/write/clear that failed (ADR 0012: no silent swallow)."""
         with self.transaction() as db:
-            stale = [
-                r["key"] for r in db.execute(
-                    "SELECT key FROM level_state WHERE namespace=? AND scope=?",
-                    (self._REFUSAL_NAMESPACE, repository),
-                ) if r["key"] not in keep
-            ]
-            db.executemany(
-                "DELETE FROM level_state WHERE namespace=? AND scope=? AND key=?",
-                [(self._REFUSAL_NAMESPACE, repository, key) for key in stale],
+            self._event(
+                db,
+                TelemetryWarning("fix_admission_refusal_ledger_fault", detail[:500], {"operation": operation}),
+                correlation=Correlation(issue=issue),
             )
-        return len(stale)
 
     def record_world_observation(
         self,
@@ -5615,7 +5614,17 @@ class SQLiteControlStore:
                 request.cap,
                 str(exc),
             )
-        except (sqlite3.DatabaseError, OSError, WorkflowAuthorityError, WorkflowEncodingError) as exc:
+        except WorkflowAuthorityError as exc:
+            return ReservationResult(
+                AccountingDisposition.UNAVAILABLE,
+                None,
+                Money.zero(request.scope.currency),
+                requested,
+                request.cap,
+                str(exc),
+                workflow_scoped=True,
+            )
+        except (sqlite3.DatabaseError, OSError, WorkflowEncodingError) as exc:
             return ReservationResult(
                 AccountingDisposition.UNAVAILABLE,
                 None,

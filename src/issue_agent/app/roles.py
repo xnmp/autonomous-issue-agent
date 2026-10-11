@@ -1938,14 +1938,10 @@ def _fix_state(
             errors[number] = str(exc)
     infra_deaths = {}
     infra_errors = {}
-    live_issues = {issue.number for issue in world.issues} | pr_issues
-    if workflow_control is not None:
-        try:
-            # A closed (then possibly reopened) issue must not inherit refusals.
-            workflow_control.prune_fix_admission_refusals(live_issues)
-        except (ControlStoreError, sqlite3.Error):
-            pass  # stale counts only bring the ceiling nearer; the next tick retries
-    for number in live_issues:
+    # No ledger pruning here: a partial observation (timed-out fetch, stale
+    # label search) would wrongly reset a live issue's ceiling. Episode scoping
+    # already keeps a reopened or re-armed issue from inheriting old refusals.
+    for number in {issue.number for issue in world.issues} | pr_issues:
         try:
             if workflow_control is None:
                 raise ValueError("fix infrastructure episode authority is unavailable")

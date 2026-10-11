@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import os
+import sys
 from pathlib import Path
 import shutil
 import subprocess
@@ -39,6 +40,7 @@ from ..domain.outcome import (
     AgentResult,
     ExitReason,
     MAX_BUDGET_STATUS,
+    DEPLOYMENT_REFUSED_SUBTYPE,
     RETURN_REFUSED_STATUS,
     budget_exhausted,
     infra_class_failure,
@@ -303,7 +305,7 @@ class AccountingRuntime(AgentRuntime):
             result = _return_refused("refusal ledger unwritable; admission failed closed until it records")
         else:
             result = await self._admit_and_run(task)
-        if track and result.envelope_subtype == RETURN_REFUSED_STATUS:
+        if track and result.envelope_subtype == RETURN_REFUSED_STATUS:  # issue-scoped only
             # Refused before any run exists, so the episode's receipt-driven
             # infra charge can never see it (#262). Count it durably here;
             # the fix role folds the ledger into the infra-death ceiling.
@@ -315,8 +317,17 @@ class AccountingRuntime(AgentRuntime):
                     self.repository, issue, selected.episode_scope, result.summary
                 )
             except Exception as exc:  # noqa: BLE001 - the store now fails this issue closed
+                self._ledger_fault(issue, "record", exc)
                 result = replace(result, summary=f"{result.summary} [refusal not recorded: {exc}]")
         return result
+
+    def _ledger_fault(self, issue: int, operation: str, exc: Exception) -> None:
+        """A ledger fault is never silent (ADR 0012): journal it, and fall back
+        to stderr when the store that failed cannot take the event either."""
+        try:
+            self.store.record_fix_refusal_ledger_fault(issue, operation, f"{type(exc).__name__}: {exc}")
+        except Exception:  # noqa: BLE001 - last resort, the daemon log captures stderr
+            print(f"fix admission refusal ledger {operation} failed for #{issue}: {exc}", file=sys.stderr)
 
     async def _admit_and_run(self, task: RuntimePlan) -> AgentResult:
         if task.runtime is not None and task.runtime.value != self.runtime_name:
@@ -592,7 +603,10 @@ class AccountingRuntime(AgentRuntime):
             )
         if reservation.disposition is not AccountingDisposition.AVAILABLE:
             if workflow is not None and reservation.disposition is not AccountingDisposition.EXHAUSTED:
-                return _return_refused(reservation.detail or reservation.disposition.value)
+                return _return_refused(
+                    reservation.detail or reservation.disposition.value,
+                    deployment=not reservation.workflow_scoped,
+                )
             headroom = max(
                 0, reservation.cap.micros - reservation.committed.micros
             )
@@ -648,8 +662,8 @@ class AccountingRuntime(AgentRuntime):
             # Admission succeeded: whatever authority was missing is back.
             try:
                 self.store.clear_fix_admission_refusals(self.repository, issue)
-            except Exception:  # noqa: BLE001 - a stale count only brings the ceiling nearer
-                pass
+            except Exception as exc:  # noqa: BLE001 - a stale count only brings the ceiling nearer
+                self._ledger_fault(issue, "clear", exc)
         publication_owner = (
             self.owner_id or f"{self.repository}:{self.role}"
         )
@@ -1213,14 +1227,17 @@ def _issue_scope(
     )
 
 
-def _return_refused(detail: str) -> AgentResult:
+def _return_refused(detail: str, *, deployment: bool = False) -> AgentResult:
     # Receipt authority is a harness precondition, not evidence of exhausted
-    # money or a failed issue implementation. `AccountingRuntime.run` counts it
-    # toward the fix infra ceiling (it mints no run, so no receipt would).
+    # money or a failed issue implementation. `AccountingRuntime.run` counts an
+    # issue-scoped refusal toward the fix infra ceiling (it mints no run, so no
+    # receipt would). A deployment-scoped one carries a different subtype so no
+    # single issue is charged for an outage; the fix workflow still reports it
+    # to the deployment-wide infra breaker (it is infra-class).
     return AgentResult(
         is_error=True,
         status=RETURN_REFUSED_STATUS,
-        envelope_subtype=RETURN_REFUSED_STATUS,
+        envelope_subtype=DEPLOYMENT_REFUSED_SUBTYPE if deployment else RETURN_REFUSED_STATUS,
         summary=f"paid admission refused: {detail}",
         exit_reason=ExitReason.RUNTIME_UNAVAILABLE,
     )

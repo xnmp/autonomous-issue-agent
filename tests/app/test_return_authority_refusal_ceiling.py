@@ -150,17 +150,21 @@ def test_repeated_pr_repair_refusals_stop_address_review_at_the_ceiling_with_one
     assert escalated == 1
 
 
-def test_an_unwritable_refusal_ledger_fails_the_issue_closed_instead_of_proceeding_blind(monkeypatch):
+def test_an_unwritable_refusal_ledger_fails_the_issue_closed_instead_of_proceeding_blind():
     store = FakeStore()
     gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
     runner = FakeRunner(ran_and_failed())
     refusing = FixTaskConfig("o/r", agent_md="AM", model="m", runtime=RuntimeName.CODEX)
     wf = workflow(gateway, store, runner, fix=refusing)
+    asyncio.run(wf.resolve(ISSUE))  # initialises the control store
+    store._workflow_db.clear_fix_admission_refusals("o/r", ISSUE)
 
-    def unwritable(*_args, **_kwargs):
-        raise OSError("disk I/O error")
-
-    monkeypatch.setattr(type(store._workflow_db), "_refusal_count", staticmethod(unwritable))
+    # A real store write failure: the database itself rejects ledger inserts.
+    with store._workflow_db.transaction() as db:
+        db.execute(
+            "CREATE TRIGGER ledger_down BEFORE INSERT ON level_state "
+            "BEGIN SELECT RAISE(ABORT, 'disk I/O error'); END"
+        )
     asyncio.run(wf.resolve(ISSUE))
     assert store._workflow_db.fix_refusal_unrecorded("o/r", ISSUE)
 
@@ -169,7 +173,8 @@ def test_an_unwritable_refusal_ledger_fails_the_issue_closed_instead_of_proceedi
     asyncio.run(healthy.resolve(ISSUE))
     assert runner.tasks == []
 
-    monkeypatch.undo()
+    with store._workflow_db.transaction() as db:
+        db.execute("DROP TRIGGER ledger_down")
     asyncio.run(healthy.resolve(ISSUE))  # still closed: this attempt re-records the refusal
     assert not store._workflow_db.fix_refusal_unrecorded("o/r", ISSUE)
     asyncio.run(healthy.resolve(ISSUE))  # ledger healthy again: admitted
@@ -224,10 +229,17 @@ def test_concurrent_ledger_updates_on_different_issues_are_never_lost():
 def test_an_agent_declared_refusal_status_is_not_counted_as_a_harness_refusal():
     store = FakeStore()
     gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
-    forged = AgentResult(
-        is_error=True, status="return_authority_unavailable", summary="agent prose",
-        session_id="sess", cost_usd=1.0, num_turns=3, exit_reason=ExitReason.AGENT_ERROR,
-    )
+    from types import SimpleNamespace
+    from issue_agent.adapters.agent_runner import result_to_agent_result
+
+    # The real SDK-envelope -> AgentResult path, with the agent's structured
+    # output declaring the harness's refusal status.
+    forged = result_to_agent_result(SimpleNamespace(
+        structured_output={"status": "return_authority_unavailable", "summary": "agent prose"},
+        is_error=True, subtype="error_during_execution", total_cost_usd=1.0,
+        session_id="sess", usage=None, num_turns=3, result="",
+    ))
+    assert forged.status == "return_authority_unavailable"
     lines = []
     wf = workflow(gateway, store, FakeRunner(forged), log=lines.append)
 
@@ -237,19 +249,52 @@ def test_an_agent_declared_refusal_status_is_not_counted_as_a_harness_refusal():
     assert not any("agent prose" in line for line in lines)
 
 
-def test_refusals_from_another_recovery_episode_or_a_closed_issue_do_not_count():
+def test_a_rearm_generation_bump_starts_the_refusal_count_over():
+    from dataclasses import replace
+    from issue_agent.adapters.workflow_rows import load_issue_aggregate, persist_workflow_snapshot
+    from issue_agent.domain.workflow_identity import IssueRef, WorkflowKey
+
     store = FakeStore()
     wf, _ = refusing_resolve(store, 2)
     assert refusal_count(wf) == 2
-    ledger = store._workflow_db
+    before = wf.workflow_control.read_issue_recovery(WorkflowKey("o/r", IssueRef(ISSUE))).episode_scope
 
-    ledger.record_fix_admission_refusal("o/r", 21, "old-episode@1", "stale")
-    ledger.record_fix_admission_refusal("o/r", 21, "old-episode@1", "stale")
-    assert ledger.fix_admission_refusals("o/r", 21, "new-episode@1") == 0
+    with store._workflow_db.transaction() as db:
+        current = load_issue_aggregate(db, WorkflowKey("o/r", IssueRef(ISSUE)))
+        fence = current.revision.fence
+        persist_workflow_snapshot(db, replace(
+            current, revision=replace(current.revision, fence=replace(fence, generation=fence.generation + 1)),
+        ))
 
-    assert wf.workflow_control.prune_fix_admission_refusals({21}) == 1  # ISSUE closed, 21 still open
+    after = wf.workflow_control.read_issue_recovery(WorkflowKey("o/r", IssueRef(ISSUE))).episode_scope
+    assert after != before
     assert refusal_count(wf) == 0
-    assert ledger.fix_admission_refusals("o/r", 21, "old-episode@1") == 2
+
+
+def test_deployment_scoped_refusals_are_not_charged_to_the_issue(monkeypatch):
+    """A database outage refuses every issue's reservation; counting it per issue
+    would escalate each active issue one by one."""
+    from issue_agent.adapters import control_store
+
+    store = FakeStore()
+    gateway = FakeGateway(issues={ISSUE: IssueView(ISSUE, title="t", body="b")}, pr_for_issue={})
+    runner = FakeRunner(ran_and_failed())
+    wf = workflow(gateway, store, runner)
+    from issue_agent.domain.contracts import Money
+
+    def outage(self, request, **kw):
+        return control_store.ReservationResult(
+            control_store.AccountingDisposition.UNAVAILABLE, None,
+            Money.zero(request.scope.currency), request.quote.maximum_charge, request.cap,
+            "deployment effect authority unavailable: disk I/O error",
+        )
+
+    monkeypatch.setattr(type(store._workflow_db), "reserve", outage)
+    for _ in range(CFG.max_infra_deaths + 2):
+        asyncio.run(wf.resolve(ISSUE))
+
+    assert runner.tasks == []
+    assert refusal_count(wf) == 0
 
 
 def test_a_corrupt_ledger_row_holds_only_that_issue_and_does_not_abort_the_tick():

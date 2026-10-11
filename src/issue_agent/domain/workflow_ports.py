@@ -1,6 +1,5 @@
 """Bound repository/owner ports for resolve and review-rejection workflow control; ADR 0015."""
 
-from collections.abc import Collection
 from typing import Protocol, runtime_checkable
 from contextlib import AbstractContextManager
 
@@ -55,8 +54,6 @@ class WorkflowControl(Protocol):
         """Refusals minted before admission (no run, no receipt), scoped to the
         selected recovery episode; they spend the infra-death ceiling (#262)."""
         ...
-
-    def prune_fix_admission_refusals(self, open_issues: Collection[int]) -> int: ...
 
     def reset_ci_episode(self, source: CIEpisodeReset) -> bool: ...
 

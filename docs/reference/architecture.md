@@ -375,10 +375,14 @@ that matters is not "wrong answer" but "loop that bills forever":
   not count as attempts. Refusals minted before admission
   (`return_authority_unavailable`: no run, so no episode receipt) spend the same
   ceiling through a per-issue `level_state` row scoped to the issue-recovery
-  episode and re-arm generation; an admitted run or the issue closing clears
-  it, and a corrupt row holds only that issue. If that write itself fails, the
-  issue fails closed from an in-memory marker. Bounded residual: a restart
-  forgets the marker, costing at most one uncounted refusal per lost write.
+  episode and re-arm generation; the next admitted run clears it, a corrupt
+  row holds only that issue, and nothing prunes it on observation (a partial
+  fetch must not reset a live ceiling). Only workflow-scoped refusals count;
+  deployment-scoped ones (database, owner, filesystem) are not charged to an
+  issue and reach `INFRA_BREAKER` through the ordinary infra-class path. If the
+  ledger write itself fails, the issue fails closed from an in-memory marker.
+  Bounded residual: the marker is lost on every restart and every hot reload
+  (re-exec), costing at most one uncounted refusal per lost write.
 - `INFRA_BREAKER` — the deployment-wide twin of the per-issue infra ceiling.
   `INFRA_BREAKER_DEATHS` infra-class deaths over ≥2 distinct issues inside
   `INFRA_BREAKER_WINDOW_SECONDS` cannot be about any one issue, so paid

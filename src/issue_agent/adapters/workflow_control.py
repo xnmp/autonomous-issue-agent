@@ -109,9 +109,6 @@ class SQLiteWorkflowControl:
         self._scope(key)
         return self._control.fix_admission_refusals(self.writer.repository, key.target.number, selected.episode_scope)
 
-    def prune_fix_admission_refusals(self, open_issues) -> int:
-        return self._control.prune_fix_admission_refusals(self.writer.repository, open_issues)
-
     def reconcile_pr_repair_returns(self) -> int:
         return self._control.reconcile_pr_repair_returns(self.writer)
 
