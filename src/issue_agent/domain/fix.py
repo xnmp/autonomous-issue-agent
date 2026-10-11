@@ -46,6 +46,7 @@ from .self_clear import (
 )
 from .ci import (
     ci_state,
+    executing_pending_checks,
     failed_checks,
     latest_other_review,
     pending_age_seconds,
@@ -1291,7 +1292,7 @@ def stalled_run_ids(pr: PRView, cfg: FixConfig) -> tuple[int, ...]:
     cancelling a subset would leave the real pin in place while looking handled.
     """
 
-    pending = pending_checks(pr.checks, cfg.ci_ignore_checks)
+    pending = executing_pending_checks(pr.checks, cfg.ci_ignore_checks)
     if not pending or any(check.run_id is None for check in pending):
         return ()
     return tuple(sorted({c.run_id for c in pending if c.run_id is not None}))

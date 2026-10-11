@@ -64,6 +64,17 @@ def pending_checks(checks: Iterable[Check], ignore_regex: str = "") -> tuple[Che
     return tuple(c for c in _kept(checks, ignore_regex) if _is_pending(c))
 
 
+def executing_pending_checks(checks: Iterable[Check], ignore_regex: str = "") -> tuple[Check, ...]:
+    """Pending checks that are not QUEUED: the ones a stall deadline may judge.
+
+    A QUEUED check has no runner yet. Saturated GitHub-hosted runners held tauri
+    jobs runnerless for 67-80 min (PRs #1065/#1070, 2026-10-11); timing that wait
+    cancelled healthy runs, lost their queue position, and escalated them to a
+    human. Every other pending state keeps its deadline and ceiling.
+    """
+    return tuple(c for c in pending_checks(checks, ignore_regex) if c.state != "QUEUED")
+
+
 def failed_checks(
     checks: Iterable[Check], ignore_regex: str = ""
 ) -> tuple[Check, ...]:
@@ -92,7 +103,7 @@ def pending_age_seconds(
     if at is None:
         return None
     starts = [
-        t for c in pending_checks(checks, ignore_regex)
+        t for c in executing_pending_checks(checks, ignore_regex)
         if (t := parse_timestamp(c.started_at)) is not None
     ]
     if not starts:

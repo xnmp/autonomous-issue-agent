@@ -186,10 +186,33 @@ def test_newest_pending_start_is_what_counts():
     # start is the clock, so a fresh job inside the window holds the deadline off.
     checks = [
         Check("old", state="IN_PROGRESS", started_at=_T0),
-        Check("just-started", state="QUEUED", started_at=_later(3500)),
+        Check("just-started", state="IN_PROGRESS", started_at=_later(3500)),
     ]
     assert not pending_deadline_breached(checks, _later(3600), 3600)
     assert pending_deadline_breached(checks, _later(7101), 3600)
+
+
+def test_a_runnerless_queued_check_never_breaches_however_long_it_waits():
+    # PRs #1065/#1070: saturated hosted runners held jobs QUEUED for 67-80 min.
+    checks = [Check("macos", state="QUEUED", started_at=_T0)]
+    assert not pending_deadline_breached(checks, _later(10**6), 3600)
+    assert pending_age_seconds(checks, _later(10**6)) is None
+
+
+def test_a_fresh_queued_job_neither_holds_off_nor_extends_an_executing_hang():
+    checks = [
+        Check("wedged", state="IN_PROGRESS", started_at=_T0),
+        Check("queued", state="QUEUED", started_at=_later(3500)),
+    ]
+    assert pending_deadline_breached(checks, _later(3600), 3600)
+
+
+def test_every_non_queued_pending_state_keeps_its_deadline():
+    for check in (Check("ext", bucket="pending", state="PENDING", started_at=_T0),
+                  Check("env", state="WAITING", bucket="pending", started_at=_T0),
+                  Check("exp", state="EXPECTED", bucket="pending", started_at=_T0),
+                  Check("run", state="IN_PROGRESS", started_at=_T0)):
+        assert pending_deadline_breached([check], _later(3601), 3600), check
 
 
 def test_a_settled_recent_check_does_not_hold_off_the_deadline():

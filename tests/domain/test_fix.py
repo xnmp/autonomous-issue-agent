@@ -2798,9 +2798,43 @@ def test_the_cancel_names_only_the_runs_pinning_this_head():
     )
     actions = decide_fix(world(prs=[p], now=_stall_now(3601)), CFG, FixState(),
                          fixer_busy=False)
+    # Run 78 is wholly runnerless: cancelling it would only lose its queue place.
     assert [(a.head, a.run_ids) for a in _cancels(actions)] == [
-        ("sha-aaa", (77, 78))
+        ("sha-aaa", (77,))
     ]
+
+
+def test_a_pr_whose_pending_checks_are_all_queued_is_never_cancelled_or_escalated():
+    # PRs #1065/#1070: hosted-runner saturation, not a hang.
+    p = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(
+            Check("unit", bucket="pass", started_at=_STALL_T0, run_id=41),
+            Check("mac", state="QUEUED", started_at=_STALL_T0, run_id=77),
+            Check("lin", state="QUEUED", started_at=_STALL_T0, run_id=78),
+        ),
+    )
+    actions = decide_fix(world(prs=[p], now=_stall_now(10**6)), CFG, FixState(),
+                         fixer_busy=False)
+    assert not _cancels(actions) and not _escalated(actions)
+
+
+def test_only_queued_jobs_left_after_a_cancel_do_not_escalate_as_a_cancel_that_never_landed():
+    # PR #1065: cancellation spawned new runnerless jobs on the head, and the
+    # harness reported "GitHub never took it down" over them.
+    p = pr(
+        100, "ai-pr-open", state="OPEN", head_ref_name="fix/5-x",
+        head_ref_oid="sha-aaa",
+        checks=(
+            Check("win", bucket="fail", started_at=_STALL_T0, run_id=77),
+            Check("agg", state="QUEUED", started_at=_STALL_T0, run_id=79),
+        ),
+    )
+    state = FixState(ci_cancel_head={100: f"sha-aaa@{_stall_now(3601)}"})
+    actions = decide_fix(world(prs=[p], now=_stall_now(3601 * 3)), CFG, state,
+                         fixer_busy=False)
+    assert not _escalated(actions)
 
 
 def test_a_stale_cancel_marker_does_not_suppress_the_new_head_s_cancel():
