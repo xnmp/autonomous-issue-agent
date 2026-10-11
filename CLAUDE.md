@@ -153,6 +153,12 @@ choice. Leave `TMPDIR` unset for routine runs so a prior disk-backed workaround
 does not slow every SQLite test. The focused Python targets retain pytest
 scratch for debugging.
 
+Shutdown-deadline tests drive `Daemon(monotonic=ManualClock())`
+(`tests/fakes/manual_clock.py`) rather than tiny real timeouts: the clock sets
+the budget, but `wait()` windows are still real, so give the worker-unwind
+window seconds (timeout 30) and close windows by advancing the clock in the
+kill hook.
+
 Before a PR, include required evidence and run an unbiased adversarial review of
 the complete diff in a subagent.
 
