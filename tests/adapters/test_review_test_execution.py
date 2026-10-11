@@ -253,38 +253,51 @@ def test_completion_captures_clean_terminal_output(tmp_path):
     assert "\x1b" not in result.summary
 
 
-@pytest.mark.parametrize("escape", [b"\x1b[32m", b"\x1b]title\x07", b"\x1b]title\x1b\\", b"\x1b7"])
-@pytest.mark.parametrize("split", [1, 2, 3])
-def test_truncated_and_chunked_capture_does_not_expose_escape_fragments(escape, split):
+@pytest.mark.parametrize("fragment", [b"[32m", b"2;1H"])
+def test_truncated_capture_removes_only_leading_csi_remainder(fragment):
     from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
 
     output = _OutputTail()
-    output.extend(b"x" * (2 * EVIDENCE_TAIL_BYTES) + escape[:split])
-    output.extend(escape[split:] + b"FAIL\n" + b"y" * (EVIDENCE_TAIL_BYTES - 8))
-    text = output.text()
-    assert "FAIL\n" in text
-    assert "32m" not in text and "title" not in text and "\x1b" not in text
+    retained = fragment + b"FAIL\n" + b"y" * (EVIDENCE_TAIL_BYTES - len(fragment) - 5)
+    output.extend(b"old output\n\x1b[" + retained)
+    assert output.text() == "[earlier output omitted]\n" + retained[len(fragment):].decode()
 
 
-@pytest.mark.parametrize("opener,terminator", [(b"\x1b]", b"\x07"), (b"\x1b[", b"m")])
-def test_escape_larger_than_capture_bound_does_not_leak_its_continuation(opener, terminator):
-    from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
+def test_unfinished_stdout_osc_cannot_consume_interleaved_stderr_failure():
+    from issue_agent.adapters.review_test_execution import _OutputTail
 
     output = _OutputTail()
-    output.extend(opener + b"3" * (4 * EVIDENCE_TAIL_BYTES))
-    output.extend(b"33" + terminator + "résultat".encode())
-    assert output.text().endswith("résultat")
-    assert "3" not in output.text() and "\x1b" not in output.text()
+    output.extend(b"\x1b]8;;https://example.test")
+    output.extend(b"FAIL stderr test case\n")
+    output.extend(b"\x1b\\")
+    assert output.text() == "]8;;https://example.testFAIL stderr test case\n"
 
 
-def test_oversized_osc_with_split_string_terminator_keeps_following_output():
+@pytest.mark.parametrize("payload_size", [100, 4 * 16384])
+def test_same_bytes_produce_identical_output_in_production_chunk_sizes(payload_size):
     from issue_agent.adapters.review_test_execution import _OutputTail, EVIDENCE_TAIL_BYTES
 
+    data = b"FAIL important\n\x1b]" + b"x" * payload_size + b"\x1b\\AFTER\n"
+    texts = []
+    for chunk_size in (8064, 8192):
+        output = _OutputTail()
+        for start in range(0, len(data), chunk_size):
+            output.extend(data[start:start + chunk_size])
+        texts.append(output.text())
+    assert texts[0] == texts[1]
+    assert texts[0].endswith("AFTER\n")
+    if len(data) <= EVIDENCE_TAIL_BYTES:
+        assert texts[0] == "FAIL important\nAFTER\n"
+    else:
+        assert texts[0] == "[earlier output omitted]\n" + "x" * (EVIDENCE_TAIL_BYTES - 8) + "AFTER\n"
+
+
+def test_malformed_utf8_is_replaced_without_losing_following_evidence():
+    from issue_agent.adapters.review_test_execution import _OutputTail
+
     output = _OutputTail()
-    output.extend(b"\x1b]" + b"title" * EVIDENCE_TAIL_BYTES + b"\x1b")
-    output.extend(b"\\FAIL\n")
-    assert output.text().endswith("FAIL\n")
-    assert "title" not in output.text() and "\x1b" not in output.text()
+    output.extend(b"\xffFAIL\n")
+    assert output.text() == "�FAIL\n"
 
 
 def test_interleaved_streams_stay_bounded_and_keep_last_line(tmp_path):

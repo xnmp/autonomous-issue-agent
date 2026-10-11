@@ -617,10 +617,12 @@ def body_review_command(body: object) -> str | None:
 
 
 def without_review_command_marker(body: str) -> str:
-    """Remove only a recognized final-line marker; unmarked review text is lossless."""
-    if body_review_command(body) is None:
+    """Remove only the exact canonical final-line harness marker."""
+    command = body_review_command(body)
+    prefix, _, last = body.rpartition("\n")
+    if command is None or last != review_command_marker(command):
         return body
-    return body.rstrip().rsplit("\n", 1)[0].rstrip() if "\n" in body.rstrip() else ""
+    return prefix.rstrip()
 
 
 @dataclass(frozen=True)

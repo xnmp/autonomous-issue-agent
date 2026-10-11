@@ -138,6 +138,15 @@ def test_failed_test_preview_shows_last_25_nonempty_lines_and_details_keep_full_
     assert blocks == ["\n".join(f"failure {i}" for i in range(15, 40)) + "\n", output + "\n"]
 
 
+def test_legacy_ansi_summary_renders_clean_in_preview_and_full_output():
+    from markdown_it import MarkdownIt
+
+    body = failed_test_review_body("failed\n\x1b[31mERROR échec\x1b[0m\n", 1)
+    blocks = [token.content for token in MarkdownIt().parse(body) if token.type == "fence"]
+    assert blocks == ["ERROR échec\n", "ERROR échec\n\n"]
+    assert "\x1b" not in body
+
+
 def test_test_output_cannot_close_its_markdown_fence():
     from markdown_it import MarkdownIt
 

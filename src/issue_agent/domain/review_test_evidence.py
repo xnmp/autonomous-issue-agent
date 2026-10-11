@@ -9,6 +9,7 @@ import re
 from .contracts import TestExecution, TestExecutionStatus
 from .review_execution import ReviewExecutionBinding, ReviewRoundIdentity
 from .review_rejection import validate_commit_sha
+from .terminal_output import strip_ansi
 from .workflow_identity import WorkflowBinding, validate_workflow_identifier
 
 # Fits a failing cargo/vitest summary after its echoed command line (#274 follow-up),
@@ -24,7 +25,7 @@ def failed_test_review_body(summary: str, exit_code: int | None) -> str:
     """Deterministic markdown within the submission bound, including marker room."""
     header = "Independent operator tests failed on this head"
     header += f" (exit {exit_code})." if exit_code is not None else "."
-    output = summary.removeprefix("failed\n")[-SUMMARY_LIMIT:]
+    output = strip_ansi(summary).removeprefix("failed\n")[-SUMMARY_LIMIT:]
 
     def render(tail: str) -> str:
         fence = "`" * max(3, 1 + max((len(run) for run in re.findall(r"`+", tail)), default=0))

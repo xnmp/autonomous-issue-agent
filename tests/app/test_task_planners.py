@@ -79,6 +79,14 @@ def test_address_review_prompt_omits_only_the_harness_command_marker(marked):
     assert "must not quote internal identifiers" in task.append_system_prompt
 
 
+def test_address_review_prompt_preserves_indented_marker_reproducer():
+    from issue_agent.domain.trust import untrusted_block
+
+    body = "Please fix parsing of this input:\n\n    <!-- issue-agent-review-command id=abc -->"
+    task = build_address_review_task(7, U(body), U("inline"), "/wt", "session", FIX_CFG)
+    assert untrusted_block("review_body", U(body)) in task.prompt
+
+
 @pytest.mark.parametrize("session", ["", "session"])
 def test_fixer_human_message_guidance_survives_fresh_and_resumed_sessions(session):
     task = build_resume_task(U("reply"), "/wt", session, FIX_CFG)

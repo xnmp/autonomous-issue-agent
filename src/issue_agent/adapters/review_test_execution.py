@@ -18,7 +18,7 @@ from ..domain.review_test_evidence import (
     MissingOperatorTestCommand, OperatorTestCommand, OperatorTestWaiver, ReviewTestConfiguration,
     ReviewTestInvocation, ReviewTestCompletion, ReviewTestOutcome, ReviewTestTreeProof, SUMMARY_LIMIT, digest,
 )
-from ..domain.terminal_output import clean_terminal_tail, strip_ansi
+from ..domain.terminal_output import strip_ansi
 from .governor import target_command_inputs
 from .child_env import child_process_env
 from .process_supervisor import ProcessSupervisor
@@ -74,9 +74,9 @@ class _OutputTail:
             self._trim()
 
     def _trim(self) -> None:
-        cleaned, truncated = clean_terminal_tail(bytes(self._buffer), EVIDENCE_TAIL_BYTES)
-        self.truncated = self.truncated or truncated
-        self._buffer = bytearray(cleaned)
+        if len(self._buffer) > EVIDENCE_TAIL_BYTES:
+            self.truncated = True
+            del self._buffer[:len(self._buffer) - EVIDENCE_TAIL_BYTES]
 
     def text(self) -> str:
         self._trim()
@@ -84,7 +84,7 @@ class _OutputTail:
         if self.truncated:
             # The cut may land inside a UTF-8 sequence; drop its orphaned continuation bytes.
             data = data.lstrip(bytes(range(0x80, 0xC0)))
-        return (OMITTED_MARKER if self.truncated else "") + strip_ansi(data.decode(errors="replace"))
+        return (OMITTED_MARKER if self.truncated else "") + strip_ansi(data.decode(errors="replace"), truncated=self.truncated)
 
 
 def clean_tree(cwd: str, head: str) -> ReviewTestTreeProof:
