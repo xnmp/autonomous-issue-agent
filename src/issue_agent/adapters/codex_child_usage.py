@@ -165,7 +165,7 @@ class CodexChildUsageMeter:
             dates.update(born + timedelta(days=i) for i in (-1, 0, 1))
         return {Path(self.home) / "sessions" / day.strftime("%Y/%m/%d") for day in dates}
 
-    def _paths(self, directories: set[Path]):
+    def _paths(self, directories: set[Path], session_id: str = ""):
         entries = 0
         for directory in sorted(directories):
             try:
@@ -175,9 +175,12 @@ class CodexChildUsageMeter:
             with stream:
                 for entry in stream:
                     entries += 1
-                    if entries > self.max_files:
-                        raise ValueError("native rollout discovery exceeded its file bound")
-                    if entry.name.startswith("rollout-") and entry.name.endswith(".jsonl"):
+                    # Shared homes include operator sessions. Bound enumeration
+                    # separately from the owned files we open for accounting.
+                    if entries > 65536:
+                        raise ValueError("native rollout discovery exceeded its scan bound")
+                    if (entry.name.startswith("rollout-")
+                            and entry.name.endswith(f"-{session_id}.jsonl" if session_id else ".jsonl")):
                         yield Path(entry.path)
 
     def _locate(self, session_id: str) -> _Rollout | None:
@@ -189,12 +192,15 @@ class CodexChildUsageMeter:
             uuid.UUID(session_id)
         except (ValueError, AttributeError):
             return None
-        paths = [path for path in self._paths(self._directories(session_id))
-                 if path.name.endswith(f"-{session_id}.jsonl")]
+        paths = list(self._paths(self._directories(session_id), session_id))
+        if len(paths) > self.max_files:
+            raise ValueError("native rollout discovery exceeded its file bound")
         if len(paths) > 1:
             raise ValueError("native session has ambiguous rollout paths")
         if not paths:
             return None
+        if len(self.rollouts) >= self.max_files:
+            raise ValueError("native rollout discovery exceeded its file bound")
         if len(self.rollouts) >= self.max_children + 1:
             raise ValueError("native rollout observer exceeded its session bound")
         found = _Rollout(Path(paths[0]), session_id)

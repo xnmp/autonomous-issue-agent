@@ -25,6 +25,17 @@ _GUARDED_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 
 @pytest.fixture(autouse=True)
+def _isolated_home(tmp_path_factory):
+    # Runtime fakes must not discover operator rollouts or login credentials.
+    home = tmp_path_factory.mktemp("home")
+    # Sharing the monkeypatch fixture moves its teardown after signal guards.
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setenv("HOME", str(home))
+        patch.setenv("CODEX_HOME", str(home / ".codex"))
+        yield
+
+
+@pytest.fixture(autouse=True)
 def _process_signal_handlers_are_restored(request):
     """A handler leaked into an xdist worker hid a stray SIGTERM as SystemExit(0)
     on the native CI runner (#249); fail the leaking test, not a later victim."""

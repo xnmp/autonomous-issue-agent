@@ -256,6 +256,22 @@ def _later(seconds):
 END = NOW.replace(microsecond=0) + timedelta(seconds=10)
 
 
+def test_recovery_with_2000_unrelated_rollouts_settles_owned_usage(tmp_path):
+    store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
+    _end_run_at(store, run_id, END)
+    home = _native_home(tmp_path)
+    for i in range(2000):
+        sid = f"019fa244-0000-7de0-8e18-{i:012x}"
+        _write_rollout(home, sid, [_meta(sid, tmp_path)])
+    evidence_dir = _frozen_evidence(tmp_path, home, "native child has unfinished turns or turns without usage")
+
+    assert CodexSpendReconciler(store, (str(evidence_dir),)).reconcile(run_id)
+
+    assert store.active_reservation_runs() == ()
+    assert store.snapshot(scope).settled == Money("USD", 12_500)
+    assert not any(evidence_dir.iterdir())
+
+
 def test_frozen_ambiguous_failure_is_remetered_from_reemission_rollout_and_settles(tmp_path):
     store, scope, run_id = _reserved_store(tmp_path, runtime="codex")
     _end_run_at(store, run_id, END)
