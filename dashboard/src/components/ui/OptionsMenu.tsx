@@ -10,6 +10,7 @@ export const DASHBOARD_THEMES = [
   ["horizon-dark", "Horizon Dark"],
   ["nord", "Nord"],
   ["tokyo-night", "Tokyo Night"],
+  ["catppuccin-latte", "Catppuccin Latte (light)"],
 ] as const;
 
 export type DashboardTheme = typeof DASHBOARD_THEMES[number][0];
