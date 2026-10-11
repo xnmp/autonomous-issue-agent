@@ -59,7 +59,6 @@ from ..adapters.review_effects import ReviewReads
 from ..adapters.review_execution_control import SQLiteReviewExecutionControl
 from ..adapters.review_workflow_control import review_family_activated
 from ..adapters.workflow_rows import WorkflowAuthorityError
-_PR_COMMITS_FETCH_CEILING = 100  # gh pr view --json commits silent cap
 
 from ..domain.fix import (
     FixConfig,
@@ -90,16 +89,6 @@ from ..domain.workflow_identity import IssueRef, PullRequestRef, WorkflowKey, Wo
 from ..domain.workflow_ports import WorkflowControl
 from ..domain.lifecycle import pr_lifecycle, retry_breaker
 from ..domain import review as review_dom
-from ..domain.exemptions import (
-    ExemptionDeclaration,
-    ExemptionFacts,
-    ExemptionGrant,
-    RULE_REQUIRED_TEST,
-    RULE_TESTS_IMMUTABLE,
-    parse_exemption_declarations,
-    parse_exemption_grants,
-)
-from ..domain.gate import looks_like_test, modified_existing_tests_from_diff
 from ..domain.identity import login_eq
 from ..domain.review import (
     DEFAULT_MAX_UNPRODUCTIVE_ROUNDS,
@@ -1686,151 +1675,6 @@ def _prediction_outcome_reporter(
     return report
 
 
-def _collect_test_exemptions(
-    gateway, world, cfg, review_bot: str, log
-) -> dict[int, "ExemptionFacts"]:
-    """#124 merge-side facts for every OPEN ai-pr-open PR. Declarations come
-    from Gate-Exemption commit trailers (one extra gh call per open harness
-    PR per tick — bounded by the concurrency cap in practice); grants come
-    from the PR's reviews and comments ALREADY in the world, filtered to
-    REVIEW_BOT's authorship before anything reaches the domain (the ADR 0012
-    laundering point — anyone can comment on a PR); the patch id is the
-    revision-checked diff's signature.
-
-    Fail directions, all CLOSED: unreadable commit messages mark the facts
-    UNVERIFIABLE — the merge stays withheld this tick and is retried next
-    (never escalated: a gh outage is not a reviewer refusal, adversarial
-    review round 2); an uncomputable diff leaves patch_id "" which the merge
-    rule likewise treats as unverifiable-retry. A PR with no declarations
-    gets NO entry — absent facts leave should_automerge untouched."""
-    facts: dict[int, ExemptionFacts] = {}
-    unreadable = ExemptionFacts(unverifiable=True)
-    for p in world.prs:
-        if p.state != "OPEN" or Label.AI_PR_OPEN not in p.labels:
-            continue
-        # Only the fixer's own unblocked PRs can auto-merge, so only they
-        # need facts — a stranger's or escalated PR here would burn a gh
-        # call per tick for a decision that can never fire.
-        if not login_eq(p.author, cfg.fix_bot) or pr_lifecycle(p).is_blocked:
-            continue
-        # Facts matter only where a merge decision could read them: the gate
-        # side reads trailers from the worktree, not from here. Collecting
-        # for merge-candidates ONLY — the SAME predicates should_automerge
-        # composes (in-scope AND merge-ready), so the two can never disagree
-        # about which PRs need facts — keeps this at ~one extra gh call per
-        # merge-ready PR per tick instead of one per open PR (2026-08-02
-        # GraphQL quota burn; round-3 MAJOR 4: without the in-scope half,
-        # AUTO_MERGE=0 or a CONFLICTING approved PR paid that call forever).
-        if not automerge_in_scope(p, cfg) or not merge_preconditions_met(
-            p, cfg
-        ):
-            continue
-        try:
-            messages = gateway.pr_commit_messages(p.number)
-        except Exception as exc:  # noqa: BLE001 — one PR ≠ the tick
-            log(
-                f"pr #{p.number}: exemption declarations unreadable ({exc}) "
-                "— merge withheld this tick, retrying next (fail closed)"
-            )
-            facts[p.number] = unreadable
-            continue
-        if len(messages) >= _PR_COMMITS_FETCH_CEILING:
-            # gh pr view fetches at most 100 commits and silently drops the
-            # tail — a declaration there would be invisible here while the
-            # worktree gate saw it. Fail closed, rather than merge a
-            # possibly-declared PR on a truncated read. DURABLE (retrying
-            # never shrinks the branch), so this is `truncated`, which the
-            # merge rule maps to WITHHELD → a one-shot escalation with an
-            # accurate reason — not unverifiable-retry-forever (round-3
-            # MAJOR 2: the old sentinel silently unmerged every ≥100-commit
-            # PR with no escalation, declared or not).
-            log(
-                f"pr #{p.number}: {len(messages)} commits reaches the gh "
-                "fetch ceiling — declarations unverifiable; merge withheld "
-                "and escalated (fail closed)"
-            )
-            facts[p.number] = ExemptionFacts(truncated=True)
-            continue
-        declared_seen: dict[ExemptionDeclaration, None] = {}
-        # required-test is still trailer-declared: absence of tests is
-        # ambiguous between "forgot" and "genuinely untestable", so the
-        # fixer's stated intent carries information the diff cannot.
-        for message in messages:
-            for declaration in parse_exemption_declarations(message):
-                if declaration.rule == RULE_REQUIRED_TEST:
-                    declared_seen.setdefault(declaration)
-        # tests-immutable is AUTO-DECLARED from the diff (ADR 0014 revised):
-        # the same revision-checked evidence that yields the patch id names
-        # every modified existing test file.
-        #
-        # The diff is fetched ONLY when the PR's observed file list contains
-        # something test-shaped. A PR touching no test file can neither carry
-        # a tests-immutable request nor need a patch id, so it merges without
-        # paying a diff download per tick — and, crucially, without a diff
-        # failure being able to stall it (round-4 MAJOR 3). `changed_files`
-        # is the same world data the path-overlap serializer already reads.
-        touches_tests = any(
-            looks_like_test(f) for f in (p.changed_files or frozenset())
-        )
-        if not touches_tests and not declared_seen:
-            continue
-        diff_text: str | None = None
-        patch_id = ""
-        if p.base_ref_oid and p.head_ref_oid:
-            try:
-                evidence = gateway.pr_diff(
-                    p.number, p.base_ref_oid, p.head_ref_oid
-                )
-                if (
-                    evidence.base_oid == p.base_ref_oid
-                    and evidence.head_oid == p.head_ref_oid
-                    and evidence.text.strip()
-                ):
-                    diff_text = evidence.text
-                    patch_id = review_dom.patch_signature(diff_text)
-            except Exception as exc:  # noqa: BLE001 — unverifiable, retried
-                log(f"pr #{p.number}: exemption diff unavailable ({exc})")
-        if diff_text is None:
-            facts[p.number] = unreadable
-            continue
-        auto_subjects, undecidable = modified_existing_tests_from_diff(
-            diff_text
-        )
-        if undecidable:
-            # "We could not tell what this record touched" must never read as
-            # "it touched no tests". Withhold durably and escalate with the
-            # real reason rather than merging on an unreadable diff shape.
-            log(
-                f"pr #{p.number}: {undecidable} diff record(s) with an "
-                "unresolvable path — merge withheld (fail closed)"
-            )
-            facts[p.number] = ExemptionFacts(undecidable_diff=True)
-            continue
-        for path in auto_subjects:
-            declared_seen.setdefault(
-                ExemptionDeclaration(RULE_TESTS_IMMUTABLE, path)
-            )
-        if not declared_seen:
-            continue
-        # Grants count ONLY from APPROVED reviews authored by REVIEW_BOT —
-        # never from comments or REQUEST_CHANGES bodies. A grant is an
-        # authorization, and the only body whose intent unambiguously says
-        # "this may land" is the approval itself (ADR 0014 adversarial
-        # review, BLOCKER 1: a refusal that QUOTED the grant line minted it).
-        grants: list[ExemptionGrant] = []
-        for review in p.reviews:
-            if review.state == REVIEW_APPROVED and login_eq(
-                review.author, review_bot
-            ):
-                grants.extend(parse_exemption_grants(review.body))
-        facts[p.number] = ExemptionFacts(
-            declarations=tuple(declared_seen),
-            grants=tuple(grants),
-            patch_id=patch_id,
-        )
-    return facts
-
-
 def _control_value(errors, key, reader, default, *, error_key=None):
     try:
         return reader(key)
@@ -1843,7 +1687,6 @@ def _fix_state(
     store: Store,
     world,
     inflight: tuple[InFlightFix, ...] = (),
-    test_exemptions: dict[int, "ExemptionFacts"] | None = None,
     *,
     workflow_control: WorkflowControl | None = None,
     available_runtimes: frozenset[str] = frozenset(),
@@ -2037,7 +1880,6 @@ def _fix_state(
         ci_pending_escalated=ci_pending_escalated,
         cleanup_sources=cleanup_sources,
         inflight=inflight,
-        test_exemptions=dict(test_exemptions or {}),
         machine_blocks=machine_blocks,
         machine_revisions=machine_revisions,
         machine_control_errors=machine_errors,
@@ -2640,8 +2482,6 @@ def compose_fix_daemon(
     codex_runtime = cfg.codex_runtime
     fix_cfg = FixConfig(
         fix_bot=fix_runtime.bot,
-        review_bot=cfg.review_bot,
-        exemption_mac_key=cfg.exemption_mac_key,
         identity_mode=repo_cfg.identity_mode,
         auto_merge=cfg.auto_merge,
         merge_method=cfg.merge_method,
@@ -2917,9 +2757,6 @@ def compose_fix_daemon(
             store,
             world,
             inflight,
-            _collect_test_exemptions(
-                gateway, world, fix_cfg, fix_cfg.review_bot, log
-            ),
             workflow_control=workflow_control,
             available_runtimes=frozenset(provider.value for provider in cfg.fix_runtimes),
         )
@@ -3290,7 +3127,6 @@ def compose_review_daemon(
         ),
         max_review_rejections=review_runtime.max_rejections,
         review_bot=review_runtime.bot,
-        exemption_mac_key=cfg.exemption_mac_key,
         reviewer_runtime=review_runtime.runtime,
         review_trigger_label=review_runtime.trigger_label,
         review_mode=review_runtime.mode,

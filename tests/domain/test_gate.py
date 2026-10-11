@@ -7,10 +7,6 @@ from issue_agent.domain.contracts import (
     TestExecution as ExecutionReceipt,
     TestExecutionStatus as ExecutionStatus,
 )
-from issue_agent.domain.exemptions import (
-    MAX_TEST_IMMUTABILITY_EXCEPTIONS,
-    SUBJECT_WHOLE_CHANGE,
-)
 from issue_agent.domain.gate import (
     OpenPrLookup,
     PushGateMode,
@@ -28,11 +24,8 @@ from issue_agent.domain.gate import (
     check_push_target,
     check_red_fails,
     check_red_is_red,
-    check_required_test,
     check_tests,
-    check_tests_immutable,
     gate_is_toothless,
-    modified_existing_tests,
     modified_existing_tests_from_diff,
     head_is_detached,
     partition_changed,
@@ -239,97 +232,7 @@ def test_no_web_blocks_browser_pr():
     assert check_no_web(["gh", "pr", "create", "--base", "dev"]).ok
 
 
-# ── required test in diff ─────────────────────────────────────────────────────
-def test_fix_branch_requires_regression_test():
-    assert not check_required_test("fix/1-x", ["src/app.py"]).ok
-    assert check_required_test("fix/1-x", ["src/app.py", "tests/test_app.py"]).ok
-
-
-def test_feat_branch_requires_test():
-    assert not check_required_test("feat/1-x", ["src/app.ts"]).ok
-    assert check_required_test("feat/1-x", ["src/app.ts", "test_app.py"]).ok
-
-
-def test_chore_branch_needs_no_test():
-    assert check_required_test("chore/1-x", ["package.json"]).ok
-
-
-# ── #124 exemption REQUEST path for required-test ────────────────────────────
-def test_declared_whole_change_exemption_lets_a_testless_change_into_the_pr():
-    # The declaration authorizes nothing: it only makes the test-less change
-    # visible so the reviewer can judge it. Merge is withheld until granted.
-    for branch in ("feat/1-x", "fix/1-x"):
-        assert check_required_test(
-            branch, ["src/app.py"], declared=(SUBJECT_WHOLE_CHANGE,)
-        ).ok, branch
-
-
-def test_undeclared_testless_change_denies_and_teaches_the_trailer():
-    for branch in ("feat/1-x", "fix/1-x"):
-        res = check_required_test(branch, ["src/app.py"])
-        assert not res.ok, branch
-        assert "Gate-Exemption: required-test" in res.reason, branch
-
-
-def test_an_overscoped_declaration_names_its_own_void_and_the_remedy():
-    # tauri #457 (2026-08-09): `*` in one commit plus `instrumentation-only`
-    # in another voided the exemption (cap 1), but the generic denial told the
-    # fixer to add the trailer it already had — it blocked blaming the
-    # harness. A declared-but-void exemption must be self-diagnosing.
-    res = check_required_test(
-        "fix/457-x", ["src/app.py"],
-        declared=(SUBJECT_WHOLE_CHANGE, "instrumentation-only"),
-    )
-    assert not res.ok
-    assert "VOID" in res.reason
-    assert "instrumentation-only" in res.reason
-    assert "exactly one" in res.reason
-    assert "reword" in res.reason
-
-
-def test_a_non_whole_change_subject_does_not_exempt_required_test():
-    # required-test is not per-file: only "*" is meaningful. A declaration
-    # naming anything else must leave the deny in place.
-    for declared in (("src/app.py",), ("tests/test_app.py",), ("something-else",), ()):
-        for branch in ("feat/1-x", "fix/1-x"):
-            assert not check_required_test(
-                branch, ["src/app.py"], declared=declared
-            ).ok, (branch, declared)
-
-
-def test_required_test_declaration_does_not_change_branches_that_need_no_test():
-    # Anti-vacuity: chore/ was already allowed; the exemption path must not be
-    # what makes it pass, nor may it start denying.
-    assert check_required_test("chore/1-x", ["package.json"]).ok
-    assert check_required_test(
-        "chore/1-x", ["package.json"], declared=(SUBJECT_WHOLE_CHANGE,)
-    ).ok
-    # ...and a branch that DID supply a test is unaffected either way.
-    assert check_required_test("fix/1-x", ["tests/test_app.py"], declared=()).ok
-
-
-def test_required_test_exemption_dies_when_the_declaration_exceeds_its_scope():
-    # required-test's bound is ONE subject. `*` plus anything else is over the
-    # bound, and an out-of-scope declaration is no exemption at all — the gate
-    # must deny HERE rather than pass a change the merge rule then wedges
-    # forever (round-3 MAJOR 3). Both stacks share `check_declaration_scope`.
-    for branch in ("feat/1-x", "fix/1-x"):
-        assert not check_required_test(
-            branch, ["src/app.py"], declared=(SUBJECT_WHOLE_CHANGE, "a.py")
-        ).ok, branch
-        # Anti-vacuity twin: `*` alone is within scope and still exempts.
-        assert check_required_test(
-            branch, ["src/app.py"], declared=(SUBJECT_WHOLE_CHANGE,)
-        ).ok, branch
-    # Repeating the same subject is not extra scope.
-    assert check_required_test(
-        "fix/1-x",
-        ["src/app.py"],
-        declared=(SUBJECT_WHOLE_CHANGE, SUBJECT_WHOLE_CHANGE),
-    ).ok
-
-
-# ── evidence + test immutability ──────────────────────────────────────────────
+# ── evidence ────────────────────────────────────────────────────────────────
 def test_evidence_non_image_not_committed():
     assert not check_no_evidence(["evidence/run.log"]).ok   # logs stay gitignored
     assert not check_no_evidence(["evidence/dump.bin"]).ok
@@ -358,384 +261,9 @@ def test_harness_control_files_are_never_committed():
     assert check_no_harness_state(["docs/.harness-notes.md"]).ok
 
 
-def test_editing_an_existing_test_is_an_automatic_exemption_request():
-    # ADR 0014 revised (2026-08-03): the diff IS the declaration. Within the
-    # scope bound the edit is ADMITTED so the reviewer can judge it — it
-    # authorizes nothing, because the MERGE rule still withholds until
-    # REVIEW_BOT grants each modified file. Denying here produced the
-    # #126/#163 comply-how loops.
-    existed = {"tests/test_app.py"}
-    assert check_tests_immutable(["tests/test_app.py"], lambda f: f in existed).ok
-    assert check_tests_immutable(
-        ["tests/test_app.py", "src/app.py"], lambda f: f in existed
-    ).ok
-    # a NEW test file (not at base) was never the subject of this rule
-    assert check_tests_immutable(["tests/test_new.py"], lambda f: f in existed).ok
-    # ...and a change touching no test at all is untouched by it either way.
-    assert check_tests_immutable(["src/app.py"], lambda f: f in existed).ok
-
-
-def test_a_purely_additive_edit_to_an_existing_test_is_denied_with_the_move():
-    """2026-08-09 tauri batch: 4 paid rounds were the reviewer refusing
-    tests-immutable grants for pure additions ('additive coverage belongs in a
-    new test file'). The gate now says so at commit time, where the move is
-    free."""
-    existed = {"tests/test_app.py"}
-    res = check_tests_immutable(
-        ["tests/test_app.py"],
-        lambda f: f in existed,
-        additive_only=("tests/test_app.py",),
-    )
-    assert not res.ok
-    assert "ADDING lines only" in res.reason
-    assert "tests/test_app.py" in res.reason
-    assert "NEW test file" in res.reason
-
-
-def test_a_correction_with_removed_lines_still_auto_declares():
-    # Any non-test additive file in the set must not trip the rule, and a test
-    # file with real removals (not in additive_only) keeps the ADR 0014 path.
-    existed = {"tests/test_app.py"}
-    assert check_tests_immutable(
-        ["tests/test_app.py", "src/app.py"],
-        lambda f: f in existed,
-        additive_only=("src/app.py",),
-    ).ok
-    assert check_tests_immutable(
-        ["tests/test_app.py"],
-        lambda f: f in existed,
-        additive_only=(),
-    ).ok
-
-
-def test_a_new_test_file_is_never_denied_for_being_additive():
-    # A brand-new test file is additive by definition and is the REMEDY the
-    # denial names — it must never itself trip the rule.
-    assert check_tests_immutable(
-        ["tests/test_new.py"],
-        lambda f: False,
-        additive_only=("tests/test_new.py",),
-    ).ok
-
-
-def test_a_mass_test_rewrite_is_still_denied_at_the_scope_bound():
-    # The one thing the gate still refuses: beyond the bound this reads as a
-    # rewrite, not a correction, and an unbounded auto-declaration would hand
-    # the reviewer an unreviewable hazard list.
-    n = MAX_TEST_IMMUTABILITY_EXCEPTIONS + 1
-    existed = {f"tests/test_{i}.py" for i in range(n)}
-    res = check_tests_immutable(sorted(existed), lambda f: f in existed)
-    assert not res.ok
-    assert str(MAX_TEST_IMMUTABILITY_EXCEPTIONS) in res.reason
-    # The message must point at the way out (reduce scope / add new files),
-    # never at trailer syntax — there is no trailer for this rule any more.
-    assert "reduce the change's scope" in res.reason
-    assert "Gate-Exemption" not in res.reason
-    # Exactly at the bound still passes: the bound is the boundary, not
-    # "more than one existing test is suspicious".
-    at_bound = sorted(existed)[:MAX_TEST_IMMUTABILITY_EXCEPTIONS]
-    assert check_tests_immutable(at_bound, lambda f: f in existed).ok
-
-
-def test_four_mechanically_updated_specs_pass_the_gate_589():
-    # tauri #589 (2026-08-09): a shared interaction change (AI actions moved
-    # into a submenu) forced path updates in four existing e2e specs — an
-    # unsplittable, rewrite-free change the old bound of 3 turned into an
-    # operator decision. Four modified existing tests must pass the gate;
-    # authorization stays with the per-file reviewer grants at merge.
-    existed = {f"e2e/ai-{name}.spec.ts" for name in ("organize", "rename", "banana", "upscale")}
-    res = check_tests_immutable(sorted(existed), lambda f: f in existed)
-    assert res.ok
-    assert MAX_TEST_IMMUTABILITY_EXCEPTIONS >= 4
-
-
-def test_only_existing_test_files_count_toward_the_bound():
-    # Anti-vacuity for the bound: new test files and non-test files are not
-    # subjects, so a big change is not denied for touching many of them.
-    existed = {"tests/test_app.py", "src/a.py", "src/b.py", "src/c.py", "src/d.py"}
-    changed = [
-        "tests/test_app.py",
-        "tests/test_new_1.py",
-        "tests/test_new_2.py",
-        "src/a.py", "src/b.py", "src/c.py", "src/d.py",
-    ]
-    assert check_tests_immutable(changed, lambda f: f in existed).ok
-
-
-# ── auto-declared subjects: the diff IS the declaration ─────────────────────
-def test_modified_existing_tests_names_exactly_the_edited_existing_tests():
-    existed = {"tests/test_app.py", "tests/test_other.py"}
-    assert modified_existing_tests(
-        ["tests/test_app.py", "tests/test_new.py", "src/app.py"],
-        lambda f: f in existed,
-    ) == ("tests/test_app.py",)
-    assert modified_existing_tests([], lambda f: f in existed) == ()
-
-
 def _record(header: str, *body: str) -> str:
     """One `diff --git` record, as git actually renders it."""
     return "\n".join((f"diff --git {header}",) + body) + "\n"
-
-
-def test_diff_derived_subjects_come_from_the_record_header_not_the_minus_line():
-    # Round-4 BLOCKER 1: deriving from `--- a/` made ABSENCE of that line mean
-    # "no exemption needed", so every record git emits without one — binary,
-    # rename, mode-only, `.gitattributes -diff` — silently disabled the whole
-    # regime. `diff --git` is emitted unconditionally, so that is the anchor.
-    diff = (
-        _record(
-            "a/tests/x_test.py b/tests/x_test.py",
-            "index 1111111..2222222 100644",
-            "--- a/tests/x_test.py",
-            "+++ b/tests/x_test.py",
-            "@@ -1 +1 @@",
-            "-assert x == 1",
-            "+assert x == 2",
-        )
-        + _record(
-            "a/src/app.py b/src/app.py",
-            "--- a/src/app.py",
-            "+++ b/src/app.py",
-        )
-    )
-    assert modified_existing_tests_from_diff(diff) == (("tests/x_test.py",), 0)
-
-
-def test_a_binary_test_record_still_declares_its_subject():
-    # A binary (or `-diff`-suppressed) record carries NO `--- a/` line at all.
-    # One `tests/** -diff` attribute used to turn the whole rule off.
-    binary = _record(
-        "a/tests/x_test.py b/tests/x_test.py",
-        "index 1111111..2222222 100644",
-        "Binary files a/tests/x_test.py and b/tests/x_test.py differ",
-    )
-    assert modified_existing_tests_from_diff(binary) == (("tests/x_test.py",), 0)
-
-
-def test_a_diff_suppressed_record_still_declares_its_subject():
-    # `.gitattributes: tests/** -diff` renders exactly this shape.
-    suppressed = _record(
-        "a/tests/y_test.py b/tests/y_test.py",
-        "index 1111111..2222222 100644",
-        "Binary files a/tests/y_test.py and b/tests/y_test.py differ",
-    )
-    assert modified_existing_tests_from_diff(suppressed) == (
-        ("tests/y_test.py",),
-        0,
-    )
-
-
-def test_renaming_a_test_out_of_the_suite_declares_the_OLD_path():
-    # Renaming a test to a non-test path removes it from the suite as surely
-    # as deleting it, and the NEW path is not test-shaped — so only the old
-    # path can be the subject.
-    renamed = _record(
-        "a/tests/y_test.py b/docs/old.txt",
-        "similarity index 100%",
-        "rename from tests/y_test.py",
-        "rename to docs/old.txt",
-    )
-    assert modified_existing_tests_from_diff(renamed) == (
-        ("tests/y_test.py",),
-        0,
-    )
-
-
-def test_a_mode_only_change_to_an_existing_test_still_declares_it():
-    # No content hunk, no `--- a/` line — but the file existed at base and the
-    # change touches it. `new mode` must not be mistaken for `new file mode`.
-    mode_only = _record(
-        "a/tests/z_test.py b/tests/z_test.py",
-        "old mode 100644",
-        "new mode 100755",
-    )
-    assert modified_existing_tests_from_diff(mode_only) == (
-        ("tests/z_test.py",),
-        0,
-    )
-
-
-def test_an_added_test_file_declares_nothing():
-    # Anti-vacuity for every case above: `new file mode` is the one marker
-    # that means "nothing existed at base", so a brand-new test is not a
-    # subject and the fixer pays no grant for writing one.
-    added = _record(
-        "a/tests/test_added.py b/tests/test_added.py",
-        "new file mode 100644",
-        "index 0000000..1111111",
-        "--- /dev/null",
-        "+++ b/tests/test_added.py",
-    )
-    assert modified_existing_tests_from_diff(added) == ((), 0)
-
-
-def test_a_deleted_test_file_is_a_subject():
-    deleted = _record(
-        "a/tests/test_gone.py b/tests/test_gone.py",
-        "deleted file mode 100644",
-        "--- a/tests/test_gone.py",
-        "+++ /dev/null",
-    )
-    assert modified_existing_tests_from_diff(deleted) == (
-        ("tests/test_gone.py",),
-        0,
-    )
-
-
-def test_a_c_quoted_non_ascii_path_is_decoded_not_dropped():
-    # Git C-quotes non-ASCII paths. Dropping the record would let a renamed
-    # `tests/test_café.py` edit through unrequested.
-    quoted = _record(
-        '"a/tests/test_caf\\303\\251.py" "b/tests/test_caf\\303\\251.py"',
-        "index 1111111..2222222 100644",
-        "Binary files differ",
-    )
-    subjects, undecidable = modified_existing_tests_from_diff(quoted)
-    assert subjects == ("tests/test_café.py",)
-    assert undecidable == 0
-
-
-def test_an_unresolvable_path_is_counted_undecidable_never_dropped():
-    # An unquoted path containing spaces has no unique split on the header
-    # line, and a binary record carries no `--- a/` witness. "We could not
-    # tell what this touched" must NOT read as "it touched no tests"
-    # (round-4 BLOCKER 2) — it is counted so the caller withholds.
-    ambiguous = _record(
-        "a/tests/my test.py b/tests/my test.py",
-        "index 1111111..2222222 100644",
-        "Binary files a/tests/my test.py and b/tests/my test.py differ",
-    )
-    subjects, undecidable = modified_existing_tests_from_diff(ambiguous)
-    assert subjects == ()
-    assert undecidable >= 1
-
-
-def test_a_spaced_path_with_a_minus_witness_resolves_instead_of_counting():
-    # Anti-vacuity twin: the fallback is real. A textual record names the old
-    # path unambiguously on its `--- a/` line, so it is resolved, not counted.
-    witnessed = _record(
-        "a/tests/my test.py b/tests/my test.py",
-        "index 1111111..2222222 100644",
-        "--- a/tests/my test.py",
-        "+++ b/tests/my test.py",
-        "@@ -1 +1 @@",
-        "-assert x == 1",
-        "+assert x == 2",
-    )
-    assert modified_existing_tests_from_diff(witnessed) == (
-        ("tests/my test.py",),
-        0,
-    )
-
-
-def test_an_unreadable_diff_is_undecidable_not_empty():
-    # The most dangerous default: `((), 0)` on junk would read as "this change
-    # touches no existing test" and merge.
-    for junk in (None, 42, b"diff --git a/tests/t_test.py b/tests/t_test.py", ["x"]):
-        assert modified_existing_tests_from_diff(junk) == ((), 1), junk
-    # An EMPTY string is a str, so it parses honestly: no records, nothing
-    # undecidable.
-    assert modified_existing_tests_from_diff("") == ((), 0)
-    assert modified_existing_tests_from_diff("no records here") == ((), 0)
-
-
-def test_mixed_records_are_each_classified_on_their_own_evidence():
-    diff = (
-        _record(
-            "a/tests/a_test.py b/tests/a_test.py",
-            "Binary files a/tests/a_test.py and b/tests/a_test.py differ",
-        )
-        + _record(
-            "a/tests/test_added.py b/tests/test_added.py",
-            "new file mode 100644",
-            "--- /dev/null",
-            "+++ b/tests/test_added.py",
-        )
-        + _record(
-            "a/tests/b_test.py b/docs/moved.txt",
-            "rename from tests/b_test.py",
-            "rename to docs/moved.txt",
-        )
-        + _record(
-            "a/tests/weird name.py b/tests/weird name.py",
-            "Binary files a/tests/weird name.py and b/tests/weird name.py differ",
-        )
-        + _record(
-            "a/src/app.py b/src/app.py",
-            "--- a/src/app.py",
-            "+++ b/src/app.py",
-        )
-    )
-    subjects, undecidable = modified_existing_tests_from_diff(diff)
-    assert subjects == ("tests/a_test.py", "tests/b_test.py")
-    assert undecidable == 1
-
-
-def test_diff_derived_subjects_dedupe_and_preserve_order():
-    diff = (
-        _record("a/tests/test_b.py b/tests/test_b.py", "--- a/tests/test_b.py")
-        + _record("a/tests/test_a.py b/tests/test_a.py", "--- a/tests/test_a.py")
-        + _record("a/tests/test_b.py b/tests/test_b.py", "--- a/tests/test_b.py")
-    )
-    assert modified_existing_tests_from_diff(diff) == (
-        ("tests/test_b.py", "tests/test_a.py"),
-        0,
-    )
-
-
-def test_the_two_subject_derivations_agree_on_the_same_change():
-    # The gate reads a worktree, the collector and the reviewer notice read a
-    # diff. Both must name the SAME subjects or the merge rule asks for a
-    # grant the reviewer was never shown.
-    existed = {"tests/test_app.py"}
-    changed = ["tests/test_app.py", "tests/test_new.py", "src/app.py"]
-    diff = (
-        _record(
-            "a/tests/test_app.py b/tests/test_app.py",
-            "--- a/tests/test_app.py",
-            "+++ b/tests/test_app.py",
-        )
-        + _record(
-            "a/tests/test_new.py b/tests/test_new.py",
-            "new file mode 100644",
-            "--- /dev/null",
-            "+++ b/tests/test_new.py",
-        )
-        + _record(
-            "a/src/app.py b/src/app.py",
-            "--- a/src/app.py",
-            "+++ b/src/app.py",
-        )
-    )
-    subjects, undecidable = modified_existing_tests_from_diff(diff)
-    assert undecidable == 0
-    assert modified_existing_tests(changed, lambda f: f in existed) == subjects
-
-
-# ── an ungrantable path is denied at the gate, not admitted then wedged ──────
-def test_a_modified_test_whose_path_cannot_be_granted_is_denied():
-    # Round-4 MINOR 6: admitting it would guarantee a permanent merge withhold
-    # and a confusing escalation later. Deny where the message can name the
-    # file and the fix is cheap.
-    for bad in ("tests/my test.py", "tests/test_café.py", "tests/@scope/t_test.py"):
-        res = check_tests_immutable([bad], lambda f: f == bad)
-        assert not res.ok, bad
-        assert bad in res.reason, bad
-        assert "charset" in res.reason or "letters, digits" in res.reason, bad
-
-
-def test_an_ungrantable_path_that_is_not_an_existing_test_denies_nothing():
-    # Anti-vacuity: the charset rule only governs the subjects this rule
-    # auto-declares. A weird path that is NOT an existing test is untouched.
-    assert check_tests_immutable(["src/my file.py"], lambda f: True).ok
-    assert check_tests_immutable(
-        ["tests/my new test.py"], lambda f: False
-    ).ok
-
-
-def test_ordinary_paths_within_the_bound_still_pass_the_charset_check():
-    existed = {"tests/test_a.py", "tests/test_b.py", "tests/c_test.py"}
-    assert check_tests_immutable(sorted(existed), lambda f: f in existed).ok
 
 
 # ── test command resolution + §1 ──────────────────────────────────────────────
@@ -793,18 +321,35 @@ def test_check_tests_opt_out_does_not_excuse_failing_tests():
 
 
 # ── §10 red-fail (the anti-tautological-test gate) ─────────────────────────────
-def test_partition_splits_new_tests_from_impl():
-    existed = {"src/app.py"}
+def test_partition_preserves_new_and_existing_tests():
     new_tests, impl = partition_changed(
-        ["src/app.py", "tests/test_new.py"], lambda f: f in existed
+        ["src/app.py", "tests/test_new.py", "tests/test_existing.py", ""]
     )
-    assert new_tests == ("tests/test_new.py",)
+    assert new_tests == ("tests/test_new.py", "tests/test_existing.py")
     assert impl == ("src/app.py",)
+
+
+@pytest.mark.parametrize("documentation", ["README.md", "guide.MD", "docs/tests.rst", "guide.adoc"])
+def test_red_fail_allows_test_maintenance_with_documentation(documentation):
+    tests, impl = partition_changed(["tests/test_existing.py", documentation])
+    assert check_red_fails(
+        RedFailInputs(test_cmd="pytest", test_files=tests, impl_files=impl),
+        lambda _impl: execution(ExecutionStatus.PASSED),
+    ).ok
+
+
+@pytest.mark.parametrize("implementation", ["docs/example.py", "src/component.mdx"])
+def test_red_fail_still_checks_executable_files_under_docs(implementation):
+    tests, impl = partition_changed(["test_existing.py", implementation, "README.md"])
+    assert not check_red_fails(
+        RedFailInputs(test_cmd="pytest", test_files=tests, impl_files=impl),
+        lambda _impl: execution(ExecutionStatus.PASSED),
+    ).ok
 
 
 def test_red_fail_blocks_tautological_test():
     # impl reverted but suite STILL passes → the test doesn't exercise the change.
-    inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
+    inp = RedFailInputs(test_cmd="pytest", test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",))
     res = check_red_fails(
         inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
@@ -813,7 +358,7 @@ def test_red_fail_blocks_tautological_test():
 
 
 def test_red_fail_allows_genuine_red():
-    inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
+    inp = RedFailInputs(test_cmd="pytest", test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",))
     assert check_red_fails(
         inp, revert_and_run=lambda impl: execution(ExecutionStatus.TEST_FAILED)
@@ -821,7 +366,7 @@ def test_red_fail_allows_genuine_red():
 
 
 def test_red_fail_skips_without_new_tests():
-    inp = RedFailInputs(test_cmd="pytest", new_test_files=(), impl_files=("src/x.py",))
+    inp = RedFailInputs(test_cmd="pytest", test_files=(), impl_files=("src/x.py",))
     # revert_and_run must NOT even be consulted → pass a poisoned callable.
     def boom(impl):
         raise AssertionError("should not run")
@@ -829,14 +374,14 @@ def test_red_fail_skips_without_new_tests():
 
 
 def test_red_fail_skips_pure_test_diff():
-    inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",), impl_files=())
+    inp = RedFailInputs(test_cmd="pytest", test_files=("tests/test_x.py",), impl_files=())
     assert check_red_fails(
         inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
     ).ok
 
 
 def test_red_fail_skips_when_explicitly_disabled():
-    base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
+    base = dict(test_files=("tests/test_x.py",), impl_files=("src/x.py",))
     assert check_red_fails(
         RedFailInputs(test_cmd="pytest", red_must_fail=False, **base),
         lambda i: execution(ExecutionStatus.PASSED),
@@ -846,7 +391,7 @@ def test_red_fail_skips_when_explicitly_disabled():
 def test_red_fail_denies_when_no_test_command():
     # No command ⇒ the anti-tautology check never ran ⇒ deny (the #39 hole),
     # rather than silently allowing an unproven "red".
-    base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
+    base = dict(test_files=("tests/test_x.py",), impl_files=("src/x.py",))
 
     def boom(impl):
         raise AssertionError("must not attempt a revert with no test command")
@@ -856,7 +401,7 @@ def test_red_fail_denies_when_no_test_command():
 
 
 def test_red_fail_no_command_allowed_with_explicit_opt_out():
-    base = dict(new_test_files=("tests/test_x.py",), impl_files=("src/x.py",))
+    base = dict(test_files=("tests/test_x.py",), impl_files=("src/x.py",))
     assert check_red_fails(
         RedFailInputs(test_cmd="", allow_untested=True, **base),
         lambda i: execution(ExecutionStatus.PASSED),
@@ -866,7 +411,7 @@ def test_red_fail_no_command_allowed_with_explicit_opt_out():
 def test_red_fail_opt_out_does_not_excuse_a_tautological_test():
     # ALLOW_UNTESTED only covers a MISSING command; with one present the revert
     # simulation still runs and still blocks a test that passes without the impl.
-    inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
+    inp = RedFailInputs(test_cmd="pytest", test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",), allow_untested=True)
     assert not check_red_fails(
         inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
@@ -874,7 +419,7 @@ def test_red_fail_opt_out_does_not_excuse_a_tautological_test():
 
 
 def test_red_fail_denies_on_unresolvable_base():
-    inp = RedFailInputs(test_cmd="pytest", new_test_files=("tests/test_x.py",),
+    inp = RedFailInputs(test_cmd="pytest", test_files=("tests/test_x.py",),
                         impl_files=("src/x.py",), base_resolvable=False)
     assert not check_red_fails(
         inp, revert_and_run=lambda impl: execution(ExecutionStatus.PASSED)
@@ -884,7 +429,7 @@ def test_red_fail_denies_on_unresolvable_base():
 def test_red_fail_rejects_timeout_and_infrastructure_failure_as_evidence():
     inp = RedFailInputs(
         test_cmd="pytest",
-        new_test_files=("tests/test_x.py",),
+        test_files=("tests/test_x.py",),
         impl_files=("src/x.py",),
     )
     timeout = check_red_fails(
@@ -1109,3 +654,53 @@ def test_generated_instruction_missing_or_malformed_evidence_denies(blobs):
 @pytest.mark.parametrize("images,limit", [(None, 1), ((), True), ((("x.png", True),), 1), ((("x.png", None),), 1), ((("x.png", 2**64),), 1), (((),), 1)])
 def test_invalid_image_facts_cannot_authorize_a_commit(images, limit):
     assert not gate.check_image_sizes(images, limit).ok
+
+
+@pytest.mark.parametrize("record,path", [
+    ("diff --git a/tests/test_old.py b/tests/test_old.py\n--- a/tests/test_old.py\n+++ b/tests/test_old.py\n", "tests/test_old.py"),
+    ("diff --git a/tests/test_gone.py b/tests/test_gone.py\ndeleted file mode 100644\n", "tests/test_gone.py"),
+    ("diff --git a/tests/test_old.py b/docs/moved.py\nrename from tests/test_old.py\nrename to docs/moved.py\n", "tests/test_old.py"),
+    ("diff --git a/tests/test_binary.py b/tests/test_binary.py\nBinary files differ\n", "tests/test_binary.py"),
+    ("diff --git a/tests/test_mode.py b/tests/test_mode.py\nold mode 100644\nnew mode 100755\n", "tests/test_mode.py"),
+    ('diff --git "a/tests/test_caf\\303\\251.py" "b/tests/test_caf\\303\\251.py"\n', "tests/test_café.py"),
+    ('diff --git "a/tests/test_caf\\303\\251.py" b/docs/moved.py\nrename from "tests/test_caf\\303\\251.py"\n', "tests/test_café.py"),
+    ("diff --git a/tests/my test.py b/tests/my test.py\nBinary files differ\n", "tests/my test.py"),
+    ("diff --git a/tests/@scope/test_old.py b/tests/@scope/test_old.py\n", "tests/@scope/test_old.py"),
+])
+def test_existing_test_listing_covers_git_record_shapes(record, path):
+    assert modified_existing_tests_from_diff(record) == (path,)
+
+
+@pytest.mark.parametrize("diff", [None, 42, b"diff --git a/tests/test_x.py b/tests/test_x.py", [], "", "not a diff", 'diff --git "unterminated\n'])
+def test_existing_test_listing_tolerates_absent_and_malformed_diff(diff):
+    assert modified_existing_tests_from_diff(diff) == ()
+
+
+def test_existing_test_listing_excludes_new_files_and_source_and_deduplicates():
+    diff = (
+        "diff --git a/tests/test_new.py b/tests/test_new.py\nnew file mode 100644\n"
+        "diff --git a/src/main.py b/src/main.py\n"
+        "diff --git a/tests/test_b.py b/tests/test_b.py\n"
+        "diff --git a/tests/test_a.py b/tests/test_a.py\n"
+        "diff --git a/tests/test_b.py b/tests/test_b.py\n"
+    )
+    assert modified_existing_tests_from_diff(diff) == ("tests/test_b.py", "tests/test_a.py")
+
+
+def test_existing_test_listing_has_no_grant_scope_or_path_limits():
+    paths = tuple(f"tests/@scope/{'x' * 250}/test_{n}.py" for n in range(1000))
+    diff = "".join(f"diff --git a/{p} b/{p}\n" for p in paths)
+    assert modified_existing_tests_from_diff(diff) == paths
+
+
+@pytest.mark.parametrize("suffix", ["test.js", "spec.js", "test.jsx", "spec.ts", "test.tsx", "spec.mjs", "test.cjs", "spec.mts", "test.cts"])
+def test_colocated_javascript_test_edits_are_prominent(suffix):
+    path = f"src/widget.{suffix}"
+    diff = (f"diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n"
+            "@@ -1 +1 @@\n-expect(render()).toEqual(42)\n+expect(true).toBe(true)\n")
+    assert modified_existing_tests_from_diff(diff) == (path,)
+
+
+@pytest.mark.parametrize("path", ["src/widget.ts", "src/widget.test.ts.map", "src/widget.spec.json"])
+def test_colocated_test_detection_excludes_source_and_artifacts(path):
+    assert modified_existing_tests_from_diff(f"diff --git a/{path} b/{path}\n") == ()

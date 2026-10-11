@@ -314,14 +314,6 @@ def test_build_gate_context_unresolvable_base():
     assert ctx.branch_subjects == ()
 
 
-def test_build_gate_context_exists_at_base_uses_cat_file():
-    fg = _builder_git()
-    fg.table["cat-file -e origin/dev:src/x.py"] = GitResult(0, "")
-    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
-    assert ctx.exists_at_base("src/x.py") is True
-    assert ctx.exists_at_base("tests/test_new.py") is False  # default rc≠0 path
-
-
 # ── published subjects (base..origin/<branch>) — keifu #182 ──
 # The commit-log gate must not re-police history that is already on the remote
 # PR branch (GitHub's own Update-branch merge commit lives there). The builder
@@ -329,31 +321,6 @@ def test_build_gate_context_exists_at_base_uses_cat_file():
 # context is rebuilt on every Bash call — and every failure mode falls back to
 # the stricter, pre-exemption behaviour of an empty tuple.
 _PUBLISHED_LOG = "log origin/dev..refs/remotes/origin/fix/5-x"
-
-
-# A rename reports only its NEW path under `--name-only`, so three tests
-# renamed out of the test tree once left the tests-immutable gate seeing
-# nothing test-shaped while the merge side saw three subjects (round-4
-# adversarial review). The old-side list closes that, and must stay SEPARATE
-# from changed_files: a deleted test path there would read as an ADDED test
-# and satisfy check_required_test.
-_OLD_SIDE = "diff --no-renames --diff-filter=MDRT --name-only"
-
-
-def test_build_gate_context_reports_old_side_paths_for_renamed_tests():
-    fg = _builder_git(changed="docs/old.txt")
-    fg.table[_OLD_SIDE] = GitResult(0, "tests/test_renamed.py\n")
-    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
-    assert ctx.touched_at_base == ("tests/test_renamed.py",)
-    assert "tests/test_renamed.py" not in ctx.changed_files
-
-
-def test_build_gate_context_leaves_old_side_empty_when_that_git_call_fails():
-    fg = _builder_git()
-    fg.table[_OLD_SIDE] = GitResult(1, "fatal: bad revision")
-    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
-    assert ctx.touched_at_base == ()
-    assert ctx.changed_files == ("src/x.py", "tests/test_x.py")
 
 
 def test_build_gate_context_reads_published_subjects_from_the_remote_branch():
@@ -1202,60 +1169,6 @@ def test_review_checkout_defers_when_a_refresh_step_fails():
         rc.ensure(165, SHA)
 
 
-# ── Gate-Exemption trailers off the branch's commit bodies (ADR 0014) ────────
-_BODY_LOG = "log origin/dev..HEAD --format=%B"
-
-
-def _bodies_git(bodies: str):
-    """`_builder_git` plus a scripted `--format=%B` read. The %B key must come
-    FIRST: FakeGit matches by prefix in insertion order, and the subjects key
-    ('log origin/dev..HEAD') would otherwise swallow it."""
-    fg = FakeGit({_BODY_LOG: GitResult(0, bodies)})
-    fg.table.update(_builder_git().table)
-    return fg
-
-
-def test_build_gate_context_reads_declared_exemptions_from_commit_bodies():
-    ctx = build_gate_context(
-        "/wt",
-        base_branch="dev",
-        git=_bodies_git(
-            "fix: the expectation was wrong\n\n"
-            "Gate-Exemption: tests-immutable tests/test_x.py\n"
-        ),
-    )
-    assert [(d.rule, d.subject) for d in ctx.declared_exemptions] == [
-        ("tests-immutable", "tests/test_x.py")
-    ]
-    assert ctx.malformed_exemption_lines == 0
-
-
-def test_build_gate_context_counts_a_malformed_declaration_for_the_denial_hint():
-    # `@scope/pkg` is a real path in a JS repo and outside the declarable
-    # subject charset. It declares nothing — and the count is what lets the
-    # gate say so instead of denying silently (#126 class).
-    ctx = build_gate_context(
-        "/wt",
-        base_branch="dev",
-        git=_bodies_git(
-            "fix: thing\n\nGate-Exemption: tests-immutable @scope/pkg\n"
-        ),
-    )
-    assert ctx.declared_exemptions == ()
-    assert ctx.malformed_exemption_lines == 1
-
-
-def test_build_gate_context_declares_nothing_when_the_body_log_fails():
-    # Fail toward the stricter, pre-exemption behaviour: no declarations, no
-    # hint, and the rest of the context still built.
-    fg = _bodies_git("")
-    fg.table[_BODY_LOG] = GitResult(1, "fatal: bad revision")
-    ctx = build_gate_context("/wt", base_branch="dev", git=fg)
-    assert ctx.declared_exemptions == ()
-    assert ctx.malformed_exemption_lines == 0
-    assert ctx.branch_subjects == ("red: t", "green: impl")
-
-
 def test_red_assertion_failure_cannot_authorize_after_restore_failure(tmp_path):
     runner = _builder_git()
     runner.table["checkout -q HEAD"] = GitResult(128, "restore failed")
@@ -1264,7 +1177,7 @@ def test_red_assertion_failure_cannot_authorize_after_restore_failure(tmp_path):
     assert result.status is ExecutionStatus.INFRA_ERROR
 
 
-@pytest.mark.parametrize("failure", ["log origin/dev..HEAD --reverse", "log origin/dev..HEAD --format=%B", "diff --name-only", "diff --no-renames --diff-filter=MDRT", "diff --no-renames --diff-filter=M --numstat"])
+@pytest.mark.parametrize("failure", ["log origin/dev..HEAD --reverse", "diff --name-only"])
 def test_required_git_history_or_diff_failure_is_not_an_empty_trusted_fact(tmp_path, failure):
     runner = _builder_git()
     runner.table = {failure: GitResult(128, ""), **{key: value for key, value in runner.table.items() if key != failure}}
@@ -1272,31 +1185,27 @@ def test_required_git_history_or_diff_failure_is_not_an_empty_trusted_fact(tmp_p
     assert not (ctx.history_available and ctx.branch_diff_available)
 
 
-@pytest.mark.parametrize("row", ["truncated", "1\tx\ttests/a.py", "1\t0\t"])
-def test_malformed_numstat_denies_instead_of_losing_test_edit_evidence(tmp_path, row):
+
+
+@pytest.mark.parametrize("tree_code", [0, 128])
+def test_red_verification_requires_proven_base_tree_membership(tmp_path, tree_code):
     runner = _builder_git()
-    runner.table["diff --no-renames --diff-filter=M --numstat"] = GitResult(0, row)
-    ctx = build_gate_context(str(tmp_path), git=runner)
-    assert not ctx.branch_diff_available
+    runner.table["cat-file -e origin/dev:src/x.py"] = GitResult(128, "")
+    runner.table["ls-tree -z --name-only origin/dev -- src/x.py"] = GitResult(tree_code, "src/x.py\x00")
+    ctx = build_gate_context(str(tmp_path), git=runner, env_test_cmd="exit 1")
+    if tree_code:
+        with pytest.raises(ValueError, match="base-tree evidence is unavailable"):
+            ctx.revert_and_run(("src/x.py",))
+    else:
+        assert ctx.revert_and_run(("src/x.py",)).status is ExecutionStatus.TEST_FAILED
 
 
-def test_failed_cat_file_requires_proven_base_tree_membership(tmp_path):
-    runner = _builder_git()
-    runner.table["cat-file -e origin/dev:tests/a.py"] = GitResult(128, "")
-    runner.table["ls-tree -z --name-only origin/dev -- tests/a.py"] = GitResult(0, "tests/a.py\x00")
-    ctx = build_gate_context(str(tmp_path), git=runner)
-    assert ctx.exists_at_base("tests/a.py")
-    runner.table["ls-tree -z --name-only origin/dev -- tests/a.py"] = GitResult(128, "")
-    with pytest.raises(ValueError, match="base-tree evidence is unavailable"):
-        ctx.exists_at_base("tests/a.py")
-
-
-def test_sdk_pr_denies_unavailable_base_membership_without_running_target(tmp_path):
+def test_sdk_pr_denies_unavailable_base_membership_before_red_execution(tmp_path):
     runner = _builder_git(changed="tests/a.py\nsrc/x.py")
-    runner.table["ls-tree -z --name-only origin/dev -- tests/a.py"] = GitResult(128, "")
+    runner.table["ls-tree -z --name-only origin/dev -- src/x.py"] = GitResult(128, "")
     calls = []
     ctx = build_gate_context(str(tmp_path), git=runner, env_test_cmd="true", run_tests=lambda cmd: calls.append(cmd) or True)
     verdict = evaluate_command('gh pr create --base dev --body "## Acceptance Criteria\n- fixed\n\nFixes #5"', ctx)
     assert not verdict.allowed
     assert "failed safely" in verdict.reason
-    assert not calls
+    assert calls == ["true"]

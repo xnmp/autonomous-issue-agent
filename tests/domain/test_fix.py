@@ -25,15 +25,6 @@ from issue_agent.domain.actions import (
     NoOp,
     Target,
 )
-from issue_agent.domain.exemptions import (
-    RULE_REQUIRED_TEST,
-    RULE_TESTS_IMMUTABLE,
-    SUBJECT_WHOLE_CHANGE,
-    ExemptionDeclaration,
-    ExemptionFacts,
-    ExemptionGrant,
-    grant_mac,
-)
 from issue_agent.domain.fix import (
     CiFlake,
     CiStallStep,
@@ -1046,199 +1037,6 @@ def test_no_automerge_when_ci_pending():
 def test_eligible_exact_head_remains_reconcilable():
     st = FixState()
     assert should_automerge(_approved_green_pr(), st, CFG) is True
-
-
-# ── #124: declared gate exemptions withhold auto-merge until REVIEW_BOT
-#    grants each (rule, subject) against the CURRENT patch id ────────────────
-# The grant-authentication key the harness holds (ADR 0014 round-3): without
-# it configured, no grant verifies at all, so every exemption fixture carries
-# one and mints through `grant_mac` rather than hand-writing a tag.
-EXEMPTION_KEY = "fix-side-key-material"
-EXEMPT_CFG = replace(
-    CFG, review_bot="review-bot", exemption_mac_key=EXEMPTION_KEY
-)
-
-IMMUTABLE_DECL = (ExemptionDeclaration(RULE_TESTS_IMMUTABLE, "tests/test_app.py"),)
-
-
-def signed_grant(rule, issue, subject, patch, key=EXEMPTION_KEY):
-    return ExemptionGrant(
-        rule, issue, subject, patch, grant_mac(key, rule, issue, subject, patch)
-    )
-
-
-def _exemption_state(declarations=IMMUTABLE_DECL, grants=(), patch_id="patch-1"):
-    return FixState(test_exemptions={
-        100: ExemptionFacts(declarations=tuple(declarations),
-                            grants=tuple(grants), patch_id=patch_id),
-    })
-
-
-def test_declared_exemption_without_grant_withholds_automerge():
-    # The PR is approved + green — everything ELSE says merge — and it still
-    # must not land until the declared edit is granted.
-    assert should_automerge(_approved_green_pr(), _exemption_state(), EXEMPT_CFG) is False
-
-
-def test_withheld_merge_ready_pr_escalates_instead_of_stalling_silently():
-    # Withheld is TERMINAL for this head: the reviewer already reviewed it and
-    # nothing dispatches another round, so "keep polling" means "stall forever
-    # with no operator signal" (ADR 0014 adversarial review, BLOCKER 2). The
-    # automerge pass must hand it to a human at once. One-shot by the label
-    # swap: the escalated PR leaves the fixer's actionable set.
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[_approved_green_pr()])
-    actions = decide_fix(w, EXEMPT_CFG, _exemption_state(), fixer_busy=False)
-    assert not any(isinstance(a, EnableAutoMerge) for a in actions)
-    escalations = [
-        a for a in actions
-        if isinstance(a, Relabel) and Label.NEEDS_HUMAN_REVIEW in a.add
-    ]
-    assert len(escalations) == 1
-    comment = next(
-        a for a in actions
-        if isinstance(a, PostComment) and "did not grant" in a.body
-    )
-    assert comment.number == 100
-    # Anti-vacuity twin: granted → merges, no escalation.
-    granted = _exemption_state(grants=(
-        signed_grant(RULE_TESTS_IMMUTABLE, 100, "tests/test_app.py", "patch-1"),
-    ))
-    actions = decide_fix(w, EXEMPT_CFG, granted, fixer_busy=False)
-    assert any(isinstance(a, EnableAutoMerge) for a in actions)
-    assert not any(
-        isinstance(a, Relabel) and Label.NEEDS_HUMAN_REVIEW in a.add
-        for a in actions
-    )
-
-
-def test_matching_grant_restores_automerge():
-    # _approved_green_pr's branch is fix/100-x, so the branch issue is 100.
-    st = _exemption_state(grants=(
-        signed_grant(RULE_TESTS_IMMUTABLE, 100, "tests/test_app.py", "patch-1"),))
-    assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is True
-
-
-def test_new_push_voids_the_grant_until_regranted():
-    st = _exemption_state(grants=(
-        signed_grant(RULE_TESTS_IMMUTABLE, 100, "tests/test_app.py", "patch-STALE"),))
-    assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is False
-
-
-def test_grant_for_wrong_issue_subject_or_rule_never_authorizes():
-    for grant in (
-        signed_grant(RULE_TESTS_IMMUTABLE, 999, "tests/test_app.py", "patch-1"),
-        signed_grant(RULE_TESTS_IMMUTABLE, 100, "tests/test_other.py", "patch-1"),
-        # right issue, subject and patch — wrong RULE
-        signed_grant(RULE_REQUIRED_TEST, 100, "tests/test_app.py", "patch-1"),
-    ):
-        st = _exemption_state(grants=(grant,))
-        assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is False, grant
-
-
-def test_a_required_test_declaration_also_withholds_until_granted():
-    # The generalization: a test-less change is exempted at the gate but still
-    # cannot land without the reviewer's whole-change grant.
-    decl = (ExemptionDeclaration(RULE_REQUIRED_TEST, SUBJECT_WHOLE_CHANGE),)
-    assert should_automerge(
-        _approved_green_pr(), _exemption_state(declarations=decl), EXEMPT_CFG
-    ) is False
-    granted = _exemption_state(
-        declarations=decl,
-        grants=(signed_grant(RULE_REQUIRED_TEST, 100, SUBJECT_WHOLE_CHANGE, "patch-1"),),
-    )
-    assert should_automerge(_approved_green_pr(), granted, EXEMPT_CFG) is True
-
-
-def test_exemption_needs_a_distinct_reviewer_identity():
-    # CFG carries no review_bot: the trust anchor is unverifiable, so a PR WITH
-    # declarations never self-authorizes — even fully granted.
-    st = _exemption_state(grants=(
-        signed_grant(RULE_TESTS_IMMUTABLE, 100, "tests/test_app.py", "patch-1"),))
-    assert should_automerge(_approved_green_pr(), st, CFG) is False
-    same = replace(EXEMPT_CFG, review_bot="fix-bot")
-    assert should_automerge(_approved_green_pr(), st, same) is False
-
-
-def test_no_declaration_pr_is_completely_unaffected():
-    # Anti-vacuity twin, both shapes: absent key and observed-but-empty facts.
-    assert should_automerge(_approved_green_pr(), FixState(), EXEMPT_CFG) is True
-    st = FixState(test_exemptions={100: ExemptionFacts()})
-    assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is True
-
-
-def _escalations(actions):
-    return [
-        a for a in actions
-        if isinstance(a, Relabel) and Label.NEEDS_HUMAN_REVIEW in a.add
-    ]
-
-
-def test_unverifiable_facts_withhold_the_merge_without_escalating_anyone():
-    # A gh outage (or a >100-commit fetch) leaves the facts unreadable. That is
-    # transient: withhold this tick and retry next. Escalating it would hand a
-    # human a healthy PR with a false "the reviewer refused" reason (ADR 0014
-    # adversarial review, round 2).
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[_approved_green_pr()])
-    st = FixState(test_exemptions={100: ExemptionFacts(unverifiable=True)})
-    actions = decide_fix(w, EXEMPT_CFG, st, fixer_busy=False)
-    assert not any(isinstance(a, EnableAutoMerge) for a in actions)
-    assert _escalations(actions) == []
-    assert not any(
-        isinstance(a, PostComment) and "ADR 0014" in a.body for a in actions
-    )
-
-
-def test_no_withheld_escalation_where_auto_merge_is_off():
-    # "Withheld" is only news where the harness would otherwise have merged.
-    # With AUTO_MERGE off nothing was going to land anyway, so the escalation
-    # would state something untrue about what stands between PR and merge.
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[_approved_green_pr()])
-    cfg = replace(EXEMPT_CFG, auto_merge=False)
-    actions = decide_fix(w, cfg, _exemption_state(), fixer_busy=False)
-    assert not any(isinstance(a, EnableAutoMerge) for a in actions)
-    assert _escalations(actions) == []
-
-
-def test_no_withheld_escalation_on_a_branch_the_harness_never_merges():
-    # A PR on a branch the harness did not author is reviewed but never merged
-    # by us; an exemption verdict on it is not a human's problem.
-    p = pr(
-        100, "ai-pr-open",
-        head_ref_name="feature/foo",
-        head_ref_oid="head-100",
-        reviews=(Review("APPROVED", "review-bot", "t1", commit_id="head-100"),),
-        checks=(Check("build", bucket="pass"),),
-    )
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[p])
-    actions = decide_fix(w, EXEMPT_CFG, _exemption_state(), fixer_busy=False)
-    assert not any(isinstance(a, EnableAutoMerge) for a in actions)
-    assert _escalations(actions) == []
-
-
-def test_the_withheld_escalation_states_the_specific_reason_and_subject():
-    # The message a human reads must name what actually happened and WHICH
-    # declaration is stuck — a generic "withheld" sends them diff-hunting.
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[_approved_green_pr()])
-    actions = decide_fix(w, EXEMPT_CFG, _exemption_state(), fixer_busy=False)
-    assert len(_escalations(actions)) == 1
-    comment = next(a for a in actions if isinstance(a, PostComment))
-    assert "did not grant" in comment.body
-    assert RULE_TESTS_IMMUTABLE in comment.body
-    assert "tests/test_app.py" in comment.body
-
-
-def test_two_identity_mode_withholds_without_escalating():
-    # Same verdict, different cause: no distinct reviewer identity exists, so
-    # auto-merge was never in scope either — nobody is paged about a reviewer
-    # that was never consulted.
-    st = _exemption_state(grants=(
-        signed_grant(RULE_TESTS_IMMUTABLE, 100, "tests/test_app.py", "patch-1"),))
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[_approved_green_pr()])
-    actions = decide_fix(w, replace(EXEMPT_CFG, identity_mode="solo"), st,
-                         fixer_busy=False)
-    # solo mode is also out of automerge scope, so nothing is escalated at all.
-    assert _escalations(actions) == []
-    assert not any(isinstance(a, EnableAutoMerge) for a in actions)
 
 
 def test_stale_or_unattributed_approval_never_authorizes_current_head():
@@ -3375,49 +3173,12 @@ def test_a_re_run_head_that_is_still_red_is_not_yet_a_flake():
     assert ci_flakes(world(prs=[p]), CFG, state) == ()
 
 
-def test_a_truncated_commit_read_escalates_because_retrying_cannot_clear_it():
-    # Unlike an unreadable fetch, a >100-commit branch stays >100 commits: the
-    # harness can never prove it declares nothing, so withholding silently
-    # would unmerge the PR forever (round-3 MAJOR 2). Durable ⇒ escalate once.
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[_approved_green_pr()])
-    st = FixState(test_exemptions={100: ExemptionFacts(truncated=True)})
-    actions = decide_fix(w, EXEMPT_CFG, st, fixer_busy=False)
-    assert not any(isinstance(a, EnableAutoMerge) for a in actions)
-    assert len(_escalations(actions)) == 1
-    comment = next(a for a in actions if isinstance(a, PostComment))
-    assert "commits" in comment.body and "100" in comment.body
 
 
-def test_a_truncated_read_withholds_the_merge_even_with_nothing_declared():
-    st = FixState(test_exemptions={100: ExemptionFacts(truncated=True)})
-    assert should_automerge(_approved_green_pr(), st, EXEMPT_CFG) is False
 
 
-def test_a_deployment_without_a_grant_key_withholds_and_says_so():
-    # The key is derived from harness credentials; a deployment missing them
-    # cannot authenticate any grant. The escalation must name THAT, not blame
-    # the reviewer.
-    keyless = replace(EXEMPT_CFG, exemption_mac_key="")
-    st = _exemption_state(grants=(
-        signed_grant(RULE_TESTS_IMMUTABLE, 100, "tests/test_app.py", "patch-1"),))
-    assert should_automerge(_approved_green_pr(), st, keyless) is False
-    w = world(issues=[issue(100, "ai-pr-open")], prs=[_approved_green_pr()])
-    comment = next(
-        a for a in decide_fix(w, keyless, st, fixer_busy=False)
-        if isinstance(a, PostComment)
-    )
-    assert "no grant-authentication key" in comment.body
 
 
-def test_a_grant_minted_under_a_different_key_never_merges():
-    # The forgery guard at the decide seam: a well-formed, correctly
-    # patch-bound grant the harness did not mint must not arm auto-merge.
-    forged = _exemption_state(grants=(
-        signed_grant(
-            RULE_TESTS_IMMUTABLE, 100, "tests/test_app.py", "patch-1",
-            key="a-key-the-harness-does-not-hold",
-        ),))
-    assert should_automerge(_approved_green_pr(), forged, EXEMPT_CFG) is False
 
 
 def test_missing_infra_authority_holds_ready_target_without_starving_peer():
@@ -3427,3 +3188,11 @@ def test_missing_infra_authority_holds_ready_target_without_starving_peer():
     paid = [action for action in actions if isinstance(action, RunAgent)]
     assert [action.number for action in paid] == [2]
     assert not any(isinstance(action, (Relabel, PostComment, CloseIssue)) and action.number == 1 for action in actions)
+
+
+def test_approved_green_pr_with_legacy_grant_text_merges_without_exemption_facts():
+    approved = _approved_green_pr()
+    approved = replace(approved, reviews=tuple(replace(r, body="gate-exemption: granted legacy text") for r in approved.reviews))
+    actions = decide_fix(world(prs=(approved,)), FixConfig("fix-bot"), FixState(), fixer_busy=False)
+    assert EnableAutoMerge(approved.number, "squash", approved.head_ref_oid) in actions
+    assert not any(isinstance(action, Relabel) and action.add == Label.NEEDS_HUMAN_REVIEW for action in actions)

@@ -315,7 +315,7 @@ def test_rehearsal_only_changes_isolated_copy_and_verifies_imports(deployment, t
     assert inspect(scope, shadow=False)["status"] == "ready"
 
 
-def test_invalid_grant_approval_does_not_erase_rejections_during_import(deployment):
+def test_approval_resets_rejections_during_import_despite_legacy_trailers(deployment):
     state, control, remote, scope = deployment
     seed(state)
     remote.views[7] = replace(remote.views[7], labels=frozenset({Label.NEEDS_HUMAN_REVIEW}))
@@ -324,15 +324,14 @@ def test_invalid_grant_approval_does_not_erase_rejections_during_import(deployme
     remote.messages = ("Gate-Exemption: required-test missing_test",)
     result = inspect(scope, shadow=True)
     assert result["status"] == "ready", result
-    assert result["shadow"][0]["ceiling_gate"]
+    assert not result["shadow"][0]["ceiling_gate"]
     activate(scope, confirm_plan_digest=result["plan"]["plan_digest"])
     with control.transaction() as db:
         snapshot = load_workflow_row(db, WorkflowKey("o/r", PullRequestRef(7)))
-        assert snapshot.gates[0].cause.non_resetting_commits == (HEAD,)
-        assert [review.review_id for review in snapshot.gates[0].cause.counted] == ["1", "2"]
+        assert snapshot.gates == ()
 
 
-def test_unavailable_grant_evidence_refuses_activation(deployment, monkeypatch):
+def test_activation_does_not_read_retired_grant_evidence(deployment, monkeypatch):
     state, _, remote, scope = deployment
     seed(state)
     remote.reviews[7] = [[review_row(1, "APPROVED")]]
@@ -341,12 +340,13 @@ def test_unavailable_grant_evidence_refuses_activation(deployment, monkeypatch):
 
     def unavailable(args):
         if args[-1].endswith("/commits?per_page=100"):
-            raise OSError("trailers unavailable")
+            raise AssertionError("activation must not read exemption trailers")
         return original(args)
 
     monkeypatch.setattr(remote, "_gh_json", unavailable)
     result = inspect(scope, shadow=True)
-    assert result["status"] == "blocked" and "trailers unavailable" in " ".join(result["blockers"])
+    assert result["status"] == "ready", result
+    assert not result["shadow"][0]["ceiling_gate"]
 
 
 def test_malformed_counter_defers_instead_of_inventing_paid_dispatch(deployment):

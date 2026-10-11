@@ -1,8 +1,8 @@
 """ADR 0011 PR/commit/push gate policy.
 
 Every rule returns a `GateResult` (Allow | Deny(reason)). The rules that derive
-truth from data — branch name, commit prefixes + TDD ordering, required
-test in the diff, evidence, test-immutability, ADR references, the adversarial
+truth from data — branch name, commit prefixes + TDD ordering, evidence,
+ADR references, the adversarial
 verdict — are PURE functions of their inputs and fully unit-tested here.
 
 The two rules that must touch the world — running the test command (§1) and the
@@ -18,19 +18,11 @@ there is no shell policy copy.
 from __future__ import annotations
 
 import re
-from collections.abc import Callable, Collection, Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from enum import Enum
 
 from .contracts import TestExecution, TestExecutionStatus
-from .exemptions import (
-    MAX_TEST_IMMUTABILITY_EXCEPTIONS,
-    RULE_REQUIRED_TEST,
-    RULE_TESTS_IMMUTABLE,
-    SUBJECT_WHOLE_CHANGE,
-    check_declaration_scope,
-    valid_subject,
-)
 from .refs import BRANCH_PREFIXES, ISSUE_BRANCH_PATTERN, is_governed_branch
 
 
@@ -49,9 +41,10 @@ def deny(reason: str) -> GateResult:
 
 
 # ── policy constants ───────────────────────────────────────────────────────
-# "this looks like a test file" (PR_TEST_FILE_RE in _pr_common.sh).
+# Shared path classifier for review notices and red-fail verification.
 TEST_FILE_RE = re.compile(
     r"(e2e|integration|regression|test|spec).*\.(spec|test)\."
+    r"|\.(spec|test)\.[cm]?[jt]sx?$"
     r"|(^|/)test_.*\.py"
     r"|.*_test\.(py|go|ts|js|rs)"
     # Rust integration tests are BY CONVENTION bare .rs files under tests/
@@ -59,15 +52,6 @@ TEST_FILE_RE = re.compile(
     # tests/ arm rejected `tests/help_popup_scroll_test.rs` on keifu #155
     # (2026-08-01) even though `cargo test` ran it.
     r"|tests?/.*\.(py|rs)"
-)
-
-# Stricter pattern for the feat/ branch "must add an e2e/integration test" rule
-# (check-pr.sh §5 feat/* arm).
-FEAT_TEST_RE = re.compile(
-    r"(e2e|integration).*\.(spec|test)\."
-    r"|(^|/)test_.*\.py"
-    r"|.*_test\.(py|go|ts|js|rs)"
-    r"|tests?/.*\.(py|rs|spec|test)"
 )
 
 # Two accepted forms for the harness's TDD/phase markers:
@@ -253,60 +237,7 @@ def check_no_web(argv: Iterable[str]) -> GateResult:
     return ALLOW
 
 
-# ── required test in the diff (check-pr.sh §5) ────────────────────────────────
-def check_required_test(
-    branch: str, changed: Iterable[str], declared: Collection[str] = ()
-) -> GateResult:
-    """feat/ ⇒ an e2e/integration (or conventional) test; fix/ ⇒ a regression
-    test. chore/refactor need none. Derived from the branch + diff, not prefixes.
-
-    `declared` are the subjects a `Gate-Exemption: required-test *` trailer
-    names (only the whole-change subject is meaningful). A declared exemption
-    passes THIS check — the reviewer must be able to see and judge the
-    test-less change — but authorizes nothing: auto-merge is withheld until
-    REVIEW_BOT grants it against the current patch id (exemptions.py). The
-    scope bound applies here exactly as in `check_tests_immutable` (round-3
-    MAJOR 3: without it, `*` plus junk subjects passed the gate and then
-    wedged at merge)."""
-    if SUBJECT_WHOLE_CHANGE in declared:
-        if check_declaration_scope(RULE_REQUIRED_TEST, declared):
-            return ALLOW
-        # A declared-but-VOID exemption must say WHY it is void, or the agent
-        # re-reads "add the trailer" it already added and files a harness bug
-        # (tauri #457, 2026-08-09: `*` plus a second subject in another commit
-        # voided the exemption; the generic denial sent the fixer in circles).
-        subjects = ", ".join(sorted(declared))
-        return deny(
-            "required-test exemption declared but VOID: this branch declares "
-            f"{len(set(declared))} subjects for required-test ({subjects}) and "
-            "the rule accepts exactly one, the whole-change '*'. Trailers "
-            "accumulate across ALL commits on the branch — reword or drop the "
-            "commit message(s) declaring the extra subject(s) so exactly one "
-            "'Gate-Exemption: required-test *' remains"
-        )
-    files = list(changed)
-    if branch.startswith("feat/"):
-        if not any(FEAT_TEST_RE.search(f) for f in files):
-            return deny(
-                "feat/ branch must add an e2e/integration (or conventional) test "
-                "(none found in the diff). If this change GENUINELY needs no "
-                "test, request a reviewer exemption: add a commit with the "
-                "trailer line 'Gate-Exemption: required-test *' — the reviewer "
-                "must then explicitly grant it before the PR can merge"
-            )
-    elif branch.startswith("fix/"):
-        if not any(looks_like_test(f) for f in files):
-            return deny(
-                "fix/ branch must add a regression test (none found in the "
-                "diff). If this change GENUINELY needs no test, request a "
-                "reviewer exemption: add a commit with the trailer line "
-                "'Gate-Exemption: required-test *' — the reviewer must then "
-                "explicitly grant it before the PR can merge"
-            )
-    return ALLOW
-
-
-# ── evidence + test-immutability (check-pr.sh §7/§7b) ─────────────────────────
+# ── evidence (check-pr.sh §7/§7b) ─────────────────────────
 def check_no_evidence(changed: Iterable[str]) -> GateResult:
     """evidence/ may contain ONLY committed screenshot images (visual proof that
     renders in the PR's Files-changed tab). Any non-image path under evidence/
@@ -381,45 +312,20 @@ class PushLookupPolicy(Enum):
     CHECK_AVAILABLE_FACTS = "check_available_facts"
 
 
-def modified_existing_tests(
-    changed: Iterable[str],
-    exists_at_base: Callable[[str], bool],
-) -> tuple[str, ...]:
-    """The existing test files this change modifies or deletes — the
-    AUTO-DECLARED tests-immutable exemption subjects (ADR 0014, revised
-    2026-08-03). The diff itself is the declaration: no trailer ceremony,
-    nothing for the fixer to get syntactically wrong, no comply-how loop.
-    Shared by the gate (scope bound), the merge-side facts collector, and
-    the reviewer notice, so all three always name the same subjects."""
-    return tuple(
-        f for f in changed if looks_like_test(f) and exists_at_base(f)
-    )
-
-
 # Per-file records. `diff --git` is emitted UNCONDITIONALLY for every changed
 # path — including binary files, pure renames, mode-only changes, and paths
 # suppressed by `.gitattributes -diff`, all of which emit NO `--- a/` line.
-# Deriving from `--- a/` instead made absence-of-header mean "no exemption
-# needed", so one `tests/** -diff` attribute disabled the whole regime
-# (round-4 adversarial review, BLOCKER 1). Anchored at column 0 with the
-# `diff --git ` prefix, which diff CONTENT can never produce (content lines
-# carry a leading +/-/space).
 _DIFF_RECORD_RE = re.compile(r"^diff --git (.+)$", re.MULTILINE)
 _DIFF_NEW_FILE_RE = re.compile(r"^new file mode ", re.MULTILINE)
 _DIFF_RENAME_FROM_RE = re.compile(r"^rename from (.+)$", re.MULTILINE)
 
 
-def _unquote_diff_path(raw: str) -> str | None:
-    """One side of a `diff --git` header → repo-relative path, or None when
-    the rendering is ambiguous. Git C-quotes paths containing non-ASCII or
-    special characters; unquoted paths containing SPACES are genuinely
-    ambiguous on this line (`a/x y.py b/x y.py` has no unique split), so those
-    resolve via the record body instead of a guess."""
+def _unquote_diff_path(raw: str, *, prefixed: bool = True) -> str | None:
+    """Decode Git C-quoted paths; header paths carry an a/ or b/ prefix."""
     raw = raw.strip()
     if raw.startswith('"'):
-        end = raw.find('"', 1)
-        while end > 0 and raw[end - 1] == "\\":
-            end = raw.find('"', end + 1)
+        quoted = re.match(r'"((?:[^"\\]|\\.)*)"', raw)
+        end = quoted.end() - 1 if quoted else -1
         if end < 0:
             return None
         try:
@@ -432,34 +338,22 @@ def _unquote_diff_path(raw: str) -> str | None:
             )
         except (UnicodeDecodeError, UnicodeEncodeError):
             return None
-        return decoded[2:] if decoded.startswith(("a/", "b/")) else decoded
-    if " " in raw:
-        return None  # ambiguous split; the caller falls back
-    return raw[2:] if raw.startswith(("a/", "b/")) else raw
+        return decoded[2:] if prefixed and decoded.startswith(("a/", "b/")) else decoded
+    return raw[2:] if prefixed and raw.startswith(("a/", "b/")) else raw
 
 
 def modified_existing_tests_from_diff(
     diff_text: object,
-) -> tuple[tuple[str, ...], int]:
-    """(subjects, undecidable) — `modified_existing_tests` derived from a
-    unified diff instead of a worktree, for the merge-side collector and the
-    reviewer notice, which hold the revision-checked diff and no checkout.
+) -> tuple[str, ...]:
+    """Existing test paths modified or deleted, in diff order, for review.
 
-    A record counts when it touches a path that existed at base (anything but
-    `new file mode`) and looks like a test — covering binary, rename-away,
-    mode-only and `-diff`-suppressed records that emit no `--- a/` line. A
-    rename's OLD path is the subject: renaming a test out of the test tree
-    removes it from the suite as surely as deleting it.
-
-    `undecidable` counts records whose old path could not be resolved
-    (ambiguous unquoted spaces with no `rename from`/`--- a/` witness). It is
-    never silently zero-valued: callers treat non-zero as WITHHELD, because
-    "we could not tell what this touched" must not read as "it touched no
-    tests"."""
+    The old side includes renames out of the suite. Record headers also cover
+    binary, mode-only and attribute-suppressed changes without hunk headers.
+    Unresolvable records carry no path; this informational list never gates.
+    """
     if not isinstance(diff_text, str):
-        return (), 1  # unreadable ⇒ undecidable, never "nothing to declare"
+        return ()
     subjects: dict[str, None] = {}
-    undecidable = 0
     records = list(_DIFF_RECORD_RE.finditer(diff_text))
     for index, match in enumerate(records):
         start = match.end()
@@ -474,89 +368,25 @@ def modified_existing_tests_from_diff(
         old = None
         rename = _DIFF_RENAME_FROM_RE.search(body)
         if rename:
-            old = rename.group(1).strip()
+            old = _unquote_diff_path(rename.group(1), prefixed=False)
         else:
             header = match.group(1)
             # `a/<p> b/<p>` for the common same-path case: take the a-side by
             # splitting at the LAST ` b/` so paths containing " b/" resolve.
             split = header.rfind(" b/")
             candidate = header[:split] if split > 0 else header
-            old = _unquote_diff_path(candidate)
+            old = _unquote_diff_path(candidate) if split > 0 or header.startswith('"') else None
             if old is None:
                 minus = re.search(
-                    r"^--- (?:a/)?(.+)$", body, re.MULTILINE
+                    r"^--- (.+)$", body, re.MULTILINE
                 )
                 if minus and minus.group(1) != "/dev/null":
-                    old = minus.group(1).rstrip("\t")
+                    old = _unquote_diff_path(minus.group(1).rstrip("\t"))
         if old is None:
-            undecidable += 1
             continue
         if looks_like_test(old):
             subjects.setdefault(old)
-    return tuple(subjects), undecidable
-
-
-def check_tests_immutable(
-    changed: Iterable[str],
-    exists_at_base: Callable[[str], bool],
-    additive_only: Iterable[str] = (),
-) -> GateResult:
-    """Existing-test edits are AUTO-DECLARED exemption requests, bounded by
-    scope. `exists_at_base(path)` reports whether the file existed at the
-    base ref.
-
-    Within the scope bound, the edit passes THIS check — visible in the diff,
-    framed for the reviewer by the exemption notice — but authorizes nothing:
-    enforcement sits at MERGE, where auto-merge is withheld until REVIEW_BOT
-    grants each modified file against the current patch id (exemptions.py).
-    Beyond the bound the gate denies: a mass rewrite is not a correction, and
-    an unbounded auto-declaration would hand the reviewer an unreviewable
-    hazard list. The former trailer path (deny undeclared edits, teach the
-    `Gate-Exemption:` syntax) produced the #126/#163 comply-how loops — the
-    fixer could not act on its own judgment; now it can, and the reviewer
-    still explicitly approves every touched test file."""
-    subjects = modified_existing_tests(changed, exists_at_base)
-    # A path that cannot be written as a grant subject can never be granted,
-    # so admitting it would guarantee a permanent withhold and a confusing
-    # escalation later. Deny HERE, where the message can name the file and
-    # the fix is cheap (round-4 MINOR 6).
-    unrepresentable = [f for f in subjects if not valid_subject(f)]
-    if unrepresentable:
-        return deny(
-            f"existing test file '{unrepresentable[0]}' was modified, but "
-            "its path cannot be carried in a reviewer grant (allowed: "
-            "letters, digits, and . _ / + - up to 200 characters). Restore "
-            "that file and put the change in a test file whose path is "
-            "within the charset, or rename the file in a separate PR"
-        )
-    if not check_declaration_scope(RULE_TESTS_IMMUTABLE, subjects):
-        return deny(
-            f"more than {MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test "
-            "files modified/deleted — changing an existing test is allowed "
-            "(the reviewer must explicitly approve each one before merge), "
-            "but this many reads as a rewrite, not a correction; reduce the "
-            "change's scope (or split it) so at most "
-            f"{MAX_TEST_IMMUTABILITY_EXCEPTIONS} existing test files are "
-            "touched, and prefer ADDING tests in new files wherever the old "
-            "expectation is still right"
-        )
-    # Purely additive edits to an existing test file are the one shape the
-    # reviewer refuses on POLICY, not judgment ("additive coverage belongs in
-    # a new test file" — 2026-08-09 tauri batch: #620/#621/#622/#633 each
-    # burned a paid round on exactly this). Denying here converts that round
-    # into a free local move; a genuine correction (any removed/changed line)
-    # still auto-declares and goes to the reviewer as before.
-    additive = set(additive_only)
-    additive_subjects = [f for f in subjects if f in additive]
-    if additive_subjects:
-        return deny(
-            f"existing test file '{additive_subjects[0]}' was changed by "
-            "ADDING lines only — additive coverage belongs in a NEW test "
-            "file (the reviewer refuses tests-immutable grants for pure "
-            "additions); move the new tests into a new file, and modify an "
-            "existing test only where its old expectation is wrong"
-        )
-    return ALLOW
+    return tuple(subjects)
 
 
 # ── ADR citation (check-pr.sh §9) ─────────────────────────────────────────────
@@ -981,46 +811,43 @@ def check_red_is_red(
 @dataclass(frozen=True)
 class RedFailInputs:
     test_cmd: str
-    new_test_files: tuple[str, ...]   # new test files (kept at HEAD)
-    impl_files: tuple[str, ...]       # implementation/non-test changes (reverted)
+    test_files: tuple[str, ...]       # changed tests (kept at HEAD)
+    impl_files: tuple[str, ...]       # non-test, non-documentation changes (reverted)
     red_must_fail: bool = True
     base_resolvable: bool = True
     allow_untested: bool = False      # operator opt-out (ALLOW_UNTESTED=1)
 
 
 def partition_changed(
-    changed: Iterable[str], exists_at_base: Callable[[str], bool]
+    changed: Iterable[str],
 ) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    """Split a changed-file list into (new_test_files, impl_files), the partition
-    §10 needs: a NEW test file is one that looks like a test AND did not exist at
-    base; everything else is implementation (or a non-test change)."""
-    new_tests: list[str] = []
+    """Keep current test assertions while reverting implementation to base."""
+    tests: list[str] = []
     impl: list[str] = []
     for f in changed:
         if not f:
             continue
-        if looks_like_test(f) and not exists_at_base(f):
-            new_tests.append(f)
-        else:
+        if looks_like_test(f):
+            tests.append(f)
+        elif not f.lower().endswith((".md", ".rst", ".adoc")):
             impl.append(f)
-    return tuple(new_tests), tuple(impl)
+    return tuple(tests), tuple(impl)
 
 
 def check_red_fails(
     inputs: RedFailInputs,
     revert_and_run: Callable[[tuple[str, ...]], TestExecution],
 ) -> GateResult:
-    """§10: with the implementation reverted, the NEW tests MUST fail (real red).
+    """§10: with the implementation reverted, current tests MUST fail (real red).
     Catches the tautological / wrong-layer test (#39 class).
 
-    Skips (ALLOW) when: RED_MUST_FAIL=0 (explicit disable), base unresolvable, no
-    new tests (§5 owns "must add a test"), or a pure-test diff (nothing to
-    revert). NO test command is NOT a skip: it means this check never ran at all,
+    Skips (ALLOW) when: RED_MUST_FAIL=0 (explicit disable), no changed
+    tests, or a test/documentation diff (nothing to revert). NO test command
+    is NOT a skip: it means this check never ran at all,
     which is exactly how #39 slipped through, so it DENIES unless the operator set
     `allow_untested` (ALLOW_UNTESTED=1) — same rule as §1, which denies first.
-    `revert_and_run(impl_files) -> passed?` performs the transient revert + test
-    run in the worktree and is responsible for restoring HEAD; it fails OPEN
-    (returns False ⇒ red ⇒ ALLOW only via this function's logic) — see note below.
+    `revert_and_run(impl_files)` performs the transient revert + test
+    run in the worktree and is responsible for restoring HEAD.
     A passing suite with the impl gone ⇒ the tests don't exercise the change ⇒ DENY.
     """
     if not inputs.red_must_fail:
@@ -1038,10 +865,10 @@ def check_red_fails(
             "the base revision cannot be resolved, so trusted red-test evidence "
             "cannot be produced; retry after restoring the base ref"
         )
-    if not inputs.new_test_files:
-        return ALLOW  # §5 owns the "must add a test" rule
+    if not inputs.test_files:
+        return ALLOW
     if not inputs.impl_files:
-        return ALLOW  # pure-test diff: nothing to revert
+        return ALLOW  # test/documentation diff: nothing to revert
 
     execution = revert_and_run(inputs.impl_files)
     if execution.status is TestExecutionStatus.INFRA_ERROR:
@@ -1064,7 +891,7 @@ def check_red_fails(
             "the new test(s) still PASS with the implementation reverted — they do "
             "not exercise the change (tautological or wrong-layer test). Assert on "
             "the observable behaviour the change produces, not on a constant that is "
-            f"always true. New test file(s): {' '.join(inputs.new_test_files)}"
+            f"always true. Changed test file(s): {' '.join(inputs.test_files)}"
         )
     if execution.status is TestExecutionStatus.TEST_FAILED:
         return ALLOW

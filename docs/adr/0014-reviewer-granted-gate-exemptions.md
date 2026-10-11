@@ -2,7 +2,13 @@
 
 Governs: src/issue_agent/domain/exemptions.py src/issue_agent/domain/gate.py
 
-Date: 2026-08-03. Status: Accepted
+Status: Superseded by #325 (2026-10-12)
+Date: 2026-08-03.
+
+The test-modification grant chain and required-test gate have been removed.
+Existing test edits are listed from the diff for ordinary reviewer judgment.
+Red-fail, suite-green, push-time checks and test-first commit order remain.
+The decision below is retained as historical context.
 
 ## Context
 

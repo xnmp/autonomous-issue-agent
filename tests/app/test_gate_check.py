@@ -146,16 +146,3 @@ def test_restore_failure_blocks_red_authorization_in_real_shell_transport(tmp_pa
     result = invoke(repo, "pr", "pr", "create", "--base", "dev", "--body", "## Acceptance Criteria\n- token works\n\nFixes #7", env={"PATH": f"{shim}:{os.environ['PATH']}"})
     assert result.returncode == 1
     assert "infrastructure" in result.stdout
-
-
-def test_successful_but_truncated_numstat_denies_real_transport(tmp_path):
-    repo = compliant_pr_repo(tmp_path / "target")
-    shim = tmp_path / "shim"
-    shim.mkdir()
-    real_git = shutil.which("git")
-    (shim / "git").write_text(f'#!/bin/sh\ncase "$*" in *--numstat*) echo truncated; exit 0;; esac\nexec "{real_git}" "$@"\n')
-    (shim / "git").chmod(0o755)
-    result = invoke(repo, "pr", "pr", "create", "--base", "dev", "--body", "## Acceptance Criteria\n- token works\n\nFixes #7", env={"PATH": f"{shim}:{os.environ['PATH']}", "TEST_CMD": "touch suite-executed"})
-    assert result.returncode == 1
-    assert "Git history/diff facts are unavailable" in result.stdout
-    assert not (repo / "suite-executed").exists()

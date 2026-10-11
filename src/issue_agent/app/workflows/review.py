@@ -12,16 +12,14 @@ from dataclasses import dataclass, field, replace
 from typing import Protocol
 
 from ...domain import review as review_dom
-from ...domain.review_exemptions import approval_grants_cover, review_declarations
 from ...domain.events import (
     Correlation,
     TelemetryEvent,
     TelemetryWarning,
 )
 from ...domain.leg import Leg, LegTarget
-from ...domain.trust import Untrusted, as_untrusted
+from ...domain.trust import Untrusted, as_untrusted, untrusted_block
 from ..planners import tasks as task_builders
-from ..planners.schemas import review_schema_with_exemptions
 from ..planners.tasks import ReviewTaskConfig
 from ...adapters.github import format_pr_discussion
 from ...adapters.runtime_plan import AgentRuntime, ContextualRuntime
@@ -33,14 +31,7 @@ from ...domain.agent_task import (
     RuntimeCapabilities,
     RuntimeName,
 )
-from ...domain.exemptions import (
-    ExemptionDeclaration,
-    authenticated_grant_pairs,
-    open_fence_marker,
-    parse_exemption_grants,
-    render_grant_line,
-    valid_subject,
-)
+from ...domain.gate import modified_existing_tests_from_diff
 from ...domain.fix import breaker_key
 from ...domain.identity import login_eq
 from ...domain.refs import issue_from_branch
@@ -61,14 +52,9 @@ _PIN_DEFERRED_STATUS = "review_checkout_deferred"
 
 @dataclass(frozen=True)
 class _PatchShortcut:
-    """Outcome of the mechanical-rebase shortcut.
-
-    An incomplete prior approval is not settled, but its old revision must
-    remain visible to rejection accounting when the normal review runs.
-    """
+    """Outcome of the mechanical-rebase shortcut."""
 
     settled: bool = False
-    non_resetting_approval_commits: frozenset[str] = frozenset()
 
 
 def _pin_deferred(result) -> bool:
@@ -121,8 +107,6 @@ class ReviewAuthority(Protocol):
         """Whether every harness read a review of this head needs is off its backoff."""
         ...
 
-    def record_evidence(self, round: BoundReviewRound, error: str | None) -> None: ...
-
     def test_due(self, round: BoundReviewRound, patch_id: str) -> bool: ...
 
     async def submit(
@@ -141,10 +125,6 @@ class ReviewWorkflowConfig:
     review_bot: str
     review_trigger_label: str
     log: Callable[[str], None]
-    # ADR 0014 grant-authentication key. Consumed ONLY by `_grant_suffix`,
-    # harness-side; never enters an agent env or prompt. "" → no grant can
-    # be minted (declared PRs then escalate via the withheld arm).
-    exemption_mac_key: str = ""
     reviewer_runtime: RuntimeName = RuntimeName.CLAUDE
     reviewer_capabilities: RuntimeCapabilities = RUNTIME_CAPABILITIES[
         RuntimeName.CLAUDE
@@ -187,7 +167,6 @@ class ReviewWorkflow:
     # Missing composition remains representable so dispatch can report a
     # migration-required refusal before performing reads or paid work.
     authority: ReviewAuthority | None = None
-    _evidence_errors: dict[int, str] = field(default_factory=dict)
 
     def _claim_matches(self, pr, claim_target: int | None) -> bool:
         """Enforce ADR 0008's observation-to-admission target fence."""
@@ -362,14 +341,12 @@ class ReviewWorkflow:
             self.authority.finish(bound)
 
     async def _review_selected(self, pr: int, p, bound: BoundReviewRound, claim_target: int | None) -> None:
-        non_resetting_approvals = frozenset()
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
             await self._review_multi(
                 pr,
                 round_number=bound.plan.displayed_round,
                 p=p,
                 claim_target=claim_target,
-                non_resetting_approval_commits=non_resetting_approvals,
                 bound=bound,
             )
             return
@@ -408,14 +385,7 @@ class ReviewWorkflow:
                 operator_guidance=guidance,
                 discussion=discussion,
             )
-        exemption_request = self._exemption_grant_notice(p, diff)
-        if exemption_request is None:
-            self._evidence_unavailable(p, bound, "exemption declarations unreadable")
-            return
-        self._evidence_available(bound)
-        notice, declared_exemptions = exemption_request
-        if notice:
-            task = self._with_exemption_notice(task, notice, declared_exemptions)
+        task = self._with_test_changes(task, diff)
         assert self.authority is not None
         child = self.authority.stage(bound, ReviewChildKind.REVIEWER, ("review",))[0]
         result = await self._run_logged("review", pr, task, p.head_ref_oid, bound=bound, child=child)
@@ -434,18 +404,11 @@ class ReviewWorkflow:
         # self-approval from a misconfigured identity), we must NOT record a session/
         # sha — otherwise the PR looks reviewed-once and never gets retried, with no
         # review on it. State advances only on a confirmed submit.
-        counted_past = self._counted_past(
-            p, non_resetting_approvals, signature, declared_exemptions
-        )
+        counted_past = frozenset()
         prior = self._prior_rejections(bound, counted_past)
-        grant_suffix = self._grant_suffix(
-            p, signature, result, declared_exemptions
-        )
         if not await self._submit_review(
             p, result, bound.plan.displayed_round, prior,
             patch_id=signature,
-            body_suffix=grant_suffix,
-            declared_exemptions=declared_exemptions,
             bound=bound,
             counted_past=counted_past,
         ):
@@ -476,7 +439,6 @@ class ReviewWorkflow:
             self.authority.finish(bound)
 
     async def _re_review_selected(self, pr: int, p, bound: BoundReviewRound, claim_target: int | None) -> None:
-        non_resetting_approvals = frozenset()
         diff = self._revision_bound_diff(p)
         if diff is None:
             self._no_progress(p, "revision-bound diff unavailable")
@@ -491,9 +453,6 @@ class ReviewWorkflow:
         patch_shortcut = await self._bound_patch_unchanged(p, diff, signature, bound, claim_target)
         if patch_shortcut.settled:
             return
-        non_resetting_approvals |= (
-            patch_shortcut.non_resetting_approval_commits
-        )
         round_number = bound.plan.displayed_round
         if self.cfg.review_mode is review_dom.ReviewMode.MULTI:
             await self._review_multi(
@@ -502,7 +461,6 @@ class ReviewWorkflow:
                 p=p,
                 diff=diff,
                 claim_target=claim_target,
-                non_resetting_approval_commits=non_resetting_approvals,
                 bound=bound,
             )
             return
@@ -555,14 +513,7 @@ class ReviewWorkflow:
                     operator_guidance=guidance,
                     discussion=discussion,
                 )
-        exemption_request = self._exemption_grant_notice(p, diff)
-        if exemption_request is None:
-            self._evidence_unavailable(p, bound, "exemption declarations unreadable")
-            return
-        self._evidence_available(bound)
-        notice, declared_exemptions = exemption_request
-        if notice:
-            task = self._with_exemption_notice(task, notice, declared_exemptions)
+        task = self._with_test_changes(task, diff)
         assert self.authority is not None
         child = self.authority.stage(bound, ReviewChildKind.REVIEWER, ("review",))[0]
         result = await self._run_logged("re-review", pr, task, p.head_ref_oid, bound=bound, child=child)
@@ -580,18 +531,11 @@ class ReviewWorkflow:
             self._no_progress(p, f"agent error: {result.status or 'error'}")
             return
         # Submit first; advance sha/round only on a confirmed submit (see _review).
-        counted_past = self._counted_past(
-            p, non_resetting_approvals, signature, declared_exemptions
-        )
+        counted_past = frozenset()
         prior = self._prior_rejections(bound, counted_past)
-        grant_suffix = self._grant_suffix(
-            p, signature, result, declared_exemptions
-        )
         if not await self._submit_review(
             p, result, round_number, prior,
             patch_id=signature,
-            body_suffix=grant_suffix,
-            declared_exemptions=declared_exemptions,
             bound=bound,
             counted_past=counted_past,
         ):
@@ -612,7 +556,7 @@ class ReviewWorkflow:
 
         The workflow authority re-decides from a fresh read: a held or stale
         binding raises `WorkflowAuthorityError` (a hold, not a death), a
-        covered head returns None. An exemption-evidence read still backing
+        covered head returns None. An evidence read still backing
         off also returns None: its schedule, not this dispatch, decides when
         the next read happens.
         """
@@ -636,35 +580,6 @@ class ReviewWorkflow:
             )
             return None
         return bound
-
-    def _evidence_unavailable(self, p, bound: BoundReviewRound, reason: str) -> None:
-        error = self._evidence_errors.pop(p.number, "")
-        assert self.authority is not None
-        # Bounded and visible: the authority backs the read off and, at its
-        # ceiling, opens an EvidenceUnavailable hold (never an approval).
-        self.authority.record_evidence(bound, f"{reason}: {error}" if error else reason)
-        self.authority.stop(bound, ReviewPlanningRefused("harness-evidence:" + bound.plan.round.round_id))
-        self.cfg.log(f"review #{p.number}: {reason} — scheduled evidence read recorded")
-
-    def _evidence_available(self, bound: BoundReviewRound) -> None:
-        assert self.authority is not None
-        self.authority.record_evidence(bound, None)
-
-    def _counted_past(
-        self, p, non_resetting: frozenset[str],
-        patch_id: str, declared: tuple[ExemptionDeclaration, ...],
-    ) -> frozenset[str]:
-        """Approvals the rejection count runs past without a reset.
-
-        A current-head approval is
-        non-resetting only when its authenticated grants do not cover this
-        revision's declarations (ADR 0014), never merely for being there.
-        """
-        latest = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
-        if (latest is not None and latest.state == "APPROVED" and latest.commit_id == p.head_ref_oid
-                and not self._grants_cover(p, patch_id, declared)):
-            return non_resetting | {p.head_ref_oid}
-        return non_resetting
 
     def _prior_rejections(
         self, bound: BoundReviewRound, non_resetting: frozenset[str]
@@ -703,20 +618,8 @@ class ReviewWorkflow:
         prior = review_dom.latest_reviewer_verdict(p, self.cfg.review_bot)
         if prior is None or prior.commit_id != bound.baseline_head:
             return _PatchShortcut()
-        if prior.state == "CHANGES_REQUESTED" and review_dom.UNGRANTED_DOWNGRADE_MARKER in prior.body:
+        if review_dom.UNGRANTED_DOWNGRADE_MARKER in prior.body:
             return _PatchShortcut()
-        if prior.state == "APPROVED":
-            complete = self._approval_grants_complete(p, diff)
-            if complete is None:
-                self._evidence_unavailable(
-                    p, bound, "exemption declarations unreadable for unchanged patch"
-                )
-                return _PatchShortcut(settled=True)
-            self._evidence_available(bound)
-            if not complete:
-                return _PatchShortcut(
-                    non_resetting_approval_commits=frozenset({bound.baseline_head})
-                )
         event = {"APPROVED": "APPROVE", "CHANGES_REQUESTED": "REQUEST_CHANGES"}.get(prior.state)
         if event is None:
             return _PatchShortcut()
@@ -739,224 +642,17 @@ class ReviewWorkflow:
         self._cleanup_checkout(p.number)
         return _PatchShortcut(settled=True)
 
-    def _approval_grants_complete(self, p, diff: str) -> bool | None:
-        """Whether existing approvals authorize every current declaration.
-
-        None is transient evidence failure, not an empty declaration set.
-        Grant syntax is aggregated across every reviewer-bot approval and then
-        MAC-, issue-, and patch-checked exactly as at merge. A later refusal or
-        omission does not revoke authority already granted for identical patch
-        content (ADR 0014).
-        """
-        request = self._exemption_grant_notice(p, diff)
-        if request is None:
-            return None
-        _notice, declarations = request
-        return self._grants_cover(p, review_dom.patch_signature(diff), declarations)
-
-    def _grants_cover(self, p, patch_id: str, declarations: tuple[ExemptionDeclaration, ...]) -> bool:
-        """Whether the reviewer's approvals authenticate every declaration for this patch (no reads)."""
-        if not declarations:
-            return True
-        return approval_grants_cover(
-            p.reviews, review_bot=self.cfg.review_bot, declarations=declarations,
-            issue_number=issue_from_branch(p.head_ref_name), patch_id=patch_id,
-            mac_key=self.cfg.exemption_mac_key,
-        )
-
-    _EXEMPTION_JUDGMENT = {
-        "tests-immutable": (
-            "grant ONLY if the existing test encodes a wrong expectation "
-            "(the test itself is the bug) and this diff corrects it without "
-            "weakening what the suite verifies; additive coverage belongs "
-            "in a new test file and does not justify modifying an existing "
-            "test file; wholesale rewriting existing tests is refused"
-        ),
-        "required-test": (
-            "grant ONLY if this change GENUINELY cannot be covered by a "
-            "meaningful automated test (pure config, comment-only, tooling "
-            "glue); 'a test would be tedious' is a refusal"
-        ),
-    }
-
-    def _exemption_grant_notice(
-        self, p, diff: str
-    ) -> tuple[str, tuple[ExemptionDeclaration, ...]] | None:
-        """ADR 0014: when the PR's commits declare gate exemptions, tell the
-        reviewer to grant via the STRUCTURED `exemption_grants` field — never
-        via body text. The harness renders the authenticated grant lines
-        itself (`_grant_suffix`), binding the patch id the model never sees;
-        prose can therefore quote or discuss anything without minting
-        authority (round-2 adversarial review: string-matching grants out of
-        prose survived fence-quoting tricks).
-
-        Returns (notice, declarations); ("", ()) when there are none; None
-        when commit-message evidence is unreadable. That last state is not
-        declaration absence: a hidden `required-test` trailer would otherwise
-        produce an approved-but-unmergeable review. A branch with no issue
-        binding still returns its declarations: no grant can be minted for it,
-        so an approval must become REQUEST_CHANGES rather than repeat that
-        same dead end.
-
-        tests-immutable subjects are AUTO-DECLARED from the same
-        revision-checked diff being reviewed — the merge-side collector
-        derives its subjects from the identical text, so the reviewer is
-        always asked about exactly the set the merge rule will require.
-        required-test stays trailer-declared (stated intent the diff cannot
-        carry); a trailer read failure only costs that rule's notice.
-
-        MULTI-mode reviews do not carry the notice yet — their verdict body
-        is synthesized, not authored in one leg; a declared PR under MULTI
-        escalates via the withheld-exemption arm in decide_fix."""
-        try:
-            messages = self.gateway.pr_commit_messages(p.number)
-        except Exception as exc:  # noqa: BLE001 — notice is an arm, not a gate
-            self.cfg.log(
-                f"review #{p.number}: exemption trailers unreadable ({exc}) — "
-                "deferring without a verdict"
-            )
-            self._evidence_errors[p.number] = f"{type(exc).__name__}: {exc}"[:512]
-            return None
-        declared = review_declarations(diff, messages)
-        if not declared:
-            return "", ()
-        judgments = "\n".join(
-            f"- `{rule}`: {self._EXEMPTION_JUDGMENT.get(rule, 'no guidance — refuse')}"
-            for rule in {d.rule for d in declared}
-        )
-        declared_list = "\n".join(
-            f'- rule="{d.rule}" subject="{d.subject}"' for d in declared
-        )
-        notice = (
-            "\n\n## Gate exemption REQUESTED\n"
-            "This change requests gate exemptions (modified existing test "
-            "files are automatic requests; `required-test` is declared by "
-            "trailer):\n"
-            f"{declared_list}\n"
-            "The gate admitted the change so you can judge it; the PR "
-            "cannot auto-merge until you explicitly grant "
-            "each request. DEFAULT IS REFUSE. Judgment per rule:\n"
-            f"{judgments}\n"
-            "To grant a declaration, your verdict must be APPROVE and your "
-            "structured output must list that exact {rule, subject} pair in "
-            "the `exemption_grants` field. Body text NEVER grants — do not "
-            "write grant syntax in prose. To refuse, omit the pair (or the "
-            "whole field) and explain the refusal in your body. Grants bind "
-            "to the current diff; any new push voids them and a fresh "
-            "review must re-grant."
-        )
-        return notice, tuple(declared)
-
     @staticmethod
-    def _with_exemption_notice(
-        task, notice: str, declarations: tuple[ExemptionDeclaration, ...]
-    ):
-        """Attach the exemption notice AND swap in the enum-constrained
-        review schema: `exemption_grants` exists only on declared PRs and
-        each entry is an object-level enum over exactly the declared
-        {rule, subject} pairs, so an undeclared or cross-matched grant is
-        unrepresentable at generation time — not merely dropped later.
-        A task with a non-review schema (no `decision`) keeps its schema."""
-        intent = task.intent
-        schema = intent.schema
-        if not schema or "decision" not in schema.get("properties", {}):
-            # No structured verdict channel → the notice would instruct a
-            # field the model cannot emit (round-3 MINOR 9). Skip both; the
-            # declared PR then escalates via the withheld arm, fail closed.
+    def _with_test_changes(task, diff: str):
+        paths = modified_existing_tests_from_diff(diff)
+        if not paths:
             return task
-        schema = review_schema_with_exemptions(
-            [(d.rule, d.subject) for d in declarations]
+        notice = (
+            "\n\n## Existing tests modified or deleted\n"
+            "Judge each change explicitly for skipped or weakened coverage.\n"
+            + untrusted_block("existing_test_paths", as_untrusted("\n".join(f"- {path}" for path in paths)))
         )
-        return replace(
-            task,
-            intent=replace(
-                intent, prompt=intent.prompt + notice, schema=schema
-            ),
-        )
-
-    def _grant_suffix(
-        self,
-        p,
-        signature: str,
-        result,
-        declarations: tuple[ExemptionDeclaration, ...],
-    ) -> str:
-        """Render the authenticated grant lines for the reviewer's structured
-        `exemption_grants` — the ONLY path that mints grant syntax (ADR
-        0014). Validation is allowlist-shaped: decision must be APPROVE, and
-        each {rule, subject} entry must match a declaration verbatim;
-        anything else is dropped and logged, never guessed at. The patch id
-        comes from the harness's own revision-checked diff — the model never
-        sees it, so a hallucinated or prompt-injected grant cannot bind."""
-        raw = result.field("exemption_grants")
-        if not raw or not isinstance(raw, list):
-            return ""
-        if result.field("decision") != "APPROVE":
-            self.cfg.log(
-                f"review #{p.number}: exemption_grants on a non-APPROVE "
-                "verdict — ignored (only an approval grants)"
-            )
-            return ""
-        if not self.cfg.exemption_mac_key:
-            self.cfg.log(
-                f"review #{p.number}: reviewer granted exemptions but no "
-                "EXEMPTION_MAC_KEY/REVIEW_BOT_TOKEN key material is "
-                "configured — grants cannot be authenticated, none minted"
-            )
-            return ""
-        issue = issue_from_branch(p.head_ref_name)
-        if issue is None or not signature:
-            return ""
-        declared = set(declarations)
-        lines: dict[str, None] = {}
-        dropped = 0
-        for entry in raw[:32]:  # a loose runtime can't spam unbounded logs
-            if not isinstance(entry, dict):
-                continue
-            candidate = ExemptionDeclaration(
-                str(entry.get("rule", "")), str(entry.get("subject", ""))
-            )
-            if candidate not in declared:
-                dropped += 1
-                if dropped <= 5:
-                    self.cfg.log(
-                        f"review #{p.number}: grant for undeclared "
-                        f"exemption rule={candidate.rule!r} "
-                        f"subject={candidate.subject!r} — dropped"
-                    )
-                continue
-            if not valid_subject(candidate.subject):
-                # An auto-declared diff path outside the grant grammar's
-                # charset cannot be rendered; report the real cause instead
-                # of silently losing the grant (the PR then escalates with
-                # this subject named as ungranted).
-                self.cfg.log(
-                    f"review #{p.number}: granted subject "
-                    f"{candidate.subject!r} is outside the grant grammar "
-                    "charset — cannot mint; the merge side will withhold"
-                )
-                continue
-            lines.setdefault(
-                render_grant_line(
-                    self.cfg.exemption_mac_key,
-                    candidate.rule,
-                    issue,
-                    candidate.subject,
-                    signature,
-                )
-            )
-        if dropped > 5:
-            self.cfg.log(
-                f"review #{p.number}: …and {dropped - 5} more undeclared "
-                "grant entries dropped"
-            )
-        if not lines:
-            return ""
-        self.cfg.log(
-            f"review #{p.number}: reviewer granted {len(lines)} gate "
-            "exemption(s) via structured output"
-        )
-        return "\n\n" + "\n".join(lines)
+        return replace(task, intent=replace(task.intent, prompt=task.intent.prompt + notice))
 
     def _pr_discussion(self, p) -> Untrusted | None:
         """The PR conversation as bounded UNTRUSTED data, or None when empty.
@@ -1017,7 +713,6 @@ class ReviewWorkflow:
         p=None,
         diff: str | None = None,
         claim_target: int | None = None,
-        non_resetting_approval_commits: frozenset[str] = frozenset(),
         *, bound: BoundReviewRound,
     ) -> None:
         """The /code-review pattern as dispatcher orchestration: skip-gate →
@@ -1052,24 +747,10 @@ class ReviewWorkflow:
         rcfg = self.cfg.review
         guidance = bound.guidance
         discussion = self._pr_discussion(p)
-        exemption_request = self._exemption_grant_notice(p, diff)
-        if exemption_request is None:
-            self._evidence_unavailable(p, bound, "exemption declarations unreadable")
-            return
-        self._evidence_available(bound)
-        _notice, declared_exemptions = exemption_request
-        grant_resolution = self._grant_resolution(
-            p,
-            signature,
-            body_suffix="",
-            declared_exemptions=declared_exemptions,
-        )
         # Escalation counts the reviewer's OWN prior rejections, not pushes (a
         # rebase that lands here without a prior REQUEST_CHANGES must not consume a
         # round). Derived from GitHub review state, robust across daemon restarts.
-        counted_past = self._counted_past(
-            p, non_resetting_approval_commits, signature, declared_exemptions
-        )
+        counted_past = frozenset()
         prior = self._prior_rejections(bound, counted_past)
 
         # 1. skip-gate — a pure doc/format/config diff short-circuits to APPROVE.
@@ -1079,14 +760,14 @@ class ReviewWorkflow:
         assert self.authority is not None
         gate_child = self.authority.stage(bound, ReviewChildKind.GATE, ("gate",))[0]
         gate = await self._run_logged("review-gate", pr, head_sha=p.head_ref_oid, bound=bound, child=gate_child, task=
-            task_builders.build_review_gate_task(
+            self._with_test_changes(task_builders.build_review_gate_task(
                 pr,
                 as_untrusted(p.title),
                 as_untrusted(p.body),
                 as_untrusted(diff),
                 rcfg,
                 operator_guidance=guidance,
-            ),
+            ), diff),
         )
         if self._pin_deferral(p, gate):
             return
@@ -1099,16 +780,14 @@ class ReviewWorkflow:
         # Fail SAFE: a degenerate gate result (is_error=False but empty envelope)
         # must default to reviewable=True — the conservative choice is to RUN the
         # full review, never to silently APPROVE unreviewed code. Only an explicit
-        # reviewable=false short-circuits.
-        if not gate.field_bool("reviewable", default=True):
-            target = review_dom.ReviewTarget(
-                issue_from_branch(p.head_ref_name), signature
-            )
+        # reviewable=false can skip only diffs without existing-test edits.
+        if (
+            not gate.field_bool("reviewable", default=True)
+            and not modified_existing_tests_from_diff(diff)
+        ):
             sub = review_dom.gate_submission(
                 prior,
                 self.cfg.max_review_rejections,
-                grant_resolution=grant_resolution,
-                target=target,
             )
             self.cfg.log(
                 f"review #{pr}: gate says non-reviewable "
@@ -1129,7 +808,7 @@ class ReviewWorkflow:
         dim_children = self.authority.stage(bound, ReviewChildKind.DIMENSION, tuple(key for key, _ in dims))
         dim_results = await self._gather_legs([
             self._run_logged(f"review:{key}", pr, head_sha=p.head_ref_oid, bound=bound, child=child, task=
-                task_builders.build_review_dimension_task(
+                self._with_test_changes(task_builders.build_review_dimension_task(
                     pr,
                     key,
                     focus,
@@ -1139,7 +818,7 @@ class ReviewWorkflow:
                     rcfg,
                     operator_guidance=guidance,
                     discussion=discussion,
-                )
+                ), diff)
             )
             for (key, focus), child in zip(dims, dim_children)
         ])
@@ -1217,10 +896,6 @@ class ReviewWorkflow:
             prior,
             self.cfg.max_review_rejections,
             complete=complete,
-            grant_resolution=grant_resolution,
-            target=review_dom.ReviewTarget(
-                issue_from_branch(p.head_ref_name), signature
-            ),
         )
         if sub is None:
             self.cfg.log(f"review #{pr}: incomplete and no blocking finding — "
@@ -1252,8 +927,6 @@ class ReviewWorkflow:
         round_number: int,
         prior_rejections: int,
         patch_id: str,
-        body_suffix: str = "",
-        declared_exemptions: tuple[ExemptionDeclaration, ...] = (),
         *, bound: BoundReviewRound,
         counted_past: frozenset[str] = frozenset(),
     ) -> bool:
@@ -1262,46 +935,11 @@ class ReviewWorkflow:
         untouched so the PR is retried next poll rather than stranded as "reviewed".
         `round_number` is for the human-facing log line only; `prior_rejections`
         (the reviewer's own prior REQUEST_CHANGES count) drives the escalation
-        ceiling. `body_suffix` is HARNESS-authored trusted text appended after
-        the model's body — today the ADR 0014 grant lines from `_grant_suffix`,
-        the only place grant syntax is minted. `declared_exemptions` is the
-        revision-derived set the same review was asked to grant. Completeness
-        aggregates authenticated grants from every existing reviewer approval
-        plus the current suffix: ADR 0014 binds authority to patch content, so
-        a later omission cannot revoke an earlier valid grant for this patch."""
+        ceiling."""
         pr = p.number
-        grant_resolution = self._grant_resolution(
-            p,
-            patch_id,
-            body_suffix=body_suffix,
-            declared_exemptions=declared_exemptions,
-        )
-        rejected_exemptions = (
-            grant_resolution.requests
-            if isinstance(grant_resolution, review_dom.RejectedExemptions)
-            else ()
-        )
-        # A partial grant cannot survive a REQUEST_CHANGES review: the merge
-        # collector intentionally trusts grant lines only in APPROVED reviews.
-        # Drop all newly minted lines on this round and require a complete set
-        # across existing approvals plus the next approval, rather than publishing
-        # authority-shaped text in a review whose actual event denies the patch.
-        effective_suffix = "" if rejected_exemptions else body_suffix
-        body = result.field("body") or ""
-        if effective_suffix:
-            # A model body ending inside an unclosed fence would swallow the
-            # harness's grant lines and later escalate with a false "the
-            # reviewer did not grant" (round-3 MINOR 7). Close it first.
-            dangling = open_fence_marker(body)
-            if dangling:
-                body += f"\n{dangling}"
         sub = review_dom.review_submission(
-            result.field("decision"), body + effective_suffix,
+            result.field("decision"), result.field("body") or "",
             prior_rejections, self.cfg.max_review_rejections,
-            grant_resolution=grant_resolution,
-            target=review_dom.ReviewTarget(
-                issue_from_branch(p.head_ref_name), patch_id
-            ),
         )
         posted = await self._post(sub, bound, patch_id, counted_past)
         if posted is None:
@@ -1318,38 +956,3 @@ class ReviewWorkflow:
             f"review #{pr} r{round_number}{tally}: submitted {posted.event}{escalated}"
         )
         return True
-
-    def _grant_resolution(
-        self,
-        p,
-        patch_id: str,
-        *,
-        body_suffix: str,
-        declared_exemptions: tuple[ExemptionDeclaration, ...],
-    ) -> review_dom.GrantResolution:
-        """Prove complete grants or return the exact requests that forbid APPROVE."""
-        grants = [
-            grant
-            for review in p.reviews
-            if review.state == "APPROVED"
-            and login_eq(review.author, self.cfg.review_bot)
-            for grant in parse_exemption_grants(review.body)
-        ]
-        grants.extend(parse_exemption_grants(body_suffix))
-        granted = authenticated_grant_pairs(
-            grants,
-            issue_number=issue_from_branch(p.head_ref_name),
-            patch_id=patch_id,
-            mac_key=self.cfg.exemption_mac_key,
-        )
-        required = tuple(
-            (declaration.rule, declaration.subject)
-            for declaration in declared_exemptions
-        )
-        return review_dom.resolve_authenticated_grants(
-            required,
-            granted,
-            target=review_dom.ReviewTarget(
-                issue_from_branch(p.head_ref_name), patch_id
-            ),
-        )

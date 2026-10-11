@@ -2,8 +2,8 @@
 
 These reads decide what a review may do; none may be guessed:
 
-- `EXEMPTION_TRAILERS`: the PR's commit trailers declaring gate exemptions
-  (ADR 0014). Unreadable is never "no declarations".
+- `EXEMPTION_TRAILERS`: retained only to decode and release historical
+  ADR 0014 holds; new reviews do not read trailers.
 - `REVIEW_HISTORY`: the complete paginated review list the rejection ceiling
   is counted from, and that settling an escalation re-reads. A partial read
   can neither count nor disprove the ceiling.
@@ -79,10 +79,6 @@ def evidence_gate_id(kind: ReviewEvidenceKind, pr: int, head_sha: str) -> str:
     return f"{kind.value}:" + hashlib.sha256(f"{pr}:{head_sha}".encode()).hexdigest()
 
 
-def exemption_evidence_gate_id(pr: int, head_sha: str) -> str:
-    return evidence_gate_id(ReviewEvidenceKind.EXEMPTION_TRAILERS, pr, head_sha)
-
-
 def review_evidence_gate_kind(gate: object) -> ReviewEvidenceKind | None:
     """The evidence kind a gate holds a review on, or None for any other gate."""
     opened = gate.gate if isinstance(gate, RearmingGate) else gate
@@ -101,10 +97,6 @@ def is_review_evidence_gate(gate: object) -> bool:
     return review_evidence_gate_kind(gate) is not None
 
 
-def is_exemption_evidence_gate(gate: object) -> bool:
-    return review_evidence_gate_kind(gate) is ReviewEvidenceKind.EXEMPTION_TRAILERS
-
-
 @dataclass(frozen=True)
 class EvidenceSchedule:
     """The read history of one head's evidence of one kind (never a verdict)."""
@@ -119,16 +111,10 @@ class EvidenceSchedule:
         validate_workflow_text(self.last_error, "review evidence error", limit=MAX_DETAIL_CHARS)
 
 
-ExemptionEvidenceSchedule = EvidenceSchedule
-
-
 @dataclass(frozen=True)
 class EvidenceProgress:
     schedule: EvidenceSchedule
     gate: OpenGate | None
-
-
-ExemptionEvidenceProgress = EvidenceProgress
 
 
 def unavailable_evidence(
@@ -214,14 +200,6 @@ def unavailable_first_observation(
     return ObservationProgress(history, exhausted, exhausted and not surfaced)
 
 
-def unavailable_exemption_evidence(
-    binding: WorkflowBinding, head_sha: str, prior: EvidenceSchedule | None, *, now: datetime,
-    error: str, policy: ReconciliationPolicy = ReconciliationPolicy(),
-) -> EvidenceProgress:
-    return unavailable_evidence(ReviewEvidenceKind.EXEMPTION_TRAILERS, binding, head_sha, prior, now=now,
-                                error=error, policy=policy)
-
-
 def evidence_due(schedule: EvidenceSchedule | None, head_sha: str, *, now: datetime) -> bool:
     """Whether a read of this head's evidence may be attempted now."""
     if not isinstance(now, datetime) or now.utcoffset() is None:
@@ -229,6 +207,3 @@ def evidence_due(schedule: EvidenceSchedule | None, head_sha: str, *, now: datet
     if schedule is None or schedule.head_sha != head_sha:
         return True
     return schedule.history.next_read_at <= now
-
-
-exemption_evidence_due = evidence_due

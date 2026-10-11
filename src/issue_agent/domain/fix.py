@@ -56,12 +56,6 @@ from .ci import (
     pending_checks,
     pending_deadline_breached,
 )
-from .exemptions import (
-    EXEMPTIONS_PERMIT,
-    EXEMPTIONS_WITHHELD,
-    ExemptionFacts,
-    exemption_status,
-)
 from .identity import login_eq
 from .checks import Observed, Unavailable
 from . import continuation_components as cc
@@ -101,16 +95,6 @@ class FixConfig:
     # A plain "three"/"solo" string still compares equal (str-Enum), so a
     # hand-built config keeps working; the config boundary hands over a member.
     identity_mode: IdentityMode = IdentityMode.THREE
-    # REVIEW_BOT's login, needed ONLY by the #124 test-immutability exemption
-    # rule in should_automerge (the fixer must prove the granter is a distinct
-    # identity, never itself). "" is safe: with no declared exemptions the rule
-    # is inert, and WITH declarations an unknown reviewer identity fails closed
-    # (the trust anchor cannot be verified, so no exemption is available).
-    review_bot: str = ""
-    # HMAC key authenticating reviewer grant lines (ADR 0014): harness-held,
-    # never placed in any agent environment or prompt. "" fails closed —
-    # declared PRs withhold with a "no grant-authentication key" reason.
-    exemption_mac_key: str = ""
     auto_merge: bool = True
     merge_method: str = "squash"
     close_issue_on_merge: bool = True
@@ -170,13 +154,6 @@ class FixState:
     # thread and PR thread, whose timestamps are unrelated.
     pr_resumed_at: dict[int, str] = field(default_factory=dict)
     pr_reply_control_errors: Mapping[int, str] = field(default_factory=dict)
-    # PR → the #124 test-immutability-exemption facts the app layer observed:
-    # declared test files (from the change's tracked declaration), REVIEW_BOT-
-    # authenticated grants, and the PR's current patch id. Absent key = nothing
-    # observed = no declarations, which leaves should_automerge untouched (the
-    # anti-vacuity contract). Grants must be authorship-filtered BEFORE they
-    # land here — see exemptions.ExemptionFacts (ADR 0012).
-    test_exemptions: dict[int, ExemptionFacts] = field(default_factory=dict)
     # Per-issue retry counters (issue → count). Drive the circuit breakers: an
     # unbounded fix-CI / address-review loop burns budget forever, so at the cap
     # we escalate to a human instead of re-dispatching. Default 0 (no attempts).
@@ -665,12 +642,7 @@ def prs_needing_resume(
 
 
 def automerge_in_scope(pr: PRView, cfg: FixConfig) -> bool:
-    """Is this PR one the harness would EVER auto-merge, config and identity
-    aside from readiness? Shared by `should_automerge` and the ADR 0014
-    withheld-exemption escalation so the escalation cannot fire on a PR the
-    harness would not have merged anyway (AUTO_MERGE off, a stranger's
-    branch, two-identity mode, conflicted/non-CLEAN) — there "withheld" is
-    not what stands between the PR and a merge, and the message would lie."""
+    """Whether this PR is in the configured auto-merge scope."""
     if not cfg.auto_merge:
         return False
     if not pr.head_ref_oid:
@@ -713,25 +685,11 @@ def should_automerge(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
         return False
     if not merge_preconditions_met(pr, cfg):
         return False
-    # #124/ADR 0014: a PR whose change declares gate exemptions may EXIST
-    # (the commit gate lets a declared violation through so the reviewer can
-    # see it) but must not LAND until REVIEW_BOT grants every declaration
-    # against the current patch id. Durably withheld is TERMINAL for this
-    # head — the PR is already reviewed, nothing re-runs the reviewer — so
-    # decide_fix pairs that verdict with a one-shot escalation; UNVERIFIABLE
-    # facts (a gh outage, an oversized fetch) also refuse the merge but are
-    # retried next tick, never escalated with a false "reviewer refused"
-    # reason. A PR with no observed facts (absent key) is unaffected.
-    return exemption_merge_status(pr, state, cfg)[0] == EXEMPTIONS_PERMIT
+    return True
 
 
 def merge_preconditions_met(pr: PRView, cfg: FixConfig) -> bool:
-    """Distinct APPROVED review at the exact head + CI ok/none — the
-    merge-readiness half of `should_automerge`, shared with the app-layer
-    exemption-facts collector so the two can never disagree about WHICH PRs
-    need facts before a merge decision (a collector predicate looser or
-    tighter than this one would either waste gh calls or let a declared PR
-    merge factless)."""
+    """Distinct approval at the exact head and successful or absent CI."""
     review = latest_other_review(pr.reviews, cfg.fix_bot)
     if (
         review is None
@@ -743,25 +701,6 @@ def merge_preconditions_met(pr: PRView, cfg: FixConfig) -> bool:
     return ci_state(
         pr.ci
     ) in (CIState.OK, CIState.NONE)
-
-
-def exemption_merge_status(
-    pr: PRView, state: FixState, cfg: FixConfig
-) -> tuple[str, str]:
-    """(verdict, reason) from the observed exemption facts (ADR 0014).
-    A PR with no observed facts permits — merge-readiness alone never
-    withholds."""
-    facts = state.test_exemptions.get(pr.number)
-    if facts is None:
-        return (EXEMPTIONS_PERMIT, "")
-    return exemption_status(
-        facts,
-        issue_number=issue_from_branch(pr.head_ref_name),
-        identity_mode=cfg.identity_mode,
-        fix_bot=cfg.fix_bot,
-        review_bot=cfg.review_bot,
-        mac_key=cfg.exemption_mac_key,
-    )
 
 
 def should_update_branch(pr: PRView, state: FixState, cfg: FixConfig) -> bool:
@@ -2075,30 +2014,6 @@ def decide_fix(
                     pr.number, cfg.merge_method, pr.head_ref_oid
                 )
             )
-        elif automerge_in_scope(pr, cfg) and merge_preconditions_met(pr, cfg):
-            # ADR 0014: approved at head, CI green, but exemption facts
-            # refuse the merge. Only a DURABLE refusal escalates: the
-            # reviewer already reviewed this head and nothing dispatches
-            # another round, so "wait" means "poll forever, silently"
-            # (adversarial review BLOCKER 2). UNVERIFIABLE facts (gh outage,
-            # oversized fetch) withhold WITHOUT escalating — retried next
-            # tick, and the collector journals the cause; escalating them
-            # would hand a human a healthy PR with a false reason (round-2
-            # MAJOR). The label swap makes the escalation one-shot, and a
-            # new push voids the whole situation anyway (grants re-bind to
-            # the new patch id).
-            verdict, reason = exemption_merge_status(pr, state, cfg)
-            if verdict == EXEMPTIONS_WITHHELD:
-                actions.extend(_escalate_pr(
-                    pr.number,
-                    f"this PR is otherwise merge-ready, but {reason} — "
-                    "auto-merge is withheld by design (ADR 0014). A human "
-                    "must either merge by hand (accepting the declared "
-                    "violation), dismiss the review to force a fresh "
-                    "round, or close the PR. Note: unparking without "
-                    "changing anything re-escalates immediately — the "
-                    "facts have not changed.",
-                ))
         if should_update_branch(pr, state, cfg):
             actions.append(
                 UpdateBranch(pr.number, pr.head_ref_oid)

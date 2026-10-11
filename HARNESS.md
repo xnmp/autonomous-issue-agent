@@ -644,7 +644,7 @@ configured role roots and repeatable `--legacy-state-dir` roots. A complete
 fresh bot-review history must corroborate both valid `last-sha` and `patch-id`
 before they import as a reviewed baseline. Otherwise the open PR owes a fresh
 review. Guidance imports verbatim; closed PR records remain evidence only.
-Fresh counting and exemption evidence may import a rejection ceiling only
+Fresh counting evidence may import a rejection ceiling only
 where legacy review holds it, including the abandoned-at-head escalation case.
 The latest bot escalation must prove the rejection-ceiling preamble; an
 independent ESCALATE verdict remains a separate hold. Unknown hold provenance

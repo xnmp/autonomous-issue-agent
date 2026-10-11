@@ -40,6 +40,8 @@ Test coverage must match the CHANGE TYPE (judge by the diff + PR intent, not pro
   a test demand where there is no behaviour to assert.
 
 ## Dimension 6 — Proof of work / no signal suppression
+Review each listed existing test modification or deletion explicitly for lost
+coverage, weakened assertions, and skipped or disabled tests.
 REQUEST_CHANGES if the PR makes a check pass by SUPPRESSING a quality/security
 signal for the code it adds or modifies: adding the changed file to coverage or
 analysis exclusions (e.g. `sonar.coverage.exclusions`), lowering a quality-gate

@@ -147,7 +147,13 @@ The fixer is governed at two levels:
 - **The gates** (`domain/gate.py` for the SDK path, `plugin/hooks/checks/*.sh`
   for codex mode) enforce the PR/push/commit contract: base branch, acceptance
   criteria, test runs, red-before-green, evidence images, ADR citations,
-  lint/typecheck.
+  lint/typecheck. Red-fail preserves changed test files, including additions to
+  existing files, and executes the suite with implementation changes reverted.
+  Existing-test edits are listed as untrusted diff evidence for reviewers; in
+  multi-review they require specialist review even if the skip classifier
+  reports no behavioural change. No test-edit grants or exemption trailers
+  authorize publication or merge. Historical grant-only downgrades require a
+  fresh review rather than being copied onto rebased heads.
 
 Those two gate implementations shared a *spec*, not code, and had already
 drifted when the review checked. They are now pinned by
@@ -610,9 +616,6 @@ shared by lifecycle policy and durable action payloads without an import cycle),
 `domain/effort.py`, `domain/environment.py`
 (the harness-attested capability manifest: what the boot probe saw, and the
 narrow conditions under which it may state a verdict rather than facts),
-`domain/exemptions.py`
-(the #124 reviewer-granted gate exemptions: declaration/grant grammar, the
-exemptable-vs-security rule classification, and the merge-withholding rule),
 `domain/events.py`, `domain/fix.py`, `domain/gate.py`,
 `domain/measurement.py` (validated incident/intervention observations),
 `domain/cohort.py` (pure admission-cohort arithmetic and explicit coverage),
@@ -638,7 +641,7 @@ blockers and #168 budget headroom — with a per-issue self-clear ceiling),
 `domain/workflow_ports.py`, `domain/workflow_policy.py`,
 `domain/workflow_reconciliation.py`, `domain/workflow_retry.py`, `domain/resolve_return.py`, `domain/resolve_split.py`,
 `domain/resolve_workspace.py`, `domain/resolve_rearm.py`, `domain/resolve_activation.py`,
-`domain/review_activation.py`, `domain/review_exemptions.py`, `domain/review_linkage.py`,
+`domain/review_activation.py`, `domain/review_linkage.py`,
 `domain/review_execution.py` (pure current execution authority and bounded ordered unresolved-suffix fold),
 `domain/review_execution_activation.py` (typed stopped import identity, ownership and selected raw source observations),
 `domain/review_execution_counter_mapping.py` (offline attribution of legacy issue and negated-PR counter files from complete open-PR linkage observations; shared issue keys block),
@@ -664,7 +667,7 @@ preparation obligations, not AUTHOR evidence or independent execution authority;
 family activation plans legacy imports offline and refuses rather than defaulting;
 an operator retry authorization buys exactly one execution of an existing
 reconciliation-only command after harness-proven absence; an unreadable
-exemption-trailer, review-history or linked-issue read backs off to a visible,
+review-history or linked-issue read backs off to a visible,
 never-approving hold; linked issue lifecycle and SQL holds are joined into review
 admission, operator facts and applicable effects; the review daemon's plan records its own per-pull-request dispatch
 decision, with the facts and the read it came from and an as-of time, which the

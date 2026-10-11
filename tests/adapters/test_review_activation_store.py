@@ -11,7 +11,7 @@ from issue_agent.adapters import review_activation as module
 from issue_agent.adapters.control_store import CorruptControlStore, SQLiteControlStore
 from issue_agent.adapters.review_activation import (
     ReviewActivationRefused, ReviewActivationSourcesChanged, SQLiteReviewActivation,
-    read_activation_commit_messages, read_legacy_review_roots, read_legacy_review_state,
+    read_legacy_review_roots, read_legacy_review_state,
 )
 from issue_agent.domain.labels import Label
 from issue_agent.domain.resolve_activation import ActivationBlocked, UnmappedLegacyEntry
@@ -168,27 +168,8 @@ def test_inventory_does_not_create_missing_authority(tmp_path):
     assert not (tmp_path / "missing").exists()
 
 
-@pytest.mark.parametrize("raw", [None, [], [[]], [[{}]], [[{"sha": HEAD, "commit": {}}]],
-    [[{"sha": "d" * 40, "commit": {"message": "moved head"}}]],
-    [[{"sha": HEAD, "commit": {"message": "same"}}] * 2],
-    [[{"sha": f"{number:040x}", "commit": {"message": "many"}} for number in range(250)]]])
-def test_incomplete_commit_trailers_never_count_approval_as_resetting(raw):
-    class Gateway:
-        def _gh_json(self, args):
-            return raw
-
-    with pytest.raises(ValueError):
-        read_activation_commit_messages(Gateway(), "o/r", 7, HEAD)
 
 
-def test_complete_commit_pages_keep_every_message_and_pin_the_head():
-    class Gateway:
-        def _gh_json(self, args):
-            assert args == ["api", "--paginate", "--slurp", "repos/o/r/pulls/7/commits?per_page=100"]
-            return [[{"sha": "b" * 40, "commit": {"message": "old\nbody"}}],
-                    [{"sha": HEAD, "commit": {"message": "head"}}]]
-
-    assert read_activation_commit_messages(Gateway(), "o/r", 7, HEAD) == ("old\nbody", "head")
 
 
 def test_review_activation_preserves_an_already_activated_resolve_family(control, state):

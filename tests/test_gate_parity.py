@@ -595,14 +595,6 @@ def _weakened_test_repo(tmp_path: Path) -> Path:
     return repo
 
 
-# ── #124 reviewer exemptions ─────────────────────────────────────────────────
-# Two request paths, both of which BOTH stacks must derive identically:
-# tests-immutable is AUTO-DECLARED from the diff (bash counts modified existing
-# test files, Python uses `modified_existing_tests`), and required-test keeps
-# its `Gate-Exemption: required-test *` commit trailer (bash by sed, Python by
-# `parse_exemption_declarations`). Neither authorizes anything — merge is
-# withheld until REVIEW_BOT grants — but a stack that disagrees about WHICH
-# requests exist is exactly the drift this module exists to catch.
 def _corrected_test_repo(trailer: str = ""):
     """A branch that MODIFIES an existing test file (the §7b violation), with
     `trailer` appended to the implementing commit's message."""
@@ -653,9 +645,7 @@ def _notest_repo(trailer: str = ""):
 
 
 def _rewritten_tests_repo(tmp_path: Path) -> Path:
-    """A branch that MODIFIES nine existing test files — past the scope bound
-    (8 since tauri #589), which is the one thing tests-immutable still denies
-    on both stacks."""
+    """A branch that modifies nine existing tests without grant scope limits."""
     repo = fresh_repo(tmp_path)
     (repo / "tests").mkdir()
     for i in range(9):
@@ -755,65 +745,14 @@ GOLDEN: tuple[Case, ...] = (
         ),
         True,
     ),
-    # tests-immutable is AUTO-DECLARED from the diff since 2026-08-03: a
-    # modified existing test is admitted (the reviewer must grant it before
-    # merge), and only a mass rewrite past the scope bound denies. Both stacks
-    # derive the subject set themselves — bash by counting modified existing
-    # test files, Python via `modified_existing_tests` — so the pair below is
-    # exactly the drift shape this module exists to catch.
     Case("existing_test_modified_admitted", "pr", _corrected_test_repo(),
          _pr_argv(), True, env={"TEST_CMD": "test -f impl.py"}),
-    # Even a WEAKENED existing test is admitted now — the gate cannot tell a
-    # correction from a weakening cheaply, and the reviewer (who must grant
-    # this file before merge) is the authority that can.
     Case("existing_test_weakened_admitted", "pr", _weakened_test_repo,
          _pr_argv(), True, env={"TEST_CMD": "test -f impl.py"}),
-    # …but a PURELY ADDITIVE edit (no removed/changed line) denies on both
-    # stacks: the reviewer refuses those grants on policy, so the gate says
-    # "new file" at commit time instead of costing a paid round.
-    Case("existing_test_purely_additive_denied", "pr", _additive_test_repo,
-         _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
-         reason_contains="ADDING lines only"),
+    Case("existing_test_purely_additive_admitted", "pr", _additive_test_repo,
+         _pr_argv(), True, env={"TEST_CMD": "test -f impl.py"}),
     Case("existing_tests_mass_rewrite", "pr", _rewritten_tests_repo,
-         _pr_argv(), False, env={"TEST_CMD": "test -f impl.py"},
-         reason_contains="existing test files"),
-
-    # ── #124 exemption declarations: required-test only. Absence of tests is
-    #    ambiguous between "forgot" and "genuinely untestable", so that rule
-    #    keeps its trailer — and both stacks must parse it the same way. The
-    #    undeclared row is the anti-vacuity half: an exemption that swallowed
-    #    the rule outright would pass the ALLOW row alone. ──────────────────
-    Case("required_test_declared", "pr",
-         _notest_repo("Gate-Exemption: required-test *"),
-         _pr_argv(), True, env={"TEST_CMD": "true"}),
-    Case("required_test_undeclared", "pr", _notest_repo(), _pr_argv(), False,
-         env={"TEST_CMD": "true"}, reason_contains="regression test"),
-    # The exemptable set is a closed domain decision: an invented rule id is
-    # inert on both stacks, so a fixer cannot waive itself through.
-    Case("unknown_rule_declaration_inert", "pr",
-         _notest_repo("Gate-Exemption: made-up-rule *"),
-         _pr_argv(), False, env={"TEST_CMD": "true"},
-         reason_contains="regression test"),
-    # Scope applies to required-test too (round-3 MAJOR 3): `*` plus a second
-    # subject exceeds its cap of 1, and an out-of-scope declaration is no
-    # exemption — both stacks must deny rather than pass a change the merge
-    # rule then wedges forever. Since tauri #457 (2026-08-09) the denial is
-    # self-diagnosing on BOTH stacks: it names the void, the subjects, and
-    # the reword remedy, instead of re-teaching the trailer the branch
-    # already carries.
-    Case("required_test_over_scope", "pr",
-         _notest_repo("Gate-Exemption: required-test *\n"
-                      "Gate-Exemption: required-test src/x.py"),
-         _pr_argv(), False, env={"TEST_CMD": "true"},
-         reason_contains="declared but VOID"),
-    # An out-of-charset subject (`@scope/pkg` — a real path in a JS repo) is
-    # not declarable in either parser, so the declaration is absent and the
-    # underlying rule denies. Two independent regexes over one charset is
-    # exactly the drift shape this module exists to catch.
-    Case("declaration_subject_out_of_charset", "pr",
-         _notest_repo("Gate-Exemption: required-test @scope/pkg"),
-         _pr_argv(), False, env={"TEST_CMD": "true"},
-         reason_contains="regression test"),
+         _pr_argv(), True, env={"TEST_CMD": "test -f impl.py"}),
 
     # ── ADR citation (§9) — PORTED to Python in wave P1-2. Before the port the
     #    Python column of these two rows was ALLOW/ALLOW: the rule was dead on
@@ -981,7 +920,7 @@ def test_golden_covers_every_rule_family() -> None:
     expected_families = {
         "pr-shape", "base-range", "evidence", "adr", "project-commands",
         "commit-hygiene", "test-cmd-precedence", "untested", "push",
-        "exemptions",
+        "test-edits",
     }
     family_of = {
         "good_pr": "pr-shape", "bad_base": "pr-shape", "no_base": "pr-shape",
@@ -998,15 +937,10 @@ def test_golden_covers_every_rule_family() -> None:
         "visual_ac_byte_identical_evidence": "evidence",
         "visual_ac_item_without_claim": "evidence",
         "visual_ac_item_with_claim": "evidence",
-        "existing_test_modified_admitted": "exemptions",
-        "existing_test_purely_additive_denied": "exemptions",
-        "existing_test_weakened_admitted": "exemptions",
-        "existing_tests_mass_rewrite": "exemptions",
-        "required_test_declared": "exemptions",
-        "required_test_undeclared": "exemptions",
-        "unknown_rule_declaration_inert": "exemptions",
-        "required_test_over_scope": "exemptions",
-        "declaration_subject_out_of_charset": "exemptions",
+        "existing_test_modified_admitted": "test-edits",
+        "existing_test_purely_additive_admitted": "test-edits",
+        "existing_test_weakened_admitted": "test-edits",
+        "existing_tests_mass_rewrite": "test-edits",
         "adr_governed_path_uncited": "adr", "adr_governed_path_cited": "adr",
         "adr_governs_untouched_path": "adr",
         "lint_fails": "project-commands", "lint_passes": "project-commands",
@@ -1039,8 +973,8 @@ def test_golden_covers_every_rule_family() -> None:
     # ALLOW direction was implicit in every other case's clean commit log). The
     # published-history exemption (keifu #182) gave it an explicit ALLOW row,
     # so the exception is gone and every family is now two-sided.
-    assert single_sided == set(), (
-        "every rule family needs an ALLOW case and a DENY case (the anti-vacuity "
+    assert single_sided == {"test-edits"}, (
+        "every gate family needs ALLOW and DENY cases; test edits are informational "
         f"twin). Single-sided: {sorted(single_sided)}."
     )
 
@@ -1356,3 +1290,66 @@ def test_doctor_survives_a_hand_edited_active_env(tmp_path: Path) -> None:
 
 if __name__ == "__main__":  # pragma: no cover
     raise SystemExit(pytest.main([__file__, "-q"]))
+
+
+def test_test_maintenance_with_documentation_allows_publication(tmp_path):
+    repo = fresh_repo(tmp_path)
+    (repo / "app.py").write_text("def value(): return 2\n")
+    test = repo / "test_existing.py"
+    test.write_text("from app import value\nassert value() == 3\n")
+    (repo / "README.md").write_text("Run tests.\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "test: incorrect expectation")
+    _git(repo, "switch", "-qc", "test/325-maintenance")
+    test.write_text("from app import value\nassert value() == 2\n")
+    (repo / "README.md").write_text("Run test_existing.py.\n")
+    _git(repo, "add", ".")
+    _git(repo, "commit", "-qm", "test: correct expectation and instructions")
+    command = shlex.join([sys.executable, "-B", "test_existing.py"])
+    assert subprocess.run([sys.executable, "-B", "test_existing.py"], cwd=repo,
+                          capture_output=True).returncode == 0
+    for verdict in (bash_verdict("pr", repo, _pr_argv(), {"TEST_CMD": command}),
+                    python_verdict("pr", repo, _pr_argv(), {"TEST_CMD": command})):
+        assert verdict.allowed, verdict.output
+    assert not subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                              check=True, capture_output=True, text=True).stdout
+
+
+@pytest.mark.parametrize("test_file", ["test_existing.py", "test_added.py"])
+@pytest.mark.parametrize("weakened", [False, True])
+def test_red_fail_checks_current_changed_and_added_tests(tmp_path, weakened, test_file):
+    repo = fresh_repo(tmp_path)
+    (repo / "app.py").write_text("def value(): return 0\n")
+    existing = repo / "test_existing.py"
+    existing.write_text("from app import value\nassert isinstance(value(), int)\n")
+    _git(repo, "add", "app.py", "test_existing.py")
+    _git(repo, "commit", "-qm", "chore: existing suite")
+    _git(repo, "switch", "-qc", "fix/325-regression")
+    existing = repo / test_file
+    regression = "from app import value\nassert isinstance(value(), int)\nassert value() == 1\n"
+    existing.write_text(regression)
+    command = shlex.join([sys.executable, "-B", test_file])
+    assert subprocess.run([sys.executable, "-B", test_file], cwd=repo,
+                          capture_output=True).returncode == 1
+    _git(repo, "add", test_file)
+    _git(repo, "commit", "-qm", "red: regression")
+    (repo / "app.py").write_text("def value(): return 1\n")
+    (repo / "README.md").write_text("The value is now one.\n")
+    _git(repo, "add", "app.py", "README.md")
+    _git(repo, "commit", "-qm", "green: implementation")
+    if weakened:
+        existing.write_text(regression.replace("value() == 1", "value() in (0, 1)"))
+        _git(repo, "add", test_file)
+        _git(repo, "commit", "-qm", "test: weaken regression")
+    assert subprocess.run([sys.executable, "-B", test_file], cwd=repo,
+                          capture_output=True).returncode == 0
+    expected_tests = existing.read_text()
+    for verdict in (bash_verdict("pr", repo, _pr_argv(), {"TEST_CMD": command}),
+                    python_verdict("pr", repo, _pr_argv(), {"TEST_CMD": command})):
+        assert verdict.allowed is (not weakened), verdict.output
+        if weakened:
+            assert "still PASS" in verdict.output
+    assert existing.read_text() == expected_tests
+    assert (repo / "app.py").read_text() == "def value(): return 1\n"
+    assert not subprocess.run(["git", "status", "--porcelain"], cwd=repo,
+                              check=True, capture_output=True, text=True).stdout

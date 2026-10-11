@@ -74,32 +74,6 @@ def read_open_pull_requests(gateway: object, repository: str) -> OpenPullRequest
         return OpenPullRequestsUnavailable(_printable(f"{type(exc).__name__}: {exc}")[:512])
 
 
-def read_activation_commit_messages(gateway: object, repository: str, pr: int, head: str) -> tuple[str, ...]:
-    """Complete trailer evidence pinned to this head, or explicit refusal.
-
-    GitHub's pull-request commits endpoint caps a response at 250 commits.
-    Reaching that ceiling cannot establish completeness, even with pagination.
-    """
-    pages = getattr(gateway, "_gh_json")(["api", "--paginate", "--slurp",
-                                         f"repos/{repository}/pulls/{pr}/commits?per_page=100"])
-    if not isinstance(pages, list) or not pages or any(not isinstance(page, list) for page in pages):
-        raise ValueError("complete commit trailer pagination is unavailable")
-    commits = [item for page in pages for item in page]
-    if not commits or len(commits) >= 250:
-        raise ValueError("commit trailer listing is absent or reaches GitHub's 250-commit ceiling")
-    messages: list[str] = []
-    shas: set[str] = set()
-    for row in commits:
-        if not isinstance(row, dict) or not is_commit_sha(row.get("sha")) or row["sha"] in shas:
-            raise ValueError("commit trailer listing contains a malformed or repeated commit")
-        commit = row.get("commit")
-        if not isinstance(commit, dict) or not isinstance(commit.get("message"), str):
-            raise ValueError("complete commit trailer text is unavailable")
-        messages.append(commit["message"])
-        shas.add(row["sha"])
-    if commits[-1]["sha"] != head:
-        raise ValueError("commit trailer listing no longer ends at the observed head")
-    return tuple(messages)
 
 
 class ReviewActivationRefused(WorkflowAuthorityError):
@@ -307,6 +281,6 @@ class SQLiteReviewActivation:
 
 __all__ = [
     "LEGACY_REVIEW_NAME", "ReviewActivationRefused", "ReviewActivationSourcesChanged", "SQLiteReviewActivation",
-    "read_activation_commit_messages", "read_legacy_review_roots", "read_legacy_review_state",
+    "read_legacy_review_roots", "read_legacy_review_state",
     "read_open_pull_requests", "read_review_inventory",
 ]

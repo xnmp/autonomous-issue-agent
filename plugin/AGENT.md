@@ -49,7 +49,6 @@ daemon's memory limit and can kill the entire run.
    name before your session starts; do not create, rename, or switch branches.
    Confirm it identifies `$ISSUE_NUMBER` and retain all prior work. The harness
    supports conventional branch types such as `fix/`, `feat/`, and `test/`.
-   `feat/` and `fix/` branches MUST add a test in the diff.
 2. Generate acceptance criteria and post them as an issue comment BEFORE writing
    any code. This fixes the bar in place so you cannot quietly lower it.
    **Write every criterion in terms of OBSERVABLE behaviour — the value a user or
@@ -163,17 +162,8 @@ daemon's memory limit and can kill the entire run.
 ## Hard rules
 - Do NOT use `--no-verify`, `-n` on commit, `HUSKY=0`, or override
   `core.hooksPath`. The gate is mandatory and these are blocked anyway.
-- Prefer ADDING tests over changing existing ones, and never skip or disable a
-  test to go green. You MAY correct an existing test whose expectation is
-  itself wrong (including making it self-isolating so it passes on any host):
-  do it directly — no trailer, no permission request — and explain the
-  correction in the PR description. The gate admits up to 7 modified existing
-  test files (more reads as a rewrite and is denied), and the independent
-  reviewer must explicitly approve every one of them before the PR can merge,
-  so a weakened test cannot land unnoticed. NEVER modify an existing test file
-  just to ADD tests: the gate denies a purely additive edit to an existing
-  test file outright — additive coverage goes in a NEW file (the reviewer
-  refuses those grants on policy, so it would cost a paid round anyway).
+- Never skip or disable a test to go green. Correct an existing test whose
+  expectation is wrong and explain the correction in the PR description.
   Do NOT refactor unrelated code.
 - Do NOT suppress a quality/security signal for the code THIS change adds or
   modifies in order to go green. The default is to fix the underlying cause:

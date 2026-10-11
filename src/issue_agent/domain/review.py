@@ -12,10 +12,9 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Literal, final
+from typing import Literal
 
 from .actions import Action, AgentKind, Relabel, RunAgent, Target
-from .exemptions import AuthenticatedGrantPairs
 from .identity import IdentityMode, login_eq
 from .labels import Label
 from .lifecycle import (
@@ -41,17 +40,10 @@ DEFAULT_MAX_REVIEW_REJECTIONS = 4
 REVIEW_COMMENTED = "COMMENTED"
 REVIEW_DISMISSED = "DISMISSED"
 
-# Round-trip-stable marker inside a downgraded-for-ungranted-exemptions
-# verdict body. The re-review patch-id shortcut must NEVER copy such a
-# verdict onto a new head: its remedy is reviewer-side (emit the grant), so
-# copying it denies the one thing that can clear it — a fresh reviewer run —
-# and an unchanged patch livelocks to the rejection ceiling (tauri #634,
-# 2026-08-09: reviewer approved on the merits, forgot the grant line, and
-# every mechanical rebase re-copied the downgrade until needs-human-review).
+# Persisted downgrades need fresh review now that grant authority is retired.
 UNGRANTED_DOWNGRADE_MARKER = (
     "did not grant every gate exemption required by the current patch"
 )
-
 
 def latest_reviewer_verdict(pr: PRView, reviewer: str) -> Review | None:
     """The reviewer's latest non-dismissed submitted verdict, if known."""
@@ -212,9 +204,8 @@ def count_prior_rejections(
     correct across daemon restarts. `reviews` is chronologically ordered (gh
     returns oldest-first / by submittedAt), so 'since the last APPROVE' is the
     suffix after the last APPROVE index. `non_resetting_approval_commits`
-    carries current-head approvals the workflow has already proven cannot
-    merge because required grants are absent; those must not manufacture a
-    reset merely because GitHub calls their raw event APPROVED."""
+    preserves the counting rule in historical workflow payloads; new reviews
+    reset on every approval."""
     mine = [r for r in reviews if login_eq(r.author, review_bot)]
     last_approve = max(
         (
@@ -589,124 +580,22 @@ def hold_review_dispatch(
 
 
 # ── review verdict → submission effect (review-pr.sh / re-review-pr.sh tails) ─
-GrantRequest = tuple[str, str]
-_COMPLETE_GRANTS_PROOF = object()
-
-
-@dataclass(frozen=True)
-class ReviewTarget:
-    """The issue and patch whose review verdict will be submitted."""
-
-    issue_number: int | None
-    patch_id: str
-
-
-@final
-class CompleteGrants:
-    """Opaque proof that every exemption required by one patch is authenticated."""
-
-    __slots__ = ("_issue_number", "_patch_id", "_requests")
-
-    def __init__(
-        self,
-        issue_number: int | None,
-        patch_id: str,
-        requests: tuple[GrantRequest, ...],
-        proof: object,
-    ) -> None:
-        if proof is not _COMPLETE_GRANTS_PROOF:
-            raise TypeError(
-                "complete grants must come from authenticated grant resolution"
-            )
-        object.__setattr__(self, "_issue_number", issue_number)
-        object.__setattr__(self, "_patch_id", patch_id)
-        object.__setattr__(self, "_requests", requests)
-
-    def __setattr__(self, name: str, value: object) -> None:
-        raise AttributeError("complete grant proof is immutable")
-
-    @property
-    def issue_number(self) -> int | None:
-        return self._issue_number
-
-    @property
-    def patch_id(self) -> str:
-        return self._patch_id
-
-    @property
-    def requests(self) -> tuple[GrantRequest, ...]:
-        return self._requests
-
-
-@dataclass(frozen=True)
-class RejectedExemptions:
-    """The non-empty exemption set that prevents an approval."""
-
-    requests: tuple[GrantRequest, ...]
-
-    def __post_init__(self) -> None:
-        if not self.requests:
-            raise ValueError("rejected exemptions require at least one request")
-        object.__setattr__(self, "requests", tuple(dict.fromkeys(self.requests)))
-
-
-GrantResolution = CompleteGrants | RejectedExemptions
-
-
-def resolve_authenticated_grants(
-    required: tuple[GrantRequest, ...],
-    authenticated: AuthenticatedGrantPairs,
-    *,
-    target: ReviewTarget,
-) -> GrantResolution:
-    """Mint a patch-bound proof only when authenticated grants cover the request."""
-    normalized = tuple(dict.fromkeys(required))
-    proof_matches = (
-        authenticated.issue_number == target.issue_number
-        and authenticated.patch_id == target.patch_id
-    )
-    missing = tuple(
-        request
-        for request in normalized
-        if not proof_matches or request not in authenticated
-    )
-    if missing or normalized and (target.issue_number is None or not target.patch_id):
-        return RejectedExemptions(missing or normalized)
-    return CompleteGrants(
-        target.issue_number,
-        target.patch_id,
-        normalized,
-        _COMPLETE_GRANTS_PROOF,
-    )
-
-
 @dataclass(frozen=True)
 class ApprovedSubmission:
-    """A GitHub approval whose required exemptions are proven complete."""
+    """A GitHub approval."""
 
     body: str
-    grants: CompleteGrants
-    target: ReviewTarget
     event: Literal["APPROVE"] = field(default="APPROVE", init=False)
     escalate: Literal[False] = field(default=False, init=False)
     escalate_cause: Literal[""] = field(default="", init=False)
 
-    def __post_init__(self) -> None:
-        if not isinstance(self.grants, CompleteGrants):
-            raise TypeError("an approval requires complete exemption grants")
-        if (self.grants.issue_number, self.grants.patch_id) != (
-            self.target.issue_number,
-            self.target.patch_id,
-        ):
-            raise ValueError("approval grant proof belongs to a different review target")
 
 
 @dataclass(frozen=True)
 class ChangesRequestedSubmission:
-    """A rejecting verdict, optionally caused by refused exemption requests."""
+    """A rejecting verdict."""
 
     body: str
-    rejected_exemptions: RejectedExemptions | None = None
     event: Literal["REQUEST_CHANGES"] = field(
         default="REQUEST_CHANGES", init=False
     )
@@ -743,60 +632,14 @@ def review_submission(
     body: str,
     prior_rejections: int,
     max_rejections: int,
-    *,
-    grant_resolution: GrantResolution,
-    target: ReviewTarget,
 ) -> ReviewSubmission:
-    """Port of the review-pr.sh / re-review-pr.sh decision tails.
+    """Approval wins; an explicit escalation or rejection ceiling hands off.
 
-    APPROVE → APPROVE only when every gate exemption required by the current
-    patch was granted. An approval that omits one or more required grants is an
-    actionable REQUEST_CHANGES: revise the patch so it no longer needs those
-    exemptions, or grant them on the next review. ESCALATE (or the ceiling
-    reached) → a COMMENT review + needs-human-review; anything else →
-    REQUEST_CHANGES.
-
-    Rejection ceiling: a mergeable APPROVE always wins (a satisfied reviewer
-    ends the loop), but a REQUEST_CHANGES — including a grant-incomplete
-    approval normalized above — that would be the `max_rejections`-th rejection
-    can no longer bounce the PR back to the fixer; it escalates. The ceiling
-    counts the reviewer's OWN prior REQUEST_CHANGES verdicts (`prior_rejections`),
-    NOT author pushes: a rebase or a post-approval housekeeping push that never
-    drew a rejection does not consume a round toward the human handoff. This
-    verdict is the (prior_rejections + 1)-th rejection, so escalate when that
-    reaches the cap. Previously escalation counted every push and depended on the
-    model voluntarily returning ESCALATE; this makes the ceiling a real breaker
-    keyed on genuine dissatisfaction.
-
-    `grant_resolution` is harness-derived, not model prose. Keeping this
-    contradiction repair here makes the submitted GitHub verdict and rejection
-    accounting agree: an unmergeable approval must not reset the rejection
-    sequence or strand the PR behind a later merge-side escalation."""
-    rejected_exemptions = (
-        grant_resolution
-        if isinstance(grant_resolution, RejectedExemptions)
-        else None
-    )
-    if decision == "APPROVE" and rejected_exemptions is not None:
-        unique = rejected_exemptions.requests
-        requests = "\n".join(
-            f"- `{rule}` for `{subject}`" for rule, subject in unique
-        )
-        guidance = (
-            "The reviewer returned APPROVE but "
-            + UNGRANTED_DOWNGRADE_MARKER
-            + ". This is therefore "
-            "REQUEST_CHANGES, not a mergeable approval. Either revise the "
-            "patch so these exemptions are no longer required, or explicitly "
-            "grant each pair on the next review. For `tests-immutable`, "
-            "additive coverage belongs in a new test file when changing an "
-            "existing test is not itself justified."
-        )
-        rationale = f"\n\nReviewer rationale:\n{body}" if body else ""
-        body = f"{guidance}\n\nUngranted requests:\n{requests}{rationale}"
-        decision = "REQUEST_CHANGES"
+    The ceiling counts the reviewer's own REQUEST_CHANGES verdicts, never
+    pushes or mechanical rebases.
+    """
     if decision == "APPROVE":
-        return ApprovedSubmission(body, grant_resolution, target)
+        return ApprovedSubmission(body)
     this_rejection = prior_rejections + 1
     ceiling_hit = max_rejections > 0 and this_rejection >= max_rejections
     if decision == "ESCALATE" or ceiling_hit:
@@ -816,7 +659,7 @@ def review_submission(
             f"{preamble}\n\n{body}",
             "verdict" if decision == "ESCALATE" else "ceiling",
         )
-    return ChangesRequestedSubmission(body, rejected_exemptions)
+    return ChangesRequestedSubmission(body)
 
 
 # ── multi-agent review synthesis (REVIEW_MODE=multi) ──────────────────────────
@@ -898,9 +741,6 @@ def _render_body(confirmed: list[Finding], approving: bool) -> str:
 def gate_submission(
     prior_rejections: int,
     max_rejections: int,
-    *,
-    grant_resolution: GrantResolution,
-    target: ReviewTarget,
 ) -> ReviewSubmission:
     """A non-reviewable PR (the skip-gate found no behavioural change: docs /
     formatting / config only) → APPROVE. Pure so the gate→verdict mapping is a
@@ -911,17 +751,12 @@ def gate_submission(
         "APPROVE",
         "No behavioural change to review (docs/formatting/config only).",
         prior_rejections, max_rejections,
-        grant_resolution=grant_resolution,
-        target=target,
     )
 
 
 def synthesize_review(
     findings: list[Finding], prior_rejections: int, max_rejections: int,
     complete: bool = True,
-    *,
-    grant_resolution: GrantResolution,
-    target: ReviewTarget,
 ) -> ReviewSubmission | None:
     """Pure synthesis of validated findings into a verdict, then through the same
     round-ceiling breaker as the single-pass reviewer.
@@ -947,6 +782,4 @@ def synthesize_review(
         body,
         prior_rejections,
         max_rejections,
-        grant_resolution=grant_resolution,
-        target=target,
     )

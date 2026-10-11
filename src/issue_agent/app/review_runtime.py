@@ -118,14 +118,13 @@ def compose_review_control(
     control: SQLiteControlStore, gateway: object, *, repository: str, owner_id: str, ceiling: int,
     trigger_label: Label, review_bot: str,
     external_holds: Callable[[ObservedPullRequest, object], tuple[str, ...]],
-    trailers: Callable[[int], object] | None,
     runtime_preflight: Callable[[], str | None] | None = None,
     execution_ceiling: int = 0,
 ) -> SQLiteReviewWorkflowControl:
     return SQLiteReviewWorkflowControl(
         control, WorkflowWriter(repository, "review", owner_id), gateway=gateway, ceiling=ceiling,
         trigger_label=trigger_label, rule=CountingRule(review_bot), external_holds=external_holds,
-        trailers=trailers, runtime_preflight=runtime_preflight, execution_ceiling=execution_ceiling,
+        runtime_preflight=runtime_preflight, execution_ceiling=execution_ceiling,
     )
 
 
@@ -140,7 +139,6 @@ def configured_review_control(
     counting rule and trusted hold sources the daemon enforces.
     """
     review = cfg.review_runtime
-    trailers = getattr(gateway, "pr_commit_messages", None)
     return compose_review_control(
         control, gateway, repository=cfg.repo, owner_id=owner_id, ceiling=review.max_rejections,
         execution_ceiling=review.max_unproductive_rounds,
@@ -150,7 +148,6 @@ def configured_review_control(
             review.max_unproductive_rounds,
             linked_holds=lambda observed, view: review_linked_issue_holds(control, gateway, observed.key, view),
         ),
-        trailers=trailers if callable(trailers) else None,
         runtime_preflight=runtime_preflight,
     )
 
@@ -652,11 +649,7 @@ class ActiveReviewRuntime:
     def evidence_due(self, binding: WorkflowBinding, head_sha: str) -> bool:
         """Whether every read a review of this head depends on may be attempted now."""
         key = binding.fence.key
-        return all(self.control.evidence_due(key, head_sha, kind) for kind in ReviewEvidenceKind if kind is not ReviewEvidenceKind.ORDINARY_TEST)
-
-    def record_evidence(self, bound: BoundReviewRound, error: str | None) -> None:
-        self.control.record_evidence(bound.binding.fence.key, bound.head_sha, ReviewEvidenceKind.EXEMPTION_TRAILERS,
-                                     error=error)
+        return all(self.control.evidence_due(key, head_sha, kind) for kind in ReviewEvidenceKind if kind not in {ReviewEvidenceKind.ORDINARY_TEST, ReviewEvidenceKind.EXEMPTION_TRAILERS})
 
     def test_due(self, bound: BoundReviewRound, patch_id: str) -> bool:
         from ..domain.review_evidence import evidence_due
@@ -723,13 +716,10 @@ class ActiveReviewRuntime:
                 return None
             evidence_ref = selected.invocation.invocation_id
             if selected.outcome is ReviewTestOutcome.FAILED:
-                from ..domain.review import review_submission, resolve_authenticated_grants, ReviewTarget
-                from ..domain.exemptions import authenticated_grant_pairs
+                from ..domain.review import review_submission
                 decision = review_submission("REQUEST_CHANGES", failed_test_review_body(selected.summary,
                     selected.execution.exit_code if selected.execution is not None else None),
-                    self.prior_rejections(bound, counted_past), self._max_review_rejections,
-                    grant_resolution=resolve_authenticated_grants((), authenticated_grant_pairs((), issue_number=None, patch_id=patch_id, mac_key=""),
-                        target=ReviewTarget(None, patch_id)), target=ReviewTarget(None, patch_id))
+                    self.prior_rejections(bound, counted_past), self._max_review_rejections)
                 event, body = decision.event, decision.body
                 escalate_cause = decision.escalate_cause if decision.escalate else None
         counting = tuple(sorted(counted_past)) if escalate_cause == "ceiling" else ()

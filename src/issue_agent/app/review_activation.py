@@ -19,7 +19,7 @@ from ..adapters.github import GitHubGateway, parse_review_pages
 from ..adapters.resolve_activation import LegacyRoots, copy_for_rehearsal, distinct_roots, file_digests
 from ..adapters.review_activation import (
     LEGACY_REVIEW_NAME, ReviewActivationRefused, ReviewActivationSourcesChanged, SQLiteReviewActivation,
-    read_activation_commit_messages, read_legacy_review_roots, read_open_pull_requests,
+    read_legacy_review_roots, read_open_pull_requests,
 )
 from ..adapters.review_effects import read_pull_request
 from ..adapters.review_linkage import read_review_linked_issue
@@ -34,14 +34,12 @@ from ..domain.review_activation import (
     imported_snapshot, legacy_ceiling_hold, legacy_hold_provenance, plan_review_activation, shadow_compare,
 )
 from ..domain.workflow_identity import PullRequestRef, WorkflowKey, canonical_workflow_repository
-from ..domain.review import ReviewConfig, ReviewExcluded, patch_signature, review_eligibility
+from ..domain.review import ReviewConfig, ReviewExcluded, review_eligibility
 from ..domain.review_linkage import LinkedIssueUnavailable, NoLinkedIssue, linked_issue_holds
-from ..domain.review_exemptions import approval_grants_cover, review_declarations
 from ..domain.review_workflow import CompleteReviews, ObservedPullRequest, PullRequestState, PullRequestUnavailable, SubmittedReviewState
 from ..domain.identity import login_eq
 from ..domain.fix import breaker_key
-from ..domain.refs import issue_from_branch
-from ..domain.world import PRView, Review
+from ..domain.world import PRView
 from .config import HarnessConfig, owner_identity_for_target
 from .resolve_activation import ActivationNotConfirmed
 from .resolve_control import load_operator_configuration
@@ -77,7 +75,6 @@ class ReviewActivationScope:
     gateway: object
     config: ReviewConfig | None = None
     review_owner: str = ""
-    exemption_mac_key: str = field(default="", repr=False, compare=False)
     review_root: str = "review"
 
 
@@ -109,7 +106,7 @@ def activation_scope(
                           max_rejections=review.max_rejections)
     return ReviewActivationScope(name, canonical_workflow_repository(cfg.repo), path, roots,
                                  cfg.review_state_dir, review.max_rejections, review.bot, Label(review.trigger_label), remote,
-                                 config, owner_identity_for_target(cfg.repo, cfg.target_dir, "review"), cfg.exemption_mac_key,
+                                 config, owner_identity_for_target(cfg.repo, cfg.target_dir, "review"),
                                  next(label for label, root in roots if os.path.realpath(root) == os.path.realpath(cfg.review_state_dir)))
 
 
@@ -152,21 +149,13 @@ def _facts(scope: ReviewActivationScope, read: ObservedPullRequest, view: PRView
             "blocked_by_open": issue.blocked_by_open, "open_blocker_numbers": issue.open_blocker_numbers,
             "workflow_holds": linked.workflow_holds,
         })
-    # The legacy counting rule only ignores a current-head approval proven
-    # incomplete. Complete REST bodies replace the potentially truncated
-    # GraphQL review list before authenticating grants.
-    has_current_approval = isinstance(read.reviews, CompleteReviews) and any(
-        review.state is SubmittedReviewState.APPROVED and review.commit_id == read.head_sha
-        and login_eq(review.author, scope.review_bot) for review in read.reviews.reviews
-    )
-    reviews: list[Review] = []
     if isinstance(read.reviews, CompleteReviews) and (
-        has_current_approval or legacy_ceiling_hold(read, scope.trigger_label, scope.review_bot)
+        legacy_ceiling_hold(read, scope.trigger_label, scope.review_bot)
     ):
         raw = getattr(gateway, "_gh_json")(["api", "--paginate", "--slurp",
                                             f"repos/{scope.repository}/pulls/{view.number}/reviews?per_page=100"])
         if parse_review_pages(raw) != read.reviews:
-            raise ValueError("complete review evidence changed while verifying grants")
+            raise ValueError("complete review evidence changed while verifying the legacy hold")
         bodies: list[tuple[str, str]] = []
         for page in raw:
             for row in page:
@@ -175,23 +164,8 @@ def _facts(scope: ReviewActivationScope, read: ObservedPullRequest, view: PRView
                 if not isinstance(row.get("body"), str):
                     raise ValueError("complete review body is unavailable")
                 bodies.append((str(row["id"]), row["body"]))
-                user = row.get("user")
-                author = str(user.get("login") or "ghost") if isinstance(user, dict) else "ghost"
-                reviews.append(Review(str(row["state"]).upper(), author, row["submitted_at"], row["body"],
-                                      row.get("commit_id") or ""))
         provenance = legacy_hold_provenance(read, scope.review_bot, tuple(bodies))
         evidence.append(raw)
-    if has_current_approval:
-        diff = getattr(gateway, "pr_diff")(view.number, view.base_ref_oid, view.head_ref_oid)
-        if not view.base_ref_oid or (diff.base_oid, diff.head_oid) != (view.base_ref_oid, read.head_sha) or not diff.text.strip():
-            raise ValueError("revision-bound exemption diff is unavailable")
-        messages = read_activation_commit_messages(gateway, scope.repository, view.number, read.head_sha)
-        declarations = review_declarations(diff.text, messages)
-        if not approval_grants_cover(tuple(reviews), review_bot=scope.review_bot, declarations=declarations,
-                                     issue_number=issue_from_branch(view.head_ref_name), patch_id=patch_signature(diff.text),
-                                     mac_key=scope.exemption_mac_key):
-            non_resetting = (read.head_sha,)
-        evidence.extend([diff.base_oid, diff.head_oid, diff.text, messages, non_resetting])
     digest = hashlib.sha256(json.dumps(evidence, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
     return ReviewActivationFacts(view.number, excluded, non_resetting, digest, provenance, linked_holds=linked_holds)
 

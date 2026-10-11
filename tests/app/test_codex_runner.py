@@ -47,7 +47,6 @@ from issue_agent.app.planners.schemas import (
     AUTHOR_SCHEMA,
     FIX_SCHEMA,
     IMPLEMENT_SCHEMA,
-    review_schema_with_exemptions,
 )
 from issue_agent.domain.outcome import AgentResult, ExitReason, Outcome, classify_outcome, infra_death
 from issue_agent.adapters.runtime_plan import RuntimePlan
@@ -263,25 +262,21 @@ def test_strict_schema_passthrough_non_object():
 
 
 def test_strict_schema_closes_objects_nested_under_array_combinators():
-    schema = review_schema_with_exemptions(
-        [("tests-immutable", "tests/example.test.ts")]
-    )
-
-    strict = _strict_schema(schema)
-
-    assert strict["additionalProperties"] is False
-    assert set(strict["required"]) == {
-        "decision",
-        "body",
-        "exemption_grants",
+    schema = {
+        "type": "object",
+        "properties": {"findings": {"type": "array", "items": {"anyOf": [{
+            "type": "object", "properties": {"detail": {"type": "string"}},
+        }]}}},
     }
-    assert strict["properties"]["exemption_grants"]["type"] == [
-        "array",
-        "null",
-    ]
-    pair = strict["properties"]["exemption_grants"]["items"]["anyOf"][0]
-    assert pair["additionalProperties"] is False
-    assert pair["required"] == ["rule", "subject"]
+    strict = _strict_schema(schema)
+    assert strict["additionalProperties"] is False
+    assert strict["required"] == ["findings"]
+    assert strict["properties"]["findings"]["type"] == ["array", "null"]
+    item = strict["properties"]["findings"]["items"]["anyOf"][0]
+    assert item["additionalProperties"] is False
+    assert item["required"] == ["detail"]
+
+
 
 
 def test_a_previously_optional_property_stays_sayable_as_null():

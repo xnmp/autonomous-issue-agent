@@ -220,7 +220,6 @@ class SQLiteReviewWorkflowControl:
         trigger_label: Label, rule: CountingRule,
         external_holds: Callable[[ObservedPullRequest, object], tuple[str, ...]] = _no_external_holds,
         policy: ReconciliationPolicy = ReconciliationPolicy(),
-        trailers: Callable[[int], object] | None = None,
         runtime_preflight: Callable[[], str | None] | None = None,
         execution_ceiling: int = 0,
     ) -> None:
@@ -238,8 +237,6 @@ class SQLiteReviewWorkflowControl:
             raise ValueError("review trigger must be a label other than the attention hold")
         if not isinstance(rule, CountingRule) or not isinstance(policy, ReconciliationPolicy) or not callable(external_holds):
             raise ValueError("review workflow control requires a counting rule, hold source and read policy")
-        if trailers is not None and not callable(trailers):
-            raise ValueError("the exemption evidence reader must be callable")
         if runtime_preflight is not None and not callable(runtime_preflight):
             raise ValueError("the runtime preparation reader must be callable")
         self._control = control
@@ -251,9 +248,6 @@ class SQLiteReviewWorkflowControl:
         self._rule = rule
         self._external_holds = external_holds
         self._policy = policy
-        # The read-only commit-trailer read behind exemption declarations
-        # (ADR 0014); None leaves evidence holds to the dispatching review.
-        self._trailers = trailers
         self._runtime_preflight = runtime_preflight
 
     @property
@@ -2377,7 +2371,7 @@ class SQLiteReviewWorkflowControl:
             self._control._transition(db, "workflow_release", command_id, "refusal_gated",
                                       {"gate_id": gate_id, "generation": binding.fence.generation})
 
-    # -- runtime: activation, settled submissions, holds and exemption evidence ----------------
+    # -- runtime: activation, settled submissions, holds and evidence --------------------------
 
     def family_active(self) -> bool:
         """Whether this repository's review family is activated; never initializes it."""
@@ -2703,7 +2697,7 @@ class SQLiteReviewWorkflowControl:
 
         A ceiling whose cause is now false is released (RELEASE_CEILING) and
         one still true is refreshed; a refused release projection becomes a
-        visible gate until a read verifies it; an exemption-evidence hold is
+        visible gate until a read verifies it; an evidence hold is
         re-read on its own schedule. Bounded by `limit` per pass and by a
         per-pull-request schedule that backs off on unavailable reads, so a
         held or terminal pull request never becomes a tight polling loop.
@@ -2883,9 +2877,6 @@ class SQLiteReviewWorkflowControl:
             schedule = self._evidence_schedule(db, key, kind)
         return evidence_due(schedule, head_sha, now=self._now())
 
-    def exemption_evidence_due(self, key: WorkflowKey, head_sha: str) -> bool:
-        return self.evidence_due(key, head_sha, ReviewEvidenceKind.EXEMPTION_TRAILERS)
-
     def record_evidence(self, key: WorkflowKey, head_sha: str, kind: ReviewEvidenceKind, *, error: str | None) -> None:
         """Persist one bounded evidence read and its visible gate atomically."""
         self._scope(key)
@@ -2904,7 +2895,6 @@ class SQLiteReviewWorkflowControl:
         state = self._load(db, key)
         prior = self._evidence_schedule(db, key, kind)
         now = self._now()
-        gate_id = evidence_gate_id(kind, key.target.number, head_sha)
         held = [(g.gate if isinstance(g, RearmingGate) else g).gate_id for g in state.gates
                 if review_evidence_gate_kind(g) is kind]
         if error is None:
@@ -2920,6 +2910,7 @@ class SQLiteReviewWorkflowControl:
         progress = unavailable_evidence(kind, state.binding, head_sha, prior, now=now, error=error,
                                         policy=(replace(self._policy, maximum_reads=1)
                                                     if kind is ReviewEvidenceKind.RUNTIME_PREPARATION else self._policy))
+        gate_id = evidence_gate_id(kind, key.target.number, head_sha)
         schedule = progress.schedule
         db.execute(
             "INSERT INTO dedupe_keys(namespace,scope,key,claimed_at,payload_json) VALUES (?,?,?,?,?) "
@@ -2942,9 +2933,6 @@ class SQLiteReviewWorkflowControl:
             "error": schedule.last_error[:512],
         })
 
-    def record_exemption_evidence(self, key: WorkflowKey, head_sha: str, *, error: str | None) -> None:
-        self.record_evidence(key, head_sha, ReviewEvidenceKind.EXEMPTION_TRAILERS, error=error)
-
     def _record_runtime_evidence_if_current(
         self, state: ReviewWorkflowSnapshot, schedule: EvidenceSchedule | None,
         head_sha: str, *, error: str | None,
@@ -2963,6 +2951,10 @@ class SQLiteReviewWorkflowControl:
         if kind is ReviewEvidenceKind.ORDINARY_TEST:
             return self._reread_ordinary_test(state)
         key = state.revision.fence.key
+        if kind is ReviewEvidenceKind.EXEMPTION_TRAILERS:
+            # Retired ADR 0014 holds can still be present in persisted workflows.
+            self.record_evidence(key, "", kind, error=None)
+            return True, ""
         with closing(self._control._connect()) as db:
             db.execute("BEGIN")
             schedule = self._evidence_schedule(db, key, kind)
@@ -3015,14 +3007,4 @@ class SQLiteReviewWorkflowControl:
                 return False, ""
             self.record_evidence(key, observed.head_sha, kind, error=None)
             return True, ""
-        if self._trailers is None:
-            return False, ""
-        try:
-            self._trailers(key.target.number)
-        except sqlite3.Error:
-            raise
-        except Exception as exc:  # noqa: BLE001 - an unreadable trailer read is unavailable evidence
-            self.record_evidence(key, observed.head_sha, kind, error=_reason(exc)[:512] or "trailers unreadable")
-            return True, ""
-        self.record_evidence(key, observed.head_sha, kind, error=None)
-        return True, ""
+        return False, ""
