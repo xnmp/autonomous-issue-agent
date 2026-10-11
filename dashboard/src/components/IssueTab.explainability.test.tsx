@@ -145,10 +145,9 @@ describe("issue explainability", () => {
     const post = fetchMock.mock.calls.find(([, init]) => (init as RequestInit)?.method === "POST");
     expect(String(post?.[0])).toBe("/api/repos/demo/issues/77/resolve-control/commands");
     expect(JSON.parse(String((post?.[1] as RequestInit).body))).toMatchObject({
-      operation: "request_rearm",
+      operation: "release",
       expected: binding,
-      gate_id: "gate-77",
-      guidance: { kind: "keep" },
+      selection: { kind: "gate", gate_id: "gate-77", intent: { kind: "resume", guidance: { kind: "keep" } } },
     });
   });
 

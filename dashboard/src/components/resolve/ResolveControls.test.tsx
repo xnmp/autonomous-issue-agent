@@ -231,7 +231,7 @@ describe("preparing and confirming a request_rearm command", () => {
     r.queueControl(availableControl({ current_intent: rearm() }));
     await user.click(screen.getByRole("button", { name: "Confirm command" }));
     await screen.findByRole("heading", { name: "Command recorded" });
-    expect(r.commandCalls[0]).toMatchObject({ guidance: { kind: "set", text: "watch the schema" } });
+    expect(r.commandCalls[0]).toMatchObject({ selection: { intent: { guidance: { kind: "set", text: "watch the schema" } } } });
   });
 });
 
@@ -636,7 +636,7 @@ describe("continue and cancel operations", () => {
     await user.click(screen.getByRole("button", { name: "Confirm command" }));
     await screen.findByRole("heading", { name: "Command recorded" });
 
-    expect(r.commandCalls[0]).toMatchObject({ operation: "continue_rearm", stopped_request_id: stopped.request_id });
+    expect(r.commandCalls[0]).toMatchObject({ operation: "release", selection: { kind: "stopped_grant", stopped_request_id: stopped.request_id } });
     expect((r.commandCalls[0] as { request_id: string }).request_id).not.toBe(stopped.request_id);
   });
 
@@ -884,10 +884,10 @@ describe("authorize one retry", () => {
     expect(r.commandCalls[1]).toEqual(r.commandCalls[0]);
     const sent = r.commandCalls[0] as Record<string, unknown>;
     expect(sent).toEqual({
-      operation: "authorize_retry", expected: binding, authorization_id: sent.authorization_id,
-      gate_id: "uncertain-77", command_id: "command-77", evidence_id: "absence-77",
+      operation: "release", expected: binding, request_id: saved.command.authorization_id,
+      selection: { kind: "gate", gate_id: "uncertain-77", intent: { kind: "retry_absent", command_id: "command-77", evidence_id: "absence-77" } },
     });
-    expect(typeof sent.authorization_id).toBe("string");
+    expect(typeof sent.request_id).toBe("string");
     expect(sessionStorage.getItem(retryKey("demo", 77))).toBeNull();
     // A grant never selects a re-arm history read.
     const reads = r.fetchMock.mock.calls.map(([input]) => String(input)).filter((url) => url.includes("resolve-control") && !url.endsWith("/commands"));

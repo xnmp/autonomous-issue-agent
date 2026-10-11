@@ -26,6 +26,7 @@ from collections.abc import Callable
 from ...adapters.dashweb import actions, costchart
 from ...adapters.dashweb.bundle import bundle_snapshot, published_dist
 from ...adapters.control_path import canonical_control_store_path
+from ...adapters.workflow_codec import validate_operator_json, WorkflowEncodingError
 from .. import cli
 from . import contracts
 from . import resolve_contracts
@@ -132,6 +133,11 @@ def create_app(
             return JSONResponse(
                 {"detail": f"missing {CSRF_HEADER} header"}, status_code=403
             )
+        if request.method == "POST" and request.url.path.endswith(("/review-control/commands", "/resolve-control/commands")):
+            try:
+                validate_operator_json(await request.body())
+            except WorkflowEncodingError as exc:
+                return JSONResponse({"detail": str(exc)}, status_code=422)
         return await call_next(request)
 
     async def invoke(call, *args):

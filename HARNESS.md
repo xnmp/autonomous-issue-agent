@@ -323,18 +323,30 @@ the current intent and holds. `workflow_held` describes SQLite holds, not remote
 readiness; submission checks external facts again. Inspection never creates or
 migrates a database, performs Git recovery, or drains commands.
 
-Commands are `request_rearm`, `continue_rearm`, `cancel_rearm`, and
-`authorize_retry`. Copy the exact `expected` identity from GET (repository,
-issue, family, epoch, generation, version, episode). Use stable
-request/cancellation/authorization IDs. Request includes gate ID and tagged
-guidance (`keep`, `clear`, or `set` with text); Continue names the stopped
-request; Cancel names the pending request and reason. Actor identity is minted
-by the server for its local OS account, never accepted from the body.
+`release` is the single recovery command; `cancel_rearm` remains cancellation.
+Copy the exact `expected` identity from GET (repository, issue or pull request,
+family, epoch, generation, version, episode) and use a stable `request_id`.
+Release selects one gate, registered eligible verdict, or stopped grant.
+For a resolve or review rejection ceiling, send:
 
-`authorize_retry` is offered only on a `retry_authorization_required` gate: a
+```json
+{"operation":"release","request_id":"operator-stable-id","expected":{"...":"copy GET expected"},"selection":{"kind":"gate","gate_id":"copy GET gate_id","intent":{"kind":"resume","guidance":{"kind":"keep"}}}}
+```
+
+Guidance is `keep`, `clear`, or `set` with text. A stopped grant selection is
+`{"kind":"stopped_grant","stopped_request_id":"original request"}`; it continues
+existing authority. Cancellation names the pending request, cancellation ID,
+and reason. Actor identity is minted by the server for its local OS account.
+Release maps to the existing domain commands, with the same ID namespaces,
+guidance normalization, receipts, and audit bytes. Browser journals and response
+operation names keep their original shapes so tabs opened before deployment
+continue to work. Original HTTP operation payloads remain accepted for those tabs.
+
+`release` with gate intent `retry_absent` is offered only for a
+`retry_authorization_required` gate: a
 command whose remote outcome expired into reconciliation-only mode and whose
 current postcondition the harness's own read later proved absent. The body
-names `authorization_id`, `gate_id`, `command_id` and `evidence_id` exactly as
+names `request_id`, selection `gate_id`, and intent `command_id`/`evidence_id` exactly as
 GET reports them; the API never accepts proof. It permits **one** execution of
 the existing command under its current generation and episode. It does not
 renew allowance, create a re-arm, advance generation, reset expiry, or erase
@@ -362,7 +374,7 @@ day; a restart before consumption keeps it open for the next scheduled read.
 Absent re-checks the original decision's guards: a changed guard is
 `inapplicable` (a standalone command retires; a re-arm obligation becomes a
 verified refusal that supersedes its request at the next re-arm reconciliation,
-after which `continue_rearm` is available, and it can never be granted again). A
+after which `release` can select the stopped grant, and it can never be granted again). A
 scope change since acceptance (other hold, generation, cancelled or retired
 obligation, stale read) is `void` and records the fresh absence. Otherwise the
 grant is consumed with the attempt in one transaction and the gate reports the
@@ -444,16 +456,21 @@ cover only facts SQLite proves:
   gate is then refused.
 
 A pull request the daemon recorded closed keeps its gates and its commands:
-closing retires nothing, and a reopen needs the lever. `request_rearm`,
-`continue_rearm` and `authorize_retry` say that acceptance re-reads GitHub and
+closing retires nothing, and a reopen needs the lever. `release` says that acceptance re-reads GitHub and
 refuses while the pull request stays closed; a refused retry grant is never
 stored, so none is spent on a certain refusal. Remote facts (a moved head, a closed pull request,
 reviews counted since the gate opened) are decided by acceptance's own fresh
 read, which returns 422 for a moved head or a terminal pull request.
 
-The commands:
+Execution renewal uses a gate selection with `renew_execution` intent and the
+execution epoch/episode from GET. A `verdict` selection names the registered
+submission command, displayed gate ID, execution epoch/episode, and guidance;
+it releases only that eligible verdict. Neither changes unrelated holds.
+Fix, steward, and imported-hold releases are not offered in this increment.
 
-- `request_rearm` on a `review_rejection_ceiling` gate authorizes dismissal of
+The release selections and cancellation:
+
+- `release` on a `review_rejection_ceiling` gate authorizes dismissal of
   exactly the counted bot reviews listed in the gate. It never dismisses a
   human review or a later review, and the review set is never on the wire.
   Tagged guidance (`keep`/`clear`/`set`) reaches exactly the next paid review.
@@ -478,11 +495,11 @@ The commands:
 - `cancel_rearm` stops the pending request. Verified effects remain,
   unexecuted obligations are retired and never run, and a
   `rearm_needs_decision` gate holds the pull request.
-- `continue_rearm` on that decision gate re-plans the stopped request's
+- `release` selecting that stopped grant re-plans the stopped request's
   remaining authorized dismissals against a fresh read. It carries no new
   authorization. Its effect text says, from the same kept-holds predicate as
   its acceptance (`continue_rearm_kept_holds`), whether it buys a review.
-- `authorize_retry` behaves as it does for resolve. After exact-replay and stale
+- `release` with `retry_absent` behaves as it does for resolve. After exact-replay and stale
   binding checks, acceptance reads the pull request and refuses a closed or merged one. The review
   drain executes it.
 

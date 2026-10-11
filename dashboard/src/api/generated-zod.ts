@@ -453,22 +453,36 @@ const SetGuidance = z.object({
   kind: z.literal("set"),
   text: z.string().min(1).max(4000),
 });
-const RequestRearm = z.object({
-  expected: ResolveExpected,
-  gate_id: z.string().min(1).max(512),
+const ResumeGate = z.object({
   guidance: z.discriminatedUnion("kind", [
     KeepGuidance,
     ClearGuidance,
     SetGuidance,
   ]),
-  operation: z.literal("request_rearm"),
-  request_id: z.string().min(1).max(512),
+  kind: z.literal("resume"),
 });
-const ContinueRearm = z.object({
-  expected: ResolveExpected,
-  operation: z.literal("continue_rearm"),
-  request_id: z.string().min(1).max(512),
+const RetryAbsent = z.object({
+  command_id: z.string().min(1).max(512),
+  evidence_id: z.string().min(1).max(512),
+  kind: z.literal("retry_absent"),
+});
+const ResolveGateSelection = z.object({
+  gate_id: z.string().min(1).max(512),
+  intent: z.discriminatedUnion("kind", [ResumeGate, RetryAbsent]),
+  kind: z.literal("gate"),
+});
+const StoppedGrantSelection = z.object({
+  kind: z.literal("stopped_grant"),
   stopped_request_id: z.string().min(1).max(512),
+});
+const ResolveRelease = z.object({
+  expected: ResolveExpected,
+  operation: z.literal("release"),
+  request_id: z.string().min(1).max(512),
+  selection: z.discriminatedUnion("kind", [
+    ResolveGateSelection,
+    StoppedGrantSelection,
+  ]),
 });
 const CancelRearm = z.object({
   cancellation_id: z.string().min(1).max(512),
@@ -477,21 +491,8 @@ const CancelRearm = z.object({
   reason: z.string().min(1).max(16384),
   request_id: z.string().min(1).max(512),
 });
-const AuthorizeRetry = z.object({
-  authorization_id: z.string().min(1).max(512),
-  command_id: z.string().min(1).max(512),
-  evidence_id: z.string().min(1).max(512),
-  expected: ResolveExpected,
-  gate_id: z.string().min(1).max(512),
-  operation: z.literal("authorize_retry"),
-});
 const api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body =
-  z.discriminatedUnion("operation", [
-    RequestRearm,
-    ContinueRearm,
-    CancelRearm,
-    AuthorizeRetry,
-  ]);
+  z.discriminatedUnion("operation", [ResolveRelease, CancelRearm]);
 const CommandResult = z.object({
   control: z.discriminatedUnion("status", [
     AvailableControl,
@@ -792,22 +793,22 @@ const ReviewActionOffered = z.object({
   effect: z.string(),
   operation: z.enum([
     "request_rearm",
+    "renew_execution",
+    "release_verdict",
     "continue_rearm",
     "cancel_rearm",
     "authorize_retry",
-    "renew_execution",
-    "release_verdict",
   ]),
   state: z.literal("offered"),
 });
 const ReviewActionRefused = z.object({
   operation: z.enum([
     "request_rearm",
+    "renew_execution",
+    "release_verdict",
     "continue_rearm",
     "cancel_rearm",
     "authorize_retry",
-    "renew_execution",
-    "release_verdict",
   ]),
   reason: z.string(),
   state: z.literal("refused"),
@@ -1066,22 +1067,46 @@ const ReviewUnavailableControl = z.object({
   reason: z.string(),
   status: z.literal("unavailable"),
 });
-const ReviewRequestRearm = z.object({
-  expected: ReviewExpected,
+const RenewExecution = z.object({
+  execution_episode: z.string().min(1).max(512),
+  execution_epoch: z.number().int().gte(1).lte(9007199254740991),
+  guidance: z.discriminatedUnion("kind", [
+    KeepGuidance,
+    ClearGuidance,
+    SetGuidance,
+  ]),
+  kind: z.literal("renew_execution"),
+});
+const GateSelection = z.object({
+  gate_id: z.string().min(1).max(512),
+  intent: z.discriminatedUnion("kind", [
+    ResumeGate,
+    RenewExecution,
+    RetryAbsent,
+  ]),
+  kind: z.literal("gate"),
+});
+const VerdictSelection = z.object({
+  execution_episode: z.string().min(1).max(512),
+  execution_epoch: z.number().int().gte(1).lte(9007199254740991),
   gate_id: z.string().min(1).max(512),
   guidance: z.discriminatedUnion("kind", [
     KeepGuidance,
     ClearGuidance,
     SetGuidance,
   ]),
-  operation: z.literal("request_rearm"),
-  request_id: z.string().min(1).max(512),
+  kind: z.literal("verdict"),
+  submission_command_id: z.string().min(1).max(512),
 });
-const ReviewContinueRearm = z.object({
+const ReviewRelease = z.object({
   expected: ReviewExpected,
-  operation: z.literal("continue_rearm"),
+  operation: z.literal("release"),
   request_id: z.string().min(1).max(512),
-  stopped_request_id: z.string().min(1).max(512),
+  selection: z.discriminatedUnion("kind", [
+    GateSelection,
+    VerdictSelection,
+    StoppedGrantSelection,
+  ]),
 });
 const ReviewCancelRearm = z.object({
   cancellation_id: z.string().min(1).max(512),
@@ -1090,50 +1115,8 @@ const ReviewCancelRearm = z.object({
   reason: z.string().min(1).max(16384),
   request_id: z.string().min(1).max(512),
 });
-const ReviewAuthorizeRetry = z.object({
-  authorization_id: z.string().min(1).max(512),
-  command_id: z.string().min(1).max(512),
-  evidence_id: z.string().min(1).max(512),
-  expected: ReviewExpected,
-  gate_id: z.string().min(1).max(512),
-  operation: z.literal("authorize_retry"),
-});
-const ReviewRequestExecutionRenewal = z.object({
-  execution_episode: z.string().min(1).max(512),
-  execution_epoch: z.number().int().gte(1).lte(9007199254740991),
-  expected: ReviewExpected,
-  gate_id: z.string().min(1).max(512),
-  guidance: z.discriminatedUnion("kind", [
-    KeepGuidance,
-    ClearGuidance,
-    SetGuidance,
-  ]),
-  operation: z.literal("renew_execution"),
-  request_id: z.string().min(1).max(512),
-});
-const ReviewRequestVerdictRelease = z.object({
-  execution_episode: z.string().min(1).max(512),
-  execution_epoch: z.number().int().gte(1).lte(9007199254740991),
-  expected: ReviewExpected,
-  gate_id: z.string().min(1).max(512),
-  guidance: z.discriminatedUnion("kind", [
-    KeepGuidance,
-    ClearGuidance,
-    SetGuidance,
-  ]),
-  operation: z.literal("release_verdict"),
-  request_id: z.string().min(1).max(512),
-  submission_command_id: z.string().min(1).max(512),
-});
 const api_review_command_api_repos__name__pulls__pr__review_control_commands_post_Body =
-  z.discriminatedUnion("operation", [
-    ReviewRequestRearm,
-    ReviewContinueRearm,
-    ReviewCancelRearm,
-    ReviewAuthorizeRetry,
-    ReviewRequestExecutionRenewal,
-    ReviewRequestVerdictRelease,
-  ]);
+  z.discriminatedUnion("operation", [ReviewRelease, ReviewCancelRearm]);
 const ReviewCommandResult = z.object({
   control: z.discriminatedUnion("status", [
     ReviewAvailableControl,
@@ -1262,10 +1245,12 @@ export const schemas = {
   KeepGuidance,
   ClearGuidance,
   SetGuidance,
-  RequestRearm,
-  ContinueRearm,
+  ResumeGate,
+  RetryAbsent,
+  ResolveGateSelection,
+  StoppedGrantSelection,
+  ResolveRelease,
   CancelRearm,
-  AuthorizeRetry,
   api_resolve_command_api_repos__name__issues__number__resolve_control_commands_post_Body,
   CommandResult,
   StepEventsPayload,
@@ -1338,12 +1323,11 @@ export const schemas = {
   ReviewMigrationRequiredControl,
   ReviewAbsentControl,
   ReviewUnavailableControl,
-  ReviewRequestRearm,
-  ReviewContinueRearm,
+  RenewExecution,
+  GateSelection,
+  VerdictSelection,
+  ReviewRelease,
   ReviewCancelRearm,
-  ReviewAuthorizeRetry,
-  ReviewRequestExecutionRenewal,
-  ReviewRequestVerdictRelease,
   api_review_command_api_repos__name__pulls__pr__review_control_commands_post_Body,
   ReviewCommandResult,
   WorkflowFamiliesAvailable,
@@ -1739,6 +1723,32 @@ const endpoints = makeApi([
       },
     ],
     response: z.object({ detail: z.string(), ok: z.boolean() }).passthrough(),
+    errors: [
+      {
+        status: 422,
+        description: `Validation Error`,
+        schema: HTTPValidationError,
+      },
+    ],
+  },
+  {
+    method: "get",
+    path: "/api/repos/:name/measurement",
+    alias: "api_measurement_api_repos__name__measurement_get",
+    requestFormat: "json",
+    parameters: [
+      {
+        name: "name",
+        type: "Path",
+        schema: z.string(),
+      },
+      {
+        name: "specification",
+        type: "Query",
+        schema: z.string().max(65536),
+      },
+    ],
+    response: z.unknown(),
     errors: [
       {
         status: 422,

@@ -208,6 +208,23 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/api/repos/{name}/measurement": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /** Api Measurement */
+        get: operations["api_measurement_api_repos__name__measurement_get"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/api/repos/{name}/overview": {
         parameters: {
             query?: never;
@@ -400,26 +417,6 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
-        /**
-         * AuthorizeRetry
-         * @description One execution of an existing command; the evidence is the harness's own read.
-         */
-        AuthorizeRetry: {
-            /** Authorization Id */
-            authorization_id: string;
-            /** Command Id */
-            command_id: string;
-            /** Evidence Id */
-            evidence_id: string;
-            expected: components["schemas"]["ResolveExpected"];
-            /** Gate Id */
-            gate_id: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "authorize_retry";
-        };
         /** AvailableControl */
         AvailableControl: {
             current_intent: components["schemas"]["Rearm"] | null;
@@ -583,19 +580,6 @@ export interface components {
             /** Reason */
             reason: string;
         };
-        /** ContinueRearm */
-        ContinueRearm: {
-            expected: components["schemas"]["ResolveExpected"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "continue_rearm";
-            /** Request Id */
-            request_id: string;
-            /** Stopped Request Id */
-            stopped_request_id: string;
-        };
         /** CostMix */
         CostMix: {
             /** Repair Usd */
@@ -652,6 +636,18 @@ export interface components {
              * @enum {string}
              */
             state: "open" | "rearming";
+        };
+        /** GateSelection */
+        GateSelection: {
+            /** Gate Id */
+            gate_id: string;
+            /** Intent */
+            intent: components["schemas"]["ResumeGate"] | components["schemas"]["RenewExecution"] | components["schemas"]["RetryAbsent"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "gate";
         };
         /** HTTPValidationError */
         HTTPValidationError: {
@@ -1304,6 +1300,20 @@ export interface components {
             /** Unresolved Since */
             unresolved_since: string;
         };
+        /** RenewExecution */
+        RenewExecution: {
+            /** Execution Episode */
+            execution_episode: string;
+            /** Execution Epoch */
+            execution_epoch: number;
+            /** Guidance */
+            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "renew_execution";
+        };
         /** RepoSummary */
         RepoSummary: {
             /** Active */
@@ -1337,21 +1347,6 @@ export interface components {
             warnings: string[];
         } & {
             [key: string]: unknown;
-        };
-        /** RequestRearm */
-        RequestRearm: {
-            expected: components["schemas"]["ResolveExpected"];
-            /** Gate Id */
-            gate_id: string;
-            /** Guidance */
-            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "request_rearm";
-            /** Request Id */
-            request_id: string;
         };
         /** ResolveCeiling */
         ResolveCeiling: {
@@ -1390,6 +1385,53 @@ export interface components {
             /** Version */
             version: number;
         };
+        /** ResolveGateSelection */
+        ResolveGateSelection: {
+            /** Gate Id */
+            gate_id: string;
+            /** Intent */
+            intent: components["schemas"]["ResumeGate"] | components["schemas"]["RetryAbsent"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "gate";
+        };
+        /** ResolveRelease */
+        ResolveRelease: {
+            expected: components["schemas"]["ResolveExpected"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "release";
+            /** Request Id */
+            request_id: string;
+            /** Selection */
+            selection: components["schemas"]["ResolveGateSelection"] | components["schemas"]["StoppedGrantSelection"];
+        };
+        /** ResumeGate */
+        ResumeGate: {
+            /** Guidance */
+            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "resume";
+        };
+        /** RetryAbsent */
+        RetryAbsent: {
+            /** Command Id */
+            command_id: string;
+            /** Evidence Id */
+            evidence_id: string;
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "retry_absent";
+        };
         /** RetryAuthorizationRequired */
         RetryAuthorizationRequired: {
             /** Absence Evidence Id */
@@ -1426,7 +1468,7 @@ export interface components {
              * Operation
              * @enum {string}
              */
-            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry" | "renew_execution" | "release_verdict";
+            operation: "request_rearm" | "renew_execution" | "release_verdict" | "continue_rearm" | "cancel_rearm" | "authorize_retry";
             /**
              * @description discriminator enum property added by openapi-typescript
              * @enum {string}
@@ -1439,7 +1481,7 @@ export interface components {
              * Operation
              * @enum {string}
              */
-            operation: "request_rearm" | "continue_rearm" | "cancel_rearm" | "authorize_retry" | "renew_execution" | "release_verdict";
+            operation: "request_rearm" | "renew_execution" | "release_verdict" | "continue_rearm" | "cancel_rearm" | "authorize_retry";
             /** Reason */
             reason: string;
             /**
@@ -1461,26 +1503,6 @@ export interface components {
             operation: string;
             /** Outcome */
             outcome: string;
-        };
-        /**
-         * ReviewAuthorizeRetry
-         * @description One execution of an existing command; the evidence is the harness's own read.
-         */
-        ReviewAuthorizeRetry: {
-            /** Authorization Id */
-            authorization_id: string;
-            /** Command Id */
-            command_id: string;
-            /** Evidence Id */
-            evidence_id: string;
-            expected: components["schemas"]["ReviewExpected"];
-            /** Gate Id */
-            gate_id: string;
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "authorize_retry";
         };
         /** ReviewAvailableControl */
         ReviewAvailableControl: {
@@ -1572,19 +1594,6 @@ export interface components {
             state: "completed";
             /** Verified Commands */
             verified_commands: string[];
-        };
-        /** ReviewContinueRearm */
-        ReviewContinueRearm: {
-            expected: components["schemas"]["ReviewExpected"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "continue_rearm";
-            /** Request Id */
-            request_id: string;
-            /** Stopped Request Id */
-            stopped_request_id: string;
         };
         /** ReviewCountedReview */
         ReviewCountedReview: {
@@ -2190,6 +2199,19 @@ export interface components {
             /** Review Bot */
             review_bot: string;
         };
+        /** ReviewRelease */
+        ReviewRelease: {
+            expected: components["schemas"]["ReviewExpected"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            operation: "release";
+            /** Request Id */
+            request_id: string;
+            /** Selection */
+            selection: components["schemas"]["GateSelection"] | components["schemas"]["VerdictSelection"] | components["schemas"]["StoppedGrantSelection"];
+        };
         /** ReviewRemoteUncertainCause */
         ReviewRemoteUncertainCause: {
             /** Command Id */
@@ -2205,64 +2227,6 @@ export interface components {
             last_error: string;
             /** Unresolved Since */
             unresolved_since: string;
-        };
-        /** ReviewRequestExecutionRenewal */
-        ReviewRequestExecutionRenewal: {
-            /** Execution Episode */
-            execution_episode: string;
-            /** Execution Epoch */
-            execution_epoch: number;
-            expected: components["schemas"]["ReviewExpected"];
-            /** Gate Id */
-            gate_id: string;
-            /** Guidance */
-            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "renew_execution";
-            /** Request Id */
-            request_id: string;
-        };
-        /**
-         * ReviewRequestRearm
-         * @description Authorize dismissal of exactly the gate's observed counted bot reviews; the set is never on the wire.
-         */
-        ReviewRequestRearm: {
-            expected: components["schemas"]["ReviewExpected"];
-            /** Gate Id */
-            gate_id: string;
-            /** Guidance */
-            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "request_rearm";
-            /** Request Id */
-            request_id: string;
-        };
-        /** ReviewRequestVerdictRelease */
-        ReviewRequestVerdictRelease: {
-            /** Execution Episode */
-            execution_episode: string;
-            /** Execution Epoch */
-            execution_epoch: number;
-            expected: components["schemas"]["ReviewExpected"];
-            /** Gate Id */
-            gate_id: string;
-            /** Guidance */
-            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
-            /**
-             * @description discriminator enum property added by openapi-typescript
-             * @enum {string}
-             */
-            operation: "release_verdict";
-            /** Request Id */
-            request_id: string;
-            /** Submission Command Id */
-            submission_command_id: string;
         };
         /** ReviewRetryAuthorizationRequiredCause */
         ReviewRetryAuthorizationRequiredCause: {
@@ -2400,6 +2364,16 @@ export interface components {
         } & {
             [key: string]: unknown;
         };
+        /** StoppedGrantSelection */
+        StoppedGrantSelection: {
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "stopped_grant";
+            /** Stopped Request Id */
+            stopped_request_id: string;
+        };
         /** ToastNotification */
         ToastNotification: {
             /** Detail */
@@ -2474,6 +2448,24 @@ export interface components {
             msg: string;
             /** Error Type */
             type: string;
+        };
+        /** VerdictSelection */
+        VerdictSelection: {
+            /** Execution Episode */
+            execution_episode: string;
+            /** Execution Epoch */
+            execution_epoch: number;
+            /** Gate Id */
+            gate_id: string;
+            /** Guidance */
+            guidance: components["schemas"]["KeepGuidance"] | components["schemas"]["ClearGuidance"] | components["schemas"]["SetGuidance"];
+            /**
+             * @description discriminator enum property added by openapi-typescript
+             * @enum {string}
+             */
+            kind: "verdict";
+            /** Submission Command Id */
+            submission_command_id: string;
         };
         /** VerificationPayload */
         VerificationPayload: {
@@ -2802,7 +2794,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["RequestRearm"] | components["schemas"]["ContinueRearm"] | components["schemas"]["CancelRearm"] | components["schemas"]["AuthorizeRetry"];
+                "application/json": components["schemas"]["ResolveRelease"] | components["schemas"]["CancelRearm"];
             };
         };
         responses: {
@@ -2927,6 +2919,39 @@ export interface operations {
             };
         };
     };
+    api_measurement_api_repos__name__measurement_get: {
+        parameters: {
+            query: {
+                specification: string;
+            };
+            header?: never;
+            path: {
+                name: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Successful Response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": unknown;
+                };
+            };
+            /** @description Validation Error */
+            422: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["HTTPValidationError"];
+                };
+            };
+        };
+    };
     api_overview_api_repos__name__overview_get: {
         parameters: {
             query?: {
@@ -3006,7 +3031,7 @@ export interface operations {
         };
         requestBody: {
             content: {
-                "application/json": components["schemas"]["ReviewRequestRearm"] | components["schemas"]["ReviewContinueRearm"] | components["schemas"]["ReviewCancelRearm"] | components["schemas"]["ReviewAuthorizeRetry"] | components["schemas"]["ReviewRequestExecutionRenewal"] | components["schemas"]["ReviewRequestVerdictRelease"];
+                "application/json": components["schemas"]["ReviewRelease"] | components["schemas"]["ReviewCancelRearm"];
             };
         };
         responses: {

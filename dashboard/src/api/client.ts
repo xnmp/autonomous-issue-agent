@@ -1,3 +1,4 @@
+import { releasePayload } from "../lib/release-command";
 /**
  * The single typed HTTP client. Every network call in the app goes through
  * `getJson` / `postJson` so that error shaping, aborting and JSON decoding have
@@ -228,7 +229,7 @@ export const api = {
 
   resolveCommand: (name: string, n: number, command: ResolveCommand, s?: AbortSignal) =>
     postJson<ResolveCommandResult>(
-      `/api/repos/${enc(name)}/issues/${n}/resolve-control/commands`, command,
+      `/api/repos/${enc(name)}/issues/${n}/resolve-control/commands`, releasePayload(command),
       schemas.CommandResult, s, resolveWrites,
     ),
 
@@ -244,7 +245,7 @@ export const api = {
 
   reviewCommand: (name: string, pr: number, command: ReviewCommand, s?: AbortSignal) =>
     postJson<ReviewCommandResult>(
-      `/api/repos/${enc(name)}/pulls/${pr}/review-control/commands`, command,
+      `/api/repos/${enc(name)}/pulls/${pr}/review-control/commands`, releasePayload(command),
       schemas.ReviewCommandResult, s, reviewWrites,
     ),
 
