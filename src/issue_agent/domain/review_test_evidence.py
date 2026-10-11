@@ -10,6 +10,10 @@ from .review_execution import ReviewExecutionBinding, ReviewRoundIdentity
 from .review_rejection import validate_commit_sha
 from .workflow_identity import WorkflowBinding, validate_workflow_identifier
 
+# Fits a failing cargo/vitest summary after its echoed command line (#274 follow-up),
+# far below GitHub's 65,536-character comment limit.
+SUMMARY_LIMIT = 16384
+
 
 EXECUTOR_POLICY = "ordinary-test-v1"
 ENVIRONMENT_POLICY = "target-child-v1"
@@ -154,7 +158,7 @@ class ReviewTestCompletion:
     def __post_init__(self) -> None:
         if not isinstance(self.invocation, ReviewTestInvocation) or not isinstance(self.outcome, ReviewTestOutcome):
             raise ValueError("test completion requires typed harness evidence")
-        if not isinstance(self.summary, str) or not self.summary or len(self.summary) > 4096:
+        if not isinstance(self.summary, str) or not self.summary or len(self.summary) > SUMMARY_LIMIT:
             raise ValueError("test completion summary must be bounded nonempty text")
         for proof in (self.before, self.after):
             if proof is not None and (not isinstance(proof, ReviewTestTreeProof) or proof.head_sha != self.invocation.subject.head_sha):
