@@ -774,6 +774,7 @@ def _v2_issue_row(
             }
         )
     )
+    facts["pr_ci_state"] = model.world_facts.get(("pr", prs[-1]), {}).get("ci_state") if prs else None
     review_legs = _review_verdict_legs(legs)
     spend_events = [
         event.payload

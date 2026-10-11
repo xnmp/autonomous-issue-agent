@@ -122,6 +122,7 @@ def collect_snapshot(
     control_db_path: str | None = None,
     local_tz: tzinfo | None = None,
     read_log=None,
+    ci_ignore_checks: str = "",
 ) -> dash.Snapshot:
     read_log = read_log or read_event_log
     now = now_fn()
@@ -183,11 +184,11 @@ def collect_snapshot(
             dash.ROLE_NAMES, typed_paths, results
         )
     )
-    model = fold(
+    model = fold((
         event
         for _role, _path, _log, events in feeds
         for event in events
-    )
+    ), ci_ignore_checks=ci_ignore_checks)
     heartbeat_times = {
         role: stamp
         for role, legacy_path in zip(dash.ROLE_NAMES, journal_paths)

@@ -51,6 +51,18 @@ function polled(data: IssuesPayload): Polled<IssuesPayload> {
 }
 
 describe("IssuesTab", () => {
+  it("shows CI activity on a pending issue with a PR", () => {
+    render(<IssuesTab repo="demo" sub="inflight" onOpenIssue={vi.fn()} issues={polled({
+      in_flight: [], done: [], backlog: [], gh_ok: true, notifications: [], warnings: [],
+      pending: [{
+        issue: 50, title: "Ready with pending CI", url: null, body: "", priority: null,
+        labels: ["ai-ready"], held: false, hold_reason: null, overlap: null,
+        pr: 75, pr_url: null, pr_state: "open", pr_ci_state: "pending",
+      }],
+    })} />);
+    expect(screen.getByText("CI running")).toHaveClass("chip-running", "pulse");
+  });
+
   it("expands done rows before opening the full issue and hides rounds by default", async () => {
     const onOpenIssue = vi.fn();
     const { container } = render(

@@ -1,7 +1,7 @@
-import { render } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { describe, expect, it } from "vitest";
 import type { CardStep } from "../../api/types";
-import { StepBadgeRow } from "./StepBadge";
+import { CiRunningBadge, StepBadgeRow } from "./StepBadge";
 
 const step = (over: Partial<CardStep>): CardStep => ({
   kind: "RESOLVE",
@@ -10,6 +10,15 @@ const step = (over: Partial<CardStep>): CardStep => ({
   cost_usd: 1,
   count: 1,
   ...over,
+});
+
+describe("CI activity", () => {
+  it.each(["passing", "failing", null] as const)("disappears when pending becomes %s", (state) => {
+    const { rerender } = render(<CiRunningBadge state="pending" hasPullRequest />);
+    expect(screen.getByText("CI running")).toBeVisible();
+    rerender(<CiRunningBadge state={state} hasPullRequest />);
+    expect(screen.queryByText("CI running")).not.toBeInTheDocument();
+  });
 });
 
 describe("the tasks strip as a condensed timeline", () => {

@@ -5,6 +5,15 @@ import { usd } from "../../lib/format";
 import { Chip } from "./Chip";
 import { tipProps } from "./Tip";
 
+export function CiRunningBadge({ state, hasPullRequest }: {
+  state?: "passing" | "failing" | "pending" | null;
+  hasPullRequest: boolean;
+}) {
+  return hasPullRequest && state === "pending"
+    ? <Chip tone="running" square pulse title="Checks pending on the current PR head">CI running</Chip>
+    : null;
+}
+
 /**
  * A review that finished by asking for changes did its job, but green would
  * read as "converged" — the verdict outranks the exit for the badge's colour.

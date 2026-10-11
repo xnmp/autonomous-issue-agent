@@ -49,7 +49,7 @@ import { shortModel } from "../lib/models";
 import { readRecord } from "../lib/prefs";
 import { Chip } from "./ui/Chip";
 import { EtaProgress } from "./ui/Charts";
-import { StepBadge } from "./ui/StepBadge";
+import { CiRunningBadge, StepBadge } from "./ui/StepBadge";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { TableFilter } from "./ui/TableFilter";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
@@ -662,7 +662,10 @@ function PendingTable({
                         <span className={`chev${open ? " open" : ""}`} aria-hidden="true">▸</span>
                         <div className="issue-summary-main">
                           <CompactIssue issue={card.issue} title={card.title} url={card.url} />
-                          <div className="row-wrap"><PrLink card={card} /></div>
+                          <div className="row-wrap">
+                            <PrLink card={card} />
+                            <CiRunningBadge state={card.pr_ci_state} hasPullRequest={card.pr != null} />
+                          </div>
                         </div>
                       </div>
                     </td>
@@ -1415,14 +1418,17 @@ function IssueLifecycle({ card }: { card: IssueCard }) {
       ? "escalated"
       : null;
   return (
-    <LifecycleStepper
-      compact
-      steps={card.steps}
-      stage={card.stage}
-      hasPullRequest={card.pr !== null}
-      attention={attention}
-      label={`Issue #${card.issue} lifecycle`}
-    />
+    <div className="step-flow">
+      <LifecycleStepper
+        compact
+        steps={card.steps}
+        stage={card.stage}
+        hasPullRequest={card.pr !== null}
+        attention={attention}
+        label={`Issue #${card.issue} lifecycle`}
+      />
+      <CiRunningBadge state={card.pr_ci_state} hasPullRequest={card.pr != null} />
+    </div>
   );
 }
 
