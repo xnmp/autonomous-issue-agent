@@ -13,7 +13,7 @@ from .codex_runner import (
     spend_evidence_path,
     usage_delta,
 )
-from .codex_child_usage import CodexChildUsageMeter, recovered_rate_table
+from .codex_child_usage import CodexChildUsageMeter, NativeFailure, recovered_rate_table
 from ..domain.run_usage import MeasuredRunUsage, RunUsage, UnavailableRunUsage, price_run_usage, total_usage
 from .control_store import (
     AccountingDisposition,
@@ -53,6 +53,7 @@ class CodexSpendReconciler:
                 if rates is None:
                     return self._unavailable(run_id, "Codex recovery has no captured price card")
                 amount = price_run_usage(native, rates)
+                remetered = NativeFailure.parse(evidence.get("native_usage_failure"))
             except (KeyError, TypeError, ValueError, ArithmeticError):
                 return self._unavailable(run_id, "Codex recovery evidence is malformed or unpriceable")
             result = self.store.settle(
@@ -68,6 +69,8 @@ class CodexSpendReconciler:
             )
             if result.disposition is not AccountingDisposition.AVAILABLE:
                 return self._unavailable(run_id, "Codex measured recovery settlement was refused")
+            if remetered is not None:
+                self.store.record_native_remetered(run_id, remetered.name, "measured")
             remove_spend_evidence(directory, run_id)
             return True
         return self._unavailable(run_id, "Codex recovery evidence is missing or invalid")
@@ -168,7 +171,10 @@ class CodexSpendReconciler:
     def _native_usage(self, evidence: dict, session_id: str) -> RunUsage | None:
         if evidence["version"] == 1:
             return UnavailableRunUsage("legacy evidence lacks native child rates and invocation baselines")
-        if evidence.get("native_usage_failure"):
+        frozen = evidence.get("native_usage_failure")
+        # Ambiguous token counts are determined by the retained rollouts alone,
+        # so a meter fix can resolve them; any other frozen failure stays final.
+        if frozen and NativeFailure.parse(frozen) is None:
             return UnavailableRunUsage(str(evidence["native_usage_failure"])[:2048])
         roots = evidence.get("native_root_sessions")
         if not isinstance(roots, dict) or len(roots) > 65:

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timedelta, timezone
+from enum import Enum
 import json
 import os
 import uuid
@@ -17,6 +18,21 @@ from pathlib import Path
 from ..domain.contracts import TokenUsage, UsageSource
 from ..domain.pricing import ModelRates, RateTable, UnknownModelPolicy
 from ..domain.run_usage import MeasuredRunUsage, ModelUsage, RunUsage, UnavailableRunUsage
+
+
+class NativeFailure(str, Enum):
+    """Meter failure classes recovery may act on; the value is the persisted text.
+
+    Failures are frozen into spend evidence as prose. Only a class whose cause is
+    fully determined by the retained rollouts may be re-metered, so recovery
+    parses the persisted text here once instead of matching strings itself.
+    """
+
+    AMBIGUOUS_TOKEN_COUNTS = "native response usage is missing or token counts are ambiguous"
+
+    @classmethod
+    def parse(cls, raw: object) -> "NativeFailure | None":
+        return next((member for member in cls if raw == member.value), None)
 
 
 def normalize_usage(raw: dict) -> TokenUsage:
@@ -489,7 +505,7 @@ class CodexChildUsageMeter:
                 for turn in own_turns:
                     receipts = [tokens for record_turn, tokens in rollout.usage.values() if record_turn == turn]
                     if final and rollout.token_counts.get(turn, []) != receipts:
-                        raise ValueError("native response usage is missing or token counts are ambiguous")
+                        raise ValueError(NativeFailure.AMBIGUOUS_TOKEN_COUNTS.value)
                     actual_model = rollout.models.get(turn)
                     # Native task_started can precede turn_context. Only an
                     # unfinished turn without usage evidence can await it;

@@ -308,6 +308,16 @@ class ReservationRetained(EventPayload):
     reason: str
 
 
+@event_type("accounting.native_usage.remetered.v1")
+@dataclass(frozen=True)
+class NativeUsageRemetered(EventPayload):
+    """Recovery re-read retained rollouts for a frozen meter failure and settled."""
+
+    run_id: str
+    failure_class: str
+    outcome: str
+
+
 @event_type("accounting.admission.reconciled.v1")
 @dataclass(frozen=True)
 class AdmissionReconciled(EventPayload):

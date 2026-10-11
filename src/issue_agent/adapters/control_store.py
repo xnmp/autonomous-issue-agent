@@ -89,6 +89,7 @@ from ..domain.events import (
     EventPayload,
     JsonValue,
     MAX_EVENT_LINE_BYTES,
+    NativeUsageRemetered,
     ReservationRetained,
     SpendRecorded,
     WorldFeedRetired,
@@ -4103,6 +4104,14 @@ class SQLiteControlStore:
             if changed:
                 self._event(db, ReservationRetained(str(run_id), reason), correlation=Correlation(run_id=str(run_id)))
             return bool(changed)
+
+    def record_native_remetered(self, run_id: RunId, failure_class: str, outcome: str) -> None:
+        """Journal a recovery that re-metered a frozen failure class (once per settlement)."""
+        if not failure_class or not outcome:
+            raise ValueError("native re-meter journal requires its failure class and outcome")
+        with self.transaction() as db:
+            self._event(db, NativeUsageRemetered(str(run_id), failure_class, outcome),
+                        correlation=Correlation(run_id=str(run_id)))
 
     def record_admission_reconciled(
         self,
