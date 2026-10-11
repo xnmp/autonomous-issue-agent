@@ -21,7 +21,7 @@ import { reviewablePullRequests } from "./review/model";
 import { ReviewControls } from "./review/ReviewControls";
 import { useLegacyUnblockRefusal } from "./review/use-legacy-unblock";
 import { ColumnMenu, type ColumnChoice } from "./ui/ColumnMenu";
-import { StepBadge, StepStatusChip } from "./ui/StepBadge";
+import { CiRunningBadge, StepBadge, StepStatusChip } from "./ui/StepBadge";
 import { LifecycleStepper } from "./ui/LifecycleStepper";
 import { TableFilter } from "./ui/TableFilter";
 import {
@@ -194,6 +194,7 @@ export function IssueTab({
                 </Chip>
               ) : null}
               {d.done ? <Chip tone="ok">done</Chip> : null}
+              <CiRunningBadge state={d.pr_ci_state} hasPullRequest={d.prs.length > 0} />
             </div>
             <div className="issue-hd-line issue-hd-meta">
               {d.stage === "awaiting human reply" && d.attention_reason ? (

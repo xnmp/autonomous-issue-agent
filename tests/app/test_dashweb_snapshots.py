@@ -2645,11 +2645,12 @@ def test_all_green_checks_read_as_passing():
     # stale check read "pending" forever.
     ["FAILURE", "ERROR", "TIMED_OUT", "CANCELLED", "ACTION_REQUIRED", "STALE"],
 )
-def test_one_bad_check_reads_as_failing_even_beside_greens_and_pendings(verdict):
+def test_pending_check_outranks_failure_until_every_check_settles(verdict):
     card = review_card(statusCheckRollup=[
         {"conclusion": "SUCCESS"}, {"conclusion": verdict}, {"state": "PENDING"},
     ])
-    assert card["pr_ci_state"] == "failing"
+    assert card["pr_ci_state"] == "pending"
+    assert review_card(statusCheckRollup=[{"conclusion": verdict}])["pr_ci_state"] == "failing"
 
 
 def test_a_still_running_check_reads_as_pending_not_passing():

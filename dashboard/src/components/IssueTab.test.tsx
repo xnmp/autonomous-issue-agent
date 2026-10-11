@@ -4,6 +4,17 @@ import { describe, expect, it, vi } from "vitest";
 import { IssueTab } from "./IssueTab";
 
 describe("IssueTab", () => {
+  it("shows current CI activity beside the issue lifecycle badges", async () => {
+    vi.stubGlobal("fetch", vi.fn().mockImplementation(() => Promise.resolve(new Response(JSON.stringify({
+      issue: 50, title: "Checks pending", url: null, stage: "reviewing", done: false,
+      prs: [75], pull_requests: [{ number: 75, url: null, state: "open" }],
+      pr_ci_state: "pending", cost_usd: 0, elapsed_s: null, working_s: null,
+      idle_s: null, idle_active: false, steps: [], events: [], warnings: [],
+    }), { status: 200, headers: { "Content-Type": "application/json" } }))));
+    render(<IssueTab repo="ci-demo" issue={50} />);
+    expect(await screen.findByText("CI running")).toHaveClass("chip-running", "pulse");
+  });
+
   it("links both issue reference and PR badge to GitHub in new tabs", async () => {
     vi.stubGlobal(
       "fetch",

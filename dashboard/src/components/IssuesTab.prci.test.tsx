@@ -1,4 +1,4 @@
-import { render } from "@testing-library/react";
+import { render, screen } from "@testing-library/react";
 import { describe, expect, it, vi } from "vitest";
 import type { Polled } from "../api/hooks";
 import type { IssueCard, IssuesPayload } from "../api/types";
@@ -81,6 +81,17 @@ describe("the PR control wears CI's verdict", () => {
   it("reads running while checks are still going", () => {
     const { container } = board({ pr_ci_state: "pending" });
     expect(prChip(container)).toHaveClass("chip-running");
+    expect(screen.getByText("CI running")).toHaveClass("chip-running", "pulse");
+  });
+
+  it.each(["passing", "failing", null] as const)("has no CI activity badge for %s", (pr_ci_state) => {
+    board({ pr_ci_state });
+    expect(screen.queryByText("CI running")).not.toBeInTheDocument();
+  });
+
+  it("has no CI activity badge without a PR", () => {
+    board({ pr: null, pr_ci_state: "pending" });
+    expect(screen.queryByText("CI running")).not.toBeInTheDocument();
   });
 
   it("claims nothing when CI state is unknown", () => {

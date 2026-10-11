@@ -722,7 +722,7 @@ def _reported_world(
     log: Callable[[str], None],
 ) -> Callable:
     deployment = _deployment_identity(cfg, role)
-    return WorldReporter(control, deployment, log).wrap(observe)
+    return WorldReporter(control, deployment, log, cfg.ci_ignore_checks).wrap(observe)
 
 
 class CancellableAsyncDispatch:

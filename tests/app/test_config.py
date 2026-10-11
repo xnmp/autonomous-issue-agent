@@ -320,6 +320,12 @@ def test_ci_ignore_and_method():
     assert c.merge_method == "merge"
 
 
+def test_invalid_ci_ignore_regex_uses_default_and_reports_config_error():
+    c = from_env({"REPO": "o/r", "CI_IGNORE_CHECKS": "["})
+    assert c.ci_ignore_checks == ""
+    assert any("CI_IGNORE_CHECKS" in error for error in c.validation_errors())
+
+
 def test_edit_check_cmd():
     assert from_env({"REPO": "x"}).edit_check_cmd == ""  # default off
     assert from_env({"REPO": "x", "EDIT_CHECK_CMD": "npx tsc --noEmit"}).edit_check_cmd == "npx tsc --noEmit"

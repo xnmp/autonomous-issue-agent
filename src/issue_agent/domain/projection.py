@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 from dataclasses import dataclass, field
 from types import MappingProxyType
 from typing import Iterable, Mapping
 
+from .ci import ci_state
+from .world import Check
 from .events import (
     AgentRunAbandoned,
     AgentRunCompleted,
@@ -21,6 +24,23 @@ from .events import (
 
 WorldSubject = tuple[str, int]
 WorldFeedSubject = tuple[str, str, str, str, int]
+
+
+@dataclass(frozen=True)
+class _PRCI:
+    head: str = ""
+    state: str = ""
+    ci_state: str | None = None
+
+    def observe(self, facts: Mapping[str, JsonValue], ignore: str) -> _PRCI:
+        head = facts.get("head_sha", self.head)
+        state = "MERGED" if self.state == "MERGED" else facts.get("state", self.state)
+        head = head if isinstance(head, str) else ""
+        state = state if isinstance(state, str) else ""
+        signal = self.ci_state if head == self.head else None
+        if facts.get("checks_known") is True:
+            signal = _observed_ci(facts, ignore) or signal
+        return _PRCI(head, state, signal if head and state == "OPEN" else None)
 
 
 @dataclass(frozen=True)
@@ -46,7 +66,7 @@ class ReadModel:
     events: tuple[EventEnvelope, ...] = ()
 
 
-def fold(events: Iterable[EventEnvelope]) -> ReadModel:
+def fold(events: Iterable[EventEnvelope], *, ci_ignore_checks: str = "") -> ReadModel:
     unique = {event.event_id: event for event in events}
     ordered = sorted(unique.values(), key=lambda event: event.order_key)
     runs: dict[str, RunProjection] = {}
@@ -55,6 +75,7 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
     spend: dict[str, int] = {}
     starts_by_event_id: dict[str, str] = {}
     retired_feeds: set[tuple[str, str, str]] = set()
+    pr_ci: dict[int, _PRCI] = {}
 
     for event in ordered:
         payload = event.payload
@@ -138,6 +159,10 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
                 if key[:3] != retired_feed
             }
         elif isinstance(payload, WorldObserved):
+            if payload.subject_kind == "pr" and payload.facts.get("present") is not False:
+                pr_ci[payload.subject_number] = pr_ci.get(payload.subject_number, _PRCI()).observe(
+                    payload.facts, ci_ignore_checks
+                )
             feed_key = (
                 event.producer.deployment,
                 event.producer.repository,
@@ -152,6 +177,10 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
             )
 
     observed, world_facts = _aggregate_world(observed_by_feed)
+    for number, projected in pr_ci.items():
+        facts = world_facts.get(("pr", number))
+        if facts is not None and facts.get("present") is True:
+            facts["ci_state"] = projected.ci_state
     return ReadModel(
         runs=MappingProxyType(runs),
         levels=MappingProxyType(levels),
@@ -169,50 +198,46 @@ def fold(events: Iterable[EventEnvelope]) -> ReadModel:
     )
 
 
+def _observed_ci(facts: Mapping[str, JsonValue], ignore: str) -> str | None:
+    summary = facts.get("ci_summary")
+    if isinstance(summary, dict) and summary.get("policy") == hashlib.sha256(ignore.encode()).hexdigest():
+        state = summary.get("state")
+        if isinstance(state, str) and state in ("pending", "ok", "failure", "none"):
+            return state
+    checks = facts.get("checks")
+    if not isinstance(checks, list) or any(
+        not isinstance(check, dict)
+        or any(not isinstance(check.get(key), str) for key in ("name", "state", "bucket"))
+        or not isinstance(check.get("advisory", False), bool)
+        for check in checks
+    ):
+        return None
+    state = ci_state(
+        (Check(check["name"], check["state"], check["bucket"], advisory=check.get("advisory", False))
+         for check in checks), ignore
+    ).value
+    # A retained running job proves activity; omitted jobs cannot prove settlement.
+    return state if facts.get("checks_total", len(checks)) == len(checks) or state == "pending" else None
+
+
 def _aggregate_world(
     by_feed: Mapping[WorldFeedSubject, EventEnvelope],
 ) -> tuple[
     dict[WorldSubject, EventEnvelope],
     dict[WorldSubject, dict[str, JsonValue]],
 ]:
-    subjects = {
-        (key[3], key[4])
-        for key in by_feed
-    }
     observed: dict[WorldSubject, EventEnvelope] = {}
     facts_by_subject: dict[WorldSubject, dict[str, JsonValue]] = {}
-    for subject in subjects:
-        candidates = [
-            event
-            for key, event in by_feed.items()
-            if (key[3], key[4]) == subject
-        ]
-        active = [
-            event
-            for event in candidates
-            if isinstance(event.payload, WorldObserved)
-            and event.payload.facts.get("present") is not False
-        ]
-        if not active:
-            latest = max(candidates, key=lambda event: event.order_key)
-            observed[subject] = latest
-            facts_by_subject[subject] = {"present": False}
-            continue
-        observed[subject] = max(active, key=lambda event: event.order_key)
-        field_values: dict[
-            str,
-            tuple[tuple[object, ...], JsonValue],
-        ] = {}
-        for event in active:
-            payload = event.payload
-            assert isinstance(payload, WorldObserved)
-            for field, value in payload.facts.items():
-                prior = field_values.get(field)
-                if prior is None or event.order_key > prior[0]:
-                    field_values[field] = (event.order_key, value)
-        facts_by_subject[subject] = {
-            field: value
-            for field, (_order, value) in field_values.items()
-        }
-        facts_by_subject[subject]["present"] = True
+    for event in sorted(by_feed.values(), key=lambda event: event.order_key):
+        payload = event.payload
+        assert isinstance(payload, WorldObserved)
+        subject = (payload.subject_kind, payload.subject_number)
+        facts = facts_by_subject.setdefault(subject, {"present": False})
+        if payload.facts.get("present") is False:
+            if facts["present"] is True:
+                continue
+        else:
+            facts.update(payload.facts)
+            facts["present"] = True
+        observed[subject] = event
     return observed, facts_by_subject

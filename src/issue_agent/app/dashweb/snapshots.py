@@ -19,6 +19,8 @@ import math
 from typing import assert_never
 
 from ...domain import dashboard as dash
+from ...domain.ci import ci_state
+from ...domain.world import Check
 from ...domain.actions import AgentKind
 from ...domain.identity import is_bot_login, login_eq
 from ...domain.labels import LIFECYCLE_LABELS as _CANONICAL_LIFECYCLE_LABELS
@@ -1753,7 +1755,7 @@ def issue_card(
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
         "pr_review_state": _pr_review_state(gh_pr),
-        "pr_ci_state": _pr_ci_state(gh_pr),
+        "pr_ci_state": _pr_ci_state(gh_pr, row),
         "stage": _display_stage(row),
         "attention_reason": _blocked_reason(row),
         "escalation_reason": _escalation_reason(row),
@@ -1814,10 +1816,13 @@ _CI_FAILURE = {
 _CI_SUCCESS = {"SUCCESS", "NEUTRAL", "SKIPPED"}
 
 
-def _pr_ci_state(gh_pr: dict | None) -> str | None:
-    """CI's one-word answer for the PR chip: failing beats pending beats
-    passing, and no checks (or an unreadable rollup) is None — an unknown must
-    render as no signal, never as green."""
+_CI_DISPLAY = {"pending": "pending", "failure": "failing", "ok": "passing"}
+
+
+def _pr_ci_state(gh_pr: dict | None, row: dash.IssueRow | None = None) -> str | None:
+    if row is not None and "pr_ci_state" in row.facts:
+        state = row.facts["pr_ci_state"]
+        return _CI_DISPLAY.get(state) if isinstance(state, str) else None
     checks = (gh_pr or {}).get("statusCheckRollup")
     if not isinstance(checks, list):
         return None
@@ -1826,13 +1831,12 @@ def _pr_ci_state(gh_pr: dict | None) -> str | None:
         for check in checks
         if isinstance(check, dict)
     ]
-    if not verdicts:
-        return None
-    if any(verdict in _CI_FAILURE for verdict in verdicts):
-        return "failing"
-    if all(verdict in _CI_SUCCESS for verdict in verdicts):
-        return "passing"
-    return "pending"
+    state = ci_state(
+        Check("", verdict,
+              "fail" if verdict in _CI_FAILURE else "pass" if verdict in _CI_SUCCESS else "pending")
+        for verdict in verdicts
+    )
+    return _CI_DISPLAY.get(state.value)
 
 
 def _pr_review_state(gh_pr: dict | None) -> str | None:
@@ -1893,7 +1897,7 @@ def pending_card(
         "pr": pr,
         "pr_url": (gh_pr or {}).get("url"),
         "pr_state": _pr_state(gh_pr),
-        "pr_ci_state": _pr_ci_state(gh_pr),
+        "pr_ci_state": _pr_ci_state(gh_pr, row),
     }
 
 
@@ -2582,7 +2586,7 @@ def issue_detail(
             }
             for number in row.prs
         ],
-        "pr_ci_state": _pr_ci_state(gh_pr),
+        "pr_ci_state": _pr_ci_state(gh_pr, row),
         "cost_usd": row.cost_usd,
         "elapsed_s": round(elapsed) if elapsed is not None else None,
         "working_s": round(working) if working is not None else None,

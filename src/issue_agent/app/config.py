@@ -390,7 +390,7 @@ class HarnessConfig:
             "choices": ("squash", "merge", "rebase"),
         },
     )
-    ci_ignore_checks: str = ""
+    ci_ignore_checks: str = field(default="", metadata={"coerce": "regex"})
     close_issue_on_merge: bool = True
     # Bound on how long CI may sit PENDING before the PR goes to a human (#30).
     # CI_IGNORE_CHECKS was the only remedy for a wedged check, and it is a knob,
@@ -1496,6 +1496,13 @@ def _metadata_value(
     raw = env.get(env_name)
     if raw is None:
         return fallback
+    if coercion == "regex":
+        try:
+            re.compile(str(raw))
+        except re.error as exc:
+            errors.append(f"{env_name} must be a valid regex: {exc} — using default {fallback!r}")
+            return fallback
+        return str(raw)
     if coercion == "optional_string":
         return str(raw) or None
     if coercion == "stripped":
