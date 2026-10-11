@@ -332,14 +332,12 @@ def submit_review_control(
     # This subject names the trusted local operator account, not an HTTP user
     # or User-Agent claim. The server's loopback/Origin/CSRF boundary is required.
     actor = w.OperatorActor(f"local-user:{os.getuid()}", "dashboard")
-    if isinstance(command, w.RequestRearm):
-        result = control.request_rearm(command, actor)
-    elif isinstance(command, w.ContinueGrantedRearm):
-        result = control.continue_rearm(command, actor)
-    elif isinstance(command, w.CancelRearm):
+    if isinstance(command, w.CancelRearm):
         result = control.cancel_rearm(command, actor)
-    else:
+    elif isinstance(command, w.AuthorizeAbsentRetry):
         result = control.authorize_retry(command, actor)
+    else:
+        result = control.request_rearm(command, actor)
     view = read_review_control(control, pr, wire.requested_rearm(body))
     if isinstance(result, w.WorkflowCommitted):
         return wire.ReviewCommandResult(outcome="replayed" if result.idempotent else "accepted", reason="", control=view)

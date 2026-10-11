@@ -77,8 +77,9 @@ describe("statuses", () => {
     expect(screen.getByRole("heading", { name: "Review command" })).toHaveFocus();
     expect(r.posts).toEqual([]);
     await user.click(screen.getByRole("button", { name: "Confirm command" }));
-    expect(r.posts).toEqual([expect.objectContaining({ operation: "renew_execution", execution_epoch: 7,
-      execution_episode: "execution-episode-12", expected: reviewBinding, gate_id: "execution-12" })]);
+    expect(r.posts).toEqual([expect.objectContaining({ operation: "release", expected: reviewBinding,
+      selection: { kind: "gate", gate_id: "execution-12", intent: { kind: "renew_execution", execution_epoch: 7,
+        execution_episode: "execution-episode-12", guidance: { kind: "keep" } } } })]);
     expect(await screen.findByRole("heading", { name: "Command recorded" })).toBeVisible();
     expect(screen.getByText("Review rejection ceiling")).toBeVisible();
   });
@@ -388,7 +389,8 @@ describe("commands", () => {
     await user.click(screen.getByRole("button", { name: "Confirm command" }));
     expect(await screen.findByRole("heading", { name: "Command recorded" })).toBeVisible();
     expect(r.posts).toEqual([expect.objectContaining({
-      operation: "request_rearm", expected: reviewBinding, gate_id: "ceiling-12", guidance: { kind: "set", text: "Check the parser." },
+      operation: "release", expected: reviewBinding,
+      selection: { kind: "gate", gate_id: "ceiling-12", intent: { kind: "resume", guidance: { kind: "set", text: "Check the parser." } } },
     })]);
     expect(sessionStorage.getItem(reviewRetryKey("demo", 12))).toBeNull();
   });
@@ -414,7 +416,7 @@ describe("commands", () => {
     expect(await screen.findByText(/Original command replayed/)).toBeVisible();
     expect(r.posts).toHaveLength(2);
     expect(r.posts[0]).toEqual(r.posts[1]);
-    expect(r.posts[0]).toMatchObject({ operation: "authorize_retry", command_id: "command-12", evidence_id: "absence-12" });
+    expect(r.posts[0]).toMatchObject({ operation: "release", selection: { kind: "gate", intent: { kind: "retry_absent", command_id: "command-12", evidence_id: "absence-12" } } });
   });
 
   it("shows a server refusal as not accepted, with its reason", async () => {

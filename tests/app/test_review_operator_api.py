@@ -1216,7 +1216,8 @@ def test_the_family_status_names_the_active_families(bare):
 
 
 def test_closed_operator_transport_captures_fixed_execution_identity_and_returns_accepted_state(current_execution_rig):
-    from issue_agent.app.dashweb.review_contracts import ReviewRequestExecutionRenewal
+    from pydantic import TypeAdapter
+    from issue_agent.app.dashweb.review_contracts import ReviewCommand
     from issue_agent.app.dashweb.review_control import submit_review_control
 
     from tests.adapters.test_review_execution_renewal_transactions import renewal_request, workflow_control
@@ -1224,7 +1225,7 @@ def test_closed_operator_transport_captures_fixed_execution_identity_and_returns
     rig = current_execution_rig
     request = renewal_request(rig)
     binding = request.expected_binding
-    body = ReviewRequestExecutionRenewal.model_validate({
+    body = TypeAdapter(ReviewCommand).validate_python({
         "operation": "renew_execution", "request_id": request.request_id, "gate_id": request.gate_id,
         "guidance": {"kind": "keep"}, "execution_epoch": request.execution_epoch,
         "execution_episode": request.execution_episode,

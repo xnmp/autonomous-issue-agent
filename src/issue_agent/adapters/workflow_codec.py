@@ -436,6 +436,22 @@ def _parsed_workflow_json(raw: str) -> object:
     return json.loads(raw, object_pairs_hook=_unique_object)
 
 
+def validate_operator_json(raw: bytes) -> None:
+    """Apply receipt codec bounds before HTTP decoding can exhaust recursion."""
+    try:
+        if len(raw) > MAX_WORKFLOW_PAYLOAD_BYTES:
+            raise ValueError("operator payload is too large")
+        stack = [(json.loads(raw, object_pairs_hook=_unique_object), 0)]
+        while stack:
+            value, depth = stack.pop()
+            if depth > MAX_WORKFLOW_PAYLOAD_DEPTH:
+                raise ValueError("operator payload nesting is excessive")
+            children = value.values() if isinstance(value, dict) else value if isinstance(value, list) else ()
+            stack.extend((child, depth + 1) for child in children)
+    except (ValueError, RecursionError, UnicodeError) as exc:
+        raise WorkflowEncodingError("invalid or excessive operator JSON") from exc
+
+
 def encode_workflow(value: object) -> str:
     try:
         encoded = json.dumps(

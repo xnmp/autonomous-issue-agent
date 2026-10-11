@@ -14,22 +14,22 @@ import sqlite3
 from dataclasses import replace
 
 from ..domain.review_workflow import (
-    AnyWorkflowSnapshot, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, ReviewRearmIntent,
+    AnyWorkflowSnapshot, ReviewRearmPreflight, CancelledReviewRearm, CompletedReviewRearm, PendingReviewRearm, ReviewRearmIntent,
     SupersededReviewRearm,
 )
 from ..domain.review_execution import ExecutionNotActivated
 from ..domain.review_workflow import ReviewWorkflowSnapshot
 from ..domain.workflow import (
-    AuthorizeAbsentRetry, AuthorizedOperatorCommand, CancelRearm, CancelledRearm, CompletedRearm,
+    AuthorizeAbsentRetry, AuthorizedOperatorCommand, OperatorActor, CancelRearm, CancelledRearm, CompletedRearm,
     ContinueGrantedRearm, OpenGate, PendingRearm, RearmIntent, RearmObligation, RearmingGate, RequestRearm,
     ResolveAttemptResult,
     SupersededRearm, WorkflowChanged, WorkflowCommitted, WorkflowConflict,
 )
-from ..domain.workflow_identity import WorkflowWriter
+from ..domain.workflow_identity import PullRequestRef, WorkflowBinding, WorkflowKey, WorkflowWriter
 from ..domain.workflow_retry import RetryAuthorizationFacts, minted_authorization
 from .control_store import SQLiteControlStore, _stamp
 from .workflow_codec import decode_workflow, encode_workflow
-from .workflow_rows import WorkflowAuthorityError
+from .workflow_rows import WorkflowAuthorityError, workflow_scope
 
 _INTENT_STATES: dict[type, str] = {
     PendingRearm: "pending", CompletedRearm: "completed",
@@ -46,6 +46,47 @@ def opened_gate(gate: OpenGate | RearmingGate) -> OpenGate:
 def intent_state(intent: RearmIntent | ReviewRearmIntent) -> str:
     """The indexed `workflow_rearms.state` of a typed intent of either family."""
     return _INTENT_STATES[type(intent)]
+
+
+def retry_request_replay(db: sqlite3.Connection, prior: AnyWorkflowSnapshot, command: AuthorizeAbsentRetry,
+                         actor: OperatorActor, binding: WorkflowBinding | None = None) -> WorkflowCommitted | WorkflowConflict | None:
+    row = db.execute("SELECT binding_json,actor_json FROM workflow_retry_authorizations WHERE authorization_id=?",
+                     (command.authorization_id,)).fetchone()
+    if row is None:
+        return None
+    try:
+        audit = decode_workflow(row["actor_json"], AuthorizedOperatorCommand)
+        if not isinstance(prior, ReviewWorkflowSnapshot):
+            granted = decode_workflow(row["binding_json"], WorkflowBinding)
+            if binding is not None and granted != binding:
+                return WorkflowConflict(prior.revision, "authorization identity was reused with different content or operator")
+    except (ValueError, TypeError) as exc:
+        raise WorkflowAuthorityError("invalid accepted retry authorization audit") from exc
+    return (WorkflowCommitted(prior, idempotent=True) if audit.command == command and audit.actor.subject == actor.subject
+            else WorkflowConflict(prior.revision, "authorization identity was reused with different content or operator"))
+
+
+def accepted_rearm_audit(db: sqlite3.Connection, key: WorkflowKey, request_id: str) -> AuthorizedOperatorCommand | None:
+    """Validate original accepted bytes and digest without translating a live row."""
+    row = db.execute("SELECT * FROM workflow_rearms WHERE request_id=?", (request_id,)).fetchone()
+    if row is None:
+        return None
+    if (row["repository"], row["target_kind"], row["target_number"]) != workflow_scope(key):
+        raise WorkflowAuthorityError("re-arm request identity belongs to another workflow")
+    try:
+        audit = decode_workflow(row["actor_json"], AuthorizedOperatorCommand)
+        intent = decode_workflow(row["intent_json"], ReviewRearmIntent if isinstance(key.target, PullRequestRef) else RearmIntent)
+    except (ValueError, TypeError) as exc:
+        raise WorkflowAuthorityError("invalid accepted re-arm audit") from exc
+    command = audit.command
+    if (not isinstance(command, (RequestRearm, ContinueGrantedRearm)) or command.request_id != request_id
+            or command.expected.fence.key != key or (not isinstance(audit.preflight, ReviewRearmPreflight) if isinstance(key.target, PullRequestRef) else audit.preflight is None)
+            or encode_workflow(audit) != row["actor_json"] or intent.request_id != request_id
+            or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"]
+            or row["state"] != intent_state(intent)
+            or row["request_digest"] != hashlib.sha256(encode_workflow((audit.actor.subject, command)).encode()).hexdigest()):
+        raise WorkflowAuthorityError("accepted re-arm audit disagrees with its durable identity")
+    return audit
 
 
 def accepted_proposal(proposal: WorkflowChanged) -> str:
@@ -71,6 +112,16 @@ def accepted_proposal(proposal: WorkflowChanged) -> str:
 def transition_receipt(proposal: WorkflowChanged) -> str:
     """A paid result's receipt is its exact audit; every other transition keeps its plan."""
     return encode_workflow(proposal.audit) if isinstance(proposal.audit, ResolveAttemptResult) else accepted_proposal(proposal)
+
+
+def accepted_operator_audit(raw: str) -> AuthorizedOperatorCommand:
+    try:
+        accepted = json.loads(raw)
+        if not isinstance(accepted, dict) or not isinstance(accepted.get("audit"), str):
+            raise ValueError("accepted workflow audit is missing its typed payload")
+        return decode_workflow(accepted["audit"], AuthorizedOperatorCommand)
+    except (ValueError, TypeError) as exc:
+        raise WorkflowAuthorityError("invalid accepted operator audit") from exc
 
 
 def same_receipt(raw: str, proposal: WorkflowChanged, encoded: str) -> bool:
@@ -105,16 +156,7 @@ def same_receipt(raw: str, proposal: WorkflowChanged, encoded: str) -> bool:
             return decode_workflow(old_snapshot, ReviewWorkflowSnapshot) == decode_workflow(normalized, ReviewWorkflowSnapshot)
         except (ValueError, TypeError):
             return False
-    try:
-        accepted = json.loads(raw)
-        if not isinstance(accepted, dict):
-            raise ValueError("accepted workflow audit must be an object")
-        accepted_audit = accepted.get("audit")
-        if not isinstance(accepted_audit, str):
-            raise ValueError("accepted workflow audit is missing its typed payload")
-        audit = decode_workflow(accepted_audit, AuthorizedOperatorCommand)
-    except (ValueError, TypeError) as exc:
-        raise WorkflowAuthorityError("invalid accepted operator audit") from exc
+    audit = accepted_operator_audit(raw)
     # Authentication is established before this bound port is called. Replay
     # belongs to the same authenticated subject and exact operator command;
     # refreshed observations, channel provenance and regenerated plans do not

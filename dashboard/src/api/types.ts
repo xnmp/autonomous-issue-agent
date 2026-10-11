@@ -7,6 +7,7 @@
  */
 
 import type { components } from "./generated";
+import type { OperatorCommand, ReleaseCommand } from "../lib/release-command";
 
 type Schema = components["schemas"];
 
@@ -46,9 +47,9 @@ export type ResolveControl = Schema["CommandResult"]["control"];
 export type AvailableResolveControl = Schema["AvailableControl"];
 export type ResolveGate = Schema["Gate"];
 export type ResolveRearm = Schema["Rearm"];
-export type ResolveCommand = Schema["RequestRearm"] | Schema["ContinueRearm"] | Schema["CancelRearm"] | Schema["AuthorizeRetry"];
+export type ResolveCommand = Schema["CancelRearm"] | Extract<ReleaseCommand<Schema["ResolveExpected"]>, { operation: "request_rearm" | "continue_rearm" | "authorize_retry" }>;
 export type ResolveCommandResult = Schema["CommandResult"];
-export type ResolveGuidance = Schema["RequestRearm"]["guidance"];
+export type ResolveGuidance = Schema["ResumeGate"]["guidance"];
 export type ReviewControl = Schema["ReviewCommandResult"]["control"];
 export type AvailableReviewControl = Schema["ReviewAvailableControl"];
 export type ReviewGate = Schema["ReviewGate"];
@@ -58,11 +59,9 @@ export type ReviewRearm = NonNullable<AvailableReviewControl["current_intent"]>;
 export type ReviewDaemonDecision = AvailableReviewControl["daemon"];
 export type ReviewDispatch = Extract<ReviewDaemonDecision, { state: "recorded" }>["dispatch"];
 export type WorkflowFamilies = Schema["WorkflowFamiliesAvailable"] | Schema["WorkflowFamiliesUnavailable"];
-export type ReviewCommand =
-  | Schema["ReviewRequestRearm"] | Schema["ReviewContinueRearm"] | Schema["ReviewCancelRearm"] | Schema["ReviewAuthorizeRetry"]
-  | Schema["ReviewRequestExecutionRenewal"] | Schema["ReviewRequestVerdictRelease"];
+export type ReviewCommand = OperatorCommand<Schema["ReviewExpected"]>;
 export type ReviewCommandResult = Schema["ReviewCommandResult"];
-export type ReviewGuidance = Schema["ReviewRequestRearm"]["guidance"];
+export type ReviewGuidance = Schema["ResumeGate"]["guidance"];
 
 export type RoleName = "fix" | "review" | "steward";
 export type VerificationStatus =

@@ -2,7 +2,7 @@
 
 from typing import Annotated, Literal
 
-from pydantic import AfterValidator, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AfterValidator, BaseModel, BeforeValidator, ConfigDict, Field, field_validator
 
 from ...domain import workflow as w
 from ...domain.workflow_identity import (
@@ -38,10 +38,9 @@ class ClosedContract(BaseModel):
         return value
 
 
-class ResolveExpected(ClosedContract):
+class OperatorExpected(ClosedContract):
+    family: Literal["resolve", "review_rejections"]
     repository: Identifier
-    issue: Positive
-    family: Literal["resolve"]
     epoch: Positive
     generation: Counter
     version: Counter
@@ -54,14 +53,23 @@ class ResolveExpected(ClosedContract):
             raise ValueError("repository must be canonical")
         return value
 
+    def key(self) -> WorkflowKey:
+        raise NotImplementedError
+
     def binding(self) -> WorkflowBinding:
-        return WorkflowBinding(
-            WorkflowFence(WorkflowKey(self.repository, IssueRef(self.issue)), self.generation),
-            FamilyAuthority(WorkflowFamily.RESOLVE, self.epoch), self.episode_id,
-        )
+        return WorkflowBinding(WorkflowFence(self.key(), self.generation),
+            FamilyAuthority(WorkflowFamily(self.family), self.epoch), self.episode_id)
 
     def revision(self) -> WorkflowRevision:
         return WorkflowRevision(self.binding().fence, self.version)
+
+
+class ResolveExpected(OperatorExpected):
+    issue: Positive
+    family: Literal["resolve"]
+
+    def key(self) -> WorkflowKey:
+        return WorkflowKey(self.repository, IssueRef(self.issue))
 
 
 class KeepGuidance(ClosedContract):
@@ -88,62 +96,131 @@ class SetGuidance(ClosedContract):
 Guidance = Annotated[KeepGuidance | ClearGuidance | SetGuidance, Field(discriminator="kind")]
 
 
-class RequestRearm(ClosedContract):
-    operation: Literal["request_rearm"]
-    expected: ResolveExpected
-    request_id: Identifier
-    gate_id: Identifier
+class ResumeGate(ClosedContract):
+    kind: Literal["resume"]
     guidance: Guidance
 
-    def command(self) -> w.RequestRearm:
-        guidance = (w.SetGuidance(self.guidance.text) if isinstance(self.guidance, SetGuidance)
-                    else w.ClearGuidance() if isinstance(self.guidance, ClearGuidance) else w.KeepGuidance())
-        return w.RequestRearm(self.request_id, self.expected.revision(), self.gate_id, guidance)
+
+class RenewExecution(ResumeGate):
+    kind: Literal["renew_execution"]
+    execution_epoch: Positive
+    execution_episode: Identifier
 
 
-class ContinueRearm(ClosedContract):
-    operation: Literal["continue_rearm"]
-    expected: ResolveExpected
-    request_id: Identifier
+class RetryAbsent(ClosedContract):
+    kind: Literal["retry_absent"]
+    command_id: Identifier
+    evidence_id: Identifier
+
+
+class GateSelection(ClosedContract):
+    kind: Literal["gate"]
+    gate_id: Identifier
+    intent: Annotated[ResumeGate | RenewExecution | RetryAbsent, Field(discriminator="kind")]
+
+
+class VerdictSelection(RenewExecution):
+    kind: Literal["verdict"]
+    gate_id: Identifier
+    submission_command_id: Identifier
+
+
+class StoppedGrantSelection(ClosedContract):
+    kind: Literal["stopped_grant"]
     stopped_request_id: Identifier
 
-    def command(self) -> w.ContinueGrantedRearm:
-        return w.ContinueGrantedRearm(self.request_id, self.expected.revision(), self.stopped_request_id)
+
+class ReleaseBody(ClosedContract):
+    operation: Literal["release"]
+    request_id: Identifier
+    expected: OperatorExpected
+    selection: Annotated[GateSelection | VerdictSelection | StoppedGrantSelection, Field(discriminator="kind")]
+
+    def command(self) -> w.OperatorCommand:
+        expected = self.expected.revision()
+        binding = self.expected.binding() if self.expected.family == "review_rejections" else None
+        selected = self.selection
+        if isinstance(selected, StoppedGrantSelection):
+            return w.ContinueGrantedRearm(self.request_id, expected, selected.stopped_request_id, expected_binding=binding)
+        elif isinstance(selected, GateSelection) and isinstance(selected.intent, RetryAbsent):
+            return w.AuthorizeAbsentRetry(self.request_id, expected, w.CommandId(selected.intent.command_id),
+                selected.gate_id, selected.intent.evidence_id, expected_binding=binding)
+        else:
+            intent = selected.intent if isinstance(selected, GateSelection) else selected
+            assert isinstance(intent, ResumeGate)
+            guidance = (w.SetGuidance(intent.guidance.text) if isinstance(intent.guidance, SetGuidance)
+                        else w.ClearGuidance() if isinstance(intent.guidance, ClearGuidance) else w.KeepGuidance())
+            if isinstance(selected, VerdictSelection):
+                return w.RequestReviewVerdictRelease(self.request_id, expected, selected.gate_id, guidance,
+                    selected.execution_epoch, selected.execution_episode, w.CommandId(selected.submission_command_id), expected_binding=binding)
+            elif isinstance(intent, RenewExecution):
+                return w.RequestReviewExecutionRenewal(self.request_id, expected, selected.gate_id, guidance,
+                    intent.execution_epoch, intent.execution_episode, expected_binding=binding)
+            else:
+                return w.RequestRearm(self.request_id, expected, selected.gate_id, guidance, expected_binding=binding)
 
 
-class CancelRearm(ClosedContract):
-    operation: Literal["cancel_rearm"]
+class ResolveGateSelection(GateSelection):
+    intent: Annotated[ResumeGate | RetryAbsent, Field(discriminator="kind")]
+
+
+class ResolveRelease(ReleaseBody):
     expected: ResolveExpected
+    selection: Annotated[ResolveGateSelection | StoppedGrantSelection, Field(discriminator="kind")]
+
+
+class Cancellation(ClosedContract):
+    operation: Literal["cancel_rearm"]
+    expected: OperatorExpected
     cancellation_id: Identifier
     request_id: Identifier
     reason: Annotated[str, Field(min_length=1, max_length=16384)]
 
     def command(self) -> w.CancelRearm:
-        return w.CancelRearm(self.cancellation_id, self.expected.revision(), self.request_id, self.reason)
+        return w.CancelRearm(self.cancellation_id, self.expected.revision(), self.request_id, self.reason,
+            expected_binding=self.expected.binding() if self.expected.family == "review_rejections" else None)
 
 
-class AuthorizeRetry(ClosedContract):
-    """One execution of an existing command; the evidence is the harness's own read."""
-    operation: Literal["authorize_retry"]
+
+class CancelRearm(Cancellation):
     expected: ResolveExpected
-    authorization_id: Identifier
-    gate_id: Identifier
-    command_id: Identifier
-    evidence_id: Identifier
-
-    def command(self) -> w.AuthorizeAbsentRetry:
-        return w.AuthorizeAbsentRetry(
-            self.authorization_id, self.expected.revision(), w.CommandId(self.command_id),
-            self.gate_id, self.evidence_id,
-        )
 
 
-ResolveCommand = Annotated[RequestRearm | ContinueRearm | CancelRearm | AuthorizeRetry, Field(discriminator="operation")]
+def legacy_release(value, release_type):
+    """Tabs opened before deployment still submit the original HTTP operations.
+
+    Temporary (#298): delete with increment 2. By then every open tab has
+    reloaded the `release` client, and saved browser retries are already
+    rewritten to `release` on load.
+    """
+    if not isinstance(value, dict) or value.get("operation") in ("release", "cancel_rearm"):
+        return value
+    operation = value.get("operation")
+    shapes = {
+        "request_rearm": ("gate", "resume", "request_id", ("gate_id", "guidance")),
+        "renew_execution": ("gate", "renew_execution", "request_id", ("gate_id", "guidance", "execution_epoch", "execution_episode")),
+        "release_verdict": ("verdict", None, "request_id", ("gate_id", "guidance", "execution_epoch", "execution_episode", "submission_command_id")),
+        "authorize_retry": ("gate", "retry_absent", "authorization_id", ("gate_id", "command_id", "evidence_id")),
+        "continue_rearm": ("stopped_grant", None, "request_id", ("stopped_request_id",)),
+    }
+    if not isinstance(operation, str) or operation not in shapes:
+        raise ValueError("unknown operator operation")
+    kind, intent, identity, fields = shapes[operation]
+    if set(value) != {"operation", "expected", identity, *fields}:
+        raise ValueError("legacy operation has missing or unknown fields")
+    selected = {key: item for key, item in value.items() if key not in ("operation", "expected", identity)}
+    if intent is not None:
+        selected = {"gate_id": selected.pop("gate_id"), "intent": {"kind": intent, **selected}}
+    return release_type.model_validate({"operation": "release", "expected": value.get("expected"),
+        "request_id": value.get(identity), "selection": {"kind": kind, **selected}})
 
 
-def requested_rearm(body: RequestRearm | ContinueRearm | CancelRearm | AuthorizeRetry) -> str | None:
-    """The re-arm history a command result should display, if it names one."""
-    return None if isinstance(body, AuthorizeRetry) else body.request_id
+ResolveCommand = Annotated[ResolveRelease | CancelRearm, Field(discriminator="operation"),
+                           BeforeValidator(lambda value: legacy_release(value, ResolveRelease))]
+
+
+def requested_rearm(body: ResolveRelease | CancelRearm) -> str | None:
+    return None if isinstance(body.command(), w.AuthorizeAbsentRetry) else body.request_id
 
 
 class ResolveCeiling(ClosedContract):

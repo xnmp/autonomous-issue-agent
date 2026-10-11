@@ -252,8 +252,9 @@ test.describe("resolve operator controls", () => {
     await page.getByRole("button", { name: "Confirm command" }).click();
     const body = (await posted).postDataJSON();
     expect(body).toMatchObject({
-      operation: "authorize_retry", authorization_id: authorizationId,
-      gate_id: `uncertain-${issue}`, command_id: `command-${issue}`, evidence_id: `absence-${issue}`,
+      operation: "release", request_id: authorizationId,
+      selection: { kind: "gate", gate_id: `uncertain-${issue}`, intent: {
+        kind: "retry_absent", command_id: `command-${issue}`, evidence_id: `absence-${issue}` } },
     });
     await expect(page.getByRole("heading", { name: "Command recorded" })).toBeVisible();
     await page.getByRole("button", { name: "Close result" }).click();

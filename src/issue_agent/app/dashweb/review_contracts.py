@@ -8,142 +8,38 @@ revision it was made against.
 
 from typing import Annotated, Literal
 
-from pydantic import Field, field_validator
+from pydantic import BeforeValidator, Field
 
 from ...domain import workflow as w
 from ...domain.workflow_identity import (
-    FamilyAuthority, PullRequestRef, WorkflowBinding, WorkflowFamily, WorkflowFence, WorkflowKey, WorkflowRevision,
-    canonical_workflow_repository,
+    PullRequestRef, WorkflowKey,
 )
-from .resolve_contracts import ClearGuidance, ClosedContract, Counter, RecoveryControl, Guidance, Identifier, Positive, SetGuidance
+from .resolve_contracts import ClosedContract, RecoveryControl, Positive, OperatorExpected, ReleaseBody, Cancellation, legacy_release
 
 
-class ReviewExpected(ClosedContract):
-    repository: Identifier
+class ReviewExpected(OperatorExpected):
     pull_request: Positive
     family: Literal["review_rejections"]
-    epoch: Positive
-    generation: Counter
-    version: Counter
-    episode_id: Identifier
 
-    @field_validator("repository")
-    @classmethod
-    def canonical_repository(cls, value: str) -> str:
-        if canonical_workflow_repository(value) != value:
-            raise ValueError("repository must be canonical")
-        return value
-
-    def binding(self) -> WorkflowBinding:
-        return WorkflowBinding(
-            WorkflowFence(WorkflowKey(self.repository, PullRequestRef(self.pull_request)), self.generation),
-            FamilyAuthority(WorkflowFamily.REVIEW_REJECTIONS, self.epoch), self.episode_id,
-        )
-
-    def revision(self) -> WorkflowRevision:
-        return WorkflowRevision(self.binding().fence, self.version)
+    def key(self) -> WorkflowKey:
+        return WorkflowKey(self.repository, PullRequestRef(self.pull_request))
 
 
-class ReviewRequestRearm(ClosedContract):
-    """Authorize dismissal of exactly the gate's observed counted bot reviews; the set is never on the wire."""
-    operation: Literal["request_rearm"]
+class ReviewRelease(ReleaseBody):
     expected: ReviewExpected
-    request_id: Identifier
-    gate_id: Identifier
-    guidance: Guidance
-
-    def command(self) -> w.RequestRearm:
-        guidance = (w.SetGuidance(self.guidance.text) if isinstance(self.guidance, SetGuidance)
-                    else w.ClearGuidance() if isinstance(self.guidance, ClearGuidance) else w.KeepGuidance())
-        return w.RequestRearm(self.request_id, self.expected.revision(), self.gate_id, guidance,
-                              expected_binding=self.expected.binding())
 
 
-class ReviewContinueRearm(ClosedContract):
-    operation: Literal["continue_rearm"]
+class ReviewCancelRearm(Cancellation):
     expected: ReviewExpected
-    request_id: Identifier
-    stopped_request_id: Identifier
-
-    def command(self) -> w.ContinueGrantedRearm:
-        return w.ContinueGrantedRearm(self.request_id, self.expected.revision(), self.stopped_request_id,
-                                      expected_binding=self.expected.binding())
 
 
-class ReviewRequestExecutionRenewal(ClosedContract):
-    operation: Literal["renew_execution"]
-    expected: ReviewExpected
-    request_id: Identifier
-    gate_id: Identifier
-    guidance: Guidance
-    execution_epoch: Positive
-    execution_episode: Identifier
-
-    def command(self) -> w.RequestReviewExecutionRenewal:
-        guidance = (w.SetGuidance(self.guidance.text) if isinstance(self.guidance, SetGuidance)
-                    else w.ClearGuidance() if isinstance(self.guidance, ClearGuidance) else w.KeepGuidance())
-        return w.RequestReviewExecutionRenewal(
-            self.request_id, self.expected.revision(), self.gate_id, guidance,
-            self.execution_epoch, self.execution_episode, expected_binding=self.expected.binding(),
-        )
-
-
-class ReviewRequestVerdictRelease(ClosedContract):
-    operation: Literal["release_verdict"]
-    expected: ReviewExpected
-    request_id: Identifier
-    gate_id: Identifier
-    guidance: Guidance
-    execution_epoch: Positive
-    execution_episode: Identifier
-    submission_command_id: Identifier
-
-    def command(self) -> w.RequestReviewVerdictRelease:
-        guidance = (w.SetGuidance(self.guidance.text) if isinstance(self.guidance, SetGuidance)
-                    else w.ClearGuidance() if isinstance(self.guidance, ClearGuidance) else w.KeepGuidance())
-        return w.RequestReviewVerdictRelease(
-            self.request_id, self.expected.revision(), self.gate_id, guidance,
-            self.execution_epoch, self.execution_episode, w.CommandId(self.submission_command_id),
-            expected_binding=self.expected.binding(),
-        )
-
-
-class ReviewCancelRearm(ClosedContract):
-    operation: Literal["cancel_rearm"]
-    expected: ReviewExpected
-    cancellation_id: Identifier
-    request_id: Identifier
-    reason: Annotated[str, Field(min_length=1, max_length=16384)]
-
-    def command(self) -> w.CancelRearm:
-        return w.CancelRearm(self.cancellation_id, self.expected.revision(), self.request_id, self.reason,
-                             expected_binding=self.expected.binding())
-
-
-class ReviewAuthorizeRetry(ClosedContract):
-    """One execution of an existing command; the evidence is the harness's own read."""
-    operation: Literal["authorize_retry"]
-    expected: ReviewExpected
-    authorization_id: Identifier
-    gate_id: Identifier
-    command_id: Identifier
-    evidence_id: Identifier
-
-    def command(self) -> w.AuthorizeAbsentRetry:
-        return w.AuthorizeAbsentRetry(
-            self.authorization_id, self.expected.revision(), w.CommandId(self.command_id),
-            self.gate_id, self.evidence_id, expected_binding=self.expected.binding(),
-        )
-
-
-ReviewCommandBody = (ReviewRequestRearm | ReviewContinueRearm | ReviewCancelRearm | ReviewAuthorizeRetry
-                     | ReviewRequestExecutionRenewal | ReviewRequestVerdictRelease)
-ReviewCommand = Annotated[ReviewCommandBody, Field(discriminator="operation")]
+ReviewCommandBody = ReviewRelease | ReviewCancelRearm
+ReviewCommand = Annotated[ReviewCommandBody, Field(discriminator="operation"),
+                          BeforeValidator(lambda value: legacy_release(value, ReviewRelease))]
 
 
 def requested_rearm(body: ReviewCommandBody) -> str | None:
-    """The re-arm history a command result should display, if it names one."""
-    return None if isinstance(body, ReviewAuthorizeRetry) else body.request_id
+    return None if isinstance(body.command(), w.AuthorizeAbsentRetry) else body.request_id
 
 
 # -- view ------------------------------------------------------------------------------------------
@@ -287,7 +183,7 @@ class ReviewAttemptedRemediation(ClosedContract):
 
 ReviewRemediation = Annotated[ReviewNoRemediation | ReviewAttemptedRemediation, Field(discriminator="kind")]
 
-ReviewOperation = Literal["request_rearm", "continue_rearm", "cancel_rearm", "authorize_retry", "renew_execution", "release_verdict"]
+ReviewOperation = Literal["request_rearm", "renew_execution", "release_verdict", "continue_rearm", "cancel_rearm", "authorize_retry"]
 
 
 class ReviewActionOffered(ClosedContract):

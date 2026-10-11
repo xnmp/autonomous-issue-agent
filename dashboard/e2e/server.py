@@ -28,6 +28,27 @@ UNAVAILABLE_ISSUE = 62
 RETRY_ISSUE = 71
 
 
+def command_view(body):
+    """Keep the fake's effect model while accepting the public release transport."""
+    if body.operation != "release":
+        return body
+    from types import SimpleNamespace
+    selected = body.selection
+    if selected.kind == "stopped_grant":
+        fields = {"operation": "continue_rearm", "request_id": body.request_id, "stopped_request_id": selected.stopped_request_id}
+    elif selected.kind == "verdict":
+        fields = {"operation": "release_verdict", **selected.model_dump(exclude={"kind"}), "guidance": selected.guidance}
+    else:
+        intent = selected.intent
+        fields = {"operation": {"resume": "request_rearm", "retry_absent": "authorize_retry", "renew_execution": "renew_execution"}[intent.kind],
+                  "gate_id": selected.gate_id, **intent.model_dump(exclude={"kind"})}
+        if hasattr(intent, "guidance"):
+            fields["guidance"] = intent.guidance
+    fields.update(expected=body.expected, request_id=body.request_id, authorization_id=body.request_id,
+                  model_dump=body.model_dump)
+    return SimpleNamespace(**fields)
+
+
 @dataclass
 class _ResolveState:
     """One issue's in-memory resolve authority. Frozen contract objects are
@@ -143,6 +164,7 @@ class ResolveFixture:
         )
 
     def command(self, number: int, body: rc.ResolveCommand) -> rc.CommandResult:
+        body = command_view(body)
         if number == INACTIVE_ISSUE:
             return rc.CommandResult(outcome="unavailable", reason="Resolve authority is inactive.",
                 control=rc.InactiveControl(status="inactive", repository=RESOLVE_REPO, issue=number))
@@ -471,6 +493,7 @@ class ReviewFixture:
                                      generation=state.generation + 1, authorized_reviews=reviews, commands=commands)
 
     def command(self, pr: int, body: wc.ReviewCommandBody) -> wc.ReviewCommandResult:
+        body = command_view(body)
         if pr - REVIEW_PR_OFFSET not in REVIEW_ISSUES:
             return wc.ReviewCommandResult(outcome="rejected", reason="review rejection control is not active",
                                           control=self.control(pr, None))

@@ -173,7 +173,7 @@ describe("resolve commands", () => {
     },
   );
 
-  it("sends the exact frozen command with JSON and CSRF headers", async () => {
+  it("sends release with JSON and CSRF headers while retaining the frozen journal command", async () => {
     const result = { outcome: "accepted", reason: "", control: available } as const;
     const mocked = mockResponse(result, 202);
 
@@ -191,7 +191,8 @@ describe("resolve commands", () => {
         "Content-Type": "application/json",
         "X-Issue-Agent-Dashboard": "1",
       },
-      body: JSON.stringify(requestCommand),
+      body: JSON.stringify({ operation: "release", expected: available.expected, request_id: "request/7?retry=true",
+        selection: { kind: "gate", gate_id: "resolve-gate-7", intent: { kind: "resume", guidance: { kind: "keep" } } } }),
       signal: undefined,
     });
     expect(requestCommand).toEqual({

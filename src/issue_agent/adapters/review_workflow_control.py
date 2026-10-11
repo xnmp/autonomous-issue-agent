@@ -98,9 +98,10 @@ from .review_dispatch_holds import (
 )
 from .workflow_codec import WorkflowEncodingError, decode_workflow, encode_workflow
 from .workflow_commit import (
+    accepted_operator_audit, accepted_rearm_audit,
     insert_pending_rearm, intent_state, owns_command, persist_retry_authorization, record_commit,
     retire_rearm_obligation,
-    same_receipt, transition_dedupe_key, transition_receipt, update_rearm_state,
+    same_receipt, transition_dedupe_key, retry_request_replay, transition_receipt, update_rearm_state,
 )
 from .workflow_rows import (
     WorkflowAuthorityError, ReviewExecutionHeld, active_families, load_family_authority, load_review_workflow_row, load_workflow_read,
@@ -398,29 +399,7 @@ class SQLiteReviewWorkflowControl:
             load_review_workflow_row(db, key)
             return self._accepted_rearm(db, key, request_id)
 
-    @staticmethod
-    def _accepted_rearm(db: sqlite3.Connection, key: WorkflowKey, request_id: str) -> AuthorizedOperatorCommand | None:
-        row = db.execute("SELECT * FROM workflow_rearms WHERE request_id=?", (request_id,)).fetchone()
-        if row is None:
-            return None
-        if (row["repository"], row["target_kind"], row["target_number"]) != workflow_scope(key):
-            raise WorkflowAuthorityError("re-arm request identity belongs to another workflow")
-        try:
-            audit = decode_workflow(row["actor_json"], AuthorizedOperatorCommand)
-            intent = decode_workflow(row["intent_json"], _REVIEW_INTENTS)
-        except (ValueError, TypeError) as exc:
-            raise WorkflowAuthorityError("invalid accepted review re-arm audit") from exc
-        command = audit.command
-        if (
-            not isinstance(command, (RequestRearm, ContinueGrantedRearm)) or command.request_id != request_id
-            or command.expected.fence.key != key or not isinstance(audit.preflight, ReviewRearmPreflight)
-            or encode_workflow(audit) != row["actor_json"] or intent.request_id != request_id
-            or intent.gate_id != row["gate_id"] or intent.to_generation != row["to_generation"]
-            or row["state"] != intent_state(intent)
-            or row["request_digest"] != hashlib.sha256(encode_workflow((audit.actor.subject, command)).encode()).hexdigest()
-        ):
-            raise WorkflowAuthorityError("accepted review re-arm audit disagrees with its durable identity")
-        return audit
+    _accepted_rearm = staticmethod(accepted_rearm_audit)
 
     def _accepted_preflight(self, db: sqlite3.Connection, state: ReviewWorkflowSnapshot) -> ReviewRearmPreflight:
         intent = state.intent
@@ -1947,14 +1926,7 @@ class SQLiteReviewWorkflowControl:
         if receipt is None:
             return None
         current = self._load(db, key)
-        try:
-            accepted = json.loads(receipt["payload_json"])
-            raw = accepted.get("audit") if isinstance(accepted, dict) else None
-            if not isinstance(raw, str):
-                raise ValueError("request receipt lacks its accepted audit")
-            audit = decode_workflow(raw, AuthorizedOperatorCommand)
-        except (ValueError, TypeError) as exc:
-            raise WorkflowAuthorityError("invalid accepted review request audit") from exc
+        audit = accepted_operator_audit(receipt["payload_json"])
         if audit.command != command or audit.actor.subject != actor.subject:
             return WorkflowConflict(current.revision, "request identity was reused with different content or operator")
         if current.intent is None or current.intent.request_id != command.request_id:
@@ -1984,16 +1956,6 @@ class SQLiteReviewWorkflowControl:
             f"AND {live} LIMIT 1",
             (key.repository, key.target.number),
         ).fetchone() is not None
-
-    def request_rearm(
-        self, command: RequestRearm, actor: OperatorActor,
-    ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected:
-        return self._accept(command, actor)
-
-    def continue_rearm(
-        self, command: ContinueGrantedRearm, actor: OperatorActor,
-    ) -> WorkflowCommitted | WorkflowConflict | WorkflowRejected:
-        return self._accept(command, actor)
 
     def _accept(
         self, command: RequestRearm | ContinueGrantedRearm, actor: OperatorActor,
@@ -2074,6 +2036,9 @@ class SQLiteReviewWorkflowControl:
                     proposal = continue_review_rearm(prior, command, actor, recorded.observation, **common)  # type: ignore[arg-type]
                 return self._apply(db, prior, key, recorded, proposal)
 
+    request_rearm = _accept
+    continue_rearm = _accept
+
     def cancel_rearm(self, command: CancelRearm, actor: OperatorActor) -> WorkflowCommitted | WorkflowConflict:
         if not isinstance(command, CancelRearm) or not isinstance(actor, OperatorActor):
             raise ValueError("review re-arm cancellation requires a typed command and actor")
@@ -2089,14 +2054,7 @@ class SQLiteReviewWorkflowControl:
                     (self._writer.repository, command.cancellation_id),
                 ).fetchone()
                 if receipt is not None:
-                    try:
-                        accepted = json.loads(receipt["payload_json"])
-                        raw = accepted.get("audit") if isinstance(accepted, dict) else None
-                        if not isinstance(raw, str):
-                            raise ValueError("cancellation receipt lacks its accepted audit")
-                        audit = decode_workflow(raw, AuthorizedOperatorCommand)
-                    except (ValueError, TypeError) as exc:
-                        raise WorkflowAuthorityError("invalid accepted cancellation audit") from exc
+                    audit = accepted_operator_audit(receipt["payload_json"])
                     if audit.command == command and audit.actor.subject == actor.subject:
                         return WorkflowCommitted(prior, idempotent=True)
                     return WorkflowConflict(prior.revision, "durable workflow identity was reused with different content")
@@ -2134,7 +2092,7 @@ class SQLiteReviewWorkflowControl:
                 conflict = self._operator_binding_conflict(prior, command, replay=True)
                 if conflict is not None:
                     return conflict
-                replayed = self._retry_replay(db, prior, command, actor)
+                replayed = retry_request_replay(db, prior, command, actor)
                 if replayed is not None:
                     return replayed
                 conflict = self._operator_binding_conflict(prior, command)
@@ -2152,7 +2110,7 @@ class SQLiteReviewWorkflowControl:
                 conflict = self._operator_binding_conflict(prior, command, replay=True)
                 if conflict is not None:
                     return conflict
-                replayed = self._retry_replay(db, prior, command, actor)
+                replayed = retry_request_replay(db, prior, command, actor)
                 if replayed is not None:
                     return replayed
                 conflict = self._operator_binding_conflict(prior, command)
@@ -2177,24 +2135,6 @@ class SQLiteReviewWorkflowControl:
                     return proposal
                 assert isinstance(proposal, WorkflowChanged)
                 return self._commit(db, prior.revision, (prior.authority,), proposal)
-
-    @staticmethod
-    def _retry_replay(
-        db: sqlite3.Connection, prior: ReviewWorkflowSnapshot, command: AuthorizeAbsentRetry, actor: OperatorActor,
-    ) -> WorkflowCommitted | WorkflowConflict | None:
-        stored = db.execute(
-            "SELECT actor_json FROM workflow_retry_authorizations WHERE authorization_id=?",
-            (command.authorization_id,),
-        ).fetchone()
-        if stored is None:
-            return None
-        try:
-            accepted = decode_workflow(stored["actor_json"], AuthorizedOperatorCommand)
-        except (ValueError, TypeError) as exc:
-            raise WorkflowAuthorityError("invalid accepted retry authorization audit") from exc
-        if accepted.command == command and accepted.actor.subject == actor.subject:
-            return WorkflowCommitted(prior, idempotent=True)
-        return WorkflowConflict(prior.revision, "authorization identity was reused with different content or operator")
 
     # -- pending re-arm reconciliation ----------------------------------------------------------
 

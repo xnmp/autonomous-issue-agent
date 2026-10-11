@@ -33,8 +33,9 @@ test.describe("review operator controls", () => {
     await panel.getByRole("button", { name: "Review command" }).click();
     const posted = page.waitForRequest("**/api/repos/self/pulls/194/review-control/commands");
     await panel.getByRole("button", { name: "Confirm command" }).click();
-    expect((await posted).postDataJSON()).toMatchObject({ operation: "renew_execution",
-      execution_epoch: 7, execution_episode: "execution-194", guidance: { kind: "keep" } });
+    expect((await posted).postDataJSON()).toMatchObject({ operation: "release",
+      selection: { kind: "gate", intent: { kind: "renew_execution",
+        execution_epoch: 7, execution_episode: "execution-194", guidance: { kind: "keep" } } } });
     await expect(panel.getByRole("heading", { name: "Command recorded" })).toBeVisible();
     await panel.getByRole("button", { name: "Close result" }).click();
     const current = panel.getByRole("region", { name: "Current re-arm request" });
@@ -116,8 +117,8 @@ test.describe("review operator controls", () => {
     await panel.getByRole("button", { name: "Review command" }).click();
     const posted = page.waitForRequest("**/api/repos/self/pulls/198/review-control/commands");
     await panel.getByRole("button", { name: "Confirm command" }).click();
-    expect((await posted).postDataJSON()).toMatchObject({ operation: "release_verdict",
-      execution_episode: "execution-198", submission_command_id: "confirmed-198" });
+    expect((await posted).postDataJSON()).toMatchObject({ operation: "release",
+      selection: { kind: "verdict", execution_episode: "execution-198", submission_command_id: "confirmed-198" } });
     await expect(panel.getByRole("heading", { name: "Command recorded" })).toBeVisible();
     await panel.getByRole("button", { name: "Close result" }).click();
     await drain(page, 198);
@@ -144,8 +145,7 @@ test.describe("review operator controls", () => {
     const posted = page.waitForRequest("**/api/repos/self/pulls/181/review-control/commands");
     await panel.getByRole("button", { name: "Confirm command" }).click();
     expect((await posted).postDataJSON()).toMatchObject({
-      operation: "request_rearm", gate_id: "review-ceiling-181",
-      guidance: { kind: "set", text: "Focus on the parser edge case." },
+      operation: "release", selection: { kind: "gate", gate_id: "review-ceiling-181", intent: { kind: "resume", guidance: { kind: "set", text: "Focus on the parser edge case." } } },
     });
     await expect(panel.getByRole("heading", { name: "Command recorded" })).toBeVisible();
     await expect(panel.getByText(/not necessarily completed/)).toBeVisible();
@@ -180,8 +180,9 @@ test.describe("review operator controls", () => {
     const posted = page.waitForRequest("**/api/repos/self/pulls/182/review-control/commands");
     await panel.getByRole("button", { name: "Confirm command" }).click();
     expect((await posted).postDataJSON()).toMatchObject({
-      operation: "authorize_retry", authorization_id: authorization, gate_id: "review-retry-182",
-      command_id: "dismiss-182", evidence_id: "absence-182",
+      operation: "release", request_id: authorization,
+      selection: { kind: "gate", gate_id: "review-retry-182", intent: {
+        kind: "retry_absent", command_id: "dismiss-182", evidence_id: "absence-182" } },
     });
     await panel.getByRole("button", { name: "Close result" }).click();
 
