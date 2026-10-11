@@ -52,6 +52,40 @@ def freeze_test_configuration(environment: dict[str, str], config_version: str) 
     return configuration, MappingProxyType(workload)
 
 
+EVIDENCE_TAIL_BYTES = 2048
+OMITTED_MARKER = "[earlier output omitted]\n"
+
+
+class _OutputTail:
+    """Last EVIDENCE_TAIL_BYTES of combined output in O(bound) memory.
+
+    Test runners print the failure summary last, so the head is the part to drop.
+    """
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+        self.truncated = False
+
+    def extend(self, block: bytes) -> None:
+        self._buffer.extend(block)
+        # Trim at 2x so each byte is moved O(1) times amortized.
+        if len(self._buffer) > 2 * EVIDENCE_TAIL_BYTES:
+            self._trim()
+
+    def _trim(self) -> None:
+        if len(self._buffer) > EVIDENCE_TAIL_BYTES:
+            self.truncated = True
+            del self._buffer[:len(self._buffer) - EVIDENCE_TAIL_BYTES]
+
+    def text(self) -> str:
+        self._trim()
+        data = bytes(self._buffer)
+        if self.truncated:
+            # The cut may land inside a UTF-8 sequence; drop its orphaned continuation bytes.
+            data = data.lstrip(bytes(range(0x80, 0xC0)))
+        return (OMITTED_MARKER if self.truncated else "") + data.decode(errors="replace")
+
+
 def clean_tree(cwd: str, head: str) -> ReviewTestTreeProof:
     cwd = os.path.abspath(cwd)
     trusted_environment = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
@@ -107,7 +141,7 @@ class ReviewTestExecutor:
         config, scope = invocation.configuration, invocation.configuration.scope
         process = None
         readers = []
-        content = bytearray()
+        content = _OutputTail()
         hashes = [hashlib.sha256(), hashlib.sha256()]
         before = after = None
         execution = None
@@ -115,7 +149,7 @@ class ReviewTestExecutor:
         async def drain(stream, index):
             while block := await stream.read(8192):
                 hashes[index].update(block)
-                content.extend(block[:max(0, 2048 - len(content))])
+                content.extend(block)
         async def teardown():
             try:
                 await self.recover(invocation)
@@ -164,7 +198,7 @@ class ReviewTestExecutor:
                 config.executor_policy, invocation.subject.head_sha)
             outcome = ReviewTestOutcome.PASSED if status is TestExecutionStatus.PASSED else ReviewTestOutcome.FAILED if status is TestExecutionStatus.TEST_FAILED else ReviewTestOutcome.UNAVAILABLE
             return ReviewTestCompletion(invocation, outcome, execution, before, after,
-                (outcome.value + "\n" + content.decode(errors="replace"))[:4096])
+                (outcome.value + "\n" + content.text())[-4096:])
         except asyncio.CancelledError:
             await _await_teardown(asyncio.create_task(teardown()))
             raise
